@@ -1,0 +1,145 @@
+// Q4_0 batched matmul: (B, K) f32 input times (N, K) Q4_0 weight to (B, N) f32.
+// It is the Q4_0 sibling of `linear_q8_0_batch.comp`. The LDS input staging and
+// the tail-lane handling are the same. Only the dequant changes, from 8-bit bytes
+// to 4-bit nibbles, so the quants buffer is half the size.
+//
+// This file has its own tile geometry: B_TILE = 8u, N_TILE = 32u, K_TILE = 32u.
+// The Q8_0 sibling uses B_TILE = 16u, so this kernel holds half as many batch
+// rows per workgroup and streams the weights twice as often for the same B.
+// local_size_x = N_TILE = 32 pins one RDNA2 wave32 through
+// VK_EXT_subgroup_size_control.
+//
+//   n_base = wg_n * N_TILE      b_base = wg_b * B_TILE      l = local id
+//
+//                n_out:  n_base+0  n_base+1   ...   n_base+31
+//                       +---------+---------+     +----------+
+//   row b_base + 0      | lane 0  | lane 1  | ... | lane 31  |
+//        ...            |   ...   |   ...   |     |   ...    |
+//   row b_base + 7      | lane 0  | lane 1  | ... | lane 31  |
+//                       +---------+---------+     +----------+
+//
+// Each lane holds the dequantized weight column of n_out in registers and sweeps
+// the 8 rows of the tile.
+//
+// The ggml Q4_0 block packs each 32-weight block into 16 bytes, which is 4 uint32
+// words. Weight i (i < 16) is the low nibble of byte i, and weight i+16 is the
+// high nibble of byte i. Each nibble dequantizes as (nibble - 8) * scale. The
+// quants buffer holds k/8 uint32 per row.
+//
+//   binding 0  readonly  f32  input[B * k]
+//   binding 1  readonly  f16  scales[(k/32) * n]
+//   binding 2  readonly  uint quants_packed[(k/8) * n]
+//   binding 3  writeonly f32  out[B * n]
+//   push       uint b, uint k, uint n
+//
+// The reduction order and the FMA fusion match `linear_q8_0_batch.comp`, so the
+// result is not bit-exact. The Zig wrapper `LinearQ40Batch` declares
+// `.relative = 2e-4`.
+
+#version 450
+#extension GL_EXT_shader_16bit_storage : require
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+
+// -- configuration ----------------------------------------------------------
+// B_TILE and N_TILE come from the shader table in `build.zig`, which gives the
+// same two values to the host grid arithmetic. K_TILE has no host twin: it is
+// the Q4_0 block length.
+#if !defined(B_TILE) || !defined(N_TILE)
+#error "B_TILE and N_TILE must come from the build (the vulkan_shaders table)"
+#endif
+#define K_TILE 32u
+
+layout(local_size_x = N_TILE, local_size_y = 1, local_size_z = 1) in;
+
+// -- bindings ---------------------------------------------------------------
+layout(std430, set = 0, binding = 0) readonly buffer InputBuf {
+    float data[];
+} input_buf;
+
+layout(std430, set = 0, binding = 1) readonly buffer ScalesBuf {
+    float16_t data[];
+} scales_buf;
+
+layout(std430, set = 0, binding = 2) readonly buffer QuantsBuf {
+    uint data[];
+} quants_buf;
+
+layout(std430, set = 0, binding = 3) writeonly buffer OutBuf {
+    float data[];
+} out_buf;
+
+layout(push_constant) uniform Params {
+    uint b;
+    uint k;
+    uint n;
+} params;
+
+shared float lds_input[B_TILE * K_TILE];
+
+// -- main -------------------------------------------------------------------
+void main() {
+    uint wg_n = gl_WorkGroupID.x;
+    uint wg_b = gl_WorkGroupID.y;
+    uint local = gl_LocalInvocationID.x;
+
+    uint b_base = wg_b * B_TILE;
+    uint n_base = wg_n * N_TILE;
+    uint n_out = n_base + local;
+    // Tail lanes (n_out >= n) still take part in the cooperative LDS load and
+    // the barrier, which need uniform control flow across the wave. The weight
+    // read, the accumulate, and the store gate on `lane_active` instead.
+    bool lane_active = (n_out < params.n);
+
+    uint blocks_per_row = params.k / K_TILE;
+    uint words_per_row = params.k / 8u; // 4 words (16 bytes) per block
+
+    float partials[B_TILE];
+    for (uint i = 0u; i < B_TILE; ++i) partials[i] = 0.0;
+
+    for (uint blk = 0u; blk < blocks_per_row; ++blk) {
+        // Cooperative input load, as in the Q8_0 batched kernel. The input is
+        // f32 and only the weights are quantized. ALL lanes take part.
+        for (uint bi = 0u; bi < B_TILE; ++bi) {
+            uint b = b_base + bi;
+            float v = 0.0;
+            if (b < params.b) v = input_buf.data[b * params.k + blk * K_TILE + local];
+            lds_input[bi * K_TILE + local] = v;
+        }
+        barrier();
+
+        if (lane_active) {
+            float scale = float(scales_buf.data[n_out * blocks_per_row + blk]);
+            uint word_base = n_out * words_per_row + blk * 4u;
+
+            // Dequant the 32-weight block of this lane into registers from 4 uints.
+            float q[K_TILE];
+            for (uint i = 0u; i < 16u; ++i) {
+                uint word = quants_buf.data[word_base + (i >> 2)];
+                uint shift = (i & 3u) * 8u;
+                int lo = int((word >> shift) & 0xFu) - 8;
+                int hi = int((word >> (shift + 4u)) & 0xFu) - 8;
+                q[i] = scale * float(lo);
+                q[i + 16u] = scale * float(hi);
+            }
+
+            for (uint bi = 0u; bi < B_TILE; ++bi) {
+                uint b = b_base + bi;
+                if (b >= params.b) continue;
+                float acc = 0.0;
+                for (uint i = 0u; i < K_TILE; ++i) {
+                    acc += lds_input[bi * K_TILE + i] * q[i];
+                }
+                partials[bi] += acc;
+            }
+        }
+        barrier();
+    }
+
+    if (lane_active) {
+        for (uint bi = 0u; bi < B_TILE; ++bi) {
+            uint b = b_base + bi;
+            if (b >= params.b) continue;
+            out_buf.data[b * params.n + n_out] = partials[bi];
+        }
+    }
+}

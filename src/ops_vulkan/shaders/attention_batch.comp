@@ -1,0 +1,220 @@
+// Batched causal attention for the resident rows of a prefill chunk. Each
+// workgroup handles one (batch row bi, head h) output. Query q[bi, h] attends
+// to the cached positions 0..start_pos+bi inclusive. The causal mask is
+// implicit, because a row reads only up through its own position
+// start_pos + bi. This variant scores the resident rows of a chunk in one
+// dispatch instead of one decode step per token. The per-(bi, h) work is the
+// work of `attention.comp`, and this kernel adds only the batch index.
+//
+//   binding 0  readonly  f32     q[B * n_heads * head_dim]
+//   binding 1  readonly  KV_ELEM k_cache[max_seq * n_kv_heads * head_dim]
+//   binding 2  readonly  KV_ELEM v_cache[max_seq * n_kv_heads * head_dim]
+//   binding 3  writeonly f32     out[B * n_heads * head_dim]
+//   push       uint n_heads, n_kv_heads, head_dim, start_pos, b_count
+//
+// The dispatch grid is (n_heads, B, 1) at local_size_x = 64, which is two RDNA2
+// wave32 waves per workgroup and the same occupancy point as decode attention:
+//
+//   gl_WorkGroupID.x = h, the head.  gl_WorkGroupID.y = bi, the batch row.
+//
+//               h = 0     h = 1         h = n_heads-1
+//            +---------+---------+-----+-------------+
+//   bi = 0   |  (0,0)  |  (1,0)  | ... |             |   t_max = start_pos + 1
+//   bi = 1   |  (0,1)  |  (1,1)  | ... |             |   t_max = start_pos + 2
+//   ...      |         |         | ... |             |
+//   bi = B-1 |         |         | ... |             |   t_max = start_pos + B
+//            +---------+---------+-----+-------------+
+//
+// Workgroup (h, bi) reads the k_cache and v_cache rows 0..t_max-1 of kv head
+// kv_h = h / (n_heads / n_kv_heads). All B rows share the one k_cache and
+// v_cache, so the batch is free parallelism. It gives more resident workgroups
+// with no extra memory traffic per row beyond its own causal extent.
+//
+// KV_ELEM is the KV cache element type. `build.zig` compiles this one source
+// twice, once with -DKV_F16, so the two variants cannot drift apart. Only the
+// storage type moves. The loads widen to `float` at the read, the scores LDS
+// stays `shared float`, the accumulators stay `precise float`, the push constants
+// keep their layout, and the element indexing is unchanged, because the element
+// count of a row does not depend on the width of an element.
+//
+// ATTN_SPLIT, a build define fed from `limits.attn_split_len`, sizes the LDS
+// scores row: 1 KiB at 256. The kernel holds every score of a row in LDS, so
+// the host dispatches it only while start_pos + B stays at or below
+// ATTN_SPLIT, and `AttentionBatch.recordInto` asserts that bound. A deeper
+// prefill row takes `attention_split.comp` and `attention_merge.comp`, as a
+// decode row does, so a row past ATTN_SPLIT gets the bytes of the decode row
+// of the same depth.
+//
+// The LDS tree-reductions sum in a different order than the CPU reference, so the
+// result is not bit-exact. The Zig wrapper `AttentionBatch` declares
+// `.relative = 1e-3`.
+
+
+#version 450
+
+// -- configuration ----------------------------------------------------------
+// Both arms define both loads, so the body below selects a load by the access
+// shape it wants and never by the element type. `KV_LOAD2` reads the adjacent
+// element pair at `e2`, which must be even. The row offsets guarantee that:
+// every row starts at a multiple of head_dim, and rope needs an even head_dim.
+// The host dispatch asserts the evenness. A pair load adds the two products in
+// ascending element order, so its result bits match the one-element loop.
+#ifdef KV_F16
+// f16 rows read as packed halves. A 32-bit word load plus the core unpack keeps
+// 16-bit storage access out of the hot loop, and word w holds elements 2w and
+// 2w+1 of the same bytes the commit wrote. A pair load therefore costs one
+// unpack per element pair and not one per element.
+#define KV_ELEM uint
+#define KV_LOAD(buf, e) unpackHalf2x16(buf.data[(e) >> 1])[(e) & 1u]
+#define KV_LOAD2(buf, e2) unpackHalf2x16(buf.data[(e2) >> 1])
+#else
+#define KV_ELEM float
+#define KV_LOAD(buf, e) float(buf.data[e])
+#define KV_LOAD2(buf, e2) vec2(float(buf.data[e2]), float(buf.data[(e2) + 1u]))
+#endif
+
+#ifndef ATTN_SPLIT
+#error "ATTN_SPLIT must come from the build (limits.attn_split_len)"
+#endif
+
+layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
+
+// -- bindings ---------------------------------------------------------------
+layout(std430, set = 0, binding = 0) readonly buffer QBuf {
+    float data[];
+} q_buf;
+
+layout(std430, set = 0, binding = 1) readonly buffer KBuf {
+    KV_ELEM data[];
+} k_buf;
+
+layout(std430, set = 0, binding = 2) readonly buffer VBuf {
+    KV_ELEM data[];
+} v_buf;
+
+layout(std430, set = 0, binding = 3) writeonly buffer OutBuf {
+    float data[];
+} out_buf;
+
+layout(push_constant) uniform Params {
+    uint n_heads;
+    uint n_kv_heads;
+    uint head_dim;
+    uint start_pos;
+    uint b_count;
+} params;
+
+shared float scores[ATTN_SPLIT];
+shared float reduce_lds[64];
+
+// -- main -------------------------------------------------------------------
+void main() {
+    uint h = gl_WorkGroupID.x;
+    uint bi = gl_WorkGroupID.y;
+    uint local = gl_LocalInvocationID.x;
+    if (h >= params.n_heads || bi >= params.b_count) return;
+
+    uint head_dim = params.head_dim;
+    // Causal: this query attends to positions 0..t_max-1.
+    uint t_max = params.start_pos + bi + 1u;
+    // The host dispatches no row past ATTN_SPLIT. The exit is
+    // workgroup-uniform, and it keeps the LDS writes inside the row for any
+    // grid.
+    if (t_max > uint(ATTN_SPLIT)) return;
+    uint group_size = params.n_heads / params.n_kv_heads;
+    uint kv_h = h / group_size;
+    uint q_off = (bi * params.n_heads + h) * head_dim;
+    float scale = 1.0 / sqrt(float(head_dim));
+
+    // Pass 1: scores[t] = dot(q_bi_h, k_cache[t, kv_h]) * scale.
+    for (uint t = local; t < t_max; t += 64u) {
+        uint k_off = t * params.n_kv_heads * head_dim + kv_h * head_dim;
+        precise float s = 0.0;
+        for (uint d = 0u; d < head_dim; d += 2u) {
+            vec2 kv = KV_LOAD2(k_buf, k_off + d);
+            s += q_buf.data[q_off + d] * kv.x;
+            s += q_buf.data[q_off + d + 1u] * kv.y;
+        }
+        scores[t] = s * scale;
+    }
+    barrier();
+
+    // Pass 2: softmax (max-stable). Tree-reduce the max, then the sum.
+    float my_max = -3.402823466e+38;
+    for (uint t = local; t < t_max; t += 64u) {
+        if (scores[t] > my_max) my_max = scores[t];
+    }
+    reduce_lds[local] = my_max;
+    barrier();
+    if (local < 32u && reduce_lds[local + 32u] > reduce_lds[local]) reduce_lds[local] = reduce_lds[local + 32u];
+    barrier();
+    if (local < 16u && reduce_lds[local + 16u] > reduce_lds[local]) reduce_lds[local] = reduce_lds[local + 16u];
+    barrier();
+    if (local < 8u && reduce_lds[local + 8u] > reduce_lds[local]) reduce_lds[local] = reduce_lds[local + 8u];
+    barrier();
+    if (local < 4u && reduce_lds[local + 4u] > reduce_lds[local]) reduce_lds[local] = reduce_lds[local + 4u];
+    barrier();
+    if (local < 2u && reduce_lds[local + 2u] > reduce_lds[local]) reduce_lds[local] = reduce_lds[local + 2u];
+    barrier();
+    if (local < 1u && reduce_lds[local + 1u] > reduce_lds[local]) reduce_lds[local] = reduce_lds[local + 1u];
+    barrier();
+    float vec_max = reduce_lds[0];
+    barrier();
+
+    float my_sum = 0.0;
+    for (uint t = local; t < t_max; t += 64u) {
+        float e = exp(scores[t] - vec_max);
+        scores[t] = e;
+        my_sum += e;
+    }
+    reduce_lds[local] = my_sum;
+    barrier();
+    if (local < 32u) reduce_lds[local] += reduce_lds[local + 32u];
+    barrier();
+    if (local < 16u) reduce_lds[local] += reduce_lds[local + 16u];
+    barrier();
+    if (local < 8u) reduce_lds[local] += reduce_lds[local + 8u];
+    barrier();
+    if (local < 4u) reduce_lds[local] += reduce_lds[local + 4u];
+    barrier();
+    if (local < 2u) reduce_lds[local] += reduce_lds[local + 2u];
+    barrier();
+    if (local < 1u) reduce_lds[local] += reduce_lds[local + 1u];
+    barrier();
+    float vec_sum = reduce_lds[0];
+    float inv_sum = 1.0 / vec_sum;
+
+    for (uint t = local; t < t_max; t += 64u) {
+        scores[t] *= inv_sum;
+    }
+    barrier();
+
+    // Pass 3: out[bi, h, d] = sum_t scores[t] * v_cache[t, kv_h, d].
+    uint out_off = (bi * params.n_heads + h) * head_dim;
+#ifdef KV_F16
+    // One lane owns the adjacent output pair (d, d+1), so one unpack feeds
+    // both running sums. Each output still accumulates over t ascending, one
+    // add per position, so its bits match the one-element loop.
+    for (uint d = local * 2u; d < head_dim; d += 128u) {
+        precise float sum_x = 0.0;
+        precise float sum_y = 0.0;
+        for (uint t = 0u; t < t_max; ++t) {
+            uint v_off = t * params.n_kv_heads * head_dim + kv_h * head_dim;
+            vec2 vv = KV_LOAD2(v_buf, v_off + d);
+            sum_x += scores[t] * vv.x;
+            sum_y += scores[t] * vv.y;
+        }
+        out_buf.data[out_off + d] = sum_x;
+        out_buf.data[out_off + d + 1u] = sum_y;
+    }
+#else
+    for (uint d = local; d < head_dim; d += 64u) {
+        precise float sum = 0.0;
+        for (uint t = 0u; t < t_max; ++t) {
+            uint v_off = t * params.n_kv_heads * head_dim + kv_h * head_dim;
+            sum += scores[t] * KV_LOAD(v_buf, v_off + d);
+        }
+        out_buf.data[out_off + d] = sum;
+    }
+#endif
+}

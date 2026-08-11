@@ -1,0 +1,62 @@
+// RoPE over every head of one token in a single dispatch, indexed by
+// (head, pair). The rotation is the one in `rope.comp`, which holds the
+// style_norm pairing and the ff freq divisors. This variant exists to collapse
+// the per-head dispatch loop, tens of dispatches per layer, into one dispatch.
+// RoPE does little arithmetic, so dispatch overhead dominates its GPU cost, and
+// fusing the heads amortizes that overhead.
+//
+//   binding 0  readwrite f32 x[n_heads * head_dim]
+//   binding 1  readonly  f32 ff[rope_dim/2]
+//   push       uint pos, uint head_dim, uint rope_dim, float freq_base,
+//              uint style_norm
+//
+// The dispatch grid is (ceil((rope_dim/2) / 64), n_heads, 1). gl_WorkGroupID.y is
+// the head and gl_GlobalInvocationID.x is the pair index inside the leading
+// rope_dim/2 dims of that head.
+//
+// GPU `pow`, `cos`, and `sin` round differently from the CPU intrinsics, so the
+// result is not bit-exact. The Zig wrapper `RopeMulti` declares
+// `.relative = 1e-5`.
+
+#version 450
+
+layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
+
+// -- bindings ---------------------------------------------------------------
+layout(std430, set = 0, binding = 0) buffer XBuf {
+    float data[];
+} x_buf;
+
+layout(std430, set = 0, binding = 1) readonly buffer FfBuf {
+    float data[];
+} ff_buf;
+
+layout(push_constant) uniform Params {
+    uint pos;
+    uint head_dim;
+    uint rope_dim;
+    float freq_base;
+    uint style_norm;
+} params;
+
+// -- main -------------------------------------------------------------------
+void main() {
+    uint i = gl_GlobalInvocationID.x;
+    uint head = gl_WorkGroupID.y;
+    uint half_dim = params.rope_dim / 2u;
+    if (i >= half_dim) return;
+
+    uint base = head * params.head_dim;
+    float inv_dim = 1.0 / float(params.rope_dim);
+    float exp_v = -2.0 * float(i) * inv_dim;
+    float theta = pow(params.freq_base, exp_v);
+    float angle = float(params.pos) * theta / ff_buf.data[i];
+    float cos_v = cos(angle);
+    float sin_v = sin(angle);
+    uint ia = (params.style_norm == 1u) ? base + 2u * i : base + i;
+    uint ib = (params.style_norm == 1u) ? base + 2u * i + 1u : base + i + half_dim;
+    float a = x_buf.data[ia];
+    float b = x_buf.data[ib];
+    x_buf.data[ia] = a * cos_v - b * sin_v;
+    x_buf.data[ib] = a * sin_v + b * cos_v;
+}

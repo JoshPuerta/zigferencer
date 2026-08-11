@@ -1,0 +1,205 @@
+// Fused scaled-dot-product attention for decode, one query head per workgroup.
+// For head h the kernel computes, over the cached positions t in 0..t_len:
+//
+//   scores[t] = (q[h] dot k_cache[t, h_kv]) / sqrt(head_dim)
+//   scores    = softmax(scores)
+//   out[h]    = sum_t scores[t] * v_cache[t, h_kv]
+//
+// Grouped-query attention maps many query heads onto each kv head through
+// h_kv = h / (n_heads / n_kv_heads), so several workgroups share one (k, v) head.
+//
+// One head per workgroup keeps the working set hot. Every lane in the group reads
+// the same q[h] and walks the same k_cache and v_cache rows, and those rows stay
+// resident in cache for the whole reduction of the head. local_size_x = 64 runs
+// two RDNA2 wave32 waves per workgroup. Two resident waves hide global memory
+// latency behind compute, which is what pays for the k_cache and v_cache fetches.
+// Two waves also stay small enough for the scores buffer to fit in LDS. In the
+// score pass the lanes stride across t, one k_cache row per lane. Those loads are
+// NOT wave-coalesced, because adjacent lanes read rows n_kv_heads*head_dim apart.
+// Each lane walks its own row in order, so it fully consumes every line it
+// fetches. The q row that all lanes share is a broadcast served from cache. The
+// V-sum pass strides the lanes across d instead, where adjacent lanes do touch
+// adjacent addresses.
+//
+// The scores live in a shared (LDS) buffer because both reductions, the softmax
+// max and sum and the final V-weighted sum, tree-reduce across lanes. A
+// tree-reduce needs a scratchpad that every lane reads.
+//
+//   binding 0  readonly  f32     q[n_heads * head_dim]
+//   binding 1  readonly  KV_ELEM k_cache[t_len * n_kv_heads * head_dim]
+//   binding 2  readonly  KV_ELEM v_cache[t_len * n_kv_heads * head_dim]
+//   binding 3  writeonly f32     out[n_heads * head_dim]
+//   push       uint n_heads, n_kv_heads, head_dim, t_len
+//
+// ATTN_SPLIT, a build define fed from `limits.attn_split_len`, sizes the LDS
+// scores buffer: 1 KiB at 256. The kernel holds every score of the row in LDS
+// at once, and the host dispatches it only for a row of at most ATTN_SPLIT
+// positions. A deeper row takes `attention_split.comp` and
+// `attention_merge.comp`, which split the walk across workgroups and merge the
+// partials in a fixed order. The buffer cannot grow with the context, because
+// LDS per workgroup divides occupancy and the target driver caps workgroup
+// shared memory at 32 KiB.
+//
+// head_dim is not bounded. The kernel reads q and k per element from global
+// memory rather than holding them in a per-lane register vector, and the V-sum
+// strides d by local_size. head_dim 256, which is the Qwen3.5 full attention,
+// therefore runs unchanged, and `gpu-selftest attn` checks it (GQA 8 to 2, dim
+// 256).
+//
+// KV_ELEM is the KV cache element type. `build.zig` compiles this one source
+// twice, once with -DKV_F16, so the two variants cannot drift apart. Only the
+// storage type moves. The loads widen to `float` at the read, the scores LDS
+// stays `shared float`, the accumulators stay `precise float`, the push constants
+// keep their layout, and the element indexing is unchanged, because the element
+// count of a row does not depend on the width of an element.
+//
+// The LDS tree-reductions sum in a different order than the CPU reference, so the
+// result is not bit-exact. The observed error of this walk is 5e-4 to 6e-4 on
+// SmolLM2, Llama-1B, and Llama-8B shapes of up to 512 positions, once the bench
+// applies its near-zero-denominator floor to rel_err. Without that floor the
+// SmolLM2 cancellation outputs, about 6e-9 absolute, inflate rel_err to about
+// 7e-2. A row past ATTN_SPLIT takes the split pass, so the tests gate this
+// kernel on the SmolLM2 shape at 128 positions and on the Qwen3.5 shape up to
+// ATTN_SPLIT positions. The Zig wrapper `Attention` declares
+// `.relative = 1e-3`.
+
+#version 450
+
+// -- configuration ----------------------------------------------------------
+#ifdef KV_F16
+// f16 rows read as packed halves. A 32-bit word load plus the core unpack keeps
+// 16-bit storage access out of the hot loop, and word w holds elements 2w and
+// 2w+1 of the same bytes the commit wrote.
+#define KV_ELEM uint
+#define KV_LOAD(buf, e) unpackHalf2x16(buf.data[(e) >> 1])[(e) & 1]
+#else
+#define KV_ELEM float
+#define KV_LOAD(buf, e) float(buf.data[e])
+#endif
+
+#ifndef ATTN_SPLIT
+#error "ATTN_SPLIT must come from the build (limits.attn_split_len)"
+#endif
+
+layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
+
+// -- bindings ---------------------------------------------------------------
+layout(std430, set = 0, binding = 0) readonly buffer QBuf {
+    float data[];
+} q_buf;
+
+layout(std430, set = 0, binding = 1) readonly buffer KBuf {
+    KV_ELEM data[];
+} k_buf;
+
+layout(std430, set = 0, binding = 2) readonly buffer VBuf {
+    KV_ELEM data[];
+} v_buf;
+
+layout(std430, set = 0, binding = 3) writeonly buffer OutBuf {
+    float data[];
+} out_buf;
+
+layout(push_constant) uniform Params {
+    uint n_heads;
+    uint n_kv_heads;
+    uint head_dim;
+    uint t_len;
+} params;
+
+shared float scores[ATTN_SPLIT]; // per-t scores buffer
+shared float reduce_lds[64];    // 64-lane reduction scratch
+
+// -- main -------------------------------------------------------------------
+void main() {
+    uint h = gl_WorkGroupID.x;
+    uint local = gl_LocalInvocationID.x;
+    if (h >= params.n_heads) return;
+
+    uint head_dim = params.head_dim;
+    uint t_len = params.t_len;
+    uint group_size = params.n_heads / params.n_kv_heads;
+    uint kv_h = h / group_size;
+    uint q_off = h * head_dim;
+    float scale = 1.0 / sqrt(float(head_dim));
+
+    // Pass 1: scores[t] = dot(q_h, k_cache[t, kv_h]) * scale.
+    //   Each lane handles a strided subset of t.
+    for (uint t = local; t < t_len; t += 64u) {
+        uint k_off = t * params.n_kv_heads * head_dim + kv_h * head_dim;
+        precise float s = 0.0;
+        for (uint d = 0u; d < head_dim; ++d) {
+            s += q_buf.data[q_off + d] * KV_LOAD(k_buf, k_off + d);
+        }
+        scores[t] = s * scale;
+    }
+    barrier();
+
+    // Pass 2: softmax over scores[0..t_len]. The max-reduce and the sum-reduce
+    // below each fold 64 lane partials to 1 with a log-step LDS tree. The
+    // steps are 64 -> 32 -> 16 -> 8 -> 4 -> 2 -> 1, one barrier per step.
+    //   max-reduce
+    float my_max = -3.402823466e+38;
+    for (uint t = local; t < t_len; t += 64u) {
+        if (scores[t] > my_max) my_max = scores[t];
+    }
+    reduce_lds[local] = my_max;
+    barrier();
+    if (local < 32u && reduce_lds[local + 32u] > reduce_lds[local]) reduce_lds[local] = reduce_lds[local + 32u];
+    barrier();
+    if (local < 16u && reduce_lds[local + 16u] > reduce_lds[local]) reduce_lds[local] = reduce_lds[local + 16u];
+    barrier();
+    if (local < 8u && reduce_lds[local + 8u] > reduce_lds[local]) reduce_lds[local] = reduce_lds[local + 8u];
+    barrier();
+    if (local < 4u && reduce_lds[local + 4u] > reduce_lds[local]) reduce_lds[local] = reduce_lds[local + 4u];
+    barrier();
+    if (local < 2u && reduce_lds[local + 2u] > reduce_lds[local]) reduce_lds[local] = reduce_lds[local + 2u];
+    barrier();
+    if (local < 1u && reduce_lds[local + 1u] > reduce_lds[local]) reduce_lds[local] = reduce_lds[local + 1u];
+    barrier();
+    float vec_max = reduce_lds[0];
+    barrier();
+
+    //   exp(score - max), then sum-reduce
+    float my_sum = 0.0;
+    for (uint t = local; t < t_len; t += 64u) {
+        float e = exp(scores[t] - vec_max);
+        scores[t] = e;
+        my_sum += e;
+    }
+    reduce_lds[local] = my_sum;
+    barrier();
+    if (local < 32u) reduce_lds[local] += reduce_lds[local + 32u];
+    barrier();
+    if (local < 16u) reduce_lds[local] += reduce_lds[local + 16u];
+    barrier();
+    if (local < 8u) reduce_lds[local] += reduce_lds[local + 8u];
+    barrier();
+    if (local < 4u) reduce_lds[local] += reduce_lds[local + 4u];
+    barrier();
+    if (local < 2u) reduce_lds[local] += reduce_lds[local + 2u];
+    barrier();
+    if (local < 1u) reduce_lds[local] += reduce_lds[local + 1u];
+    barrier();
+    float vec_sum = reduce_lds[0];
+    float inv_sum = 1.0 / vec_sum;
+
+    //   normalize
+    for (uint t = local; t < t_len; t += 64u) {
+        scores[t] *= inv_sum;
+    }
+    barrier();
+
+    // Pass 3: out[h, d] = sum_t scores[t] * v_cache[t, kv_h, d].
+    //   Each lane handles a strided subset of d. head_dim <= 64 gives
+    //   one output per lane, and head_dim 128 gives two.
+    uint out_off = h * head_dim;
+    for (uint d = local; d < head_dim; d += 64u) {
+        precise float sum = 0.0;
+        for (uint t = 0u; t < t_len; ++t) {
+            uint v_off = t * params.n_kv_heads * head_dim + kv_h * head_dim;
+            sum += scores[t] * KV_LOAD(v_buf, v_off + d);
+        }
+        out_buf.data[out_off + d] = sum;
+    }
+}

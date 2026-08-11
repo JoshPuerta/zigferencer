@@ -1,0 +1,9 @@
+# Probes for `run` and `bench-model` on a Debug build, where no function is
+# inlined. Debug times are not release times. Use the output for the call
+# order and the call counts only.
+^io\.gguf\.loader\.loadWith$
+^core\.tokenizer\.bpe\.(encodeAlloc|decodeAlloc)$
+^runtime\.generate\.(decode|timedGreedy)$
+^runtime\.(llama|qwen)_runner\.(LlamaRunner|QwenRunner)\.(step|stepBatch|prefillBatch|layerForward|linearBatch|attention\w*)$
+^runtime\.parallel\.(linearBatch|attentionTyped)$
+^runtime\.sampler\.(sample|samplePool|greedy|pick)$

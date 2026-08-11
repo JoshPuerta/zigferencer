@@ -1,0 +1,185 @@
+// Gated DeltaNet decode step for one Qwen3.5 GDN layer, with support for
+// DECOUPLED heads. Decoupled means more value heads than key heads: the 9B is
+// n_k=16 and n_v=32, and the 2B is the n_v == n_k case. It mirrors the validated
+// CPU reference in src/ops/gdn.zig step(). The steps are a causal depthwise
+// conv1d (k=4) with SiLU, then an L2-norm of q and k per key head, then a q-scale
+// of 1/sqrt(D), then the gated delta recurrence, then a gated RMSNorm.
+//
+// The kernel maps one workgroup per KEY head. It dispatches n_k_heads workgroups
+// at local_size_x = head_dim D (128), with lane j as the value-dim index.
+// Workgroup ki owns a disjoint set of conv channels: the q and k of key head ki,
+// plus the v channels of every value head vh with vh % n_k == ki, which is
+// vh = ki + vk*n_k for vk in 0..v_per_k. That disjoint ownership lets the kernel
+// advance conv_state in place with no cross-workgroup race. The kernel L2-norms
+// and q-scales q and k once per key head. The recurrence then runs for each of
+// the v_per_k value heads that share the key head, each with its own DxD state.
+//
+//   0  qkv[convDim]             readonly  [q(key_dim) | k(key_dim) | v(value_dim)]
+//   1  z[value_dim]             readonly  output-gate projection
+//   2  alpha[n_v]               readonly  decay projection
+//   3  beta_in[n_v]             readonly  delta-strength projection
+//   4  conv_w[K*convDim]        readonly  depthwise conv weights, w[c*K + tap]
+//   5  ssm_a[n_v]               readonly  already -exp(A_log)
+//   6  dt_bias[n_v]             readonly
+//   7  ssm_norm[D]              readonly  gated-RMSNorm weight
+//   8  state[n_v*D*D]           in/out    per-value-head recurrent state
+//   9  conv_state[(K-1)*convDim] in/out   conv ring, [t*convDim + c], t=0 oldest
+//   10 o_out[value_dim]         writeonly readout, before ssm_out
+//   push  uint D, K, n_k, n_v, float eps, uint n_tokens, row0, state_off, conv_off
+//
+// with key_dim = n_k*D, value_dim = n_v*D, convDim = 2*key_dim + value_dim, and
+// v_per_k = n_v / n_k. The 2B has n_k == n_v, so v_per_k == 1 and one value head
+// runs per workgroup. n_tokens folds several tokens into one dispatch: 1 for
+// decode, and the chunk length for prefill. The field comments on the push struct
+// carry the detail.
+//
+// The cross-lane reductions are redundant sequential sums over shared memory that
+// hold the CPU summation order. The GPU `exp`, sigmoid, silu, and `inversesqrt`
+// still differ from the CPU intrinsics, so the result is not bit-exact. The Zig
+// wrapper `GdnDecode` declares `.relative = 1e-4`.
+
+#version 450
+
+layout(local_size_x = 128, local_size_y = 1, local_size_z = 1) in;
+
+// -- bindings ---------------------------------------------------------------
+layout(std430, set = 0, binding = 0)  readonly  buffer B0  { float qkv[]; };
+layout(std430, set = 0, binding = 1)  readonly  buffer B1  { float z[]; };
+layout(std430, set = 0, binding = 2)  readonly  buffer B2  { float alpha[]; };
+layout(std430, set = 0, binding = 3)  readonly  buffer B3  { float beta_in[]; };
+layout(std430, set = 0, binding = 4)  readonly  buffer B4  { float conv_w[]; };
+layout(std430, set = 0, binding = 5)  readonly  buffer B5  { float ssm_a[]; };
+layout(std430, set = 0, binding = 6)  readonly  buffer B6  { float dt_bias[]; };
+layout(std430, set = 0, binding = 7)  readonly  buffer B7  { float ssm_norm[]; };
+layout(std430, set = 0, binding = 8)            buffer B8  { float state[]; };
+layout(std430, set = 0, binding = 9)            buffer B9  { float conv_state[]; };
+layout(std430, set = 0, binding = 10) writeonly buffer B10 { float o_out[]; };
+
+layout(push_constant) uniform Params {
+    uint  D;
+    uint  K;
+    uint  n_k;
+    uint  n_v;
+    float eps;
+    // Tokens processed by ONE dispatch. Decode is 1. Prefill folds the whole
+    // chunk into this single dispatch. Token t reads and writes row t of the
+    // BATCHED projection and output buffers, at offset t*stride. The recurrent
+    // state and the conv ring carry across t in global memory. One dispatch per
+    // chunk removes the (n_tokens-1) host pipeline barriers and dispatches per
+    // layer. The per-token workgroup barriers, which are the cross-lane
+    // reductions, stay on chip at low cost.
+    uint  n_tokens;
+    // Multi-slot runs group the same-slot rows of a batch into one dispatch.
+    // row0 is the first batched-buffer row that this run reads and writes.
+    // state_off and conv_off are ELEMENT offsets of the slot region inside the
+    // slot-strided state and conv buffers. All three at zero address the first
+    // slot, which is the single-slot case, bit-identically.
+    uint  row0;
+    uint  state_off;
+    uint  conv_off;
+} p;
+
+const uint MAX_V_PER_K = 8u;
+
+shared float qsh[128];
+shared float ksh[128];
+shared float osh[128];
+
+// -- helpers ----------------------------------------------------------------
+float silu(float x)     { return x / (1.0 + exp(-x)); }
+float sigmoidf(float x) { return 1.0 / (1.0 + exp(-x)); }
+float softplusf(float x){ return (x > 20.0) ? x : log(1.0 + exp(x)); }
+
+// Causal depthwise conv (K taps) and SiLU for channel c. It advances
+// conv_state[:,c] inside the slot region at p.conv_off, and it reads `qkv` at the
+// batched row `qkv_off`. The ring carries across the tokens of the run.
+float conv_silu(uint c, uint qkv_off, uint K, uint convDim) {
+    float xin = qkv[qkv_off + c];
+    float acc = 0.0;
+    for (uint t = 0u; t + 1u < K; t++) acc += conv_w[c * K + t] * conv_state[p.conv_off + t * convDim + c];
+    acc += conv_w[c * K + (K - 1u)] * xin;
+    for (uint t = 0u; t + 2u < K; t++) conv_state[p.conv_off + t * convDim + c] = conv_state[p.conv_off + (t + 1u) * convDim + c];
+    conv_state[p.conv_off + (K - 2u) * convDim + c] = xin;
+    return silu(acc);
+}
+
+// -- main -------------------------------------------------------------------
+void main() {
+    uint ki = gl_WorkGroupID.x;       // key head
+    uint j = gl_LocalInvocationID.x;  // value-dim lane (0..D-1; D == local_size_x)
+    uint D = p.D;
+    uint K = p.K;
+    uint key_dim = p.n_k * D;
+    uint value_dim = p.n_v * D;
+    uint convDim = 2u * key_dim + value_dim;
+    uint v_per_k = p.n_v / p.n_k;
+    float eps = p.eps;
+
+    // Sequential recurrence over the chunk. Token t carries the recurrent state
+    // and the conv ring, both in global memory, from token t-1. The loop body is
+    // therefore bit-identical to one decode dispatch run n_tokens times. Only the
+    // BATCHED projection and output rows shift by t*stride.
+    for (uint t = 0u; t < p.n_tokens; t++) {
+        uint qkv_off = (p.row0 + t) * convDim;
+        uint v_off   = (p.row0 + t) * value_dim;
+        uint ab_off  = (p.row0 + t) * p.n_v;
+
+        // 1-2. conv and silu for the q and k of this key head and the v of its
+        //      value heads.
+        float qv = conv_silu(ki * D + j, qkv_off, K, convDim);
+        float kv = conv_silu(key_dim + ki * D + j, qkv_off, K, convDim);
+        float vconv[MAX_V_PER_K];
+        for (uint vk = 0u; vk < v_per_k; vk++) {
+            uint vh = ki + vk * p.n_k;
+            vconv[vk] = conv_silu(2u * key_dim + vh * D + j, qkv_off, K, convDim);
+        }
+
+        qsh[j] = qv;
+        ksh[j] = kv;
+        barrier();
+
+        // 3. L2-norm q,k over the key head. Scale q by 1/sqrt(D) (once per key head).
+        float ssq = 0.0;
+        float ssk = 0.0;
+        for (uint i = 0u; i < D; i++) { ssq += qsh[i] * qsh[i]; ssk += ksh[i] * ksh[i]; }
+        float qn = qsh[j] * inversesqrt(ssq + eps) * inversesqrt(float(D));
+        float kn = ksh[j] * inversesqrt(ssk + eps);
+        barrier();
+        qsh[j] = qn;
+        ksh[j] = kn;
+        barrier();
+
+        // 4-6. recurrence + gated-norm for each value head sharing this key head.
+        for (uint vk = 0u; vk < v_per_k; vk++) {
+            uint vh = ki + vk * p.n_k;
+            // ssm_a and dt_bias are per-layer weights and carry no batch row.
+            // alpha and beta_in are per-token projections at offset ab_off.
+            float g = ssm_a[vh] * softplusf(alpha[ab_off + vh] + dt_bias[vh]);
+            float decay = exp(g);
+            float beta = sigmoidf(beta_in[ab_off + vh]);
+            uint sbase = p.state_off + vh * D * D;
+
+            float kvmem = 0.0;
+            for (uint i = 0u; i < D; i++) {
+                float sij = state[sbase + i * D + j] * decay;
+                state[sbase + i * D + j] = sij;
+                kvmem += sij * ksh[i];
+            }
+            float delta = (vconv[vk] - kvmem) * beta;
+            float oj = 0.0;
+            for (uint i = 0u; i < D; i++) {
+                float sij = state[sbase + i * D + j] + ksh[i] * delta;
+                state[sbase + i * D + j] = sij;
+                oj += sij * qsh[i];
+            }
+
+            osh[j] = oj;
+            barrier();
+            float sso = 0.0;
+            for (uint i = 0u; i < D; i++) sso += osh[i] * osh[i];
+            float invo = inversesqrt(sso / float(D) + eps);
+            o_out[v_off + vh * D + j] = oj * invo * ssm_norm[j] * silu(z[v_off + vh * D + j]);
+            barrier(); // before the next value head (or next token) reuses osh
+        }
+    }
+}

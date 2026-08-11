@@ -1,0 +1,111 @@
+//! The batch row every runner steps, and the row rule they all hold. The file
+//! carries no weights and no state, so a runner of either family can depend on
+//! it without depending on another runner.
+
+const std = @import("std");
+const Allocator = std.mem.Allocator;
+
+// -- types ------------------------------------------------------------------
+
+pub const Error = error{
+    MissingTensor,
+    UnsupportedWeightDtype,
+    PositionOutOfRange,
+    TooManyRows,
+} || Allocator.Error;
+
+/// One row of a batched forward step. Rows sharing a slot must be adjacent
+/// and ascending by exactly one position. `want_logits` rows must form a
+/// suffix of the batch (their hidden states are contiguous, so the lm_head
+/// runs as one batched projection and prompt rows skip it entirely).
+pub const StepRow = struct {
+    /// KV slot to read and write.
+    slot: u32,
+    token: u32,
+    /// Position to write at. Attention spans `0..=pos`.
+    pos: u32,
+    /// Compute final norm + lm_head for this row. Logits for the row at batch
+    /// index i land at `logits[i * vocab_size ..]`.
+    want_logits: bool,
+};
+
+// -- api --------------------------------------------------------------------
+
+/// Check the row rule that every runner shares, so they cannot drift: a
+/// batch row sees exactly the inputs of its solo call. Slot bounds, same-slot
+/// adjacency, and the `want_logits` suffix are programmer errors (asserts). An
+/// out-of-range position is runtime data (typed error). A row count past
+/// `rows_max` is a typed error in every build mode, because a ReleaseFast
+/// overflow writes past the row scratch. Returns the count of `want_logits`
+/// rows.
+pub fn validateRows(
+    rows: []const StepRow,
+    slot_count: u32,
+    rows_max: u32,
+    max_seq: u32,
+) error{ PositionOutOfRange, TooManyRows }!u32 {
+    std.debug.assert(rows.len >= 1);
+    if (rows.len > rows_max) return error.TooManyRows;
+    var seen_logits = false;
+    var n_logits: u32 = 0;
+    for (rows, 0..) |r, i| {
+        std.debug.assert(r.slot < slot_count);
+        if (r.pos >= max_seq) return error.PositionOutOfRange;
+        if (i > 0 and rows[i - 1].slot == r.slot) {
+            // Consecutive ascending positions: the chunked-prefill shape.
+            std.debug.assert(rows[i - 1].pos + 1 == r.pos);
+        } else if (i > 0) {
+            // A slot's rows are adjacent. It must not reappear later.
+            for (rows[0 .. i - 1]) |prev| std.debug.assert(prev.slot != r.slot);
+        }
+        if (seen_logits) std.debug.assert(r.want_logits);
+        if (r.want_logits) {
+            seen_logits = true;
+            n_logits += 1;
+        }
+    }
+    return n_logits;
+}
+
+/// Start of the `want_logits` suffix: rows[first..] all want logits, and
+/// no earlier row does, because the row rule makes them a suffix. lm_head runs
+/// for that suffix only. The prompt rows of a prefill chunk therefore skip the
+/// costliest matmul in the model.
+pub fn wantLogitsFirst(rows: []const StepRow) u32 {
+    var first: u32 = @intCast(rows.len);
+    while (first > 0 and rows[first - 1].want_logits) first -= 1;
+    return first;
+}
+
+/// True when the runner that `RunnerPtr` points at declares
+/// `chunked_prefill = true`. Such a runner prefills a prompt in
+/// `prefillBatch` chunks. Every other runner keeps the per-token loop.
+pub fn chunkedPrefill(comptime RunnerPtr: type) bool {
+    const R = @typeInfo(RunnerPtr).pointer.child;
+    return @hasDecl(R, "chunked_prefill") and R.chunked_prefill;
+}
+
+// -- tests ------------------------------------------------------------------
+
+test "chunkedPrefill: reads the runner declaration, absent means false" {
+    const On = struct {
+        pub const chunked_prefill: bool = true;
+    };
+    const Off = struct {
+        pub const chunked_prefill: bool = false;
+    };
+    const Bare = struct {};
+    try std.testing.expect(chunkedPrefill(*On));
+    try std.testing.expect(chunkedPrefill(*const On));
+    try std.testing.expect(!chunkedPrefill(*Off));
+    try std.testing.expect(!chunkedPrefill(*Bare));
+}
+
+test "validateRows: a row count past the cap is a typed error" {
+    const rows = [_]StepRow{
+        .{ .slot = 0, .token = 1, .pos = 0, .want_logits = false },
+        .{ .slot = 0, .token = 1, .pos = 1, .want_logits = true },
+    };
+    try std.testing.expectError(error.TooManyRows, validateRows(&rows, 1, 1, 16));
+    try std.testing.expectEqual(@as(u32, 1), try validateRows(&rows, 1, 2, 16));
+}

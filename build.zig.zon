@@ -1,0 +1,37 @@
+// Package manifest for zigferencer. `zig build` reads it to resolve the package
+// name, the toolchain floor, and, for a GPU build alone, the vulkan-zig
+// dependency. `zig fetch` uses the `.dependencies` hashes to fill the cache.
+.{
+    .name = .zigferencer,
+    .version = "0.1.0",
+
+    // Auto-generated package id (Zig writes it on first build). Do not hand-edit.
+    .fingerprint = 0x8d219c7ebb4de560,
+
+    // Hard floor on the toolchain. The code uses the 0.16 `std.Io` and build
+    // APIs. An older or a newer Zig does not compile it. A raise is deliberate.
+    .minimum_zig_version = "0.16.0",
+
+    .dependencies = .{
+        // vulkan-zig generates the Vulkan bindings (`vk.zig`) from the registry
+        // XML at build time. `-Druntime=vulkan` ALONE materializes it, because
+        // build.zig calls `b.dependency("vulkan", ...)` inside `wireVulkan`. A
+        // default CPU build therefore never fetches or compiles it. The pin is
+        // an exact commit, which keeps the generated API fixed.
+        .vulkan = .{
+            .url = "git+https://github.com/Snektron/vulkan-zig?ref=master#b496a6a561ffbbeb530b0f9ed4e059f88c0723a5",
+            .hash = "vulkan-0.0.0-r7Ytx7N9AwD7IZt5_XNHtkJ4G9qY0pCH-cpcOsbL8wzD",
+        },
+    },
+
+    // The files a published and hashed package holds. A local `zig build` works
+    // from the full checkout whatever this list says. The list matters when
+    // another package takes zigferencer as a dependency. The GLSL shaders live
+    // under `src/` and travel with it. `tests/` and `tools/` serve development
+    // alone, so the list omits them.
+    .paths = .{
+        "build.zig",
+        "build.zig.zon",
+        "src",
+    },
+}

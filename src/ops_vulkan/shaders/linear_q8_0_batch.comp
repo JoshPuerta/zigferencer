@@ -1,0 +1,176 @@
+// Batched Q8_0 matmul: (B, K) f32 input times (N, K) Q8_0 weight to (B, N) f32.
+// The decode kernel `linear_q8_0_reduce.comp` streams the whole weight from VRAM
+// once per output column. This kernel streams it once per B_TILE outputs and so
+// amortizes the weight bandwidth across the batch. A 411-token Llama-8B prefill
+// makes 411 forward passes, each streaming 7.6 GB of weights. This kernel
+// collapses them into roughly one 7.6 GB pass, which is the time-to-first-token
+// win it targets.
+//
+// The tile geometry is B_TILE = 16 batch rows and N_TILE = 32 output features per
+// workgroup, which is one RDNA2 wave. K_TILE = 32 is the Q8_0 block. Lane l in
+// [0, 32) owns one weight column n_out = n_base + l and computes B_TILE outputs
+// for it:
+//
+//   n_base = wg_n * N_TILE      b_base = wg_b * B_TILE      l = local id
+//
+//                n_out:  n_base+0  n_base+1   ...   n_base+31
+//                       +---------+---------+     +----------+
+//   row b_base + 0      | lane 0  | lane 1  | ... | lane 31  |
+//   row b_base + 1      | lane 0  | lane 1  | ... | lane 31  |
+//        ...            |   ...   |   ...   |     |   ...    |
+//   row b_base + 15     | lane 0  | lane 1  | ... | lane 31  |
+//                       +---------+---------+     +----------+
+//
+// The lane caches the dequantized weight block (32 floats) in registers, then
+// sweeps the B_TILE batch rows and accumulates into per-row partials. That reuse
+// is the whole point, because a b-token prefill then streams the weights only
+// ceil(b / B_TILE) times.
+//
+// Three memory streams feed the inner loop:
+//   - input[b][k]    broadcast across the wave (all 32 lanes read one address), L1.
+//   - quants[n][k]   each lane reads its own column. Adjacent lanes read adjacent
+//                    rows, so the bytes of a block are contiguous and coalesced.
+//   - scales[n][blk] strided across lanes by blocks_per_row*2 bytes. Not
+//                    coalesced, but L2-resident at these sizes.
+//
+//   binding 0  readonly  f32  input[B * k]
+//   binding 1  readonly  f16  scales[(k/32) * n]
+//   binding 2  readonly  uint quants_packed[(k/4) * n]
+//   binding 3  writeonly f32  out[B * n]
+//   push       uint b, uint k, uint n
+//
+// The dispatch is (ceil(N / N_TILE), ceil(B / B_TILE), 1). Occupancy sets the
+// knee in B_TILE, not compute: this is a single-wave workgroup at about 40
+// registers per lane, so resident waves are capped and achieved bandwidth falls
+// as B_TILE grows. B_TILE = 16 is the knee measured on a 9B prefill, and 32 gains
+// nothing. A better result needs the multi-wave register-blocked GEMM, which is
+// `linear_q8_0_gemm.comp`.
+//
+// Tail lanes (n_out >= N) and tail rows (b >= B) carry a `lane_active` flag and a
+// per-row check instead of an early `return`. A `return` skips the cooperative
+// LDS load and the `barrier()`, which the whole wave must reach uniformly, and it
+// corrupts the outputs whenever N is not a multiple of N_TILE.
+//
+// The per-row accumulation reorders the reduction and lets the compiler fuse a
+// multiply and an add into an FMA, so the result is not bit-exact. The Zig
+// wrapper `LinearQ80Batch` declares `.relative = 2e-4`.
+
+#version 450
+#extension GL_EXT_shader_16bit_storage : require
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+
+// -- configuration ----------------------------------------------------------
+// B_TILE and N_TILE come from the shader table in `build.zig`, which gives the
+// same two values to the host grid arithmetic. K_TILE has no host twin: it is
+// the Q8_0 block length.
+#if !defined(B_TILE) || !defined(N_TILE)
+#error "B_TILE and N_TILE must come from the build (the vulkan_shaders table)"
+#endif
+#define K_TILE 32u
+
+layout(local_size_x = N_TILE, local_size_y = 1, local_size_z = 1) in;
+
+// -- bindings ---------------------------------------------------------------
+layout(std430, set = 0, binding = 0) readonly buffer InputBuf {
+    float data[];
+} input_buf;
+
+layout(std430, set = 0, binding = 1) readonly buffer ScalesBuf {
+    float16_t data[];
+} scales_buf;
+
+layout(std430, set = 0, binding = 2) readonly buffer QuantsBuf {
+    uint data[];
+} quants_buf;
+
+layout(std430, set = 0, binding = 3) writeonly buffer OutBuf {
+    float data[];
+} out_buf;
+
+layout(push_constant) uniform Params {
+    uint b;
+    uint k;
+    uint n;
+} params;
+
+// LDS cache for one K_TILE of inputs across all B_TILE batch rows:
+// 16 * 32 = 512 floats = 2 KB per workgroup, far under the 64 KB per-CU
+// budget. The cooperative load plus the LDS-broadcast inner loop beats
+// per-lane global reads on RDNA2, because a broadcast inside the wave
+// costs 1 LDS cycle instead of an L1 cache transaction.
+shared float lds_input[B_TILE * K_TILE];
+
+// -- main -------------------------------------------------------------------
+void main() {
+    uint wg_n = gl_WorkGroupID.x;
+    uint wg_b = gl_WorkGroupID.y;
+    uint local = gl_LocalInvocationID.x;
+
+    uint b_base = wg_b * B_TILE;
+    uint n_base = wg_n * N_TILE;
+    uint n_out = n_base + local;
+    // Lanes past the output tail (n_out >= n) MUST NOT early-return. They still
+    // own a column of `lds_input` in the cooperative load below, and `barrier()`
+    // needs uniform control flow across the wave. A return leaves LDS columns
+    // unfilled and desyncs the barrier, which corrupts the outputs whenever
+    // n % N_TILE != 0. The 2B GDN alpha and beta matmuls hit that case at
+    // n = n_v = 16. The weight read, the accumulate, and the store instead gate
+    // on `lane_active`.
+    bool lane_active = (n_out < params.n);
+
+    uint blocks_per_row = params.k / K_TILE;
+    uint words_per_row = params.k / 4u;
+
+    float partials[B_TILE];
+    for (uint i = 0u; i < B_TILE; ++i) partials[i] = 0.0;
+
+    for (uint blk = 0u; blk < blocks_per_row; ++blk) {
+        // Cooperative input load. Within each bi the 32-lane access is
+        // coalesced, because adjacent K elements sit at adjacent global
+        // addresses. ALL lanes take part, tail lanes included, so every
+        // LDS column is filled before the barrier.
+        for (uint bi = 0u; bi < B_TILE; ++bi) {
+            uint b = b_base + bi;
+            float v = 0.0;
+            if (b < params.b) v = input_buf.data[b * params.k + blk * K_TILE + local];
+            lds_input[bi * K_TILE + local] = v;
+        }
+        barrier();
+
+        if (lane_active) {
+            float scale = float(scales_buf.data[n_out * blocks_per_row + blk]);
+            uint word_base = n_out * words_per_row + blk * 8u;
+
+            // Dequant the weight block of this lane into 32 register floats.
+            float q[K_TILE];
+            for (uint i = 0u; i < K_TILE; ++i) {
+                uint word = quants_buf.data[word_base + (i >> 2)];
+                int qi = bitfieldExtract(int(word), int((i & 3u) * 8u), 8);
+                q[i] = scale * float(qi);
+            }
+
+            // All 32 lanes read the SAME `lds_input[bi*K_TILE + i]` for a
+            // fixed (bi, i), which is a 1-cycle LDS broadcast with no bank
+            // conflict. The rejected alternative interchanges the loops to
+            // K-outer and B-inner, and it runs about 8% slower.
+            for (uint bi = 0u; bi < B_TILE; ++bi) {
+                uint b = b_base + bi;
+                if (b >= params.b) continue;
+                float acc = 0.0;
+                for (uint i = 0u; i < K_TILE; ++i) {
+                    acc += lds_input[bi * K_TILE + i] * q[i];
+                }
+                partials[bi] += acc;
+            }
+        }
+        barrier();
+    }
+
+    if (lane_active) {
+        for (uint bi = 0u; bi < B_TILE; ++bi) {
+            uint b = b_base + bi;
+            if (b >= params.b) continue;
+            out_buf.data[b * params.n + n_out] = partials[bi];
+        }
+    }
+}

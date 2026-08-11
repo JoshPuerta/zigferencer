@@ -1,0 +1,93 @@
+// Q4_0 decode matvec: (1, K) f32 input times (N, K) Q4_0 weight to (N) f32. It is
+// the Q4_0 sibling of `linear_q8_0_reduce.comp`. The structure is the same: one
+// workgroup per output column, 32 lanes that split the K blocks, and an LDS
+// reduction in lane 0. Only the dequant changes, from 8-bit bytes to 4-bit
+// nibbles, so the quants buffer is half the size.
+//
+// That halving is the whole point. Decode is memory-bandwidth-bound, because B=1
+// streams the whole weight once per token. Q4_0 reads about half the bytes of
+// Q8_0: 16 packed bytes against 32 per 32-weight block, plus the same 2-byte
+// scale. A bandwidth-bound matvec therefore runs close to twice as fast, and this
+// kernel exists to measure that.
+//
+// The ggml Q4_0 block packs each 32-weight block into 16 bytes, which is 4 uint32
+// words. Weight i (i < 16) is the low nibble of byte i, and weight i+16 is the
+// high nibble of byte i. Each nibble is a value in [0, 15] and dequantizes as
+// (nibble - 8) * scale. The quants buffer therefore holds k/8 uint32 per row.
+//
+//   binding 0  readonly  f32  input[k]
+//   binding 1  readonly  f16  scales[(k/32) * n]
+//   binding 2  readonly  uint quants_packed[(k/8) * n]
+//   binding 3  writeonly f32  out[n]
+//   push       uint k, uint n
+//
+// The lane partials accumulate in lane order and lane 0 then sums them, so the
+// result is not bit-exact. The Zig wrapper `LinearQ40Reduce` declares
+// `.relative = 2e-4`.
+
+#version 450
+#extension GL_EXT_shader_16bit_storage : require
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+
+layout(local_size_x = 32, local_size_y = 1, local_size_z = 1) in;
+
+// -- bindings ---------------------------------------------------------------
+layout(std430, set = 0, binding = 0) readonly buffer InputBuf {
+    float data[];
+} input_buf;
+
+layout(std430, set = 0, binding = 1) readonly buffer ScalesBuf {
+    float16_t data[];
+} scales_buf;
+
+layout(std430, set = 0, binding = 2) readonly buffer QuantsBuf {
+    uint data[];
+} quants_buf;
+
+layout(std430, set = 0, binding = 3) writeonly buffer OutBuf {
+    float data[];
+} out_buf;
+
+layout(push_constant) uniform Params {
+    uint k;
+    uint n;
+} params;
+
+shared float lds_partials[32];
+
+// -- main -------------------------------------------------------------------
+void main() {
+    uint j = gl_WorkGroupID.x;
+    uint local = gl_LocalInvocationID.x;
+    if (j >= params.n) {
+        lds_partials[local] = 0.0;
+        barrier();
+        return;
+    }
+
+    uint blocks_per_row = params.k / 32u;
+    uint words_per_row = params.k / 8u; // 4 words (16 bytes) per block
+
+    float partial = 0.0;
+    for (uint blk = local; blk < blocks_per_row; blk += 32u) {
+        float scale = float(scales_buf.data[j * blocks_per_row + blk]);
+        uint word_base = j * words_per_row + blk * 4u;
+        for (uint i = 0u; i < 16u; ++i) {
+            uint word = quants_buf.data[word_base + (i >> 2)];
+            uint shift = (i & 3u) * 8u;
+            int lo = int((word >> shift) & 0xFu) - 8;
+            int hi = int((word >> (shift + 4u)) & 0xFu) - 8;
+            partial += input_buf.data[blk * 32u + i] * scale * float(lo);
+            partial += input_buf.data[blk * 32u + 16u + i] * scale * float(hi);
+        }
+    }
+
+    lds_partials[local] = partial;
+    barrier();
+
+    if (local == 0u) {
+        precise float sum = 0.0;
+        for (uint i = 0u; i < 32u; ++i) sum += lds_partials[i];
+        out_buf.data[j] = sum;
+    }
+}

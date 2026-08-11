@@ -1,0 +1,218 @@
+// Chunked-parallel gated delta-rule scan for the Qwen3.5 GDN value heads over a
+// prefill chunk of T tokens. It mirrors ops/gdn.zig chunkScan, which is validated
+// against the sequential recurrence. The conv and L2-norm front end runs upstream
+// in `gdn_chunk_conv.comp`, so this kernel reads the convolved and L2-normed q_n
+// and k_n of the KEY head of the value head. It also reads the v_conv of the
+// value head and the per-token alpha and beta projections. The gated RMSNorm
+// couples the columns of a head, so it runs after this kernel in
+// `gdn_chunk_norm.comp`. This kernel writes the raw readout to o_out.
+//
+// The columns of the DxD state are independent here. So one workgroup owns W = 32
+// columns of one value head, and D / W = 4 workgroups cover a head. Workgroup g
+// serves value head g / 4 and column block c = g % 4. Lane l owns state column
+// j = c*W + l. The lane holds that column in registers for the whole chunk. It
+// loads the column one time at the start and stores it one time at the end.
+//
+//              block c = 0          block c = 1               block c = 3
+//          +------------------+------------------+-----+------------------+
+//  state   | j = 0 .. 31      | j = 32 .. 63     | ... | j = 96 .. 127    |
+//          +------------------+------------------+-----+------------------+
+//            workgroup 4vh      workgroup 4vh+1          workgroup 4vh+3
+//
+// Every index into the register column is a compile-time constant, because the
+// U128 macro below expands each loop over i. A variable index forces the array
+// to scratch memory. D is therefore fixed at 128, and the host asserts it.
+//
+// ksub[r*D + i] and qsub[r*D + i] hold the k_n and q_n rows of the sub-chunk.
+// KK[r*C + s] and KQ[r*C + s] hold the C x C dot products. Each workgroup of a
+// head computes them in the same order, so all four hold equal values. Lane l
+// owns column l of dlt, so the strictly lower-triangular solve over r runs per
+// lane with no barrier.
+//
+// Per sub-chunk, with S_in the incoming state and P[r] = prod_{u<=r} decay:
+//   delta_r = beta_r (v_r - P[r] S_in^T k_r) - sum_{s<r} beta_r (P[r]/P[s])(k_s.k_r) delta_s
+//   o_r     = P[r] S_in^T q_r + sum_{s<=r} (P[r]/P[s])(k_s.q_r) delta_s
+//   S_out   = P[C-1] S_in + sum_s (P[C-1]/P[s]) k_s (x) delta_s
+// Every decay factor is a ratio of cumulative decays in (0,1], so it is at most
+// 1. The recurrence is numerically stable as a result. Each output and state
+// element keeps one summation order: i ascending for the dot products, and s
+// ascending for the sums over the sub-chunk.
+//
+//   0  q_n[T*key_dim]      readonly  normed and scaled q, [t*key_dim + kh*D + i]
+//   1  k_n[T*key_dim]      readonly  normed k
+//   2  v_conv[T*value_dim] readonly  convolved v, [t*value_dim + vh*D + j]
+//   3  alpha[T*n_v]        readonly  decay projection
+//   4  beta_in[T*n_v]      readonly  delta-strength projection
+//   5  ssm_a[n_v]          readonly  already -exp(A_log)
+//   6  dt_bias[n_v]        readonly
+//   7  ssm_norm[D]         unused    read by the norm pass
+//   8  z[T*value_dim]      unused    read by the norm pass
+//   9  state[n_v*D*D]      in/out    per-value-head recurrent state [vh*D*D + i*D + j]
+//   10 o_out[T*value_dim]  writeonly raw readout, before the gated norm
+//   push  uint D, n_k, n_v, n_tokens, float eps
+//
+// The sub-chunk solve reorders the reduction against the sequential recurrence,
+// and the GPU transcendentals differ from the CPU intrinsics, so the result is
+// not bit-exact. The Zig wrapper `GdnChunkParallel` declares `.relative = 1e-4`.
+
+#version 450
+
+// -- configuration ----------------------------------------------------------
+// The build passes CSUB (the sub-chunk), W (the columns of one workgroup), and
+// DH (the head width) from src/core/limits.zig. The U128 expansion below
+// assumes DH = 128.
+
+// U128(M) expands M(0u) .. M(127u) in ascending order.
+#define U4(M, b) M((b)) M((b) + 1u) M((b) + 2u) M((b) + 3u)
+#define U16(M, b) U4(M, (b)) U4(M, (b) + 4u) U4(M, (b) + 8u) U4(M, (b) + 12u)
+#define U128(M) U16(M, 0u) U16(M, 16u) U16(M, 32u) U16(M, 48u) \
+                U16(M, 64u) U16(M, 80u) U16(M, 96u) U16(M, 112u)
+
+layout(local_size_x = W, local_size_y = 1, local_size_z = 1) in;
+
+// -- bindings ---------------------------------------------------------------
+layout(std430, set = 0, binding = 0)  readonly  buffer B0  { float q_n[]; };
+layout(std430, set = 0, binding = 1)  readonly  buffer B1  { float k_n[]; };
+layout(std430, set = 0, binding = 2)  readonly  buffer B2  { float v_conv[]; };
+layout(std430, set = 0, binding = 3)  readonly  buffer B3  { float alpha[]; };
+layout(std430, set = 0, binding = 4)  readonly  buffer B4  { float beta_in[]; };
+layout(std430, set = 0, binding = 5)  readonly  buffer B5  { float ssm_a[]; };
+layout(std430, set = 0, binding = 6)  readonly  buffer B6  { float dt_bias[]; };
+layout(std430, set = 0, binding = 9)            buffer B9  { float state[]; };
+layout(std430, set = 0, binding = 10) writeonly buffer B10 { float o_out[]; };
+
+layout(push_constant) uniform Params {
+    uint  D;
+    uint  n_k;
+    uint  n_v;
+    uint  n_tokens;
+    float eps;
+} p;
+
+shared float ksub[CSUB * DH];     // k_n rows for the sub-chunk  [r*D + i]
+shared float qsub[CSUB * DH];     // q_n rows
+shared float dlt[CSUB * W];       // delta of the owned columns   [r*W + l]
+shared float KK[CSUB * CSUB];     // k_s . k_r
+shared float KQ[CSUB * CSUB];     // k_s . q_r
+shared float Psh[CSUB];           // cumulative LOG decay (sum of g), P[r] = exp(Psh[r])
+shared float glog[CSUB];          // log-decay g per token
+shared float bsh[CSUB];           // beta per token
+shared float rcoef[CSUB];         // exp(Psh[C-1] - Psh[s]), the state-update ratios
+
+// -- helpers ----------------------------------------------------------------
+float sigmoidf(float x) { return 1.0 / (1.0 + exp(-x)); }
+float softplusf(float x){ return (x > 20.0) ? x : log(1.0 + exp(x)); }
+
+// -- main -------------------------------------------------------------------
+void main() {
+    uint vh = gl_WorkGroupID.x / (DH / W);
+    uint c  = gl_WorkGroupID.x % (DH / W);
+    uint l  = gl_LocalInvocationID.x;
+    uint j  = c * W + l;               // the state column of this lane
+    uint nk = p.n_k;
+    uint nv = p.n_v;
+    uint T = p.n_tokens;
+    uint ki = vh % nk;                 // the key head of this value head
+    uint key_dim = nk * DH;
+    uint value_dim = nv * DH;
+    uint sbase = vh * DH * DH;
+
+    float S[DH];
+#define LOAD_S(i) S[i] = state[sbase + (i) * DH + j];
+    U128(LOAD_S)
+
+    uint t0 = 0u;
+    while (t0 < T) {
+        uint C = min(CSUB, T - t0);
+
+        // 1. Load k_n / q_n (key head ki) for the sub-chunk into LDS. Then compute
+        //    the per-token decay + beta for this value head.
+        for (uint e = l; e < C * DH; e += W) {
+            uint r = e / DH;
+            uint i = e % DH;
+            ksub[e] = k_n[(t0 + r) * key_dim + ki * DH + i];
+            qsub[e] = q_n[(t0 + r) * key_dim + ki * DH + i];
+        }
+        if (l < C) {
+            uint t = t0 + l;
+            // g = log(decay) (decay = exp(g)). Work in log space so the
+            // cumulative decay never underflows. The ratios P[r]/P[s] become
+            // exp(Psh[r]-Psh[s]) with the exponent <= 0, so there is no 1/P blow-up.
+            glog[l] = ssm_a[vh] * softplusf(alpha[t * nv + vh] + dt_bias[vh]);
+            bsh[l] = sigmoidf(beta_in[t * nv + vh]);
+        }
+        barrier();
+        if (l == 0u) {
+            float acc = 0.0;
+            for (uint r = 0u; r < C; r++) { acc += glog[r]; Psh[r] = acc; } // Psh[r] = log P[r]
+        }
+        barrier();
+
+        // 2. KK[r,s] = k_s.k_r,  KQ[r,s] = k_s.q_r  (cooperative over r*C+s).
+        //    The state-update ratios depend on Psh only, so they share this step.
+        for (uint pr = l; pr < C * C; pr += W) {
+            uint r = pr / C;
+            uint s = pr % C;
+            float akk = 0.0;
+            float akq = 0.0;
+            for (uint i = 0u; i < DH; i++) {
+                float ks = ksub[s * DH + i];
+                akk += ks * ksub[r * DH + i];
+                akq += ks * qsub[r * DH + i];
+            }
+            KK[r * C + s] = akk;
+            KQ[r * C + s] = akq;
+        }
+        if (l < C) rcoef[l] = exp(Psh[C - 1u] - Psh[l]);
+        barrier();
+
+        // 3. delta init: dlt[r,l] = beta_r (v_r[j] - P[r] (S_in^T k_r)[j]).
+        for (uint r = 0u; r < C; r++) {
+            float sk = 0.0;
+#define SK_STEP(i) sk += S[i] * ksub[r * DH + (i)];
+            U128(SK_STEP)
+            float vr = v_conv[(t0 + r) * value_dim + vh * DH + j];
+            dlt[r * W + l] = bsh[r] * (vr - exp(Psh[r]) * sk);
+        }
+        // 4. forward substitution, per lane over its own column, so no barrier:
+        //    dlt[r,l] -= sum_{s<r} beta_r exp(Psh[r]-Psh[s]) KK[r,s] dlt[s,l].
+        for (uint r = 1u; r < C; r++) {
+            float acc = dlt[r * W + l];
+            for (uint s = 0u; s < r; s++) {
+                acc -= bsh[r] * exp(Psh[r] - Psh[s]) * KK[r * C + s] * dlt[s * W + l];
+            }
+            dlt[r * W + l] = acc;
+        }
+
+        // 5. o_r[j] = P[r] (S_in^T q_r)[j] + sum_{s<=r} (P[r]/P[s]) KQ[r,s] dlt[s,l].
+        //    It reads S_in, so it precedes step 6.
+        for (uint r = 0u; r < C; r++) {
+            float sq = 0.0;
+#define SQ_STEP(i) sq += S[i] * qsub[r * DH + (i)];
+            U128(SQ_STEP)
+            float orj = exp(Psh[r]) * sq;
+            for (uint s = 0u; s <= r; s++) {
+                orj += exp(Psh[r] - Psh[s]) * KQ[r * C + s] * dlt[s * W + l];
+            }
+            o_out[(t0 + r) * value_dim + vh * DH + j] = orj;
+        }
+
+        // 6. S_out[i,j] = P[C-1] S_in[i,j] + sum_s (P[C-1]/P[s]) k_s[i] dlt[s,l].
+        //    The s loop is outside the i expansion. Each element still starts
+        //    from S_in * pfac and adds the terms in ascending s.
+        float pfac = exp(Psh[C - 1u]);
+#define DECAY_STEP(i) S[i] = S[i] * pfac;
+        U128(DECAY_STEP)
+        for (uint s = 0u; s < C; s++) {
+            float rc = rcoef[s];
+            float ds = dlt[s * W + l];
+#define UPDATE_STEP(i) S[i] += rc * ksub[s * DH + (i)] * ds;
+            U128(UPDATE_STEP)
+        }
+        barrier(); // every lane is done with ksub, rcoef, and Psh before the next load
+        t0 += C;
+    }
+
+#define STORE_S(i) state[sbase + (i) * DH + j] = S[i];
+    U128(STORE_S)
+}

@@ -1,0 +1,112 @@
+// Q8_0 matvec, the third variant. It shares the shape and the tolerance class of
+// `linear_q8_0_reduce.comp`, which is one workgroup per output j and 32 lanes
+// that reduce the row. Two changes take traffic off the critical path:
+//
+//   1. The input vector stages into LDS once at the top of the workgroup, and
+//      every multiply then reads it from LDS instead of the global SSBO. The
+//      reduce variant re-fetches the same input from global memory in all 32
+//      lanes.
+//   2. The cross-lane reduction is a single `subgroupAdd`, one RDNA2 wave32
+//      hardware instruction, instead of an LDS store, a barrier, and a
+//      sequential sum in lane 0.
+//
+// This variant exists to test whether one `subgroupAdd` beats the LDS round trip.
+// The bench row decides.
+//
+//   binding 0  readonly  f32  input[k]
+//   binding 1  readonly  f16  scales[(k/32) * n]
+//   binding 2  readonly  uint quants_packed[(k/4) * n]
+//   binding 3  writeonly f32  out[n]
+//   push       uint k, uint n
+//
+// `subgroupAdd` reorders the lane partials by hardware-defined rules and can
+// fuse a multiply and an add internally, so the result is not bit-exact against
+// the CPU reference or against `linear_q8_0_reduce`. The Zig wrapper
+// `LinearQ80Subgroup` declares `.relative = 2e-4`.
+
+#version 450
+#extension GL_EXT_shader_16bit_storage : require
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+#extension GL_KHR_shader_subgroup_arithmetic : require
+
+// -- configuration ----------------------------------------------------------
+// LDS_CAPACITY comes from the shader table in `build.zig`, which gives the same
+// value to the host dispatch that rejects a wider shape.
+#ifndef LDS_CAPACITY
+#error "LDS_CAPACITY must come from the build (the vulkan_shaders table)"
+#endif
+
+layout(local_size_x = 32, local_size_y = 1, local_size_z = 1) in;
+
+// -- bindings ---------------------------------------------------------------
+layout(std430, set = 0, binding = 0) readonly buffer InputBuf {
+    float data[];
+} input_buf;
+
+layout(std430, set = 0, binding = 1) readonly buffer ScalesBuf {
+    float16_t data[];
+} scales_buf;
+
+layout(std430, set = 0, binding = 2) readonly buffer QuantsBuf {
+    uint data[];
+} quants_buf;
+
+layout(std430, set = 0, binding = 3) writeonly buffer OutBuf {
+    float data[];
+} out_buf;
+
+layout(push_constant) uniform Params {
+    uint k;
+    uint n;
+} params;
+
+// LDS_CAPACITY f32 input elements take 16 KB of LDS, which covers
+// every shape in the bench except the ffn_down rows (k=8192 for
+// Llama-1B, k=14336 for Llama-8B). For those the host dispatch returns
+// `error.InFeaturesTooLargeForLdsKernel` and the bench skips the row.
+// RDNA2 has 64 KB LDS per CU, so 16 KB per workgroup still leaves
+// 4 workgroups in flight per CU.
+shared float input_lds[LDS_CAPACITY];
+
+// -- main -------------------------------------------------------------------
+void main() {
+    uint local = gl_LocalInvocationID.x;
+    uint j = gl_WorkGroupID.x;
+
+    // gl_WorkGroupID.x is uniform across the workgroup, so either every
+    // lane returns or none do. All lanes or no lanes therefore reach the
+    // cooperative LDS load and the barrier below.
+    if (j >= params.n) return;
+
+    uint k = params.k;
+
+    // A stride of 32 across the lanes keeps the global reads coalesced,
+    // because adjacent lanes then read adjacent addresses.
+    for (uint i = local; i < k; i += 32u) {
+        input_lds[i] = input_buf.data[i];
+    }
+    barrier();
+
+    uint blocks_per_row = k / 32u;
+    uint words_per_row = k / 4u;
+
+    // Within a lane the accumulation is `precise`, so the partial folds
+    // into no FMA. The `subgroupAdd` below is the only intentional reorder
+    // of this variant against the CPU reference.
+    precise float partial = 0.0;
+    for (uint blk = local; blk < blocks_per_row; blk += 32u) {
+        precise float scale = float(scales_buf.data[j * blocks_per_row + blk]);
+        uint word_base = j * words_per_row + blk * 8u;
+        for (uint i = 0u; i < 32u; ++i) {
+            precise float in_v = input_lds[blk * 32u + i];
+            uint word = quants_buf.data[word_base + (i >> 2)];
+            int q = bitfieldExtract(int(word), int((i & 3u) * 8u), 8);
+            precise float in_scale = in_v * scale;
+            precise float term = in_scale * float(q);
+            partial += term;
+        }
+    }
+
+    float sum = subgroupAdd(partial);
+    if (local == 0u) out_buf.data[j] = sum;
+}

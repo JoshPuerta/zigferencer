@@ -1,0 +1,471 @@
+// Split pass of decode and prefill attention for a deep row. The host runs it
+// for a row of more than ATTN_SPLIT positions, and the resident kernels take a
+// shorter row.
+// Split j of a row owns the positions [j * ATTN_SPLIT, min((j + 1) *
+// ATTN_SPLIT, t_len)). For query head h and split j, the kernel writes one
+// partial record:
+//
+//   s_t = (q[h] dot k_cache[t, h_kv]) / sqrt(head_dim)   for each t of split j
+//   m_j = max_t s_t
+//   l_j = sum_t exp(s_t - m_j)
+//   a_j = sum_t exp(s_t - m_j) * v_cache[t, h_kv]
+//
+// `attention_merge.comp` combines the records of a row into the softmax:
+// M = max_j m_j, L = sum_j l_j * exp(m_j - M), and
+// out = (sum_j a_j * exp(m_j - M)) / L. In exact arithmetic this combine is
+// associative and commutative, so every split of the row gives the same
+// softmax. In f32 the rounding follows the order, and the merge fixes the
+// order.
+//
+// The grid is (n_kv_heads * qgroups, n_splits, 1), with n_splits =
+// ceil(t_len / ATTN_SPLIT). The G = n_heads / n_kv_heads query heads of one
+// KV head read the same K and V rows, so one workgroup of 64 lanes serves up
+// to ATTN_QUERIES of them and reads each row once for all. qgroups =
+// ceil(G / ATTN_QUERIES), so a group wider than ATTN_QUERIES takes more than
+// one workgroup. Workgroup (x, j) serves KV head g = x / qgroups and its heads
+// h = g * G + c * ATTN_QUERIES + qi, with c = x % qgroups and qi < n_q. The
+// count n_q = min(ATTN_QUERIES, G - c * ATTN_QUERIES) is workgroup-uniform.
+// The resident kernel runs one workgroup per query head over the whole row,
+// too few workgroups to fill the device at depth.
+//
+// The lanes first copy the q rows of the n_q heads into LDS, so the score
+// pass reads q from LDS and not from global memory. In the score pass each
+// lane takes two positions per step, tt and tt + 64, with tt = local + 128 i.
+// For each 128-byte line of its two K rows, a lane issues 8 wide loads per row
+// before any arithmetic, so 16 loads of one line burst are in flight at once.
+// Each element of a line then feeds the score chains of every query. A head
+// that is not whole lines ends in a tail of single wide loads, one per row per
+// step. The lanes write the scores to the LDS row of each query. Per query, an
+// LDS tree takes the maximum. The lanes write exp(s - m) back to the row, and
+// an LDS tree sums the lane partials into l. Each tree step folds every query
+// column before its barrier.
+//
+// For the V sum, lane l owns the w adjacent elements [l * w, l * w + w), with
+// w = 4 past head_dim 128, w = 2 past 64, and w = 1 otherwise. So 64 lanes
+// cover every head up to 256, and the lanes of a wave read one contiguous run
+// of each V row. Each lane walks the V block once, in ascending t. It loads
+// its w elements of a row once and feeds the w chains of every query. Chain i
+// of query qi sums the products scores[qi][tt] * v[tt][l * w + i] in
+// ascending tt, as one chain per element does. w follows head_dim, a push
+// constant, so the branch that picks it is uniform. A lane whose first
+// element is past head_dim skips the walk. The chains stay unnormalized,
+// because only the merge knows L.
+//
+// The workgroup map moves the loads, but it does not change one bit of a
+// record. Each load word holds the same elements that a scalar read of the
+// same row gets. Each score of a head is one `precise` chain over d in
+// ascending order, one product q[d] * k[d] per step, as in the resident
+// kernel. The chain has no dot(), no fma(), and no vector partial sum. The
+// trees of each query run the steps of a one-query tree on their own column.
+// Each V chain of a head is the chain of one element. Pass 2 reads the scores
+// from LDS by tt, so the map from lanes to positions decides no bit. The
+// second position of a lane past the split reads row tn - 1, so no load
+// leaves the split and the loads do not diverge. The lane does not store that
+// score.
+//
+// The loads and the accumulators are named registers: 16 wide K loads, 16
+// score chains, and up to 32 V chains, chosen by uniform guards on n_q. A
+// dynamic index into a per-lane array spills to scratch memory on the target
+// driver.
+//
+// The record of (scratch_row, h, j) starts at the element
+// ((scratch_row * n_heads + h) * max_splits + j) * (head_dim + 2) of the
+// partials buffer. It holds acc[head_dim], then m, then l, all f32 at either KV
+// element type. Each workgroup writes only the records of its own heads, so
+// the pass needs no atomics. The merge reads the records in a fixed order
+// after a barrier.
+//
+// The host plans the split rows of a step in record groups. Row k of a group
+// passes k as scratch_row and the stride of the group as max_splits, so the
+// records of a group stay inside the scratch at any group size. The record
+// content does not depend on its place.
+//
+// ATTN_SPLIT, a build define fed from `limits.attn_split_len`, ATTN_D_MAX, fed
+// from `limits.attn_max_head_dim`, and ATTN_QUERIES, fed from
+// `limits.attn_split_queries`, size the LDS. At 256, 256, and 4, the score
+// rows take 4 KiB, the q rows 4 KiB, the trees 1 KiB, and the m slots 16
+// bytes. A workgroup holds 9 KiB and 16 bytes of LDS, inside the 32 KiB that
+// the target driver allows.
+//
+// The host asserts these preconditions before each dispatch, and each runner
+// refuses a model that breaks the head_dim rules at boot. head_dim is at most
+// ATTN_D_MAX, so the q row fits in LDS. head_dim is a multiple of 8, so a K
+// row is a whole number of wide loads at both element types.
+// stream_stride_elems is a multiple of 8, and the K binding offset is a
+// multiple of 16 bytes. So each K row starts on a 16-byte boundary, which
+// the wide loads need.
+//
+//   binding 0  readonly  f32     q[n_rows_total * n_heads * head_dim]
+//   binding 1  readonly  KV_VEC  k_cache[N_STREAMS * stream_stride_elems / VEC_ELEMS]
+//   binding 2  readonly  KV_ELEM v_cache[N_STREAMS * stream_stride_elems]
+//   binding 3  writeonly f32     partials[rows * n_heads * max_splits * (head_dim + 2)]
+//   push       uint n_heads, n_kv_heads, head_dim, t_len, stream_stride_elems,
+//              uint q_row_base, kv_stream_base, scratch_row, max_splits
+//
+// The q row is q_row_base and the K/V slab is kv_stream_base, as in
+// `attention_multi_stream.comp`. A single-stream caller passes both bases as 0.
+//
+// KV_ELEM is the KV cache element type. `build.zig` compiles this one source
+// twice, once with -DKV_F16, as for `attention.comp`. Only the storage type
+// moves. The loads widen to `float` at the read. KV_VEC is the wide K load: a
+// `uvec4` holds 8 halves, and a `vec4` holds 4 floats. The records, the LDS
+// rows, and the push constants keep their types and their layout.
+//
+// The LDS trees and the split reorder the sums against the CPU reference, so
+// the result is not bit-exact. The Zig wrapper `AttentionSplit` declares
+// `.relative = 1e-3`.
+
+#version 450
+
+// -- configuration ----------------------------------------------------------
+#ifdef KV_F16
+// f16 rows read as packed halves. A 32-bit word load plus the core unpack keeps
+// 16-bit storage access out of the hot loop, and word w holds elements 2w and
+// 2w+1 of the same bytes the commit wrote.
+#define KV_ELEM uint
+#define KV_LOAD(buf, e) unpackHalf2x16(buf.data[(e) >> 1])[(e) & 1]
+// An even element e2 starts a word, so one load gives elements e2 and e2 + 1.
+#define KV_LOAD2(buf, e2) unpackHalf2x16(buf.data[(e2) >> 1])
+#define KV_VEC uvec4
+#define VEC_ELEMS 8u
+#define LINE_ELEMS 64u
+// Word w of a K row holds elements 2w and 2w+1, so component x of the unpack
+// is the even element, as in KV_LOAD.
+#define FEED_VEC(d, va, vb) { \
+    vec2 a01 = unpackHalf2x16(va.x); vec2 a23 = unpackHalf2x16(va.y); \
+    vec2 a45 = unpackHalf2x16(va.z); vec2 a67 = unpackHalf2x16(va.w); \
+    vec2 b01 = unpackHalf2x16(vb.x); vec2 b23 = unpackHalf2x16(vb.y); \
+    vec2 b45 = unpackHalf2x16(vb.z); vec2 b67 = unpackHalf2x16(vb.w); \
+    FEED_ALL(d) }
+#define FEED_Q(i, sa, sb, d) if (n_q > (i)) { \
+    uint o = (i) * uint(ATTN_D_MAX) + (d); \
+    FEED_ELEM(sa, sb, o, a01.x, b01.x) FEED_ELEM(sa, sb, o + 1u, a01.y, b01.y) \
+    FEED_ELEM(sa, sb, o + 2u, a23.x, b23.x) FEED_ELEM(sa, sb, o + 3u, a23.y, b23.y) \
+    FEED_ELEM(sa, sb, o + 4u, a45.x, b45.x) FEED_ELEM(sa, sb, o + 5u, a45.y, b45.y) \
+    FEED_ELEM(sa, sb, o + 6u, a67.x, b67.x) FEED_ELEM(sa, sb, o + 7u, a67.y, b67.y) }
+#else
+#define KV_ELEM float
+#define KV_LOAD(buf, e) float(buf.data[e])
+#define KV_LOAD2(buf, e2) vec2(float(buf.data[e2]), float(buf.data[(e2) + 1u]))
+#define KV_VEC vec4
+#define VEC_ELEMS 4u
+#define LINE_ELEMS 32u
+#define FEED_VEC(d, va, vb) { vec4 a03 = va; vec4 b03 = vb; FEED_ALL(d) }
+#define FEED_Q(i, sa, sb, d) if (n_q > (i)) { \
+    uint o = (i) * uint(ATTN_D_MAX) + (d); \
+    FEED_ELEM(sa, sb, o, a03.x, b03.x) FEED_ELEM(sa, sb, o + 1u, a03.y, b03.y) \
+    FEED_ELEM(sa, sb, o + 2u, a03.z, b03.z) FEED_ELEM(sa, sb, o + 3u, a03.w, b03.w) }
+#endif
+
+// One element of the K line feeds the score chains of one query at both
+// positions. The q value comes from LDS once for the two products.
+#define FEED_ELEM(sa, sb, o, ka, kb) { float qv = q_lds[(o)]; sa += qv * (ka); sb += qv * (kb); }
+#define FEED_ALL(d) \
+    FEED_Q(0u, s0a, s0b, d) FEED_Q(1u, s1a, s1b, d) FEED_Q(2u, s2a, s2b, d) FEED_Q(3u, s3a, s3b, d) \
+    FEED_Q(4u, s4a, s4b, d) FEED_Q(5u, s5a, s5b, d) FEED_Q(6u, s6a, s6b, d) FEED_Q(7u, s7a, s7b, d)
+#define STORE_Q(i, sa, sb) if (n_q > (i)) { \
+    scores[(i) * uint(ATTN_SPLIT) + tt] = sa * scale; \
+    if (tb < tn) scores[(i) * uint(ATTN_SPLIT) + tb] = sb * scale; }
+
+// The V walk feeds the w chains of each query from one load of the V elements
+// of the lane. The record of query i starts rec_stride elements after the
+// record of query i - 1.
+#define V4(i, x0, x1, x2, x3) if (n_q > (i)) { \
+    float p = scores[(i) * uint(ATTN_SPLIT) + tt]; \
+    x0 += p * v01.x; x1 += p * v01.y; x2 += p * v23.x; x3 += p * v23.y; }
+#define W4(i, x0, x1, x2, x3) if (n_q > (i)) { \
+    uint r = rec0 + (i) * rec_stride + d0; \
+    part_buf.data[r] = x0; part_buf.data[r + 1u] = x1; \
+    part_buf.data[r + 2u] = x2; part_buf.data[r + 3u] = x3; }
+#define V2(i, x0, x1) if (n_q > (i)) { \
+    float p = scores[(i) * uint(ATTN_SPLIT) + tt]; \
+    x0 += p * v01.x; x1 += p * v01.y; }
+#define W2(i, x0, x1) if (n_q > (i)) { \
+    uint r = rec0 + (i) * rec_stride + d0; \
+    part_buf.data[r] = x0; part_buf.data[r + 1u] = x1; }
+#define V1(i, x0) if (n_q > (i)) { x0 += scores[(i) * uint(ATTN_SPLIT) + tt] * v0; }
+#define W1(i, x0) if (n_q > (i)) { part_buf.data[rec0 + (i) * rec_stride + d0] = x0; }
+
+#ifndef ATTN_SPLIT
+#error "ATTN_SPLIT must come from the build (limits.attn_split_len)"
+#endif
+#ifndef ATTN_D_MAX
+#error "ATTN_D_MAX must come from the build (limits.attn_max_head_dim)"
+#endif
+#if (ATTN_D_MAX % 8) != 0
+#error "ATTN_D_MAX must be a multiple of 8 (limits.attn_max_head_dim)"
+#endif
+#ifndef ATTN_QUERIES
+#error "ATTN_QUERIES must come from the build (limits.attn_split_queries)"
+#endif
+#if (ATTN_QUERIES < 1) || (ATTN_QUERIES > 8)
+#error "ATTN_QUERIES must be 1 to 8, one named register set per query"
+#endif
+
+layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
+
+// -- bindings ---------------------------------------------------------------
+layout(std430, set = 0, binding = 0) readonly buffer QBuf {
+    float data[];
+} q_buf;
+
+layout(std430, set = 0, binding = 1) readonly buffer KBuf {
+    KV_VEC data[];
+} k_buf;
+
+layout(std430, set = 0, binding = 2) readonly buffer VBuf {
+    KV_ELEM data[];
+} v_buf;
+
+layout(std430, set = 0, binding = 3) writeonly buffer PartBuf {
+    float data[];
+} part_buf;
+
+layout(push_constant) uniform Params {
+    uint n_heads;
+    uint n_kv_heads;
+    uint head_dim;
+    uint t_len;
+    uint stream_stride_elems;
+    uint q_row_base;
+    uint kv_stream_base;
+    uint scratch_row;
+    uint max_splits;
+} params;
+
+shared float scores[ATTN_QUERIES * ATTN_SPLIT];
+shared float q_lds[ATTN_QUERIES * ATTN_D_MAX];
+shared float reduce_lds[ATTN_QUERIES * 64];
+shared float m_lds[ATTN_QUERIES];
+
+// -- main -------------------------------------------------------------------
+void main() {
+    uint x = gl_WorkGroupID.x;
+    uint split = gl_WorkGroupID.y;
+    uint local = gl_LocalInvocationID.x;
+    uint t0 = split * uint(ATTN_SPLIT);
+    uint group_size = params.n_heads / params.n_kv_heads;
+    uint qgroups = (group_size + uint(ATTN_QUERIES) - 1u) / uint(ATTN_QUERIES);
+    // Both exits are workgroup-uniform, so every barrier below sits in uniform
+    // control flow. The host grid holds no empty split, and the second exit
+    // keeps the kernel total for any grid.
+    if (x >= params.n_kv_heads * qgroups) return;
+    if (t0 >= params.t_len) return;
+
+    uint head_dim = params.head_dim;
+    uint tn = min(uint(ATTN_SPLIT), params.t_len - t0);
+    uint kv_h = x / qgroups;
+    uint sub = x - kv_h * qgroups;
+    uint h0 = kv_h * group_size + sub * uint(ATTN_QUERIES);
+    uint n_q = min(uint(ATTN_QUERIES), group_size - sub * uint(ATTN_QUERIES));
+    uint q_off = (params.q_row_base * params.n_heads + h0) * head_dim;
+    uint kv_base = params.kv_stream_base * params.stream_stride_elems;
+    float scale = 1.0 / sqrt(float(head_dim));
+
+    // The q rows of the n_q heads lie next to each other in q.
+    for (uint e = local; e < n_q * head_dim; e += 64u) {
+        uint qi = e / head_dim;
+        q_lds[qi * uint(ATTN_D_MAX) + (e - qi * head_dim)] = q_buf.data[q_off + e];
+    }
+    barrier();
+
+    // Pass 1: scores[qi][tt] = dot(q_{h0 + qi}, k_cache[t0 + tt, kv_h]) *
+    // scale, for the two positions ta = tt and tb = tt + 64 of each lane step.
+    for (uint tt = local; tt < tn; tt += 128u) {
+        uint tb = tt + 64u;
+        uint ka = (kv_base + (t0 + tt) * params.n_kv_heads * head_dim + kv_h * head_dim) / VEC_ELEMS;
+        uint kb = (kv_base + (t0 + min(tb, tn - 1u)) * params.n_kv_heads * head_dim + kv_h * head_dim) / VEC_ELEMS;
+        precise float s0a = 0.0, s0b = 0.0, s1a = 0.0, s1b = 0.0;
+        precise float s2a = 0.0, s2b = 0.0, s3a = 0.0, s3b = 0.0;
+        precise float s4a = 0.0, s4b = 0.0, s5a = 0.0, s5b = 0.0;
+        precise float s6a = 0.0, s6b = 0.0, s7a = 0.0, s7b = 0.0;
+        uint d = 0u;
+        for (; d + LINE_ELEMS <= head_dim; d += LINE_ELEMS) {
+            uint va = ka + d / VEC_ELEMS;
+            uint vb = kb + d / VEC_ELEMS;
+            KV_VEC a0 = k_buf.data[va];
+            KV_VEC a1 = k_buf.data[va + 1u];
+            KV_VEC a2 = k_buf.data[va + 2u];
+            KV_VEC a3 = k_buf.data[va + 3u];
+            KV_VEC a4 = k_buf.data[va + 4u];
+            KV_VEC a5 = k_buf.data[va + 5u];
+            KV_VEC a6 = k_buf.data[va + 6u];
+            KV_VEC a7 = k_buf.data[va + 7u];
+            KV_VEC b0 = k_buf.data[vb];
+            KV_VEC b1 = k_buf.data[vb + 1u];
+            KV_VEC b2 = k_buf.data[vb + 2u];
+            KV_VEC b3 = k_buf.data[vb + 3u];
+            KV_VEC b4 = k_buf.data[vb + 4u];
+            KV_VEC b5 = k_buf.data[vb + 5u];
+            KV_VEC b6 = k_buf.data[vb + 6u];
+            KV_VEC b7 = k_buf.data[vb + 7u];
+            FEED_VEC(d, a0, b0)
+            FEED_VEC(d + VEC_ELEMS, a1, b1)
+            FEED_VEC(d + 2u * VEC_ELEMS, a2, b2)
+            FEED_VEC(d + 3u * VEC_ELEMS, a3, b3)
+            FEED_VEC(d + 4u * VEC_ELEMS, a4, b4)
+            FEED_VEC(d + 5u * VEC_ELEMS, a5, b5)
+            FEED_VEC(d + 6u * VEC_ELEMS, a6, b6)
+            FEED_VEC(d + 7u * VEC_ELEMS, a7, b7)
+        }
+        // A head that is not whole lines ends in single wide loads, and the
+        // chains continue in ascending d.
+        for (; d < head_dim; d += VEC_ELEMS) {
+            KV_VEC a = k_buf.data[ka + d / VEC_ELEMS];
+            KV_VEC b = k_buf.data[kb + d / VEC_ELEMS];
+            FEED_VEC(d, a, b)
+        }
+        STORE_Q(0u, s0a, s0b)
+        STORE_Q(1u, s1a, s1b)
+        STORE_Q(2u, s2a, s2b)
+        STORE_Q(3u, s3a, s3b)
+        STORE_Q(4u, s4a, s4b)
+        STORE_Q(5u, s5a, s5b)
+        STORE_Q(6u, s6a, s6b)
+        STORE_Q(7u, s7a, s7b)
+    }
+    barrier();
+
+    // Pass 2: per query, the maximum m and the shifted sum l of the split,
+    // each a lane partial folded by the LDS tree of the resident kernel. Each
+    // tree step folds every query column before its barrier.
+    for (uint qi = 0u; qi < n_q; ++qi) {
+        uint row = qi * uint(ATTN_SPLIT);
+        float my_max = -3.402823466e+38;
+        for (uint tt = local; tt < tn; tt += 64u) {
+            if (scores[row + tt] > my_max) my_max = scores[row + tt];
+        }
+        reduce_lds[qi * 64u + local] = my_max;
+    }
+    barrier();
+    for (uint k = 32u; k > 0u; k >>= 1u) {
+        for (uint qi = 0u; qi < n_q; ++qi) {
+            uint col = qi * 64u;
+            if (local < k && reduce_lds[col + local + k] > reduce_lds[col + local]) reduce_lds[col + local] = reduce_lds[col + local + k];
+        }
+        barrier();
+    }
+    if (local < n_q) m_lds[local] = reduce_lds[local * 64u];
+    barrier();
+
+    for (uint qi = 0u; qi < n_q; ++qi) {
+        uint row = qi * uint(ATTN_SPLIT);
+        float m = m_lds[qi];
+        float my_sum = 0.0;
+        for (uint tt = local; tt < tn; tt += 64u) {
+            float e = exp(scores[row + tt] - m);
+            scores[row + tt] = e;
+            my_sum += e;
+        }
+        reduce_lds[qi * 64u + local] = my_sum;
+    }
+    barrier();
+    for (uint k = 32u; k > 0u; k >>= 1u) {
+        for (uint qi = 0u; qi < n_q; ++qi) {
+            uint col = qi * 64u;
+            if (local < k) reduce_lds[col + local] += reduce_lds[col + local + k];
+        }
+        barrier();
+    }
+
+    // Pass 3: acc[qi][d] = sum_tt scores[qi][tt] * v_cache[t0 + tt, kv_h, d],
+    // then the record acc[head_dim], m, l of each query. Lane `local` owns
+    // the elements [local * w, local * w + w) and walks the V block once.
+    uint rec_stride = params.max_splits * (head_dim + 2u);
+    uint rec0 = ((params.scratch_row * params.n_heads + h0) * params.max_splits + split) * (head_dim + 2u);
+    if (head_dim > 128u) {
+        uint d0 = local * 4u;
+        if (d0 < head_dim) {
+            precise float acc00 = 0.0, acc01 = 0.0, acc02 = 0.0, acc03 = 0.0;
+            precise float acc10 = 0.0, acc11 = 0.0, acc12 = 0.0, acc13 = 0.0;
+            precise float acc20 = 0.0, acc21 = 0.0, acc22 = 0.0, acc23 = 0.0;
+            precise float acc30 = 0.0, acc31 = 0.0, acc32 = 0.0, acc33 = 0.0;
+            precise float acc40 = 0.0, acc41 = 0.0, acc42 = 0.0, acc43 = 0.0;
+            precise float acc50 = 0.0, acc51 = 0.0, acc52 = 0.0, acc53 = 0.0;
+            precise float acc60 = 0.0, acc61 = 0.0, acc62 = 0.0, acc63 = 0.0;
+            precise float acc70 = 0.0, acc71 = 0.0, acc72 = 0.0, acc73 = 0.0;
+            for (uint tt = 0u; tt < tn; ++tt) {
+                uint v_off = kv_base + (t0 + tt) * params.n_kv_heads * head_dim + kv_h * head_dim;
+                vec2 v01 = KV_LOAD2(v_buf, v_off + d0);
+                vec2 v23 = KV_LOAD2(v_buf, v_off + d0 + 2u);
+                V4(0u, acc00, acc01, acc02, acc03)
+                V4(1u, acc10, acc11, acc12, acc13)
+                V4(2u, acc20, acc21, acc22, acc23)
+                V4(3u, acc30, acc31, acc32, acc33)
+                V4(4u, acc40, acc41, acc42, acc43)
+                V4(5u, acc50, acc51, acc52, acc53)
+                V4(6u, acc60, acc61, acc62, acc63)
+                V4(7u, acc70, acc71, acc72, acc73)
+            }
+            W4(0u, acc00, acc01, acc02, acc03)
+            W4(1u, acc10, acc11, acc12, acc13)
+            W4(2u, acc20, acc21, acc22, acc23)
+            W4(3u, acc30, acc31, acc32, acc33)
+            W4(4u, acc40, acc41, acc42, acc43)
+            W4(5u, acc50, acc51, acc52, acc53)
+            W4(6u, acc60, acc61, acc62, acc63)
+            W4(7u, acc70, acc71, acc72, acc73)
+        }
+    } else if (head_dim > 64u) {
+        uint d0 = local * 2u;
+        if (d0 < head_dim) {
+            precise float acc00 = 0.0, acc01 = 0.0, acc10 = 0.0, acc11 = 0.0;
+            precise float acc20 = 0.0, acc21 = 0.0, acc30 = 0.0, acc31 = 0.0;
+            precise float acc40 = 0.0, acc41 = 0.0, acc50 = 0.0, acc51 = 0.0;
+            precise float acc60 = 0.0, acc61 = 0.0, acc70 = 0.0, acc71 = 0.0;
+            for (uint tt = 0u; tt < tn; ++tt) {
+                uint v_off = kv_base + (t0 + tt) * params.n_kv_heads * head_dim + kv_h * head_dim;
+                vec2 v01 = KV_LOAD2(v_buf, v_off + d0);
+                V2(0u, acc00, acc01)
+                V2(1u, acc10, acc11)
+                V2(2u, acc20, acc21)
+                V2(3u, acc30, acc31)
+                V2(4u, acc40, acc41)
+                V2(5u, acc50, acc51)
+                V2(6u, acc60, acc61)
+                V2(7u, acc70, acc71)
+            }
+            W2(0u, acc00, acc01)
+            W2(1u, acc10, acc11)
+            W2(2u, acc20, acc21)
+            W2(3u, acc30, acc31)
+            W2(4u, acc40, acc41)
+            W2(5u, acc50, acc51)
+            W2(6u, acc60, acc61)
+            W2(7u, acc70, acc71)
+        }
+    } else {
+        uint d0 = local;
+        if (d0 < head_dim) {
+            precise float acc0 = 0.0, acc1 = 0.0, acc2 = 0.0, acc3 = 0.0;
+            precise float acc4 = 0.0, acc5 = 0.0, acc6 = 0.0, acc7 = 0.0;
+            for (uint tt = 0u; tt < tn; ++tt) {
+                uint v_off = kv_base + (t0 + tt) * params.n_kv_heads * head_dim + kv_h * head_dim;
+                float v0 = KV_LOAD(v_buf, v_off + d0);
+                V1(0u, acc0)
+                V1(1u, acc1)
+                V1(2u, acc2)
+                V1(3u, acc3)
+                V1(4u, acc4)
+                V1(5u, acc5)
+                V1(6u, acc6)
+                V1(7u, acc7)
+            }
+            W1(0u, acc0)
+            W1(1u, acc1)
+            W1(2u, acc2)
+            W1(3u, acc3)
+            W1(4u, acc4)
+            W1(5u, acc5)
+            W1(6u, acc6)
+            W1(7u, acc7)
+        }
+    }
+    // Lane qi writes m and l of query qi. The sum tree left l in the first
+    // slot of each query column, and pass 3 does not write the tree.
+    if (local < n_q) {
+        uint r = rec0 + local * rec_stride + head_dim;
+        part_buf.data[r] = m_lds[local];
+        part_buf.data[r + 1u] = reduce_lds[local * 64u];
+    }
+}

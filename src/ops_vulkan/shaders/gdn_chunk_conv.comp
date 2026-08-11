@@ -1,0 +1,100 @@
+// Conv1d, SiLU, and L2-norm front end for the chunked GDN prefill of Qwen3.5. It
+// pairs with `gdn_chunk_scan.comp`, which consumes what this kernel writes, and
+// it mirrors the conv and L2-norm front of ops/gdn.zig step().
+//
+// One workgroup runs per KEY head at local_size_x = D (128), with lane j as the
+// head-dim index. Each workgroup steps over the T chunk tokens in order, because
+// the causal conv ring carries token t into token t+1. Each (key head, lane) owns
+// disjoint conv channels: the q and k of key head ki, plus the v of every value
+// head vh = ki + vk*n_k. Advancing conv_state therefore has no cross-workgroup
+// race. The kernel writes the normed and scaled q_n and k_n of this key head and
+// the convolved v_conv of its value heads.
+//
+//   0 qkv[T*convDim]            readonly  [q(key_dim)|k(key_dim)|v(value_dim)] per token
+//   1 conv_w[K*convDim]         readonly  depthwise conv weights, w[c*K + tap]
+//   2 conv_state[(K-1)*convDim] in/out    conv ring, [t*convDim + c], t=0 oldest
+//   3 q_n[T*key_dim]            writeonly normed and 1/sqrt(D)-scaled q
+//   4 k_n[T*key_dim]            writeonly normed k
+//   5 v_conv[T*value_dim]       writeonly convolved v
+//   push  uint D, n_k, n_v, K, n_tokens, float eps
+//
+// The GPU `exp` and `inversesqrt` differ from the CPU intrinsics, so the result
+// is not bit-exact. The Zig wrapper `GdnChunkParallel` declares
+// `.relative = 1e-4`.
+
+#version 450
+
+layout(local_size_x = 128, local_size_y = 1, local_size_z = 1) in;
+
+// -- bindings ---------------------------------------------------------------
+layout(std430, set = 0, binding = 0) readonly  buffer B0 { float qkv[]; };
+layout(std430, set = 0, binding = 1) readonly  buffer B1 { float conv_w[]; };
+layout(std430, set = 0, binding = 2)           buffer B2 { float conv_state[]; };
+layout(std430, set = 0, binding = 3) writeonly buffer B3 { float q_n[]; };
+layout(std430, set = 0, binding = 4) writeonly buffer B4 { float k_n[]; };
+layout(std430, set = 0, binding = 5) writeonly buffer B5 { float v_conv[]; };
+
+layout(push_constant) uniform Params {
+    uint  D;
+    uint  n_k;
+    uint  n_v;
+    uint  K;
+    uint  n_tokens;
+    float eps;
+} p;
+
+shared float qsh[128];
+shared float ksh[128];
+
+// -- helpers ----------------------------------------------------------------
+float silu(float x) { return x / (1.0 + exp(-x)); }
+
+// Causal depthwise conv (K taps) and SiLU for channel c at batched row qkv_off.
+// It advances conv_state[:,c], one ring that carries across the tokens of the
+// chunk.
+float conv_silu(uint c, uint qkv_off, uint K, uint convDim) {
+    float xin = qkv[qkv_off + c];
+    float acc = 0.0;
+    for (uint t = 0u; t + 1u < K; t++) acc += conv_w[c * K + t] * conv_state[t * convDim + c];
+    acc += conv_w[c * K + (K - 1u)] * xin;
+    for (uint t = 0u; t + 2u < K; t++) conv_state[t * convDim + c] = conv_state[(t + 1u) * convDim + c];
+    conv_state[(K - 2u) * convDim + c] = xin;
+    return silu(acc);
+}
+
+// -- main -------------------------------------------------------------------
+void main() {
+    uint ki = gl_WorkGroupID.x;        // key head
+    uint j  = gl_LocalInvocationID.x;  // head-dim lane 0..D-1
+    uint D = p.D;
+    uint nk = p.n_k;
+    uint nv = p.n_v;
+    uint K = p.K;
+    uint T = p.n_tokens;
+    uint key_dim = nk * D;
+    uint value_dim = nv * D;
+    uint convDim = 2u * key_dim + value_dim;
+    uint v_per_k = nv / nk;
+    float eps = p.eps;
+    float q_scale = inversesqrt(float(D));
+
+    for (uint t = 0u; t < T; t++) {
+        uint qkv_off = t * convDim;
+        float qv = conv_silu(ki * D + j, qkv_off, K, convDim);
+        float kv = conv_silu(key_dim + ki * D + j, qkv_off, K, convDim);
+        for (uint vk = 0u; vk < v_per_k; vk++) {
+            uint vh = ki + vk * nk;
+            v_conv[t * value_dim + vh * D + j] = conv_silu(2u * key_dim + vh * D + j, qkv_off, K, convDim);
+        }
+
+        qsh[j] = qv;
+        ksh[j] = kv;
+        barrier();
+        float ssq = 0.0;
+        float ssk = 0.0;
+        for (uint i = 0u; i < D; i++) { ssq += qsh[i] * qsh[i]; ssk += ksh[i] * ksh[i]; }
+        q_n[t * key_dim + ki * D + j] = qsh[j] * inversesqrt(ssq + eps) * q_scale;
+        k_n[t * key_dim + ki * D + j] = ksh[j] * inversesqrt(ssk + eps);
+        barrier(); // before next token overwrites qsh/ksh
+    }
+}

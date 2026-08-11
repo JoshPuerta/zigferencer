@@ -1,0 +1,76 @@
+// KV commit narrowing, f32 scratch to f16 scratch:
+//
+//   k_out[i] = float16_t(k_src[i])
+//   v_out[i] = float16_t(v_src[i])   for i < n
+//
+// The runner writes K and V rows into two contiguous f32 scratch buffers, then
+// scatters them into the cache with a copy list. This kernel sits between those
+// two steps and narrows the scratch. It never sees the cache layout.
+//
+// One dispatch per layer covers a whole commit whatever the row count, because
+// the scratch is contiguous. `n` is the total element count of one layer of K
+// scratch, which equals the V count. The rejected alternative converts at the
+// scatter. That form carries the per-row (slot, position) table of a batched
+// commit, up to 264 rows, which is past the 128-byte push-constant guarantee. It
+// then needs a row-descriptor buffer or one dispatch per row. Narrowing the
+// scratch first needs neither, and it leaves the scatter a plain copy list of
+// halved regions.
+//
+// K and V share the one dispatch because they share `n` and neither depends on
+// the other. That halves the dispatch count against a kernel per tensor.
+//
+// Rounding: the kernel declares the SPIR-V `RoundingModeRTE` execution mode at
+// width 16, so the CPU commit and the GPU commit round the same way. The CPU
+// commit narrows with F16C, which rounds to nearest even, and the declared mode
+// asks the device for that same rule instead of the driver default.
+// `tests/vulkan_kv_commit_f16_test.zig` gates the identity bit for bit.
+//
+//   binding 0  readonly  f32 k_src[n]
+//   binding 1  readonly  f32 v_src[n]
+//   binding 2  writeonly f16 k_out[n]
+//   binding 3  writeonly f16 v_out[n]
+//   push       uint n
+//
+// local_size_x = 64 is two RDNA2 wave32 waves. Lane i touches element i of all
+// four buffers, so every load and every store coalesces across the wave.
+//
+// Bit-exact against the CPU reference: the declared rounding mode makes the
+// device conversion round the same as the Zig `@floatCast`.
+
+#version 450
+#extension GL_EXT_shader_16bit_storage : require
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+#extension GL_EXT_spirv_intrinsics : require
+
+spirv_execution_mode(extensions = ["SPV_KHR_float_controls"], capabilities = [4467], 4462, 16);
+
+layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
+
+// -- bindings ---------------------------------------------------------------
+layout(std430, set = 0, binding = 0) readonly buffer KSrcBuf {
+    float data[];
+} k_src_buf;
+
+layout(std430, set = 0, binding = 1) readonly buffer VSrcBuf {
+    float data[];
+} v_src_buf;
+
+layout(std430, set = 0, binding = 2) writeonly buffer KOutBuf {
+    float16_t data[];
+} k_out_buf;
+
+layout(std430, set = 0, binding = 3) writeonly buffer VOutBuf {
+    float16_t data[];
+} v_out_buf;
+
+layout(push_constant) uniform Params {
+    uint n;
+} params;
+
+// -- main -------------------------------------------------------------------
+void main() {
+    uint i = gl_GlobalInvocationID.x;
+    if (i >= params.n) return;
+    k_out_buf.data[i] = float16_t(k_src_buf.data[i]);
+    v_out_buf.data[i] = float16_t(v_src_buf.data[i]);
+}

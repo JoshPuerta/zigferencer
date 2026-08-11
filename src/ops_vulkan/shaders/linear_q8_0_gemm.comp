@@ -1,0 +1,168 @@
+// Register-blocked, LDS-staged Q8_0 GEMM: C[B,N] = A[B,K] @ dequant(W[N,K])^T. A
+// is f32, C is f32, and W is Q8_0, which is one f16 scale per 32-block plus i8
+// quants packed 4 per uint, row-major [N][K]. This is the prefill matmul. It
+// shares the SSBO and push-constant surface of `linear_q8_0_batch.comp`, so it
+// drops into the runner in its place, and it uses a different mapping built for
+// occupancy.
+//
+// `linear_q8_0_batch.comp` runs one wave per workgroup, so the per-lane register
+// footprint caps resident waves. It runs occupancy-bound at 13% to 21% of FP32
+// peak, and its achieved bandwidth falls as B_TILE grows. This kernel decouples
+// workgroup-level reuse from per-thread registers. A 256-thread (8-wave)
+// workgroup computes a BM x BN output tile, and each thread computes only a small
+// TM x TN micro-tile. Per-thread register pressure therefore stays roughly
+// constant while the tile grows, and with it the weight reuse and the occupancy.
+//
+// The tiles are BM = 64 batch rows and BN = 64 output cols per workgroup, stepped
+// in BK = 32. BK is one Q8_0 block, so there is exactly one scale per (col,
+// k-tile). Each thread owns TM = 4 rows and TN = 4 cols. The 256 threads
+// therefore form a 16 x 16 grid of 4x4 micro-tiles:
+//
+//                   BN = 64 output cols
+//                 +--------------------------+
+//                 | (0,0) (1,0) ...   (15,0) |   thread (tx, ty) writes output
+//       BM = 64   | (0,1)                    |     rows  ty*4 .. ty*4+3
+//       batch     |   ...    4x4 each        |     cols  tx*4 .. tx*4+3
+//       rows      | (0,15)            (15,15)|
+//                 +--------------------------+
+//
+// Each W tile (BN x BK) loads once per workgroup and every one of the BM rows
+// reuses it. A b-token prefill therefore streams the weights ceil(b / BM) times,
+// which is 2 passes at b=128 against the 8 passes of `linear_q8_0_batch.comp` at
+// B_TILE=16. The staging uses 16 KB of LDS per workgroup: As[BK][BM], and
+// Bs[BK][BN] for the dequantized W tile. A is held TRANSPOSED, so the inner loop
+// reads contiguous rows. The edges carry the tails: rows bm_base+row >= B and
+// cols bn_base+col >= N are zero-filled when staged and skipped when written, so
+// a non-multiple B or N works. K is always a multiple of 32, because a Q8_0 block
+// is 32 weights wide.
+//
+//   binding 0  readonly  f32  input[B * k]
+//   binding 1  readonly  f16  scales[(k/32) * n]
+//   binding 2  readonly  uint quants_packed[(k/4) * n]
+//   binding 3  writeonly f32  out[B * n]
+//   push       uint b, uint k, uint n
+//
+// The micro-tile accumulation reorders the reduction and lets the compiler fuse
+// a multiply and an add into an FMA, so the result is not bit-exact. The Zig
+// wrapper `LinearQ80Gemm` declares `.relative = 2e-4`.
+
+#version 450
+#extension GL_EXT_shader_16bit_storage : require
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+
+// -- configuration ----------------------------------------------------------
+// BM and BN come from the shader table in `build.zig`, which gives the same two
+// values to the host grid arithmetic. BK is the Q8_0 block length, and TM and
+// TN are the micro-tile that BM and BN divide across the 16 by 16 workgroup.
+#if !defined(BM) || !defined(BN)
+#error "BM and BN must come from the build (the vulkan_shaders table)"
+#endif
+#define BK 32u
+#define TM 4u
+#define TN 4u
+
+layout(local_size_x = 16, local_size_y = 16, local_size_z = 1) in;
+
+// -- bindings ---------------------------------------------------------------
+layout(std430, set = 0, binding = 0) readonly buffer InputBuf {
+    float data[];
+} input_buf;
+
+layout(std430, set = 0, binding = 1) readonly buffer ScalesBuf {
+    float16_t data[];
+} scales_buf;
+
+layout(std430, set = 0, binding = 2) readonly buffer QuantsBuf {
+    uint data[];
+} quants_buf;
+
+layout(std430, set = 0, binding = 3) writeonly buffer OutBuf {
+    float data[];
+} out_buf;
+
+layout(push_constant) uniform Params {
+    uint b;
+    uint k;
+    uint n;
+} params;
+
+shared float As[BK][BM]; // As[kk][row]  (A staged transposed)
+shared float Bs[BK][BN]; // Bs[kk][col]  (dequantized weight)
+
+// -- main -------------------------------------------------------------------
+void main() {
+    uint tx = gl_LocalInvocationID.x; // 0..15 -> column group
+    uint ty = gl_LocalInvocationID.y; // 0..15 -> row group
+    uint tid = ty * 16u + tx;         // 0..255
+
+    uint bm_base = gl_WorkGroupID.y * BM; // batch-row tile base
+    uint bn_base = gl_WorkGroupID.x * BN; // output-col tile base
+
+    uint K = params.k;
+    uint N = params.n;
+    uint B = params.b;
+    uint blocks_per_row = K / BK; // scales: blocks per weight row
+    uint words_per_row = K / 4u;  // quants: u32 words per weight row (4 i8 each)
+
+    float acc[TM][TN];
+    for (uint m = 0u; m < TM; m++)
+        for (uint nn = 0u; nn < TN; nn++) acc[m][nn] = 0.0;
+
+    uint num_k_tiles = K / BK;
+    for (uint kt = 0u; kt < num_k_tiles; kt++) {
+        uint k_base = kt * BK;
+
+        // Load the A tile transposed into As[BK][BM]: 2048 elements over 256
+        // threads is 8 each, and the global reads are contiguous in c.
+        for (uint s = 0u; s < (BM * BK) / 256u; s++) {
+            uint idx = tid + s * 256u; // 0..2047
+            uint r = idx / BK;         // 0..63 row in tile
+            uint c = idx % BK;         // 0..31 k in tile
+            uint brow = bm_base + r;
+            float v = 0.0;
+            if (brow < B) v = input_buf.data[brow * K + k_base + c];
+            As[c][r] = v;
+        }
+
+        // Load and dequant the W tile into Bs[BK][BN]. BK is the block size,
+        // so this k-tile holds one block per col and one scale per col.
+        for (uint s = 0u; s < (BN * BK) / 256u; s++) {
+            uint idx = tid + s * 256u; // 0..2047
+            uint c = idx / BK;         // 0..63 col in tile
+            uint kk = idx % BK;        // 0..31 k in tile
+            uint col = bn_base + c;
+            float v = 0.0;
+            if (col < N) {
+                float scale = float(scales_buf.data[col * blocks_per_row + kt]);
+                uint word = quants_buf.data[col * words_per_row + (k_base >> 2) + (kk >> 2)];
+                int qi = bitfieldExtract(int(word), int((kk & 3u) * 8u), 8);
+                v = scale * float(qi);
+            }
+            Bs[kk][c] = v;
+        }
+
+        barrier();
+
+        // Accumulate the micro-tile outer products over this k-tile.
+        for (uint kk = 0u; kk < BK; kk++) {
+            float a[TM];
+            float bcol[TN];
+            for (uint m = 0u; m < TM; m++) a[m] = As[kk][ty * TM + m];
+            for (uint nn = 0u; nn < TN; nn++) bcol[nn] = Bs[kk][tx * TN + nn];
+            for (uint m = 0u; m < TM; m++)
+                for (uint nn = 0u; nn < TN; nn++)
+                    acc[m][nn] += a[m] * bcol[nn];
+        }
+        barrier();
+    }
+
+    for (uint m = 0u; m < TM; m++) {
+        uint row = bm_base + ty * TM + m;
+        if (row >= B) continue;
+        for (uint nn = 0u; nn < TN; nn++) {
+            uint col = bn_base + tx * TN + nn;
+            if (col >= N) continue;
+            out_buf.data[row * N + col] = acc[m][nn];
+        }
+    }
+}

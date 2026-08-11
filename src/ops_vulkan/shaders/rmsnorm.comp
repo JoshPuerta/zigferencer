@@ -1,0 +1,89 @@
+// Root-mean-square normalization over one row, the norm that wraps the attention
+// block and the FFN block of every layer both families run:
+//
+//   y[i] = x[i] / sqrt(mean(x^2) + eps) * w[i]   for i in 0..d
+//
+//   binding 0  readonly  f32 x[d]
+//   binding 1  readonly  f32 w[d]
+//   binding 2  writeonly f32 y[d]
+//   push       uint d, float eps
+//
+// A single workgroup of 256 lanes handles the whole vector, which covers every
+// hidden dim the engine sees (576, 2048, 4096). The work is two cooperative
+// passes over d with an LDS reduction between them. Pass 1 strides each lane
+// across d by 256 to accumulate its own sum of squares, and the 256 partials then
+// tree-reduce to one in LDS. Every lane reads that total back and computes
+// inv_rms locally, because an LDS broadcast costs less than a subgroupBroadcast
+// or another barrier. Pass 2 strides the lanes across d again to write y.
+//
+// The tree-reduce sums in a different order than the sequential scalar sum of the
+// CPU reference, so the result is not bit-exact. The lane partial carries
+// `precise` so that `glslc -O` cannot fuse `sum_sq += v * v` into an fma, which
+// changes the rounding and widens the gap.
+//
+// The Zig wrapper `Rmsnorm` declares `.relative = 5e-5`.
+
+#version 450
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+// -- bindings ---------------------------------------------------------------
+layout(std430, set = 0, binding = 0) readonly buffer XBuf {
+    float data[];
+} x_buf;
+
+layout(std430, set = 0, binding = 1) readonly buffer WBuf {
+    float data[];
+} w_buf;
+
+layout(std430, set = 0, binding = 2) writeonly buffer YBuf {
+    float data[];
+} y_buf;
+
+layout(push_constant) uniform Params {
+    uint d;
+    float eps;
+} params;
+
+shared float partial[256];
+
+// -- main -------------------------------------------------------------------
+void main() {
+    uint local = gl_LocalInvocationID.x;
+    uint d = params.d;
+
+    // Pass 1: sum of squares over the strided subset of each lane.
+    // `precise` keeps the lane partial out of an fma.
+    precise float sum_sq = 0.0;
+    for (uint i = local; i < d; i += 256u) {
+        precise float v = x_buf.data[i];
+        sum_sq += v * v;
+    }
+    partial[local] = sum_sq;
+    barrier();
+
+    if (local < 128u) partial[local] += partial[local + 128u];
+    barrier();
+    if (local < 64u) partial[local] += partial[local + 64u];
+    barrier();
+    if (local < 32u) partial[local] += partial[local + 32u];
+    barrier();
+    if (local < 16u) partial[local] += partial[local + 16u];
+    barrier();
+    if (local < 8u) partial[local] += partial[local + 8u];
+    barrier();
+    if (local < 4u) partial[local] += partial[local + 4u];
+    barrier();
+    if (local < 2u) partial[local] += partial[local + 2u];
+    barrier();
+    if (local < 1u) partial[local] += partial[local + 1u];
+    barrier();
+
+    float total_sum_sq = partial[0];
+    float inv_rms = 1.0 / sqrt(total_sum_sq / float(d) + params.eps);
+
+    // Pass 2: write y cooperatively.
+    for (uint i = local; i < d; i += 256u) {
+        y_buf.data[i] = x_buf.data[i] * inv_rms * w_buf.data[i];
+    }
+}

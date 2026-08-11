@@ -1,0 +1,11 @@
+# Probes for `run` and `bench-model` on a release build: one hit per load,
+# per prompt, per runner step, and per sampled token. Each line is an extended
+# regular expression over the full symbol name. A release build inlines
+# `generate.decode` and `layerForward`, so this list names their callers and
+# callees. structure-run.txt names them on a Debug build.
+^io\.gguf\.loader\.loadWith$
+^core\.tokenizer\.bpe\.(encodeAlloc|decodeAlloc)$
+^runtime\.(llama|qwen)_runner\.(LlamaRunner|QwenRunner)\.(stepBatch|prefillBatch|step)$
+^runtime\.(llama|qwen)_(fused|hybrid)\.\w+\.(step|stepBatch|prefillBatch|stepStagedKey|prefillStaged)$
+^runtime\.sampler\.(sample|samplePool)$
+^cli\.(run_cmd|bench_model_exec)\.\w+$

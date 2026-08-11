@@ -1,0 +1,19 @@
+# Build artifacts
+.zig-cache/
+zig-out/
+# Local package cache for the URL-pinned vulkan-zig dependency.
+zig-pkg/
+
+# Downloaded models, and machine-local links into an external store.
+# Never tracked. `zigferencer fetch` gets them.
+models/
+
+# Editor / OS / tooling-local
+.vscode/
+.idea/
+.DS_Store
+
+# Runtime artifacts: prompt-cache snapshots, log capture, bench sweep output.
+.prompt_cache/
+*.log
+/bench_threads.jsonl
