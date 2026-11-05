@@ -9,7 +9,7 @@
 const std = @import("std");
 const Io = std.Io;
 
-const cli = @import("command.zig");
+const context = @import("context.zig");
 const args = @import("args.zig");
 const style = @import("style.zig");
 const registry = @import("../core/registry.zig");
@@ -45,7 +45,7 @@ const Windows = struct {
 
 /// Resolve a load command's model. A name goes through the registry lookup. With no name, a TTY
 /// gets the picker and a non-TTY gets an error. The pointer is into the static registry table.
-pub fn model(ctx: cli.Context, maybe_name: ?[]const u8) !*const registry.Model {
+pub fn model(ctx: context.Context, maybe_name: ?[]const u8) !*const registry.Model {
     if (maybe_name) |name| {
         return registry.lookup(name) orelse {
             unknownModel(ctx.io, name);
@@ -67,7 +67,7 @@ pub fn model(ctx: cli.Context, maybe_name: ?[]const u8) !*const registry.Model {
 
 /// The no-argument picker for fetch: return the chosen `pub_name`, or null when the user aborts.
 /// Enter has no default, so one keystroke cannot start a multi-GB download.
-pub fn fetchPick(ctx: cli.Context) !?[]const u8 {
+pub fn fetchPick(ctx: context.Context) !?[]const u8 {
     const p = style.Palette.init(ctx.color_err);
     const models = registry.all();
 
@@ -117,7 +117,7 @@ pub fn printModelsDir(w: *std.Io.Writer, p: style.Palette, models_root: []const 
 
 /// Present the on-disk models on stderr and return the chosen one. `locate` spans the same roots as
 /// a load command, so the picker offers a model exactly when a load can open it.
-fn pickPresent(ctx: cli.Context) !*const registry.Model {
+fn pickPresent(ctx: context.Context) !*const registry.Model {
     const p = style.Palette.init(ctx.color_err);
     const models = registry.all();
     const present = try ctx.arena.alloc(*const registry.Model, models.len);
@@ -205,7 +205,7 @@ fn printMenu(
 
 /// A model's ceiling and its default windows, read without faulting weight pages. Null means the
 /// file does not open or its card does not parse, and the picker lists the model without numbers.
-fn readWindows(ctx: cli.Context, path: []const u8, m: *const registry.Model) ?Windows {
+fn readWindows(ctx: context.Context, path: []const u8, m: *const registry.Model) ?Windows {
     var loaded = loader.loadWith(
         ctx.io,
         ctx.arena,

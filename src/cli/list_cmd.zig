@@ -5,7 +5,7 @@
 const std = @import("std");
 const Io = std.Io;
 
-const cli = @import("command.zig");
+const context = @import("context.zig");
 const args = @import("args.zig");
 const select = @import("select.zig");
 const style = @import("style.zig");
@@ -30,15 +30,13 @@ const Flags = struct {
 
 // -- api --------------------------------------------------------------------
 
-pub fn run(ctx: cli.Context) !void {
+pub fn run(ctx: context.Context) !void {
     const flags = try args.parseInto(Flags, ctx) orelse return;
     if (flags.present) return printPresent(ctx);
 
     const p = style.Palette.init(ctx.color);
 
-    var stdout_buffer: [cli.stdout_buffer_bytes]u8 = undefined;
-    var stdout_writer: Io.File.Writer = .initStreaming(.stdout(), ctx.io, &stdout_buffer);
-    const w = &stdout_writer.interface;
+    const w = &ctx.stdout.interface;
 
     const models = registry.all();
     const default_root = std.mem.eql(u8, ctx.models_root, registry.default_models_root);
@@ -78,10 +76,8 @@ pub fn run(ctx: cli.Context) !void {
 // -- helpers ----------------------------------------------------------------
 
 /// `--present`: the bare pub_names of the on-disk models, one per line, unstyled.
-fn printPresent(ctx: cli.Context) !void {
-    var stdout_buffer: [cli.stdout_buffer_bytes]u8 = undefined;
-    var stdout_writer: Io.File.Writer = .initStreaming(.stdout(), ctx.io, &stdout_buffer);
-    const w = &stdout_writer.interface;
+fn printPresent(ctx: context.Context) !void {
+    const w = &ctx.stdout.interface;
 
     for (registry.all()) |m| {
         if ((try registry.locate(ctx.arena, ctx.io, ctx.models_root, m)) != null) {

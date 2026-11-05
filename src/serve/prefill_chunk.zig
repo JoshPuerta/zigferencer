@@ -1,12 +1,15 @@
-//! The prefill chunk rule of the serve scheduler: how many prompt rows one
-//! forward pass takes from the turn that feeds. The function is pure. The
-//! scheduler owns the state (`fed`, the decode set) and passes the numbers in.
+//! The prefill chunk rule of the serve scheduler: how many prompt rows one forward pass takes from
+//! the turn that feeds. The function is pure. The scheduler owns the state (`fed`, the decode set)
+//! and passes the numbers in.
 //!
-//! Three rules exist. `derived` is the default. A pass with no decode row takes
-//! a full row width of prompt, so one session prefills in ceil(N / width)
-//! passes. A pass with decode rows takes the spare decode rows, so a decoding
-//! neighbor keeps its tick cadence. `spare_rows` takes the spare decode rows
+//! Rules. `derived` is the default. A pass with no decode row takes a full row width of prompt, so
+//! one session prefills in ceil(N / width) passes. A pass with decode rows takes the spare decode
+//! rows, so a decoding neighbor keeps its tick cadence. `spare_rows` takes the spare decode rows
 //! always. `fixed` takes an explicit number of rows.
+//!
+//! Scratch. A runner sizes its row scratch with `stepRows`. The decode rows are at most `batch`.
+//! The `batch + 1` floor keeps the one-row prefill legal when decode saturates. The slot count is
+//! a floor too, so every session fits in one pass.
 
 const std = @import("std");
 const limits = @import("../core/limits.zig");
@@ -20,8 +23,7 @@ pub const cpu_rule: Rule = .{ .derived = limits.cpu_prefill_chunk };
 // -- types ------------------------------------------------------------------
 
 pub const Rule = union(enum) {
-    /// The payload is the static row width of the runner: the rows its scratch
-    /// holds for one prompt chunk.
+    /// The static row width of the runner: the rows its scratch holds for one prompt chunk.
     derived: u32,
     /// The spare decode rows: `max_batch - n_decode`, with a floor of one.
     spare_rows,
@@ -39,10 +41,9 @@ pub fn fromFlag(flag: ?u32, width: u32) Rule {
     return .{ .fixed = n };
 }
 
-/// The prompt rows one pass takes. `remaining` is the prompt rows the feeding
-/// turn still owes. `n_decode` is the decode rows of the pass. `step_cap` is the
-/// most rows the runner takes in one pass. The result is zero only when decode
-/// rows fill the pass, and the caller then composes the pass without a chunk.
+/// The prompt rows one pass takes, given the rows that the feeding turn still owes (`remaining`).
+/// `step_cap` is the most rows the runner takes in one pass. The result is zero only when decode
+/// rows fill the pass. The caller then composes the pass without a chunk.
 pub fn chunk(
     rule: Rule,
     remaining: usize,
@@ -74,10 +75,8 @@ pub fn chunk(
     return result;
 }
 
-/// The rows a runner needs for its row scratch, before the runner clamps the
-/// request to its own width. The decode rows are at most `batch`. The
-/// `batch + 1` floor keeps the one-row prefill legal when decode saturates.
-/// The slot count is a floor too, so every session fits in one pass.
+/// The rows a runner needs for its row scratch, before the runner clamps the request to its own
+/// width. See "Scratch" in the header.
 pub fn stepRows(rule: Rule, slots: u32, batch: u32) u32 {
     const prompt_rows: u32 = switch (rule) {
         .spare_rows => 0,
@@ -99,19 +98,38 @@ const ChunkCase = struct {
     want: usize,
 };
 
+/// A table row. The fields follow the order of `chunk`, then the wanted rows.
+fn chunkCase(
+    rule: Rule,
+    remaining: usize,
+    n_decode: usize,
+    max_batch: usize,
+    step_cap: usize,
+    want: usize,
+) ChunkCase {
+    return .{
+        .rule = rule,
+        .remaining = remaining,
+        .n_decode = n_decode,
+        .max_batch = max_batch,
+        .step_cap = step_cap,
+        .want = want,
+    };
+}
+
 test "chunk: decode rows narrow the chunk to the spare rows, and a full pass takes none" {
     const derived: Rule = .{ .derived = 64 };
     const cases = [_]ChunkCase{
-        .{ .rule = derived, .remaining = 440, .n_decode = 1, .max_batch = 4, .step_cap = 68, .want = 3 },
-        .{ .rule = derived, .remaining = 440, .n_decode = 4, .max_batch = 4, .step_cap = 68, .want = 1 },
-        .{ .rule = derived, .remaining = 1, .n_decode = 2, .max_batch = 4, .step_cap = 68, .want = 1 },
-        .{ .rule = .spare_rows, .remaining = 440, .n_decode = 2, .max_batch = 4, .step_cap = 5, .want = 2 },
-        .{ .rule = .spare_rows, .remaining = 440, .n_decode = 4, .max_batch = 4, .step_cap = 5, .want = 1 },
+        chunkCase(derived, 440, 1, 4, 68, 3),
+        chunkCase(derived, 440, 4, 4, 68, 1),
+        chunkCase(derived, 1, 2, 4, 68, 1),
+        chunkCase(.spare_rows, 440, 2, 4, 5, 2),
+        chunkCase(.spare_rows, 440, 4, 4, 5, 1),
         // The row cap wins over the budget, and a full pass leaves no room.
-        .{ .rule = .spare_rows, .remaining = 9, .n_decode = 2, .max_batch = 2, .step_cap = 2, .want = 0 },
-        .{ .rule = .spare_rows, .remaining = 9, .n_decode = 1, .max_batch = 2, .step_cap = 2, .want = 1 },
-        .{ .rule = .{ .fixed = 4 }, .remaining = 5, .n_decode = 3, .max_batch = 3, .step_cap = 6, .want = 3 },
-        .{ .rule = .{ .fixed = 4 }, .remaining = 5, .n_decode = 6, .max_batch = 6, .step_cap = 6, .want = 0 },
+        chunkCase(.spare_rows, 9, 2, 2, 2, 0),
+        chunkCase(.spare_rows, 9, 1, 2, 2, 1),
+        chunkCase(.{ .fixed = 4 }, 5, 3, 3, 6, 3),
+        chunkCase(.{ .fixed = 4 }, 5, 6, 6, 6, 0),
     };
     for (cases) |c| {
         try std.testing.expectEqual(

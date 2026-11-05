@@ -170,16 +170,16 @@ must size the disk for the sum of the active budgets.
   not fit gets a `turn_too_long` refusal, and the detail names both numbers
   (`protocol.turn_too_long_fmt`, `protocol.system_too_long_fmt`). The server
   never drops, shifts, or truncates rows. The chat client continues a full
-  conversation by compaction (`cli/client_transcript.zig`).
+  conversation by compaction (`cli/client/client_transcript.zig`).
 - **The cache paths are best-effort.** Any refusal or failure in the prefix cache degrades to a cold prefill. A warm restore equals a cold prefill token for token.
 - **Boundary values carry the ownership rule.** `Request` is the one value that owns bytes across a thread hop. The adapter dupes the turn text into the gpa. The scheduler frees it after tokenizing. `OutEvent` is fixed-size, so the
   queues hold plain copies and need no ownership rule at all.
 - **Token text is raw bytes.** One `token` event can carry a partial UTF-8
   sequence, and only the concatenation of a turn is well-formed. The reference
-  client returns the bytes as they are, and `cli/client_cmd.zig` holds a partial
+  client returns the bytes as they are, and `cli/client/client_streaming.zig` holds a partial
   codepoint back until the next token. The HTTP adapter holds a partial
   codepoint back too, so every SSE delta is valid UTF-8.
-- **The per-op GPU backend cannot serve.** `cli/serve_common.zig` returns
+- **The per-op GPU backend cannot serve.** `cli/boot/boot_lines.zig` returns
   `error.UnsupportedServeBackend` for it. The CPU runners, the fused runners, and
   the hybrids all serve.
 
@@ -432,7 +432,7 @@ then, and not before.
 | Cache-insert eligibility | `prefix_manager.zig` `insert`, offered by `scheduler.zig` `maybeInsertPrefix` | position-zero completions only |
 | The RAM split, blobs against prefix | `core/kv_budget.zig` `splitRam`, with the corners in `engine/device_arm.zig` | blobs get their provable need, the prefix gets the surplus |
 | The blob tier of an unset `--kv-ram` | `core/kv_budget.zig` `quoteRam`, called through `engine/resolve.zig` and `engine/device_arm.zig` | the full need of `(E + 1)` blobs, or a boot refusal with both fits |
-| Full window | `scheduler.zig` decode admission and the turn refusal, `cli/client_transcript.zig` `plan` | the server stops and refuses with numbers, the client keeps the longest suffix of turns that fits beside the system prompt and the reserve |
+| Full window | `scheduler.zig` decode admission and the turn refusal, `cli/client/client_transcript.zig` `plan` | the server stops and refuses with numbers, the client keeps the longest suffix of turns that fits beside the system prompt and the reserve |
 
 ## Where to start
 

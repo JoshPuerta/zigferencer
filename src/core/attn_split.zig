@@ -1,22 +1,25 @@
-//! The geometry of split-depth GPU attention. A decode or prefill row of
-//! `t_len` positions splits its walk into runs of S = `limits.attn_split_len`
-//! positions. Split `j` holds the positions `[j * S, min((j + 1) * S, t_len))`,
-//! so every position lands in one split and no split is empty. Each split
-//! writes one partial record per query head: the value sums, the maximum
-//! score, and the sum of the shifted exponentials. A merge pass combines the
-//! records in split order. The split count is a function of `t_len` alone, so a row gets the
-//! same geometry at every window, batch, and slot.
+//! The geometry of split-depth GPU attention. The module is pure: no allocation, no device, and no
+//! I/O.
 //!
-//! The records live in a scratch of `limits.attn_split_rows` rows. A record
-//! element offset is a mixed-radix numeral with the radices `n_heads`,
-//! `max_splits`, and the record width (Knuth, TAOCP vol 1, section 2.2.6). So
-//! each coordinate of the record box gets its own element, and every element
-//! stays below the scratch size.
+//! Splits. A decode or prefill row of `t_len` positions splits its walk into runs of
+//! S = `limits.attn_split_len` positions. Split `j` holds the positions
+//! `[j * S, min((j + 1) * S, t_len))`, so every position lands in one split and no split is empty.
+//! Each split writes one partial record per query head: the value sums, the maximum score, and the
+//! sum of the shifted exponentials. A merge pass combines the records in split order. The split
+//! count is a function of `t_len` alone, so a row gets the same geometry at every window, batch,
+//! and slot.
 //!
-//! The planner turns the rows of one step into an `AttnPlan`: the resident
-//! rows, the split rows, and the record groups that share the scratch. The plan
-//! names no backend. `runtime/attn_record.zig` walks it through the attention
-//! kit of the build. The module is pure: no allocation, no device, and no I/O.
+//! Scratch. The records live in a scratch of `limits.attn_split_rows` rows. A record element
+//! offset is a mixed-radix numeral with the radices `n_heads`, `max_splits`, and the record width
+//! (Knuth, TAOCP vol 1, section 2.2.6). So each coordinate of the record box gets its own element,
+//! and every element stays below the scratch size. A record group of the planner lays out its rows
+//! at its own stride: row `k` of the group, head `h`, and split `j` sit at record
+//! `(k * n_heads + h) * stride + j`. The group holds at most `rows * max_splits` records per head.
+//!
+//! Planner. It turns the rows of one step into an `AttnPlan`: the resident rows, the split rows,
+//! and the record groups that share the scratch. A group takes its first row, then the next while
+//! (rows in group) * (largest splitCount in group) <= budget. The plan names no backend.
+//! `runtime/attn_record.zig` walks it through the attention kit of the build.
 
 const std = @import("std");
 const prop = @import("prop.zig");
@@ -43,13 +46,8 @@ pub const max_plan_rows: u32 = limits.max_prefill_chunk;
 
 // -- types ------------------------------------------------------------------
 
-/// The partial records of the split attention: `rows * max_splits` records
-/// per query head. A record holds `head_dim` value sums, then the maximum
-/// score, then the exponential sum. At the layout of `offset`, each row holds
-/// one split row in flight. A record group of the planner lays out its rows at
-/// its own stride instead: row `k` of the group, head `h`, and split `j` sit at
-/// record `(k * n_heads + h) * stride + j`. The group holds at most
-/// `rows * max_splits` records per head, so it stays inside the scratch.
+/// The partial records of the split attention: `rows * max_splits` records per query head.
+/// A record holds `head_dim` value sums, then the maximum score, then the exponential sum.
 pub const Scratch = struct {
     rows: u32,
     n_heads: u32,
@@ -121,9 +119,7 @@ pub const Scratch = struct {
         assert(self.max_splits >= 1);
         assert(self.max_splits <= max_splits_bound);
 
-        // The engine sets no bound on the head count or the head width. So the
-        // byte total is checked in 128 bits, and every 64-bit product stays
-        // exact.
+        // The engine bounds neither the head count nor the head width, so check in 128 bits.
         const widest = @as(u128, self.rows) * self.n_heads * self.max_splits *
             (@as(u128, self.head_dim) + 2) * elem_bytes;
         assert(widest <= std.math.maxInt(u64));
@@ -161,12 +157,10 @@ const BudgetGroup = struct {
     hi: u32,
 };
 
-/// The attention dispatches of one step, as a value that names no backend.
-/// A resident row runs one dispatch. A split row runs its split pass in a
-/// record group, and the merges of a group follow the split passes of the
-/// group. Each list keeps the step order of its rows. Only the first `count`
-/// entries of each array hold data. `budget` is the record count, in units of
-/// one head, that one group can hold.
+/// The attention dispatches of one step, as a value that names no backend. A resident row runs
+/// one dispatch. A split row runs its split pass in a record group, and the merges of a group
+/// follow its split passes. Only the first `count` entries of each array hold data. `budget` is
+/// the record count, in units of one head, that one group can hold.
 pub const AttnPlan = struct {
     budget: u32,
     resident_count: u32,
@@ -203,11 +197,8 @@ pub const AttnPlan = struct {
         return self.split[g.first..][0..g.len];
     }
 
-    /// Each resident row stays inside one split, and each split row goes past
-    /// one split. The groups cover the split rows in order. A group takes its
-    /// first row, then the next while (rows in group) * (largest splitCount in
-    /// group) <= budget. Every row of a group has a split count of at most the
-    /// stride of the group.
+    /// Each resident row stays inside one split, and each split row goes past one split. The
+    /// groups cover the split rows in order. A row of a group has a split count within its stride.
     pub fn assertValid(self: *const AttnPlan) void {
         assert(self.budget >= 1);
         assert(self.resident_count + self.split_count <= max_plan_rows);
@@ -291,10 +282,8 @@ pub fn usesSplit(t_len: u32) bool {
     return uses;
 }
 
-/// The first device limit the scratch breaks. There is one home for the
-/// verdict: `limits.bufferFits`. The scratch is its own buffer, bound whole at
-/// offset 0, so the offset alignment does not bind its size, and the verdict
-/// is never `.misaligned`.
+/// The first device limit the scratch breaks (`limits.bufferFits`). The scratch is bound whole at
+/// offset 0, so the verdict is never `.misaligned`.
 pub fn fits(s: Scratch, lim: limits.BufferLimits) limits.BufferVerdict {
     const elems = s.totalElems();
     const bytes = s.totalBytes();
@@ -311,10 +300,8 @@ pub fn fits(s: Scratch, lim: limits.BufferLimits) limits.BufferVerdict {
     return verdict;
 }
 
-/// Plan the attention of one step against the scratch of `max_splits` splits
-/// per row and head. Row `i` of `sites` is query row `i` and output row `i`. A
-/// row of one split runs the resident kernel. The split rows fill record groups
-/// in step order, and the record count of a group stays within the
+/// Plan the attention of one step against the scratch of `max_splits` splits per row and head.
+/// Row `i` of `sites` is query row `i` and output row `i`. A group stays within the
 /// `limits.attn_split_rows * max_splits` records of the scratch.
 pub fn planRows(sites: []const RowSite, max_splits: u32) AttnPlan {
     assert(max_splits >= 1);
@@ -336,12 +323,12 @@ pub fn planRowsBudget(sites: []const RowSite, budget: u32) AttnPlan {
         .resident_count = 0,
         .split_count = 0,
         .group_count = 0,
-        // The counts bound every read, and the loops write each entry below
-        // its count.
+        // The counts bound every read, and the loops write each entry below its count.
         .resident = undefined,
         .split = undefined,
         .groups = undefined,
     };
+    // Sort the rows into resident rows and split rows.
     var counts: [max_plan_rows]u32 = undefined;
     for (sites, 0..) |site, i| {
         const row: PlanRow = .{ .row = @intCast(i), .slot = site.slot, .t_len = site.t_len };
@@ -358,6 +345,7 @@ pub fn planRowsBudget(sites: []const RowSite, budget: u32) AttnPlan {
         plan.split_count += 1;
     }
 
+    // Group the split rows greedily, left to right.
     if (plan.split_count > 0) {
         var spans: [max_plan_rows]BudgetGroup = undefined;
         for (budgetGroups(budget, counts[0..plan.split_count], &spans)) |span| {
@@ -486,10 +474,8 @@ const wide_limits: limits.BufferLimits = .{
     .offset_alignment = 16,
 };
 
-/// The narrowest limits a device can report. The 128 MiB storage range is the
-/// Vulkan minimum. A translation-layer driver reports the 2 GiB allocation
-/// size. The 256-byte offset alignment is the largest that Vulkan lets a
-/// device require.
+/// The narrowest limits a device can report: the Vulkan minimum storage range, the 2 GiB
+/// allocation size of a translation-layer driver, and the largest offset alignment Vulkan allows.
 const spec_min_limits: limits.BufferLimits = .{
     .storage_range = 134_217_728,
     .allocation_size = 2_147_483_648,
@@ -514,7 +500,7 @@ test "usesSplit: the resident kernel runs up to S positions and the split path p
     try testing.expect(usesSplit(limits.max_model_ctx));
 }
 
-test "headDimFits: the common head widths fit, and a head past the bound or off the granule does not" {
+test "headDimFits: common head widths fit, a head past the bound or off the granule does not" {
     for ([_]u32{ 64, 80, 96, 112, 128, 256 }) |hd| {
         try testing.expect(headDimFits(hd));
     }
@@ -528,7 +514,7 @@ test "headDimFits: the common head widths fit, and a head past the bound or off 
     }
 }
 
-test "queryGroups: every head of a group lands in one workgroup slot, and every slot holds a head" {
+test "queryGroups: every head of a group lands in one workgroup slot, every slot holds a head" {
     const Q = limits.attn_split_queries;
     try testing.expectEqual(@as(u32, 1), queryGroups(1));
     try testing.expectEqual(@as(u32, 1), queryGroups(Q));
@@ -665,7 +651,7 @@ test "anchors: the scratch of the four registry shapes at S = 256 and 4 rows" {
     }
 }
 
-test "fits: the 31-bit index and the storage range pass at their bounds and fail one step past" {
+test "fits: the 31-bit index and the storage range pass at their bounds, fail one step past" {
     // 131072 heads of 254 elements at 64 splits hold 64 * 256 * 131072 = 2^31
     // elements in one row.
     const at_bound: Scratch = .{ .rows = 1, .n_heads = 131_072, .head_dim = 254, .max_splits = 64 };
@@ -683,29 +669,39 @@ test "fits: the 31-bit index and the storage range pass at their bounds and fail
     try testing.expectEqual(limits.BufferVerdict.past_storage_range, fits(qwen_9b, lim));
 }
 
-test "fits: every registry model at its declared context fits the spec-minimum limits, from pinned shapes" {
+test "fits: every registry model at its declared context fits the spec-minimum limits" {
     // The shapes come from a pinned table and not from the model files. So the
     // test runs where no file is present, and it opens no model file. Each
     // registry entry must have exactly one row, so a new entry fails the test
     // until it gets a row.
     const registry = @import("registry.zig");
-    const Row = struct { pub_name: []const u8, n_heads: u32, head_dim: u32, context_length: u32 };
+    const Row = struct { name: []const u8, n_heads: u32, head_dim: u32, ctx: u32 };
     const pinned = [_]Row{
-        .{ .pub_name = "SmolLM2-135M-Instruct-Q8_0", .n_heads = 9, .head_dim = 64, .context_length = 8192 },
-        .{ .pub_name = "SmolLM2-135M-Instruct-Q4_0", .n_heads = 9, .head_dim = 64, .context_length = 8192 },
-        .{ .pub_name = "Meta-Llama-3.1-8B-Instruct-Q8_0", .n_heads = 32, .head_dim = 128, .context_length = 131_072 },
-        .{ .pub_name = "Meta-Llama-3.1-8B-Instruct-Q4_0", .n_heads = 32, .head_dim = 128, .context_length = 131_072 },
-        .{ .pub_name = "Qwen3.5-2B-Q8_0", .n_heads = 8, .head_dim = 256, .context_length = 262_144 },
-        .{ .pub_name = "Qwen3.5-9B-Q8_0", .n_heads = 16, .head_dim = 256, .context_length = 262_144 },
+        .{ .name = "SmolLM2-135M-Instruct-Q8_0", .n_heads = 9, .head_dim = 64, .ctx = 8192 },
+        .{ .name = "SmolLM2-135M-Instruct-Q4_0", .n_heads = 9, .head_dim = 64, .ctx = 8192 },
+        .{
+            .name = "Meta-Llama-3.1-8B-Instruct-Q8_0",
+            .n_heads = 32,
+            .head_dim = 128,
+            .ctx = 131_072,
+        },
+        .{
+            .name = "Meta-Llama-3.1-8B-Instruct-Q4_0",
+            .n_heads = 32,
+            .head_dim = 128,
+            .ctx = 131_072,
+        },
+        .{ .name = "Qwen3.5-2B-Q8_0", .n_heads = 8, .head_dim = 256, .ctx = 262_144 },
+        .{ .name = "Qwen3.5-9B-Q8_0", .n_heads = 16, .head_dim = 256, .ctx = 262_144 },
     };
     try testing.expectEqual(registry.all().len, pinned.len);
     for (registry.all()) |m| {
         var matches: u32 = 0;
         for (pinned) |row| {
-            if (!std.mem.eql(u8, row.pub_name, m.pub_name)) continue;
+            if (!std.mem.eql(u8, row.name, m.pub_name)) continue;
 
             matches += 1;
-            const scratch = Scratch.init(row.n_heads, row.head_dim, row.context_length);
+            const scratch = Scratch.init(row.n_heads, row.head_dim, row.ctx);
             try testing.expectEqual(limits.BufferVerdict.fits, fits(scratch, spec_min_limits));
         }
 
@@ -802,7 +798,7 @@ fn checkPlanRows(_: void, c: prop.Trial) anyerror!void {
     try testing.expectEqual(plan.split_count, next);
 }
 
-test "planRows: every row lands once, in step order, and the split rows fill maximal groups within the budget" {
+test "planRows: every row lands once, in step order, and split rows fill maximal groups" {
     try prop.forAll(
         .{ .site = 0x0031_a7a5, .cases = 400, .max_size = 399 },
         {},

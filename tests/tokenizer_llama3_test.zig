@@ -1,11 +1,12 @@
 //! Golden-id gate for the llama3 (`llama-bpe`) pre-tokenizer against the real
 //! Meta-Llama-3.1-8B-Instruct-Q8_0 GGUF.
 //!
-//! The expected ids come from the llama.cpp `llama-tokenize --ids` reference, so
-//! the ids must match it exactly. The gate pins the regex pre-split and
-//! `ignore_merges` to that reference. The digit run is the case of interest,
-//! because the pre-split turns "2147" into "214" and "7". The test finds the
-//! fixture through `test_fixtures.path`.
+//! Reference. The expected ids come from the llama.cpp `llama-tokenize --ids` reference, so the ids
+//! must match it exactly. The gate pins the regex pre-split and `ignore_merges` to that reference.
+//!
+//! Digit run. The pre-split turns "2147" into "214" and "7".
+//!
+//! Fixture. The test finds the fixture through `test_fixtures.path`.
 
 const std = @import("std");
 const zigferencer = @import("zigferencer");
@@ -19,11 +20,19 @@ const Case = struct { text: []const u8, ids: []const u32 };
 
 // The ids come from `llama-tokenize --ids` and carry BOS 128000. The digit run
 // is the case the pre-split fixes: 2147 becomes 11584 ("214") plus 22 ("7").
+const bos = 128000;
+
+fn row(comptime text: []const u8, comptime ids: []const u32) Case {
+    return .{ .text = text, .ids = ids };
+}
+
+const code_ids = [_]u32{ bos, 2900, 2120, 11, 379, 8, 314, 471, 865, 44110, 26, 335 };
+
 const golden = [_]Case{
-    .{ .text = "The year is 2147.", .ids = &.{ 128000, 791, 1060, 374, 220, 11584, 22, 13 } },
-    .{ .text = "I don't think it's ready", .ids = &.{ 128000, 40, 1541, 956, 1781, 433, 596, 5644 } },
-    .{ .text = "func(x, y) { return x+y; }", .ids = &.{ 128000, 2900, 2120, 11, 379, 8, 314, 471, 865, 44110, 26, 335 } },
-    .{ .text = "12345 67", .ids = &.{ 128000, 4513, 1774, 220, 3080 } },
+    row("The year is 2147.", &.{ bos, 791, 1060, 374, 220, 11584, 22, 13 }),
+    row("I don't think it's ready", &.{ bos, 40, 1541, 956, 1781, 433, 596, 5644 }),
+    row("func(x, y) { return x+y; }", &code_ids),
+    row("12345 67", &.{ bos, 4513, 1774, 220, 3080 }),
 };
 
 // -- tests ------------------------------------------------------------------

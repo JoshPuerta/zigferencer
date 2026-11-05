@@ -1,18 +1,20 @@
-//! OpenAI-compatible request and response values. They are plain structs
-//! across the HTTP and JSON boundary, because a boundary carries values.
-//! `std.json` parses `ChatRequest` from a request body, and
-//! `std.json.Stringify` serializes the rest back.
+//! OpenAI-compatible request and response values. They are plain structs across the HTTP and JSON
+//! boundary, because a boundary carries values. `std.json` parses `ChatRequest` from a request
+//! body, and `std.json.Stringify` serializes the rest back.
 //!
-//! Every optional field has a default, so a minimal request parses. The parse
-//! also drops unknown fields (`ParseOptions.ignore_unknown_fields`), so a full
-//! OpenAI client with tools and stop strings still round-trips. The map layer
-//! logs each unknown field name once per process. Every sampling field is a
-//! named field here, so no sampling value drops in silence.
+//! Parse. Every optional field has a default, so a minimal request parses. The parse drops
+//! unknown fields (`ParseOptions.ignore_unknown_fields`), so a full OpenAI client with tools and
+//! stop strings still round-trips. The map layer logs each unknown field name once per process.
+//!
+//! Sampling. Every sampling field is a named field here, so no sampling value drops in silence.
+//!
+//! Serialize. The serializer omits a null optional field, so every body keeps the OpenAI shape.
+//! A streamed `Delta` carries `{role}` first, then `{reasoning_content}` chunks for a think block
+//! and `{content}` chunks for the reply. The final chunk carries `{}` plus a `finish_reason`.
 
 // -- types ------------------------------------------------------------------
 
-/// One message as the client sends it. `role` is a free string here. The map
-/// layer narrows it to a `chat.Role`.
+/// One message as the client sends it. The map layer narrows the free string `role` to `chat.Role`.
 pub const ChatMessage = struct {
     role: []const u8,
     content: []const u8 = "",
@@ -39,8 +41,7 @@ pub const ChatRequest = struct {
     chat_template_kwargs: ?ChatTemplateKwargs = null,
 };
 
-/// The template switches of the vLLM and llama.cpp servers. Only
-/// `enable_thinking` has an effect here. Null keeps the server's mode.
+/// The template switches of the vLLM and llama.cpp servers. Only `enable_thinking` has an effect.
 pub const ChatTemplateKwargs = struct {
     enable_thinking: ?bool = null,
 };
@@ -58,8 +59,6 @@ pub const CompletionDetails = struct {
     reasoning_tokens: u32,
 };
 
-/// The serializer omits a null `reasoning_content`, so a reply with no think
-/// block keeps the OpenAI shape.
 pub const RespMessage = struct {
     role: []const u8 = "assistant",
     content: []const u8,
@@ -81,10 +80,7 @@ pub const ChatResponse = struct {
     usage: Usage,
 };
 
-/// A streamed delta. With `emit_null_optional_fields = false`, the null fields
-/// vanish. The first chunk carries `{role}`. A think block streams as
-/// `{reasoning_content}` chunks and the reply as `{content}` chunks. The final
-/// chunk carries `{}` plus a `finish_reason`.
+/// A streamed delta. With `emit_null_optional_fields = false`, the null fields vanish.
 pub const Delta = struct {
     role: ?[]const u8 = null,
     content: ?[]const u8 = null,
@@ -117,9 +113,7 @@ pub const ModelsList = struct {
     data: []const ModelEntry,
 };
 
-/// The optional fields follow the llama.cpp server. Only a context overflow
-/// sets them. The serializer omits a null field, so every other error body
-/// keeps the OpenAI shape.
+/// The optional fields follow the llama.cpp server. Only a context overflow sets them.
 pub const ErrorBody = struct {
     code: ?u16 = null,
     message: []const u8,
@@ -128,8 +122,7 @@ pub const ErrorBody = struct {
     n_ctx: ?u32 = null,
 };
 
-/// The OpenAI error envelope: `{"error": {...}}`. `@"error"` is the field name
-/// on the wire. The quoted identifier is only how Zig spells a keyword field.
+/// The OpenAI error envelope: `{"error": {...}}`. The quoted identifier spells a keyword field.
 pub const ErrorObject = struct {
     @"error": ErrorBody,
 };

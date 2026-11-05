@@ -1,23 +1,62 @@
-//! Qwen3.5 hybrid forward (CPU reference) over a bounded set of session slots.
-//! 3 of every 4 layers are Gated DeltaNet: linear attention with a recurrent
-//! state, and the op lives in `ops/gdn.zig`. Every 4th layer is full softmax
-//! attention with QK-norm and output gating. FFN is SwiGLU, and the embeddings
-//! are tied (lm_head = token_embd).
+//! Qwen3.5 hybrid forward (CPU reference) over a bounded set of session slots. 3 of every 4 layers
+//! are Gated DeltaNet: linear attention with a recurrent state, and the op lives in `ops/gdn.zig`.
+//! Every 4th layer is full softmax attention with QK-norm and output gating. FFN is SwiGLU, and
+//! the embeddings are tied (lm_head = token_embd).
 //!
-//! This file is the Control Unit. It holds the per-slot GDN recurrent state,
-//! the full-attention KV caches, and the shared scratch. The numerical ops
-//! (`ops.*`, `gdn.*`) are pure datapath. This file is also the coherence
-//! reference, validated before any GPU kernel.
+//! Role. This file is the Control Unit. It holds the per-slot GDN recurrent state, the
+//! full-attention KV caches, and the shared scratch. The numerical ops (`ops.*`, `gdn.*`) are pure
+//! datapath. This file is also the coherence reference, validated before any GPU kernel.
 //!
-//! `stepBatch` advances a batch of rows in the llama `LlamaRunner` shape. Every q8_0
-//! projection (GDN qkv/gate/alpha/beta/out, full-attention q/k/v/o, FFN,
-//! lm_head) runs as one batched pass per weight, so the weight streams from
-//! DRAM once per call instead of once per row. Everything stateful stays per
-//! row. The GDN recurrence is sequential in TIME, not across sessions. Each row
-//! steps the state of its own slot, and the row rule keeps same-slot rows
-//! (chunked prefill) adjacent and ascending. Batch order is therefore time
-//! order, and every row sees exactly the state of its solo run. Batched output
-//! is bit-identical to running each row alone.
+//! Backend. `ops` is the CPU op API that the build resolved. With `-Dops-backend=vulkan` it is
+//! `wrap`, the GPU per-op backend. `wrap` re-exports the whole CPU op API, backs the heavy ops
+//! (matmul, rmsnorm, swiglu, residual, attention) with the GPU, and adds `gdnStep`. The GDN
+//! recurrence and the full-attention-at-256 GPU kernels are bit-checked against this CPU path
+//! (`gpu-selftest`). On a vulkan_fused build this runner is the qwen SESSION engine, because the
+//! fused GPU runner is single-sequence, so it takes the `cpu_ops` variant the build resolved.
+//!
+//! Batched step. `stepBatch` advances a batch of rows in the `LlamaRunner` shape. Every q8_0
+//! projection (GDN qkv/gate/alpha/beta/out, full-attention q/k/v/o, FFN, lm_head) runs as one
+//! batched pass per weight, so the weight streams from DRAM once per call instead of once per row.
+//! Everything stateful stays per row. The GDN recurrence is sequential in TIME, not across
+//! sessions. Each row steps the state of its own slot, and the row rule keeps same-slot rows
+//! (chunked prefill) adjacent and ascending. Batch order is therefore time order, and every row
+//! sees exactly the state of its solo run. Batched output is bit-identical to running each row
+//! alone.
+//!
+//! Scratch. Init preallocates the scratch buffers, sized by `max_rows`. Row i of a batched call
+//! owns the i-th stripe of each. `max_rows` is decoupled from the slot count, so a prefill chunk
+//! can exceed the session count. The per-slot GDN state and the logits stay sized by the slot
+//! count. Only the `want_logits` rows (at most `n_slots`) get an lm_head, and they land compactly
+//! at `logits[j * vocab_size ..]`, where `Sessions.advance` reads them. One row of attention part
+//! records serves every row of a step, because the rows attend one at a time. The per-op GPU
+//! attention keeps its own records, so that build holds none.
+//!
+//! GDN state. `gdn_state` and `gdn_conv_state` hold one slice per (slot, layer), indexed
+//! `slot * layers.len + layer`. `layers.len` is the layer count of this runner, which a prefix
+//! narrows. A full-attention layer gets an empty slice. The slabs are a running accumulator with
+//! no position axis. Zeroed at init means a fresh sequence. `Sessions` relies on
+//! rewrite-before-read for slot reuse of the KV, but it resets the GDN state explicitly (see
+//! `resetSlotState`).
+//!
+//! Prefix ranges. `isFullAttention` keeps the ABSOLUTE layer index, so a prefix layer runs the
+//! mixer the whole model gives it. `kv_slot` stays compacted WITHIN the range, so it counts the
+//! full-attention layers below its layer inside `[0..n_layers)`. That count coincides with the
+//! model-global one, because a prefix starts at 0. A range below the attention interval holds no
+//! full-attention layer and no KV. `KvCache` refuses a zero-layer slab, so the slot vector is
+//! empty.
+//!
+//! KV commit. The f32 scratch pipeline never learns the KV dtype. One conversion boundary narrows
+//! the finished K/V rows at commit. Zen 3 carries F16C, so the compiler vectorizes the narrowing
+//! into hardware round-to-nearest-even. The GDN state stays f32 under every KV dtype, so the
+//! planner can price the per-slot fixed state as one constant.
+//!
+//! Blobs. Prefix snapshots move the state of a slot to and from a host blob. The CPU state already
+//! lives in host memory, so both directions are memcpys. The blob walks the layers in model order:
+//! KV rows for a full-attention layer, the whole recurrent and conv slabs for a GDN layer, because
+//! the scan state has no position axis. That order matches the bytes of the fused GPU runner
+//! exactly, so a blob holds the same bytes whichever backend wrote it at the same KV dtype. The
+//! presence of `evictSlot` lights `Sessions.can_snapshot` and `Residency.can_evict` for this
+//! runner.
 
 const std = @import("std");
 const span = @import("../core/span.zig");
@@ -42,19 +81,12 @@ const ProfileCat = cpu_profile.ProfileCat;
 
 const StepRow = step_row.StepRow;
 
-// Shared tensor-by-name lookup. `findTensor` and `findByFmt` are the required
-// forms. This runner stores weights as `*const Tensor`, so the `fp32View`
-// helper below adapts the pointer to the shared value-taking view.
+// Shared tensor-by-name lookup. This runner stores weights as `*const Tensor`, so the local
+// `fp32View` adapts the pointer to the shared value-taking view.
 const findTensor = tensor_lookup.findRequired;
 const findByFmt = tensor_lookup.findByFmt;
 
-// `wrap` is the GPU per-op backend. It re-exports the whole CPU op API, backs
-// the heavy ops (matmul, rmsnorm, swiglu, residual, attention) with the GPU,
-// and adds gdnStep. The GDN recurrence and the full-attention-at-256 GPU
-// kernels are bit-checked against this CPU path (`gpu-selftest`).
-// `-Dops-backend=vulkan` selects it. On a vulkan_fused build this runner is the
-// qwen SESSION engine, because the fused GPU runner is single-sequence, so it
-// takes the `cpu_ops` variant the build resolved.
+// The op backend that the build resolved. The header describes the choices.
 const ops = if (build_options.use_vulkan_ops)
     @import("../ops_vulkan/wrap.zig")
 else if (build_options.cpu_ops_simd_pf)
@@ -111,21 +143,16 @@ const Layer = struct {
     },
 };
 
-/// Qwen3.5 hybrid forward-pass state over `n_slots` session slots (the
-/// Control Unit). `n_slots = 1` is the single-sequence CLI shape.
+/// Qwen3.5 hybrid forward-pass state over `n_slots` session slots. One slot is the CLI shape.
 pub const QwenRunner = struct {
     card: loader.ModelCard,
     /// The clock source of the CPU timer.
     io: std.Io,
-    /// The pool and the policy of the row-parallel matmuls and the attention
-    /// fan-out, the same fan-out `LlamaRunner` uses. A pool of one thread runs
-    /// fully serial, with zero overhead. The pool must outlive the runner.
+    /// Row-parallel matmul and attention fan-out. The caller owns the pool and must outlive it.
     pool: *Pool,
     policy: parallel.Policy,
 
-    /// Per-op CPU timer, present only in a `-Dtrace` build. Null on every
-    /// production path. A bench command installs one to measure the serial-op
-    /// fraction. See `cpu_profile.CpuProfile`.
+    /// Per-op CPU timer, present only in a `-Dtrace` build. A bench command installs one.
     profile: cpu_profile.Slot = cpu_profile.slot_off,
 
     gdn_dims: gdn.Dims,
@@ -143,34 +170,22 @@ pub const QwenRunner = struct {
     output_norm: []const f32,
     layers: []Layer,
 
-    /// One full-attn KV cache per session slot. Empty when the runner holds no
-    /// full-attention layer, which only a prefix shorter than the attention
-    /// interval reaches.
+    /// One full-attention KV cache per session slot. Empty when the range holds no such layer.
     kv_slots: []KvCache,
-    /// The element type every full-attention KV row is framed at. The GDN
-    /// recurrent state stays f32 under every dtype, so this dtype prices the
-    /// attention half of a slot only.
+    /// The element type of every full-attention KV row. It prices the attention half only.
     kv_dtype: dtype.KvDtype,
     n_slots: u32,
-    /// Max rows in one `stepBatch` (row-scratch capacity), decoupled from the
-    /// KV-slot count so a prefill chunk can exceed the session count. `>= n_slots`.
+    /// Max rows in one `stepBatch`, the row-scratch capacity. At least `n_slots`.
     max_rows: u32,
-    /// Max prompt rows in one `prefillBatch`: `max_rows`, clamped to the stack
-    /// row array of `prefillBatch`.
+    /// Max prompt rows in one `prefillBatch`: `max_rows`, clamped to the stack row array.
     prefill_batch_max: u32,
-    /// Sequence cap, mirrored flat so every runner exposes the same field
-    /// (LlamaRunner and LlamaFusedRunner already do, so callers read one name).
+    /// Sequence cap, mirrored flat so every runner exposes the same field.
     max_seq: u32,
-    // Per-(slot, layer) recurrent and conv state, indexed `slot * layers.len +
-    // layer`. That is the layer count of this runner, which a prefix narrows,
-    // and a full-attention layer gets an empty slice. Zeroed at init = fresh
-    // sequence. `Sessions` relies on rewrite-before-read for slot reuse of the
-    // KV, but it resets the GDN state explicitly (see `resetSlotState`).
+    // Per-(slot, layer) recurrent and conv state. The header describes the indexing.
     gdn_state: [][]f32,
     gdn_conv_state: [][]f32,
 
-    // Scratch buffers, preallocated at init and sized x n_slots: row i of a
-    // batched call owns the i-th stripe of each. One arena allocation each.
+    // Scratch buffers. The header describes their layout.
     x: []f32,
     x_norm: []f32,
     qkv: []f32, // [convDim] gdn q|k|v / conv buffer, per row
@@ -190,10 +205,8 @@ pub const QwenRunner = struct {
     ffn_u: []f32,
     logits: []f32,
 
-    /// The GDN slabs are a running accumulator with no position axis, so a
-    /// reused slot inherits the previous conversation unless it is scrubbed.
-    /// The session surface reads this marker and then needs `resetSlotState`
-    /// and `cloneSlotState` from this runner by name.
+    /// A reused slot inherits the previous conversation unless it is scrubbed. The session surface
+    /// reads this marker and then needs `resetSlotState` and `cloneSlotState` by name.
     pub const has_recurrent_state = true;
 
     /// The per-op GPU build keeps the per-token prompt loop that its token-hash
@@ -202,9 +215,7 @@ pub const QwenRunner = struct {
 
     // -- init ---------------------------------------------------------------
 
-    /// The whole-model constructor. The caller states the KV dtype. The flag
-    /// resolves one dtype per process, and the resolution gates it against the
-    /// model before this runs.
+    /// The whole-model constructor. Flag resolution has already gated `kv_dtype` against the model.
     pub fn init(
         arena: Allocator,
         loaded: *const loader.Loaded,
@@ -228,15 +239,8 @@ pub const QwenRunner = struct {
         );
     }
 
-    /// A prefix runner executes layers `[0..n_layers)` with weights, KV, and
-    /// GDN state sized to match. The hybrid runner composes through it. The
-    /// whole init chain funnels here, so one body sizes and frames every slab.
-    ///
-    /// Two range facts hold this constructor together. `isFullAttention` keeps
-    /// the ABSOLUTE layer index, so a prefix layer runs the mixer the whole
-    /// model gives it. `kv_slot` stays compacted WITHIN the range, so it counts
-    /// the full-attention layers below its layer inside `[0..n_layers)`. That
-    /// count coincides with the model-global one, because a prefix starts at 0.
+    /// A prefix runner executes layers `[0..n_layers)` with weights, KV, and GDN state sized to
+    /// match. The hybrid runner composes through it. See "Prefix ranges" in the header.
     pub fn initPrefix(
         arena: Allocator,
         loaded: *const loader.Loaded,
@@ -248,11 +252,13 @@ pub const QwenRunner = struct {
         policy: parallel.Policy,
         kv_dtype: dtype.KvDtype,
     ) Error!QwenRunner {
+        // Check the limits and refuse a model or dtype this runner cannot run.
         const n_slots: u32 = plan.n_slots;
         const max_seq: u32 = plan.window;
         std.debug.assert(n_slots >= 1);
         std.debug.assert(n_slots <= limits.max_batch);
         std.debug.assert(pool.threads() == @max(policy.n_threads, 1));
+
         const c = loaded.card;
         if (c.arch != .qwen35) return error.NotQwen;
 
@@ -261,6 +267,7 @@ pub const QwenRunner = struct {
         std.debug.assert(n_layers <= c.n_layers);
         try linear_dispatch.requireWeights(loaded.tensors, n_layers);
 
+        // Derive the GDN dimensions.
         const gd: gdn.Dims = .{
             .n_k_heads = g.group_count,
             .n_v_heads = g.time_step_rank, // 9B is decoupled (n_v=32 > n_k=16)
@@ -270,19 +277,19 @@ pub const QwenRunner = struct {
         const value_dim: u32 = @intCast(gd.valueDim()); // z / mix_o width (= inner_size)
         const conv_dim: u32 = @intCast(gd.convDim());
 
+        // Find the weights that no layer owns.
         const refs = loaded.tensors;
         const embed = try findTensor(refs, "token_embd.weight");
         // lm_head: separate output.weight when present (9B), else tied to embed (2B).
         const lm_head = findTensor(refs, "output.weight") catch embed;
         const output_norm = fp32View(try findTensor(refs, "output_norm.weight"));
 
+        // Allocate the layer table and the state slices.
         const layers = try arena.alloc(Layer, n_layers);
         const gdn_state = try arena.alloc([]f32, @as(usize, n_slots) * n_layers);
         const gdn_conv_state = try arena.alloc([]f32, @as(usize, n_slots) * n_layers);
 
-        // The KV height the range asks for, counted before the walk assigns the
-        // first `kv_slot`: the compaction assert needs the total, and the walk
-        // produces it one layer too late.
+        // Count the full-attention layers first, because the compaction assert needs the total.
         var n_full_range: u32 = 0;
         {
             var li: u32 = 0;
@@ -293,6 +300,7 @@ pub const QwenRunner = struct {
             }
         }
 
+        // Walk the layers: find the weights and allocate the GDN state.
         var n_full: u32 = 0;
         var name_buf: [80]u8 = undefined;
         var i: u32 = 0;
@@ -373,20 +381,19 @@ pub const QwenRunner = struct {
         }
 
         std.debug.assert(n_full == n_full_range); // the walk filled the height it priced
-        // A range below the attention interval holds no full-attention layer,
-        // so it holds no KV at all. `KvCache` refuses a zero-layer slab, and an
-        // empty slot vector states that absence, where a zero-height cache
-        // hides it.
+
+        // Allocate the KV caches. No full-attention layer means an empty slot vector.
         const kv_slots = try arena.alloc(KvCache, if (n_full == 0) 0 else n_slots);
         for (kv_slots) |*slot| {
             slot.* = try KvCache.init(arena, n_full, c.n_kv_heads, c.head_dim, max_seq, kv_dtype);
         }
 
+        // The row scratch holds the widest stepBatch, and never fewer rows than the slots.
         const ns: usize = n_slots;
-        // Row-scratch holds the widest stepBatch (decode + a prefill chunk). The
-        // per-slot GDN state and logits below stay sized by the slot count.
         const rows_cap: u32 = @max(n_slots, max_rows);
         std.debug.assert(rows_cap <= limits.max_batch + limits.max_prefill_chunk);
+
+        // Log the KV size.
         const kv_bytes: u64 = 2 * @as(u64, n_slots) * n_full * max_seq * kv_dtype.rowBytes(
             c.n_kv_heads * c.head_dim,
         );
@@ -397,6 +404,8 @@ pub const QwenRunner = struct {
                 @as(f64, @floatFromInt(kv_bytes)) / (1024.0 * 1024.0),
             },
         );
+
+        // Allocate the scratch and build the runner.
         return .{
             .card = c,
             .io = io,
@@ -436,10 +445,6 @@ pub const QwenRunner = struct {
             .k_buf = try arena.alloc(f32, rows_cap * c.n_kv_heads * c.head_dim),
             .v_buf = try arena.alloc(f32, rows_cap * c.n_kv_heads * c.head_dim),
             .attn_out = try arena.alloc(f32, rows_cap * c.n_heads * c.head_dim),
-            // The part records of one attention row. The rows attend one at a
-            // time, and each call ends before the next starts, so one row of
-            // records serves every row of a step. The per-op GPU attention
-            // keeps its own records, so that build holds none here.
             .attn_parts = try arena.alloc(
                 f32,
                 if (build_options.use_vulkan_ops) 0 else attn_cpu.partialLen(c.n_heads, c.head_dim),
@@ -447,30 +452,25 @@ pub const QwenRunner = struct {
             .mix_out = try arena.alloc(f32, rows_cap * c.embedding_length),
             .ffn_g = try arena.alloc(f32, rows_cap * c.feed_forward_length),
             .ffn_u = try arena.alloc(f32, rows_cap * c.feed_forward_length),
-            // Logits: only want_logits rows (<= n_slots), written compactly.
             .logits = try arena.alloc(f32, ns * c.vocab_size),
         };
     }
 
-    /// Max rows one `stepBatch` accepts (the row-scratch capacity).
+    /// Max rows one `stepBatch` accepts.
     pub fn maxStepRows(self: *const QwenRunner) u32 {
         return self.max_rows;
     }
 
     // -- step ---------------------------------------------------------------
 
-    /// One forward step on slot 0, the single-sequence shape, a thin wrapper
-    /// over `stepBatch`. It returns the `vocab_size` logits row. The runner
-    /// owns that row and reuses it on the next call.
+    /// One forward step on slot 0. It returns the `vocab_size` logits row, which the runner reuses.
     pub fn step(self: *QwenRunner, token_id: u32, pos: u32) Error![]f32 {
         try self.stepBatch(&.{.{ .slot = 0, .token = token_id, .pos = pos, .want_logits = true }});
         return self.logits[0..self.card.vocab_size];
     }
 
-    /// Consume `ids` on slot 0 at positions `pos..pos + ids.len` in one batched
-    /// step, and return the logits of the last row only. The runner owns the
-    /// slice and reuses it on the next call. Callers chunk a longer prompt by
-    /// `prefill_batch_max`.
+    /// Consume `ids` on slot 0 at `pos..pos + ids.len` in one batched step, and return the
+    /// logits of the last row only. Callers chunk a longer prompt by `prefill_batch_max`.
     pub fn prefillBatch(self: *QwenRunner, ids: []const u32, pos: u32) Error![]f32 {
         std.debug.assert(ids.len >= 1);
 
@@ -498,12 +498,8 @@ pub const QwenRunner = struct {
         return out;
     }
 
-    /// Advance every row one position: embed, all layers, then final norm +
-    /// lm_head for the `want_logits` suffix only (prompt rows skip the most
-    /// costly projection in the model). Projections run batched across
-    /// rows. The GDN scan and attention run per row against the row's slot
-    /// state. The logits are compact: the j-th `want_logits` row lands at
-    /// `logits[j * vocab_size ..][0..vocab_size]`.
+    /// Advance every row one position: embed, all layers, then final norm and lm_head for the
+    /// `want_logits` suffix only. Projections run batched. The GDN scan and attention run per row.
     pub fn stepBatch(self: *QwenRunner, rows: []const StepRow) Error!void {
         _ = try step_row.validateRows(rows, self.n_slots, self.max_rows, self.max_seq);
         log.debug(
@@ -517,6 +513,7 @@ pub const QwenRunner = struct {
             }
         }
 
+        // Embed each token.
         const t_embed = self.tBegin();
         for (rows, 0..) |r, i| {
             ops.embedLookup(self.embed.*, r.token, d, self.x[i * d ..][0..d]);
@@ -524,6 +521,7 @@ pub const QwenRunner = struct {
 
         self.tEnd(t_embed, .embed);
 
+        // Run all layers.
         const live = (comptime core_log.hot) and core_log.enabled(.layer, .debug);
         const n_layers: u32 = @intCast(self.layers.len);
         var li: u32 = 0;
@@ -546,6 +544,7 @@ pub const QwenRunner = struct {
             }
         }
 
+        // Project the want-logits suffix, if any.
         var first: usize = rows.len;
         while (first > 0 and rows[first - 1].want_logits) {
             first -= 1;
@@ -565,8 +564,6 @@ pub const QwenRunner = struct {
 
         self.tEnd(t_norm, .rmsnorm);
         const n_logits = rows.len - first;
-        // Compact: want-logits rows land at logits[0..], so the buffer needs only
-        // n_slots rows, not max_rows (Sessions.advance reads the same index).
         self.linearBatch(
             self.x_norm[first * d .. rows.len * d],
             self.lm_head.*, // output.weight (9B) or tied embed (2B)
@@ -577,10 +574,8 @@ pub const QwenRunner = struct {
         std.debug.assert(first + n_logits == rows.len);
     }
 
-    /// One decoder layer over all rows: pre-mixer norm per row, the layer's
-    /// mixer (GDN or full attention), then residual. The SwiGLU FFN follows,
-    /// with batched projections. It is public so a composing runner can drive
-    /// the layers itself.
+    /// One decoder layer over all rows: norm, the mixer (GDN or full attention), residual, then the
+    /// SwiGLU FFN. Public for a composing runner.
     pub fn layerForward(self: *QwenRunner, layer: u32, rows: []const StepRow) void {
         const sp = span.beginHot(.layer_forward);
         defer sp.end();
@@ -592,7 +587,7 @@ pub const QwenRunner = struct {
         std.debug.assert(n <= self.max_rows);
         const lw = &self.layers[layer];
 
-        // -- mixer block ----------------------------------------------------
+        // Normalize, then run the mixer and add the residual.
         const t_an = self.tBegin();
         for (0..n) |i| {
             ops.rmsnorm(
@@ -616,7 +611,7 @@ pub const QwenRunner = struct {
 
         self.tEnd(t_res1, .residual);
 
-        // -- FFN / SwiGLU block ---------------------------------------------
+        // Normalize for the feed-forward block.
         const t_fn = self.tBegin();
         for (0..n) |i| {
             ops.rmsnorm(
@@ -628,6 +623,8 @@ pub const QwenRunner = struct {
         }
 
         self.tEnd(t_fn, .rmsnorm);
+
+        // Gate and up projections, then SwiGLU.
         self.linearBatch(self.x_norm[0 .. n * d], lw.ffn_gate.*, self.ffn_g, n, .gate_up_proj);
         self.linearBatch(self.x_norm[0 .. n * d], lw.ffn_up.*, self.ffn_u, n, .gate_up_proj);
         const t_sg = self.tBegin();
@@ -640,6 +637,8 @@ pub const QwenRunner = struct {
         }
 
         self.tEnd(t_sg, .swiglu);
+
+        // Down projection and the second residual add.
         self.linearBatch(self.ffn_g[0 .. n * fd], lw.ffn_down.*, self.mix_out, n, .down_proj);
         const t_res2 = self.tBegin();
         for (0..n) |i| {
@@ -651,11 +650,8 @@ pub const QwenRunner = struct {
 
     // -- slot state ---------------------------------------------------------
 
-    /// Zero the GDN recurrent state of a slot for a fresh conversation. KV
-    /// needs no scrub, because attention reads only rewritten positions. The
-    /// GDN scan is a running accumulator, so a reused slot inherits the state
-    /// of the previous session without this. `Sessions.create` calls it when
-    /// present.
+    /// Zero the GDN recurrent state of a slot for a fresh conversation. KV needs no scrub,
+    /// because attention reads only rewritten positions.
     pub fn resetSlotState(self: *QwenRunner, slot: u32) void {
         std.debug.assert(slot < self.n_slots);
 
@@ -669,18 +665,15 @@ pub const QwenRunner = struct {
         }
     }
 
-    /// Copy slot state for a session fork: KV rows `0..pos` of the
-    /// full-attention layers, plus the WHOLE GDN recurrent and conv slabs. The
-    /// scan state has no position axis, so the accumulator copies in full.
-    /// `Sessions.clone` calls this when present.
+    /// Copy slot state for a session fork: KV rows `0..pos` of the full-attention layers, plus the
+    /// WHOLE GDN recurrent and conv slabs, because the scan state has no position axis.
     pub fn cloneSlotState(self: *QwenRunner, source_slot: u32, target_slot: u32, pos: u32) void {
         std.debug.assert(source_slot < self.n_slots);
         std.debug.assert(target_slot < self.n_slots);
         std.debug.assert(source_slot != target_slot);
         std.debug.assert(pos <= self.max_seq);
 
-        // A runner without a full-attention layer carries no KV to fork, so the
-        // GDN slabs below are the whole state.
+        // A runner without a full-attention layer carries no KV to fork.
         if (self.kv_slots.len > 0) {
             self.kv_slots[target_slot].copyFrom(&self.kv_slots[source_slot], pos);
         }
@@ -695,27 +688,14 @@ pub const QwenRunner = struct {
 
     // -- tiered kv ----------------------------------------------------------
 
-    // Prefix snapshots move the state of a slot to and from a host blob. The
-    // CPU state already lives in host memory, so both directions are memcpys.
-    // The blob walks the layers in model order: KV rows for a full-attention
-    // layer, the whole recurrent and conv slabs for a GDN layer, because the
-    // scan state has no position axis. That order matches the bytes of the
-    // fused GPU runner exactly, so a blob holds the same bytes whichever
-    // backend wrote it at the same KV dtype. The presence of `evictSlot` is
-    // what lights `Sessions.can_snapshot` and `Residency.can_evict` for this
-    // runner.
-
-    /// Bytes that the state of one slot occupies in a host blob at `n_rows`
-    /// committed positions.
+    /// Bytes that the state of one slot occupies in a host blob at `n_rows` committed positions.
     pub fn evictSlotBytesFor(self: *const QwenRunner, n_rows: u32) u64 {
         const row_bytes: u64 = self.kv_dtype.rowBytes(self.n_kv_heads * self.head_dim);
         var total: u64 = 0;
         for (self.layers) |*layer| {
             switch (layer.kind) {
                 .full => total += @as(u64, 2) * n_rows * row_bytes,
-                // The GDN state keeps f32 under every KV dtype. The planner prices
-                // the per-slot fixed state as one constant, so a dtype-varying slab
-                // breaks that pricing.
+                // The GDN state keeps f32 under every KV dtype. See "KV commit" above.
                 .gdn => total += (@as(
                     u64,
                     self.gdn_dims.stateLen(),
@@ -806,12 +786,8 @@ pub const QwenRunner = struct {
 
     // -- mixers -------------------------------------------------------------
 
-    /// Gated DeltaNet layer: project q|k|v, gate z, decay a, and beta b, each
-    /// as one batched pass over all rows. Then run the recurrent op PER ROW
-    /// against the slot state of that row, and project the readouts back to
-    /// hidden. Row order is time order for same-slot rows (validateRows), so
-    /// the scan of each row sees exactly the state of its solo run. Inside a
-    /// row, the value heads fan out on the pool.
+    /// Gated DeltaNet layer: batched projections, the recurrent op PER ROW against the slot state
+    /// of that row, then the batched readout projection. Inside a row, the value heads fan out.
     fn gdnMixer(self: *QwenRunner, w: GdnWeights, rows: []const StepRow, li: usize) void {
         const d = self.gdn_dims;
         const n = rows.len;
@@ -819,11 +795,14 @@ pub const QwenRunner = struct {
         const cd = d.convDim();
         const vd = d.valueDim();
         const nv = d.n_v_heads;
+
+        // Project q|k|v, the z gate, the decay a, and beta b over all rows.
         self.linearBatch(self.x_norm[0 .. n * hidden], w.qkv.*, self.qkv, n, .gdn_proj);
         self.linearBatch(self.x_norm[0 .. n * hidden], w.gate.*, self.z, n, .gdn_proj);
         self.linearBatch(self.x_norm[0 .. n * hidden], w.alpha.*, self.gdn_a, n, .gdn_proj);
         self.linearBatch(self.x_norm[0 .. n * hidden], w.beta.*, self.gdn_b, n, .gdn_proj);
 
+        // Run the recurrence per row. Row order is time order for same-slot rows.
         const t_step = self.tBegin();
         for (rows, 0..) |r, i| {
             const state_idx = @as(usize, r.slot) * self.layers.len + li;
@@ -833,7 +812,7 @@ pub const QwenRunner = struct {
             const b_row = self.gdn_b[i * nv ..][0..nv];
             const o_row = self.mix_o[i * vd ..][0..vd];
             if (comptime build_options.use_vulkan_ops) {
-                // GPU: GdnDecode kernel (bit-checked vs gdn.step via gpu-selftest).
+                // The GdnDecode kernel, bit-checked against `gdn.step` by `gpu-selftest`.
                 ops.gdnStep(
                     @intCast(d.n_k_heads),
                     @intCast(d.n_v_heads),
@@ -877,21 +856,15 @@ pub const QwenRunner = struct {
         }
 
         self.tEnd(t_step, .gdn_step);
+
+        // Project the readouts back to hidden.
         self.linearBatch(self.mix_o[0 .. n * vd], w.out.*, self.mix_out, n, .gdn_out);
     }
 
-    /// Full softmax attention. q/k/v run as batched passes. Then per row:
-    /// query|gate split, per-head QK-norm, partial RoPE, K/V commit. This
-    /// mixer writes the K/V of every row before any row attends. Row i reads
-    /// the `0..=pos_i` range of its own slot, so causality holds by
-    /// construction, the same argument as `LlamaRunner.layerForward`. Then GQA
-    /// attention plus a sigmoid output gate per row, and one batched output
-    /// projection.
+    /// Full softmax attention with a sigmoid output gate. It writes the K/V of every row before any
+    /// row attends, so causality holds as in `LlamaRunner.layerForward`.
     fn fullMixer(self: *QwenRunner, w: FullWeights, rows: []const StepRow) void {
-        // The compaction invariant, consumer side: a full-attention layer
-        // implies a cache, and its `kv_slot` addresses a layer inside that
-        // cache. A prefix sizes the cache to its own range, so a model-global
-        // index reads the rows of another layer and never fails a bound.
+        // A prefix sizes the cache to its own range. See "Prefix ranges" in the header.
         std.debug.assert(self.kv_slots.len == self.n_slots);
         std.debug.assert(w.kv_slot < self.kv_slots[0].n_layers);
 
@@ -900,14 +873,16 @@ pub const QwenRunner = struct {
         const hidden = self.hidden;
         const qd = self.n_heads * hd;
         const kvd = self.n_kv_heads * hd;
+
+        // Project q|gate, k, and v over all rows.
         self.linearBatch(self.x_norm[0 .. n * hidden], w.q.*, self.q_gate, n, .attn_proj);
         self.linearBatch(self.x_norm[0 .. n * hidden], w.k.*, self.k_buf, n, .attn_proj);
         self.linearBatch(self.x_norm[0 .. n * hidden], w.v.*, self.v_buf, n, .attn_proj);
 
+        // Per row: split query and gate, apply QK-norm and RoPE, then commit K/V.
         for (rows, 0..) |r, i| {
             const t_qk = self.tBegin();
-            // De-interleave: attn_q is reshaped [head_dim*2, n_head] => per head
-            // [query(head_dim) | gate(head_dim)]. Pull into contiguous buffers.
+            // De-interleave attn_q, which holds [query(head_dim) | gate(head_dim)] per head.
             const q = self.q_full[i * qd ..][0..qd];
             const gate = self.gate_full[i * qd ..][0..qd];
             const qg = self.q_gate[i * qd * 2 ..][0 .. qd * 2];
@@ -917,7 +892,7 @@ pub const QwenRunner = struct {
                 @memcpy(gate[dh * hd ..][0..hd], qg[dh * 2 * hd + hd ..][0..hd]);
             }
 
-            // QK-norm (per head, over head_dim) then RoPE (partial, GGUF rope_dim).
+            // QK-norm per head over head_dim, then partial RoPE with the GGUF rope_dim.
             var h: u32 = 0;
             while (h < self.n_heads) : (h += 1) {
                 const qh = q[h * hd ..][0..hd];
@@ -934,10 +909,7 @@ pub const QwenRunner = struct {
 
             self.tEnd(t_qk, .qk_norm_rope);
             const t_kv = self.tBegin();
-            // The one conversion boundary: the f32 scratch pipeline never learns
-            // the dtype, and the commit narrows the finished rows. Zen 3 carries
-            // F16C, so the compiler vectorizes this into hardware
-            // round-to-nearest-even.
+            // The one conversion boundary. See "KV commit" in the header.
             switch (self.kv_dtype) {
                 .f32 => {
                     @memcpy(
@@ -964,6 +936,7 @@ pub const QwenRunner = struct {
             self.tEnd(t_kv, .kv_commit);
         }
 
+        // Per row: attend over the slot positions `0..=pos`, then apply the output gate.
         for (rows, 0..) |r, i| {
             const t_attn = self.tBegin();
             const t_len: usize = @intCast(r.pos + 1);
@@ -1018,7 +991,7 @@ pub const QwenRunner = struct {
             }
 
             self.tEnd(t_attn, .attention);
-            // Sigmoid output gate.
+
             const t_gate = self.tBegin();
             const out_row = self.attn_out[i * qd ..][0..qd];
             const gate = self.gate_full[i * qd ..][0..qd];
@@ -1029,16 +1002,14 @@ pub const QwenRunner = struct {
             self.tEnd(t_gate, .attn_gate);
         }
 
+        // Project the gated attention output.
         self.linearBatch(self.attn_out[0 .. n * qd], w.o.*, self.mix_out, n, .o_proj);
     }
 
     // -- matmul dispatch ----------------------------------------------------
 
-    /// Dispatch the right batched linear kernel by weight dtype, with optional
-    /// row-parallel fan-out. See the shared `linear_dispatch.linearBatchDispatch`.
-    /// The method binds the pool and the policy of this runner. It is
-    /// also the one interface every matmul of the step passes through, so the CPU
-    /// timer charges every matmul category here.
+    /// Bind the pool and the policy to `linear_dispatch.linearBatchDispatch`. Every matmul of the
+    /// step passes through here, so the CPU timer charges the matmul categories in one place.
     fn linearBatch(
         self: *const QwenRunner,
         inputs: []const f32,
@@ -1070,8 +1041,7 @@ pub const QwenRunner = struct {
 
 // -- helpers ----------------------------------------------------------------
 
-/// The shared `tensor_lookup.fp32View`, adapted to the `*const Tensor` form
-/// this runner stores its weights in.
+/// The shared `tensor_lookup.fp32View`, adapted to the `*const Tensor` form of the weights.
 fn fp32View(t: *const Tensor) []const f32 {
     return tensor_lookup.fp32View(t.*);
 }
@@ -1087,8 +1057,7 @@ test {
 }
 
 test "cpu profile: the qwen categories partition one decode step" {
-    // The instrument exists only in a `-Dtrace` build, and the GPU per-op
-    // backend dispatches to a device this test must not touch.
+    // The instrument exists only in a `-Dtrace` build. The GPU per-op backend touches a device.
     if (comptime !core_log.hot or build_options.use_vulkan_ops) {
         return error.SkipZigTest;
     } else {
@@ -1118,8 +1087,7 @@ test "cpu profile: the qwen categories partition one decode step" {
             .f32,
         );
 
-        // One unprofiled step faults in the weight pages, so the measured step
-        // pays no first-touch cost the brackets cannot see.
+        // One unprofiled step faults in the weight pages, so the measured step pays no first touch.
         _ = try r.step(1, 0);
 
         var prof: cpu_profile.CpuProfile = .{ .family = .qwen };
@@ -1131,9 +1099,7 @@ test "cpu profile: the qwen categories partition one decode step" {
         const wall: u64 = @intCast(t0.durationTo(t1).raw.toNanoseconds());
 
         try std.testing.expectEqual(@as(u64, 1), prof.steps);
-        // Cover: one decode step charges every qwen category, so no category
-        // is dead and no op of the step escapes the partition. A llama
-        // category stays at zero.
+        // Cover: one decode step charges every qwen category, and a llama category stays at zero.
         for (std.enums.values(ProfileCat)) |cat| {
             if (cat.usedBy(.qwen)) {
                 try std.testing.expect(prof.nsOf(cat) > 0);
@@ -1142,14 +1108,11 @@ test "cpu profile: the qwen categories partition one decode step" {
             }
         }
 
-        // Disjoint: two overlapping brackets charge one nanosecond twice, which
-        // pushes the sum past the wall time of the step.
+        // Disjoint: two overlapping brackets charge one nanosecond twice, past the wall time.
         try std.testing.expect(prof.total() <= wall);
-        // Whole: the uncounted remainder is row validation and loop
-        // bookkeeping, so the categories carry the greater part of the step.
+        // Whole: the uncounted remainder is row validation and loop bookkeeping.
         try std.testing.expect(prof.total() * 2 >= wall);
-        // The pool share is a subset of the whole, because the step also
-        // runs serial categories.
+        // The pool share is a subset of the whole, because the step also runs serial categories.
         try std.testing.expect(prof.nsParallel() > 0);
         try std.testing.expect(prof.nsParallel() < prof.total());
     }

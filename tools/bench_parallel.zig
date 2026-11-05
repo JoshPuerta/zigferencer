@@ -17,16 +17,15 @@
 //!                      wall time, because a hardware counter is not always
 //!                      available.
 //!
-//! Every section prints a plain table to stdout. No section has a rel_err or a
-//! status column, so no section uses the shared reporter. All run on the CPU
-//! and take no GPU runner.
+//! Output. Every section prints a plain table to stdout. No section has a rel_err or a status
+//! column, so no section uses the shared reporter. All run on the CPU and take no GPU runner.
 
 const std = @import("std");
-const z = @import("zigferencer");
-const Tensor = z.tensor.Tensor;
-const parallel = z.parallel;
-const Pool = z.pool.Pool;
-const bu = @import("bench_util.zig");
+const zigferencer = @import("zigferencer");
+const Tensor = zigferencer.tensor.Tensor;
+const parallel = zigferencer.parallel;
+const Pool = zigferencer.pool.Pool;
+const bench_util = @import("bench_util.zig");
 
 // -- types ------------------------------------------------------------------
 
@@ -64,8 +63,8 @@ const EmptyUnits = struct { sink: u32 };
 // -- api --------------------------------------------------------------------
 
 pub fn benchFanoutCost(gpa: std.mem.Allocator, io: std.Io) !void {
-    // The weight shape gives two units or more at every pool size up to 64.
-    // n = 256 output rows, k = 32, one q8_0 block of 34 bytes per row.
+    // Build a weight that gives two units or more at every pool size up to 64.
+    // The shape is n = 256 output rows with k = 32, one q8_0 block of 34 bytes per row.
     const k: u32 = 32;
     const n: u32 = 256;
     const row_bytes: usize = 34;
@@ -87,6 +86,7 @@ pub fn benchFanoutCost(gpa: std.mem.Allocator, io: std.Io) !void {
     const out = try gpa.alloc(f32, n);
     defer gpa.free(out);
 
+    // Define the closure that times one pool dispatch of the near-empty kernel.
     const Ctx = struct {
         pool: *Pool,
         policy: parallel.Policy,
@@ -107,6 +107,7 @@ pub fn benchFanoutCost(gpa: std.mem.Allocator, io: std.Io) !void {
         }
     };
 
+    // Print the table header.
     std.debug.print(
         "\nzigferencer bench: parallel dispatch cost of linearBatch (pool path, near-empty " ++
             "kernel)\n",
@@ -117,6 +118,7 @@ pub fn benchFanoutCost(gpa: std.mem.Allocator, io: std.Io) !void {
         .{ "threads", "us/call", "overhead_us", "us/thread" },
     );
 
+    // Time each thread count against the one-thread row.
     const threads = [_]u32{ 1, 2, 4, 8, 16, 32 };
     var base_us: f64 = 0;
     for (threads) |t| {
@@ -125,7 +127,7 @@ pub fn benchFanoutCost(gpa: std.mem.Allocator, io: std.Io) !void {
         try parallel.initPool(&pool, io, policy);
         defer pool.deinit();
 
-        const timed = try bu.timed(
+        const timed = try bench_util.timed(
             io,
             1000,
             Ctx{ .pool = &pool, .policy = policy, .input = input, .w = w, .out = out },
@@ -144,6 +146,7 @@ pub fn benchFanoutCost(gpa: std.mem.Allocator, io: std.Io) !void {
 /// The pool participants are the owner plus its workers, so a pool of `parts`
 /// threads serves a dispatch of `parts` participants.
 pub fn benchDispatchCost(io: std.Io) !void {
+    // Print the table header.
     std.debug.print(
         "\nzigferencer bench: dispatch cost of empty units (Io.Group against the pool)\n",
         .{},
@@ -155,14 +158,14 @@ pub fn benchDispatchCost(io: std.Io) !void {
 
     const participants = [_]u32{ 2, 4, 8, 16 };
     for (participants) |parts| {
-        const group = try bu.timed(io, 0, GroupCtx{ .io = io, .parts = parts });
+        const group = try bench_util.timed(io, 0, GroupCtx{ .io = io, .parts = parts });
         var pool_us: [2]f64 = undefined;
         for ([_]u64{ 0, parallel.default_spin_ns }, &pool_us) |spin_ns, *us| {
             var p: Pool = undefined;
             try p.init(io, parts, spin_ns);
             defer p.deinit();
 
-            const timed = try bu.timed(io, 0, PoolCtx{ .pool = &p, .parts = parts });
+            const timed = try bench_util.timed(io, 0, PoolCtx{ .pool = &p, .parts = parts });
             us.* = timed.ms * 1000.0;
         }
 
@@ -174,7 +177,7 @@ pub fn benchDispatchCost(io: std.Io) !void {
 }
 
 pub fn benchBandwidth(gpa: std.mem.Allocator, io: std.Io) !void {
-    // 2 GiB is far past a 32 MiB L3, so every read misses to DRAM. That is the
+    // Allocate a buffer far past the 32 MiB L3, so every read misses to DRAM. That is the
     // regime of streaming the weights of a multi-GB model once per decode step.
     const n_floats: usize = (2 << 30) / @sizeOf(f32);
     const buf = gpa.alloc(f32, n_floats) catch {
@@ -187,6 +190,7 @@ pub fn benchBandwidth(gpa: std.mem.Allocator, io: std.Io) !void {
         x.* = @floatFromInt(i & 0xff); // first-touch every page
     }
 
+    // Define the closure that sums the buffer in `n_threads` chunks.
     const bytes: f64 = @floatFromInt(buf.len * @sizeOf(f32));
     const max_threads: usize = 32;
     var partials: [max_threads]f64 = undefined;
@@ -210,17 +214,19 @@ pub fn benchBandwidth(gpa: std.mem.Allocator, io: std.Io) !void {
         }
     };
 
+    // Print the table header.
     std.debug.print(
         "\nzigferencer bench: DRAM read bandwidth (2 GiB sum-reduce, Io.Group fan-out)\n",
         .{},
     );
     std.debug.print("{s:>8}{s:>12}{s:>10}{s:>10}\n", .{ "threads", "ms", "GB/s", "scaling" });
 
+    // Time each thread count against the one-thread row.
     const threads = [_]usize{ 1, 2, 4, 8, 16, 32 };
     var base_gbs: f64 = 0;
     var sink: f64 = 0;
     for (threads) |t| {
-        const timed = try bu.timed(
+        const timed = try bench_util.timed(
             io,
             1_000_000_000,
             Ctx{ .buf = buf, .partials = &partials, .io = io, .n_threads = t },
@@ -245,10 +251,9 @@ pub fn benchBandwidth(gpa: std.mem.Allocator, io: std.Io) !void {
 
 // -- helpers ----------------------------------------------------------------
 
-/// Near-empty batched linear kernel: one write per call keeps the dispatch
-/// alive, and the negligible compute leaves a timed `parallel.linearBatch`
-/// dominated by the cost of the fan-out on the pool. The bench runs it at batch 1. The
-/// fan-out still slices `weight`, which the body ignores.
+/// Near-empty batched linear kernel: one write per call keeps the dispatch alive, so a timed
+/// `parallel.linearBatch` at batch 1 shows the pool fan-out cost. The fan-out still slices
+/// `weight`.
 fn tinyKernel(
     inputs: []const f32,
     weight: Tensor,

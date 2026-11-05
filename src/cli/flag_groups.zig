@@ -7,7 +7,6 @@
 const std = @import("std");
 
 const args = @import("args.zig");
-const serve_common = @import("serve_common.zig");
 const limits = @import("../core/limits.zig");
 const dtype = @import("../core/dtype.zig");
 const chat = @import("../core/chat.zig");
@@ -38,13 +37,13 @@ pub const EngineDocs = struct {
             .group = "tuning",
             .value = "F",
             .text = "ops below this stay serial",
-            .default = serve_common.groupDigits(parallel.default_min_parallel_flops),
+            .default = groupDigits(parallel.default_min_parallel_flops),
         },
         .spin_us = Doc{
             .group = "tuning",
             .text = std.fmt.comptimePrint(
                 "microseconds a pool worker spins before it sleeps\n(0 to {s})",
-                .{serve_common.groupDigits(parallel.max_spin_us)},
+                .{groupDigits(parallel.max_spin_us)},
             ),
             .default = std.fmt.comptimePrint(
                 "{d}",
@@ -190,6 +189,35 @@ fn windowDefault(comptime bytes: u64) []const u8 {
     );
 }
 
+/// The decimal digits of `v` in groups of three, joined by `_`, the way the
+/// Zig source writes the constant.
+fn groupDigits(comptime v: u64) []const u8 {
+    comptime {
+        const plain = std.fmt.comptimePrint("{d}", .{v});
+        const len = plain.len + (plain.len - 1) / 3;
+        var buf: [len]u8 = undefined;
+        var j: usize = len;
+        var i: usize = plain.len;
+        var in_group: usize = 0;
+        while (i > 0) {
+            i -= 1;
+            if (in_group == 3) {
+                j -= 1;
+                buf[j] = '_';
+                in_group = 0;
+            }
+
+            j -= 1;
+            buf[j] = plain[i];
+            in_group += 1;
+        }
+
+        std.debug.assert(j == 0);
+        const final = buf;
+        return &final;
+    }
+}
+
 // -- tests ------------------------------------------------------------------
 
 test "EngineFlags: the thread help states the parallel defaults" {
@@ -204,19 +232,19 @@ test "EngineFlags: the thread help states the parallel defaults" {
         "[default: min(physical cores, {d})]",
         .{parallel.max_default_threads},
     );
-    try std.testing.expect(std.mem.indexOf(u8, body, threads) != null);
-    const floor = "[default: " ++ comptime serve_common.groupDigits(
+    try std.testing.expect(std.mem.find(u8, body, threads) != null);
+    const floor = "[default: " ++ comptime groupDigits(
         parallel.default_min_parallel_flops,
     ) ++ "]";
-    try std.testing.expect(std.mem.indexOf(u8, body, floor) != null);
+    try std.testing.expect(std.mem.find(u8, body, floor) != null);
     const spin = std.fmt.comptimePrint(
         "[default: {d}]",
         .{parallel.default_spin_ns / std.time.ns_per_us},
     );
-    try std.testing.expect(std.mem.indexOf(u8, body, spin) != null);
-    try std.testing.expect(std.mem.indexOf(u8, body, "--spin-us N") != null);
-    try std.testing.expect(std.mem.indexOf(u8, body, "--gpu-layers N|auto") != null);
-    try std.testing.expect(std.mem.indexOf(u8, body, "--thinking auto|on|off") != null);
+    try std.testing.expect(std.mem.find(u8, body, spin) != null);
+    try std.testing.expect(std.mem.find(u8, body, "--spin-us N") != null);
+    try std.testing.expect(std.mem.find(u8, body, "--gpu-layers N|auto") != null);
+    try std.testing.expect(std.mem.find(u8, body, "--thinking auto|on|off") != null);
 }
 
 test "ServeFlags: every shared serve flag reaches its field" {
@@ -262,4 +290,13 @@ test "ServeFlags: every shared serve flag reaches its field" {
     try std.testing.expectEqual(@as(?u32, 2), p.engine.threads.threads);
     try std.testing.expectEqual(chat.ThinkingFlag.off, p.engine.thinking);
     try std.testing.expectEqual(@as(u32, 7), p.engine.thinking_budget);
+}
+
+test "groupDigits: groups of three from the right, as the Zig source writes them" {
+    try std.testing.expectEqualStrings("0", comptime groupDigits(0));
+    try std.testing.expectEqualStrings("8", comptime groupDigits(8));
+    try std.testing.expectEqualStrings("999", comptime groupDigits(999));
+    try std.testing.expectEqualStrings("1_000", comptime groupDigits(1_000));
+    try std.testing.expectEqualStrings("250_000", comptime groupDigits(250_000));
+    try std.testing.expectEqualStrings("12_345_678", comptime groupDigits(12_345_678));
 }

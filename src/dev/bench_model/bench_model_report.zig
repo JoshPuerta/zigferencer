@@ -2,12 +2,13 @@
 //! human table and the single-line JSON. The module is pure and keeps no state.
 
 const std = @import("std");
+const zigferencer = @import("zigferencer");
 const Io = std.Io;
 const build_options = @import("build_options");
 
-const parallel = @import("../runtime/parallel.zig");
-const step_stats = @import("../core/step_stats.zig");
-const cli = @import("command.zig");
+const parallel = zigferencer.parallel;
+const step_stats = zigferencer.step_stats;
+const context = zigferencer.cli.context;
 const common = @import("bench_model_common.zig");
 const RunResult = common.RunResult;
 const PlanInfo = common.PlanInfo;
@@ -20,7 +21,7 @@ const Stats = struct { mean: f64, stddev: f64, min: f64, max: f64 };
 // -- api --------------------------------------------------------------------
 
 pub fn printTable(
-    io: Io,
+    w: *Io.Writer,
     model_name: []const u8,
     prompt: []const u8,
     prompt_tokens: usize,
@@ -28,10 +29,6 @@ pub fn printTable(
     results: []const RunResult,
     policy: parallel.Policy,
 ) !void {
-    var stdout_buffer: [cli.stdout_buffer_bytes]u8 = undefined;
-    var stdout_writer: Io.File.Writer = .initStreaming(.stdout(), io, &stdout_buffer);
-    const w = &stdout_writer.interface;
-
     try w.print("model:    {s}\n", .{model_name});
     try w.print("backend:  {s}\n", .{build_options.ops_backend});
     try w.print(
@@ -84,7 +81,7 @@ pub fn printTable(
 }
 
 pub fn printJson(
-    io: Io,
+    w: *Io.Writer,
     model_name: []const u8,
     prompt_tokens: usize,
     decode_len: u32,
@@ -92,10 +89,6 @@ pub fn printJson(
     policy: parallel.Policy,
 ) !void {
     std.debug.assert(results.len > 0);
-
-    var stdout_buffer: [cli.stdout_buffer_bytes]u8 = undefined;
-    var stdout_writer: Io.File.Writer = .initStreaming(.stdout(), io, &stdout_buffer);
-    const w = &stdout_writer.interface;
 
     try w.print(
         "{{\"model\":\"{s}\",\"backend\":\"{s}\",\"threads\":{d},\"min_parallel_flops\":{d},\"prompt_tokens\":{d},\"decode_len\":{d},\"runs\":[",
@@ -239,9 +232,9 @@ test "printDepthJson: one member on one line, no key the sweep scripts grep" {
     try std.testing.expectEqualStrings(
         \\"itl_by_depth":[{"pos":0,"steps":4,"mean_ms":2.500},{"pos":512,"steps":2,"mean_ms":3.500}]
     , out);
-    try std.testing.expect(std.mem.indexOf(u8, out, "\"itl_ms\":") == null);
-    try std.testing.expect(std.mem.indexOf(u8, out, "\"ttft_ms\":") == null);
-    try std.testing.expect(std.mem.indexOfScalar(u8, out, '\n') == null);
+    try std.testing.expect(std.mem.find(u8, out, "\"itl_ms\":") == null);
+    try std.testing.expect(std.mem.find(u8, out, "\"ttft_ms\":") == null);
+    try std.testing.expect(std.mem.findScalar(u8, out, '\n') == null);
 
     var empty_buf: [empty_test_bytes]u8 = undefined;
     var empty: Io.Writer = .fixed(&empty_buf);
@@ -269,23 +262,23 @@ test "printHostSteps: merged host steps print one line each, an untimed run prin
     try printHostSteps(&w, &.{ rr, rr2 });
     const out = w.buffered();
     try std.testing.expect(
-        std.mem.indexOf(u8, out, "host_record_ms: avg=2.000  max=3.000  n=4\n") != null,
+        std.mem.find(u8, out, "host_record_ms: avg=2.000  max=3.000  n=4\n") != null,
     );
     try std.testing.expect(
-        std.mem.indexOf(u8, out, "host_argmax_ms: avg=0.500  max=0.500  n=1\n") != null,
+        std.mem.find(u8, out, "host_argmax_ms: avg=0.500  max=0.500  n=1\n") != null,
     );
     try std.testing.expect(
-        std.mem.indexOf(u8, out, "host_wait_ms: avg=0.000  max=0.000  n=0\n") != null,
+        std.mem.find(u8, out, "host_wait_ms: avg=0.000  max=0.000  n=0\n") != null,
     );
     try std.testing.expect(
-        std.mem.indexOf(u8, out, "host_ring: hits=0  misses=0  speculated=0  wasted=0\n") != null,
+        std.mem.find(u8, out, "host_ring: hits=0  misses=0  speculated=0  wasted=0\n") != null,
     );
 
     w = .fixed(&buf);
     rr.host.ring = .{ .hits = 31, .misses = 1, .speculated = 32, .wasted = 1 };
     try printHostSteps(&w, &.{rr});
     try std.testing.expect(
-        std.mem.indexOf(
+        std.mem.find(
             u8,
             w.buffered(),
             "host_ring: hits=31  misses=1  speculated=32  wasted=1\n",

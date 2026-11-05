@@ -1,10 +1,11 @@
 //! An immutable tensor view, the boundary value modules pass to each other.
-//! Storage (mmap, arena, scratch slab) lives outside, owned by the caller. Ops
+//!
+//! Ownership. Storage (mmap, arena, scratch slab) lives outside, owned by the caller. Ops
 //! never allocate, because the caller supplies the output buffer. `data` stays
 //! a borrow (`[]const u8`) and allocation stays at the edges, so the kernels
 //! compose with no hidden lifecycle and each op tests on its own.
 //!
-//! GGUF stores 2D weight shapes REVERSED vs PyTorch: a linear weight that is
+//! Layout. GGUF stores 2D weight shapes REVERSED vs PyTorch: a linear weight that is
 //! PyTorch [out_features, in_features] arrives here as shape = [in, out].
 //! Memory is row-major by OUTPUT row, so the linear kernels read w[j*in + k]
 //! for output j, input k (see `ops/naive.zig`):
@@ -16,7 +17,7 @@
 //!                                ...    |          (out rows)          |
 //!                                       +------------------------------+
 //!
-//! Rank is fixed at 4 (`limits.max_n_dims`). `data` is the raw byte view (use
+//! Rank. It is fixed at 4 (`limits.max_n_dims`). `data` is the raw byte view (use
 //! `bytesAsSlice` for the f32 view of an f32 tensor).
 
 const std = @import("std");

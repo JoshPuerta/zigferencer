@@ -1,37 +1,56 @@
-//! Token selection from a logits vector. `greedy` is argmax. It is
-//! deterministic by construction, with no RNG, temperature, or top-k/p, and it
-//! anchors every cross-backend token-stream hash gate. The sampled path never
+//! Token selection from a logits vector.
+//!
+//! Greedy. `greedy` is argmax. It is deterministic by construction, with no RNG, temperature, or
+//! top-k/p, and it anchors every cross-backend token-stream hash gate. The sampled path never
 //! touches it.
 //!
-//! `sample` adds seeded temperature, top-k, min-p, and top-p for sampling
-//! variety. The caller owns the RNG, one per session, seeded on purpose. Every
-//! sampled draw takes exactly one float from it, and a greedy draw takes none.
-//! The same seed, the same logits, and the same build then reproduce the same
-//! token. The promise holds for one build only. A build that changes the
-//! exponential or a cut can draw a different id for the same seed, from the
-//! same distribution. Bit-identity of a sampled stream across platforms is not
-//! promised, because the softmax goes through f32 exponentials. The
-//! cross-backend gate stays greedy.
+//! Reproducibility. `sample` adds seeded temperature, top-k, min-p, and top-p for sampling variety.
+//! The caller owns the RNG, one per session, seeded on purpose. Every sampled draw takes exactly
+//! one float from it, and a greedy draw takes none. The same seed, the same logits, and the same
+//! build then reproduce the same token. The promise holds for one build only. A build that changes
+//! the exponential or a cut can draw a different id for the same seed, from the same distribution.
+//! Bit-identity of a sampled stream across platforms is not promised, because the softmax goes
+//! through f32 exponentials. The cross-backend gate stays greedy.
 //!
-//! The chain is the penalty fix-up, top_k, temperature, min_p, top_p, then the
-//! draw. min_p keeps the ids whose weight is at least `min_p` times the
-//! largest weight. top_p then keeps the smallest ranked prefix of the min_p
-//! survivors whose mass reaches `top_p` of their mass. Ties rank the lower id
-//! first, the order `greedy` uses.
+//! Chain. The chain is the penalty fix-up, top_k, temperature, min_p, top_p, then the draw. min_p
+//! keeps the ids whose weight is at least `min_p` times the largest weight. top_p then keeps the
+//! smallest ranked prefix of the min_p survivors whose mass reaches `top_p` of their mass. Ties
+//! rank the lower id first, the order `greedy` uses.
 //!
-//! A positive top_k selects a pool of at most `limits.max_top_k` candidates,
-//! and every cut runs inside the pool. With top_k 0 every cut is exact over
-//! the full vocab. One vector exponential pass writes the weights and their
-//! block sums into the caller scratch. A radix select over the weight bits
-//! finds the cut, one pass zeroes the weights below it, and the CDF walk reads
-//! the rest. No step sorts the full vocab.
+//! Pool and full vocab. A positive top_k selects a pool of at most `limits.max_top_k` candidates,
+//! and every cut runs inside the pool. With top_k 0 every cut is exact over the full vocab. One
+//! vector exponential pass writes the weights and their block sums into the caller scratch. A
+//! radix select over the weight bits finds the cut, one pass zeroes the weights below it, and the
+//! CDF walk reads the rest. No step sorts the full vocab. The CDF walk skips whole blocks by their
+//! sums, so it reads about `V / 64` sums and at most 64 weights.
 //!
-//! A request with a penalty copies the row into the caller scratch and changes
-//! the logit of each marked id. An id in the context set takes the repetition
-//! rule `l > 0 ? l / r : l * r`, and an id in the presence set then loses
-//! `presence_penalty`. A neutral request reads the logits buffer as it is. The
-//! sampler never writes the logits buffer, because the prefix cache keeps
-//! final logits. Every greedy hash therefore stays unchanged.
+//! Penalties. A request with a penalty copies the row into the caller scratch and changes the logit
+//! of each marked id. An id in the context set takes the repetition rule `l > 0 ? l / r : l * r`,
+//! and an id in the presence set then loses `presence_penalty`. A neutral request reads the logits
+//! buffer as it is. The sampler never writes the logits buffer, because the prefix cache keeps
+//! final logits. Every greedy hash therefore stays unchanged. The penalty walk reads the presence
+//! set only when the presence penalty is not 0, and the context set only when the factor is not 1.
+//! It walks the set bits, so its cost past the copy is `V / 64` words plus one step per marked id.
+//! It reads no bit past `source.len`, so a padding bit of the last word never names an id. A result
+//! past the finite f32 range clamps to it, and a marked NaN or -inf becomes `-floatMax`, so the row
+//! maximum stays finite. A presence-only id computes `l - presence`, the f32 operation of a
+//! per-element view, so a presence stream keeps its bits.
+//!
+//! Exact top_p cut. A weight in [0, 1] has f32 bits that order as the values do, so a histogram of
+//! a bit field ranks whole buckets by mass. Each radix level adds the mass of a field value from
+//! the top down, until the mass reaches the target. That value is the boundary bucket, and every
+//! higher bucket survives whole. A boundary bucket of at most `cut_candidates_max` ids is sorted,
+//! and the walk inside it finds the cut. A larger bucket takes the next 10 bits. After three
+//! levels the bucket holds one weight value, and only its tie count is left to find. The masses sum
+//! in f64, so the cut matches a sorted f64 walk to f64 rounding. The scans skip every weight at or
+//! below `skip = (1 - top_p) floor_mass / (2 V)`, where `floor_mass` is a lower bound on the mass
+//! of the floor set, at least 1. Those weights hold at most half of `(1 - top_p)` of the floor set
+//! mass. The mass above `skip` therefore passes the target with room, so the cut lies above
+//! `skip`, and a skipped weight never survives.
+//!
+//! Pool selection. `samplePool` stays `noinline`. Its selection loop is branchy, and inlined into a
+//! caller it measured 107 us or 155 us per Qwen row with the caller layout alone changed. Out of
+//! line it measured 107 us in both layouts.
 
 const std = @import("std");
 const prop = @import("../core/prop.zig");
@@ -45,24 +64,20 @@ const Vec = exp_simd.Vec;
 
 // -- constants --------------------------------------------------------------
 
-/// Weights per block sum of the full-vocab draw. The CDF walk skips whole
-/// blocks by their sums, so it reads about `V / 64` sums and at most 64
-/// weights.
+/// Weights per block sum of the full-vocab draw.
 const weight_block = 64;
 
-/// The weight bits that one level of the radix select reads. A weight lies in
-/// [0, 1], so its bits lie below 2^30, and three levels read every bit.
+/// The weight bits of one radix level. A weight in [0, 1] has bits below 2^30, so three levels
+/// read every bit.
 const radix_bits = 10;
 
 const radix_buckets = 1 << radix_bits;
 const radix_levels = 3;
 
-/// The histogram copies of one radix level. Four copies break the add chains
-/// of a bucket that many neighbor ids share.
+/// The histogram copies of one radix level. Four copies break the add chains of a shared bucket.
 const radix_ways = 4;
 
-/// The most ids the cut sorts. A boundary bucket with more ids takes the next
-/// radix level, so the sort never grows with the vocab.
+/// The most ids the cut sorts. A larger boundary bucket takes the next radix level.
 const cut_candidates_max = 1024;
 
 comptime {
@@ -77,26 +92,21 @@ comptime {
 pub const Params = struct {
     /// 0 = greedy (argmax, no RNG draw). Higher flattens.
     temperature: f32 = 0,
-    /// Candidate pool size. 0 = no cap, and every cut then runs over the full
-    /// vocab. Must be <= limits.max_top_k.
+    /// Candidate pool size. 0 = no cap, and every cut runs over the full vocab.
+    /// At most `limits.max_top_k`.
     top_k: u32 = 0,
-    /// Nucleus cut: keep the smallest ranked prefix of the min_p survivors
-    /// whose mass reaches top_p of their mass. 1.0 = off. Must be in (0, 1].
+    /// Nucleus cut: the mass share to keep. 1.0 = off. Must be in (0, 1].
     top_p: f32 = 1.0,
-    /// Keep the ids whose probability is at least min_p times the largest
-    /// probability. 0 = off. Must be in [0, 1].
+    /// Keep the ids with at least min_p times the largest probability. 0 = off. Must be in [0, 1].
     min_p: f32 = 0,
     /// Subtracted from the logit of every id in `presence`. 0 is off.
     presence_penalty: f32 = 0,
-    /// One bit per vocab id marks the ids that count for the presence
-    /// penalty. Empty is none. The caller owns the set and marks it between
-    /// draws.
+    /// One bit per vocab id for the presence penalty. Empty is none. The caller owns and marks it.
     presence: []const u64 = &.{},
-    /// The repetition factor for every id in `context`. 1 is off. Must be in
-    /// (0, limits.max_repetition_penalty].
+    /// The repetition factor for every id in `context`. 1 is off.
+    /// In (0, `limits.max_repetition_penalty`].
     repetition_penalty: f32 = 1,
-    /// One bit per vocab id marks the ids that count for the repetition
-    /// penalty. Empty is none. The caller owns the set.
+    /// One bit per vocab id for the repetition penalty. Empty is none. The caller owns it.
     context: []const u64 = &.{},
 
     fn penalized(p: Params) bool {
@@ -113,9 +123,8 @@ pub const Params = struct {
     }
 };
 
-/// The slot state that `penalize` reads, borrowed for one draw. A new penalty
-/// that reads more slot state adds a field here, so no caller of `penalize`
-/// changes. Each set is empty or holds `setWords(vocab)` words.
+/// The slot state that `penalize` reads, borrowed for one draw. A new penalty adds a field here.
+/// Each set is empty or holds `setWords(vocab)` words.
 pub const PenaltySets = struct {
     /// The ids accepted since the turn began.
     seen: []const u64 = &.{},
@@ -123,13 +132,11 @@ pub const PenaltySets = struct {
     context: []const u64 = &.{},
 };
 
-/// The penalty settings of one request. The zero value is neutral. A new penalty
-/// adds a field with its neutral value as the default.
+/// The penalty settings of one request. The zero value is neutral.
 pub const Penalties = struct {
     /// Subtracted from the logit of every id in `PenaltySets.seen`.
     presence: f32 = 0,
-    /// The factor of the repetition rule for every id in
-    /// `PenaltySets.context`.
+    /// The factor of the repetition rule for every id in `PenaltySets.context`.
     repetition: f32 = 1,
 };
 
@@ -137,8 +144,7 @@ const Candidate = struct {
     v: f32,
     i: u32,
 
-    /// Descending by value. Ties resolve to the lower index, the order `greedy`
-    /// uses.
+    /// Descending by value. Ties resolve to the lower index.
     fn moreLikely(_: void, a: Candidate, b: Candidate) bool {
         if (a.v != b.v) return a.v > b.v;
         return a.i < b.i;
@@ -190,8 +196,8 @@ pub fn isMarked(set: []const u64, id: u32) bool {
     return set[id / 64] & (@as(u64, 1) << @intCast(id % 64)) != 0;
 }
 
-/// The f32 count of the scratch that `sample` takes for a `vocab`-id row: one
-/// row, then one sum per weight block.
+/// The f32 count of the scratch that `sample` takes for a `vocab`-id row: one row, then one sum
+/// per weight block.
 pub fn scratchLen(vocab: usize) usize {
     return vocab + blockCount(vocab);
 }
@@ -201,9 +207,8 @@ pub fn greedy(logits: []const f32) u32 {
     return argmax(logits);
 }
 
-/// Draw one token. Same logits + same params + same RNG state => same token,
-/// on the same build. `scratch` holds `scratchLen(logits.len)` floats that the
-/// draw can overwrite.
+/// Draw one token. The same logits, params, and RNG state give the same token on one build.
+/// `scratch` holds `scratchLen(logits.len)` floats that the draw can overwrite.
 pub fn sample(logits: []const f32, params: Params, random: std.Random, scratch: []f32) u32 {
     const sp = span.begin(.sample);
     defer sp.end();
@@ -234,27 +239,26 @@ pub fn sample(logits: []const f32, params: Params, random: std.Random, scratch: 
     return id;
 }
 
-/// Copy `source` into `target` and apply the penalties to every id that the
-/// sets mark. The walk reads the presence set only when the presence penalty
-/// is not 0, and the context set only when the factor is not 1. It walks the
-/// set bits, so its cost past the copy is `V / 64` words plus one step per
-/// marked id. It reads no bit past `source.len`, so a padding bit of the last
-/// word never names an id. A result past the finite f32 range clamps to it,
-/// and a marked NaN or -inf becomes `-floatMax`, so the row maximum stays
-/// finite.
+/// Copy `source` into `target` and apply the penalties to every id that the sets mark.
+/// See "Penalties" in the header.
 pub fn penalize(source: []const f32, target: []f32, sets: PenaltySets, knobs: Penalties) void {
     assert(source.len == target.len);
     assert(source.len > 0);
 
+    // Check the sets and the settings.
     const words = setWords(source.len);
     assert(sets.seen.len == 0 or sets.seen.len == words);
     assert(sets.context.len == 0 or sets.context.len == words);
     assert(std.math.isFinite(knobs.presence));
     assert(knobs.repetition > 0);
     assert(knobs.repetition <= limits.max_repetition_penalty);
+
+    // Copy the row.
     @memcpy(target, source);
     const seen: []const u64 = if (knobs.presence != 0) sets.seen else &.{};
     const context: []const u64 = if (knobs.repetition != 1) sets.context else &.{};
+
+    // Walk the marked ids word by word.
     for (0..words) |w| {
         const s = if (w < seen.len) seen[w] else 0;
         const c = if (w < context.len) context[w] else 0;
@@ -283,9 +287,7 @@ fn validBits(w: usize, vocab: usize) u64 {
     return (@as(u64, 1) << @intCast(vocab - first)) - 1;
 }
 
-/// One marked logit: the repetition rule, then the presence penalty, then the
-/// clamp. A presence-only id computes `l - presence`, the f32 operation of a
-/// per-element view, so a presence stream keeps its bits.
+/// One marked logit: the repetition rule, then the presence penalty, then the clamp.
 fn penalizeOne(l: f32, in_context: bool, in_seen: bool, knobs: Penalties) f32 {
     var v = l;
     if (in_context) {
@@ -297,8 +299,7 @@ fn penalizeOne(l: f32, in_context: bool, in_seen: bool, knobs: Penalties) f32 {
     }
 
     const max = std.math.floatMax(f32);
-    // `@min` returns the other operand for a NaN, so the clamp alone sends a
-    // NaN to `floatMax`, the top of the row.
+    // The clamp alone sends a NaN to `floatMax`, the top of the row.
     if (std.math.isNan(v)) return -max;
 
     return std.math.clamp(v, -max, max);
@@ -332,9 +333,8 @@ fn argmax(row: []const f32) u32 {
     return @intCast(best);
 }
 
-/// Temperature-only draw over the whole vocab: one weight pass, then a CDF walk
-/// over the block sums and inside one block. `row` can alias the row part of
-/// `scratch`, because the weight pass reads each element before it writes it.
+/// Temperature-only draw over the whole vocab: one weight pass, then a CDF walk. `row` can alias
+/// the row part of `scratch`, because the weight pass reads each element before it writes it.
 fn sampleFullVocab(row: []const f32, temperature: f32, random: std.Random, scratch: []f32) u32 {
     assert(temperature > 0);
 
@@ -352,10 +352,9 @@ fn sampleFullCut(row: []const f32, params: Params, random: std.Random, scratch: 
     return drawWeights(scratch[0..n], scratch[n..][0..blockCount(n)], total, random);
 }
 
-/// Write the full-vocab weights into the scratch, zero every weight that the
-/// min_p and top_p cuts drop, and return the sum of the block sums. The weight
-/// pass and the cut pass each read the vocab once. The radix select reads it
-/// at most `radix_levels` times and sorts at most `cut_candidates_max` ids.
+/// Write the full-vocab weights into the scratch, zero every weight that the min_p and top_p cuts
+/// drop, and return the sum of the block sums. The radix select reads the vocab at most
+/// `radix_levels` times.
 fn fullCutWeights(row: []const f32, params: Params, scratch: []f32) f32 {
     assert(params.temperature > 0);
     assert(params.top_k == 0);
@@ -365,13 +364,9 @@ fn fullCutWeights(row: []const f32, params: Params, scratch: []f32) f32 {
     const weights = scratch[0..n];
     const sums = scratch[n..][0..blockCount(n)];
     const all = fullVocabWeights(row, params.temperature, weights, sums);
-    // The largest weight is 1, so min_p is a floor on the weights. With no
-    // min_p the floor is the smallest positive f32, which drops only the
-    // zero weights, and those add no mass.
+    // The largest weight is 1, so min_p is a floor. With no min_p the floor drops zero weights.
     const floor: f32 = if (params.min_p > 0) params.min_p else std.math.floatTrueMin(f32);
-    // A lower bound on the mass of the floor set. With no min_p the floor
-    // set is every positive weight, and the f32 sum of 64-weight blocks errs
-    // by far less than 1 %.
+    // A lower bound on the floor set mass. The f32 block sums err by far less than the 1 % margin.
     const floor_mass: f32 = if (params.min_p > 0) 1 else @max(1, all * 0.99);
     const cut: Cut = if (params.top_p < 1)
         selectCut(weights, floor, floor_mass, params.top_p)
@@ -382,8 +377,8 @@ fn fullCutWeights(row: []const f32, params: Params, scratch: []f32) f32 {
     return total;
 }
 
-/// One CDF draw over the weights, block sum by block sum, then inside one
-/// block. `total` is the sum of the block sums in block order.
+/// One CDF draw over the weights, block sum by block sum, then inside one block.
+/// `total` is the sum of the block sums in block order.
 fn drawWeights(weights: []const f32, sums: []const f32, total: f32, random: std.Random) u32 {
     // The term at the maximum is exactly 1, and every cut keeps it.
     assert(total >= 1);
@@ -408,16 +403,18 @@ fn drawWeights(weights: []const f32, sums: []const f32, total: f32, random: std.
     unreachable;
 }
 
-/// Write `exp((l - max) / T)` for every id into `weights`, and the sum of each
-/// block of `weight_block` weights into `sums`. Returns the sum of the block
-/// sums, in block order.
+/// Write `exp((l - max) / T)` for every id into `weights`, and the sum of each block of
+/// `weight_block` weights into `sums`. Returns the sum of the block sums, in block order.
 fn fullVocabWeights(row: []const f32, temperature: f32, weights: []f32, sums: []f32) f32 {
     assert(weights.len == row.len);
     assert(sums.len == blockCount(row.len));
 
+    // Find the row maximum.
     const m = rowMax(row);
     const m_v: Vec = @splat(m);
     const t_v: Vec = @splat(temperature);
+
+    // Write the weights and the sum of each block.
     var total: f32 = 0;
     for (sums, 0..) |*sum, b| {
         const start = b * weight_block;
@@ -466,24 +463,8 @@ fn rowMax(row: []const f32) f32 {
     return m;
 }
 
-/// The exact top_p cut among the weights at or above `floor`: the smallest
-/// ranked prefix whose mass reaches `top_p` of their mass.
-///
-/// The method is a radix select by mass. A weight in [0, 1] has f32 bits that
-/// order as the values do, so a histogram of a bit field ranks whole buckets.
-/// Each level adds the mass of a field value from the top down, until the
-/// mass reaches the target. That value is the boundary bucket, and every
-/// higher bucket survives whole. A boundary bucket of at most
-/// `cut_candidates_max` ids is sorted, and the walk inside it finds the cut.
-/// A larger bucket takes the next 10 bits. After three levels the bucket holds
-/// one weight value, and only its tie count is left to find. The masses sum in
-/// f64, so the cut matches a sorted f64 walk to f64 rounding.
-///
-/// `floor_mass` is a lower bound on the mass of the floor set, at least 1.
-/// The scans skip every weight at or below `skip = (1 - top_p) floor_mass /
-/// (2 V)`. Those weights hold at most half of `(1 - top_p)` of the floor set
-/// mass. The mass above `skip` therefore passes the target with room, so the
-/// cut lies above `skip`, and a skipped weight never survives.
+/// The exact top_p cut among the weights at or above `floor`: the smallest ranked prefix whose
+/// mass reaches `top_p` of their mass. `floor_mass` is at least 1. See "Exact top_p cut".
 fn selectCut(weights: []const f32, floor: f32, floor_mass: f32, top_p: f32) Cut {
     assert(floor > 0);
     assert(floor_mass >= 1);
@@ -493,6 +474,8 @@ fn selectCut(weights: []const f32, floor: f32, floor_mass: f32, top_p: f32) Cut 
     const n: f64 = @floatFromInt(weights.len);
     const skip: f32 = @floatCast((1 - @as(f64, top_p)) * floor_mass / (2 * n));
     const scan_key = @max(@as(u32, @bitCast(floor)), @as(u32, @bitCast(skip)) + 1);
+
+    // Narrow the boundary bucket one radix level at a time.
     var mass: [radix_buckets]f64 = undefined;
     var count: [radix_buckets]u32 = undefined;
     var prefix: u32 = 0;
@@ -530,11 +513,9 @@ fn selectCut(weights: []const f32, floor: f32, floor_mass: f32, top_p: f32) Cut 
     unreachable;
 }
 
-/// One radix level: the mass and the count of each field value at `shift`,
-/// over the weights at or above `scan_key` whose higher bits equal `prefix`.
-/// With `with_total` it also returns the f64 mass of every weight at or
-/// above `floor`. The vector compare skips a lane group with no such weight,
-/// so most of the vocab costs one compare per 8 ids.
+/// One radix level: the mass and count of each field value at `shift`, over the weights at or
+/// above `scan_key` whose higher bits equal `prefix`. With `with_total` it also returns the f64
+/// mass of every weight at or above `floor`. A vector compare skips a lane group with no hit.
 fn radixLevel(
     weights: []const f32,
     floor: f32,
@@ -545,9 +526,7 @@ fn radixLevel(
     count: *[radix_buckets]u32,
     with_total: bool,
 ) f64 {
-    // Each lane adds into the copy of its lane index modulo `radix_ways`. Two
-    // lanes in one bucket then add into two copies, so the adds do not wait
-    // on each other.
+    // Each lane adds into the copy of its index modulo `radix_ways`, so adds do not chain.
     var mass_ways: [radix_ways][radix_buckets]f64 = @splat(@splat(0));
     var count_ways: [radix_ways][radix_buckets]u32 = @splat(@splat(0));
     const floor_v: Vec = @splat(floor);
@@ -560,6 +539,8 @@ fn radixLevel(
     const none: @Vector(lanes, bool) = @splat(false);
     var lo: Wide = @splat(0);
     var hi: Wide = @splat(0);
+
+    // Accumulate the lane groups into the histogram copies.
     var i: usize = 0;
     while (i + lanes <= weights.len) : (i += lanes) {
         const w: Vec = weights[i..][0..lanes].*;
@@ -584,6 +565,7 @@ fn radixLevel(
         }
     }
 
+    // Accumulate the scalar tail.
     var total: f64 = @reduce(.Add, lo) + @reduce(.Add, hi);
     while (i < weights.len) : (i += 1) {
         const w = weights[i];
@@ -599,6 +581,7 @@ fn radixLevel(
         count_ways[0][d] += 1;
     }
 
+    // Merge the copies.
     for (mass, count, 0..) |*m, *c, d| {
         m.* = 0;
         c.* = 0;
@@ -611,10 +594,8 @@ fn radixLevel(
     return total;
 }
 
-/// The highest bucket whose mass, added to `above.*`, reaches `target`. The
-/// mass of every higher bucket moves into `above.*`. f64 rounding can leave
-/// the walk short of the target, and the lowest nonempty bucket then takes
-/// the cut, so every id of the level survives.
+/// The highest bucket whose mass, added to `above.*`, reaches `target`. Higher buckets add their
+/// mass to `above.*`. If f64 rounding leaves the walk short, the lowest nonempty bucket wins.
 fn boundaryBucket(
     mass: *const [radix_buckets]f64,
     count: *const [radix_buckets]u32,
@@ -637,8 +618,7 @@ fn boundaryBucket(
     return last;
 }
 
-/// The cut inside a boundary bucket of at most `cut_candidates_max` ids: sort
-/// the bucket, then walk it from the mass above it.
+/// The cut inside a boundary bucket of at most `cut_candidates_max` ids: sort it, then walk it.
 fn sortedCut(
     weights: []const f32,
     scan_key: u32,
@@ -647,6 +627,7 @@ fn sortedCut(
     above: f64,
     target: f64,
 ) Cut {
+    // Collect the bucket ids.
     var cand: [cut_candidates_max]Candidate = undefined;
     var n: usize = 0;
     const scan_v: Vec = @splat(@as(f32, @bitCast(scan_key)));
@@ -679,6 +660,7 @@ fn sortedCut(
         n += 1;
     }
 
+    // Sort the bucket and walk its mass up to the target.
     assert(n >= 1);
     std.mem.sort(Candidate, cand[0..n], {}, Candidate.moreLikely);
     var j: usize = 0;
@@ -688,6 +670,7 @@ fn sortedCut(
         acc += cand[j].v;
     }
 
+    // Count the ties that the cut keeps.
     const weight = cand[j].v;
     var ties: u32 = 0;
     for (cand[0 .. j + 1]) |c| {
@@ -700,8 +683,7 @@ fn sortedCut(
     return .{ .weight = weight, .ties = ties };
 }
 
-/// The cut inside a bucket of `n` equal weights: the ties it takes, in id
-/// order, to reach the target.
+/// The cut inside a bucket of `n` equal weights: the ties, in id order, that reach the target.
 fn tieCut(weight: f32, n: u32, above: f64, target: f64) Cut {
     assert(n >= 1);
     assert(weight > 0);
@@ -716,15 +698,14 @@ fn tieCut(weight: f32, n: u32, above: f64, target: f64) Cut {
     return .{ .weight = weight, .ties = ties };
 }
 
-/// Zero every weight that `cut` drops and rewrite the block sums. Returns the
-/// sum of the block sums, in block order. The vector pass keeps every weight
-/// at or above the cut. When the cut keeps only some of the ties, a second
-/// pass zeroes the rest in id order and sums the blocks again.
+/// Zero every weight that `cut` drops and rewrite the block sums. Returns the sum of the block
+/// sums, in block order. A second pass zeroes the surplus ties in id order.
 fn applyCut(weights: []f32, sums: []f32, cut: Cut) f32 {
     assert(sums.len == blockCount(weights.len));
     assert(cut.weight > 0);
     assert(cut.ties >= 1);
 
+    // Keep every weight at or above the cut, and count the ties.
     const t_v: Vec = @splat(cut.weight);
     const zero: Vec = @splat(0);
     var tied: usize = 0;
@@ -757,6 +738,7 @@ fn applyCut(weights: []f32, sums: []f32, cut: Cut) f32 {
         sum.* = s;
     }
 
+    // Zero the surplus ties in id order and sum the blocks again.
     if (tied > cut.ties) {
         var kept_ties: u32 = 0;
         for (weights) |*w| {
@@ -780,6 +762,7 @@ fn applyCut(weights: []f32, sums: []f32, cut: Cut) f32 {
         }
     }
 
+    // Sum the blocks in block order.
     var total: f32 = 0;
     for (sums) |s| {
         total += s;
@@ -816,11 +799,8 @@ fn lastPositive(weights: []const f32, b: usize) u32 {
     unreachable;
 }
 
-/// Pool draw: the top `top_k` candidates as weights, the min_p and nucleus
-/// cuts, then one CDF draw within the cut. The selection loop is branchy, and
-/// inlined into a caller it measured 107 us or 155 us per Qwen row with the
-/// caller layout alone changed. Out of line it measured 107 us in both
-/// layouts.
+/// Pool draw: the top `top_k` candidates as weights, the min_p and nucleus cuts, then one CDF draw
+/// within the cut. See "Pool selection" in the header for why it stays `noinline`.
 noinline fn samplePool(row: []const f32, params: Params, random: std.Random) u32 {
     var pool: [limits.max_top_k]Candidate = undefined;
     var probs: [limits.max_top_k]f32 = undefined;
@@ -836,10 +816,9 @@ noinline fn samplePool(row: []const f32, params: Params, random: std.Random) u32
     return pool[cut.n - 1].i;
 }
 
-/// Select the top `min(top_k, V)` candidates with a bounded min-heap
-/// (O(V log k) worst case), sort them descending, and write the weight
-/// `exp((l - max) / T)` of each. The first weight is exactly 1. Returns the
-/// candidate count.
+/// Select the top `min(top_k, V)` candidates with a bounded min-heap (O(V log k) worst case), sort
+/// them descending, and write the weight `exp((l - max) / T)` of each. The first weight is
+/// exactly 1. Returns the candidate count.
 fn poolWeights(
     row: []const f32,
     top_k: u32,
@@ -878,10 +857,8 @@ fn poolWeights(
     return k;
 }
 
-/// The min_p cut, then the nucleus cut, over pool weights in rank order. The
-/// first weight is 1, so min_p keeps the ranked prefix of weights at or above
-/// `min_p`. The nucleus keeps the smallest prefix of those whose mass reaches
-/// `top_p` of their mass. The first candidate always survives.
+/// The min_p cut, then the nucleus cut, over pool weights in rank order. The first weight is 1,
+/// so min_p keeps the ranked prefix at or above `min_p`. The first candidate always survives.
 fn poolCut(probs: []const f32, min_p: f32, top_p: f32) PoolCut {
     assert(probs.len >= 1);
     assert(probs[0] == 1);
@@ -1061,8 +1038,7 @@ test "presence penalty: the pool and the full vocab never draw a heavily penaliz
     const set = testSet(x.len, &.{0});
     var prng = std.Random.DefaultPrng.init(77);
     for (0..64) |_| {
-        // 10 - 2 = 8 is still a candidate in a pool of two. At a low
-        // temperature the mass sits on id 1.
+        // 10 - 2 = 8 is still a candidate in a pool of two. At low temperature id 1 holds the mass.
         const pooled = sample(
             &x,
             .{ .temperature = 0.05, .top_k = 2, .presence_penalty = 2, .presence = &set },
@@ -1112,8 +1088,8 @@ test "neutral penalties equal the plain path draw for draw" {
     }
 }
 
-// The property tests below run over seeded random rows. The row size is off
-// the lane grid and off the weight block grid, so every tail path runs.
+// The property tests below run over seeded random rows. The row size is off the lane grid and
+// off the weight block grid, so every tail path runs.
 
 const prop_vocab = 1000 + 3;
 const prop_rounds = 64;
@@ -1133,19 +1109,42 @@ fn fillSet(r: std.Random, set: []u64, vocab: usize) void {
 }
 
 /// Every path of the chain, with and without each penalty.
-fn propShapes(set: []const u64) [11]Params {
+fn propShapes(ids: []const u64) [11]Params {
+    const everything: Params = .{
+        .temperature = 1,
+        .top_p = 0.8,
+        .min_p = 0.02,
+        .presence_penalty = 1,
+        .presence = ids,
+        .repetition_penalty = 1.5,
+        .context = ids,
+    };
+    const pool_presence: Params = .{
+        .temperature = 1,
+        .top_k = 20,
+        .top_p = 0.95,
+        .presence_penalty = -0.5,
+        .presence = ids,
+    };
+    const pool_repetition: Params = .{
+        .temperature = 1,
+        .top_k = 40,
+        .min_p = 0.05,
+        .repetition_penalty = 1.2,
+        .context = ids,
+    };
     return .{
         .{},
-        .{ .presence_penalty = 1.5, .presence = set },
-        .{ .repetition_penalty = 1.3, .context = set },
+        .{ .presence_penalty = 1.5, .presence = ids },
+        .{ .repetition_penalty = 1.3, .context = ids },
         .{ .temperature = 0.8 },
-        .{ .temperature = 0.8, .presence_penalty = 1.5, .presence = set },
+        .{ .temperature = 0.8, .presence_penalty = 1.5, .presence = ids },
         .{ .temperature = 1, .top_k = 20, .top_p = 0.95 },
-        .{ .temperature = 1, .top_k = 20, .top_p = 0.95, .presence_penalty = -0.5, .presence = set },
-        .{ .temperature = 1, .top_k = 40, .min_p = 0.05, .repetition_penalty = 1.2, .context = set },
+        pool_presence,
+        pool_repetition,
         .{ .temperature = 0.6, .top_p = 0.9 },
         .{ .temperature = 0.6, .min_p = 0.1 },
-        .{ .temperature = 1, .top_p = 0.8, .min_p = 0.02, .presence_penalty = 1, .presence = set, .repetition_penalty = 1.5, .context = set },
+        everything,
     };
 }
 
@@ -1593,9 +1592,11 @@ test "min_p golden rows: three of four ids survive, and the order of the cuts ke
 
     // The full-vocab cut keeps the same ids.
     var scratch: TestScratch(row.len) = undefined;
+    const row_a: [4]f32 = .{ @log(0.5), @log(0.3), @log(0.15), @log(0.05) };
+    const row_b: [4]f32 = .{ @log(0.4), @log(0.3), @log(0.2), @log(0.1) };
     const cases = [_]struct { row: [4]f32, min_p: f32, top_p: f32, kept: []const u32 }{
-        .{ .row = .{ @log(0.5), @log(0.3), @log(0.15), @log(0.05) }, .min_p = 0.2, .top_p = 1, .kept = &.{ 0, 1, 2 } },
-        .{ .row = .{ @log(0.4), @log(0.3), @log(0.2), @log(0.1) }, .min_p = 0.3, .top_p = 0.75, .kept = &.{ 0, 1 } },
+        .{ .row = row_a, .min_p = 0.2, .top_p = 1, .kept = &.{ 0, 1, 2 } },
+        .{ .row = row_b, .min_p = 0.3, .top_p = 0.75, .kept = &.{ 0, 1 } },
     };
     for (cases) |c| {
         const kept = fullCutKept(&c.row, 1, c.min_p, c.top_p, &scratch);
@@ -1658,7 +1659,7 @@ fn checkMinPPool(_: void, seed: u64) anyerror!void {
     }
 }
 
-test "min_p bound on the pool: survivors reach the floor, dropped members do not, and top_k commutes" {
+test "min_p bound on the pool: survivors reach the floor, drops do not, top_k commutes" {
     try prop.forAll(
         .{ .site = 0x7004, .cases = prop_rounds * 4 },
         {},

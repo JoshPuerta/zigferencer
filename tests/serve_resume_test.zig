@@ -1,23 +1,26 @@
-//! The session resumption gate over a real model and real sockets. Each test
-//! boots its own in-process server through `serve_harness.zig` and drives it
-//! through the reference client.
+//! The session resumption gate over a real model and real sockets. Each test boots its own
+//! in-process server through `serve_harness.zig` and drives it through the reference client.
 //!
-//! The load-bearing assertion is exact. A session that a client keeps, drops,
-//! and resumes on a new connection continues with the ids and the position of
-//! an undropped twin that ran the same turns. This holds for greedy and for
-//! seeded sampling on SmolLM2, and for greedy on the Qwen CPU runner. A drop
-//! in the middle of a turn cuts that turn as a cancel does, and the session
-//! keeps the carry of the cut turn. An expired lease answers `unknown_session`,
-//! and a session rebuilt from the client transcript with kept pairs continues
-//! as the twin does. A live open on a full table takes the detached slot with
-//! the earliest deadline. With resumption off, a keep is forbidden and a drop
-//! frees the session as before. Every test returns `error.SkipZigTest` when no
-//! fixture exists.
+//! Twin. The load-bearing assertion is exact. A session that a client keeps, drops, and resumes on
+//! a new connection continues with the ids and the position of an undropped twin that ran the same
+//! turns. This holds for greedy and for seeded sampling on SmolLM2, and for greedy on the Qwen CPU
+//! runner.
+//!
+//! Drop and lease. A drop in the middle of a turn cuts that turn as a cancel does, and the session
+//! keeps the carry of the cut turn. An expired lease answers `unknown_session`. A live open on a
+//! full table takes the detached slot with the earliest deadline.
+//!
+//! Rebuild. A session rebuilt from the client transcript with kept pairs continues as the twin
+//! does.
+//!
+//! Resumption off. A keep is forbidden, and a drop frees the session.
+//!
+//! Skips. Every test returns `error.SkipZigTest` when no fixture exists.
 
 const std = @import("std");
-const z = @import("zigferencer");
-const protocol = z.serve_protocol;
-const Client = z.serve_client.Client;
+const zigferencer = @import("zigferencer");
+const protocol = zigferencer.serve_protocol;
+const Client = zigferencer.serve_client.Client;
 const harness = @import("serve_harness.zig");
 const Harness = harness.Harness;
 const oneTurn = harness.oneTurn;
@@ -261,7 +264,7 @@ test "resumption: a resumed seeded session reseeded at turn 4 gives the ids of i
     try resumeMatchesTwin(Harness, .chatml_smollm2, turn_tokens, seeded, reseeded);
 }
 
-test "resumption: a dropped and resumed Qwen session gives the turn 4 ids of its twin, thinking off" {
+test "resumption: a resumed Qwen session gives the turn 4 ids of its twin, thinking off" {
     try resumeMatchesTwin(
         harness.QwenHarness,
         .{ .chatml_qwen = .off },
@@ -292,7 +295,7 @@ test "resumption: sampling state, presence set, and repetition set carry across 
     );
 }
 
-test "resumption: a Qwen session with a think budget gives the turn 4 ids and the reasoning count of its twin" {
+test "resumption: a Qwen session with a think budget matches its twin on ids and reasoning count" {
     const turn: Client.TurnOptions = .{
         .max_tokens = qwen_think_tokens,
         .think_open = true,
@@ -307,7 +310,7 @@ test "resumption: a Qwen session with a think budget gives the turn 4 ids and th
     );
 }
 
-test "resumption: a drop mid-decode cuts the turn as cancelled, and the next turn continues from the carry" {
+test "resumption: a drop mid-decode cuts the turn as cancelled, and the next turn uses the carry" {
     var h = try Harness.boot(std.testing.allocator, std.testing.io, .tcp, opts(.{
         .max_sessions = 2,
         .max_batch = 2,
@@ -447,10 +450,8 @@ test "resumption: an expired lease is unknown, and kept pairs rebuild the sessio
 
     const probe = try openWhenFree(&twin);
     try twin.closeSession(probe);
-    // The detach ran before the probe open, and the deadline is 1 ms after
-    // the detach on the pinned clock. The engine thread also reads the pin at
-    // each tick, so the pin is atomic. Every read after this write is past
-    // the deadline, and the next request leaves the client after the write.
+    // The deadline is 1 ms after the detach on the pinned clock, so every read after this write
+    // is past it. The engine thread reads the pin at each tick, so the pin is atomic.
     h.server.sched.pinClock(atMs(2));
 
     var second = try h.connect();

@@ -1,28 +1,61 @@
-//! Row-parallel matmul dispatcher over the fork-join `Pool`. It wraps a
-//! linear-kernel function pointer. When serial (one pool thread), below the
-//! FLOPs floor, or with fewer than two units, it calls the kernel directly, at
-//! zero overhead: no pool touch, no alloc, no sync. Otherwise it splits the
-//! output rows into units and runs them on the pool.
+//! Row-parallel matmul dispatcher over the fork-join `Pool`. It wraps a linear-kernel function
+//! pointer. When serial (one pool thread), below the FLOPs floor, or with fewer than two units, it
+//! calls the kernel directly, at zero overhead: no pool touch, no alloc, no sync. Otherwise it
+//! splits the output rows into units and runs them on the pool.
 //!
-//! The dispatcher is bit-deterministic across thread counts. Exactly one unit
-//! computes each output row in the reduction order of the kernel. The bench
-//! token hash therefore holds across thread counts. `--threads N`,
-//! `--min-parallel-flops F`, and `--spin-us N` override the defaults.
+//! The module also holds the control units of CPU attention and of the GDN step. They spread the
+//! work units of one row over the same pool, with the same gate, `Policy.parts`.
 //!
-//! The module also holds the control units of CPU attention and of the GDN
-//! step. They spread the work units of one row over the same pool, with the
-//! same gate, `Policy.parts`.
+//! Determinism. The dispatcher is bit-deterministic across thread counts. Exactly one unit
+//! computes each output row in the reduction order of the kernel. The bench token hash therefore
+//! holds across thread counts. `--threads N`, `--min-parallel-flops F`, and `--spin-us N` override
+//! the defaults.
+//!
+//! Fan-out gate. An op runs inline when the pool has one thread, when it has fewer than two units,
+//! or when its FLOPs fall under `min_parallel_flops`. Otherwise `min(threads, n_units)`
+//! participants claim the units. Every fan-out decision comes through `Policy.parts`, so a new
+//! rule, such as a cap for each bound of an op or a floor for each op class, goes there.
+//!
+//! Defaults. One floor serves the matmuls, the attention, and the Gated-DeltaNet heads. A sweep of
+//! the floor measured 250 kFLOP best on a small model and on a 2 GB model. A dispatch on the pool
+//! costs about half a microsecond at 8 participants, so an op of this size gains from a split. A
+//! worker that sleeps adds a futex wake to the next dispatch, and a 50 us spin covers the gap
+//! between the matmuls of one decode step. A longer spin keeps idle workers on the cores and gives
+//! no gain, so `--spin-us` stops at one second. Decode saturates the memory bandwidth of a
+//! dual-channel desktop between 4 and 8 threads, and prefill keeps gaining to 8. The default thread
+//! count stops at 8 to keep sustained load off the rest of the cores. `--threads N` raises it.
+//!
+//! Matmul units. The partition stays over output rows, not the batch. Each unit streams a disjoint
+//! weight chunk once for all rows, which is bandwidth-optimal. A batch partition streams the full
+//! weight per thread, the traffic that batching exists to remove. A unit is a chunk of
+//! `matmulUnitRows` output rows, about four units per participant, so a participant that finishes
+//! early claims more. The chunk size is a function of the shape and the pool size. It never
+//! changes a bit, because the kernels give a row the same bits at every chunk boundary.
+//!
+//! Attention units. The geometry of `attn_cpu` splits the row into `c = attn_cpu.partCount(t_len)`
+//! parts. A unit is one KV group over one part, so the row holds `n_kv_heads * c` units. Unit `u`
+//! is group `u / c` and part `u % c`. A unit writes the records of its group heads for its part,
+//! and no two units write one record. A unit runs the same kernel on the same inputs on every
+//! participant. After every unit ends, `Kernels.attentionMerge` combines the
+//! records on the calling thread, adding the parts in ascending order. The geometry is a function
+//! of `t_len` alone, so any assignment of units to participants gives the same bits.
+//!
+//! GDN units. The caller thread runs `gdn.stepPrologue`, then the value heads run on the pool, one
+//! head per unit. A head writes only its own state and readout, so any assignment of heads to
+//! participants gives the bits of `gdn.step`. The finite check runs after every head ends.
+//!
+//! Weight slices. `Tensor.byte_stride` carries per-axis strides, but the kernels compute the bytes
+//! of one output row as the data length divided by the output count (`shape[1]`). The slice math
+//! uses the same rule, so it works for f32, Q8_0, and any dtype added later.
 //!
 //! To fan out a new op on the pool, do these steps:
 //!
-//! 1. Divide the op into units. The result of a unit must not change with the
-//!    worker that runs it.
+//! 1. Divide the op into units. The result of a unit must not change with the worker that runs it.
 //! 2. Write a context value and a unit function for `Pool.run`.
 //! 3. Count the FLOPs of the op.
-//! 4. Get the participant count from `Policy.parts`. If it is 1, run the
-//!    units inline on the caller.
-//! 5. Add a test that the fan-out at several thread counts gives the bits of
-//!    the serial path.
+//! 4. Get the participant count from `Policy.parts`. If it is 1, run the units inline on the
+//!    caller.
+//! 5. Add a test that the fan-out at several thread counts gives the bits of the serial path.
 
 const std = @import("std");
 const builtin = @import("builtin");
@@ -37,30 +70,19 @@ const log = std.log.scoped(.parallel);
 
 // -- constants --------------------------------------------------------------
 
-/// The default fan-out floor in FLOPs. One floor serves the matmuls, the
-/// attention, and the Gated-DeltaNet heads. A sweep of the floor measured
-/// 250 kFLOP best on a small model and on a 2 GB model. A dispatch on the
-/// pool costs about half a microsecond at 8 participants, so an op of this
-/// size gains from a split.
+/// The default fan-out floor in FLOPs. See "Defaults" in the header.
 pub const default_min_parallel_flops: u64 = 250_000;
 
-/// The default spin budget of a pool worker. A worker that sleeps adds a
-/// futex wake to the next dispatch, and a 50 us spin covers the gap between
-/// the matmuls of one decode step.
+/// The default spin budget of a pool worker.
 pub const default_spin_ns: u64 = 50_000;
 
-/// The cap on `--spin-us`, one second. A longer spin keeps idle workers on
-/// the cores and gives no gain on the next dispatch.
+/// The cap on `--spin-us`, one second.
 pub const max_spin_us: u64 = 1_000_000;
 
-/// The cap on the default thread count. Decode saturates the memory
-/// bandwidth of a dual-channel desktop between 4 and 8 threads, and prefill
-/// keeps gaining to 8. The cap keeps sustained load off the rest of the
-/// cores. `--threads N` raises it.
+/// The cap on the default thread count. `--threads N` raises it.
 pub const max_default_threads: u32 = 8;
 
-/// The cap on the logical CPUs that `hostCores` reads. A host with more
-/// CPUs falls back to the logical estimate, and the log names the cause.
+/// The cap on the logical CPUs that `hostCores` reads. A host with more CPUs logs the cause.
 const max_host_cpus: u32 = 512;
 
 /// The longest `thread_siblings_list` text that `hostCores` keeps.
@@ -68,12 +90,9 @@ const sibling_text_max: usize = 48;
 
 // -- types ------------------------------------------------------------------
 
-/// A batched linear kernel: `out = input @ weight.T` with weight in `[in, out]`
-/// (GGUF row-major) layout, over `batch` input rows against one weight. Row b
-/// reads `inputs[b*in ..]` and writes `outs[b*out_stride ..][0..out]`.
-/// `out_stride` lets a kernel given a weight-row *slice* still write into
-/// full-width rows. The kernel is opaque to this module. `llama_runner.zig` passes
-/// the build-selected variant in.
+/// A batched linear kernel: `out = input @ weight.T` with weight in `[in, out]` (GGUF row-major).
+/// Row b reads `inputs[b*in ..]` and writes `outs[b*out_stride ..][0..out]`.
+/// `out_stride` lets a kernel that gets a weight-row slice still write full-width rows.
 pub const LinearBatchKernel = *const fn (
     inputs: []const f32,
     weight: Tensor,
@@ -82,9 +101,8 @@ pub const LinearBatchKernel = *const fn (
     out_stride: usize,
 ) void;
 
-/// The threading policy of one process: the pool size and the gates that
-/// decide when an op runs on the pool. `forHost` gives the defaults, and the
-/// command flags replace single fields through `resolve`.
+/// The threading policy of one process: the pool size and the gates for the pool.
+/// `forHost` gives the defaults, and the command flags replace single fields through `resolve`.
 pub const Policy = struct {
     /// The pool size, the calling thread included. 1 (or 0) = single-threaded.
     n_threads: u32 = 1,
@@ -93,8 +111,8 @@ pub const Policy = struct {
     /// The time a pool worker spins on the epoch word before it sleeps.
     spin_ns: u64 = default_spin_ns,
 
-    /// The default policy of the host: `defaultThreads` of the physical cores,
-    /// the default floor, and the default spin budget.
+    /// The default policy of the host: `defaultThreads` of the physical cores, the default floor,
+    /// and the default spin budget.
     pub fn forHost(io: std.Io) Policy {
         const policy: Policy = .{ .n_threads = defaultThreads(hostCores(io).physical) };
         std.debug.assert(policy.n_threads >= 1);
@@ -102,12 +120,8 @@ pub const Policy = struct {
         return policy;
     }
 
-    /// The participant count of one op on a pool of `threads` threads: 1 runs
-    /// the op inline on the caller. An op runs inline when the pool has one
-    /// thread, when it has fewer than two units, or when its FLOPs fall under
-    /// `min_parallel_flops`. Otherwise `min(threads, n_units)` participants
-    /// claim the units. Every fan-out decision comes here, so a new rule, such
-    /// as a cap for each bound of an op or a floor for each op class, goes here.
+    /// The participant count of one op on a pool of `threads` threads. 1 runs the op inline on
+    /// the caller. See "Fan-out gate" in the header.
     pub fn parts(self: Policy, threads: u32, n_units: usize, flops: u64) u32 {
         std.debug.assert(threads >= 1);
 
@@ -126,8 +140,7 @@ pub const Policy = struct {
 /// The physical core count of the host, and where it came from.
 pub const HostCores = struct {
     physical: u32,
-    /// True when the count comes from the sysfs topology, false when it is
-    /// the estimate of half the logical CPUs.
+    /// True for the sysfs topology, false for the estimate of half the logical CPUs.
     from_sysfs: bool,
 };
 
@@ -157,8 +170,7 @@ pub const PoolError = pool_mod.InitError || error{TooManyThreads};
 /// The flag values that `resolve` refuses.
 pub const ResolveError = error{ TooManyThreads, SpinTooLong };
 
-/// The inputs of one matmul as its units read them. Unit `u` covers the
-/// output rows `[u * rows, min(n, (u + 1) * rows))`.
+/// The inputs of one matmul. Unit `u` covers the output rows `[u * rows, min(n, (u + 1) * rows))`.
 const MatmulUnits = struct {
     kernel: LinearBatchKernel,
     inputs: []const f32,
@@ -177,8 +189,7 @@ const MatmulUnits = struct {
     }
 };
 
-/// The inputs of one GDN step as its units read them. Unit `u` is value
-/// head `u`.
+/// The inputs of one GDN step. Unit `u` is value head `u`.
 const GdnUnits = struct {
     d: gdn.Dims,
     heads: gdn.Heads,
@@ -190,9 +201,8 @@ const GdnUnits = struct {
     }
 };
 
-/// The inputs of one attention row as its units read them. The pool erases
-/// the type of the context, so the element type and the kernels bind through
-/// this type.
+/// The inputs of one attention row. The pool erases the context type, so this type binds `E` and
+/// the kernels.
 fn Units(comptime E: type, comptime Kernels: type) type {
     return struct {
         q: []const f32,
@@ -216,8 +226,7 @@ fn Units(comptime E: type, comptime Kernels: type) type {
             const head_dim32: u32 = @intCast(self.head_dim);
             const group_size = self.n_heads / self.n_kv_heads;
             const rec_stride = attn_cpu.recordStride(head_dim32);
-            // The part kernel finds head h at `(h - h_lo) * rec_stride` past
-            // the record of head h_lo, where the merge reads it.
+            // The part kernel finds head h at `(h - h_lo) * rec_stride` past head h_lo.
             std.debug.assert(attn_cpu.recordOffset(n_heads32, head_dim32, n_heads32 - 1, 0) ==
                 (self.n_heads - 1) * rec_stride);
             var u = u_lo;
@@ -253,9 +262,8 @@ fn Units(comptime E: type, comptime Kernels: type) type {
 
 // -- api --------------------------------------------------------------------
 
-/// Start `pool` with the threads and the spin budget of `policy`. A policy over
-/// `limits.max_threads` threads returns `error.TooManyThreads`, because the
-/// pool holds a fixed array of workers.
+/// Start `pool` with the threads and the spin budget of `policy`.
+/// A policy over `limits.max_threads` threads returns `error.TooManyThreads`.
 pub fn initPool(pool: *Pool, io: std.Io, policy: Policy) PoolError!void {
     const n_threads = @max(policy.n_threads, 1);
     if (n_threads > limits.max_threads) return error.TooManyThreads;
@@ -273,11 +281,9 @@ pub fn defaultThreads(physical: u32) u32 {
     return threads;
 }
 
-/// Apply the flags of a command to the host policy. A command whose
-/// placement runs no CPU op gets one thread, so its pool starts no workers.
-/// A `--threads` value over `limits.max_threads` returns
-/// `error.TooManyThreads`. A `--spin-us` value over `max_spin_us` returns
-/// `error.SpinTooLong`.
+/// Apply the flags of a command to the host policy. A placement that runs no CPU op gets one
+/// thread. A `--threads` value over `limits.max_threads` returns `error.TooManyThreads`.
+/// A `--spin-us` value over `max_spin_us` returns `error.SpinTooLong`.
 pub fn resolve(host: Policy, flags: Flags, runs_cpu_ops: bool) ResolveError!Resolved {
     std.debug.assert(host.n_threads >= 1);
 
@@ -332,10 +338,8 @@ pub fn logResolved(r: Resolved) void {
     });
 }
 
-/// The physical cores of the host. The count is the number of distinct
-/// `thread_siblings_list` texts in the sysfs topology, because SMT siblings
-/// share one text. Without a readable topology the count is half the
-/// logical CPUs, the SMT-2 estimate.
+/// The physical cores of the host: the distinct `thread_siblings_list` texts in sysfs, because
+/// SMT siblings share one text. Without a readable topology, half the logical CPUs (SMT-2).
 pub fn hostCores(io: std.Io) HostCores {
     if (readSysfsCores(io)) |physical| {
         std.debug.assert(physical >= 1);
@@ -350,9 +354,7 @@ pub fn hostCores(io: std.Io) HostCores {
     return .{ .physical = physical, .from_sysfs = false };
 }
 
-/// The number of distinct sibling-list texts in `lists`, with surrounding
-/// white space ignored. Each physical core has one text, and every logical
-/// CPU of the core repeats it.
+/// The number of distinct sibling-list texts in `lists`, with surrounding white space ignored.
 pub fn countCores(lists: []const []const u8) u32 {
     std.debug.assert(lists.len >= 1);
     std.debug.assert(lists.len <= max_host_cpus);
@@ -374,20 +376,9 @@ pub fn countCores(lists: []const []const u8) u32 {
     return distinct;
 }
 
-/// Run a linear matmul over `batch` input rows, parallelized when the work is
-/// large enough. The serial path is a direct kernel call: no pool touch, no
-/// allocation, no synchronization.
-///
-/// The partition stays over OUTPUT rows, not the batch. Each unit streams a
-/// disjoint weight chunk once for ALL rows, which is bandwidth-optimal. A batch
-/// partition streams the full weight per thread, the exact traffic that
-/// batching exists to remove. Exactly one unit computes each (row, output)
-/// element in the reduction order of the kernel, so the result is bit-identical
-/// across thread counts. `outs` must hold `batch` rows at stride
-/// `weight.shape[1]`.
-///
-/// A unit is a chunk of `matmulUnitRows` output rows. The pool has about four
-/// units per participant, so a participant that finishes early claims more.
+/// Run a linear matmul over `batch` input rows, on the pool when the work is large enough.
+/// The serial path is a direct kernel call. See "Matmul units" in the header.
+/// `outs` must hold `batch` rows at stride `weight.shape[1]`.
 pub fn linearBatch(
     pool: *Pool,
     policy: Policy,
@@ -397,18 +388,22 @@ pub fn linearBatch(
     outs: []f32,
     batch: usize,
 ) void {
+    // Check the shapes.
     const k: usize = @intCast(weight.shape[0]);
     const n: usize = @intCast(weight.shape[1]);
     std.debug.assert(batch > 0);
     std.debug.assert(n > 0);
     std.debug.assert(inputs.len == batch * k);
     std.debug.assert(outs.len >= batch * n);
+
+    // Size the units and pick the participants.
     const threads = pool.threads();
     std.debug.assert(@max(policy.n_threads, 1) == threads);
     const flops: u64 = 2 * @as(u64, k) * @as(u64, n) * @as(u64, batch);
     const rows = matmulUnitRows(n, threads);
     const n_units = std.math.divCeil(usize, n, rows) catch unreachable;
 
+    // Call the kernel directly when one participant is enough.
     const parts = policy.parts(threads, n_units, flops);
     if (parts == 1) {
         log.debug(
@@ -419,6 +414,7 @@ pub fn linearBatch(
         return;
     }
 
+    // Run the row chunks on the pool.
     log.debug(
         "linearBatch fanout: {d} parts, {d} units of {d} rows over n {d}, batch {d}, flops {d}",
         .{ parts, n_units, rows, n, batch, flops },
@@ -435,10 +431,7 @@ pub fn linearBatch(
     pool.run(MatmulUnits, &ctx, MatmulUnits.unit, @intCast(n_units), parts);
 }
 
-/// The output rows of one matmul unit: `ceil(n / (4 * threads))` rounded up to
-/// a multiple of 4. The size is a function of the shape and the pool size.
-/// It never changes a bit, because the kernels give a row the same bits at
-/// every chunk boundary.
+/// The output rows of one matmul unit: `ceil(n / (4 * threads))` rounded up to a multiple of 4.
 pub fn matmulUnitRows(n: usize, threads: u32) usize {
     std.debug.assert(n > 0);
     std.debug.assert(threads >= 1);
@@ -450,26 +443,9 @@ pub fn matmulUnitRows(n: usize, threads: u32) usize {
     return rows;
 }
 
-/// The control unit of one CPU decode attention row. The geometry of
-/// `attn_cpu` splits the row into `c = attn_cpu.partCount(t_len)` parts. A work
-/// unit is one KV group over one part, so the row holds `n_kv_heads * c` units.
-/// Unit `u` is group `u / c` and part `u % c`. A unit writes the records of its
-/// group heads for its part, and no two units write one record. After every
-/// unit ends, `Kernels.attentionMerge` combines the records on the calling
-/// thread.
-///
-/// Any assignment of units to participants gives the same bits. The geometry
-/// is a function of `t_len` alone. A unit runs the same kernel on the same
-/// inputs on every participant. The merge adds the parts in ascending order.
-/// So the token hash holds across thread counts, the same guarantee as
-/// `linearBatch`.
-///
-/// `Policy.parts` decides between the serial row and the fan-out.
-///
-/// `Kernels` is an ops namespace that declares `attentionPartTyped` and
-/// `attentionMerge`. `E` is the KV element type, and it reaches the kernel
-/// unchanged. `parts_buf` holds at least `attn_cpu.partialLen(n_heads,
-/// head_dim)` f32s, a length that the window does not change.
+/// The control unit of one CPU decode attention row. See "Attention units" in the header.
+/// `Kernels` declares `attentionPartTyped` and `attentionMerge`. `E` is the KV element type.
+/// `parts_buf` holds at least `attn_cpu.partialLen(n_heads, head_dim)` f32s.
 pub fn attentionTyped(
     comptime E: type,
     comptime Kernels: type,
@@ -485,6 +461,7 @@ pub fn attentionTyped(
     parts_buf: []f32,
     out: []f32,
 ) void {
+    // Check the shapes and buffers.
     comptime std.debug.assert(E == f32 or E == f16);
     std.debug.assert(n_kv_heads >= 1);
     std.debug.assert(n_heads >= n_kv_heads);
@@ -502,6 +479,7 @@ pub fn attentionTyped(
     const threads = pool.threads();
     std.debug.assert(@max(policy.n_threads, 1) == threads);
 
+    // Build the unit context and count the units.
     const units: Units(E, Kernels) = .{
         .q = q,
         .n_heads = n_heads,
@@ -518,6 +496,7 @@ pub fn attentionTyped(
     // 4 FLOP per (head, position, dim): the score dot plus the weighted-V sum.
     const flops: u64 = 4 * @as(u64, n_heads) * @as(u64, head_dim) * @as(u64, t_len);
 
+    // Run the units serially or on the pool.
     const parts = policy.parts(threads, n_units, flops);
     if (parts == 1) {
         log.debug(
@@ -533,17 +512,12 @@ pub fn attentionTyped(
         pool.run(Units(E, Kernels), &units, Units(E, Kernels).unit, @intCast(n_units), parts);
     }
 
+    // Merge the part records on the calling thread.
     Kernels.attentionMerge(parts_buf, units.n_parts, n_heads, head_dim, out);
 }
 
-/// The control unit of one GDN step of one row. The caller thread runs
-/// `gdn.stepPrologue`, then the value heads run on the pool, one head per
-/// unit. A head writes only its own state and readout, so any assignment of
-/// heads to participants gives the bits of `gdn.step`. The finite check runs
-/// after every head ends. `heads.qkv` must be `qkv`, the buffer that the
-/// prologue writes.
-///
-/// `Policy.parts` decides between the serial heads and the fan-out.
+/// The control unit of one GDN step of one row. See "GDN units" in the header.
+/// `heads.qkv` must be `qkv`, the buffer that the prologue writes.
 pub fn gdnStep(
     pool: *Pool,
     policy: Policy,
@@ -562,6 +536,7 @@ pub fn gdnStep(
     // 7 FLOP per state element: decay 1, key read 2, rank-1 write 2, query read 2.
     const flops: u64 = 7 * @as(u64, d.n_v_heads) * d.head_dim * d.head_dim;
 
+    // Run the prologue on the caller, then the heads serially or on the pool.
     gdn.stepPrologue(d, qkv, conv_w, conv_state, heads.rms_eps);
     const n_units: u32 = @intCast(d.n_v_heads);
     const parts = policy.parts(threads, n_units, flops);
@@ -577,15 +552,14 @@ pub fn gdnStep(
         pool.run(GdnUnits, &ctx, GdnUnits.unit, n_units, parts);
     }
 
+    // Check the readout after every head ends.
     gdn.assertFinite(d, heads.o_out);
 }
 
 // -- helpers ----------------------------------------------------------------
 
-/// Read the sibling list of each logical CPU from sysfs and count the
-/// physical cores. The read stops at the first CPU without a topology file.
-/// It returns null when no CPU has one, when a read fails, or when a list or
-/// the CPU count passes its cap. A cap that cuts the read logs the cause.
+/// Count the physical cores from the sibling list of each logical CPU in sysfs. It returns null
+/// when no CPU has a topology file, when a read fails, or when a cap cuts the read, which logs.
 fn readSysfsCores(io: std.Io) ?u32 {
     if (builtin.os.tag != .linux) return null;
 
@@ -627,14 +601,8 @@ fn readSysfsCores(io: std.Io) ?u32 {
     return countCores(lists[0..n]);
 }
 
-/// Build a Tensor view of `weight` over the row range `[start, end)` along the
-/// output dimension (`shape[1]` in GGUF reversed-shape convention).
-///
-/// Rationale for `data.len / out_features`: the `Tensor.byte_stride` field
-/// carries per-axis strides. The kernels instead compute per-output-row bytes
-/// from the total data length divided by the output count (`shape[1]`). The
-/// same convention here keeps the slice math consistent with the kernels, and
-/// it works uniformly for f32, Q8_0, and any dtype added later.
+/// Build a Tensor view of `weight` over the output rows `[start, end)` (`shape[1]` in GGUF
+/// reversed-shape order). See "Weight slices" in the header.
 fn sliceWeightRows(weight: Tensor, start: usize, end: usize) Tensor {
     std.debug.assert(weight.n_dims == 2);
 
@@ -781,12 +749,10 @@ const Q80Fixture = struct {
 
         for (0..out_features) |row| {
             const off = row * row_bytes;
-            var blk: usize = 0;
-            while (blk < in_features / 32) : (blk += 1) {
+            for (0..in_features / 32) |blk| {
                 const blk_off = off + blk * 34;
                 std.mem.writeInt(u16, w_data[blk_off..][0..2], 0x3c00, .little);
-                var i: usize = 0;
-                while (i < 32) : (i += 1) {
+                for (0..32) |i| {
                     const v: i8 = @intCast(@as(i32, @intCast((row + blk * 32 + i) % 13)) - 6);
                     w_data[blk_off + 2 + i] = @bitCast(v);
                 }
@@ -812,8 +778,8 @@ const Q80Fixture = struct {
     }
 };
 
-/// Run the fixture matmul serially and on a pool of each thread count with
-/// floor 0, and expect the bits of the serial call every time.
+/// Run the fixture matmul serially and on a pool of each thread count with floor 0, and expect
+/// the bits of the serial call every time.
 fn expectFanOutMatchesSerial(out_features: usize, batch: usize, thread_counts: []const u32) !void {
     const naive = @import("../ops/naive.zig");
     const gpa = std.testing.allocator;
@@ -881,8 +847,7 @@ test "attention: forced fan-out at 1, 2, 3, 4, and 16 threads gives the bits of 
         .{ .n_heads = 4, .n_kv_heads = 2, .head_dim = 8 },
         .{ .n_heads = 6, .n_kv_heads = 3, .head_dim = 8 },
     };
-    // One part, two parts, and 17 tiles in 16 parts. At 3 threads the units
-    // do not split evenly over the participants.
+    // One part, two parts, and 17 tiles in 16 parts. At 3 threads the units split unevenly.
     const depths = [_]usize{ 5, T + 1, 16 * T + 3 };
     var prng = std.Random.DefaultPrng.init(0xA770_00A3);
     const r = prng.random();
@@ -897,8 +862,7 @@ test "attention: forced fan-out at 1, 2, 3, 4, and 16 threads gives the bits of 
 
 test "gdnStep: forced fan-out at 1, 2, 3, 4, and 16 threads gives the bits of gdn.step" {
     const gpa = std.testing.allocator;
-    // The 2B (16 value heads) and the 9B (32 value heads). At 3 threads the
-    // heads do not split evenly over the participants.
+    // The 2B (16 value heads) and the 9B (32 value heads). At 3 threads the heads split unevenly.
     const shapes = [_]gdn.Dims{
         .{ .n_k_heads = 16, .n_v_heads = 16, .head_dim = 128, .conv_kernel = 4 },
         .{ .n_k_heads = 16, .n_v_heads = 32, .head_dim = 128, .conv_kernel = 4 },
@@ -908,6 +872,7 @@ test "gdnStep: forced fan-out at 1, 2, 3, 4, and 16 threads gives the bits of gd
     var prng = std.Random.DefaultPrng.init(0x6D17_00A5);
     const r = prng.random();
     for (shapes) |d| {
+        // Carve the random inputs of one shape.
         const cd = d.convDim();
         const vd = d.valueDim();
         const nv = d.n_v_heads;
@@ -951,7 +916,7 @@ test "gdnStep: forced fan-out at 1, 2, 3, 4, and 16 threads gives the bits of gd
             x.* = r.float(f32) - 0.5;
         }
 
-        // The serial reference: `gdn.step` over the tokens.
+        // Run the serial reference: `gdn.step` over the tokens.
         const state_ref = try gpa.dupe(f32, state0);
         defer gpa.free(state_ref);
 
@@ -982,6 +947,7 @@ test "gdnStep: forced fan-out at 1, 2, 3, 4, and 16 threads gives the bits of gd
             );
         }
 
+        // Run the fan-out at each thread count and compare the bytes.
         const state = try gpa.alloc(f32, d.stateLen());
         defer gpa.free(state);
 

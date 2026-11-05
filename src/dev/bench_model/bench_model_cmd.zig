@@ -12,20 +12,22 @@
 //! (the whole model on the GPU), and `bench_model_placement.zig` (a CPU and GPU split).
 
 const std = @import("std");
+const zigferencer = @import("zigferencer");
 const build_options = @import("build_options");
 
-const cli = @import("command.zig");
-const args = @import("args.zig");
-const select = @import("select.zig");
-const serve_common = @import("serve_common.zig");
+const context = zigferencer.cli.context;
+const args = zigferencer.cli.args;
+const select = zigferencer.cli.select;
+const boot_facts = zigferencer.cli.boot_facts;
+const boot_lines = zigferencer.cli.boot_lines;
 const common = @import("bench_model_common.zig");
 const host = @import("bench_model_host.zig");
-const family = @import("../engine/family.zig");
-const resolve_mod = @import("../engine/resolve.zig");
-const core_log = @import("../core/log.zig");
-const limits = @import("../core/limits.zig");
-const registry = @import("../core/registry.zig");
-const loader = @import("../io/gguf/loader.zig");
+const family = zigferencer.family;
+const resolve_mod = zigferencer.resolve;
+const core_log = zigferencer.log;
+const limits = zigferencer.limits;
+const registry = zigferencer.registry;
+const loader = zigferencer.loader;
 
 const fused_build = build_options.use_vulkan_fused_ops;
 const per_op_build = build_options.use_vulkan_ops;
@@ -36,38 +38,38 @@ const placement = if (fused_build) @import("bench_model_placement.zig") else voi
 
 // -- api --------------------------------------------------------------------
 
-pub fn run(ctx: cli.Context) !void {
+pub fn run(ctx: context.Context) !void {
     const opt = try args.parseInto(common.Options, ctx) orelse return;
     try refuseBadFlags(ctx.io, opt);
 
     // A whole-model fused bench runs no CPU op, so its pool starts no workers.
     const runs_cpu_ops = !fused_build or opt.engine.gpu_layers != null;
     const flags = opt.engine.threads.policyFlags();
-    const policy = try serve_common.resolvePolicy(ctx.io, flags, runs_cpu_ops);
+    const policy = try boot_facts.resolvePolicy(ctx.io, flags, runs_cpu_ops);
 
     const model = try select.model(ctx, opt.pub_name);
-    const entry = serve_common.entryOf(model);
+    const entry = boot_facts.entryOf(model);
     const input: resolve_mod.Input = .{ .engine = opt.engine, .force_hybrid = opt.force_hybrid };
 
     // Every refusal that needs no model file lands here, before the load.
     switch (resolve_mod.early(.bench, input, entry)) {
         .ok => {},
-        .refused => |r| return serve_common.refuse(ctx.io, model.pub_name, r),
+        .refused => |r| return boot_lines.refuse(ctx.io, model.pub_name, r),
     }
 
     const path = try registry.resolveLoadPath(ctx.arena, ctx.io, ctx.models_root, model.*);
     var loaded = try loader.load(ctx.io, ctx.arena, path);
     defer loaded.close();
 
-    const model_facts = try serve_common.modelFacts(ctx.gpa, &loaded);
-    const ram_free = serve_common.hostRamFree(ctx.io);
+    const model_facts = try boot_facts.modelFacts(ctx.gpa, &loaded);
+    const ram_free = boot_facts.hostRamFree(ctx.io);
     const facts: resolve_mod.Facts = .{ .ram_free = ram_free, .model = model_facts };
     const resolved = switch (resolve_mod.resolve(.bench, input, entry, loaded.card, facts)) {
         .ok => |r| r,
-        .refused => |r| return serve_common.refuse(ctx.io, model.pub_name, r),
+        .refused => |r| return boot_lines.refuse(ctx.io, model.pub_name, r),
     };
 
-    const boot: serve_common.DeviceBoot = .{
+    const boot: boot_facts.DeviceBoot = .{
         .kind = .bench,
         .input = input,
         .entry = entry,

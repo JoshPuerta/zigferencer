@@ -10,8 +10,8 @@ const std = @import("std");
 const Io = std.Io;
 const build_options = @import("build_options");
 
-const style = @import("style.zig");
-const op_requires = @import("../core/op_requires.zig");
+const style = @import("../style.zig");
+const op_requires = @import("../../core/op_requires.zig");
 
 // -- constants --------------------------------------------------------------
 
@@ -122,7 +122,7 @@ test "print names every architecture and marks exactly the linked backend" {
 
     const text = w.buffered();
     for (arch_rows) |row| {
-        try std.testing.expect(std.mem.indexOf(u8, text, row.title) != null);
+        try std.testing.expect(std.mem.find(u8, text, row.title) != null);
     }
 
     // One linked mark per architecture row, plus the legend.

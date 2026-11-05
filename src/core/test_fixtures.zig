@@ -1,7 +1,7 @@
 //! Shared fixture lookup for the model tests. Test code imports this file. The
 //! root module re-exports it only for the tests under `tests/`.
 //!
-//! A test names a registry model, and `path` finds its file through
+//! Lookup. A test names a registry model, and `path` finds its file through
 //! `registry.locate`: the repo-local `models/` first, then the store that
 //! `$ZIGFERENCER_MODELS_DIR` names. A missing file skips the test only when the
 //! variable is unset. A machine that says where its models are must run every

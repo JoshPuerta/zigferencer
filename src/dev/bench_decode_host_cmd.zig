@@ -15,31 +15,32 @@
 //! command buffer per step.
 
 const std = @import("std");
+const zigferencer = @import("zigferencer");
 const Io = std.Io;
 const vk = if (build_options.use_vulkan_fused_ops) @import("vulkan") else void;
 const build_options = @import("build_options");
 
-const cli = @import("command.zig");
-const args = @import("args.zig");
-const style = @import("style.zig");
-const select = @import("select.zig");
-const serve_common = @import("serve_common.zig");
-const registry = @import("../core/registry.zig");
-const loader = @import("../io/gguf/loader.zig");
-const limits = @import("../core/limits.zig");
-const kv_budget = @import("../core/kv_budget.zig");
-const dtype = @import("../core/dtype.zig");
-const step_stats = @import("../core/step_stats.zig");
-const family = @import("../engine/family.zig");
-const sampler = @import("../runtime/sampler.zig");
+const context = zigferencer.cli.context;
+const args = zigferencer.cli.args;
+const style = zigferencer.cli.style;
+const select = zigferencer.cli.select;
+const boot_facts = zigferencer.cli.boot_facts;
+const registry = zigferencer.registry;
+const loader = zigferencer.loader;
+const limits = zigferencer.limits;
+const kv_budget = zigferencer.kv_budget;
+const dtype = zigferencer.dtype;
+const step_stats = zigferencer.step_stats;
+const family = zigferencer.family;
+const sampler = zigferencer.sampler;
 const log = std.log.scoped(.bench_decode_host);
 
 const vulkan_ctx_mod = if (build_options.use_vulkan_fused_ops)
-    @import("../runtime/vulkan_ctx.zig")
+    zigferencer.vulkan_ctx
 else
     void;
 const kernels = if (build_options.use_vulkan_fused_ops)
-    @import("../ops_vulkan/kernels.zig")
+    zigferencer.ops_vulkan
 else
     void;
 
@@ -57,7 +58,7 @@ const Mode = enum { m3, m4, m5, gap, all };
 
 /// What every mode of one bench reads.
 const Bench = if (build_options.use_vulkan_fused_ops) struct {
-    ctx: cli.Context,
+    ctx: context.Context,
     ctxp: *vulkan_ctx_mod.Context,
     loaded: *const loader.Loaded,
     model: *const registry.Model,
@@ -106,7 +107,7 @@ const Opt = struct {
 
 // -- api --------------------------------------------------------------------
 
-pub fn run(ctx: cli.Context) !void {
+pub fn run(ctx: context.Context) !void {
     const opt = try args.parseInto(Opt, ctx) orelse return;
     if (opt.reps == 0 or opt.reps > reps_max) {
         return args.fail(ctx.io, "--reps must be in 1..{d}", .{reps_max});
@@ -143,12 +144,12 @@ pub fn windowFor(pos: u32, reps: u32) u32 {
 /// queue wrote the stamps wrong, so the caller must not read a number.
 pub fn gapNs(end_prev: u64, start_next: u64, period_ns: f64) error{StampsOutOfOrder}!u64 {
     if (start_next < end_prev) return error.StampsOutOfOrder;
-    return @intFromFloat(@as(f64, @floatFromInt(start_next - end_prev)) * period_ns);
+    return @trunc(@as(f64, @floatFromInt(start_next - end_prev)) * period_ns);
 }
 
 // -- helpers ----------------------------------------------------------------
 
-fn runFused(ctx: cli.Context, pub_name: ?[]const u8, opt: Opt) !void {
+fn runFused(ctx: context.Context, pub_name: ?[]const u8, opt: Opt) !void {
     const model = try select.model(ctx, pub_name);
     const path = try registry.resolveLoadPath(ctx.arena, ctx.io, ctx.models_root, model.*);
 
@@ -172,9 +173,6 @@ fn runFused(ctx: cli.Context, pub_name: ?[]const u8, opt: Opt) !void {
     });
     defer ctxp.deinit();
 
-    var stdout_buffer: [cli.stdout_buffer_bytes]u8 = undefined;
-    var stdout_writer: Io.File.Writer = .initStreaming(.stdout(), ctx.io, &stdout_buffer);
-
     const bench: Bench = .{
         .ctx = ctx,
         .ctxp = ctxp,
@@ -183,7 +181,7 @@ fn runFused(ctx: cli.Context, pub_name: ?[]const u8, opt: Opt) !void {
         .opt = opt,
         .ceiling = ceiling,
         .window = window,
-        .w = &stdout_writer.interface,
+        .w = &ctx.stdout.interface,
     };
     switch (loaded.card.arch) {
         inline else => |arch| return benchFamily(family.Of(arch), &bench),
@@ -195,9 +193,9 @@ fn runFused(ctx: cli.Context, pub_name: ?[]const u8, opt: Opt) !void {
 fn benchFamily(comptime Family: type, b: *const Bench) !void {
     const ctx = b.ctx;
     const card = b.loaded.card;
-    const kv_dtype = serve_common.kvDtypeFor(b.opt.kv_dtype, b.model);
+    const kv_dtype = boot_facts.kvDtypeFor(b.opt.kv_dtype, b.model);
 
-    const vram_free = serve_common.vramFigure(b.ctxp);
+    const vram_free = boot_facts.vramFigure(b.ctxp);
     const caps = try Family.kvCaps(ctx.gpa, b.loaded, b.ceiling, vram_free, 1, kv_dtype);
     const cost = Family.Fused.kvCostModel(card, kv_dtype);
     const plan = try kv_budget.kvPlan(caps, cost, .{ .window = b.window, .slots = 1, .batch = 1 });

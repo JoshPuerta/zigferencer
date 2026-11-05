@@ -1,11 +1,12 @@
-//! Tokenizer gate for the byte-level BPE path against the real
-//! SmolLM2-135M-Instruct-Q8_0 GGUF.
+//! Tokenizer gate for the byte-level BPE path against the real SmolLM2-135M-Instruct-Q8_0 GGUF.
 //!
-//! Two invariants hold without an oracle, and both must hold exactly.
-//! `decode(encode(s))` returns `s` for short ASCII inputs, and the SmolLM2
-//! `<|im_start|>` special token encodes as one id. A third test pins the
-//! pre-split to the llama.cpp `llama-tokenize --ids` reference. The tests find the
-//! file through `test_fixtures.path`.
+//! Invariants. Two invariants hold without an oracle, and both must hold exactly.
+//! `decode(encode(s))` returns `s` for short ASCII inputs, and the SmolLM2 `<|im_start|>` special
+//! token encodes as one id.
+//!
+//! Reference. A third test pins the pre-split to the llama.cpp `llama-tokenize --ids` reference.
+//!
+//! Fixture. The tests find the file through `test_fixtures.path`.
 
 const std = @import("std");
 const zigferencer = @import("zigferencer");

@@ -406,7 +406,7 @@ fn choiceSeparator(comptime index: usize, comptime count: usize) []const u8 {
 /// The refusal of a token that no flag takes. A known flag with `=value` gets
 /// the spelling that works, because the parser reads the value as the next token.
 fn failUnknown(comptime T: type, token: []const u8, diag: *Diag) error{UsageError} {
-    const eq = std.mem.indexOfScalar(u8, token, '=') orelse
+    const eq = std.mem.findScalar(u8, token, '=') orelse
         return diag.fail("unknown flag '{s}'", .{token});
 
     const head = token[0..eq];
@@ -487,9 +487,9 @@ fn defaultSuffix(comptime e: Entry, comptime width: usize) []const u8 {
         const close = "]";
 
         const text = e.doc.text;
-        const text_last_start = if (std.mem.lastIndexOfScalar(u8, text, '\n')) |k| k + 1 else 0;
+        const text_last_start = if (std.mem.findScalarLast(u8, text, '\n')) |k| k + 1 else 0;
         const text_last_len = text.len - text_last_start;
-        const default_head_len = std.mem.indexOfScalar(u8, e.default, '\n') orelse e.default.len;
+        const default_head_len = std.mem.findScalar(u8, e.default, '\n') orelse e.default.len;
 
         const suffix_len = gap.len + open.len + default_head_len + close.len;
         const line_end = width + 2 + text_last_len + suffix_len;
@@ -936,20 +936,20 @@ test "helpBody: a long label and a default past the margin move to their own lin
 test "helpBody: one line per flag, groups in first-flag order, defaults stated" {
     const body = comptime helpBody(Sample);
     try std.testing.expect(std.mem.startsWith(u8, body, "A test command.\n"));
-    try std.testing.expect(std.mem.indexOf(u8, body, "--count N") != null);
-    try std.testing.expect(std.mem.indexOf(u8, body, "a count   [default: 7]") != null);
-    try std.testing.expect(std.mem.indexOf(u8, body, "-v, --verbose") != null);
-    try std.testing.expect(std.mem.indexOf(u8, body, "--mode fast|slow") != null);
-    try std.testing.expect(std.mem.indexOf(u8, body, "over two lines   [default: \"hi\"]") != null);
+    try std.testing.expect(std.mem.find(u8, body, "--count N") != null);
+    try std.testing.expect(std.mem.find(u8, body, "a count   [default: 7]") != null);
+    try std.testing.expect(std.mem.find(u8, body, "-v, --verbose") != null);
+    try std.testing.expect(std.mem.find(u8, body, "--mode fast|slow") != null);
+    try std.testing.expect(std.mem.find(u8, body, "over two lines   [default: \"hi\"]") != null);
     try std.testing.expect(
-        std.mem.indexOf(u8, body, "the depth the command states   [default: 4]") != null,
+        std.mem.find(u8, body, "the depth the command states   [default: 4]") != null,
     );
-    try std.testing.expect(std.mem.indexOf(u8, body, "--hidden") == null);
+    try std.testing.expect(std.mem.find(u8, body, "--hidden") == null);
     // The ungrouped flags print first, then the inner group under its header.
     try std.testing.expect(
-        std.mem.indexOf(u8, body, "--count").? < std.mem.indexOf(u8, body, "  inner\n").?,
+        std.mem.find(u8, body, "--count").? < std.mem.find(u8, body, "  inner\n").?,
     );
     try std.testing.expect(
-        std.mem.indexOf(u8, body, "  inner\n").? < std.mem.indexOf(u8, body, "--depth").?,
+        std.mem.find(u8, body, "  inner\n").? < std.mem.find(u8, body, "--depth").?,
     );
 }

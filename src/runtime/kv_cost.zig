@@ -1,8 +1,11 @@
-//! The KV price of a model card, one entry per layer. The planner splits this
-//! vector at a placement, and the RAM quote prices every serve arm from it. It
-//! reads the card alone and touches no device. A CPU build prices the same
-//! figures as a fused-GPU build. Every caller reads the price here, so no runner
-//! states a second price.
+//! The KV price of a model card, one entry per layer. The planner splits this vector at a
+//! placement, and the RAM quote prices every serve arm from it. It reads the card alone and touches
+//! no device. A CPU build prices the same figures as a fused-GPU build. Every caller reads the
+//! price here, so no runner states a second price.
+//!
+//! Layer kinds. A Llama layer holds the same KV and no recurrent state. A Qwen3.5 full-attention
+//! layer charges KV rows a token. A GDN layer holds one recurrent state and one conv ring a slot,
+//! which stay f32 under any KV dtype. One product over the layer count cannot price this mix.
 
 const std = @import("std");
 const dtype = @import("../core/dtype.zig");
@@ -11,8 +14,7 @@ const loader = @import("../io/gguf/loader.zig");
 
 // -- api --------------------------------------------------------------------
 
-/// The per-layer price of the model the card states: the Qwen3.5 vector for a
-/// card with GDN layers, and the Llama vector otherwise.
+/// The per-layer price of the model the card states: Qwen3.5 with GDN layers, else Llama.
 pub fn costVector(card: loader.ModelCard, kv_dtype: dtype.KvDtype) kv_budget.KvCostVector {
     return if (card.gdn != null) qwenCostVector(
         card,
@@ -20,8 +22,7 @@ pub fn costVector(card: loader.ModelCard, kv_dtype: dtype.KvDtype) kv_budget.KvC
     ) else llamaCostVector(card, kv_dtype);
 }
 
-/// Every Llama layer holds the same KV and no recurrent state, so the vector
-/// is uniform and its fixed column is zero.
+/// The Llama vector is uniform, and its fixed column is zero.
 pub fn llamaCostVector(card: loader.ModelCard, kv_dtype: dtype.KvDtype) kv_budget.KvCostVector {
     std.debug.assert(card.gdn == null);
 
@@ -33,10 +34,7 @@ pub fn llamaCostVector(card: loader.ModelCard, kv_dtype: dtype.KvDtype) kv_budge
     return vector;
 }
 
-/// The two kinds of Qwen3.5 layer charge differently. A full-attention layer
-/// charges KV rows a token. A GDN layer holds one recurrent state and one conv
-/// ring a slot, which stay f32 under any KV dtype. One product over the layer
-/// count cannot price this mix, so only the vector prices a span.
+/// The Qwen3.5 vector: KV bytes on full-attention layers, fixed state bytes on GDN layers.
 pub fn qwenCostVector(card: loader.ModelCard, kv_dtype: dtype.KvDtype) kv_budget.KvCostVector {
     const g = card.gdn orelse return kv_budget.KvCostVector.uniform(card.n_layers, 0);
     const key_dim: u64 = @as(u64, g.group_count) * g.state_size;
@@ -61,9 +59,8 @@ pub fn qwenCostVector(card: loader.ModelCard, kv_dtype: dtype.KvDtype) kv_budget
 
 // -- helpers ----------------------------------------------------------------
 
-/// A family states its price twice: as the vector here and as the scalar of
-/// `kv_budget.costModel`. The two can disagree only through a mistake, so this
-/// check catches the mistake at the source.
+/// A family states its price twice: as this vector and as the scalar of `kv_budget.costModel`.
+/// The two must agree, so this check catches a mistake at the source.
 fn validate(vector: kv_budget.KvCostVector, card: loader.ModelCard, kv_dtype: dtype.KvDtype) void {
     const whole = vector.total();
     const scalar = kv_budget.costModel(card.kvShape(), kv_dtype);
@@ -132,7 +129,7 @@ test "costVector: the 8B card charges 4096 f16 bytes a token on every layer" {
     );
 }
 
-test "costVector: the 2B card prices attention and GDN layers apart, and the dtype moves only the tokens" {
+test "costVector: the 2B card prices attention and GDN apart, and the dtype moves only tokens" {
     for ([_]dtype.KvDtype{ .f32, .f16 }) |kv_dtype| {
         const vector = costVector(qwenCard(), kv_dtype);
         const attn_bytes: u64 = 2 * kv_dtype.rowBytes(2 * 256);

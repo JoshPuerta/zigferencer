@@ -1,35 +1,37 @@
-//! The shared boot for the serve tests, not a test itself. A harness loads the
-//! SmolLM2 fixture, builds the CPU `LlamaRunner` and its session pool, and
-//! starts an in-process binary server. `QwenHarness` does the same with the
-//! CPU `QwenRunner` over the Qwen fixture. The server listens on an
-//! ephemeral TCP port or on a unix socket in a temporary directory. A test
-//! drives it through the reference client and stops it over the wire or
-//! through the process owner's own request.
+//! The shared boot for the serve tests, not a test itself.
 //!
-//! The harness reads the canonical SmolLM2 Q8_0 or Qwen3.5-2B Q8_0 from
-//! `test_fixtures.path`. `boot` returns `error.SkipZigTest` only when that
-//! function does. A load failure or a bind failure fails the test. The chat
-//! template kind defaults to `.none`, because template wrapping has its own
-//! unit tests and the reference comparison holds for any template. A test of
-//! the turn wraps names its kind.
+//! Boot. A harness loads the SmolLM2 fixture, builds the CPU `LlamaRunner` and its session pool,
+//! and starts an in-process binary server. `QwenHarness` does the same with the CPU `QwenRunner`
+//! over the Qwen fixture.
+//!
+//! Transport. The server listens on an ephemeral TCP port or on a unix socket in a temporary
+//! directory. A test drives it through the reference client and stops it over the wire or through
+//! the process owner's own request.
+//!
+//! Fixtures. The harness reads the canonical SmolLM2 Q8_0 or Qwen3.5-2B Q8_0 from
+//! `test_fixtures.path`. `boot` returns `error.SkipZigTest` only when that function does. A load
+//! failure or a bind failure fails the test.
+//!
+//! Chat template. The kind defaults to `.none`, because template wrapping has its own unit tests
+//! and the reference comparison holds for any template. A test of the turn wraps names its kind.
 
 const std = @import("std");
 const Io = std.Io;
 const Allocator = std.mem.Allocator;
-const z = @import("zigferencer");
-const tp = @import("test_policy.zig");
-const loader = z.loader;
-const vocab_mod = z.vocab;
-const bpe = z.bpe;
-const LlamaRunner = z.llama_runner.LlamaRunner;
-const QwenRunner = z.qwen_runner.QwenRunner;
-const Sessions = z.session.Sessions;
-const limits = z.limits;
-const protocol = z.serve_protocol;
-const event = z.serve_event;
-const server_mod = z.serve_server;
-const prefill_chunk = z.serve_prefill_chunk;
-const Client = z.serve_client.Client;
+const zigferencer = @import("zigferencer");
+const test_policy = @import("test_policy.zig");
+const loader = zigferencer.loader;
+const vocab_mod = zigferencer.vocab;
+const bpe = zigferencer.bpe;
+const LlamaRunner = zigferencer.llama_runner.LlamaRunner;
+const QwenRunner = zigferencer.qwen_runner.QwenRunner;
+const Sessions = zigferencer.session.Sessions;
+const limits = zigferencer.limits;
+const protocol = zigferencer.serve_protocol;
+const event = zigferencer.serve_event;
+const server_mod = zigferencer.serve_server;
+const prefill_chunk = zigferencer.serve_prefill_chunk;
+const Client = zigferencer.serve_client.Client;
 
 // -- constants --------------------------------------------------------------
 
@@ -92,7 +94,7 @@ pub fn HarnessFor(comptime Runner: type) type {
         pieces: []const []const u8,
         /// The pool of the runner. It lives in the arena, so its address stays
         /// fixed while the engine loop runs.
-        cpu_pool: *tp.Pool,
+        cpu_pool: *test_policy.Pool,
         runner: *Runner,
         engine: *Sessions(Runner),
         codec: *event.Codec,
@@ -126,7 +128,7 @@ pub fn HarnessFor(comptime Runner: type) type {
             else
                 "SmolLM2-135M-Instruct-Q8_0";
 
-            const fixture = try z.test_fixtures.path(arena, fixture_name);
+            const fixture = try zigferencer.test_fixtures.path(arena, fixture_name);
 
             const loaded = try arena.create(loader.Loaded);
             loaded.* = try loader.load(io, arena, fixture);
@@ -149,16 +151,16 @@ pub fn HarnessFor(comptime Runner: type) type {
                 .eos_id = vocab.eos_id,
             };
 
-            const policy = tp.policy();
-            const cpu_pool = try arena.create(tp.Pool);
-            try tp.startPool(cpu_pool, io, policy);
+            const policy = test_policy.policy();
+            const cpu_pool = try arena.create(test_policy.Pool);
+            try test_policy.startPool(cpu_pool, io, policy);
             errdefer cpu_pool.deinit();
 
             const runner = try arena.create(Runner);
             runner.* = try Runner.init(
                 arena,
                 loaded,
-                z.kv_budget.pinned(opts.max_sessions, opts.window),
+                zigferencer.kv_budget.pinned(opts.max_sessions, opts.window),
                 prefill_chunk.stepRows(opts.prefill, opts.max_sessions, opts.max_batch),
                 io,
                 cpu_pool,
@@ -188,8 +190,8 @@ pub fn HarnessFor(comptime Runner: type) type {
             };
 
             // The launcher's own builder, so the harness boots the think config the server boots.
-            const think = z.serve_common.schedulerThink(
-                try z.serve_common.thinkTagsOf(arena, vocab, opts.kind),
+            const think = zigferencer.codec_parts.schedulerThink(
+                try zigferencer.codec_parts.thinkTagsOf(arena, vocab, opts.kind),
                 opts.kind,
                 0,
             );
@@ -244,10 +246,8 @@ pub fn HarnessFor(comptime Runner: type) type {
         }
 
         /// Stop the server over the wire, then wait for the engine loop to return.
-        /// A failing assertion must leave a failing test and not a process blocked
-        /// on the still-running server task. A handshake that fails on `client`
-        /// therefore falls back to a fresh connection, and then to the owner's
-        /// request.
+        /// A failed handshake on `client` falls back to a fresh connection, then to the owner's
+        /// request, so a failing assertion never leaves the process blocked on the server task.
         pub fn stop(self: *Self, client: *Client) void {
             if (!self.running) return;
             client.shutdown() catch self.stopOverFallback();

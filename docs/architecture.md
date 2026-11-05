@@ -72,7 +72,7 @@ This document explains how zigferencer works, from the build to a served token.
 | Artifact | Root file | Where it goes | What it is |
 | --- | --- | --- | --- |
 | `zigferencer` | `src/main.zig` | `zig-out/bin/` | The release binary: `list`, `fetch`, `inspect`, `info`, `run`, `serve`, `serve-openai`, and `client`. |
-| `zigferencer-dev` | `src/dev_main.zig` | `zig-out/bin/` | The release commands, plus the developer commands: the model benchmarks, `gpu-selftest`, `tokens`, and `serve-demo`. |
+| `zigferencer-dev` | `src/dev/dev_main.zig` | `zig-out/bin/` | The release commands, plus the developer commands: the model benchmarks, `gpu-selftest`, `tokens`, and `serve-demo`. |
 | `zigferencer-bench` | `tools/bench.zig` | not installed | The op micro-benchmarks. `zig build bench` builds and runs it. |
 | `zigferencer-simd-probe` | `tools/simd_probe.zig` | `zig-out/` | The assembly of each op, for `make simd-report`. `zig build simd-probe` installs only the `.s` file. |
 | test binaries | `src/main.zig`, `tests/*_test.zig` | `zig-out/test/` | The unit tests, and one binary for each integration test. Only `test-install` installs one. |
@@ -269,7 +269,8 @@ the lessons from digital design in VHDL I had many years ago.
 
 | Directory | What it holds | Files to start with |
 | --- | --- | --- |
-| [`src/cli/`](../src/cli/README.md) | The commands: the command line in, one handler for each command. | `command.zig` (the command tables), `args.zig` (the flag parser), `run_cmd.zig`, `serve_common.zig` (builds the serve engine) |
+| [`src/cli/`](../src/cli/README.md) | The commands: the command line in, one handler for each command. | `command.zig` (the command tables), `args.zig` (the flag parser), `run_cmd.zig`, `boot/serve_boot.zig` (builds the serve engine) |
+| [`src/dev/`](../src/dev/README.md) | The developer commands of `zigferencer-dev`. | `dev_command.zig` (the developer table), `bench_model/bench_model_cmd.zig`, `gpu_selftest/gpu_selftest_cmd.zig` |
 | [`src/engine/`](../src/engine/) | The boot decisions. | `resolve.zig`, `device_arm.zig` (the GPU fit), `family.zig` (the runners of each family) |
 | [`src/core/`](../src/core/README.md) | The shared values and helpers. | `tensor.zig`, `dtype.zig`, `limits.zig` (every bound), `kv_budget.zig` (the plans), `registry.zig` (the model table), `tokenizer/` |
 | [`src/io/`](../src/io/README.md) | Files and the network. | `gguf/parser.zig`, `gguf/loader.zig`, `mmap.zig`, `download.zig` |
@@ -1129,7 +1130,7 @@ run_cmd.run(ctx)                                           the pool gets workers
 
 ```
 serve_cmd.run(ctx)                                         cli/serve_cmd.zig
-  serve_common.buildAndServe(flags, launcher)              cli/serve_common.zig: the engine builder
+  serve_boot.buildAndServe(flags, launcher)                cli/boot/serve_boot.zig: the engine builder
     resolve.early, loader.load, resolve.resolve(.serve)    the window, the KV type, the chat kind
     parallel.initPool, the vocab, scheduler.Config
     the placement: fused | hybrid | CPU                    the build options and --gpu-layers
@@ -1142,7 +1143,7 @@ serve_cmd.run(ctx)                                         cli/serve_cmd.zig
         ServeEngine.init: listen, the request queue        serve/engine.zig
           Scheduler.init -> PrefixManager.init             serve/scheduler.zig, serve/prefix_manager.zig
           preloadPrefixes                                  --preload
-        printReady -> "READY tcp host:port"                cli/serve_common.zig
+        printReady -> "READY tcp host:port"                cli/boot/serve_boot.zig
         ServeEngine.run                                    the engine loop, on the main thread
           acceptorTask                                     a concurrent task
           loop: take requests -> scheduler.handle(req), then scheduler.tick

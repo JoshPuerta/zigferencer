@@ -72,9 +72,9 @@
 //
 // Numerics
 //   Tolerance: `Attention` declares `.relative = 1e-3`. The LDS sum tree reorders the softmax sum
-//   against the CPU reference, and the GPU exp rounds differently. The resident walk showed 5e-4
-//   to 6e-4 on SmolLM2, Llama-1B, and Llama-8B shapes of up to 512 positions, with the bench floor
-//   on a near-zero denominator. Without that floor, SmolLM2 cancellation outputs of about 6e-9
+//   against the CPU reference, and the GPU exp rounds differently. The measured relative error is
+//   5e-4 to 6e-4 on SmolLM2, Llama-1B, and Llama-8B shapes, with the bench floor on a near-zero
+//   denominator. Without that floor, SmolLM2 cancellation outputs of about 6e-9
 //   inflate rel_err to about 7e-2. The tests gate the SmolLM2 shape at 128 positions and the
 //   Qwen3.5 shape up to ATTN_SPLIT positions. `precise` chains run in ascending d for a score and
 //   ascending t for a V sum, and each tree folds fixed slot pairs, so a run repeats its bytes.

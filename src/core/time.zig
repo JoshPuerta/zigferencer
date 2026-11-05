@@ -1,5 +1,5 @@
-//! Clock arithmetic on `std.Io.Clock.Timestamp` pairs. One definition for
-//! the whole tree, so elapsed-time math cannot drift between callers.
+//! Clock arithmetic on `std.Io.Clock.Timestamp` pairs. One definition serves the whole tree,
+//! so elapsed-time math cannot drift between callers.
 
 const std = @import("std");
 const Io = std.Io;

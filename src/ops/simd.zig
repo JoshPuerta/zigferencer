@@ -1,13 +1,23 @@
-//! The `@Vector(8, f32)` variant of `ops/naive.zig`. The public signatures match
-//! naive exactly, so the runner selects this backend by swapping one import.
-//! The file overrides `linearF32` and `linearF32Q80` with vectorized kernels,
-//! takes the attention part kernel and the serial row from `attention_simd.zig`,
-//! and re-exports every other op from naive unchanged.
+//! The `@Vector(8, f32)` variant of `ops/naive.zig`. The public signatures match naive exactly,
+//! so the runner selects this backend by swapping one import. The file overrides `linearF32` and
+//! `linearF32Q80` with vectorized kernels, takes the attention part kernel and the serial row
+//! from `attention_simd.zig`, and re-exports every other op from naive unchanged.
 //!
-//! Width 8 matches the 256-bit AVX2 ymm register, and Zig lowers it to a NEON
-//! 4+4 pair. A vector reduction sums in a different order than a scalar loop, so
-//! the output differs bit for bit from naive but stays inside the declared
-//! tolerance. naive stays the reference.
+//! Width. Width 8 matches the 256-bit AVX2 ymm register, and Zig lowers it to a NEON 4+4 pair.
+//!
+//! Reduction order. A vector reduction sums in a different order than a scalar loop, so the
+//! output differs bit for bit from naive but stays inside the declared tolerance. naive stays
+//! the reference.
+//!
+//! Requirements. Every AVX2 target also carries F16C. Without F16C the f16 widening stays
+//! correct and runs scalar, so `requires` does not list it.
+//!
+//! Q4 and Q6_K. The q4 CPU path exists for completeness, so it reuses the naive scalar
+//! dequant-and-dot. The runner still parallelizes it across rows.
+//!
+//! Batch. The batch forms run one B=1 call per row, so they match it bit for bit. No
+//! weight-reuse win exists here, because the batched microkernel lives in `simd_pf`, which is
+//! the auto default.
 
 const std = @import("std");
 const attention_simd = @import("attention_simd.zig");
@@ -20,10 +30,7 @@ const f16BitsToF32 = naive.f16BitsToF32;
 
 const vec_lanes = 8;
 
-/// AVX2 and FMA on x86_64. The build system rejects `-Dops-backend=simd` when
-/// the target does not meet these.
-/// Every AVX2 target also carries F16C. Without F16C the f16 widening stays
-/// correct and runs scalar, so the requirement does not list it.
+/// AVX2 and FMA on x86_64. The build system rejects `-Dops-backend=simd` on a lesser target.
 pub const requires: op_requires.OpRequires = .{
     .arch = .x86_64,
     .min_simd = .avx2,
@@ -49,8 +56,7 @@ pub const attentionPartTyped = attention_simd.plain.attentionPartTyped;
 pub const attentionMerge = attention_simd.plain.attentionMerge;
 pub const attentionRowTyped = attention_simd.plain.attentionRowTyped;
 
-// The q4 CPU path exists for completeness, so it reuses the naive scalar
-// dequant-and-dot. The runner still parallelizes it across rows.
+// See "Q4 and Q6_K" in the header.
 pub const linearF32Q40 = naive.linearF32Q40;
 pub const linearF32Q40Batch = naive.linearF32Q40Batch;
 pub const linearF32Q41 = naive.linearF32Q41;
@@ -69,6 +75,7 @@ pub fn linearF32(input: []const f32, weight: Tensor, out: []f32) void {
 
     const w: []const f32 = @alignCast(std.mem.bytesAsSlice(f32, weight.data));
 
+    // Take one dot product per output row.
     var j: usize = 0;
     while (j < out_features) : (j += 1) {
         var acc: Vec = @splat(0);
@@ -108,6 +115,7 @@ pub fn linearF32Q80(input: []const f32, weight: Tensor, out: []f32) void {
     const row_bytes = (in_features / 32) * 34;
     const n_blocks = in_features / 32;
 
+    // Take one dot product per output row, one Q8_0 block at a time.
     var j: usize = 0;
     while (j < out_features) : (j += 1) {
         var acc: Vec = @splat(0);
@@ -141,9 +149,7 @@ pub fn linearF32Q80(input: []const f32, weight: Tensor, out: []f32) void {
     }
 }
 
-/// Batch by rows over this variant's own kernels. The result is bit-identical
-/// to one B=1 call per row. No weight-reuse win exists here, because the
-/// batched microkernel lives in `simd_pf`, which is the auto default.
+/// Batch by rows over this variant's own kernels, bit-identical to one B=1 call per row.
 pub fn linearF32Batch(
     inputs: []const f32,
     weight: Tensor,
@@ -257,9 +263,8 @@ test "simd linearF32 matches naive within tolerance" {
     naive.linearF32(input, w, out_naive);
     linearF32(input, w, out_simd);
 
-    // An f32 dot product over hundreds of elements accumulates rounding on the
-    // order of N*eps. SIMD reduces in a different tree than scalar, so 1e-3
-    // relative is the right tolerance, not 1e-7.
+    // The SIMD tree rounds differently from the scalar sum over hundreds of terms. So 1e-3
+    // relative is the tolerance, not 1e-7.
     for (out_naive, out_simd) |n, s| {
         try std.testing.expectApproxEqRel(n, s, 1e-3);
     }
@@ -313,9 +318,8 @@ test "simd linearF32Q80 matches naive within tolerance" {
     naive.linearF32Q80(input, w, out_naive);
     linearF32Q80(input, w, out_simd);
 
-    // An f32 dot product over hundreds of elements accumulates rounding on the
-    // order of N*eps. SIMD reduces in a different tree than scalar, so 1e-3
-    // relative is the right tolerance, not 1e-7.
+    // The SIMD tree rounds differently from the scalar sum over hundreds of terms. So 1e-3
+    // relative is the tolerance, not 1e-7.
     for (out_naive, out_simd) |n, s| {
         try std.testing.expectApproxEqRel(n, s, 1e-3);
     }

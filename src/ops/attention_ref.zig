@@ -1,11 +1,24 @@
-//! Shared test support for the CPU attention kernels: an f64 reference row, a
-//! scalar full-row oracle, the input fillers, and the checks that the scalar
-//! and the vector kernel tests and the control unit test run. Test code imports
-//! this file, and no production path reaches it.
+//! Shared test support for the CPU attention kernels: an f64 reference row, a scalar full-row
+//! oracle, the input fillers, and the checks that the scalar and the vector kernel tests and the
+//! control unit test run. Test code imports this file, and no production path reaches it.
 //!
-//! A check takes the kernels as a namespace that declares `attentionPartTyped`,
-//! `attentionMerge`, and `attentionRowTyped`, the shape of an ops backend. So
-//! one reference and one tolerance hold every CPU backend.
+//! Kernels. A check takes the kernels as a namespace that declares `attentionPartTyped`,
+//! `attentionMerge`, and `attentionRowTyped`, the shape of an ops backend. So one reference and
+//! one tolerance hold every CPU backend.
+//!
+//! Tolerance. `row_abs_tol` is the largest absolute error against `attentionRefF64` that the row
+//! tests accept. Over the cases of the scalar tests, the scalar part row measures at most
+//! 3.33e-7 on the f16 sink, and the scalar oracle at most 3.07e-6 on the f32 sink. The vector
+//! part row measures at most 4.81e-7 on the f16 sink. Uniform rows measure at most 7.8e-8. The
+//! bound is 41.6 times the largest part row maximum.
+//!
+//! Leads. `fillAttention` starts every value uniform in [-1, 1]. A head with a lead reads K
+//! coordinate `@intFromEnum(lead) - 1` at weight `sqrt(head_dim)`, and its other coordinates
+//! shrink to a tenth. So that coordinate sets the score of the head to within about 0.1. The
+//! ramp rises from -10 to 10 across the row. A ramp head zeroes its other coordinates, so its
+//! score is the ramp alone, and a short last tile of a long row still raises the maximum. The
+//! sink is 10 at `sink_t` and 0 elsewhere. The large lead is uniform in [90, 100], where an
+//! unshifted f32 exponential overflows.
 
 const std = @import("std");
 const attn_cpu = @import("../core/attn_cpu.zig");
@@ -17,12 +30,7 @@ const Pool = @import("../runtime/pool.zig").Pool;
 
 pub const cpu_tile: usize = limits.attn_cpu_tile;
 
-/// The largest absolute error against `attentionRefF64` that the row tests
-/// accept. Over the cases of the scalar tests, the scalar part row measures at
-/// most 3.33e-7 on the f16 sink, and the scalar oracle at most 3.07e-6 on the
-/// f32 sink. The vector part row measures at most 4.81e-7 on the f16 sink.
-/// Uniform rows measure at most 7.8e-8. The bound is 41.6 times the largest
-/// part row maximum.
+/// The largest absolute error against `attentionRefF64` that the row tests accept.
 const row_abs_tol: f32 = 2.0e-5;
 
 // -- types ------------------------------------------------------------------
@@ -30,21 +38,13 @@ const row_abs_tol: f32 = 2.0e-5;
 /// A test geometry: query heads, KV heads, and head width.
 pub const AttnShape = struct { n_heads: usize, n_kv_heads: usize, head_dim: usize };
 
-/// The score profile of a test head. A head with a lead reads one K
-/// coordinate that sets its scores. `none` leaves the head uniform.
+/// The score profile of a test head. `none` leaves the head uniform.
 pub const Lead = enum { none, ramp, sink, large };
 
 // -- api --------------------------------------------------------------------
 
-/// Fill one test row. Every value starts uniform in [-1, 1], as in the other
-/// attention tests. A head with a lead reads K coordinate
-/// `@intFromEnum(lead) - 1` at weight `sqrt(head_dim)`, and its other
-/// coordinates shrink to a tenth. So that coordinate sets the score of the head
-/// to within about 0.1. The ramp rises from -10 to 10 across the row. A ramp
-/// head zeroes its other coordinates, so its score is the ramp alone, and a
-/// short last tile of a long row still raises the maximum. The sink
-/// is 10 at `sink_t` and 0 elsewhere. The large lead is uniform in [90, 100],
-/// where an unshifted f32 exponential overflows.
+/// Fill one test row with random values, then shape the heads that have a lead.
+/// See "Leads" in the header.
 pub fn fillAttention(
     comptime E: type,
     r: std.Random,
@@ -56,6 +56,7 @@ pub fn fillAttention(
     k: []E,
     v: []E,
 ) void {
+    // Fill q, k, and v uniformly.
     for (q) |*x| {
         x.* = r.float(f32) * 2.0 - 1.0;
     }
@@ -70,6 +71,7 @@ pub fn fillAttention(
 
     if (leads.len == 0) return;
 
+    // Set the q side of each lead head.
     std.debug.assert(leads.len == shape.n_heads);
     std.debug.assert(shape.head_dim >= 4);
     const hd = shape.head_dim;
@@ -91,6 +93,7 @@ pub fn fillAttention(
 
     if (used[1]) std.debug.assert(sink_t < t_len);
 
+    // Set the k side of each lead.
     const span: f32 = @floatFromInt(@max(t_len, 2) - 1);
     for (0..t_len) |t| {
         for (0..shape.n_kv_heads) |kv_h| {
@@ -110,9 +113,8 @@ pub fn fillAttention(
     }
 }
 
-/// Fill one row, then demand that the row of `Kernels` and, when
-/// `with_oracle` is set, the scalar oracle stay inside `row_abs_tol` of the
-/// f64 reference.
+/// Fill one row, then demand that the row of `Kernels` and, when `with_oracle` is set, the
+/// scalar oracle stay inside `row_abs_tol` of the f64 reference.
 pub fn expectRowNearF64(
     comptime Kernels: type,
     comptime E: type,
@@ -147,10 +149,13 @@ pub fn expectRowNearF64(
     const ref_out = try gpa.alloc(f64, nh * hd);
     defer gpa.free(ref_out);
 
+    // Run the kernel row and the f64 reference on the same inputs.
     fillAttention(E, r, shape, t_len, leads, 0, q, k, v);
     try expectLeadProfiles(E, q, k, shape, leads, 0, 0, t_len);
     Kernels.attentionRowTyped(E, q, nh, hd, k, v, shape.n_kv_heads, t_len, parts, out);
     attentionRefF64(E, q, nh, hd, k, v, shape.n_kv_heads, t_len, ref_scores, ref_out);
+
+    // Compare the errors with the bound.
     const row_err = maxAbsErr(out, ref_out);
     var oracle_err: f64 = 0;
     if (with_oracle) {
@@ -165,8 +170,8 @@ pub fn expectRowNearF64(
     try std.testing.expect(oracle_err <= row_abs_tol);
 }
 
-/// Run one part of `Kernels` over the heads `[h_lo, h_hi)`, then each head
-/// alone, and demand the same record bytes.
+/// Run one part of `Kernels` over the heads `[h_lo, h_hi)`, then each head alone, and demand
+/// the same record bytes.
 pub fn expectPartMatchesSingleHeads(
     comptime Kernels: type,
     comptime E: type,
@@ -201,6 +206,7 @@ pub fn expectPartMatchesSingleHeads(
     const single = try gpa.alloc(f32, rec_len);
     defer gpa.free(single);
 
+    // Run the whole head range at once.
     fillAttention(E, r, shape, t_hi, leads, sink_t, q, k, v);
     try expectLeadProfiles(E, q, k, shape, leads, sink_t, t_lo, t_hi);
     Kernels.attentionPartTyped(
@@ -218,6 +224,8 @@ pub fn expectPartMatchesSingleHeads(
         recs,
         rec_stride,
     );
+
+    // Run each head alone and compare the record bytes.
     for (h_lo..h_hi) |h| {
         Kernels.attentionPartTyped(
             E,
@@ -243,11 +251,9 @@ pub fn expectPartMatchesSingleHeads(
     }
 }
 
-/// Fill one row, then demand that every kernel set in `kernel_sets` gives the
-/// bits of the serial row of the first set: serial, through the attention
-/// control unit on one thread, and fanned out at 2, 3, 4, and 16 threads.
-/// Garbage in the partial buffer before each call proves that every record the
-/// merge reads comes from that call.
+/// Fill one row, then demand that every kernel set in `kernel_sets` gives the bits of the
+/// serial row of the first set, serial, on one thread, and fanned out at 2, 3, 4, and 16.
+/// Garbage in the partial buffer before each call proves that the merge reads only fresh records.
 pub fn expectFanOutMatchesRow(
     comptime kernel_sets: anytype,
     comptime E: type,
@@ -278,9 +284,12 @@ pub fn expectFanOutMatchesRow(
     const out = try gpa.alloc(f32, nh * hd);
     defer gpa.free(out);
 
+    // Take the serial row of the first set as the expected bits.
     fillAttention(E, r, shape, t_len, &.{}, 0, q, k, v);
 
     kernel_sets[0].attentionRowTyped(E, q, nh, hd, k, v, shape.n_kv_heads, t_len, parts, out_row);
+
+    // Check every set, serial first and then fanned out.
     const thread_counts = [_]u32{ 1, 2, 3, 4, 16 };
     inline for (kernel_sets) |Kernels| {
         for (parts) |*x| {
@@ -330,10 +339,8 @@ pub fn expectFanOutMatchesRow(
 
 // -- helpers ----------------------------------------------------------------
 
-/// Test reference: the full attention row in f64. The dot, the maximum, the
-/// exponentials, the sums, and the output are f64, and the f16 widening is
-/// exact. So the gap between an f32 kernel and this reference is the kernel
-/// error.
+/// Test reference: the full attention row in f64, with exact f16 widening.
+/// So the gap between an f32 kernel and this reference is the kernel error.
 fn attentionRefF64(
     comptime E: type,
     q: []const f32,
@@ -384,10 +391,9 @@ fn attentionRefF64(
     }
 }
 
-/// Test reference: the full f32 attention row of every query head, one head
-/// at a time. It keeps the whole score row in `scratch`, runs one
-/// softmax, then sums the weighted values. It widens element by element and
-/// blocks no group. The row tests hold it to the same f64 bound as the part row.
+/// Test reference: the full f32 attention row of every query head, one head at a time.
+/// It keeps the whole score row in `scratch`, runs one softmax, and blocks no group.
+/// The row tests hold it to the same f64 bound as the part row.
 fn attentionRowScalarOracle(
     comptime E: type,
     q: []const f32,
@@ -453,8 +459,7 @@ fn expectLeadProfiles(
         switch (lead) {
             .none => {},
             .ramp => {
-                // Every tile raises the maximum, so every tile after the first
-                // tile of a part rescales.
+                // Every tile raises the maximum, so each tile after the first rescales.
                 var before = -std.math.inf(f64);
                 var tile_lo = t_lo;
                 while (tile_lo < t_hi) : (tile_lo += cpu_tile) {
@@ -498,8 +503,7 @@ fn maxAbsErr(got: []const f32, want: []const f64) f64 {
     return worst;
 }
 
-/// In-place softmax over the whole slice, shifted by the maximum. Only the
-/// scalar full-row oracle runs it.
+/// In-place softmax over the whole slice, shifted by the maximum. Only the oracle runs it.
 fn softmaxInplace(x: []f32) void {
     if (x.len == 0) return;
 

@@ -1,24 +1,22 @@
-//! Chunked-prefill gate for the CPU runners. A prompt fed through
-//! `prefillBatch` in chunks must give the same last-row logits, bit for bit,
-//! and the same greedy continuation as the prompt fed one token at a time
-//! through `step`.
+//! Chunked-prefill gate for the CPU runners. A prompt fed through `prefillBatch` in chunks must
+//! give the same last-row logits, bit for bit, and the same greedy continuation as the prompt fed
+//! one token at a time through `step`.
 //!
-//! The reference path runs `step` per token at one thread with `max_rows = 0`,
-//! the shape of the per-token prefill. The chunked paths run chunks of 1, 17,
-//! and 64 rows over a 70-token prompt, so a chunk boundary falls inside and
-//! outside the 4-row groups of the batch kernel. Each chunked path runs at one
-//! thread and at four threads with the fan-out forced on.
+//! Legs. The reference path runs `step` per token at one thread with `max_rows = 0`, the shape of
+//! the per-token prefill. The chunked paths run chunks of 1, 17, and 64 rows over a 70-token
+//! prompt, so a chunk boundary falls inside and outside the 4-row groups of the batch kernel. Each
+//! chunked path runs at one thread and at four threads with the fan-out forced on.
 //!
-//! The SmolLM2 and Qwen3.5-2B fixtures come from `test_fixtures.path`.
+//! Fixtures. The SmolLM2 and Qwen3.5-2B fixtures come from `test_fixtures.path`.
 
 const std = @import("std");
-const z = @import("zigferencer");
-const tp = @import("test_policy.zig");
-const loader = z.loader;
-const vocab_mod = z.vocab;
-const bpe = z.bpe;
-const LlamaRunner = z.llama_runner.LlamaRunner;
-const QwenRunner = z.qwen_runner.QwenRunner;
+const zigferencer = @import("zigferencer");
+const test_policy = @import("test_policy.zig");
+const loader = zigferencer.loader;
+const vocab_mod = zigferencer.vocab;
+const bpe = zigferencer.bpe;
+const LlamaRunner = zigferencer.llama_runner.LlamaRunner;
+const QwenRunner = zigferencer.qwen_runner.QwenRunner;
 
 // -- fixtures ---------------------------------------------------------------
 
@@ -31,14 +29,14 @@ const n_prompt: usize = 70;
 const n_decode: usize = 8;
 const max_seq: u32 = 256;
 const chunk_sizes = [_]u32{ 1, 17, 64 };
-const serial_policy: tp.Policy = .{ .n_threads = 1 };
-const forced_policy: tp.Policy = .{ .n_threads = 4, .min_parallel_flops = 0 };
+const serial_policy: test_policy.Policy = .{ .n_threads = 1 };
+const forced_policy: test_policy.Policy = .{ .n_threads = 4, .min_parallel_flops = 0 };
 
 comptime {
     // The widest chunk here is the production chunk, and the prompt spans
     // more than one of them, so a short tail attends to a full chunk.
-    std.debug.assert(chunk_sizes[chunk_sizes.len - 1] == z.limits.cpu_prefill_chunk);
-    std.debug.assert(n_prompt > z.limits.cpu_prefill_chunk);
+    std.debug.assert(chunk_sizes[chunk_sizes.len - 1] == zigferencer.limits.cpu_prefill_chunk);
+    std.debug.assert(n_prompt > zigferencer.limits.cpu_prefill_chunk);
     std.debug.assert(n_prompt + n_decode <= max_seq);
 }
 
@@ -63,11 +61,11 @@ fn decodeTail(
     pos: u32,
     out: *[n_decode]u32,
 ) !void {
-    var tok = z.sampler.greedy(logits);
+    var tok = zigferencer.sampler.greedy(logits);
     for (out, 0..) |*o, k| {
         o.* = tok;
         const lg = try runner.step(tok, pos + @as(u32, @intCast(k)));
-        tok = z.sampler.greedy(lg);
+        tok = zigferencer.sampler.greedy(lg);
     }
 }
 
@@ -79,14 +77,14 @@ fn referenceLeg(
     ids: []const u32,
 ) !Outcome {
     const io = std.testing.io;
-    var cpu_pool: tp.Pool = undefined;
-    try tp.startPool(&cpu_pool, io, serial_policy);
+    var cpu_pool: test_policy.Pool = undefined;
+    try test_policy.startPool(&cpu_pool, io, serial_policy);
     defer cpu_pool.deinit();
 
     var runner = try Runner.init(
         arena,
         loaded,
-        z.kv_budget.pinned(1, max_seq),
+        zigferencer.kv_budget.pinned(1, max_seq),
         0,
         io,
         &cpu_pool,
@@ -111,24 +109,24 @@ fn chunkedLeg(
     loaded: *const loader.Loaded,
     ids: []const u32,
     chunk: u32,
-    policy: tp.Policy,
+    policy: test_policy.Policy,
 ) !Outcome {
     const io = std.testing.io;
-    var cpu_pool: tp.Pool = undefined;
-    try tp.startPool(&cpu_pool, io, policy);
+    var cpu_pool: test_policy.Pool = undefined;
+    try test_policy.startPool(&cpu_pool, io, policy);
     defer cpu_pool.deinit();
 
     var runner = try Runner.init(
         arena,
         loaded,
-        z.kv_budget.pinned(1, max_seq),
-        z.limits.cpu_prefill_chunk,
+        zigferencer.kv_budget.pinned(1, max_seq),
+        zigferencer.limits.cpu_prefill_chunk,
         io,
         &cpu_pool,
         policy,
         .f32,
     );
-    try std.testing.expectEqual(z.limits.cpu_prefill_chunk, runner.prefill_batch_max);
+    try std.testing.expectEqual(zigferencer.limits.cpu_prefill_chunk, runner.prefill_batch_max);
     var pos: u32 = 0;
     var last: []f32 = undefined;
     var calls: u32 = 0;
@@ -153,7 +151,7 @@ fn expectChunksMatch(
 ) !void {
     const ids = try promptIds(arena, loaded);
     const ref = try referenceLeg(Runner, arena, loaded, ids);
-    for ([_]tp.Policy{ serial_policy, forced_policy }) |policy| {
+    for ([_]test_policy.Policy{ serial_policy, forced_policy }) |policy| {
         for (chunk_sizes) |chunk| {
             const got = try chunkedLeg(Runner, arena, loaded, ids, chunk, policy);
             // Bytes, not floats: the claim is bit identity, NaN included.
@@ -174,7 +172,7 @@ test "llama chunked prefill is bit-identical to per-token step" {
     defer arena_state.deinit();
 
     const arena = arena_state.allocator();
-    const fixture = try z.test_fixtures.path(arena, "SmolLM2-135M-Instruct-Q8_0");
+    const fixture = try zigferencer.test_fixtures.path(arena, "SmolLM2-135M-Instruct-Q8_0");
     var loaded = try loader.load(std.testing.io, arena, fixture);
     defer loaded.close();
 
@@ -186,7 +184,7 @@ test "qwen chunked prefill is bit-identical to per-token step" {
     defer arena_state.deinit();
 
     const arena = arena_state.allocator();
-    const fixture = try z.test_fixtures.path(arena, "Qwen3.5-2B-Q8_0");
+    const fixture = try zigferencer.test_fixtures.path(arena, "Qwen3.5-2B-Q8_0");
     var loaded = try loader.load(std.testing.io, arena, fixture);
     defer loaded.close();
 
@@ -199,19 +197,19 @@ test "llama stepBatch and prefillBatch refuse rows past the row scratch" {
     defer arena_state.deinit();
 
     const arena = arena_state.allocator();
-    const fixture = try z.test_fixtures.path(arena, "SmolLM2-135M-Instruct-Q8_0");
+    const fixture = try zigferencer.test_fixtures.path(arena, "SmolLM2-135M-Instruct-Q8_0");
     var loaded = try loader.load(io, arena, fixture);
     defer loaded.close();
 
     // One slot and `max_rows = 0` hold one row of scratch.
-    var cpu_pool: tp.Pool = undefined;
-    try tp.startPool(&cpu_pool, io, serial_policy);
+    var cpu_pool: test_policy.Pool = undefined;
+    try test_policy.startPool(&cpu_pool, io, serial_policy);
     defer cpu_pool.deinit();
 
     var runner = try LlamaRunner.init(
         arena,
         &loaded,
-        z.kv_budget.pinned(1, max_seq),
+        zigferencer.kv_budget.pinned(1, max_seq),
         0,
         io,
         &cpu_pool,
@@ -220,7 +218,7 @@ test "llama stepBatch and prefillBatch refuse rows past the row scratch" {
     );
     try std.testing.expectEqual(@as(u32, 1), runner.max_rows);
     try std.testing.expectEqual(@as(u32, 1), runner.prefill_batch_max);
-    const two = [_]z.step_row.StepRow{
+    const two = [_]zigferencer.step_row.StepRow{
         .{ .slot = 0, .token = 1, .pos = 0, .want_logits = false },
         .{ .slot = 0, .token = 1, .pos = 1, .want_logits = true },
     };
@@ -236,18 +234,18 @@ test "qwen stepBatch and prefillBatch refuse rows past the row scratch" {
     defer arena_state.deinit();
 
     const arena = arena_state.allocator();
-    const fixture = try z.test_fixtures.path(arena, "Qwen3.5-2B-Q8_0");
+    const fixture = try zigferencer.test_fixtures.path(arena, "Qwen3.5-2B-Q8_0");
     var loaded = try loader.load(io, arena, fixture);
     defer loaded.close();
 
-    var cpu_pool: tp.Pool = undefined;
-    try tp.startPool(&cpu_pool, io, serial_policy);
+    var cpu_pool: test_policy.Pool = undefined;
+    try test_policy.startPool(&cpu_pool, io, serial_policy);
     defer cpu_pool.deinit();
 
     var runner = try QwenRunner.init(
         arena,
         &loaded,
-        z.kv_budget.pinned(1, max_seq),
+        zigferencer.kv_budget.pinned(1, max_seq),
         0,
         io,
         &cpu_pool,
@@ -255,7 +253,7 @@ test "qwen stepBatch and prefillBatch refuse rows past the row scratch" {
         .f32,
     );
     try std.testing.expectEqual(@as(u32, 1), runner.max_rows);
-    const two = [_]z.step_row.StepRow{
+    const two = [_]zigferencer.step_row.StepRow{
         .{ .slot = 0, .token = 1, .pos = 0, .want_logits = false },
         .{ .slot = 0, .token = 1, .pos = 1, .want_logits = true },
     };

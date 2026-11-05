@@ -1,28 +1,39 @@
-//! The KV budget planner: byte budgets in, `n_slots x window` out. It is pure:
-//! no allocation, no device query, no I/O. One arithmetic therefore serves both
-//! the plan and the preflight, and any caller can replay it in a test.
+//! The KV budget planner: byte budgets in, `n_slots x window` out. It is pure: no allocation, no
+//! device query, no I/O. One arithmetic serves both the plan and the preflight, and any caller can
+//! replay it in a test.
 //!
-//! Two modes exist. Mode A takes a VRAM byte budget X. Alone, X buys slots at
-//! the resolved window. With a slot count beside it (`--vram-slots`), the count
-//! is pinned and the window follows the money instead. Mode B has no budget:
-//! the caller's structure passes through and the window is the serve default.
-//! Degenerate input therefore yields the shipped shapes, which keeps the
-//! decoded token hashes stable.
+//! Modes. Mode A takes a VRAM byte budget X. Alone, X buys slots at the resolved window. With a
+//! slot count beside it (`--vram-slots`), the count is pinned and the window follows the money.
+//! Mode B has no budget: the caller's structure passes through and the window is the serve
+//! default. Degenerate input therefore yields the shipped shapes, which keeps the decoded token
+//! hashes stable.
 //!
-//! The window policy has two ceilings. The model ceiling is `Caps.model_ctx`
-//! under the engine bound, and a named window past it is a refusal, never a
-//! clamp. The default ceiling also caps at the `run` default of the model, and
-//! the money window stops there when the request names no window. The caller
-//! fills both default windows from `defaultWindow`, a byte budget per session.
+//! Window policy. The window has two ceilings. The model ceiling is `Caps.model_ctx` under the
+//! engine bound, and a named window past it is a refusal, never a clamp. The default ceiling also
+//! caps at the `run` default of the model, and the money window stops there when the request names
+//! no window. The caller fills both default windows from `defaultWindow`, a byte budget per
+//! session.
 //!
-//! A second planner shares the file, and the same usable-VRAM rule. It prices
-//! one weight placement: the host layers take the prefix `[0..split)` and the
-//! GPU layers take the suffix `[split..n_layers)`. It reads the KV structure
-//! the first planner resolved, so it never derives a window or a slot count of
-//! its own. That placement planner takes a per-layer price vector, so a family
-//! whose layers differ in price is priced by span instead of by one product.
-//! The placement planner also prices the host RAM of the split, and it refuses
-//! a split whose anonymous host bytes pass the usable share of the free RAM.
+//! Placement planner. A second planner shares the file and the same usable-VRAM rule. It prices
+//! one weight placement: the host layers take the prefix `[0..split)` and the GPU layers take the
+//! suffix `[split..n_layers)`. It reads the KV structure the first planner resolved, so it never
+//! derives a window or a slot count of its own. It takes a per-layer price vector, so a family
+//! whose layers differ in price is priced by span instead of by one product. It also prices the
+//! host RAM of the split, and it refuses a split whose anonymous host bytes pass the usable share
+//! of the free RAM.
+//!
+//! Overflow ledger. The window is at most 2^18 (`limits.max_model_ctx`). The per-token column sums
+//! to at most 2^30 and the fixed column to at most 2^32. So one slot's span stays under 2^49. The
+//! slot count is at most 2^7 (`limits.max_vram_slots`), so `kv_vram` stays under 2^56.
+//!
+//! RAM fit formula. The host spend is linear in the window w: spend(w) = P * w + F. P sums the
+//! per-token bytes the vector holds per position: `n_slots` copies of the host prefix, plus
+//! `blobs` copies of the whole model when the blobs grow with the window. F sums the fixed slabs
+//! of the same tiers plus a constant that the caller states: the stage pair, the prefix, and a blob
+//! share that the window does not move. The stage pair is constant, because a stage holds at most
+//! one chunk, and the stage at the refused window bounds the stage at any narrower one. So the
+//! widest w with P * w + F within the usable RAM is floor((usable - F) / P), and no search is
+//! needed.
 
 const std = @import("std");
 const dtype = @import("dtype.zig");
@@ -94,9 +105,7 @@ pub const Caps = struct {
     vram_free: u64,
     weights: u64,
     logits: u64,
-    /// Device bytes of the runner's activation scratch (the per-row forward
-    /// buffers). A named reservation, so the derived budget and the preflight
-    /// count it instead of assuming the usable-VRAM reserve absorbs it.
+    /// Device bytes of the activation scratch. Named, so the budget and the preflight count it.
     scratch: u64 = 0,
     /// The model ceiling the caller resolved through `limits.contextCeiling`.
     model_ctx: u32,
@@ -173,15 +182,10 @@ pub const KvPlan = struct {
     vram: Vram,
     ram: Ram,
     n_slots: u32,
-    /// The decode width this plan serves: rows advanced per tick. At most
-    /// `n_slots`, because a decode row occupies a slot, and at most
-    /// `limits.max_batch`. The slot count can exceed it: breadth is bought,
-    /// width is stepped.
+    /// Decode rows per tick, at most `n_slots` (a row holds a slot) and `limits.max_batch`.
     n_streams: u32,
     window: u32,
-    /// True when the physical slot ceiling cut the count the money bought. It
-    /// is witness plumbing for the cap-and-signal rule: the caller prints the
-    /// clamp and the bytes it stranded, which the silent `min` never stated.
+    /// True when the slot ceiling cut the count the money bought. The caller prints the clamp.
     slots_clamped: bool = false,
 };
 
@@ -307,19 +311,14 @@ pub const PlacementPlan = struct {
     /// vector passes the usable RAM, and the stages price zero for a caller
     /// without residency.
     pub const Ram = struct {
-        /// The KV plan splits Y before a placement exists, and the split never
-        /// reads one. This planner therefore carries both shares and derives
-        /// neither.
+        /// The KV plan splits Y before a placement exists, so this planner carries both shares.
         blobs: u64,
         prefix: u64,
         /// `kv_host` under a second name, so the host ledger reads whole from
         /// one vector.
         host_kv: u64,
-        /// Both swap staging buffers at high water. One stage holds one chunk
-        /// of `limits.swap_stage_chunk_bytes`, or the whole device span of one
-        /// slot when that span is smaller, so the figure stops growing with
-        /// the window. Only a residency pool evicts and restores, so a caller
-        /// without one prices zero here.
+        /// Both swap stages at high water: one chunk of `limits.swap_stage_chunk_bytes` each, or
+        /// one slot span when smaller. Zero without a residency pool.
         swap_stages: u64,
 
         /// The anonymous host bytes the placement spends: the figure the RAM
@@ -332,17 +331,12 @@ pub const PlacementPlan = struct {
 
     split: u32,
     n_layers: u32,
-    /// Weight bytes of the GPU suffix. Every GPU layer is resident, so a
-    /// streamed class costs nothing here. A placement that puts any layer on
-    /// the device runs the final norm and the lm_head there too, so the head
-    /// bytes join this figure as well.
+    /// Weight bytes of the GPU suffix, resident. Any GPU layer adds the final norm and lm_head.
     weight_resident: u64,
     kv_vram: u64,
     kv_host: u64,
     ram: Ram,
-    /// The usable share of the free RAM that funded `ram`. `priced` is its
-    /// only writer, so a plan from `placementPlan` holds null, and so does a
-    /// quote of unknown free RAM.
+    /// The usable share of free RAM that funded `ram`. Null from `placementPlan` or unknown RAM.
     ram_usable: ?u64,
     logits: u64,
     scratch: u64,
@@ -428,10 +422,7 @@ pub const HostRequest = struct {
     /// The Y split the KV plan already ran. It goes into the host vector, so
     /// one value states the whole host ledger.
     ram_split: KvPlan.Ram,
-    /// True only for a caller with a residency pool. Such a pool evicts and
-    /// restores sessions, and it snapshots and restores prefixes through the
-    /// same copy path, so only it grows the two swap stages. A pool with more
-    /// logical sessions than slots must state it.
+    /// True for a caller with a residency pool, the only one that grows the two swap stages.
     residency: bool,
 };
 
@@ -510,9 +501,7 @@ pub const BlobRefusal = struct {
     /// The widest window whose whole vector, blobs included, fits the usable
     /// RAM. Null when no window at or over the window floor fits.
     fit_window: ?u32,
-    /// The most logical sessions whose blob need fits beside the rest of the
-    /// vector. Null when no evictable session fits, and the text then names
-    /// the slot count.
+    /// The most logical sessions whose blobs fit beside the rest. Null when none fit.
     fit_sessions: ?u32,
 };
 
@@ -580,28 +569,23 @@ pub const VramRefusal = struct {
 
 // -- api --------------------------------------------------------------------
 
-/// Plan the KV economy. Both refusals are loud on purpose. A named window past
-/// the model ceiling is a request the model cannot serve, never a silent clamp.
-/// A budget that cannot host one decode row per tick is a configuration
-/// mistake, never a silent downgrade to a narrower batch.
+/// Plan the KV economy. A named window past the model ceiling is a refusal, never a clamp.
+/// A budget that cannot host one decode row per tick is a refusal, never a narrower batch.
 pub fn kvPlan(
     caps: Caps,
     cost: KvCostModel,
     req: Request,
 ) error{ KvVramBudgetTooSmall, WindowExceedsCeiling }!KvPlan {
+    // Check the caps and the request.
     std.debug.assert(req.batch >= 1);
     std.debug.assert(req.batch <= limits.max_batch);
     std.debug.assert(req.batch <= caps.max_batch);
-    // A decode row needs a slot to sit in, and a slot count over the physical
-    // ceiling is a caller mistake. Both bounds also keep the byte products
-    // inside a `u64`.
+    // A decode row needs a slot to sit in. Both bounds also keep the byte products inside a `u64`.
     std.debug.assert(caps.max_batch <= caps.max_vram_slots);
     std.debug.assert(caps.max_vram_slots <= limits.max_vram_slots);
     std.debug.assert(caps.max_model_ctx <= limits.max_model_ctx);
     std.debug.assert(caps.model_ctx >= 1);
-    // The caller derives both default windows at one ceiling. The serve budget
-    // sits under the run budget, so the serve default never passes the default
-    // ceiling.
+    // The serve budget sits under the run budget, so the serve default stays under the ceiling.
     std.debug.assert(caps.serve_default >= 1);
     std.debug.assert(caps.serve_default <= caps.default_ceil);
     std.debug.assert(cost.kv_bytes_per_token <= max_kv_bytes_per_token);
@@ -622,6 +606,7 @@ pub fn kvPlan(
         std.debug.assert(n <= limits.max_logical_sessions);
     }
 
+    // Resolve the window, then the slots that fund it.
     const window = try resolveWindow(caps, cost, req);
     const slots = resolveSlots(caps, cost, req, window) orelse
         return error.KvVramBudgetTooSmall;
@@ -641,8 +626,7 @@ pub fn kvPlan(
         .slots_clamped = slots.clamped,
     };
 
-    // The window never exceeds the ceiling, in either mode, and the decode
-    // width always has a slot per row.
+    // Check the plan against the request.
     std.debug.assert(plan.window <= windowCeil(caps));
     std.debug.assert(plan.n_streams <= plan.n_slots);
     if (req.window) |w| {
@@ -664,6 +648,7 @@ pub fn kvPlan(
         std.debug.assert(plan.n_slots == caps.max_vram_slots);
     }
 
+    // Check the budget.
     if (req.x_bytes) |x| {
         // Mode A never spends more KV bytes than the budget.
         std.debug.assert(plan.vram.kv <= x);
@@ -678,9 +663,9 @@ pub fn kvPlan(
         std.debug.assert(plan.n_slots == (req.slots orelse req.batch));
     }
 
+    // Check the RAM split.
     if (req.y_bytes != null and req.n_logical != null) {
-        // The split spends Y whole, and the prefix cache takes only what the
-        // blob ledger cannot reach.
+        // The split spends Y whole. The prefix cache takes only what the blobs cannot reach.
         std.debug.assert(plan.ram.blobs + plan.ram.prefix == req.y_bytes.?);
 
         if (plan.ram.prefix > 0) {
@@ -696,10 +681,8 @@ pub fn kvPlan(
     return plan;
 }
 
-/// A plan that states a shape and reserves no device bytes. A CPU runner holds
-/// its KV in host memory, and a bench or a test that fixes a shape needs no
-/// budget, so neither has bytes to plan. A device runner must come through
-/// `kvPlan`, whose reservations its preflight checks.
+/// A plan that states a shape and reserves no device bytes, for a CPU runner or a bench that fixes
+/// a shape. A device runner must come through `kvPlan`, whose reservations its preflight checks.
 pub fn pinned(n_slots: u32, window: u32) KvPlan {
     std.debug.assert(n_slots >= 1);
     std.debug.assert(n_slots <= limits.max_vram_slots);
@@ -733,13 +716,9 @@ pub fn quote(caps: Caps, cost: KvCostModel, req: Request) error{WindowExceedsCei
     return .{ .window = window, .per_slot_bytes = perSlotBytes(cost, window) };
 }
 
-/// What one KV slot costs, for either family, from the model dimensions. This
-/// is the one home of the per-family price, so the CLI can size a default
-/// window before any runner exists. A uniform family charges one K row and one
-/// V row per layer per token. A hybrid family charges them on its
-/// full-attention layers alone, and each recurrent layer holds a fixed state
-/// and conv ring per slot. The fixed state stays f32 under any KV dtype, so a
-/// narrower dtype moves the per-token column alone.
+/// What one KV slot costs, from the model dimensions, before any runner exists. A uniform family
+/// charges one K row and one V row per layer per token. A hybrid family charges them on its
+/// full-attention layers alone. Its recurrent state stays f32 under any KV dtype.
 pub fn costModel(shape: KvShape, kv_dtype: dtype.KvDtype) KvCostModel {
     std.debug.assert(shape.n_layers >= 1);
     std.debug.assert(shape.n_layers <= limits.max_layers);
@@ -771,11 +750,9 @@ pub fn costModel(shape: KvShape, kv_dtype: dtype.KvDtype) KvCostModel {
     return cost;
 }
 
-/// The window of a session that no flag names: the session byte budget in
-/// whole granules, floored at `limits.min_kv_window`, and capped by the
-/// model ceiling. A family with no per-token cost gets the whole ceiling. The
-/// fixed per-slot state stays outside the budget, because it does not grow
-/// with the window.
+/// The window of a session that no flag names: the session byte budget in whole granules,
+/// floored at `limits.min_kv_window`, and capped by the ceiling. Fixed state stays outside.
+/// A family with no per-token cost gets the whole ceiling.
 pub fn defaultWindow(cost: KvCostModel, ceiling: u32, session_bytes: u64) u32 {
     std.debug.assert(ceiling >= 1);
     std.debug.assert(ceiling <= limits.max_model_ctx);
@@ -811,12 +788,9 @@ pub fn defaultWindows(cost: KvCostModel, ceiling: u32) DefaultWindows {
     return windows;
 }
 
-/// The widest window, at most `window`, whose plan for `n_slots` slots fits the
-/// derived budget: the money window at `derivedX(caps)` under the cap
-/// `window`. A caller shrinks a default window with it when that window does
-/// not fit the live budget. The result floors at `min_window`, so a budget
-/// that cannot fund the floor still gets the floor, and the preflight then
-/// refuses it.
+/// The widest window, at most `window`, that the derived budget funds for `n_slots` slots. The
+/// result floors at `min_window`, so a budget below the floor still gets it, and the preflight
+/// then refuses it.
 pub fn fitWindow(caps: Caps, cost: KvCostModel, n_slots: u32, window: u32) u32 {
     std.debug.assert(n_slots >= 1);
     std.debug.assert(n_slots <= caps.max_vram_slots);
@@ -838,13 +812,9 @@ pub fn fitWindow(caps: Caps, cost: KvCostModel, n_slots: u32, window: u32) u32 {
     return fit;
 }
 
-/// The widest window under a refused `window` whose plan for `n_slots` slots
-/// fits the usable share of `available` beside the `reserved` bytes. A VRAM
-/// refusal names it as the window to ask for. The result never drops under
-/// `limits.min_kv_window`, because the planner floors every window there and a
-/// smaller suggestion contradicts it. Null means that no window in
-/// `min_kv_window..window-1` fits, or that the model has no per-token cost to
-/// shrink.
+/// The widest window under a refused `window` whose plan for `n_slots` slots fits the usable
+/// share of `available` beside `reserved`. Null means that no window in
+/// `min_kv_window..window-1` fits, or that the model has no per-token cost.
 pub fn largestFittingWindow(
     available: u64,
     reserved: u64,
@@ -886,26 +856,15 @@ pub fn windowCeil(caps: Caps) u32 {
     return @min(caps.model_ctx, caps.max_model_ctx);
 }
 
-/// The default VRAM budget for KV when no flag names one: what usable VRAM
-/// leaves after the weights, the logits, and the activation scratch. It
-/// saturates, so an over-subscribed device yields zero and the planner then
-/// refuses.
+/// The default KV VRAM budget: usable VRAM less the weights, the logits, and the scratch. It
+/// saturates, so an over-subscribed device yields zero and the planner refuses.
 pub fn derivedX(caps: Caps) u64 {
     return usable(caps) -| caps.weights -| caps.logits -| caps.scratch;
 }
 
-/// Bytes one slot holds over the layer span `[from..to)`: the window price of
-/// every token position, plus the fixed state the span holds at any position.
-///
-/// The device suffix form is the blob half that one swap moves, which
-/// `llama_hybrid.deviceSwapBytes` reaches at `n_rows == window`. A stage holds
-/// at most one chunk of it (`stageBytes`). The figure stays per slot and
-/// multiplies up, and no caller divides it back out of `kv_vram`.
-///
-/// The overflow ledger: the window is at most 2^18 (`limits.max_model_ctx`), the
-/// per-token column sums to at most 2^30, and the fixed column to at most 2^32,
-/// so one slot's span stays under 2^49. The slot count is at most 2^7
-/// (`limits.max_vram_slots`), so `kv_vram` stays under 2^56.
+/// Bytes one slot holds over the layer span `[from..to)`: the window price of every token
+/// position, plus the fixed state. The device suffix form is the blob half that one swap moves
+/// (`llama_hybrid.deviceSwapBytes` at `n_rows == window`). See "Overflow ledger" in the header.
 pub fn slotSpanBytes(kv: KvStructure, from: u32, to: u32) u64 {
     std.debug.assert(from <= to);
     std.debug.assert(to <= kv.costs.n_layers);
@@ -934,16 +893,9 @@ pub fn assertStageCap(capacity: u64, chunk: u64, span: u64) void {
     std.debug.assert(capacity <= @min(chunk, span));
 }
 
-/// Clip a copy list to the byte range `[offset, offset + len)` of the packed
-/// host blob. `full` holds the copies of one whole blob in blob order, so the
-/// host side of copy `i` starts where copy `i - 1` ends, at zero for the first.
-/// `to_host` names the host side: the destination for a save, the source for a
-/// restore. The clipped copies address the range from a stage that holds it at
-/// offset zero, and each keeps the device side of its piece. A range can span
-/// several copies, and the clipped pieces tile it once, in order.
-///
-/// `CopyT` is any copy record with the fields `src_offset`, `dst_offset`, and
-/// `size`, so the device copy and a test record share this one arithmetic.
+/// Clip `full`, the copies of one whole blob in blob order, to the blob byte range
+/// `[offset, offset + len)`. The pieces tile the range once. `to_host` is true for a save.
+/// `CopyT` is any record with `src_offset`, `dst_offset`, and `size`.
 pub fn clipCopies(
     comptime CopyT: type,
     full: []const CopyT,
@@ -955,13 +907,14 @@ pub fn clipCopies(
     std.debug.assert(len >= 1);
     std.debug.assert(out.len >= full.len);
 
+    // Clip each copy to the range.
     const end = offset + len;
     var at: u64 = 0;
     var c: usize = 0;
     var clipped: u64 = 0;
     for (full) |copy| {
         const host_offset = if (to_host) copy.dst_offset else copy.src_offset;
-        // The packed blob order: each copy starts where the last one ended.
+        // Each copy starts where the last one ended.
         std.debug.assert(host_offset == at);
         const lo = @max(at, offset);
         const hi = @min(at + copy.size, end);
@@ -984,29 +937,15 @@ pub fn clipCopies(
         at += copy.size;
     }
 
-    // The range lies inside the blob, and the pieces cover it exactly.
+    // Check that the range lies inside the blob and the pieces cover it.
     std.debug.assert(end <= at);
     std.debug.assert(clipped == len);
     return out[0..c];
 }
 
-/// Plan the weight placement against a resolved KV structure. `gpu_layers` is
-/// the pinned count of GPU layers, counted from the top, so it names the split
-/// `n_layers - N`. A null count lets the planner follow the money. `head_bytes`
-/// is the final norm plus the lm_head, which any placement with a GPU layer
-/// uploads whole.
-///
-/// The refusal is loud on purpose: a pinned count the budget cannot fund is a
-/// configuration mistake, never a silent shrink to a narrower suffix.
-///
-/// This planner never reads `caps.weights`. The per-layer vector and the head
-/// figure replace that one scalar total, because a split prices a suffix rather
-/// than the whole.
-///
-/// `host` states the host side, and the plan carries the host vector of the
-/// split. The split never reads it. This planner checks no RAM: `quoteRam` is
-/// the one home of that check, so the caller states no free RAM here and
-/// quotes the split the planner took (`PlacementPlan.priced`).
+/// Plan the weight placement against a resolved KV structure. A null `gpu_layers` follows the
+/// money, and a pinned count that the budget cannot fund is a refusal, never a shrink. It checks
+/// no RAM and never reads `caps.weights`. `head_bytes` is the final norm plus the lm_head.
 pub fn placementPlan(
     caps: Caps,
     weights: []const u64,
@@ -1015,6 +954,7 @@ pub fn placementPlan(
     host: HostRequest,
     gpu_layers: ?u32,
 ) error{WeightsVramBudgetTooSmall}!PlacementPlan {
+    // Check the weights and the KV structure.
     std.debug.assert(weights.len >= 1);
     std.debug.assert(weights.len <= limits.max_layers);
 
@@ -1028,15 +968,13 @@ pub fn placementPlan(
     std.debug.assert(kv.n_slots <= limits.max_vram_slots);
     std.debug.assert(kv.window >= 1);
     std.debug.assert(kv.window <= limits.max_model_ctx);
-    // Two per-layer vectors describe one stack, and neither side trusts the
-    // other.
+    // Two per-layer vectors describe one stack, and neither side trusts the other.
     std.debug.assert(kv.costs.n_layers == weights.len);
-    // The whole-model sums fire the cost ceilings that bound every byte product
-    // below, and the conservation postcondition reads the same value.
+    // The whole-model sums fire the cost ceilings that bound every byte product below.
     const whole = kv.costs.total();
 
+    // Choose the split, and refuse a pin that the budget cannot fund.
     const n_layers: u32 = @intCast(weights.len);
-    // A model cannot put more layers on the GPU than it has.
     if (gpu_layers) |g| std.debug.assert(g <= n_layers);
 
     const split = if (gpu_layers) |g| n_layers - g else autoSplit(caps, weights, head_bytes, kv);
@@ -1048,8 +986,7 @@ pub fn placementPlan(
         return error.WeightsVramBudgetTooSmall;
     }
 
-    // The pure CPU placement runs the head on the host with the layers, so it
-    // is the one split that carries no head bytes.
+    // Price both sides of the split. The pure CPU split carries no head bytes.
     const head_resident: u64 = if (split < n_layers) head_bytes else 0;
     const plan: PlacementPlan = .{
         .split = split,
@@ -1065,7 +1002,7 @@ pub fn placementPlan(
         .window = kv.window,
     };
 
-    // The placement spends inside the usable share.
+    // Check the plan against the budget and the KV structure.
     std.debug.assert(plan.spend() <= usable(caps));
     // One contiguous split covers the model exactly once.
     std.debug.assert(plan.split <= plan.n_layers);
@@ -1081,15 +1018,13 @@ pub fn placementPlan(
     std.debug.assert(plan.window == kv.window);
     std.debug.assert(plan.logits == caps.logits);
     std.debug.assert(plan.scratch == caps.scratch);
-    // The KV plan ran the Y split, so the vector passes it through. A second
-    // derivation here can only disagree with the plan that already ran it.
+
+    // Check the host vector. The KV plan ran the Y split, so the vector passes it through.
     std.debug.assert(plan.ram.blobs == host.ram_split.blobs);
     std.debug.assert(plan.ram.prefix == host.ram_split.prefix);
-    // One host ledger under two names, so the conservation identity above
-    // reads on the vector too.
+    // One host ledger under two names.
     std.debug.assert(plan.ram.host_kv == plan.kv_host);
-    // With residency, the staging pair costs two chunks, or twice one slot's
-    // VRAM KV when that is smaller, and never more than two chunks.
+    // With residency, the staging pair costs at most two chunks.
     if (host.residency) {
         std.debug.assert(
             plan.ram.swap_stages == 2 * stageBytes(slotSpanBytes(kv, split, n_layers)),
@@ -1102,6 +1037,7 @@ pub fn placementPlan(
     // The pure CPU placement holds no device suffix, so it stages nothing.
     if (plan.split == plan.n_layers) std.debug.assert(plan.ram.swap_stages == 0);
 
+    // Check the split against the pin or the auto rule.
     if (gpu_layers) |g| {
         // A pinned count is honored exactly, or refused above.
         std.debug.assert(plan.split == n_layers - g);
@@ -1145,19 +1081,9 @@ pub fn placementQuote(
     };
 }
 
-/// Quote the host RAM of one serve arm at split `k`. The CPU arm is `k ==
-/// n_layers` and the whole-fused arm is `k == 0`, so every arm prices the one
-/// vector of `ramAt`. `kv_ram_named` states whether `--kv-ram` named the Y
-/// that `host.ram_split` carries.
-///
-/// A named blob share stays as named. An unset one funds the full need of
-/// `(evictable + 1)` blobs from the usable RAM that the rest of the vector
-/// leaves, or the quote refuses with `error.BlobRamBudgetTooSmall`. A swap holds
-/// the evicted blob and the restored blob at once, so a smaller budget admits a
-/// schedule that parks a turn until another session closes. The spend check
-/// then refuses a vector past the usable RAM with
-/// `error.HostRamBudgetTooSmall`. `ram_free` is `MemAvailable` at boot, and an
-/// unknown free RAM turns both checks off.
+/// Quote the host RAM of one serve arm at split `k` (CPU arm `k == n_layers`, fused `k == 0`).
+/// An unset blob share funds `(evictable + 1)` blobs or refuses `error.BlobRamBudgetTooSmall`. A
+/// vector past the usable RAM refuses `error.HostRamBudgetTooSmall`. Unknown `ram_free` skips both.
 pub fn quoteRam(
     kv: KvStructure,
     k: u32,
@@ -1177,11 +1103,10 @@ pub fn quoteRam(
     );
 }
 
-/// The RAM refusal of a vector at split `k`. A refusal message reads it, so no
-/// call site rebuilds the arithmetic that refused it. The caller states the
-/// free RAM, because a quote without a RAM figure has nothing to refuse
-/// against. The blob share is the one `host.ram_split` carries.
+/// The RAM refusal of a vector at split `k`, so no call site rebuilds the refusing arithmetic.
+/// The caller states `ram_free`, and the blob share is the one `host.ram_split` carries.
 pub fn ramRefusal(kv: KvStructure, k: u32, host: HostRequest, ram_free: u64) RamRefusal {
+    // Price the vector at the split.
     const n_layers = kv.costs.n_layers;
     std.debug.assert(k <= n_layers);
     std.debug.assert(kv.n_slots >= 1);
@@ -1192,8 +1117,7 @@ pub fn ramRefusal(kv: KvStructure, k: u32, host: HostRequest, ram_free: u64) Ram
     const ram = ramAt(kv, k, n_layers, host);
     // The host KV never prices more than every slot of the whole model.
     std.debug.assert(ram.host_kv <= @as(u64, kv.n_slots) * perSlotBytes(whole, kv.window));
-    // The stage pair is constant in the window, so it joins the fixed term.
-    // The advice keeps headroom and whole granules, and the check stays exact.
+    // Advise a window that fits. The advice keeps headroom, and the check stays exact.
     const fit = adviceFit(
         ramFitWindow(
             kv,
@@ -1203,8 +1127,7 @@ pub fn ramRefusal(kv: KvStructure, k: u32, host: HostRequest, ram_free: u64) Ram
             adviceUsable(usable_ram),
         ),
     );
-    // A refused window passes the usable RAM, so the widest funded window
-    // sits strictly under it.
+    // A refused window passes the usable RAM, so the fit sits under it.
     if (ram.spend() > usable_ram) {
         if (fit) |f| std.debug.assert(f < kv.window);
     }
@@ -1290,7 +1213,7 @@ pub fn formatRamRefusal(buf: []u8, r: RamRefusal) []const u8 {
 
     const mib = 1024 * 1024;
     var w: std.Io.Writer = .fixed(buf);
-    // The buffer holds the widest refusal, so no write can fail.
+    // The buffer holds the widest refusal, so no write can fail. Name the need and the plan.
     w.print(
         "ram budget: the placement needs {d} MiB of RAM, but only {d} MiB of the {d} MiB " ++
             "free are usable. ",
@@ -1308,9 +1231,9 @@ pub fn formatRamRefusal(buf: []u8, r: RamRefusal) []const u8 {
     w.print("The plan serves {d} {s} x {d} positions at gpu {d}/{d} layers. ", .{
         r.n_slots, slotWord(r.n_slots), r.window, r.gpu_layers, r.n_layers,
     }) catch unreachable;
+    // Name the advice.
     if (r.fit) |fit| {
-        // Only a split arm names its layer count. The CPU and the fused arms
-        // take no `--gpu-layers` value to repeat.
+        // Only a split arm names its layer count. The other arms take no `--gpu-layers` value.
         if (r.gpu_layers > 0 and r.gpu_layers < r.n_layers) {
             w.print(
                 "Use --gpu-layers {d} --max-seq {d} or less.",
@@ -1320,8 +1243,7 @@ pub fn formatRamRefusal(buf: []u8, r: RamRefusal) []const u8 {
             w.print("Use --max-seq {d} or less.", .{fit}) catch unreachable;
         }
     } else {
-        // Name only the levers that lower this spend. Fewer slots cut the host
-        // KV, and a lower --kv-ram cuts the blobs and the prefix cache.
+        // Name only the levers that lower this spend.
         const fewer_slots = r.n_slots > 1;
         const lower_y = r.blobs > 0 or r.prefix > 0;
         w.writeAll("No window fits this split. Use ") catch unreachable;
@@ -1343,10 +1265,8 @@ pub fn formatRamRefusal(buf: []u8, r: RamRefusal) []const u8 {
     return text;
 }
 
-/// Write the placement in span form, for example
-/// `placement: 0..24 host, 24..32 resident (gpu 8/32 layers)`. A degenerate
-/// placement drops the empty span. This function writes into the caller's
-/// buffer, so the planner stays free of allocation and of I/O.
+/// Write the placement in span form, such as `placement: 0..24 host, 24..32 resident (gpu 8/32
+/// layers)`, into `buf`. A degenerate placement drops the empty span.
 pub fn formatPlacement(plan: PlacementPlan, buf: []u8) []const u8 {
     std.debug.assert(buf.len >= placement_text_max);
     std.debug.assert(plan.split <= plan.n_layers);
@@ -1375,12 +1295,9 @@ pub fn formatPlacement(plan: PlacementPlan, buf: []u8) []const u8 {
     return text catch unreachable;
 }
 
-/// Write the placement in ledger form, for example
-/// `ledger: 2 slots x 512 window | gpu 3 MiB weights + 5 MiB kv | host 7 MiB kv
-/// + 11 MiB blobs + 13 MiB prefix + 17 MiB stages | ram 48 of 1792 MiB usable`.
-/// The span form names which layers sit where, and this form names what they
-/// cost. This function writes into the caller's buffer, so the planner stays
-/// free of allocation and of I/O.
+/// Write the placement in ledger form, which names what the spans cost, into `buf`: `ledger: 2
+/// slots x 512 window | gpu 3 MiB weights + 5 MiB kv | host 7 MiB kv + 11 MiB blobs + ... | ram
+/// 48 of 1792 MiB usable`.
 pub fn formatLedger(plan: PlacementPlan, buf: []u8) []const u8 {
     std.debug.assert(buf.len >= placement_ledger_text_max);
 
@@ -1407,10 +1324,8 @@ pub fn formatLedger(plan: PlacementPlan, buf: []u8) []const u8 {
     return w.buffered();
 }
 
-/// Write the refusal of a KV plan that the free VRAM cannot hold. One text
-/// serves every runner family, and the optional parts carry the differences.
-/// This function writes into the caller's buffer, so the planner stays free
-/// of allocation and of I/O.
+/// Write the refusal of a KV plan that the free VRAM cannot hold. One text serves every runner
+/// family, and the optional parts carry the differences.
 pub fn formatVramRefusal(buf: []u8, r: VramRefusal) []const u8 {
     std.debug.assert(buf.len >= vram_refusal_text_max);
     std.debug.assert(r.n_slots >= 1);
@@ -1419,7 +1334,7 @@ pub fn formatVramRefusal(buf: []u8, r: VramRefusal) []const u8 {
 
     const mib = 1024 * 1024;
     var w: std.Io.Writer = .fixed(buf);
-    // The buffer holds the widest refusal, so no write can fail.
+    // The buffer holds the widest refusal, so no write can fail. Name the need and the parts.
     w.print(
         "vram budget: the KV plan needs {d} MiB of VRAM, but only {d} MiB of the {d} MiB " ++
             "free are usable. It holds {d} MiB of {s}weights",
@@ -1443,6 +1358,8 @@ pub fn formatVramRefusal(buf: []u8, r: VramRefusal) []const u8 {
     }
 
     w.print(" for {d} slots x {d} positions. ", .{ r.n_slots, r.window }) catch unreachable;
+
+    // Name the advice.
     if (r.fit) |fit| {
         w.print(
             "Use --max-seq {d} or less, or {s}",
@@ -1478,6 +1395,7 @@ fn quoteRamAt(
     ram_free: ?u64,
     chunk: u64,
 ) error{ HostRamBudgetTooSmall, BlobRamBudgetTooSmall }!RamQuote {
+    // Check the split and the sessions.
     const n_layers = kv.costs.n_layers;
     std.debug.assert(k <= n_layers);
     std.debug.assert(kv.n_slots >= 1);
@@ -1485,12 +1403,12 @@ fn quoteRamAt(
     std.debug.assert(kv.window >= 1);
     std.debug.assert(n_logical >= 1);
     std.debug.assert(n_logical <= limits.max_logical_sessions);
-    // Only a residency pool can evict a session. A pool with no evictable
-    // session still snapshots prefixes through the stages.
+    // Only a residency pool can evict a session.
     if (n_logical > kv.n_slots) std.debug.assert(host.residency);
     // An unset flag names no Y, so the KV plan split none into blobs.
     if (!kv_ram_named) std.debug.assert(host.ram_split.blobs == 0);
 
+    // Price the blob tier: named, derived from the RAM left, or unenforced.
     const evictable = n_logical -| kv.n_slots;
     const blob = slotSpanBytes(kv, 0, n_layers);
     const need = blobNeed(n_logical, kv.n_slots, blob);
@@ -1507,14 +1425,14 @@ fn quoteRamAt(
         break :tier .{ .bounded = need };
     };
 
+    // Refuse a vector past the usable RAM.
     if (ram_cap) |ram_usable| {
         if (ram.spend() > ram_usable) return error.HostRamBudgetTooSmall;
     }
 
-    // An accepted quote spends inside the usable RAM.
+    // Check the accepted quote. It spends inside the usable RAM.
     if (ram_cap) |ram_usable| std.debug.assert(ram.spend() <= ram_usable);
-    // The stages need residency and a device suffix, and never pass two
-    // chunks.
+    // The stages need residency and a device suffix, and never pass two chunks.
     if (!host.residency) std.debug.assert(ram.swap_stages == 0);
     if (k == n_layers) std.debug.assert(ram.swap_stages == 0);
 
@@ -1559,6 +1477,7 @@ fn blobRefusalAt(
     ram_free: u64,
     chunk: u64,
 ) BlobRefusal {
+    // Check the split, then price the need against the RAM left.
     const n_layers = kv.costs.n_layers;
     std.debug.assert(host.ram_split.blobs == 0);
     std.debug.assert(k <= n_layers);
@@ -1576,11 +1495,8 @@ fn blobRefusalAt(
     std.debug.assert(fixed +| need > usable_ram);
     const left = usable_ram -| fixed;
 
-    // The need grows by one blob a session. The largest evictable count `E`
-    // with `(E + 1)` blobs inside the RAM left is `left / blob - 1`, and it
-    // serves `n_slots + E` sessions. A count under one names the slot count.
-    // Both fits are advice, so they keep the headroom and the check stays
-    // exact.
+    // The largest evictable count `E` with `(E + 1)` blobs in the RAM left is `left / blob - 1`,
+    // and it serves `n_slots + E` sessions. Both fits keep the headroom.
     const advice_usable = adviceUsable(usable_ram);
     const funded = (advice_usable -| fixed) / blob;
     const fit_sessions: ?u32 = if (funded >= 2) kv.n_slots + @as(
@@ -1590,8 +1506,7 @@ fn blobRefusalAt(
 
     if (fit_sessions) |m| std.debug.assert(m < n_logical);
 
-    // The blobs grow with the window as well. The stage pair is constant, so
-    // it joins the fixed term with the prefix.
+    // Advise the window that fits. The blobs grow with the window, and the stage pair does not.
     const fit_window = adviceFit(
         ramFitWindow(kv, k, evictable + 1, ram.swap_stages +| ram.prefix, advice_usable),
     );
@@ -1637,11 +1552,9 @@ fn windowFits(available: u64, reserved: u64, cost: KvCostModel, n_slots: u32, wi
     return limits.vramPlanFits(reserved +| kv, available);
 }
 
-/// The window a pinned slot count affords under budget X: each slot's share of
-/// X, minus the fixed state, in whole tokens. Clamped to `[min_window, cap]`.
-/// The caller passes the model ceiling under a named window and the default
-/// ceiling without one. Affordability of the floor is `resolveSlots`' refusal,
-/// not a silent shrink here.
+/// The window a pinned slot count affords under budget X: each slot's share of X, minus the fixed
+/// state, in whole tokens. Clamped to `[min_window, cap]`. `resolveSlots` refuses a floor that X
+/// cannot fund.
 fn moneyWindow(caps: Caps, cost: KvCostModel, x: u64, n_slots: u32, cap: u32) u32 {
     std.debug.assert(n_slots >= 1);
     std.debug.assert(cost.kv_bytes_per_token >= 1);
@@ -1657,11 +1570,9 @@ fn moneyWindow(caps: Caps, cost: KvCostModel, x: u64, n_slots: u32, cap: u32) u3
     return window;
 }
 
-/// The window resolves before the slots, because a slot costs one window of
-/// bytes. A named `--max-seq` past the model ceiling is a refusal. A budget
-/// with a pinned slot count takes the money window, which a named window caps
-/// and which otherwise stops at the default ceiling. Everything else takes the
-/// named window or the serve default.
+/// The window resolves before the slots, because a slot costs one window of bytes. A budget with
+/// a pinned slot count takes the money window. Everything else takes the named window or the
+/// serve default.
 fn resolveWindow(caps: Caps, cost: KvCostModel, req: Request) error{WindowExceedsCeiling}!u32 {
     const ceil = windowCeil(caps);
     if (req.window) |w| {
@@ -1679,19 +1590,16 @@ fn resolveWindow(caps: Caps, cost: KvCostModel, req: Request) error{WindowExceed
     return moneyWindow(caps, cost, x, s, implicitCeil(caps));
 }
 
-/// Slots follow the money in mode A, or stand pinned when the request names
-/// them. A null result is a refusal: the budget cannot fund the shape. Mode B
-/// passes the structural request through. Only the money path can clamp,
-/// because a pinned count is honored whole or refused.
+/// Slots follow the money in mode A, or stand pinned when named. Null is a refusal. Mode B passes
+/// the request through. Only the money path can clamp: a pinned count is honored whole or refused.
 fn resolveSlots(caps: Caps, cost: KvCostModel, req: Request, window: u32) ?ResolvedSlots {
     const x = req.x_bytes orelse return .{ .n_slots = req.slots orelse req.batch };
     const per_slot = perSlotBytes(cost, window);
     if (per_slot == 0) return null;
 
     if (req.slots) |s| {
-        // Pinned slots: refuse when X cannot fund them at the resolved window.
-        // `moneyWindow` floors at `min_window`, so an under-funded floor
-        // surfaces here rather than shrinking silently.
+        // Refuse when X cannot fund the pinned slots. `moneyWindow` floors at `min_window`, so an
+        // under-funded floor surfaces here and never shrinks silently.
         if (@as(u64, s) * per_slot > x) return null;
         return .{ .n_slots = s };
     }
@@ -1703,11 +1611,8 @@ fn resolveSlots(caps: Caps, cost: KvCostModel, req: Request, window: u32) ?Resol
     return .{ .n_slots = @intCast(@min(raw, ceiling)), .clamped = raw > ceiling };
 }
 
-/// What the residency blob ledger can reach: one blob per session the slots
-/// cannot hold, plus one transient blob a rotation holds mid-swap. A logical
-/// count at or under the slot count evicts nobody, so it needs no blob at all.
-/// `blob` is one slot of the whole model at the window, the largest blob one
-/// evicted session holds.
+/// What the residency blob ledger can reach: one blob per session the slots cannot hold, plus one
+/// transient blob mid-swap. `blob` is one slot of the whole model at the window.
 fn blobNeed(n_logical: u32, n_slots: u32, blob: u64) u64 {
     const evictable = n_logical -| n_slots;
     if (evictable == 0) return 0;
@@ -1720,10 +1625,8 @@ fn fixedRam(ram: PlacementPlan.Ram) u64 {
     return ram.prefix +| ram.host_kv +| ram.swap_stages;
 }
 
-/// Split the RAM budget Y between the blob ledger and the prefix cache. Bytes
-/// past what the ledger can reach are unreachable there, so they fund the
-/// prefix cache instead. A caller that states no logical count leaves the split
-/// unrun, which keeps the shipped reservation.
+/// Split the RAM budget Y between the blob ledger and the prefix cache. Bytes past what the ledger
+/// can reach fund the prefix cache. A caller with no logical count leaves the split unrun.
 fn splitRam(cost: KvCostModel, req: Request, n_slots: u32, window: u32) KvPlan.Ram {
     const y = req.y_bytes orelse return .{ .blobs = 0, .prefix = 0 };
     const n_logical = req.n_logical orelse return .{ .blobs = y, .prefix = 0 };
@@ -1731,17 +1634,8 @@ fn splitRam(cost: KvCostModel, req: Request, n_slots: u32, window: u32) KvPlan.R
     return .{ .blobs = blobs, .prefix = y - blobs };
 }
 
-/// The widest window the usable RAM funds at split `k`.
-///
-/// The spend is linear in the window w: spend(w) = P * w + F. P sums the
-/// per-token bytes the vector holds per position: `n_slots` copies of the host
-/// prefix, plus `blobs` copies of the whole model when the blobs grow with the
-/// window. F sums the fixed slabs of the same tiers plus `constant`, which the
-/// caller states: the stage pair, the prefix, and a blob share that the window
-/// does not move. The stage pair is constant, because a stage holds at most one
-/// chunk, and the stage at the refused window bounds the stage at any narrower
-/// one. So the widest w with P * w + F within the usable RAM is
-/// floor((usable - F) / P), and no search is needed.
+/// The widest window the usable RAM funds at split `k`. `constant` is the fixed term that the
+/// window does not move. See "RAM fit formula" in the header.
 fn ramFitWindow(kv: KvStructure, k: u32, blobs: u64, constant: u64, ram_usable: u64) ?u32 {
     std.debug.assert(k <= kv.costs.n_layers);
     std.debug.assert(blobs <= limits.max_logical_sessions + 1);
@@ -1772,10 +1666,8 @@ fn ramFitWindow(kv: KvStructure, k: u32, blobs: u64, constant: u64, ram_usable: 
     return fit;
 }
 
-/// The host vector of split `k`, the one home of the stage formula. It mirrors
-/// the host vector of the placement model. Only a residency pool grows the two
-/// swap stages, so a caller without one prices zero for them. A stage holds
-/// one chunk at most, so the pair stops growing with the window.
+/// The host vector of split `k`, the one home of the stage formula. Only a residency pool grows
+/// the two swap stages. A stage holds one chunk at most, so the pair stops growing with the window.
 fn ramAt(kv: KvStructure, k: u32, n_layers: u32, host: HostRequest) PlacementPlan.Ram {
     return ramAtChunk(kv, k, n_layers, host, limits.swap_stage_chunk_bytes);
 }
@@ -1848,11 +1740,8 @@ fn kvHostBytes(kv: KvStructure, k: u32) u64 {
     return @as(u64, kv.n_slots) * slotSpanBytes(kv, 0, k);
 }
 
-/// The device bytes one split spends. A split at or past the layer count is the
-/// pure CPU runner, which holds no device context and charges nothing. Every
-/// other split runs the head on the device, so it pays `head_bytes` whole: the
-/// residual stream leaves the host once, and it never comes back for the
-/// lm_head.
+/// The device bytes one split spends. The pure CPU runner holds no device context and charges
+/// nothing. Every other split runs the head on the device, so it pays `head_bytes` whole.
 fn deviceSpend(caps: Caps, weights: []const u64, head_bytes: u64, kv: KvStructure, k: u32) u64 {
     if (weights.len <= k) return 0;
     return suffixWeights(weights, k) + head_bytes + kvVramBytes(kv, k) +
@@ -1865,10 +1754,9 @@ fn placementFits(caps: Caps, weights: []const u64, head_bytes: u64, kv: KvStruct
     return deviceSpend(caps, weights, head_bytes, kv, k) <= usable(caps);
 }
 
-/// The least split the budget funds, so the GPU suffix is the widest it can
-/// buy. Both the resident weights and the VRAM KV shrink as the split rises, so
-/// the first feasible split on an upward walk is the best one. The pure CPU
-/// split spends nothing, so the walk always ends on a feasible split.
+/// The least split the budget funds, so the GPU suffix is the widest. Weights and VRAM KV shrink
+/// as the split rises, so the first feasible split on an upward walk is best. The pure CPU split
+/// spends nothing, so the walk always ends on a feasible split.
 fn autoSplit(caps: Caps, weights: []const u64, head_bytes: u64, kv: KvStructure) u32 {
     const n_layers: u32 = @intCast(weights.len);
     var k: u32 = 0;
@@ -1881,15 +1769,16 @@ fn autoSplit(caps: Caps, weights: []const u64, head_bytes: u64, kv: KvStructure)
 
 // -- tests ------------------------------------------------------------------
 
-test "GpuLayers: parse takes the word auto or a decimal u32 count and nothing else, pin and isZeroCount follow" {
+test "GpuLayers: parse takes auto or a decimal u32 and nothing else, pin and isZeroCount follow" {
     const Case = struct { raw: []const u8, want: ?GpuLayers, pin: ?u32 = null, zero: bool = false };
+    const u32_max = std.math.maxInt(u32);
     const cases = [_]Case{
         .{ .raw = "auto", .want = .auto },
         .{ .raw = "0", .want = .{ .count = 0 }, .pin = 0, .zero = true },
         .{ .raw = "1", .want = .{ .count = 1 }, .pin = 1 },
         .{ .raw = "12", .want = .{ .count = 12 }, .pin = 12 },
         .{ .raw = "17", .want = .{ .count = 17 }, .pin = 17 },
-        .{ .raw = "4294967295", .want = .{ .count = std.math.maxInt(u32) }, .pin = std.math.maxInt(u32) },
+        .{ .raw = "4294967295", .want = .{ .count = u32_max }, .pin = u32_max },
         // One past the `u32` ceiling is a refusal, not a wrap.
         .{ .raw = "4294967296", .want = null },
         .{ .raw = "", .want = null },
@@ -1914,10 +1803,8 @@ const llama_8b_cost: KvCostModel = .{ .kv_bytes_per_token = 262_144 };
 // The same model at the f16 KV dtype: half the element size halves the
 // per-token cost, and nothing else in the economy moves.
 const llama_8b_f16_cost: KvCostModel = .{ .kv_bytes_per_token = 131_072 };
-// The two default windows of Llama-3.1-8B at f32 KV, by the byte rule:
-// `134217728 / 262144 = 512` at the serve budget and `2147483648 / 262144 =
-// 8192` at the run budget. The planner fixtures carry them at every dtype, so
-// each anchor states one fixed pair of default windows.
+// The default windows of Llama-3.1-8B at f32 KV: `134217728 / 262144 = 512` at the serve budget
+// and `2147483648 / 262144 = 8192` at the run budget. The fixtures carry them at every dtype.
 const llama_8b_serve_default: u32 = 512;
 const llama_8b_default_ceil: u32 = 8192;
 const no_vram_caps: Caps = llama8bCaps(0);
@@ -1933,11 +1820,8 @@ fn llama8bCaps(vram_free: u64) Caps {
     };
 }
 
-// A shared placement fixture: 32 layers of 1000 weight bytes, one slot at a
-// 100-token window, and 10 KV bytes per layer per token. The device spend at
-// split `k` is then `1000 * (32 - k)` weight bytes plus the same again in KV,
-// which is `2000 * (32 - k)`. The arithmetic is round, so a reviewer replays it
-// in one line.
+// A shared placement fixture: 32 layers of 1000 weight bytes, one slot at a 100-token window, and
+// 10 KV bytes per layer per token. The device spend at split `k` is `2000 * (32 - k)`.
 const anchor_weights = [_]u64{1000} ** 32;
 const anchor_kv: KvStructure = .{
     .n_slots = 1,
@@ -2099,33 +1983,110 @@ test "kvPlan: the planner anchors, the f16 dtype anchors, and the named-window a
     const qwen_f16: KvCostModel = .{ .kv_bytes_per_token = 12_288 };
     const cases = [_]PlanCase{
         // A 5 GiB KV budget at window 512 buys 40 slots, of which 8 decode per tick.
-        .{ .name = "budget, window, and batch", .cost = llama_8b_cost, .req = .{ .x_bytes = 5 * gib, .window = 512, .batch = 8 }, .want = .{ .n_slots = 40, .n_streams = 8, .window = 512, .vram_kv = 5 * gib } },
+        .{
+            .name = "budget, window, and batch",
+            .cost = llama_8b_cost,
+            .req = .{ .x_bytes = 5 * gib, .window = 512, .batch = 8 },
+            .want = .{ .n_slots = 40, .n_streams = 8, .window = 512, .vram_kv = 5 * gib },
+        },
         // No flags: slots equal the decode width and the window is the serve default.
-        .{ .name = "no flags", .cost = llama_8b_cost, .req = .{ .batch = 4 }, .want = .{ .n_slots = 4, .n_streams = 4, .window = 512 } },
+        .{
+            .name = "no flags",
+            .cost = llama_8b_cost,
+            .req = .{ .batch = 4 },
+            .want = .{ .n_slots = 4, .n_streams = 4, .window = 512 },
+        },
         // A pinned slot count with a budget takes the window the money affords:
         // 1 GiB over 4 slots at 256 KiB/token is a 1024-token window.
-        .{ .name = "pinned slots take the money window", .cost = llama_8b_cost, .req = .{ .x_bytes = gib, .slots = 4, .batch = 4 }, .want = .{ .n_slots = 4, .window = 1024, .vram_kv = gib } },
+        .{
+            .name = "pinned slots take the money window",
+            .cost = llama_8b_cost,
+            .req = .{ .x_bytes = gib, .slots = 4, .batch = 4 },
+            .want = .{ .n_slots = 4, .window = 1024, .vram_kv = gib },
+        },
         // A slot at window 512 costs 128 MiB at 262144 bytes per token and 64 MiB
         // at 131072, so 1 GiB buys 8 slots at f32 and 16 at f16.
-        .{ .name = "f32 buys 8 slots", .cost = llama_8b_cost, .req = .{ .x_bytes = gib, .window = 512, .batch = 8 }, .want = .{ .n_slots = 8, .slots_clamped = false } },
-        .{ .name = "f16 buys 16 slots", .cost = llama_8b_f16_cost, .req = .{ .x_bytes = gib, .window = 512, .batch = 8 }, .want = .{ .n_slots = 16, .slots_clamped = false } },
+        .{
+            .name = "f32 buys 8 slots",
+            .cost = llama_8b_cost,
+            .req = .{ .x_bytes = gib, .window = 512, .batch = 8 },
+            .want = .{ .n_slots = 8, .slots_clamped = false },
+        },
+        .{
+            .name = "f16 buys 16 slots",
+            .cost = llama_8b_f16_cost,
+            .req = .{ .x_bytes = gib, .window = 512, .batch = 8 },
+            .want = .{ .n_slots = 16, .slots_clamped = false },
+        },
         // 9 GiB over a 64 MiB slot derives 144 slots, which the 128-slot ceiling
         // cuts. The 1 GiB left over stays unspendable.
-        .{ .name = "f16 saturates the slot ceiling", .cost = llama_8b_f16_cost, .req = .{ .x_bytes = 9 * gib, .window = 512, .batch = 8 }, .want = .{ .n_slots = limits.max_vram_slots, .slots_clamped = true, .vram_kv = 8 * gib } },
-        .{ .name = "f32 reaches no ceiling at 9 GiB", .cost = llama_8b_cost, .req = .{ .x_bytes = 9 * gib, .window = 512, .batch = 8 }, .want = .{ .n_slots = 72, .slots_clamped = false } },
+        .{
+            .name = "f16 saturates the slot ceiling",
+            .cost = llama_8b_f16_cost,
+            .req = .{ .x_bytes = 9 * gib, .window = 512, .batch = 8 },
+            .want = .{
+                .n_slots = limits.max_vram_slots,
+                .slots_clamped = true,
+                .vram_kv = 8 * gib,
+            },
+        },
+        .{
+            .name = "f32 reaches no ceiling at 9 GiB",
+            .cost = llama_8b_cost,
+            .req = .{ .x_bytes = 9 * gib, .window = 512, .batch = 8 },
+            .want = .{ .n_slots = 72, .slots_clamped = false },
+        },
         // Half the per-token price buys twice the window, and the default ceiling
         // of 8192 grants that doubling free.
-        .{ .name = "f16 money window doubles below the default ceiling", .cost = llama_8b_f16_cost, .req = .{ .x_bytes = gib, .slots = 4, .batch = 4 }, .want = .{ .n_slots = 4, .window = 2048, .versus_default_ceil = .lt, .slots_clamped = false } },
+        .{
+            .name = "f16 money window doubles below the default ceiling",
+            .cost = llama_8b_f16_cost,
+            .req = .{ .x_bytes = gib, .slots = 4, .batch = 4 },
+            .want = .{
+                .n_slots = 4,
+                .window = 2048,
+                .versus_default_ceil = .lt,
+                .slots_clamped = false,
+            },
+        },
         // 5 GiB over 4 pinned slots buys 10240 tokens at f16. The request names no
         // window, so the default ceiling cuts it to the run default of Llama-8B at
         // f32. A pinned count never raises the clamp witness.
-        .{ .name = "f16 money window lands on the default ceiling", .cost = llama_8b_f16_cost, .req = .{ .x_bytes = 5 * gib, .slots = 4, .batch = 4 }, .want = .{ .n_slots = 4, .window = 8192, .run_default_of = llama_8b_cost, .slots_clamped = false, .vram_kv = 4 * gib } },
+        .{
+            .name = "f16 money window lands on the default ceiling",
+            .cost = llama_8b_f16_cost,
+            .req = .{ .x_bytes = 5 * gib, .slots = 4, .batch = 4 },
+            .want = .{
+                .n_slots = 4,
+                .window = 8192,
+                .run_default_of = llama_8b_cost,
+                .slots_clamped = false,
+                .vram_kv = 4 * gib,
+            },
+        },
         // The named window is the last context past the model ceiling of 262144.
-        .{ .name = "a named window one past the model ceiling", .cost = qwen_f16, .model_ctx = 262_144, .req = .{ .window = 262_145 }, .want = .{ .err = error.WindowExceedsCeiling } },
+        .{
+            .name = "a named window one past the model ceiling",
+            .cost = qwen_f16,
+            .model_ctx = 262_144,
+            .req = .{ .window = 262_145 },
+            .want = .{ .err = error.WindowExceedsCeiling },
+        },
         // The named 32768 sits under the model ceiling, so the money fixes the window.
-        .{ .name = "a named window past the default ceiling takes the money window", .cost = llama_8b_f16_cost, .req = .{ .x_bytes = 5 * gib, .slots = 4, .batch = 4, .window = 32_768 }, .want = .{ .window = 10_240, .versus_default_ceil = .gt } },
+        .{
+            .name = "a named window past the default ceiling takes the money window",
+            .cost = llama_8b_f16_cost,
+            .req = .{ .x_bytes = 5 * gib, .slots = 4, .batch = 4, .window = 32_768 },
+            .want = .{ .window = 10_240, .versus_default_ceil = .gt },
+        },
         // One slot at 12288 bytes a token over 262144 positions reserves 3 GiB.
-        .{ .name = "a named window at the model ceiling", .cost = qwen_f16, .model_ctx = 262_144, .req = .{ .window = 262_144, .batch = 1 }, .want = .{ .window = 262_144, .vram_kv = 3_221_225_472 } },
+        .{
+            .name = "a named window at the model ceiling",
+            .cost = qwen_f16,
+            .model_ctx = 262_144,
+            .req = .{ .window = 262_144, .batch = 1 },
+            .want = .{ .window = 262_144, .vram_kv = 3_221_225_472 },
+        },
     };
     for (cases) |c| {
         errdefer std.debug.print("plan case: {s}\n", .{c.name});
@@ -2370,7 +2331,7 @@ test "kvPlan mode B: degenerate input reproduces the shipped shapes" {
     try std.testing.expectEqual(@as(u64, 1 << 30), explicit.ram.blobs);
 }
 
-test "kvPlan: a named window is refused exactly past the model ceiling, and an unnamed one stays under the default ceiling" {
+test "kvPlan: a named window is refused past the model ceiling, an unnamed one stays under" {
     // The last context sits past the engine bound, so the ceiling there is the
     // bound itself.
     const contexts = [_]u32{ 256, 8192, 131_072, limits.max_model_ctx, limits.max_model_ctx + 1 };
@@ -3295,7 +3256,7 @@ fn checkQuoteSweep(sweep: *QuoteSweep, seed: u64) anyerror!void {
     }
 }
 
-test "quoteRam: over 2048 seeded stacks a derived spend fits, the stages ignore the window, and a refusal has a reason" {
+test "quoteRam: over 2048 seeded stacks a derived spend fits and a refusal has a reason" {
     var sweep: QuoteSweep = .{};
     try prop.forAll(
         .{ .site = 0x5eed_0b10, .cases = 2048 },
@@ -3315,7 +3276,7 @@ test "quoteRam: over 2048 seeded stacks a derived spend fits, the stages ignore 
 /// they still boot after it.
 const lowered_free_bytes: u64 = 74 << 20;
 
-test "ramFitWindow: the stage pair is a constant term, so the fit never moves with it per position" {
+test "ramFitWindow: the stage pair is a constant term, so the fit never moves with it" {
     const kv = ramAnchorKv(131_072);
     // The placement proofs state a 64 MiB chunk, so the stage pair here is
     // their 128 MiB.
@@ -3570,10 +3531,8 @@ test "placementPlan: the auto split is maximal and monotone, and every plan cons
         const roomy = try placementPlan(anchorCaps(1 << 30), weights, 0, kv, unchecked_serve, null);
         try std.testing.expectEqual(@as(u32, 0), roomy.split);
 
-        // The same grid on a ramp vector: every layer charges a different
-        // per-token price, and every third layer holds a fixed slab instead. A
-        // planner that multiplies one price by a layer count moves the split
-        // here.
+        // The same grid on a ramp vector. A planner that multiplies one price by a layer count
+        // moves the split here.
         const ramp: KvStructure = .{ .n_slots = 2, .window = 100, .costs = rampCosts(n) };
         const ramp_total: u64 = @as(u64, ramp.n_slots) * perSlotBytes(
             ramp.costs.total(),
@@ -4450,10 +4409,8 @@ fn checkRamSweep(sweep: *RamSweep, seed: u64) anyerror!void {
             );
         }
 
-        // The check stays exact. The exact fit holds the stage pair of the
-        // refused window, which bounds the pair at any narrower window.
-        // So one more position, or the floor window with no exact fit,
-        // refuses whenever its stage pair is that same pair.
+        // The exact fit holds the stage pair of the refused window, which bounds narrower pairs.
+        // So one more position, or the floor with no exact fit, refuses on that same pair.
         const exact = ramFitWindow(
             stack.kv,
             vram_plan.split,

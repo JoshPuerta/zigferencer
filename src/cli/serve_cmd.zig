@@ -1,14 +1,16 @@
 //! `zigferencer serve <pub_name>` is the binary frontend. It parses the flags and hands
-//! a `BinaryLauncher` to `serve_common.buildAndServe`. A client can stop the server with
+//! a `BinaryLauncher` to `serve_boot.buildAndServe`. A client can stop the server with
 //! `shutdown` only under `--allow-shutdown`, because a shared server must not stop on
 //! the request of one client. stdout holds only the READY line, which a spawner parses.
 
 const std = @import("std");
 
-const cli = @import("command.zig");
+const context = @import("context.zig");
 const args = @import("args.zig");
-const flags_mod = @import("flags.zig");
-const serve_common = @import("serve_common.zig");
+const flags_mod = @import("flag_groups.zig");
+const codec_parts = @import("boot/codec_parts.zig");
+const serve_boot = @import("boot/serve_boot.zig");
+const serve_checks = @import("boot/serve_checks.zig");
 const limits = @import("../core/limits.zig");
 const event = @import("../serve/event.zig");
 const scheduler_mod = @import("../serve/scheduler.zig");
@@ -27,9 +29,9 @@ const BinaryLauncher = struct {
     pub fn serve(
         self: BinaryLauncher,
         comptime EngineT: type,
-        ctx: cli.Context,
+        ctx: context.Context,
         engine: *EngineT,
-        parts: serve_common.CodecParts,
+        parts: codec_parts.CodecParts,
         sched_cfg: scheduler_mod.Config,
     ) !void {
         const codec: event.Codec = .{
@@ -50,9 +52,9 @@ const BinaryLauncher = struct {
         );
 
         if (self.socket_path) |sp| {
-            try serve_common.printReadyUnix(ctx.io, sp);
+            try serve_boot.printReadyUnix(&ctx.stdout.interface, sp);
         } else {
-            try serve_common.printReadyTcp(ctx.io, server.boundAddress());
+            try serve_boot.printReadyTcp(&ctx.stdout.interface, server.boundAddress());
         }
 
         try server.run();
@@ -123,7 +125,7 @@ const Flags = struct {
 
 // -- api --------------------------------------------------------------------
 
-pub fn run(ctx: cli.Context) !void {
+pub fn run(ctx: context.Context) !void {
     const flags = try args.parseInto(Flags, ctx) orelse return;
 
     const socket_path = flags.socket;
@@ -131,7 +133,7 @@ pub fn run(ctx: cli.Context) !void {
         return args.fail(ctx.io, "--socket and --host/--port are mutually exclusive", .{});
     }
 
-    const wire: serve_common.Wire = .{
+    const wire: serve_checks.Wire = .{
         .allow_shutdown = flags.allow_shutdown,
         .sessions_per_connection = flags.sessions_per_connection,
         .resume_ttl_ms = flags.resume_ttl,
@@ -145,5 +147,5 @@ pub fn run(ctx: cli.Context) !void {
 
     const launcher: BinaryLauncher = .{ .transport = transport, .socket_path = socket_path };
 
-    return serve_common.buildAndServe(ctx, flags.pub_name, &flags.serve, wire, launcher);
+    return serve_boot.buildAndServe(ctx, flags.pub_name, &flags.serve, wire, launcher);
 }

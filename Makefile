@@ -14,7 +14,7 @@
 ## BACKEND  auto, naive, simd, simd_pf, vulkan, or vulkan_fused (default auto)
 ## FLAGS    more zig build flags, for example FLAGS="-Dtrace=true -Dtarget=x86_64-windows-gnu"
 ## ARGS     the words after the binary or the script name
-## TEST     the test binary of debug-test: unit or a tests/ file stem (default unit)
+## TEST     the test binary of debug-test: unit, dev_unit, or a tests/ file stem (default unit)
 ## FILTER   a part of the test names of debug-test
 
 ZIG     ?= zig

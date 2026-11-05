@@ -2,20 +2,21 @@
 //! helpers.
 
 const std = @import("std");
+const zigferencer = @import("zigferencer");
 const Io = std.Io;
 const Allocator = std.mem.Allocator;
-const kv_budget = @import("../core/kv_budget.zig");
-const dtype = @import("../core/dtype.zig");
-const limits = @import("../core/limits.zig");
-const step_stats = @import("../core/step_stats.zig");
-const registry = @import("../core/registry.zig");
-const loader = @import("../io/gguf/loader.zig");
-const resolve_mod = @import("../engine/resolve.zig");
-const parallel = @import("../runtime/parallel.zig");
-const args = @import("args.zig");
-const cli = @import("command.zig");
-const flags_mod = @import("flags.zig");
-const serve_common = @import("serve_common.zig");
+const kv_budget = zigferencer.kv_budget;
+const dtype = zigferencer.dtype;
+const limits = zigferencer.limits;
+const step_stats = zigferencer.step_stats;
+const registry = zigferencer.registry;
+const loader = zigferencer.loader;
+const resolve_mod = zigferencer.resolve;
+const parallel = zigferencer.parallel;
+const args = zigferencer.cli.args;
+const context = zigferencer.cli.context;
+const flags_mod = zigferencer.cli.flag_groups;
+const boot_facts = zigferencer.cli.boot_facts;
 
 pub const writeStderr = args.writeStderr;
 
@@ -29,11 +30,11 @@ pub const itl_bucket_positions: u32 = 512;
 /// What every path of one bench reads. `bench_model_cmd` builds it once, after
 /// the load and the resolve.
 pub const Bench = struct {
-    ctx: cli.Context,
+    ctx: context.Context,
     opt: Options,
     model: *const registry.Model,
     loaded: *const loader.Loaded,
-    boot: *const serve_common.DeviceBoot,
+    boot: *const boot_facts.DeviceBoot,
     resolved: *const resolve_mod.Resolved,
     policy: parallel.Policy,
 

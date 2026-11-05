@@ -1,24 +1,21 @@
-//! The decode core: greedy generation from a runner. `run` and `bench-model`
-//! share this one control loop.
+//! The decode core: greedy generation from a runner. `run` and `bench-model` share this one
+//! control loop.
 //!
-//! The loop owns the sequencing (sample, step, stop) and the timing. The caller
-//! owns the per-token effect and passes it in as a `sink` value, because
-//! boundaries are values. A sink streams the detokenized piece, or folds the id
-//! into a hash. Prefill stays the job of the caller because it varies:
-//! per-token CPU, batched GPU, or cache restore. `decode` picks up from the
+//! Ownership. The loop owns the sequencing (sample, step, stop) and the timing. The caller owns
+//! the per-token effect and passes it in as a `sink` value, because boundaries are values. A sink
+//! streams the detokenized piece, or folds the id into a hash. Prefill stays the job of the caller
+//! because it varies: per-token CPU, batched GPU, or cache restore. `decode` picks up from the
 //! `last_logits` and `pos` that prefill left.
 //!
-//! `sink` is any value with `onToken(id: u32) !void`. The loop hands every
-//! sampled id to the sink, the terminal EOS included. A hash therefore counts
-//! EOS, and a streamer can choose not to print it. A sink can also declare
-//! `onStep(pos: u32, ns: u64) void`. The loop then hands it the position each
-//! step wrote and the wall time since the previous mark. The first mark is the
-//! first token. A sink without `onStep` pays no clock read per step.
+//! Sink. A sink is any value with `onToken(id: u32) !void`. The loop hands every sampled id to the
+//! sink, the terminal EOS included. A hash therefore counts EOS, and a streamer can choose not to
+//! print it. A sink can also declare `onStep(pos: u32, ns: u64) void`. The loop then hands it the
+//! position each step wrote and the wall time since the previous mark. The first mark is the first
+//! token. A sink without `onStep` pays no clock read per step.
 //!
-//! The three stop conditions are asymmetric on purpose. EOS and a full cache
-//! stop before the loop steps the last token. The token budget stops after the
-//! step and commits the KV of that token, so a follow-up turn resumes with it
-//! in context.
+//! Stop conditions. The three stops are asymmetric on purpose. EOS and a full cache stop before
+//! the loop steps the last token. The token budget stops after the step and commits the KV of that
+//! token, so a follow-up turn resumes with it in context.
 
 const std = @import("std");
 const Io = std.Io;
@@ -29,25 +26,21 @@ const log = std.log.scoped(.run);
 
 // -- types ------------------------------------------------------------------
 
-/// Timing and extent of one decode. The fields match the per-turn value of
-/// `bench`, so a turn maps across with no translation.
+/// Timing and extent of one decode. The fields match the per-turn value of `bench`.
 pub const Generated = struct {
     ttft_ms: f64,
-    /// The decode wall time from the first token to the stop, divided by
-    /// `steps`. Zero when the loop ran no step.
+    /// Decode wall time from the first token to the stop, divided by `steps`. Zero with no step.
     itl_ms: f64,
     tokens_generated: u32,
-    /// Runner steps the loop ran. A budget stop steps every token. An EOS or
-    /// a full-cache stop leaves the last token unstepped.
+    /// Runner steps the loop ran. An EOS or a full-cache stop leaves the last token unstepped.
     steps: u32,
     pos_end: u32,
-    /// Host time of the decode host steps. A fused runner fills the first four,
-    /// and every runner gets the argmax step. Zero counts mean the step did not run.
+    /// Host time of the decode host steps. A fused runner fills the first four, and every runner
+    /// gets the argmax step. A zero count means the step did not run.
     host: step_stats.DecodeHost = .{},
 };
 
-/// A sink or a runner arrives by pointer or by value. `@hasDecl` and
-/// `@hasField` need the struct.
+/// A sink or a runner arrives by pointer or by value. `@hasDecl` and `@hasField` need the struct.
 fn Pointee(comptime T: type) type {
     return switch (@typeInfo(T)) {
         .pointer => |p| p.child,
@@ -57,10 +50,9 @@ fn Pointee(comptime T: type) type {
 
 // -- api --------------------------------------------------------------------
 
-/// Decode up to `max_tokens` ids greedily from `last_logits` at `pos`, and hand
-/// each one to `sink.onToken`. The caller captures `t_start` before prefill.
-/// TTFT then spans prefill plus the first token, which is the latency a user
-/// feels.
+/// Decode up to `max_tokens` ids greedily from `last_logits` at `pos`, and hand each one to
+/// `sink.onToken`. The caller captures `t_start` before prefill, so TTFT spans prefill plus the
+/// first token.
 pub fn decode(
     runner: anytype,
     last_logits_in: []f32,
@@ -76,6 +68,7 @@ pub fn decode(
     std.debug.assert(max_seq > 0);
     std.debug.assert(last_logits_in.len > 0);
 
+    // Detect the optional sink and runner hooks at comptime.
     const has_on_step = comptime @hasDecl(Pointee(@TypeOf(sink)), "onStep");
     const has_host = comptime @hasField(Pointee(@TypeOf(runner)), "host");
     if (has_host) {
@@ -89,6 +82,7 @@ pub fn decode(
         .{ pos_in, max_tokens, max_seq },
     );
 
+    // Return at once when the budget is zero.
     var pos = pos_in;
     if (max_tokens == 0) {
         return .{
@@ -100,6 +94,7 @@ pub fn decode(
         };
     }
 
+    // Sample and emit the first token.
     var last_logits = last_logits_in;
     var id = timedGreedy(last_logits, io, &argmax);
     const t_first = Io.Clock.Timestamp.now(io, .awake);
@@ -108,6 +103,7 @@ pub fn decode(
     var n: u32 = 1;
     var steps: u32 = 0;
 
+    // Step and sample until a stop condition holds.
     var stop: []const u8 = "eos";
     while (true) {
         if (!ignore_eos and id == eos_id) break; // EOS: stop before stepping it.
@@ -140,6 +136,7 @@ pub fn decode(
 
     log.debug("decode stop: {s}, {d} tokens produced, {d} steps", .{ stop, n, steps });
 
+    // Check the loop counters and build the result.
     const t_end = Io.Clock.Timestamp.now(io, .awake);
 
     std.debug.assert(n <= max_tokens);
@@ -182,9 +179,8 @@ fn timedGreedy(logits: []const f32, io: Io, stat: *step_stats.Stat) u32 {
 
 // -- tests ------------------------------------------------------------------
 
-// A canned-logits runner plus a recording sink test the control loop without a
-// model. Greedy picks argmax, so each fixed logits vector names the next token,
-// and the recorder captures exactly what the loop emitted.
+// A canned-logits runner plus a recording sink test the control loop without a model.
+// Each fixed logits vector names the next token, and the recorder captures what the loop emitted.
 const FakeRunner = struct {
     seq: []const []f32,
     i: usize = 0,

@@ -1,5 +1,5 @@
 //! Executable entry point: `main` passes control to `entry` with the release
-//! command table. `src/dev_main.zig` calls `entry` with the dev table. The file
+//! command table. `src/dev/dev_main.zig` calls `entry` with the dev table. The file
 //! also re-exports the sub-modules of the engine, so an integration test under
 //! `tests/` can `@import("zigferencer")` rather than cross a module root with a
 //! relative path, which Zig forbids. The `test {}` block pulls in every module
@@ -7,11 +7,12 @@
 //! variants, so their tests run under `zig build test`.
 
 const std = @import("std");
+const File = std.Io.File;
 const builtin = @import("builtin");
 const build_options = @import("build_options");
-const cli = @import("cli/command.zig");
-const log = @import("core/log.zig");
-const span = @import("core/span.zig");
+pub const cli = @import("cli.zig");
+pub const log = @import("core/log.zig");
+pub const span = @import("core/span.zig");
 
 // -- constants --------------------------------------------------------------
 
@@ -31,7 +32,7 @@ pub const std_options: std.Options = .{
 // without a `../src/...` path import, which Zig forbids across module roots.
 pub const loader = @import("io/gguf/loader.zig");
 pub const parser = @import("io/gguf/parser.zig");
-const registry = @import("core/registry.zig");
+pub const registry = @import("core/registry.zig");
 pub const limits = @import("core/limits.zig");
 pub const kv_budget = @import("core/kv_budget.zig");
 pub const kv_cost = @import("runtime/kv_cost.zig");
@@ -42,11 +43,17 @@ pub const attn_record = @import("runtime/attn_record.zig");
 pub const ring_fsm = @import("core/ring_fsm.zig");
 pub const tensor = @import("core/tensor.zig");
 pub const dtype = @import("core/dtype.zig");
+pub const step_stats = @import("core/step_stats.zig");
+pub const time = @import("core/time.zig");
 pub const ops = @import("ops/naive.zig");
 pub const gdn = @import("ops/gdn.zig");
 pub const vocab = @import("core/tokenizer/vocab.zig");
 pub const bpe = @import("core/tokenizer/bpe.zig");
-const chat = @import("core/chat.zig");
+pub const chat = @import("core/chat.zig");
+pub const family = @import("engine/family.zig");
+pub const resolve = @import("engine/resolve.zig");
+pub const generate = @import("runtime/generate.zig");
+pub const cpu_profile = @import("runtime/cpu_profile.zig");
 pub const step_row = @import("runtime/step_row.zig");
 pub const llama_runner = @import("runtime/llama_runner.zig");
 pub const qwen_runner = @import("runtime/qwen_runner.zig");
@@ -71,8 +78,8 @@ pub const serve_client = @import("serve/client.zig");
 pub const serve_openai_http = @import("serve/openai/http_server.zig");
 pub const serve_openai_map = @import("serve/openai/map.zig");
 pub const serve_openai_raw_codec = @import("serve/openai/raw_codec.zig");
-pub const client_transcript = @import("cli/client_transcript.zig");
-pub const serve_common = @import("cli/serve_common.zig");
+pub const client_transcript = @import("cli/client/client_transcript.zig");
+pub const codec_parts = @import("cli/boot/codec_parts.zig");
 pub const ops_simd = @import("ops/simd.zig");
 pub const ops_simd_pf = @import("ops/simd_pf.zig");
 
@@ -91,6 +98,11 @@ else
 
 pub const ops_vulkan = if (build_options.use_vulkan)
     @import("ops_vulkan/kernels.zig")
+else
+    struct {};
+
+pub const ops_vulkan_wrap = if (build_options.use_vulkan)
+    @import("ops_vulkan/wrap.zig")
 else
     struct {};
 
@@ -122,21 +134,23 @@ else
 // -- api --------------------------------------------------------------------
 
 pub fn main(init: std.process.Init) !void {
-    return entry(init, .release);
+    return entry(init, cli.command.dispatchRelease);
 }
 
-/// Set the log gate and the trace recorder from the environment, then dispatch
-/// argv over the command table of `which`. Both executables share this body.
-pub fn entry(init: std.process.Init, comptime which: enum { release, dev }) !void {
-    const dispatch = switch (which) {
-        .release => cli.dispatchRelease,
-        .dev => cli.dispatchDev,
-    };
+/// Set the log gate and the trace recorder from the environment, then pass control to
+/// `dispatch`. Both executables share this body. It owns the stdout writer of every command, so
+/// it can read the cause of a failed write.
+pub fn entry(
+    init: std.process.Init,
+    comptime dispatch: fn (std.process.Init, *File.Writer) anyerror!void,
+) !void {
+    var stdout_buffer: [cli.context.stdout_buffer_bytes]u8 = undefined;
+    var stdout: File.Writer = .initStreaming(.stdout(), init.io, &stdout_buffer);
 
     // The top-level help runs before the log and trace setup, so a bad trace variable cannot hide
     // it.
     const argv = try init.minimal.args.toSlice(init.arena.allocator());
-    if (argv.len > 1 and cli.isHelpWord(argv[1])) return dispatch(init);
+    if (argv.len > 1 and cli.command.isHelpWord(argv[1])) return dispatch(init, &stdout);
 
     log.setFromEnv(init.environ_map.get("ZIGFERENCER_LOG"));
     const trace_spans = init.environ_map.get(limits.trace_spans_env);
@@ -151,7 +165,7 @@ pub fn entry(init: std.process.Init, comptime which: enum { release, dev }) !voi
     };
     defer span.finish();
 
-    dispatch(init) catch |err| {
+    dispatch(init, &stdout) catch |err| {
         // A handled user error is one of bad arguments, an unknown model, or no
         // model picked. Its handler already printed a readable message to
         // stderr, so `main` exits non-zero and drops the developer return-trace,
@@ -159,6 +173,16 @@ pub fn entry(init: std.process.Init, comptime which: enum { release, dev }) !voi
         // parse failure) falls through with its trace intact, and that is where
         // the trace earns its keep.
         if (isUserError(err)) {
+            span.finish();
+            std.process.exit(1);
+        }
+
+        // A reader that closes the pipe ends the output on purpose, as `head` does.
+        if (stdoutCause(err, &stdout)) |cause| {
+            if (cause != error.BrokenPipe) {
+                printStdoutFailure(init.io, cause);
+            }
+
             span.finish();
             std.process.exit(1);
         }
@@ -180,6 +204,21 @@ fn printBadTraceSpans(io: std.Io, text: []const u8) void {
         .{ limits.spans_per_thread_max, text },
     ) catch return;
     w.flush() catch {};
+}
+
+// A failed write has nowhere useful to go, as in the dispatcher refusals.
+fn printStdoutFailure(io: std.Io, cause: File.Writer.Error) void {
+    var buf: [128]u8 = undefined;
+    var fw: File.Writer = .initStreaming(.stderr(), io, &buf);
+    fw.interface.print("error: cannot write the output: {t}\n", .{cause}) catch return;
+    fw.interface.flush() catch {};
+}
+
+/// The cause of a failed write to stdout, or null when `err` came from another writer.
+/// `error.WriteFailed` names no device, so the concrete writer holds the cause.
+fn stdoutCause(err: anyerror, stdout: *const File.Writer) ?File.Writer.Error {
+    if (err != error.WriteFailed) return null;
+    return stdout.err;
 }
 
 /// The errors whose handler already explained itself to the user, so `main` can
@@ -295,24 +334,34 @@ test {
     _ = vocab;
     _ = chat;
     // A command body is analyzed only where it is named. `main` names
-    // `dispatchRelease`, and a test binary has no `main`. This line names the
-    // dev dispatch, whose table holds every command, so every arm of every
-    // command compiles under `test-build`. That includes the placement arms,
-    // whose device code no other reference reaches.
-    _ = &cli.dispatchDev;
+    // `dispatchRelease`, and a test binary has no `main`. This line names it, so
+    // every arm of every release command compiles under `test-build`. That
+    // includes the placement arms, whose device code no other reference reaches.
+    // `dev_main.zig` holds the same line for the developer commands.
+    _ = &cli.command.dispatchRelease;
     // CLI sub-modules whose tests belong under `zig build test`.
-    _ = @import("cli/arch_matrix.zig");
-    _ = @import("cli/bench_decode_host_cmd.zig");
-    _ = @import("cli/bench_swap_cmd.zig");
+    _ = @import("cli/info/arch_matrix.zig");
     _ = @import("cli/args.zig");
-    _ = @import("cli/flags.zig");
+    _ = @import("cli/flag_groups.zig");
     _ = @import("engine/resolve.zig");
-    _ = @import("cli/client_cmd.zig");
-    _ = @import("cli/client_transcript.zig");
+    _ = @import("cli/client/client_blocking.zig");
+    _ = @import("cli/client/client_chat.zig");
+    _ = @import("cli/client/client_cmd.zig");
+    _ = @import("cli/client/client_history.zig");
+    _ = @import("cli/client/client_input.zig");
+    _ = @import("cli/client/client_output.zig");
+    _ = @import("cli/client/client_reconnect.zig");
+    _ = @import("cli/client/client_startup.zig");
+    _ = @import("cli/client/client_streaming.zig");
+    _ = @import("cli/client/client_transcript.zig");
     _ = @import("cli/fetch_cmd.zig");
     _ = @import("cli/inspect_cmd.zig");
     _ = @import("cli/prompt.zig");
-    _ = @import("cli/serve_common.zig");
+    _ = @import("cli/boot/boot_facts.zig");
+    _ = @import("cli/boot/boot_lines.zig");
+    _ = @import("cli/boot/codec_parts.zig");
+    _ = @import("cli/boot/serve_boot.zig");
+    _ = @import("cli/boot/serve_checks.zig");
     _ = @import("cli/style.zig");
     _ = gdn;
     _ = prompt_cache;
@@ -364,4 +413,21 @@ test {
         _ = &qwen_hybrid.QwenHybridRunner.logitRowsMax;
         _ = &llama_fused.LlamaFusedRunner.initFromLoaded;
     }
+}
+
+test "a failed write to stdout names its cause, and no other error does" {
+    if (builtin.os.tag != .linux) return error.SkipZigTest;
+
+    const io = std.testing.io;
+    const full = try std.Io.Dir.openFileAbsolute(io, "/dev/full", .{ .mode = .write_only });
+    defer full.close(io);
+
+    var buffer: [16]u8 = undefined;
+    var writer: File.Writer = .initStreaming(full, io, &buffer);
+    try std.testing.expectEqual(null, stdoutCause(error.WriteFailed, &writer));
+
+    try writer.interface.writeAll("text");
+    try std.testing.expectError(error.WriteFailed, writer.interface.flush());
+    try std.testing.expectEqual(error.NoSpaceLeft, stdoutCause(error.WriteFailed, &writer).?);
+    try std.testing.expectEqual(null, stdoutCause(error.OutOfMemory, &writer));
 }

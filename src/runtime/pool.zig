@@ -1,16 +1,19 @@
-//! A persistent fork-join pool for the CPU ops. The pool is the control unit:
-//! it owns the threads, the epoch word, and the claim counter. A unit function
-//! is the datapath: it computes one unit of an op, and its result does not
-//! depend on the thread that runs it.
+//! A persistent fork-join pool for the CPU ops. The pool is the control unit: it owns the threads,
+//! the epoch word, and the claim counter. A unit function is the datapath: it computes one unit of
+//! an op, and its result does not depend on the thread that runs it.
 //!
-//! The caller owns the pool and keeps its address fixed, because every worker
-//! holds a pointer to it. The calling thread is participant 0 of a dispatch,
-//! and `threads - 1` workers wait between dispatches. A dispatch publishes one
-//! job and a new epoch word. Participant `i` runs unit `i` first, then every
-//! participant claims units from a shared counter until the counter passes the
-//! unit count. The owner waits until every worker of the epoch reports done.
+//! Ownership. The caller owns the pool and keeps its address fixed, because every worker holds a
+//! pointer to it. The calling thread is participant 0 of a dispatch, and `threads - 1` workers wait
+//! between dispatches.
 //!
-//! The protocol, with the memory order of every access:
+//! Dispatch. A dispatch publishes one job and a new epoch word. Participant `i` runs unit `i`
+//! first, then every participant claims units from a shared counter until the counter passes the
+//! unit count. The owner waits until every worker of the epoch reports done. A partial wake can
+//! leave a participant asleep, so the wake reaches every waiter. Each worker makes at most
+//! `n_units - parts` claims plus one. Each participant makes one failed claim, so the counter ends
+//! at `n_units + parts`.
+//!
+//! Memory order. The protocol, with the order of every access:
 //!
 //!   owner   write the job, store `claim = parts`, `pending = parts - 1`,
 //!           store `ctl` (seq_cst), load `sleepers` (seq_cst), and wake every
@@ -22,14 +25,13 @@
 //!           job. A participant runs its units and decrements `pending`
 //!           (release).
 //!
-//! The two seq_cst pairs fall in one total order. Either the owner load sees
-//! the increment of a worker and wakes it, or the worker load sees the new
-//! epoch and does not wait. The kernel compares the futex word atomically, so
-//! no wake-up is lost between the load and the wait.
+//! No lost wake-up. The two seq_cst pairs fall in one total order. Either the owner load sees the
+//! increment of a worker and wakes it, or the worker load sees the new epoch and does not wait. The
+//! kernel compares the futex word atomically, so no wake-up is lost between the load and the wait.
 //!
-//! The sequence wraps at 2^24 dispatches. The pool assumes that no worker
-//! stays preempted across exactly a multiple of 2^24 dispatches
-//! between two of its loads of `ctl`. Such a worker can miss its epoch.
+//! Sequence wrap. The sequence wraps at 2^24 dispatches. The pool assumes that no worker stays
+//! preempted across exactly a multiple of 2^24 dispatches between two of its loads of `ctl`. Such a
+//! worker can miss its epoch.
 
 const std = @import("std");
 const builtin = @import("builtin");
@@ -53,16 +55,13 @@ comptime {
     assert(@as(u32, seq_bits) + parts_bits == 32);
 }
 
-/// The word before the first dispatch. A dispatch has at least two
-/// participants when it stores the word, so it never stores zero.
+/// The word before the first dispatch. A dispatch stores at least two participants, never zero.
 const ctl_idle: u32 = 0;
 
-/// The word that ends the workers. Its count, 255, is above every legal
-/// participant count, so no dispatch stores it.
+/// The word that ends the workers. Its count, 255, is above every legal participant count.
 const ctl_stop: u32 = std.math.maxInt(u32);
 
-/// Pause iterations between two clock reads of the spin wait. A clock read
-/// costs more than one pause, so the wait reads it rarely.
+/// Pause iterations between two clock reads of the spin wait. A clock read costs more than a pause.
 const spin_check: u32 = 64;
 
 // -- types ------------------------------------------------------------------
@@ -77,14 +76,12 @@ const Job = struct {
     n_units: u32,
 };
 
-/// One atomic word on a cache line of its own. The struct alignment rounds
-/// its size up to the line, so no other field shares the line.
+/// One atomic word on a cache line of its own. The alignment rounds the size up to the line.
 const Line = struct {
     value: std.atomic.Value(u32) align(cache_line),
 };
 
-/// The pool state. Each shared counter sits on a cache line of its own, so a
-/// claim does not slow the spin of a waiting worker.
+/// The pool state. Each shared counter has its own cache line, so a claim does not slow a spin.
 pub const Pool = struct {
     ctl: Line,
     claim: Line,
@@ -104,8 +101,8 @@ pub const Pool = struct {
     // -- api ----------------------------------------------------------------
 
     /// Start `n_threads - 1` workers. The pool must not move until `deinit`.
-    /// `spin_ns` is the time a worker spins on the epoch word before it
-    /// sleeps. Zero makes every worker sleep at once.
+    /// `spin_ns` is the time a worker spins on the epoch word before it sleeps. Zero sleeps
+    /// at once.
     pub fn init(self: *Pool, io: std.Io, n_threads: u32, spin_ns: u64) InitError!void {
         assert(n_threads >= 1);
         assert(n_threads <= limits.max_threads);
@@ -129,8 +126,7 @@ pub const Pool = struct {
         errdefer self.stopWorkers(spawned);
 
         while (spawned < n_threads - 1) : (spawned += 1) {
-            // Each worker starts from the idle word, not from a load of its
-            // own. A load at thread start can miss a dispatch that ran first.
+            // Pass the idle word in: a load at thread start can miss a dispatch that ran first.
             self.workers[spawned] = try std.Thread.spawn(
                 .{},
                 workerMain,
@@ -161,10 +157,9 @@ pub const Pool = struct {
         return self.n_threads;
     }
 
-    /// Run `unit_fn(ctx, u)` once for every `u < n_units` over `parts`
-    /// participants, the calling thread included, and return when all are
-    /// done. Only one thread at a time can dispatch on a pool. `parts = 1`
-    /// runs every unit on the caller and touches no shared word.
+    /// Run `unit_fn(ctx, u)` once for every `u < n_units` over `parts` participants, the caller
+    /// included, and return when all are done. One thread at a time can dispatch.
+    /// `parts = 1` runs every unit on the caller and touches no shared word.
     pub fn run(
         self: *Pool,
         comptime Ctx: type,
@@ -190,6 +185,7 @@ pub const Pool = struct {
         const sp = span.beginHot(.pool_run);
         defer sp.end();
 
+        // Run inline when one participant owns every unit.
         if (builtin.single_threaded or parts == 1) {
             var unit: u32 = 0;
             while (unit < n_units) : (unit += 1) {
@@ -199,27 +195,25 @@ pub const Pool = struct {
             return;
         }
 
+        // Publish the job, then the new epoch word.
         assert(self.pending.value.load(.monotonic) == 0);
         self.job = .{ .unit_fn = Erased.call, .ctx = ctx, .n_units = n_units };
         self.claim.value.store(parts, .monotonic);
         self.pending.value.store(parts - 1, .monotonic);
         self.seq = (self.seq + 1) & seq_mask;
         self.ctl.value.store(pack(self.seq, parts), .seq_cst);
-        // A partial wake can leave a participant asleep, so the wake reaches
-        // every waiter.
+
+        // Wake every sleeper. See "Memory order" in the header.
         if (self.sleepers.value.load(.seq_cst) > 0) {
             self.io.futexWake(u32, &self.ctl.value.raw, std.math.maxInt(u32));
         }
 
+        // Run the share of participant 0, then wait for the workers.
         runShare(&self.job, &self.claim.value, 0);
-        // The wait ends when the last of `parts - 1` workers finishes its
-        // claims. Each worker makes at most `n_units - parts` claims plus one.
         while (self.pending.value.load(.acquire) != 0) {
             std.Thread.yield() catch {};
         }
 
-        // Each participant made one failed claim, so the counter holds every
-        // unit plus one claim per participant.
         assert(self.claim.value.load(.monotonic) == n_units + parts);
     }
 
@@ -237,8 +231,7 @@ pub const Pool = struct {
         assert(was_busy);
     }
 
-    /// Store the stop word, wake every waiter, and join the first `count`
-    /// workers.
+    /// Store the stop word, wake every waiter, and join the first `count` workers.
     fn stopWorkers(self: *Pool, count: u32) void {
         assert(count < limits.max_threads);
 
@@ -273,9 +266,8 @@ pub const Pool = struct {
         }
     }
 
-    /// Wait until the epoch word differs from `seen`, and return the new
-    /// word. The spin budget starts again on every call, so a worker that
-    /// skips an epoch spins again before it sleeps.
+    /// Wait until the epoch word differs from `seen`, and return the new word.
+    /// The spin budget restarts on every call, so a worker that skips an epoch spins again.
     fn waitChange(self: *Pool, seen: u32) u32 {
         if (self.spin_ns > 0) {
             const start = nowNs(self.io);
@@ -290,8 +282,7 @@ pub const Pool = struct {
             }
         }
 
-        // The sleep loop runs once per wake-up. A spurious wake-up with no
-        // new word goes back to sleep.
+        // Sleep until the word changes. A spurious wake-up goes back to sleep.
         while (true) {
             _ = self.sleepers.value.fetchAdd(1, .seq_cst);
             if (self.ctl.value.load(.seq_cst) == seen) {
@@ -333,8 +324,7 @@ fn unpackParts(word: u32) u32 {
 }
 
 comptime {
-    // The stop word holds a participant count that no dispatch can use, and
-    // every counter sits on a cache line of its own.
+    // The stop word holds a participant count that no dispatch can use.
     assert(unpackParts(ctl_stop) > limits.max_threads);
     assert(@sizeOf(Line) == cache_line);
 }
@@ -385,8 +375,8 @@ fn expectRuns(counts: Counts, n_units: u32, want: u32) !void {
     }
 }
 
-/// Wait until every worker of the pool is inside its sleep loop. The wait is
-/// bounded: with `spin_ns = 0` every idle worker goes to sleep at once.
+/// Wait until every worker is inside its sleep loop. With `spin_ns = 0`, an idle worker sleeps
+/// at once.
 fn awaitAllAsleep(pool: *Pool) void {
     while (pool.sleepers.value.load(.seq_cst) != pool.n_threads - 1) {
         std.Thread.yield() catch {};
@@ -453,8 +443,7 @@ test "pool: 100 init and deinit cycles" {
         defer pool.deinit();
 
         try testing.expectEqual(n_threads, pool.threads());
-        // Every other cycle ends with no dispatch, so deinit also meets
-        // workers that never left their first wait.
+        // Every other cycle skips the dispatch, so deinit also meets workers in their first wait.
         if (cycle % 2 == 1) {
             counts.reset();
             pool.run(Counts, &counts, Counts.unit, runs.len, n_threads);

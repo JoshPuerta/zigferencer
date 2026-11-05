@@ -1,35 +1,33 @@
-//! GPU gate for the streaming upload ring. The ring owns a fixed set of host
-//! segments and rotates them, so the host can fill one segment while the device
-//! still reads another.
+//! GPU gate for the streaming upload ring. The ring owns a fixed set of host segments and rotates
+//! them, so the host can fill one segment while the device still reads another.
 //!
-//! The ring is the first place in the engine that uses a VkFence, so the
-//! property under test is the synchronization and not any arithmetic. Each test
-//! uploads a byte pattern the host knows, then reads the device segment back
-//! through the ordinary staging path and compares. A missing barrier, a
-//! mis-sized copy, or a slot whose bytes the next rotation overwrote all show
-//! up as a byte mismatch.
+//! Property. The ring is the first place in the engine that uses a VkFence, so the property under
+//! test is the synchronization and not any arithmetic. Each test uploads a byte pattern the host
+//! knows, then reads the device segment back through the ordinary staging path and compares. A
+//! missing barrier, a mis-sized copy, or a slot whose bytes the next rotation overwrote all show up
+//! as a byte mismatch.
 //!
-//! `core/ring_fsm.zig` already proves the state table at comptime. Only
-//! hardware can prove that the fence really covers the transfer, so the first
-//! test replays the same anchor trace against a live device.
+//! Anchor trace. `core/ring_fsm.zig` proves the state table at comptime. Only hardware can prove
+//! that the fence really covers the transfer, so the first test replays the same anchor trace
+//! against a live device.
 //!
-//! The ring here holds two 4 KiB segments. The whole test costs well under
-//! 32 KiB of device memory, which keeps it safe to run beside anything else.
+//! Size. The ring here holds two 4 KiB segments. The whole test costs well under 32 KiB of device
+//! memory, which keeps it safe to run beside anything else.
 //!
-//! The tests return `error.SkipZigTest` when Vulkan cannot start.
+//! Skips. The tests return `error.SkipZigTest` when Vulkan cannot start.
 
 const std = @import("std");
-const z = @import("zigferencer");
+const zigferencer = @import("zigferencer");
 
-const fsm = z.ring_fsm;
-const StreamRing = z.ops_vulkan.StreamRing;
+const fsm = zigferencer.ring_fsm;
+const StreamRing = zigferencer.ops_vulkan.StreamRing;
 
 // -- fixtures ---------------------------------------------------------------
 
 const segment_capacity: u64 = 4096;
 
-fn initCtx() !z.vulkan_ctx.Context {
-    return z.vulkan_ctx.Context.init(std.testing.allocator, .{}) catch |e| switch (e) {
+fn initCtx() !zigferencer.vulkan_ctx.Context {
+    return zigferencer.vulkan_ctx.Context.init(std.testing.allocator, .{}) catch |e| switch (e) {
         error.NoVulkanDevice,
         error.NoComputeQueue,
         error.InitializationFailed,
@@ -49,9 +47,9 @@ fn patternByte(upload: usize, j: usize) u8 {
 /// Check the view of a `ready` slot. Then read the device bytes back and
 /// compare them with the pattern of the upload the slot holds.
 fn checkSegment(
-    ctx: *const z.vulkan_ctx.Context,
+    ctx: *const zigferencer.vulkan_ctx.Context,
     ring: *StreamRing,
-    scratch: *z.ops_vulkan.HostBuffer,
+    scratch: *zigferencer.ops_vulkan.HostBuffer,
     slot: StreamRing.Slot,
     upload: usize,
     len: u64,
@@ -61,13 +59,13 @@ fn checkSegment(
     try std.testing.expectEqual(@as(u64, slot) * ring.stride, v.offset);
     try std.testing.expectEqual(len, v.range);
 
-    const copies = [_]z.ops_vulkan.Copy{.{
+    const copies = [_]zigferencer.ops_vulkan.Copy{.{
         .src = v.buffer,
         .dst = scratch.buffer,
         .size = len,
         .src_offset = v.offset,
     }};
-    try z.ops_vulkan.runStagingCopies(ctx, &copies);
+    try zigferencer.ops_vulkan.runStagingCopies(ctx, &copies);
 
     const got = scratch.mapped[0..@as(usize, @intCast(len))];
     for (got, 0..) |b, j| {
@@ -88,7 +86,7 @@ test "stream_ring: the anchor trace, uploaded and read back" {
     var ctx = try initCtx();
     defer ctx.deinit();
 
-    var scratch: z.ops_vulkan.HostBuffer = .{ .ctx = &ctx };
+    var scratch: zigferencer.ops_vulkan.HostBuffer = .{ .ctx = &ctx };
     defer scratch.deinit();
 
     try scratch.ensure(segment_capacity);
@@ -174,7 +172,7 @@ test "stream_ring: overlap does not corrupt" {
     var ctx = try initCtx();
     defer ctx.deinit();
 
-    var scratch: z.ops_vulkan.HostBuffer = .{ .ctx = &ctx };
+    var scratch: zigferencer.ops_vulkan.HostBuffer = .{ .ctx = &ctx };
     defer scratch.deinit();
 
     try scratch.ensure(segment_capacity);

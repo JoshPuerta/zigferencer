@@ -1,15 +1,56 @@
-//! Scalar f32 reference ops, the full set a Llama forward pass needs. That set
-//! is matmul, embed lookup, RMSNorm, SwiGLU/SiLU, residual add, RoPE, and
-//! decode attention as row parts with an ordered merge. Every other ops variant
-//! re-exports the remaining ops from here. It overrides the linear kernels, and
-//! the SIMD variants also override the attention part kernel and the serial row.
+//! Scalar f32 reference ops, the full set a Llama forward pass needs. That set is matmul, embed
+//! lookup, RMSNorm, SwiGLU/SiLU, residual add, RoPE, and decode attention as row parts with an
+//! ordered merge. Every other ops variant re-exports the remaining ops from here. It overrides
+//! the linear kernels, and the SIMD variants also override the attention part kernel and the
+//! serial row.
 //!
-//! This file is the correctness reference. Every other variant must match its
-//! output inside a stated tolerance, and the variant tests plus the
-//! cross-backend bench check that. No fusion, no shortcuts. Each op asserts its
-//! shape preconditions and, under runtime safety, a finiteness postcondition.
-//! Boundary inputs are `Tensor`, and inner slices are raw `[]f32` the caller
-//! owns.
+//! Reference. This file is the correctness reference. Every other variant must match its output
+//! inside a stated tolerance. No fusion, no shortcuts. Each op asserts its shape preconditions and,
+//! under runtime safety, a finiteness postcondition. Boundary inputs are `Tensor`, and inner
+//! slices are raw `[]f32` the caller owns.
+//!
+//! Linear layout. `out = input @ W.T` with `W` in `[out, in]` row-major, the PyTorch layout that
+//! GGUF stores. GGUF's `weight.shape = [in, out]` is the reversed shape. The embed table is
+//! PyTorch `[vocab, embed_dim]`, so GGUF `shape[0]` is `embed_dim` and `shape[1]` is the vocab.
+//!
+//! Quant blocks. Each row is `in / 32` blocks, except Q6_K.
+//! - Q8_0: 34 bytes, an f16 scale and 32 i8 values.
+//! - Q4_0: 18 bytes, an f16 scale and 16 packed bytes. Weight `i` (i < 16) is the LOW nibble of
+//!   byte `i`, and weight `i + 16` is the HIGH nibble. A nibble in [0, 15] dequantizes as
+//!   `(nibble - 8) * scale`.
+//! - Q4_1: 20 bytes, an f16 scale `d`, an f16 min `m`, and 16 packed bytes in the Q4_0 order. A
+//!   nibble dequantizes as `nibble * d + m`, with no -8 bias. The `m` term carries that bias.
+//! - Q6_K: a superblock of 256 values in 210 bytes, `ql[128]` (low 4 bits) | `qh[64]` (high 2
+//!   bits) | `scales[16]` (i8) | `d` (f16). Each value is `d * scale * (q6 - 32)`, where the
+//!   6-bit `q6` comes from one ql nibble plus two qh bits. This mirrors ggml `block_q6_K`. The
+//!   linear op dequantizes one superblock at a time into a 256-element stack buffer, so the
+//!   caller needs no scratch. ggml emits Q6_K for the logit head of Q4_0 ftypes.
+//!
+//! Batch. A batched linear runs `batch` input rows against one weight. Row b reads
+//! `inputs[b * in ..][0..in]` and writes `outs[b * out_stride ..][0..out]`. `out_stride` lets a
+//! caller slice the output rows of the weight and still write into full-width rows, as
+//! `parallel.linearBatch` does. The j-outer and b-inner nest streams each weight row once for all
+//! inputs. For one (row, output) pair the reduction order is exactly the B=1 order, so each row
+//! is bit-identical to a B=1 call. The engine batch tests pin that.
+//!
+//! RoPE. `RopeStyle` follows the llama.cpp rope type per architecture: the llama family is
+//! `norm`, the qwen family is `neox`. The style must match how the conversion laid out the GGUF Q
+//! and K weights. The wrong style scrambles attention geometry, and greedy decode degenerates into
+//! loops. `freq_factors` is the per-pair frequency divisor from a `rope_freqs.weight` tensor
+//! (Llama-3.1 long-context scaling). Pair i rotates by `pos * base^(-2i/D) / freq_factors[i]`.
+//! Null is classic RoPE.
+//!
+//! Attention part. One part covers the query heads `[h_lo, h_hi)` over the positions
+//! `[t_lo, t_hi)`. The kernel folds the part with the online softmax, one tile of
+//! `limits.attn_cpu_tile` positions at a time. The record of head `h` starts at
+//! `recs[(h - h_lo) * rec_stride]`: the value sums `a` without the division by `l`, the maximum
+//! score `m`, then the sum `l` of the exponentials shifted by `m`. This is the record layout of
+//! the GPU split pass. The fold state belongs to one head, so a head split gives the same records.
+//!
+//! Attention merge. Per head: `M = max_p m_p`, `w_p = exp(m_p - M)`, `L = sum_p l_p * w_p`, and
+//! `out = (sum_p a_p * w_p) * (1 / L)`. Every sum runs in ascending part order from zero, as the
+//! GPU merge pass runs it. So one row length gives one result bit for bit at any thread count.
+//! The parts are the geometry of `attn_cpu`, a function of `t_len` alone.
 
 const std = @import("std");
 const attn_cpu = @import("../core/attn_cpu.zig");
@@ -22,18 +63,13 @@ const Tensor = @import("../core/tensor.zig").Tensor;
 const max_head_dim: usize = limits.attn_max_head_dim;
 const max_group: usize = limits.attn_max_group;
 
-/// The naive variant runs anywhere. It is the correctness reference every other
-/// variant validates against.
+/// The naive variant runs anywhere.
 pub const requires: op_requires.OpRequires = .{ .arch = .any };
 
 // -- types ------------------------------------------------------------------
 
-/// Which lanes form a RoPE rotation pair. The angle for pair i is the same
-/// either way. Only the memory layout differs. The layout must match how the
-/// conversion laid out the GGUF Q and K weights. The style follows the llama.cpp
-/// rope type per architecture: the llama family is `norm`, the qwen family is
-/// `neox`. Rotating with the wrong style scrambles attention geometry at every
-/// position, and greedy decode degenerates into repetition loops.
+/// Which lanes form a RoPE rotation pair. The angle for pair i is the same either way.
+/// Only the memory layout differs. See "RoPE" in the header.
 pub const RopeStyle = enum {
     /// Adjacent pairs (x[2i], x[2i+1]).
     norm,
@@ -43,9 +79,7 @@ pub const RopeStyle = enum {
 
 // -- api --------------------------------------------------------------------
 
-/// Linear layer: `out = input @ W.T` with `W` in `[out, in]` row-major (the
-/// PyTorch layout that GGUF stores). GGUF's `weight.shape = [in, out]` is the
-/// reversed shape.
+/// Linear layer: `out = input @ W.T`. See "Linear layout" in the header.
 pub fn linearF32(input: []const f32, weight: Tensor, out: []f32) void {
     std.debug.assert(weight.dtype == .f32);
     std.debug.assert(weight.n_dims == 2);
@@ -74,8 +108,7 @@ pub fn linearF32(input: []const f32, weight: Tensor, out: []f32) void {
     }
 }
 
-/// Linear layer with Q8_0 weights. Same `[out, in]` row-major layout, where
-/// each row is `in/32` Q8_0 blocks of 34 bytes.
+/// Linear layer with Q8_0 weights. See "Quant blocks" in the header.
 pub fn linearF32Q80(input: []const f32, weight: Tensor, out: []f32) void {
     std.debug.assert(weight.dtype == .q8_0);
     std.debug.assert(weight.n_dims == 2);
@@ -112,14 +145,8 @@ pub fn linearF32Q80(input: []const f32, weight: Tensor, out: []f32) void {
     }
 }
 
-/// Batched linear: `batch` independent input rows against one f32 weight.
-/// Row b reads `inputs[b*in ..][0..in]` and writes `outs[b*out_stride ..]
-/// [0..out]`. `out_stride` exists so a caller can slice the weight's output
-/// rows and still write into full-width rows, as `parallel.linearBatch` does.
-/// The j-outer and b-inner nest streams each weight row once for all `batch`
-/// inputs. For one (row, output) pair the reduction order is exactly the
-/// `linearF32` order, so each row's result is bit-identical to a B=1 call. The
-/// engine batch tests pin that equivalence.
+/// Batched linear: `batch` input rows against one f32 weight. See "Batch" in the header.
+/// Each row is bit-identical to a B=1 `linearF32` call.
 pub fn linearF32Batch(
     inputs: []const f32,
     weight: Tensor,
@@ -163,11 +190,8 @@ pub fn linearF32Batch(
     }
 }
 
-/// Batched linear with Q8_0 weights. Layout and row addressing follow
-/// `linearF32Q80`. Row b reads `inputs[b*in ..][0..in]` and writes
-/// `outs[b*out_stride ..][0..out]`, the same rule as `linearF32Batch`. For one
-/// (row, output) pair the block walk and accumulation order are exactly the
-/// `linearF32Q80` ones.
+/// Batched linear with Q8_0 weights. See "Batch" in the header.
+/// The block walk and accumulation order are those of `linearF32Q80`.
 pub fn linearF32Q80Batch(
     inputs: []const f32,
     weight: Tensor,
@@ -186,6 +210,7 @@ pub fn linearF32Q80Batch(
     std.debug.assert(outs.len >= (batch - 1) * out_stride + out_features);
     std.debug.assert(in_features % 32 == 0);
 
+    // Walk the weight rows once, and every batch row against each.
     const row_bytes = (in_features / 32) * 34;
     var j: usize = 0;
     while (j < out_features) : (j += 1) {
@@ -211,6 +236,7 @@ pub fn linearF32Q80Batch(
         }
     }
 
+    // Check that every output is finite.
     if (std.debug.runtime_safety) {
         var b: usize = 0;
         while (b < batch) : (b += 1) {
@@ -221,11 +247,8 @@ pub fn linearF32Q80Batch(
     }
 }
 
-/// Per-row batch fallback over any B=1 linear kernel. The output is
-/// bit-identical to calling the kernel once per row, with none of the
-/// weight-reuse win. A variant without a true batched microkernel exports this
-/// over its own kernels, so `linearF32*Batch` always matches that variant's B=1
-/// output.
+/// Per-row batch fallback over any B=1 linear kernel, bit-identical to one call per row.
+/// A variant without a batched microkernel exports it over its own kernels.
 pub fn linearBatchPerRow(
     comptime kernel: fn ([]const f32, Tensor, []f32) void,
     inputs: []const f32,
@@ -253,11 +276,7 @@ pub fn linearBatchPerRow(
     }
 }
 
-/// Linear layer with Q4_0 weights. `[out, in]` row-major, where each row is
-/// `in/32` Q4_0 blocks of 18 bytes (2-byte f16 scale + 16 packed bytes).
-/// ggml Q4_0 nibble order: weight `i` (i<16) is the LOW nibble of byte
-/// `i`. Weight `i+16` is the HIGH nibble of byte `i`. Each nibble is a
-/// 4-bit value in [0,15] dequantized as `(nibble - 8) * scale`.
+/// Linear layer with Q4_0 weights. See "Quant blocks" in the header.
 pub fn linearF32Q40(input: []const f32, weight: Tensor, out: []f32) void {
     std.debug.assert(weight.dtype == .q4_0);
     std.debug.assert(weight.n_dims == 2);
@@ -297,10 +316,7 @@ pub fn linearF32Q40(input: []const f32, weight: Tensor, out: []f32) void {
     }
 }
 
-/// Batched Q4_0 linear through the per-row fallback. Each output is
-/// bit-identical to the B=1 `linearF32Q40` result, with no cross-batch weight
-/// reuse. The q4 CPU path exists for completeness, not throughput. Row
-/// parallelism comes from the runner `parallel.linearBatch`.
+/// Batched Q4_0 linear through the per-row fallback, bit-identical to `linearF32Q40`.
 pub fn linearF32Q40Batch(
     inputs: []const f32,
     weight: Tensor,
@@ -313,10 +329,7 @@ pub fn linearF32Q40Batch(
     linearBatchPerRow(linearF32Q40, inputs, weight, outs, batch, out_stride);
 }
 
-/// Linear layer with Q4_1 weights. Same `[out, in]` row-major layout and nibble
-/// order as Q4_0. Each 32-weight block is 20 bytes: an f16 scale `d`, an f16
-/// min `m`, then 16 packed bytes. A nibble dequantizes as `nibble*d + m`, with
-/// an unsigned nibble in [0,15] and no -8 bias. The `m` term carries that bias.
+/// Linear layer with Q4_1 weights. See "Quant blocks" in the header.
 pub fn linearF32Q41(input: []const f32, weight: Tensor, out: []f32) void {
     std.debug.assert(weight.dtype == .q4_1);
     std.debug.assert(weight.n_dims == 2);
@@ -372,11 +385,8 @@ pub fn linearF32Q41Batch(
     linearBatchPerRow(linearF32Q41, inputs, weight, outs, batch, out_stride);
 }
 
-/// Linear layer with Q6_K weights, the higher-precision logit head that ggml
-/// emits for Q4_0 ftypes. The layout is `[out, in]` row-major with `in/256`
-/// superblocks of 210 bytes each. The op allocates nothing: it dequantizes one
-/// superblock at a time into a 256-element stack buffer and accumulates it, so
-/// the caller needs no scratch.
+/// Linear layer with Q6_K weights, with `in / 256` superblocks per row. It allocates nothing.
+/// See "Quant blocks" in the header.
 pub fn linearF32Q6K(input: []const f32, weight: Tensor, out: []f32) void {
     std.debug.assert(weight.dtype == .q6_k);
     std.debug.assert(weight.n_dims == 2);
@@ -455,10 +465,8 @@ pub fn f16BitsToF32(bits: u16) f32 {
     return @floatCast(half);
 }
 
-/// Dequantize a Q4_0 buffer (`src.len % 18 == 0`) into f32
-/// (`dst.len == (src.len/18)*32`). Nibble order matches `linearF32Q40`:
-/// element `i` (i<16) is the low nibble of byte `i`, element `i+16` the high
-/// nibble. Each dequantizes as `(nibble - 8) * scale`.
+/// Dequantize a Q4_0 buffer (`src.len % 18 == 0`) into f32 (`dst.len == (src.len/18)*32`).
+/// The nibble order matches `linearF32Q40`.
 pub fn dequantQ40(src: []const u8, dst: []f32) void {
     std.debug.assert(src.len % 18 == 0);
 
@@ -485,10 +493,8 @@ pub fn dequantQ40(src: []const u8, dst: []f32) void {
     }
 }
 
-/// Dequantize a Q4_1 buffer (`src.len % 20 == 0`) into f32
-/// (`dst.len == (src.len/20)*32`). Nibble order matches `linearF32Q41`:
-/// element `i` (i<16) is the low nibble of byte `i`, element `i+16` the high
-/// nibble. Each dequantizes as `nibble*d + m`.
+/// Dequantize a Q4_1 buffer (`src.len % 20 == 0`) into f32 (`dst.len == (src.len/20)*32`).
+/// The nibble order matches `linearF32Q41`.
 pub fn dequantQ41(src: []const u8, dst: []f32) void {
     std.debug.assert(src.len % 20 == 0);
 
@@ -514,11 +520,9 @@ pub fn dequantQ41(src: []const u8, dst: []f32) void {
     }
 }
 
-/// Quantize f32 to Q4_0, ggml's `quantize_row_q4_0_ref` scheme.
-/// `src.len % 32 == 0`, `dst.len == (src.len/32)*18`. The block scale is
-/// `d = max_signed_abs / -8`. Each value maps to `clamp(floor(x/d + 8.5), 0, 15)`.
-/// Only used at load to requantize the one Q6_K weight QuantFactory ships for
-/// the lm_head, keeping the GPU path uniformly Q4_0.
+/// Quantize f32 to Q4_0 (`src.len % 32 == 0`, `dst.len == (src.len/32)*18`), as ggml
+/// `quantize_row_q4_0_ref`: `d = max_signed_abs / -8`, value `clamp(floor(x / d + 8.5), 0, 15)`.
+/// Load uses it only to requantize the Q6_K lm_head that QuantFactory ships, to keep GPU Q4_0.
 pub fn quantizeQ40(src: []const f32, dst: []u8) void {
     std.debug.assert(src.len % 32 == 0);
 
@@ -554,12 +558,8 @@ pub fn quantizeQ40(src: []const f32, dst: []u8) void {
     }
 }
 
-/// Dequantize a Q6_K buffer into f32. `src.len % 210 == 0`,
-/// `dst.len == (src.len/210)*256`. Superblock layout (ggml `block_q6_K`):
-/// `ql[128]` (low 4 bits) | `qh[64]` (high 2 bits) | `scales[16]` (i8) |
-/// `d` (f16). Each of the 256 values is `d * scale * (q6 - 32)` where the
-/// 6-bit `q6` comes from one ql nibble plus two qh bits. Mirrors
-/// ggml `dequantize_row_q6_K`.
+/// Dequantize a Q6_K buffer into f32 (`src.len % 210 == 0`, `dst.len == (src.len/210)*256`).
+/// It mirrors ggml `dequantize_row_q6_K`. See "Quant blocks" in the header.
 pub fn dequantQ6K(src: []const u8, dst: []f32) void {
     std.debug.assert(src.len % 210 == 0);
 
@@ -569,7 +569,8 @@ pub fn dequantQ6K(src: []const u8, dst: []f32) void {
     while (sb < n_super) : (sb += 1) {
         const blk = src[sb * 210 ..][0..210];
         const d = f16BitsToF32(std.mem.readInt(u16, blk[208..][0..2], .little));
-        // Two 128-element halves. Pointers advance ql+=64, qh+=32, sc+=8.
+
+        // Decode the two 128-element halves. The bases advance ql+=64, qh+=32, sc+=8.
         var half: usize = 0;
         while (half < 2) : (half += 1) {
             const ql_base = half * 64;
@@ -609,12 +610,8 @@ pub fn dequantQ6K(src: []const u8, dst: []f32) void {
     }
 }
 
-/// Look up `weight[token_id, :]` (length `dim`) into `dst`. Dequantizes if Q8_0.
-///
-/// GGUF stores tensor shape *reversed* w.r.t. PyTorch. The embed table is
-/// PyTorch `[vocab, embed_dim]` -> GGUF `shape = [embed_dim, vocab]`. Memory
-/// is `vocab` rows of `embed_dim` elements each, row-major. So:
-///   `shape[0] = embed_dim` (= `dim`),  `shape[1] = vocab_size`.
+/// Look up `weight[token_id, :]` (length `dim`) into `dst`. A quantized table dequantizes.
+/// `shape[0] = dim` and `shape[1] = vocab`. See "Linear layout" in the header.
 pub fn embedLookup(weight: Tensor, token_id: u32, dim: usize, dst: []f32) void {
     std.debug.assert(weight.n_dims == 2);
     std.debug.assert(weight.shape[0] == dim);
@@ -712,13 +709,8 @@ pub fn residualAdd(x: []const f32, dst: []f32) void {
     }
 }
 
-/// In-place RoPE on one head_dim vector at position `pos`. Pair lanes per
-/// `style`. Dims beyond `rope_dim` stay untouched.
-///
-/// `freq_factors` is the per-pair frequency divisor from a `rope_freqs.weight`
-/// tensor (Llama-3.1 long-context scaling): pair i rotates by `pos *
-/// base^(-2i/D) / freq_factors[i]`, matching ggml's rope (`theta / ff`).
-/// Null = classic RoPE.
+/// In-place RoPE on one head_dim vector at position `pos`. Dims beyond `rope_dim` stay untouched.
+/// `freq_factors` is null for classic RoPE. See "RoPE" in the header.
 pub fn ropeInplace(
     x: []f32,
     pos: u32,
@@ -758,19 +750,9 @@ pub fn ropeInplace(
     }
 }
 
-/// One part of a decode attention row: the query heads `[h_lo, h_hi)` over the
-/// positions `[t_lo, t_hi)`. The kernel folds the part with the online softmax,
-/// one tile of `limits.attn_cpu_tile` positions at a time from `t_lo`. The
-/// record of head `h` starts at `recs[(h - h_lo) * rec_stride]`. It holds the
-/// value sums `a` without the division by `l`, then the maximum score `m`, then
-/// the sum `l` of the exponentials shifted by `m`. It is the record layout of
-/// the GPU split pass, and `attentionMerge` combines the records of a row.
-///
-/// The kernel walks the heads of one KV head in blocks of at most `max_group`
-/// heads. So each K and V row loads and widens once per block. The fold state
-/// belongs to one head and never to a block. So the bits of a head do not
-/// depend on the other heads in its block, and a head split gives the same
-/// records.
+/// One part of a decode attention row: heads `[h_lo, h_hi)` over positions `[t_lo, t_hi)`, one
+/// record per head. It walks the heads of a KV head in blocks of `max_group`, so each K and V row
+/// widens once per block, and the bits of a head never depend on its block. See "Attention part".
 pub fn attentionPartTyped(
     comptime E: type,
     q: []const f32,
@@ -786,6 +768,7 @@ pub fn attentionPartTyped(
     recs: []f32,
     rec_stride: usize,
 ) void {
+    // Check the arguments.
     comptime std.debug.assert(E == f32 or E == f16);
     const tile: usize = limits.attn_cpu_tile;
     std.debug.assert(h_lo < h_hi);
@@ -805,17 +788,18 @@ pub fn attentionPartTyped(
     // The tile loop below runs at most this many times.
     std.debug.assert((t_hi - t_lo + tile - 1) / tile <= limits.max_model_ctx / tile);
 
+    // Reserve the scratch. Row g of `scores` holds block head g over one tile, then its
+    // shifted exponentials.
     const group_size = n_heads / n_kv_heads;
     const scale: f32 = 1.0 / @sqrt(@as(f32, @floatFromInt(head_dim)));
 
     var row: [if (E == f32) 0 else max_head_dim]f32 = undefined;
-    // Row g holds the scores of block head g over one tile, and the fold
-    // replaces them with the shifted exponentials.
     var scores: [max_group][limits.attn_cpu_tile]f32 = undefined;
     var s_acc: [max_group]f32 = undefined;
     var m_run: [max_group]f32 = undefined;
     var l_run: [max_group]f32 = undefined;
 
+    // Walk each KV head, its blocks of heads, and the tiles of the part.
     var kv_h = h_lo / group_size;
     const kv_h_end = (h_hi - 1) / group_size + 1;
     while (kv_h < kv_h_end) : (kv_h += 1) {
@@ -831,6 +815,7 @@ pub fn attentionPartTyped(
                 const tile_hi = @min(t_hi, tile_lo + tile);
                 const tile_n = tile_hi - tile_lo;
 
+                // Score every position of the tile.
                 var t = tile_lo;
                 while (t < tile_hi) : (t += 1) {
                     const k_off = t * kv_stride + kv_h * head_dim;
@@ -848,8 +833,7 @@ pub fn attentionPartTyped(
                         var h = blk_lo;
                         while (h < blk_hi) : (h += 1) {
                             const q_off = h * head_dim + d0;
-                            // The chunk continues the accumulator, so the
-                            // summand sequence is the whole-row one.
+                            // The chunk continues the accumulator, so the sums match the whole row.
                             var s: f32 = s_acc[h - blk_lo];
                             var d: usize = 0;
                             while (d < dn) : (d += 1) {
@@ -866,6 +850,7 @@ pub fn attentionPartTyped(
                     }
                 }
 
+                // Fold the scores into the running state of each head.
                 var h = blk_lo;
                 while (h < blk_hi) : (h += 1) {
                     const g = h - blk_lo;
@@ -904,12 +889,12 @@ pub fn attentionPartTyped(
                         l += s.*;
                     }
 
-                    // The term at the maximum adds exp(0) = 1, and no term
-                    // is negative.
+                    // The term at the maximum adds exp(0) = 1, and no term is negative.
                     std.debug.assert(l >= 1);
                     l_run[g] = l;
                 }
 
+                // Add the weighted V rows to the value sums.
                 t = tile_lo;
                 while (t < tile_hi) : (t += 1) {
                     const v_off = t * kv_stride + kv_h * head_dim;
@@ -936,6 +921,7 @@ pub fn attentionPartTyped(
                 }
             }
 
+            // Store the running maximum and sum of each head.
             var h = blk_lo;
             while (h < blk_hi) : (h += 1) {
                 const rec = recs[(h - h_lo) * rec_stride ..][0..rec_len];
@@ -945,6 +931,7 @@ pub fn attentionPartTyped(
         }
     }
 
+    // Check that every record is finite.
     if (std.debug.runtime_safety) {
         var h = h_lo;
         while (h < h_hi) : (h += 1) {
@@ -955,11 +942,8 @@ pub fn attentionPartTyped(
     }
 }
 
-/// Combine the first `n_parts` part records of every query head into the
-/// attention output. Per head: `M = max_p m_p`, `w_p = exp(m_p - M)`,
-/// `L = sum_p l_p * w_p`, and `out = (sum_p a_p * w_p) * (1 / L)`. Every sum
-/// runs in ascending part order from zero, as the GPU merge pass runs it. So
-/// one row length gives one result bit for bit at any thread count.
+/// Combine the first `n_parts` part records of every query head into the attention output.
+/// The order of the sums fixes the bits. See "Attention merge" in the header.
 pub fn attentionMerge(
     parts_buf: []const f32,
     n_parts: usize,
@@ -983,6 +967,7 @@ pub fn attentionMerge(
             off.* = attn_cpu.recordOffset(n_heads32, head_dim32, h, @intCast(p));
         }
 
+        // Find the maximum score over the parts.
         var big_m = parts_buf[offs[0] + head_dim];
         for (offs[1..n_parts]) |off| {
             if (parts_buf[off + head_dim] > big_m) {
@@ -990,6 +975,7 @@ pub fn attentionMerge(
             }
         }
 
+        // Weight the sums of the parts.
         var big_l: f32 = 0;
         for (offs[0..n_parts], w[0..n_parts]) |off, *w_p| {
             w_p.* = std.math.exp(parts_buf[off + head_dim] - big_m);
@@ -998,6 +984,7 @@ pub fn attentionMerge(
 
         // The part at the maximum adds its own sum, at least 1, at weight 1.
         std.debug.assert(big_l >= 1);
+        // Weight the value sums and divide by the total.
         const inv_l = 1.0 / big_l;
         const out_h = out[@as(usize, h) * head_dim ..][0..head_dim];
         for (out_h, 0..) |*o, d| {
@@ -1017,10 +1004,8 @@ pub fn attentionMerge(
     }
 }
 
-/// The attention row of every query head, serial: each part of the row in
-/// order through `attentionPartTyped`, then `attentionMerge`. The parts are the
-/// geometry of `attn_cpu`, a function of `t_len` alone. `parts_buf` holds at
-/// least `attn_cpu.partialLen(n_heads, head_dim)` f32s, and the row writes
+/// The attention row of every query head, serial: each part in order, then `attentionMerge`.
+/// `parts_buf` holds at least `attn_cpu.partialLen(n_heads, head_dim)` f32s. The row writes
 /// every record it reads.
 pub fn attentionRowTyped(
     comptime E: type,
@@ -1049,9 +1034,8 @@ pub fn attentionRowTyped(
     );
 }
 
-/// The serial attention row over the part kernel of `Kernels`, a namespace
-/// that declares `attentionPartTyped` with the signature of this file. Every
-/// CPU backend runs this one row, so the part order and the merge stay one.
+/// The serial attention row over the part kernel of `Kernels`, a namespace that declares
+/// `attentionPartTyped`. Every CPU backend runs this one row, so the part order stays one.
 pub fn attentionRowWith(
     comptime Kernels: type,
     comptime E: type,
@@ -1080,8 +1064,7 @@ pub fn attentionRowWith(
     while (p < n_parts) : (p += 1) {
         const part = attn_cpu.partRange(t_len32, p);
         const rec_lo = attn_cpu.recordOffset(n_heads32, head_dim32, 0, p);
-        // The part kernel finds head h at `h * rec_stride` past the record of
-        // head 0, where the merge reads it.
+        // The part kernel finds head h at `h * rec_stride` past head 0, where the merge reads it.
         std.debug.assert(attn_cpu.recordOffset(n_heads32, head_dim32, n_heads32 - 1, p) ==
             rec_lo + (n_heads - 1) * rec_stride);
         Kernels.attentionPartTyped(
@@ -1106,12 +1089,9 @@ pub fn attentionRowWith(
 
 // -- helpers ----------------------------------------------------------------
 
-/// Expand one storage row into f32. The compiler scalarizes an f16 widen that
-/// sits inside an arithmetic loop, into one `vpinsrw` plus one single-lane
-/// `vcvtph2ps` per element. The conversion therefore runs here as a packed
-/// 8-lane `@floatCast`, and the arithmetic loops read f32 only. `noinline` is
-/// load-bearing. Inlined, the optimizer forwards the stores into the serial
-/// consumer and scalarizes the converts again.
+/// Expand one storage row into f32 with packed 8-lane converts, because a scalar widen in an
+/// arithmetic loop costs a `vpinsrw` and a single-lane `vcvtph2ps` per element. `noinline` is
+/// load-bearing: inlined, the optimizer forwards the stores and scalarizes the converts again.
 noinline fn widenRow(comptime E: type, noalias src: []const E, noalias dst: []f32) void {
     comptime std.debug.assert(E == f16);
     std.debug.assert(src.len == dst.len);
@@ -1130,8 +1110,7 @@ noinline fn widenRow(comptime E: type, noalias src: []const E, noalias dst: []f3
 
 // -- tests ------------------------------------------------------------------
 
-// Shared synthetic Q8_0 weight builder for the batch-equivalence tests. The scale
-// is 1.0 per block. The i8 ramp varies per (row, element), so no two rows are equal.
+// Build a synthetic Q8_0 weight with scale 1.0. The i8 ramp varies per (row, element).
 fn fillTestQ80(w_data: []u8, in_features: usize, out_features: usize) void {
     const row_bytes = (in_features / 32) * 34;
     for (0..out_features) |row| {
@@ -1357,10 +1336,8 @@ test "rope pos=0 is identity" {
 }
 
 test "rope styles rotate the documented pairs" {
-    // pos=1, rope_dim=4: pair i=0 rotates by angle 1.0, pair i=1 by 1/100.
-    // norm pairs are (x0,x1) and (x2,x3). neox pairs are (x0,x2) and (x1,x3).
-    // Start from a one-hot vector so the rotation lands in exactly one partner
-    // lane. The lane that moves identifies the pairing.
+    // At pos=1 and rope_dim=4, pair 0 turns by 1.0. A one-hot input shows which lane moves.
+    // The norm pairs are (x0,x1) and (x2,x3). The neox pairs are (x0,x2) and (x1,x3).
     var x_norm = [_]f32{ 1, 0, 0, 0 };
     ropeInplace(&x_norm, 1, 4, 10000.0, .norm, null);
     try std.testing.expectApproxEqAbs(@cos(@as(f32, 1.0)), x_norm[0], 1e-6);
@@ -1572,9 +1549,7 @@ test "attention at f16 tracks the f32 reference and repeats bitwise" {
         rel_max = @max(rel_max, @abs(a - b) / denom);
     }
 
-    // The bound states what f16 storage claims. This fixture measures 7.4e-4,
-    // so a regression has to move the error by more than an order of magnitude
-    // before it trips.
+    // This fixture measures 7.4e-4, so a regression must grow the error tenfold to trip.
     try std.testing.expect(rel_max < 1.0e-2);
 
     // Same inputs, same order, same bits: the narrower store does not cost
@@ -1629,9 +1604,8 @@ test "attention row: the part row tracks the f64 reference across tile and part 
     const depths = [_]usize{ 1, 7, T - 1, T, T + 1, 2 * T, 16 * T, 16 * T + 1, 4 * T + 3 };
     var prng = std.Random.DefaultPrng.init(0xA770_0001);
     const r = prng.random();
-    // The deep rows take few and narrow heads, so the test stays short in
-    // Debug. The widest head spans 3 tiles in 3 parts, so it crosses two tile
-    // edges and two part edges.
+    // The deep rows take few and narrow heads, so the test stays short in Debug.
+    // The widest head spans 3 tiles in 3 parts, so it crosses two tile and two part edges.
     inline for (.{ f32, f16 }) |E| {
         for (depths) |t_len| {
             try expectRowNearF64(

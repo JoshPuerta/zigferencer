@@ -7,19 +7,19 @@ const Io = std.Io;
 const builtin = @import("builtin");
 const build_options = @import("build_options");
 
-const cli = @import("command.zig");
-const args = @import("args.zig");
-const style = @import("style.zig");
+const context = @import("../context.zig");
+const args = @import("../args.zig");
+const style = @import("../style.zig");
 const arch_matrix = @import("arch_matrix.zig");
-const log = @import("../core/log.zig");
-const hwinfo = @import("../core/hwinfo.zig");
-const op_requires = @import("../core/op_requires.zig");
-const naive_ops = @import("../ops/naive.zig");
-const simd_ops = @import("../ops/simd.zig");
-const simd_pf_ops = @import("../ops/simd_pf.zig");
-const parallel = @import("../runtime/parallel.zig");
-const limits = @import("../core/limits.zig");
-const vulkan_ctx = if (build_options.use_vulkan) @import("../runtime/vulkan_ctx.zig") else void;
+const log = @import("../../core/log.zig");
+const hwinfo = @import("../../core/hwinfo.zig");
+const op_requires = @import("../../core/op_requires.zig");
+const naive_ops = @import("../../ops/naive.zig");
+const simd_ops = @import("../../ops/simd.zig");
+const simd_pf_ops = @import("../../ops/simd_pf.zig");
+const parallel = @import("../../runtime/parallel.zig");
+const limits = @import("../../core/limits.zig");
+const vulkan_ctx = if (build_options.use_vulkan) @import("../../runtime/vulkan_ctx.zig") else void;
 
 // -- constants --------------------------------------------------------------
 
@@ -58,15 +58,13 @@ const Flags = struct {
 
 // -- api --------------------------------------------------------------------
 
-pub fn run(ctx: cli.Context) !void {
+pub fn run(ctx: context.Context) !void {
     _ = try args.parseInto(Flags, ctx) orelse return;
 
     const card = hwinfo.detect(ctx.io, ctx.arena);
     const p = style.Palette.init(ctx.color);
 
-    var stdout_buffer: [cli.stdout_buffer_bytes]u8 = undefined;
-    var stdout_writer: Io.File.Writer = .initStreaming(.stdout(), ctx.io, &stdout_buffer);
-    const w = &stdout_writer.interface;
+    const w = &ctx.stdout.interface;
 
     try printHost(w, p, card);
     try printSimd(w, p, card.simd);
@@ -165,7 +163,7 @@ fn printBackends(w: *Io.Writer, p: style.Palette, card: hwinfo.HwCard) !void {
     );
 }
 
-fn printThreading(ctx: cli.Context, w: *Io.Writer, p: style.Palette) !void {
+fn printThreading(ctx: context.Context, w: *Io.Writer, p: style.Palette) !void {
     const cores = parallel.hostCores(ctx.io);
     const host_policy = parallel.Policy.forHost(ctx.io);
 
@@ -189,7 +187,7 @@ fn printThreading(ctx: cli.Context, w: *Io.Writer, p: style.Palette) !void {
 /// Print the storage-buffer limits of the device a Vulkan command opens, and
 /// the range the buffer checks read. A host with no usable device prints the
 /// open error and keeps the rest of the card.
-fn printBufferLimits(ctx: cli.Context, w: *std.Io.Writer, p: style.Palette) !void {
+fn printBufferLimits(ctx: context.Context, w: *std.Io.Writer, p: style.Palette) !void {
     try w.print("\n{s}GPU buffer limits:{s}\n", .{ p.bold, p.reset });
     var vc = vulkan_ctx.Context.init(
         ctx.arena,

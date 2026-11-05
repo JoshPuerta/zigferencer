@@ -1,18 +1,54 @@
 //! Compute-kernel wrappers for the Vulkan op backend, one struct per shader.
-//! Each wrapper owns its shader module, descriptor set layout, pipeline layout,
-//! and compute pipeline, but not the buffers. A caller hands it data, and the
-//! wrapper records the dispatch. The engine records many small pipelines into
-//! one command buffer per token, not one fused mega-shader. Every pipeline must
-//! therefore be a self-contained value that the recording side binds and
-//! dispatches. Each kernel struct declares its own `requires`, because the
-//! variants span more than one tolerance class.
 //!
-//! The per-op wrappers keep buffer handling simple: host-visible coherent
-//! memory, a fresh descriptor pool per dispatch, and queue-wait-idle as the only
-//! synchronization. That trades speed for clarity, which suits a correctness
-//! reference and the per-op benchmarks. The fused runners in
-//! `runtime/llama_fused.zig` and `runtime/qwen_fused.zig` hold device-local
-//! weights, pre-bound descriptor sets, and one submit per token.
+//! Ownership. Each wrapper owns its shader module, descriptor set layout, pipeline layout, and
+//! compute pipeline, but not the buffers. A caller hands it data, and the wrapper records the
+//! dispatch. Each kernel struct declares its own `requires`, because the variants span more than
+//! one tolerance class.
+//!
+//! Shader headers. The header of each file in `shaders/` owns the math, the schedule, the memory
+//! table, and the bindings of its kernel. A wrapper here states what the host owes: a precondition
+//! or a tolerance. See `docs/gpu-rdna2.md` section 5 for the wave32 pin of every pipeline.
+//!
+//! Two paths. The per-op wrappers use host-visible coherent memory, one descriptor set per kernel,
+//! and queue-wait-idle as the only synchronization. The fused runners hold device-local weights,
+//! pre-bound descriptor sets, and one submit per token, and they call the record-only forms. The
+//! driver holds a descriptor update until the next submit of a command buffer that reads the set.
+//!
+//! SPIR-V embeds. `glslc` makes each blob at build time, and `build.zig` declares its anonymous
+//! import. `createShaderModule` casts the blob back to `[*]const u32`, so every declaration forces
+//! `align(@alignOf(u32))` on the embed. A bare `@embedFile` has alignment 1.
+//!
+//! Attention tolerance. The measured relative error is 5e-4 to 6e-4 on SmolLM2, Llama-1B, and
+//! Llama-8B shapes, with a near-zero-denominator floor of 1e-5 (see `computeErrors` in
+//! tools/bench.zig). The declared 1e-3 leaves a 1.5x cushion. tests/vulkan_attention_test.zig gates
+//! `Attention` on the SmolLM2 shape at 128 positions. `gpu-selftest attn` gates it on the Qwen3.5
+//! shape at 7 and `limits.attn_split_len` positions, at both KV types.
+//!
+//! Resident weights. Each weight becomes one `Q80Weight` at model-load time and stays in VRAM for
+//! the life of the model. A per-call re-upload costs too much: the lm_head alone is about 27 MB.
+//! Every Q8_0 and Q4_0 kernel reads the same scales-plus-quants layout. The repack turns each GGUF
+//! block (a 2-byte f16 scale plus 32 i8 quants) into two flat arrays: scales by `(j, blk)` and
+//! quants by `(j, p)`. The copy keeps every bit pattern, which the bit-exact match against the CPU
+//! kernel needs, so never reorder bytes.
+//!
+//! VRAM arenas. The driver sets the constraint. A Llama-8B Q8_0 model holds 225 Q8_0 weights, so
+//! one buffer and one memory object each makes 450 device allocations. That count plus a 512 MB KV
+//! cache exhausts the device-local heap of the target driver long before the 16 GB fill up. Ten
+//! segments of about 1 GB each keep the count low. Buffer usage is a parameter, so one arena type
+//! backs the scales, the quants, and the KV shards. Offsets align to
+//! `minStorageBufferOffsetAlignment`. Allocation is append-only: weights live as long as the
+//! runner, and a per-session KV pool resets whole between sessions.
+//!
+//! One-shot submits. The paravirtual driver leaks part of a command buffer when it is freed. So
+//! every one-shot submit reuses the one staging buffer of the context. The wait before
+//! `submitOnce` returns keeps that buffer idle at the next entry. A failed wait can leave the
+//! buffer pending, and a reset of a pending buffer is invalid, so every later call returns that
+//! error. The Vulkan host thread is single, and the busy flag asserts that no call nests.
+//!
+//! Staged swaps. Evict, restore, and the prefix snapshot all walk one loop, `walkStage`. The stage
+//! holds one chunk of at most `chunk_bytes`. The walk takes `kv_budget.ChunkWalk.count` trips.
+//! Each trip clips the full copy list to its byte range, submits, and waits. A save copies
+//! the stage out after the wait, and a restore fills the stage before the submit.
 
 const std = @import("std");
 const vk = @import("vulkan");
@@ -40,8 +76,8 @@ comptime {
 
 // -- constants --------------------------------------------------------------
 
-/// Q8_0 and Q4_0 block layout, in lockstep with `src/core/dtype.zig` and the
-/// CPU decoder in `ops/naive.zig`. The quant kernels assert a match.
+/// Q8_0 and Q4_0 block layout, in lockstep with `src/core/dtype.zig` and the CPU decoder in
+/// `ops/naive.zig`.
 const q8_0_block_elems: usize = 32;
 
 const q8_0_block_bytes: usize = 2 + q8_0_block_elems; // f16 scale + 32 i8 quants
@@ -49,39 +85,30 @@ const q4_0_block_elems: usize = 32;
 const q4_0_packed_bytes: usize = 16; // 32 weights at 4 bits = 16 bytes
 pub const q4_0_block_bytes: usize = 2 + q4_0_packed_bytes; // f16 scale + 16 packed
 
-/// The largest workgroup count a dispatch can ask for in one dimension. Vulkan
-/// guarantees at least this in `maxComputeWorkGroupCount[0]`, so a kernel that
-/// stays under it needs no device query. The narrowing kernels assert against
-/// it, because their grid follows an element count the caller supplies.
+/// The largest workgroup count in one dimension that needs no device query, because Vulkan
+/// guarantees at least this in `maxComputeWorkGroupCount[0]`. The narrowing kernels assert against
+/// it, because their grid follows an element count that the caller supplies.
 const max_workgroups_x: u32 = 65535;
 
-/// SPIR-V binary for `shaders/vec_add.comp`, produced by `glslc` at build time
-/// and embedded through an anonymous import that `build.zig` declares.
-/// SPIR-V is a stream of 4-byte words and `createShaderModule` casts back to
-/// `[*]const u32`, so the declaration forces `align(@alignOf(u32))` on the
-/// embed. A bare `@embedFile` gives a `*const [N]u8` of alignment 1. Every
-/// shader embed below repeats this form.
+// One blob per shader, in the form that "SPIR-V embeds" in the header states.
 const vec_add_spv: [
     @embedFile(
         "vec_add.spv",
     ).len
 ]u8 align(@alignOf(u32)) = @embedFile("vec_add.spv").*;
 
-/// SPIR-V for `shaders/residual_add.comp`.
 const residual_add_spv: [
     @embedFile(
         "residual_add.spv",
     ).len
 ]u8 align(@alignOf(u32)) = @embedFile("residual_add.spv").*;
 
-/// SPIR-V for `shaders/sigmoid_gate.comp`.
 const sigmoid_gate_spv: [
     @embedFile(
         "sigmoid_gate.spv",
     ).len
 ]u8 align(@alignOf(u32)) = @embedFile("sigmoid_gate.spv").*;
 
-/// SPIR-V for `shaders/attention.comp`, once per KV-cache element type.
 const attention_spv: [
     @embedFile(
         "attention.spv",
@@ -94,8 +121,6 @@ const attention_f16_spv: [
     ).len
 ]u8 align(@alignOf(u32)) = @embedFile("attention_f16.spv").*;
 
-/// SPIR-V for `shaders/attention_split.comp`, once per KV-cache element type,
-/// and for `shaders/attention_merge.comp`, whose f32 records serve both types.
 const attention_split_spv: [
     @embedFile(
         "attention_split.spv",
@@ -113,95 +138,80 @@ const attention_merge_spv: [
     ).len
 ]u8 align(@alignOf(u32)) = @embedFile("attention_merge.spv").*;
 
-/// SPIR-V for `shaders/rope.comp`.
 const rope_spv: [@embedFile("rope.spv").len]u8 align(@alignOf(u32)) = @embedFile("rope.spv").*;
 
-/// SPIR-V for `shaders/rope_multi.comp`.
 const rope_multi_spv: [
     @embedFile(
         "rope_multi.spv",
     ).len
 ]u8 align(@alignOf(u32)) = @embedFile("rope_multi.spv").*;
 
-/// SPIR-V for `shaders/rmsnorm.comp`.
 const rmsnorm_spv: [
     @embedFile(
         "rmsnorm.spv",
     ).len
 ]u8 align(@alignOf(u32)) = @embedFile("rmsnorm.spv").*;
 
-/// SPIR-V for `shaders/swiglu.comp`.
 const swiglu_spv: [
     @embedFile(
         "swiglu.spv",
     ).len
 ]u8 align(@alignOf(u32)) = @embedFile("swiglu.spv").*;
 
-/// SPIR-V for `shaders/linear_q8_0.comp`. See `vec_add_spv` for the alignment
-/// rule that every shader embed here follows.
 const linear_q8_0_spv: [
     @embedFile(
         "linear_q8_0.spv",
     ).len
 ]u8 align(@alignOf(u32)) = @embedFile("linear_q8_0.spv").*;
 
-/// SPIR-V for `shaders/linear_q8_0_reduce.comp`.
 const linear_q8_0_reduce_spv: [
     @embedFile(
         "linear_q8_0_reduce.spv",
     ).len
 ]u8 align(@alignOf(u32)) = @embedFile("linear_q8_0_reduce.spv").*;
 
-/// SPIR-V for `shaders/linear_q4_0_reduce.comp`.
 const linear_q4_0_reduce_spv: [
     @embedFile(
         "linear_q4_0_reduce.spv",
     ).len
 ]u8 align(@alignOf(u32)) = @embedFile("linear_q4_0_reduce.spv").*;
 
-/// SPIR-V for `shaders/linear_q8_0_subgroup.comp`.
 const linear_q8_0_subgroup_spv: [
     @embedFile(
         "linear_q8_0_subgroup.spv",
     ).len
 ]u8 align(@alignOf(u32)) = @embedFile("linear_q8_0_subgroup.spv").*;
 
-/// SPIR-V for `shaders/linear_q8_0_batch.comp`.
 const linear_q8_0_batch_spv: [
     @embedFile(
         "linear_q8_0_batch.spv",
     ).len
 ]u8 align(@alignOf(u32)) = @embedFile("linear_q8_0_batch.spv").*;
 
-/// SPIR-V for `shaders/linear_q8_0_gemm.comp`.
 const linear_q8_0_gemm_spv: [
     @embedFile(
         "linear_q8_0_gemm.spv",
     ).len
 ]u8 align(@alignOf(u32)) = @embedFile("linear_q8_0_gemm.spv").*;
 
-/// SPIR-V for `shaders/linear_q4_0_batch.comp`.
 const linear_q4_0_batch_spv: [
     @embedFile(
         "linear_q4_0_batch.spv",
     ).len
 ]u8 align(@alignOf(u32)) = @embedFile("linear_q4_0_batch.spv").*;
 
-/// SPIR-V for `shaders/rmsnorm_batch.comp`.
 const rmsnorm_batch_spv: [
     @embedFile(
         "rmsnorm_batch.spv",
     ).len
 ]u8 align(@alignOf(u32)) = @embedFile("rmsnorm_batch.spv").*;
 
-/// SPIR-V for `shaders/rope_multi_batch.comp`.
 const rope_multi_batch_spv: [
     @embedFile(
         "rope_multi_batch.spv",
     ).len
 ]u8 align(@alignOf(u32)) = @embedFile("rope_multi_batch.spv").*;
 
-/// SPIR-V for `shaders/attention_batch.comp`, once per KV-cache element type.
 const attention_batch_spv: [
     @embedFile(
         "attention_batch.spv",
@@ -214,8 +224,6 @@ const attention_batch_f16_spv: [
     ).len
 ]u8 align(@alignOf(u32)) = @embedFile("attention_batch_f16.spv").*;
 
-/// SPIR-V for `shaders/attention_multi_stream.comp`, once per KV-cache element
-/// type.
 const attention_multi_stream_spv: [
     @embedFile(
         "attention_multi_stream.spv",
@@ -228,21 +236,18 @@ const attention_multi_stream_f16_spv: [
     ).len
 ]u8 align(@alignOf(u32)) = @embedFile("attention_multi_stream_f16.spv").*;
 
-/// SPIR-V for `shaders/kv_commit_f16.comp`.
 const kv_commit_f16_spv: [
     @embedFile(
         "kv_commit_f16.spv",
     ).len
 ]u8 align(@alignOf(u32)) = @embedFile("kv_commit_f16.spv").*;
 
-/// SPIR-V for `shaders/gdn_decode.comp`.
 const gdn_decode_spv: [
     @embedFile(
         "gdn_decode.spv",
     ).len
 ]u8 align(@alignOf(u32)) = @embedFile("gdn_decode.spv").*;
 
-/// SPIR-V for the chunked-parallel GDN prefill (three dispatches).
 const gdn_chunk_conv_spv: [
     @embedFile(
         "gdn_chunk_conv.spv",
@@ -260,7 +265,6 @@ const gdn_chunk_norm_spv: [
     ).len
 ]u8 align(@alignOf(u32)) = @embedFile("gdn_chunk_norm.spv").*;
 
-/// SPIR-V for `shaders/qwen_qk_norm.comp`.
 const qwen_qk_norm_spv: [
     @embedFile(
         "qwen_qk_norm.spv",
@@ -269,11 +273,8 @@ const qwen_qk_norm_spv: [
 
 // -- types ------------------------------------------------------------------
 
-/// The four objects of one compute-pipeline chain: the shader module, the
-/// descriptor set layout, the pipeline layout, and the pipeline handle. They are
-/// created and destroyed as a unit, and every kernel wrapper below embeds one.
-/// Only the SPIR-V blob, the storage-buffer binding count, and the push-constant
-/// size vary per kernel, so those three are the init parameters.
+/// The four objects of one compute-pipeline chain, created and destroyed as a unit. Every kernel
+/// wrapper embeds one. Only the SPIR-V blob, the binding count, and the push size vary.
 pub const Pipeline = struct {
     shader_module: vk.ShaderModule,
     set_layout: vk.DescriptorSetLayout,
@@ -335,16 +336,11 @@ pub const Pipeline = struct {
     }
 };
 
-/// Double-buffered host-to-device upload ring, the asynchronous counterpart to
-/// `runStagingCopies`.
+/// Double-buffered host-to-device upload ring, the asynchronous counterpart to `runStagingCopies`.
 pub const StreamRing = @import("stream_ring.zig").StreamRing;
 
-/// Element-wise `out[i] = a[i] + b[i]`, the proof-of-life pipeline. Three
-/// storage buffers (a, b, out) and one `u32` push constant for the element
-/// count. The three slices must have the same length. One lane per element at
-/// local_size_x = 256, so the grid is ceil(n / 256) workgroups. The result is
-/// bit-exact against the CPU reference, because one IEEE 754 add per element
-/// carries no reduction.
+/// Element-wise `out[i] = a[i] + b[i]`, the proof-of-life kernel. The three slices must have the
+/// same length.
 pub const VecAdd = struct {
     ctx: *const vulkan_ctx.Context,
     pipeline: Pipeline,
@@ -407,6 +403,7 @@ pub const VecAdd = struct {
     ) RunError!void {
         if (a.len != b.len or a.len != out.len) return error.BuffersLengthMismatch;
 
+        // Stage the inputs in host-visible memory.
         const n: u32 = @intCast(a.len);
         const byte_size: vk.DeviceSize = @intCast(a.len * @sizeOf(f32));
 
@@ -417,6 +414,7 @@ pub const VecAdd = struct {
         @memcpy(self.buf_a.sliceTyped(f32, a.len), a);
         @memcpy(self.buf_b.sliceTyped(f32, b.len), b);
 
+        // Bind the three buffers.
         const buf_infos = [_]vk.DescriptorBufferInfo{
             .{ .buffer = self.buf_a.buffer, .offset = 0, .range = byte_size },
             .{ .buffer = self.buf_b.buffer, .offset = 0, .range = byte_size },
@@ -424,6 +422,7 @@ pub const VecAdd = struct {
         };
         updateStorageBindings(self.ctx, self.oneshot.desc_set, &buf_infos);
 
+        // Record the dispatch.
         try self.ctx.vkd.resetCommandBuffer(self.oneshot.cmd_buffer, .{});
         const begin: vk.CommandBufferBeginInfo = .{ .flags = .{ .one_time_submit_bit = true } };
         try self.ctx.vkd.beginCommandBuffer(self.oneshot.cmd_buffer, &begin);
@@ -449,6 +448,7 @@ pub const VecAdd = struct {
         self.ctx.vkd.cmdDispatch(self.oneshot.cmd_buffer, group_count_x, 1, 1);
         try self.ctx.vkd.endCommandBuffer(self.oneshot.cmd_buffer);
 
+        // Submit, wait, and read the result back.
         const cmds = [_]vk.CommandBuffer{self.oneshot.cmd_buffer};
         const submits = [_]vk.SubmitInfo{
             .{ .command_buffer_count = 1, .p_command_buffers = &cmds },
@@ -460,11 +460,7 @@ pub const VecAdd = struct {
     }
 };
 
-/// In-place residual add `dst[i] += x[i]`. Two storage buffers (x readonly, dst
-/// read and write) and one `u32` push constant for the length. `x` and `dst`
-/// must have the same length. One lane per element at local_size_x = 256. The
-/// result is bit-exact against the CPU reference, because one IEEE 754 add per
-/// element carries no reduction.
+/// In-place residual add `dst[i] += x[i]`. `x` and `dst` must have the same length.
 pub const ResidualAdd = struct {
     ctx: *const vulkan_ctx.Context,
     pipeline: Pipeline,
@@ -504,13 +500,9 @@ pub const ResidualAdd = struct {
 
     pub const RunError = VecAdd.RunError || error{LengthMismatch};
 
-    /// Record `n_dispatches` back-to-back `residual_add` invocations into one
-    /// command buffer and submit once. The result is
-    /// `dst_final[i] = dst_init[i] + n_dispatches * x[i]`, because each dispatch
-    /// adds `x` to the previous dispatch's write. The benchmark reads the timing
-    /// rather than the math. Per-dispatch wall-clock falls as `n_dispatches`
-    /// rises, which prices the per-call submit overhead that one command buffer
-    /// per token amortizes across a whole layer.
+    /// Record `n_dispatches` adds into one command buffer and submit once, so `dst_final[i] =
+    /// dst_init[i] + n_dispatches * x[i]`. The benchmark reads the timing: per-dispatch time falls
+    /// as `n_dispatches` rises, which prices the submit that one buffer per token amortizes.
     pub fn runRepeat(
         self: *ResidualAdd,
         n_dispatches: u32,
@@ -521,6 +513,7 @@ pub const ResidualAdd = struct {
         if (x.len != dst_init.len) return error.LengthMismatch;
         if (x.len != dst_final.len) return error.LengthMismatch;
 
+        // Stage the inputs in host-visible memory.
         const n: u32 = @intCast(x.len);
         const byte_size: vk.DeviceSize = @intCast(x.len * @sizeOf(f32));
 
@@ -530,6 +523,7 @@ pub const ResidualAdd = struct {
         @memcpy(self.buf_x.sliceTyped(f32, x.len), x);
         @memcpy(self.buf_dst.sliceTyped(f32, dst_init.len), dst_init);
 
+        // Bind x and dst.
         const buf_infos = [_]vk.DescriptorBufferInfo{
             .{ .buffer = self.buf_x.buffer, .offset = 0, .range = byte_size },
             .{ .buffer = self.buf_dst.buffer, .offset = 0, .range = byte_size },
@@ -550,6 +544,7 @@ pub const ResidualAdd = struct {
 
         self.ctx.vkd.updateDescriptorSets(self.ctx.device, &writes, null);
 
+        // Record the dispatches, with a barrier between each pair.
         try self.ctx.vkd.resetCommandBuffer(self.oneshot.cmd_buffer, .{});
         const begin: vk.CommandBufferBeginInfo = .{ .flags = .{ .one_time_submit_bit = true } };
         try self.ctx.vkd.beginCommandBuffer(self.oneshot.cmd_buffer, &begin);
@@ -573,9 +568,8 @@ pub const ResidualAdd = struct {
         );
         const group_count_x: u32 = (n + 255) / 256;
 
-        // SSBO read-after-write hazard between dispatches: each dispatch
-        // reads the previous dispatch's writes to `dst`. Without an
-        // explicit barrier the driver is free to overlap them.
+        // Each dispatch reads the writes of the last one to `dst`. Without an explicit barrier the
+        // driver is free to overlap them.
         const ssbo_barrier: vk.MemoryBarrier = .{
             .src_access_mask = .{ .shader_write_bit = true },
             .dst_access_mask = .{ .shader_read_bit = true, .shader_write_bit = true },
@@ -600,6 +594,7 @@ pub const ResidualAdd = struct {
 
         try self.ctx.vkd.endCommandBuffer(self.oneshot.cmd_buffer);
 
+        // Submit, wait, and read the result back.
         const cmds = [_]vk.CommandBuffer{self.oneshot.cmd_buffer};
         const submits = [_]vk.SubmitInfo{
             .{ .command_buffer_count = 1, .p_command_buffers = &cmds },
@@ -610,9 +605,8 @@ pub const ResidualAdd = struct {
         @memcpy(dst_final, self.buf_dst.sliceTyped(f32, dst_final.len));
     }
 
-    /// Record one `dst[i] += x[i]` dispatch into a command buffer the caller
-    /// owns. `dst` carries both the input and the result. The caller binds the
-    /// descriptor set (x, dst) and inserts any barriers.
+    /// Record one `dst[i] += x[i]` dispatch into a command buffer the caller owns. `dst` carries
+    /// both the input and the result. The caller binds the set (x, dst) and inserts any barriers.
     pub fn recordInto(
         self: *ResidualAdd,
         cb: vk.CommandBuffer,
@@ -629,6 +623,7 @@ pub const ResidualAdd = struct {
             &desc_sets,
             null,
         );
+
         self.ctx.vkd.cmdPushConstants(
             cb,
             self.pipeline.pipeline_layout,
@@ -644,6 +639,7 @@ pub const ResidualAdd = struct {
     pub fn run(self: *ResidualAdd, x: []const f32, dst: []f32) RunError!void {
         if (x.len != dst.len) return error.LengthMismatch;
 
+        // Stage the inputs in host-visible memory.
         const n: u32 = @intCast(x.len);
         const byte_size: vk.DeviceSize = @intCast(x.len * @sizeOf(f32));
 
@@ -653,6 +649,7 @@ pub const ResidualAdd = struct {
         @memcpy(self.buf_x.sliceTyped(f32, x.len), x);
         @memcpy(self.buf_dst.sliceTyped(f32, dst.len), dst);
 
+        // Bind x and dst.
         const buf_infos = [_]vk.DescriptorBufferInfo{
             .{ .buffer = self.buf_x.buffer, .offset = 0, .range = byte_size },
             .{ .buffer = self.buf_dst.buffer, .offset = 0, .range = byte_size },
@@ -673,6 +670,7 @@ pub const ResidualAdd = struct {
 
         self.ctx.vkd.updateDescriptorSets(self.ctx.device, &writes, null);
 
+        // Record the dispatch.
         try self.ctx.vkd.resetCommandBuffer(self.oneshot.cmd_buffer, .{});
         const begin: vk.CommandBufferBeginInfo = .{ .flags = .{ .one_time_submit_bit = true } };
         try self.ctx.vkd.beginCommandBuffer(self.oneshot.cmd_buffer, &begin);
@@ -698,6 +696,7 @@ pub const ResidualAdd = struct {
         self.ctx.vkd.cmdDispatch(self.oneshot.cmd_buffer, group_count_x, 1, 1);
         try self.ctx.vkd.endCommandBuffer(self.oneshot.cmd_buffer);
 
+        // Submit, wait, and read the result back.
         const cmds = [_]vk.CommandBuffer{self.oneshot.cmd_buffer};
         const submits = [_]vk.SubmitInfo{
             .{ .command_buffer_count = 1, .p_command_buffers = &cmds },
@@ -709,11 +708,7 @@ pub const ResidualAdd = struct {
     }
 };
 
-/// In-place output gate `dst[i] *= sigmoid(gate[i])` for Qwen3.5 full attention.
-/// Two storage buffers (dst read and write, gate readonly) and one `u32` push
-/// constant for the length. `dst` and `gate` must have the same length. One lane
-/// per element at local_size_x = 256. The GPU `exp` rounds differently from the
-/// CPU one, so the declared tolerance is `.relative = 1e-5`.
+/// In-place output gate of Qwen3.5 full attention. `dst` and `gate` must have the same length.
 pub const SigmoidGate = struct {
     ctx: *const vulkan_ctx.Context,
     pipeline: Pipeline,
@@ -769,6 +764,7 @@ pub const SigmoidGate = struct {
             &sets,
             null,
         );
+
         self.ctx.vkd.cmdPushConstants(
             cb,
             self.pipeline.pipeline_layout,
@@ -814,23 +810,17 @@ pub const SigmoidGate = struct {
     }
 };
 
-/// Fused single-token attention: the scores, the softmax, and the V-weighted
-/// sum, one workgroup per query head. Reads q, k_cache, and v_cache, and writes
-/// out. `t_len` must be at least 1 and at most `limits.max_model_ctx`, and
-/// `n_heads` must be a multiple of `n_kv_heads`. `recordInto` takes a row of at
-/// most `limits.attn_split_len` positions, whose scores the shader holds in LDS,
-/// and head_dim carries no bound. `run` takes a row of any depth, and it sends
-/// a longer row through the two passes of `AttentionSplit`. The resident grid
-/// is n_heads workgroups of 64 lanes. The declared tolerance is
-/// `.relative = 1e-3`.
+/// Fused single-token attention. `t_len` must be at least 1 and at most `limits.max_model_ctx`, and
+/// `n_kv_heads` must divide `n_heads`. `recordInto` takes a row of at most `limits.attn_split_len`
+/// positions. `run` takes any depth, and it sends a longer row through `AttentionSplit`.
 pub const Attention = struct {
     ctx: *const vulkan_ctx.Context,
     pipeline: Pipeline,
     oneshot: OneShot,
     /// The KV-cache element type of the pipelines, which `runTyped` checks.
     kv: dtype.KvDtype,
-    /// The split path of `runTyped`, built for its first split row. The fused
-    /// runners only call `recordInto`, so they never build it.
+    /// The split path of `runTyped`, built for its first split row. The fused runners never build
+    /// it.
     split: ?SplitKit,
     buf_q: HostBuffer,
     buf_k: HostBuffer,
@@ -841,16 +831,7 @@ pub const Attention = struct {
     pub const requires: op_requires.OpRequires = .{
         .arch = .any,
         .runtime = .vulkan,
-        // The reduction order differs from the CPU reference. LDS tree-reduces
-        // carry the softmax max and sum and the per-output V-sum, and the GPU
-        // `exp` rounds differently. The resident walk showed a relative error
-        // of 5e-4 to 6e-4 on SmolLM2, Llama-1B, and Llama-8B shapes of up to
-        // 512 positions. The bench applies a near-zero-denominator floor of
-        // 1e-5 (see `computeErrors` in tools/bench.zig). 1e-3 leaves a 1.5x
-        // cushion. Rows past `limits.attn_split_len` take `AttentionSplit`, so
-        // tests/vulkan_attention_test.zig gates this kernel on the SmolLM2
-        // shape at 128 positions. `gpu-selftest attn` gates it on the Qwen3.5
-        // shape at 7 and `limits.attn_split_len` positions, at both KV types.
+        // See "Attention tolerance" in the header.
         .tolerance = .{ .relative = 1e-3 },
     };
 
@@ -914,13 +895,9 @@ pub const Attention = struct {
         return initKv(ctx, .f32);
     }
 
-    /// Build the resident pipeline for the KV-cache element type the process
-    /// resolved. The f16 variant comes from the same GLSL source under a
-    /// define, so only the element type of the k_cache and v_cache bindings
-    /// differs. The LDS scores buffer, the accumulators, the push constants, and
-    /// the element indexing stay the same. So one selector covers the
-    /// difference, and no call site below needs to know. `runTyped` builds the
-    /// split passes for the same element type when it gets its first split row.
+    /// Build the resident pipeline for the KV-cache element type of the process. `build.zig`
+    /// compiles the f16 variant from the same source, so one selector covers the difference.
+    /// `runTyped` builds the split passes for the same type at its first split row.
     pub fn initKv(ctx: *const vulkan_ctx.Context, kv: dtype.KvDtype) InitError!Attention {
         const spv: []align(@alignOf(u32)) const u8 = switch (kv) {
             .f32 => &attention_spv,
@@ -962,11 +939,9 @@ pub const Attention = struct {
 
     pub const RunError = ResidualAdd.RunError || SplitKit.BuildError;
 
-    /// Record one fused-attention dispatch into a command buffer the caller
-    /// owns. The caller binds the descriptor set (q, k_cache, v_cache, out).
-    /// One workgroup per head. The caller must keep `t_len` within
-    /// `limits.attn_split_len`. A deeper row takes the split passes through
-    /// the attention kit.
+    /// Record one fused-attention dispatch into a command buffer the caller owns. The caller binds
+    /// the set (q, k_cache, v_cache, out) and keeps `t_len` within `limits.attn_split_len`. A
+    /// deeper row takes the split passes through the attention kit.
     pub fn recordInto(
         self: *Attention,
         cb: vk.CommandBuffer,
@@ -983,6 +958,7 @@ pub const Attention = struct {
         std.debug.assert(n_heads % n_kv_heads == 0);
         std.debug.assert(head_dim >= 1);
 
+        // Bind the pipeline and the descriptor set.
         self.ctx.vkd.cmdBindPipeline(cb, .compute, self.pipeline.handle);
         const desc_sets = [_]vk.DescriptorSet{desc_set};
         self.ctx.vkd.cmdBindDescriptorSets(
@@ -993,6 +969,8 @@ pub const Attention = struct {
             &desc_sets,
             null,
         );
+
+        // Push the head shape and dispatch one workgroup per head.
         const pc: PushConsts = .{
             .n_heads = n_heads,
             .n_kv_heads = n_kv_heads,
@@ -1025,11 +1003,9 @@ pub const Attention = struct {
         return self.runTyped(f32, q, k_cache, v_cache, n_heads, n_kv_heads, head_dim, t_len, out);
     }
 
-    /// Run one row against caches of element type `T`, which must match the
-    /// KV dtype of the pipelines. A row of at most `limits.attn_split_len`
-    /// positions runs the resident kernel. A longer row runs the split pass, a
-    /// shader barrier, and the merge pass. The first longer row builds the
-    /// split passes. Either way the row takes one submission.
+    /// Run one row against caches of element type `T`, which must match the KV dtype of the
+    /// pipelines. A row past `limits.attn_split_len` positions runs the split pass, a shader
+    /// barrier, and the merge pass. Either way the row takes one submission.
     pub fn runTyped(
         self: *Attention,
         comptime T: type,
@@ -1048,6 +1024,7 @@ pub const Attention = struct {
             else => @compileError("Attention.runTyped: the KV element type must be f32 or f16"),
         };
 
+        // Check the row shape.
         std.debug.assert(self.kv == kv);
         std.debug.assert(t_len >= 1);
         std.debug.assert(t_len <= limits.max_model_ctx);
@@ -1055,21 +1032,22 @@ pub const Attention = struct {
         std.debug.assert(n_heads % n_kv_heads == 0);
         std.debug.assert(q.len == n_heads * head_dim);
         std.debug.assert(out.len >= q.len);
-        // The whole row is the one stream of the split pass, and the shaders
-        // index it in 32 bits.
+        // The whole row is the one stream of the split pass, and the shaders index it in 32 bits.
         const row_elems = @as(u64, t_len) * n_kv_heads * head_dim;
         std.debug.assert(row_elems <= limits.max_kv_index_elems);
         std.debug.assert(k_cache.len >= row_elems);
         std.debug.assert(v_cache.len >= row_elems);
+
+        // Build the split passes at the first deep row.
         const deep = attn_split.usesSplit(t_len);
         if (deep and self.split == null) {
             self.split = try SplitKit.init(self.ctx, self.kv);
         }
 
+        // Size the bindings and stage the inputs.
         const q_bytes: vk.DeviceSize = @intCast(q.len * @sizeOf(f32));
-        // The f16 shaders read the caches as 32-bit words, so each binding
-        // covers whole words. The split pass reads K in 16-byte loads, so the
-        // K binding covers whole loads. No shader reads the padding.
+        // The f16 shaders read words, so each binding covers whole words. The split pass reads K in
+        // 16-byte loads, so the K binding covers whole loads. No shader reads the padding.
         const k_bytes: vk.DeviceSize = std.mem.alignForward(
             vk.DeviceSize,
             k_cache.len * @sizeOf(T),
@@ -1090,6 +1068,7 @@ pub const Attention = struct {
         @memcpy(self.buf_k.sliceTyped(T, k_cache.len), k_cache);
         @memcpy(self.buf_v.sliceTyped(T, v_cache.len), v_cache);
 
+        // Describe the four buffers.
         const q_info: vk.DescriptorBufferInfo = .{
             .buffer = self.buf_q.buffer,
             .offset = 0,
@@ -1111,15 +1090,15 @@ pub const Attention = struct {
             .range = out_bytes,
         };
 
-        // The split path writes one row of records at scratch row 0. A record
-        // offset does not depend on the row count, so a one-row scratch has the
-        // offsets of the first row of a runner scratch.
+        // Bind the split sets or the resident set. A record offset does not depend on the row
+        // count, so a one-row scratch has the offsets of the first row of a runner scratch.
         const scratch: attn_split.Scratch = .{
             .rows = 1,
             .n_heads = n_heads,
             .head_dim = head_dim,
             .max_splits = attn_split.splitCount(t_len),
         };
+
         if (deep) {
             const kit = &self.split.?;
             const scratch_bytes: vk.DeviceSize = scratch.totalBytes();
@@ -1140,6 +1119,7 @@ pub const Attention = struct {
             updateStorageBindings(self.ctx, self.oneshot.desc_set, &buf_infos);
         }
 
+        // Record the split pass, a barrier, and the merge pass, or the resident kernel.
         const cb = self.oneshot.cmd_buffer;
         try self.ctx.vkd.resetCommandBuffer(cb, .{});
         const begin: vk.CommandBufferBeginInfo = .{ .flags = .{ .one_time_submit_bit = true } };
@@ -1159,6 +1139,7 @@ pub const Attention = struct {
                 0,
                 scratch.max_splits,
             );
+
             // The merge reads the records that the split pass wrote.
             const records_ready = [_]vk.MemoryBarrier{.{
                 .src_access_mask = .{ .shader_write_bit = true },
@@ -1173,6 +1154,7 @@ pub const Attention = struct {
                 null,
                 null,
             );
+
             kit.passes.recordMerge(
                 cb,
                 kit.merge_set,
@@ -1189,6 +1171,7 @@ pub const Attention = struct {
 
         try self.ctx.vkd.endCommandBuffer(cb);
 
+        // Submit, wait, and read the output back.
         const cmds = [_]vk.CommandBuffer{cb};
         const submits = [_]vk.SubmitInfo{
             .{ .command_buffer_count = 1, .p_command_buffers = &cmds },
@@ -1200,18 +1183,9 @@ pub const Attention = struct {
     }
 };
 
-/// Split-depth decode attention for a row of more than `limits.attn_split_len`
-/// positions. The split pass runs one workgroup of 64 lanes per split and per
-/// run of at most `limits.attn_split_queries` query heads of one GQA group.
-/// The heads of a run share their K and V rows, so the workgroup reads each
-/// row once for all of them. It writes one partial record per head into a
-/// scratch that `attn_split.Scratch` lays out. The merge pass runs one
-/// workgroup per query head and per 64-element chunk of the head, one lane per
-/// element. It combines the records of the row in ascending split order, so
-/// one `t_len` gives one result bit for bit. The geometry of a row follows its
-/// `t_len` alone. The kernel is record-only: the caller owns
-/// the scratch, the descriptor sets, and the shader barrier between the two
-/// passes. The declared tolerance is `.relative = 1e-3`.
+/// Split-depth decode attention for a row past `limits.attn_split_len` positions. The kernel is
+/// record-only: the caller owns the scratch, the descriptor sets, and the shader barrier between
+/// the two passes. One `t_len` gives one result bit for bit.
 pub const AttentionSplit = struct {
     ctx: *const vulkan_ctx.Context,
     split: Pipeline,
@@ -1221,15 +1195,12 @@ pub const AttentionSplit = struct {
     pub const split_bindings: u32 = 4;
     /// Bindings of a merge set: the scratch, the output.
     pub const merge_bindings: u32 = 2;
-    /// Lanes of a merge workgroup, the `local_size_x` of
-    /// `attention_merge.comp`. One lane owns one element of a head.
+    /// Lanes of a merge workgroup, the `local_size_x` of `attention_merge.comp`.
     const merge_lanes: u32 = 64;
 
     pub const requires: op_requires.OpRequires = .{
         .arch = .any,
         .runtime = .vulkan,
-        // The split sums and the merge reorder the softmax and the V sums
-        // against the CPU reference, as the LDS trees of `Attention` do.
         // `gpu-selftest attn` prints the measured error at each depth.
         .tolerance = .{ .relative = 1e-3 },
     };
@@ -1287,13 +1258,9 @@ pub const AttentionSplit = struct {
         self.split.deinit(self.ctx);
     }
 
-    /// Record the split pass of one row, on the grid
-    /// `(n_kv_heads * attn_split.queryGroups(n_heads / n_kv_heads),
-    /// attn_split.splitCount(t_len))`. The caller binds `set` with
-    /// q, the K region, the V region, and the scratch. Row `q_row_base` of q
-    /// reads stream `kv_stream_base` of the regions, and the records land in
-    /// row `scratch_row` of a record group of `stride` splits per head. The
-    /// shader reads `stride` from its `max_splits` push constant.
+    /// Record the split pass of one row. The caller binds `set` with q, the K region, the V region,
+    /// and the scratch. Row `q_row_base` of q reads stream `kv_stream_base`, and the records land
+    /// in row `scratch_row` of a record group of `stride` splits per head.
     pub fn recordSplit(
         self: *const AttentionSplit,
         cb: vk.CommandBuffer,
@@ -1308,6 +1275,7 @@ pub const AttentionSplit = struct {
         scratch_row: u32,
         stride: u32,
     ) void {
+        // Check the row and the grid.
         std.debug.assert(attn_split.usesSplit(t_len));
 
         const n_splits = attn_split.splitCount(t_len);
@@ -1318,9 +1286,9 @@ pub const AttentionSplit = struct {
         std.debug.assert(n_kv_heads >= 1);
         std.debug.assert(n_heads % n_kv_heads == 0);
         std.debug.assert(head_dim >= 1);
-        // The shader stages q in LDS of `attn_max_head_dim` floats, and it
-        // reads K in whole 16-byte loads. `guardHeadDim` refuses a model
-        // that breaks either rule at boot.
+
+        // The shader stages q in LDS of `attn_max_head_dim` floats, and it reads K in whole 16-byte
+        // loads. `guardHeadDim` refuses a model that breaks either rule at boot.
         std.debug.assert(head_dim <= limits.attn_max_head_dim);
         std.debug.assert(head_dim % limits.attn_head_dim_granule == 0);
         // With a 16-byte K binding offset (`assertKBinding`), every K row then
@@ -1337,6 +1305,8 @@ pub const AttentionSplit = struct {
             (@as(u64, q_row_base) + 1) * n_heads * head_dim <= limits.max_kv_index_elems,
         );
         assertRecordsIndexable(n_heads, head_dim, scratch_row, stride);
+
+        // Bind the split pipeline and the descriptor set.
         self.ctx.vkd.cmdBindPipeline(cb, .compute, self.split.handle);
         const desc_sets = [_]vk.DescriptorSet{set};
         self.ctx.vkd.cmdBindDescriptorSets(
@@ -1347,6 +1317,8 @@ pub const AttentionSplit = struct {
             &desc_sets,
             null,
         );
+
+        // Push the row geometry.
         const pc: SplitPush = .{
             .n_heads = n_heads,
             .n_kv_heads = n_kv_heads,
@@ -1366,6 +1338,7 @@ pub const AttentionSplit = struct {
             @sizeOf(SplitPush),
             @ptrCast(&pc),
         );
+
         // One workgroup serves up to `attn_split_queries` heads of one GQA
         // group, so each workgroup reads its K and V rows once for them.
         const groups_x = n_kv_heads * attn_split.queryGroups(n_heads / n_kv_heads);
@@ -1374,12 +1347,9 @@ pub const AttentionSplit = struct {
         self.ctx.vkd.cmdDispatch(cb, groups_x, n_splits, 1);
     }
 
-    /// Record the merge pass of one row, on the grid
-    /// `(n_heads, ceil(head_dim / merge_lanes))`. The caller binds `set` with
-    /// the scratch and the output, and it records a shader barrier between the
-    /// split pass of the row and this pass. It
-    /// reads the records at the `scratch_row` and `stride` of the split pass.
-    /// The result lands in row `out_row` of the output.
+    /// Record the merge pass of one row. The caller binds `set` with the scratch and the output,
+    /// and it records a shader barrier after the split pass of the row. It passes the `scratch_row`
+    /// and `stride` of that pass, and the result lands in row `out_row` of the output.
     pub fn recordMerge(
         self: *const AttentionSplit,
         cb: vk.CommandBuffer,
@@ -1391,6 +1361,7 @@ pub const AttentionSplit = struct {
         stride: u32,
         out_row: u32,
     ) void {
+        // Check the row and the grid.
         std.debug.assert(attn_split.usesSplit(t_len));
         std.debug.assert(attn_split.splitCount(t_len) <= stride);
         std.debug.assert(n_heads >= 1);
@@ -1400,6 +1371,8 @@ pub const AttentionSplit = struct {
         std.debug.assert((@as(u64, out_row) + 1) * n_heads * head_dim <= limits.max_kv_index_elems);
 
         assertRecordsIndexable(n_heads, head_dim, scratch_row, stride);
+
+        // Bind the merge pipeline and the descriptor set.
         self.ctx.vkd.cmdBindPipeline(cb, .compute, self.merge.handle);
         const desc_sets = [_]vk.DescriptorSet{set};
         self.ctx.vkd.cmdBindDescriptorSets(
@@ -1410,6 +1383,8 @@ pub const AttentionSplit = struct {
             &desc_sets,
             null,
         );
+
+        // Push the row geometry.
         const pc: MergePush = .{
             .n_heads = n_heads,
             .head_dim = head_dim,
@@ -1426,6 +1401,7 @@ pub const AttentionSplit = struct {
             @sizeOf(MergePush),
             @ptrCast(&pc),
         );
+
         // Each lane of a workgroup owns one element of the head, so the
         // chunks of a head cover every element and the last chunk is partial.
         const chunks = std.math.divCeil(u32, head_dim, merge_lanes) catch unreachable;
@@ -1436,10 +1412,8 @@ pub const AttentionSplit = struct {
         self.ctx.vkd.cmdDispatch(cb, n_heads, chunks, 1);
     }
 
-    /// Assert the K binding of a split set at the site that writes it. The
-    /// split pass reads K with 16-byte loads, so the binding must start on a
-    /// 16-byte boundary and hold whole loads. `recordSplit` asserts the row
-    /// strides.
+    /// Assert the K binding of a split set at the site that writes it. The split pass reads K in
+    /// 16-byte loads, so the binding must start on a 16-byte boundary and hold whole loads.
     pub fn assertKBinding(k: vk.DescriptorBufferInfo) void {
         std.debug.assert(k.offset % 16 == 0);
         std.debug.assert(k.range % 16 == 0);
@@ -1478,14 +1452,12 @@ pub const AttentionSplit = struct {
     }
 };
 
-/// The summation-order class of an attention kit. The byte tests (the split
-/// digests, and the equality of rows across paths) hold for one class only.
-/// A kit of another class runs the reference tests at its declared tolerance and
-/// the token gates.
+/// The summation-order class of an attention kit. The byte tests (the split digests, and the
+/// equality of rows across paths) hold for one class only. A kit of another class runs the
+/// reference tests at its declared tolerance and the token gates.
 pub const AttnOrderClass = enum {
-    /// Each split sums its positions in ascending order, and the merge
-    /// combines the splits in ascending order. So a row gets the same bytes at
-    /// every batch, slot, and record group.
+    /// Splits and merge both run in ascending order, so a row gets the same bytes at every batch,
+    /// slot, and record group.
     split_ascending,
 };
 
@@ -1499,10 +1471,9 @@ pub const AttnShape = struct {
     max_splits: u32,
 };
 
-/// The attention kit of `-Dattn-kernel=split`: the resident kernels for a row
-/// inside one split, and `AttentionSplit` past it. The kit owns no pipeline.
-/// It points at the pipelines of its runner, and `runtime/attn_record.zig`
-/// records a plan through it.
+/// The attention kit of `-Dattn-kernel=split`: the resident kernels for a row inside one split, and
+/// `AttentionSplit` past it. The kit points at the pipelines of its runner and owns none, and
+/// `runtime/attn_record.zig` records a plan through it.
 pub const SplitAttnKit = struct {
     single: *Attention,
     multi: *AttentionMultiStream,
@@ -1681,13 +1652,8 @@ pub const AttnKit = switch (build_options.attn_kernel) {
     .split => SplitAttnKit,
 };
 
-/// In-place RoPE rotation on one head_dim vector at the given position. Two
-/// storage buffers (x read and write, the frequency factors readonly) and four
-/// push constants (pos, rope_dim, freq_base, style). `rope_dim` must be even and
-/// at most `x.len`. Lanes stride across the rope_dim/2 pairs at
-/// local_size_x = 64. The declared tolerance is `.relative = 5e-5`. Only the
-/// benchmark calls this kernel. The per-op path runs the CPU rope, and the
-/// fused runners use `RopeMulti`.
+/// In-place RoPE rotation of one head_dim vector. `rope_dim` must be even and at most `x.len`. Only
+/// the benchmark calls this kernel.
 pub const Rope = struct {
     ctx: *const vulkan_ctx.Context,
     pipeline: Pipeline,
@@ -1698,9 +1664,7 @@ pub const Rope = struct {
     pub const requires: op_requires.OpRequires = .{
         .arch = .any,
         .runtime = .vulkan,
-        // Observed relative error is 1.6e-5 at head_dim 64. The GPU `pow`,
-        // `cos`, and `sin` round more loosely than the CPU intrinsics.
-        // 5e-5 leaves headroom.
+        // The observed relative error is 1.6e-5 at head_dim 64, so 5e-5 leaves headroom.
         .tolerance = .{ .relative = 5e-5 },
     };
 
@@ -1744,6 +1708,7 @@ pub const Rope = struct {
         if (rope_dim > x.len) return error.LengthMismatch;
         if (rope_dim % 2 != 0) return error.RopeDimNotEven;
 
+        // Stage x and the frequency factors.
         const half = rope_dim / 2;
         if (freq_factors) |ff| std.debug.assert(ff.len >= half);
 
@@ -1760,12 +1725,14 @@ pub const Rope = struct {
             @memset(ff_dst, 1.0);
         }
 
+        // Bind both buffers.
         const buf_infos = [_]vk.DescriptorBufferInfo{
             .{ .buffer = self.buf_x.buffer, .offset = 0, .range = byte_size },
             .{ .buffer = self.buf_ff.buffer, .offset = 0, .range = ff_bytes },
         };
         updateStorageBindings(self.ctx, self.oneshot.desc_set, &buf_infos);
 
+        // Record the rotation.
         try self.ctx.vkd.resetCommandBuffer(self.oneshot.cmd_buffer, .{});
         const begin: vk.CommandBufferBeginInfo = .{ .flags = .{ .one_time_submit_bit = true } };
         try self.ctx.vkd.beginCommandBuffer(self.oneshot.cmd_buffer, &begin);
@@ -1779,6 +1746,8 @@ pub const Rope = struct {
             &desc_sets,
             null,
         );
+
+        // Push the rotation parameters and dispatch.
         const pc: PushConsts = .{
             .pos = pos,
             .rope_dim = @intCast(rope_dim),
@@ -1797,6 +1766,7 @@ pub const Rope = struct {
         self.ctx.vkd.cmdDispatch(self.oneshot.cmd_buffer, group_count_x, 1, 1);
         try self.ctx.vkd.endCommandBuffer(self.oneshot.cmd_buffer);
 
+        // Submit, wait, and read the result back.
         const cmds = [_]vk.CommandBuffer{self.oneshot.cmd_buffer};
         const submits = [_]vk.SubmitInfo{
             .{ .command_buffer_count = 1, .p_command_buffers = &cmds },
@@ -1808,13 +1778,9 @@ pub const Rope = struct {
     }
 };
 
-/// Multi-head RoPE. Same rotation as `Rope`, applied to every head of an
-/// `(n_heads, head_dim)` buffer in one dispatch. It replaces the per-head Rope
-/// dispatch loop, which costs 40 dispatches per layer on a Llama-class model
-/// against 2 here. `rope_dim` must be even. The grid is
-/// (ceil(rope_dim / 2 / 64), n_heads). The declared tolerance is
-/// `.relative = 1e-5`. `recordInto` is the only entry point, because every
-/// caller records into its own command buffer.
+/// The rotation of `Rope` on every head of an `(n_heads, head_dim)` buffer in one dispatch, 2
+/// dispatches per layer on a Llama-class model against 40 per-head ones. `rope_dim` must be even.
+/// Every caller records into its own command buffer, so `recordInto` is the only entry point.
 pub const RopeMulti = struct {
     ctx: *const vulkan_ctx.Context,
     pipeline: Pipeline,
@@ -1872,6 +1838,7 @@ pub const RopeMulti = struct {
             &desc_sets,
             null,
         );
+
         const pc: PushConsts = .{
             .pos = pos,
             .head_dim = head_dim,
@@ -1893,13 +1860,7 @@ pub const RopeMulti = struct {
     }
 };
 
-/// RMS normalization `y[i] = x[i] * inv_rms * w[i]`, where
-/// `inv_rms = 1 / sqrt(mean(x^2) + eps)`. Three storage buffers (x, w, y) and
-/// two push constants (d, eps). The three slices must have the same length. A
-/// single workgroup of 256 lanes tree-reduces in LDS, then writes y across the
-/// lanes. The tree-reduce sums in a different order than the scalar CPU
-/// reference, so the result is not bit-exact. The declared tolerance is
-/// `.relative = 5e-5`.
+/// RMS normalization `y[i] = x[i] * inv_rms * w[i]`. The three slices must have the same length.
 pub const Rmsnorm = struct {
     ctx: *const vulkan_ctx.Context,
     pipeline: Pipeline,
@@ -1964,6 +1925,7 @@ pub const Rmsnorm = struct {
             &desc_sets,
             null,
         );
+
         const pc: PushConsts = .{ .d = d, .eps = eps };
         self.ctx.vkd.cmdPushConstants(
             cb,
@@ -1979,6 +1941,7 @@ pub const Rmsnorm = struct {
     pub fn run(self: *Rmsnorm, x: []const f32, w: []const f32, eps: f32, y: []f32) RunError!void {
         if (x.len != w.len or x.len != y.len) return error.LengthMismatch;
 
+        // Stage the inputs in host-visible memory.
         const d: u32 = @intCast(x.len);
         const byte_size: vk.DeviceSize = @intCast(x.len * @sizeOf(f32));
 
@@ -1989,6 +1952,7 @@ pub const Rmsnorm = struct {
         @memcpy(self.buf_x.sliceTyped(f32, x.len), x);
         @memcpy(self.buf_w.sliceTyped(f32, w.len), w);
 
+        // Bind the three buffers.
         const buf_infos = [_]vk.DescriptorBufferInfo{
             .{ .buffer = self.buf_x.buffer, .offset = 0, .range = byte_size },
             .{ .buffer = self.buf_w.buffer, .offset = 0, .range = byte_size },
@@ -1996,6 +1960,7 @@ pub const Rmsnorm = struct {
         };
         updateStorageBindings(self.ctx, self.oneshot.desc_set, &buf_infos);
 
+        // Record the dispatch.
         try self.ctx.vkd.resetCommandBuffer(self.oneshot.cmd_buffer, .{});
         const begin: vk.CommandBufferBeginInfo = .{ .flags = .{ .one_time_submit_bit = true } };
         try self.ctx.vkd.beginCommandBuffer(self.oneshot.cmd_buffer, &begin);
@@ -2021,6 +1986,7 @@ pub const Rmsnorm = struct {
         self.ctx.vkd.cmdDispatch(self.oneshot.cmd_buffer, 1, 1, 1);
         try self.ctx.vkd.endCommandBuffer(self.oneshot.cmd_buffer);
 
+        // Submit, wait, and read the result back.
         const cmds = [_]vk.CommandBuffer{self.oneshot.cmd_buffer};
         const submits = [_]vk.SubmitInfo{
             .{ .command_buffer_count = 1, .p_command_buffers = &cmds },
@@ -2032,12 +1998,7 @@ pub const Rmsnorm = struct {
     }
 };
 
-/// SwiGLU activation `dst[i] = silu(gate[i]) * up[i]`. Three storage buffers
-/// (gate and up readonly, dst writeonly) and one `u32` push constant for the
-/// length. The three slices must have the same length. One lane per element at
-/// local_size_x = 256. The GPU `exp` rounds differently from the CPU
-/// `std.math.exp`, so the result is not bit-exact. The declared tolerance is
-/// `.relative = 1e-5`.
+/// SwiGLU activation `dst[i] = silu(gate[i]) * up[i]`. The three slices must have the same length.
 pub const Swiglu = struct {
     ctx: *const vulkan_ctx.Context,
     pipeline: Pipeline,
@@ -2098,6 +2059,7 @@ pub const Swiglu = struct {
             &desc_sets,
             null,
         );
+
         self.ctx.vkd.cmdPushConstants(
             cb,
             self.pipeline.pipeline_layout,
@@ -2113,6 +2075,7 @@ pub const Swiglu = struct {
     pub fn run(self: *Swiglu, gate: []const f32, up: []const f32, dst: []f32) RunError!void {
         if (gate.len != up.len or gate.len != dst.len) return error.LengthMismatch;
 
+        // Stage the inputs in host-visible memory.
         const n: u32 = @intCast(gate.len);
         const byte_size: vk.DeviceSize = @intCast(gate.len * @sizeOf(f32));
 
@@ -2123,6 +2086,7 @@ pub const Swiglu = struct {
         @memcpy(self.buf_gate.sliceTyped(f32, gate.len), gate);
         @memcpy(self.buf_up.sliceTyped(f32, up.len), up);
 
+        // Bind the three buffers.
         const buf_infos = [_]vk.DescriptorBufferInfo{
             .{ .buffer = self.buf_gate.buffer, .offset = 0, .range = byte_size },
             .{ .buffer = self.buf_up.buffer, .offset = 0, .range = byte_size },
@@ -2130,6 +2094,7 @@ pub const Swiglu = struct {
         };
         updateStorageBindings(self.ctx, self.oneshot.desc_set, &buf_infos);
 
+        // Record the dispatch.
         try self.ctx.vkd.resetCommandBuffer(self.oneshot.cmd_buffer, .{});
         const begin: vk.CommandBufferBeginInfo = .{ .flags = .{ .one_time_submit_bit = true } };
         try self.ctx.vkd.beginCommandBuffer(self.oneshot.cmd_buffer, &begin);
@@ -2155,6 +2120,7 @@ pub const Swiglu = struct {
         self.ctx.vkd.cmdDispatch(self.oneshot.cmd_buffer, group_count_x, 1, 1);
         try self.ctx.vkd.endCommandBuffer(self.oneshot.cmd_buffer);
 
+        // Submit, wait, and read the result back.
         const cmds = [_]vk.CommandBuffer{self.oneshot.cmd_buffer};
         const submits = [_]vk.SubmitInfo{
             .{ .command_buffer_count = 1, .p_command_buffers = &cmds },
@@ -2166,31 +2132,19 @@ pub const Swiglu = struct {
     }
 };
 
-/// A GPU-resident Q8_0 weight matrix. It owns the f16 scales buffer, the packed
-/// quants buffer, and the dimensions. A caller builds it once from a CPU-side
-/// weight blob, and `LinearQ80.dispatch` or `LinearQ80Reduce.dispatch` then
-/// consumes it many times.
-///
-/// The split between the build and the dispatch is the point. A repack and
-/// re-upload on every matmul is ruinous: the lm_head alone is about 27 MB, which
-/// dominates the GPU share of the benchmark. So the upload leaves the per-call
-/// path. Each weight becomes one `Q80Weight` at model-load time and stays in
-/// VRAM for the life of the model. Every Q8_0 and Q4_0 kernel here reads the
-/// same scales-plus-quants layout, so this type serves all of them.
+/// A GPU-resident Q8_0 weight matrix: the f16 scales, the packed quants, and the dimensions. A
+/// caller builds it once from a CPU-side weight blob, and the matmul kernels read it many times.
+/// See "Resident weights" in the header.
 pub const Q80Weight = struct {
     ctx: *const vulkan_ctx.Context,
-    /// View into device-local memory: (buffer, offset, range). Either
-    /// references arena-owned memory (when `owned` is null) or a
-    /// privately-allocated DeviceBuffer (when `owned` is non-null).
-    /// Shape matches `vk.DescriptorBufferInfo` so callers can write
-    /// it directly into a descriptor update.
+    /// Device-local view in the shape of a descriptor write, in an arena or in the buffers of
+    /// `owned`.
     scales: vk.DescriptorBufferInfo,
     quants: vk.DescriptorBufferInfo,
     in_features: u32,
     out_features: u32,
-    /// Set when this weight allocated its own memory through `init`, and
-    /// `deinit` then frees it. When null, the memory belongs to the
-    /// `VramArena` values the caller owns, and `deinit` frees nothing.
+    /// The memory that `init` allocated and that `deinit` frees. Null means that the caller's
+    /// arenas own it.
     owned: ?Owned = null,
 
     pub const Owned = struct {
@@ -2213,25 +2167,23 @@ pub const Q80Weight = struct {
         vk.DeviceWrapper.QueueSubmitError ||
         vk.DeviceWrapper.QueueWaitIdleError;
 
-    /// Build a GPU-resident weight with its own dedicated device-memory
-    /// allocations (one per buffer). Each call produces 2 VkBuffers +
-    /// 2 VkDeviceMemory objects. Use this for one-off uses (bench,
-    /// per-op tests, lazy wrap.zig cache). For long-lived bulk uploads
-    /// (LlamaFusedRunner loading 200+ weights at init) use `initInArenas`
-    /// instead. The arena version produces ~10 device allocations
-    /// total instead of 2 per weight.
+    /// Build a weight with its own device memory: 2 buffers and 2 memory objects. Use it for
+    /// one-off uses: the bench, the per-op tests, and the `wrap.zig` cache. A bulk upload takes
+    /// `initInArenas`, about 10 device allocations in total.
     pub fn init(
         ctx: *const vulkan_ctx.Context,
         weight_bytes: []const u8,
         in_features: usize,
         out_features: usize,
     ) InitError!Q80Weight {
+        // Refuse a weight that does not fill whole blocks.
         if (in_features % q8_0_block_elems != 0) return error.InFeaturesNotMultipleOf32;
 
         const blocks_per_row = in_features / q8_0_block_elems;
         const row_bytes = blocks_per_row * q8_0_block_bytes;
         if (weight_bytes.len < out_features * row_bytes) return error.WeightSizeMismatch;
 
+        // Repack the weight into host staging.
         const scales_bytes: vk.DeviceSize = @intCast(out_features * blocks_per_row * 2);
         const quants_bytes: vk.DeviceSize = @intCast(out_features * in_features);
 
@@ -2251,6 +2203,7 @@ pub const Q80Weight = struct {
             staging_quants.sliceTyped(u8, @intCast(quants_bytes)),
         );
 
+        // Allocate the device buffers.
         var scales_db: DeviceBuffer = .{ .ctx = ctx };
         errdefer scales_db.deinit();
 
@@ -2260,6 +2213,7 @@ pub const Q80Weight = struct {
         try scales_db.ensure(scales_bytes);
         try quants_db.ensure(quants_bytes);
 
+        // Upload the repacked bytes.
         const copies = [_]Copy{
             .{ .src = staging_scales.buffer, .dst = scales_db.buffer, .size = scales_bytes },
             .{ .src = staging_quants.buffer, .dst = quants_db.buffer, .size = quants_bytes },
@@ -2279,22 +2233,23 @@ pub const Q80Weight = struct {
         };
     }
 
-    /// Q4_0 variant of init. Same container (scales f16 + packed quants),
-    /// but the quants buffer is HALF the size (16 bytes/block vs 32) and
-    /// holds 4-bit nibbles. Pair with the LinearQ40* kernels, which do the
-    /// nibble extraction. `weight_bytes` is a Q4_0 tensor (18 bytes/block).
+    /// The Q4_0 form of `init`. The quants buffer holds 16 bytes of 4-bit nibbles per block, half
+    /// the Q8_0 size. `weight_bytes` is a Q4_0 tensor, and the LinearQ40 kernels extract the
+    /// nibbles.
     pub fn initQ40(
         ctx: *const vulkan_ctx.Context,
         weight_bytes: []const u8,
         in_features: usize,
         out_features: usize,
     ) InitError!Q80Weight {
+        // Refuse a weight that does not fill whole blocks.
         if (in_features % q4_0_block_elems != 0) return error.InFeaturesNotMultipleOf32;
 
         const blocks_per_row = in_features / q4_0_block_elems;
         const row_bytes = blocks_per_row * q4_0_block_bytes;
         if (weight_bytes.len < out_features * row_bytes) return error.WeightSizeMismatch;
 
+        // Repack the weight into host staging.
         const scales_bytes: vk.DeviceSize = @intCast(out_features * blocks_per_row * 2);
         const quants_bytes: vk.DeviceSize = @intCast(out_features * (in_features / 2));
 
@@ -2314,6 +2269,7 @@ pub const Q80Weight = struct {
             staging_quants.sliceTyped(u8, @intCast(quants_bytes)),
         );
 
+        // Allocate the device buffers.
         var scales_db: DeviceBuffer = .{ .ctx = ctx };
         errdefer scales_db.deinit();
 
@@ -2323,6 +2279,7 @@ pub const Q80Weight = struct {
         try scales_db.ensure(scales_bytes);
         try quants_db.ensure(quants_bytes);
 
+        // Upload the repacked bytes.
         const copies = [_]Copy{
             .{ .src = staging_scales.buffer, .dst = scales_db.buffer, .size = scales_bytes },
             .{ .src = staging_quants.buffer, .dst = quants_db.buffer, .size = quants_bytes },
@@ -2342,12 +2299,9 @@ pub const Q80Weight = struct {
         };
     }
 
-    /// Sub-allocate scales + quants from two caller-managed VramArenas
-    /// and upload via staging. The arenas own the underlying VkBuffer
-    /// + VkDeviceMemory. This Q80Weight only stores (buffer, offset,
-    /// range) views into them. `deinit` is a no-op for the weight's
-    /// storage. The arenas free everything when they themselves are
-    /// deinit-ed.
+    /// Sub-allocate scales and quants from two caller-managed arenas and upload through staging.
+    /// This weight stores views only, so `deinit` frees nothing for it. The arenas free everything
+    /// at their own `deinit`.
     pub fn initInArenas(
         ctx: *const vulkan_ctx.Context,
         scales_arena: *VramArena,
@@ -2356,12 +2310,14 @@ pub const Q80Weight = struct {
         in_features: usize,
         out_features: usize,
     ) (InitError || VramArena.AllocError)!Q80Weight {
+        // Refuse a weight that does not fill whole blocks.
         if (in_features % q8_0_block_elems != 0) return error.InFeaturesNotMultipleOf32;
 
         const blocks_per_row = in_features / q8_0_block_elems;
         const row_bytes = blocks_per_row * q8_0_block_bytes;
         if (weight_bytes.len < out_features * row_bytes) return error.WeightSizeMismatch;
 
+        // Repack the weight into host staging.
         const scales_bytes: vk.DeviceSize = @intCast(out_features * blocks_per_row * 2);
         const quants_bytes: vk.DeviceSize = @intCast(out_features * in_features);
 
@@ -2381,12 +2337,13 @@ pub const Q80Weight = struct {
             staging_quants.sliceTyped(u8, @intCast(quants_bytes)),
         );
 
+        // Upload the repacked bytes into the arenas.
         const scales_view = try scales_arena.alloc(scales_bytes);
         const quants_view = try quants_arena.alloc(quants_bytes);
 
         const copies = [_]Copy{
-            .{ .src = staging_scales.buffer, .dst = scales_view.buffer, .size = scales_bytes, .dst_offset = scales_view.offset },
-            .{ .src = staging_quants.buffer, .dst = quants_view.buffer, .size = quants_bytes, .dst_offset = quants_view.offset },
+            copyToView(&staging_scales, scales_view),
+            copyToView(&staging_quants, quants_view),
         };
         try runStagingCopies(ctx, &copies);
 
@@ -2400,9 +2357,8 @@ pub const Q80Weight = struct {
         };
     }
 
-    /// Q4_0 arena upload (the LlamaFusedRunner path). Like initInArenas but the
-    /// quants buffer is HALF size (16 bytes/block) and holds 4-bit nibbles.
-    /// Pair with the LinearQ40* kernels. `weight_bytes` is a Q4_0 tensor.
+    /// The Q4_0 form of `initInArenas`, the upload path of `LlamaFusedRunner`. The quants buffer
+    /// holds 16 bytes of 4-bit nibbles per block. `weight_bytes` is a Q4_0 tensor.
     pub fn initInArenasQ40(
         ctx: *const vulkan_ctx.Context,
         scales_arena: *VramArena,
@@ -2411,12 +2367,14 @@ pub const Q80Weight = struct {
         in_features: usize,
         out_features: usize,
     ) (InitError || VramArena.AllocError)!Q80Weight {
+        // Refuse a weight that does not fill whole blocks.
         if (in_features % q4_0_block_elems != 0) return error.InFeaturesNotMultipleOf32;
 
         const blocks_per_row = in_features / q4_0_block_elems;
         const row_bytes = blocks_per_row * q4_0_block_bytes;
         if (weight_bytes.len < out_features * row_bytes) return error.WeightSizeMismatch;
 
+        // Repack the weight into host staging.
         const scales_bytes: vk.DeviceSize = @intCast(out_features * blocks_per_row * 2);
         const quants_bytes: vk.DeviceSize = @intCast(out_features * (in_features / 2));
 
@@ -2436,12 +2394,13 @@ pub const Q80Weight = struct {
             staging_quants.sliceTyped(u8, @intCast(quants_bytes)),
         );
 
+        // Upload the repacked bytes into the arenas.
         const scales_view = try scales_arena.alloc(scales_bytes);
         const quants_view = try quants_arena.alloc(quants_bytes);
 
         const copies = [_]Copy{
-            .{ .src = staging_scales.buffer, .dst = scales_view.buffer, .size = scales_bytes, .dst_offset = scales_view.offset },
-            .{ .src = staging_quants.buffer, .dst = quants_view.buffer, .size = quants_bytes, .dst_offset = quants_view.offset },
+            copyToView(&staging_scales, scales_view),
+            copyToView(&staging_quants, quants_view),
         };
         try runStagingCopies(ctx, &copies);
 
@@ -2463,18 +2422,21 @@ pub const Q80Weight = struct {
             self.owned = null;
         }
     }
+
+    /// The copy that fills a whole arena view from the start of a staging buffer.
+    fn copyToView(staging: *const HostBuffer, view: VramArena.View) Copy {
+        return .{
+            .src = staging.buffer,
+            .dst = view.buffer,
+            .size = view.range,
+            .dst_offset = view.offset,
+        };
+    }
 };
 
-/// Q8_0 matrix-vector product `out = input @ weight^T`, the same shape as the
-/// CPU `linearF32Q80` op. `input` is `[k]f32` and `out` is `[n]f32`. The weight
-/// is `[n, k]` Q8_0 in the GGUF layout. Each row holds k/32 blocks of 34 bytes,
-/// a 2-byte f16 scale plus 32 i8 quants. `k` must be a multiple of 32. One
-/// workgroup of 32 lanes covers 32 output rows, so the grid is ceil(n / 32).
-/// This struct owns only the per-dispatch resources: the descriptor pool and
-/// set, the command buffer, and the host-visible input and output buffers. The
-/// scales and quants live in a `Q80Weight` that the caller builds once and
-/// passes to `dispatch`. The shader keeps the scalar reduction order of the CPU
-/// reference, so the result is bit-exact.
+/// Bit-exact Q8_0 matvec `out = input @ weight^T`, the shape of the CPU `linearF32Q80` op. `input`
+/// is `[k]f32` and `out` is `[n]f32`, with `k` a multiple of 32. The caller builds a `Q80Weight`
+/// once and passes it to `dispatch`.
 pub const LinearQ80 = struct {
     ctx: *const vulkan_ctx.Context,
     pipeline: Pipeline,
@@ -2485,15 +2447,11 @@ pub const LinearQ80 = struct {
     pub const requires: op_requires.OpRequires = .{
         .arch = .any,
         .runtime = .vulkan,
-        // The linear_q8_0.comp shader keeps the scalar reduction order of the
-        // CPU reference and tags every f32 in the reduction `precise`, so the
-        // output is bit-identical. `tests/vulkan_linear_q8_0_test.zig` holds
-        // the check.
+        // `tests/vulkan_linear_q8_0_test.zig` holds the bit-identity check.
         .tolerance = .bit_exact,
     };
 
-    /// `cmdPushConstants` payload: must match `linear_q8_0.comp`'s
-    /// `Params` block. `extern` so the field order is guaranteed.
+    /// Must match the `Params` block of `linear_q8_0.comp`.
     const PushConsts = extern struct { k: u32, n: u32 };
 
     pub const InitError = VecAdd.InitError;
@@ -2527,11 +2485,9 @@ pub const LinearQ80 = struct {
 
     pub const RunOneShotError = DispatchError || Q80Weight.InitError;
 
-    /// `out = input @ weight^T` with the weight already resident in VRAM.
-    /// `input.len` must equal `weight.in_features`, and `out.len` must equal
-    /// `weight.out_features`. The per-call cost is the kilobyte-scale input and
-    /// output copies, a descriptor update, and the dispatch. The weight repack
-    /// happens once, when the `Q80Weight` is built.
+    /// `out = input @ weight^T` with the weight resident in VRAM. `input.len` must equal
+    /// `weight.in_features`, and `out.len` must equal `weight.out_features`. The per-call cost is
+    /// the kilobyte-scale copies, a descriptor update, and the dispatch.
     pub fn dispatch(
         self: *LinearQ80,
         weight: *const Q80Weight,
@@ -2541,6 +2497,7 @@ pub const LinearQ80 = struct {
         if (input.len != weight.in_features) return error.InputShapeMismatch;
         if (out.len != weight.out_features) return error.OutputShapeMismatch;
 
+        // Stage the inputs in host-visible memory.
         const in_bytes: vk.DeviceSize = @intCast(input.len * @sizeOf(f32));
         const out_bytes: vk.DeviceSize = @intCast(out.len * @sizeOf(f32));
 
@@ -2549,6 +2506,7 @@ pub const LinearQ80 = struct {
 
         @memcpy(self.buf_in.sliceTyped(f32, input.len), input);
 
+        // Bind the input, the weight, and the output.
         const buf_infos = [_]vk.DescriptorBufferInfo{
             .{ .buffer = self.buf_in.buffer, .offset = 0, .range = in_bytes },
             weight.scales,
@@ -2557,6 +2515,7 @@ pub const LinearQ80 = struct {
         };
         updateStorageBindings(self.ctx, self.oneshot.desc_set, &buf_infos);
 
+        // Record the dispatch.
         try self.ctx.vkd.resetCommandBuffer(self.oneshot.cmd_buffer, .{});
         const begin: vk.CommandBufferBeginInfo = .{ .flags = .{ .one_time_submit_bit = true } };
         try self.ctx.vkd.beginCommandBuffer(self.oneshot.cmd_buffer, &begin);
@@ -2570,6 +2529,7 @@ pub const LinearQ80 = struct {
             &desc_sets,
             null,
         );
+
         const pc: PushConsts = .{ .k = weight.in_features, .n = weight.out_features };
         self.ctx.vkd.cmdPushConstants(
             self.oneshot.cmd_buffer,
@@ -2583,6 +2543,7 @@ pub const LinearQ80 = struct {
         self.ctx.vkd.cmdDispatch(self.oneshot.cmd_buffer, group_count_x, 1, 1);
         try self.ctx.vkd.endCommandBuffer(self.oneshot.cmd_buffer);
 
+        // Submit, wait, and read the result back.
         const cmds = [_]vk.CommandBuffer{self.oneshot.cmd_buffer};
         const submits = [_]vk.SubmitInfo{
             .{ .command_buffer_count = 1, .p_command_buffers = &cmds },
@@ -2610,13 +2571,8 @@ pub const LinearQ80 = struct {
     }
 };
 
-/// Workgroup-cooperative Q8_0 matvec, the same shape and storage layout as
-/// `LinearQ80`. One workgroup of 32 lanes, one RDNA2 wave, computes a single
-/// output row through partial sums in LDS. The grid is n workgroups against
-/// ceil(n / 32) for `LinearQ80`, which gives 32 times more independent work
-/// units. That is the throughput win when n is too small to keep every compute
-/// unit busy under one invocation per output. The cross-lane reduce breaks
-/// bit-exactness, so this variant declares `.relative = 2e-4`.
+/// Workgroup-cooperative Q8_0 matvec, with the shape and the storage layout of `LinearQ80`. The
+/// caller builds the weight once, and `k` must be a multiple of 32.
 pub const LinearQ80Reduce = struct {
     ctx: *const vulkan_ctx.Context,
     pipeline: Pipeline,
@@ -2627,11 +2583,8 @@ pub const LinearQ80Reduce = struct {
     pub const requires: op_requires.OpRequires = .{
         .arch = .any,
         .runtime = .vulkan,
-        // Each lane sums its own partials precisely, then lane 0 reduces the
-        // 32 partials in lane order. That cross-lane step differs from the
-        // scalar CPU path. The drift grows with k: 8.5e-5 at k=576 and about
-        // 1e-4 at k=14336. 2e-4 leaves headroom through the widest Llama-8B
-        // shape, ffn_down at k=14336.
+        // The drift grows with k: 8.5e-5 at k=576 and about 1e-4 at k=14336. 2e-4 leaves headroom
+        // through the widest Llama-8B shape, ffn_down at k=14336.
         .tolerance = .{ .relative = 2e-4 },
     };
 
@@ -2663,14 +2616,9 @@ pub const LinearQ80Reduce = struct {
 
     pub const DispatchError = LinearQ80.DispatchError;
 
-    /// Record one Q8_0 matmul into a command buffer the caller owns. The
-    /// caller must do two things:
-    ///   1. Point `desc_set` at (input, scales, quants, output) before it
-    ///      submits the command buffer. The driver holds the descriptor update
-    ///      until the next submit of a command buffer that reads the set.
-    ///   2. Insert the memory barriers the dispatch needs.
-    /// The fused runners chain many such dispatches into one command buffer and
-    /// pay the submit and wait-idle cost once.
+    /// Record one Q8_0 matmul into a command buffer the caller owns. Before the submit, the caller
+    /// points `desc_set` at (input, scales, quants, output), and it inserts the barriers. The fused
+    /// runners chain many such dispatches, and they pay the submit and wait-idle once.
     pub fn recordInto(
         self: *LinearQ80Reduce,
         cb: vk.CommandBuffer,
@@ -2688,6 +2636,7 @@ pub const LinearQ80Reduce = struct {
             &desc_sets,
             null,
         );
+
         const pc: PushConsts = .{ .k = k, .n = n };
         self.ctx.vkd.cmdPushConstants(
             cb,
@@ -2709,6 +2658,7 @@ pub const LinearQ80Reduce = struct {
         if (input.len != weight.in_features) return error.InputShapeMismatch;
         if (out.len != weight.out_features) return error.OutputShapeMismatch;
 
+        // Stage the inputs in host-visible memory.
         const in_bytes: vk.DeviceSize = @intCast(input.len * @sizeOf(f32));
         const out_bytes: vk.DeviceSize = @intCast(out.len * @sizeOf(f32));
 
@@ -2717,6 +2667,7 @@ pub const LinearQ80Reduce = struct {
 
         @memcpy(self.buf_in.sliceTyped(f32, input.len), input);
 
+        // Bind the input, the weight, and the output.
         const buf_infos = [_]vk.DescriptorBufferInfo{
             .{ .buffer = self.buf_in.buffer, .offset = 0, .range = in_bytes },
             weight.scales,
@@ -2725,6 +2676,7 @@ pub const LinearQ80Reduce = struct {
         };
         updateStorageBindings(self.ctx, self.oneshot.desc_set, &buf_infos);
 
+        // Record the dispatch.
         try self.ctx.vkd.resetCommandBuffer(self.oneshot.cmd_buffer, .{});
         const begin: vk.CommandBufferBeginInfo = .{ .flags = .{ .one_time_submit_bit = true } };
         try self.ctx.vkd.beginCommandBuffer(self.oneshot.cmd_buffer, &begin);
@@ -2738,6 +2690,7 @@ pub const LinearQ80Reduce = struct {
             &desc_sets,
             null,
         );
+
         const pc: PushConsts = .{ .k = weight.in_features, .n = weight.out_features };
         self.ctx.vkd.cmdPushConstants(
             self.oneshot.cmd_buffer,
@@ -2751,6 +2704,7 @@ pub const LinearQ80Reduce = struct {
         self.ctx.vkd.cmdDispatch(self.oneshot.cmd_buffer, group_count_x, 1, 1);
         try self.ctx.vkd.endCommandBuffer(self.oneshot.cmd_buffer);
 
+        // Submit, wait, and read the result back.
         const cmds = [_]vk.CommandBuffer{self.oneshot.cmd_buffer};
         const submits = [_]vk.SubmitInfo{
             .{ .command_buffer_count = 1, .p_command_buffers = &cmds },
@@ -2762,11 +2716,7 @@ pub const LinearQ80Reduce = struct {
     }
 };
 
-/// Q4_0 decode matvec. Same structure as `LinearQ80Reduce`: one workgroup of 32
-/// lanes per output row, reducing through LDS. The weight container is a
-/// `Q80Weight` built by `Q80Weight.initQ40`, with f16 scales and 16 bytes of
-/// 4-bit quants per block. The shader extracts the nibbles. `k` must be a
-/// multiple of 32. The declared tolerance is `.relative = 2e-4`.
+/// Q4_0 decode matvec. The weight comes from `Q80Weight.initQ40`, and `k` must be a multiple of 32.
 pub const LinearQ40Reduce = struct {
     ctx: *const vulkan_ctx.Context,
     pipeline: Pipeline,
@@ -2777,10 +2727,8 @@ pub const LinearQ40Reduce = struct {
     pub const requires: op_requires.OpRequires = .{
         .arch = .any,
         .runtime = .vulkan,
-        // The Q4 quantization error belongs to the data, not the kernel. The
-        // bench measures relative error against the Q4_0 CPU reference, so the
-        // cross-lane reduce drift is the only error the kernel adds. That puts
-        // it in the same class as the Q8_0 reduce.
+        // The Q4 quantization error belongs to the data. The bench measures against the Q4_0 CPU
+        // reference, so the cross-lane reduce drift is the only error the kernel adds.
         .tolerance = .{ .relative = 2e-4 },
     };
 
@@ -2830,6 +2778,7 @@ pub const LinearQ40Reduce = struct {
             &desc_sets,
             null,
         );
+
         const pc: PushConsts = .{ .k = k, .n = n };
         self.ctx.vkd.cmdPushConstants(
             cb,
@@ -2851,6 +2800,7 @@ pub const LinearQ40Reduce = struct {
         if (input.len != weight.in_features) return error.InputShapeMismatch;
         if (out.len != weight.out_features) return error.OutputShapeMismatch;
 
+        // Stage the inputs in host-visible memory.
         const in_bytes: vk.DeviceSize = @intCast(input.len * @sizeOf(f32));
         const out_bytes: vk.DeviceSize = @intCast(out.len * @sizeOf(f32));
 
@@ -2859,6 +2809,7 @@ pub const LinearQ40Reduce = struct {
 
         @memcpy(self.buf_in.sliceTyped(f32, input.len), input);
 
+        // Bind the input, the weight, and the output.
         const buf_infos = [_]vk.DescriptorBufferInfo{
             .{ .buffer = self.buf_in.buffer, .offset = 0, .range = in_bytes },
             weight.scales,
@@ -2867,6 +2818,7 @@ pub const LinearQ40Reduce = struct {
         };
         updateStorageBindings(self.ctx, self.oneshot.desc_set, &buf_infos);
 
+        // Record the dispatch.
         try self.ctx.vkd.resetCommandBuffer(self.oneshot.cmd_buffer, .{});
         const begin: vk.CommandBufferBeginInfo = .{ .flags = .{ .one_time_submit_bit = true } };
         try self.ctx.vkd.beginCommandBuffer(self.oneshot.cmd_buffer, &begin);
@@ -2892,6 +2844,7 @@ pub const LinearQ40Reduce = struct {
         self.ctx.vkd.cmdDispatch(self.oneshot.cmd_buffer, weight.out_features, 1, 1);
         try self.ctx.vkd.endCommandBuffer(self.oneshot.cmd_buffer);
 
+        // Submit, wait, and read the result back.
         const cmds = [_]vk.CommandBuffer{self.oneshot.cmd_buffer};
         const submits = [_]vk.SubmitInfo{
             .{ .command_buffer_count = 1, .p_command_buffers = &cmds },
@@ -2903,14 +2856,9 @@ pub const LinearQ40Reduce = struct {
     }
 };
 
-/// Q8_0 matvec, the subgroup variant. Same shape as `LinearQ80Reduce`, one
-/// workgroup of 32 lanes per output row, with two changes. The workgroup stages
-/// the whole input into LDS at entry, so each invocation reads it from shared
-/// memory instead of the global buffer. The cross-lane reduce is one
-/// `subgroupAdd` instead of an LDS store, a barrier, and a scalar sum on lane 0.
-/// `weight.in_features` must be at most `lds_capacity`. The declared tolerance
-/// is `.relative = 2e-4`, the same class as the reduce variant, because the
-/// lanes sum precisely and only `subgroupAdd` reorders.
+/// Q8_0 matvec with staged input and a `subgroupAdd` reduction, with the shape of
+/// `LinearQ80Reduce`. `weight.in_features` must be at most `lds_capacity`, and `dispatch` refuses a
+/// wider weight.
 pub const LinearQ80Subgroup = struct {
     ctx: *const vulkan_ctx.Context,
     pipeline: Pipeline,
@@ -2952,8 +2900,7 @@ pub const LinearQ80Subgroup = struct {
 
     pub const DispatchError = LinearQ80.DispatchError || error{InFeaturesTooLargeForLdsKernel};
 
-    /// The `shared float input_lds[]` size in `linear_q8_0_subgroup.comp`. The
-    /// build gives the shader the same value as the LDS_CAPACITY define.
+    /// The LDS_CAPACITY define of `linear_q8_0_subgroup.comp`, the length of `input_lds`.
     const lds_capacity: u32 = limits.subgroup_lds_capacity;
 
     pub fn dispatch(
@@ -2968,6 +2915,7 @@ pub const LinearQ80Subgroup = struct {
         // error rather than corrupt memory when it does not fit.
         if (weight.in_features > lds_capacity) return error.InFeaturesTooLargeForLdsKernel;
 
+        // Stage the inputs in host-visible memory.
         const in_bytes: vk.DeviceSize = @intCast(input.len * @sizeOf(f32));
         const out_bytes: vk.DeviceSize = @intCast(out.len * @sizeOf(f32));
 
@@ -2976,6 +2924,7 @@ pub const LinearQ80Subgroup = struct {
 
         @memcpy(self.buf_in.sliceTyped(f32, input.len), input);
 
+        // Bind the input, the weight, and the output.
         const buf_infos = [_]vk.DescriptorBufferInfo{
             .{ .buffer = self.buf_in.buffer, .offset = 0, .range = in_bytes },
             weight.scales,
@@ -2984,6 +2933,7 @@ pub const LinearQ80Subgroup = struct {
         };
         updateStorageBindings(self.ctx, self.oneshot.desc_set, &buf_infos);
 
+        // Record the dispatch.
         try self.ctx.vkd.resetCommandBuffer(self.oneshot.cmd_buffer, .{});
         const begin: vk.CommandBufferBeginInfo = .{ .flags = .{ .one_time_submit_bit = true } };
         try self.ctx.vkd.beginCommandBuffer(self.oneshot.cmd_buffer, &begin);
@@ -2997,6 +2947,7 @@ pub const LinearQ80Subgroup = struct {
             &desc_sets,
             null,
         );
+
         const pc: PushConsts = .{ .k = weight.in_features, .n = weight.out_features };
         self.ctx.vkd.cmdPushConstants(
             self.oneshot.cmd_buffer,
@@ -3010,6 +2961,7 @@ pub const LinearQ80Subgroup = struct {
         self.ctx.vkd.cmdDispatch(self.oneshot.cmd_buffer, group_count_x, 1, 1);
         try self.ctx.vkd.endCommandBuffer(self.oneshot.cmd_buffer);
 
+        // Submit, wait, and read the result back.
         const cmds = [_]vk.CommandBuffer{self.oneshot.cmd_buffer};
         const submits = [_]vk.SubmitInfo{
             .{ .command_buffer_count = 1, .p_command_buffers = &cmds },
@@ -3021,17 +2973,11 @@ pub const LinearQ80Subgroup = struct {
     }
 };
 
-/// Batched Q8_0 matmul: a `(B, K)` input against an `(N, K)` weight into a
-/// `(B, N)` output. Each workgroup computes a 16 by 32 output tile, which
-/// amortizes the weight read across 16 batch rows. `k` must be a multiple of 32.
-/// The grid is (ceil(n / 32), ceil(b / 16)), and the kernel covers a partial
-/// tail tile. This is the prefill kernel, where B is large. Decode keeps
-/// `LinearQ80Reduce`, because per-call overhead dominates at B = 1. The declared
-/// tolerance is `.relative = 2e-4`, the same as the reduce variant: the math is
-/// identical and only the tiling differs.
+/// Batched Q8_0 matmul, a `(B, K)` input against an `(N, K)` weight into a `(B, N)` output. `k`
+/// must be a multiple of 32. This is the prefill kernel, where B is large. Decode keeps
+/// `LinearQ80Reduce`, because per-call overhead dominates at B = 1.
 pub const LinearQ80Batch = struct {
-    /// The build gives `linear_q8_0_batch.comp` the same two values as the
-    /// B_TILE and N_TILE defines.
+    /// The B_TILE and N_TILE defines of `linear_q8_0_batch.comp`.
     const batch_tile: u32 = limits.q8_batch_b_tile;
     const output_tile: u32 = limits.q8_batch_n_tile;
 
@@ -3060,10 +3006,8 @@ pub const LinearQ80Batch = struct {
         self.pipeline.deinit(self.ctx);
     }
 
-    /// Record one batched Q8_0 matmul. The caller binds the descriptor set
-    /// (input, scales, quants, output). `b` is the batch size of this dispatch.
-    /// The kernel covers the tail tile when `b` is not a multiple of
-    /// `batch_tile`.
+    /// Record one batched Q8_0 matmul. The caller binds the set (input, scales, quants, output).
+    /// `b` is the batch size of this dispatch, and the kernel covers a tail tile.
     pub fn recordInto(
         self: *LinearQ80Batch,
         cb: vk.CommandBuffer,
@@ -3082,6 +3026,7 @@ pub const LinearQ80Batch = struct {
             &desc_sets,
             null,
         );
+
         const pc: PushConsts = .{ .b = b, .k = k, .n = n };
         self.ctx.vkd.cmdPushConstants(
             cb,
@@ -3096,10 +3041,8 @@ pub const LinearQ80Batch = struct {
         self.ctx.vkd.cmdDispatch(cb, wg_n, wg_b, 1);
     }
 
-    /// One-shot batched matmul for the correctness gate and the bench. See
-    /// `matmulOneShot`. `input` is `[b, in_features]` row-major and `out` is
-    /// `[b, out_features]`. This is not the hot path. The runner uses
-    /// `recordInto` against pre-bound device buffers.
+    /// One-shot batched matmul for the correctness gate and the bench, through `matmulOneShot`.
+    /// `input` is `[b, in_features]` row-major and `out` is `[b, out_features]`.
     pub fn runOneShot(
         self: *LinearQ80Batch,
         input: []const f32,
@@ -3113,16 +3056,11 @@ pub const LinearQ80Batch = struct {
     }
 };
 
-/// Register-blocked, LDS-staged Q8_0 GEMM, the wide prefill matmul. It takes
-/// the same storage bindings and push constants as `LinearQ80Batch`, so the
-/// runner swaps one for the other at `recordInto`. A workgroup of 256 threads,
-/// eight RDNA2 waves, computes a 64 by 64 output tile, and each thread owns a
-/// 4 by 4 micro-tile. The input rows and the dequantized weight tile stage
-/// through LDS. `k` must be a multiple of 32. The grid is
-/// (ceil(n / 64), ceil(b / 64)). The declared tolerance is `.relative = 2e-4`.
+/// Register-blocked, LDS-staged Q8_0 GEMM, the wide prefill matmul. It takes the bindings and the
+/// push constants of `LinearQ80Batch`, so the runner swaps one for the other at `recordInto`. `k`
+/// must be a multiple of 32.
 pub const LinearQ80Gemm = struct {
-    /// The build gives `linear_q8_0_gemm.comp` the same two values as the BM
-    /// and BN defines.
+    /// The BM and BN defines of `linear_q8_0_gemm.comp`.
     const tile_m: u32 = limits.gemm_m_tile;
     const tile_n: u32 = limits.gemm_n_tile;
 
@@ -3172,6 +3110,7 @@ pub const LinearQ80Gemm = struct {
             &desc_sets,
             null,
         );
+
         const pc: PushConsts = .{ .b = b, .k = k, .n = n };
         self.ctx.vkd.cmdPushConstants(
             cb,
@@ -3199,15 +3138,10 @@ pub const LinearQ80Gemm = struct {
     }
 };
 
-/// Q4_0 prefill matmul. It takes the same storage bindings and push constants
-/// as `LinearQ80Batch`, with an 8 by 32 output tile and LDS input staging. The
-/// weight container is a `Q80Weight` built by `Q80Weight.initQ40`, whose quants
-/// buffer holds 16 bytes per block. The shader extracts the nibbles. `k` must be
-/// a multiple of 32. The grid is (ceil(n / 32), ceil(b / 8)). The declared
-/// tolerance is `.relative = 2e-4`.
+/// Q4_0 prefill matmul, with the bindings and the push constants of `LinearQ80Batch`. The weight
+/// comes from `Q80Weight.initQ40`, and `k` must be a multiple of 32.
 pub const LinearQ40Batch = struct {
-    /// The build gives `linear_q4_0_batch.comp` the same two values as the
-    /// B_TILE and N_TILE defines.
+    /// The B_TILE and N_TILE defines of `linear_q4_0_batch.comp`.
     const batch_tile: u32 = limits.q4_batch_b_tile;
     const output_tile: u32 = limits.q4_batch_n_tile;
 
@@ -3254,6 +3188,7 @@ pub const LinearQ40Batch = struct {
             &desc_sets,
             null,
         );
+
         const pc: PushConsts = .{ .b = b, .k = k, .n = n };
         self.ctx.vkd.cmdPushConstants(
             cb,
@@ -3269,10 +3204,7 @@ pub const LinearQ40Batch = struct {
     }
 };
 
-/// Batched RMS normalization, applied independently to each of B input rows.
-/// One workgroup of 256 lanes per row shares the reduction, so the grid is b.
-/// The arithmetic matches the decode `Rmsnorm`, and the declared tolerance is
-/// `.relative = 5e-5`.
+/// Batched RMS normalization, applied independently to each of `b` input rows.
 pub const RmsnormBatch = struct {
     ctx: *const vulkan_ctx.Context,
     pipeline: Pipeline,
@@ -3317,6 +3249,7 @@ pub const RmsnormBatch = struct {
             &desc_sets,
             null,
         );
+
         const pc: PushConsts = .{ .d = d, .eps = eps };
         self.ctx.vkd.cmdPushConstants(
             cb,
@@ -3330,10 +3263,8 @@ pub const RmsnormBatch = struct {
     }
 };
 
-/// Batched multi-head RoPE over a `(B, n_heads, head_dim)` buffer. Row `bi`
-/// rotates at position `start_pos + bi * pos_stride`. One dispatch covers every
-/// (head, row) pair, so the grid is (ceil(rope_dim / 2 / 64), n_heads, b). The
-/// declared tolerance is `.relative = 1e-5`.
+/// Batched multi-head RoPE over a `(B, n_heads, head_dim)` buffer. Row `bi` rotates at position
+/// `start_pos + bi * pos_stride`.
 pub const RopeMultiBatch = struct {
     ctx: *const vulkan_ctx.Context,
     pipeline: Pipeline,
@@ -3369,11 +3300,9 @@ pub const RopeMultiBatch = struct {
         self.pipeline.deinit(self.ctx);
     }
 
-    /// `pos_stride`: 1 for prefill (each batch row has position
-    /// `start_pos + bi`, monotonically increasing). 0 for lockstep
-    /// or single-row dispatches (every row uses `start_pos`).
-    /// `row_base` offsets which buffer rows the dispatch touches, so
-    /// arbitrary per-row positions record as B=1 dispatches per row.
+    /// `pos_stride` is 1 for prefill and 0 for a lockstep or single-row dispatch, where every row
+    /// uses `start_pos`. `row_base` offsets the buffer rows of the dispatch, so arbitrary per-row
+    /// positions record as B=1 dispatches per row.
     pub fn recordInto(
         self: *RopeMultiBatch,
         cb: vk.CommandBuffer,
@@ -3388,6 +3317,7 @@ pub const RopeMultiBatch = struct {
         row_base: u32,
         style: RopeStyle,
     ) void {
+        // Bind the pipeline and the descriptor set.
         self.ctx.vkd.cmdBindPipeline(cb, .compute, self.pipeline.handle);
         const desc_sets = [_]vk.DescriptorSet{desc_set};
         self.ctx.vkd.cmdBindDescriptorSets(
@@ -3398,6 +3328,8 @@ pub const RopeMultiBatch = struct {
             &desc_sets,
             null,
         );
+
+        // Push the row geometry and dispatch every (head, row) pair.
         const pc: PushConsts = .{
             .start_pos = start_pos,
             .head_dim = head_dim,
@@ -3422,13 +3354,9 @@ pub const RopeMultiBatch = struct {
     }
 };
 
-/// Batched causal attention for the resident rows of a prefill chunk, one
-/// workgroup of 64 lanes per (head, row) pair. Query row `bi` attends to the K
-/// and V positions 0 through `start_pos + bi`. The kernel holds every score of
-/// a row in LDS, so `start_pos + b` must be at most `limits.attn_split_len`.
-/// A deeper row takes the split passes of `AttentionSplit`, through
-/// `attn_record.recordPrefill`. The grid is (n_heads, b). The declared
-/// tolerance is `.relative = 1e-3`.
+/// Batched causal attention for the resident rows of a prefill chunk. `start_pos + b` must be at
+/// most `limits.attn_split_len`, because the kernel holds every score of a row in LDS. A deeper row
+/// takes `AttentionSplit`, through `attn_record.recordPrefill`.
 pub const AttentionBatch = struct {
     ctx: *const vulkan_ctx.Context,
     pipeline: Pipeline,
@@ -3477,6 +3405,7 @@ pub const AttentionBatch = struct {
         start_pos: u32,
         b: u32,
     ) void {
+        // Check the row range and the head shape.
         std.debug.assert(b >= 1);
         // Row bi attends to positions 0 through start_pos + bi, so the last
         // row reaches start_pos + b. The LDS score row holds one split.
@@ -3487,6 +3416,7 @@ pub const AttentionBatch = struct {
         // element types, so an odd head_dim reads past the row.
         std.debug.assert(head_dim % 2 == 0);
 
+        // Bind the pipeline and the descriptor set.
         self.ctx.vkd.cmdBindPipeline(cb, .compute, self.pipeline.handle);
         const desc_sets = [_]vk.DescriptorSet{desc_set};
         self.ctx.vkd.cmdBindDescriptorSets(
@@ -3497,6 +3427,8 @@ pub const AttentionBatch = struct {
             &desc_sets,
             null,
         );
+
+        // Push the run and dispatch every (head, row) pair.
         const pc: PushConsts = .{
             .n_heads = n_heads,
             .n_kv_heads = n_kv_heads,
@@ -3516,12 +3448,8 @@ pub const AttentionBatch = struct {
     }
 };
 
-/// Multi-stream attention, one row per stream. Each row reads the K and V slice
-/// of its own stream from the K region and the V region of one layer. Every
-/// stream shares `t_len`, which is what lockstep decoding gives. The grid is
-/// (n_heads, n_rows) of 64 lanes. The bounds match the decode kernel, so a row
-/// past `limits.attn_split_len` positions takes `AttentionSplit`. The declared
-/// tolerance is `.relative = 1e-3`.
+/// Lockstep multi-stream attention, one row per stream. Every stream shares `t_len`, and a row past
+/// `limits.attn_split_len` positions takes `AttentionSplit`.
 pub const AttentionMultiStream = struct {
     ctx: *const vulkan_ctx.Context,
     pipeline: Pipeline,
@@ -3565,10 +3493,9 @@ pub const AttentionMultiStream = struct {
         self.pipeline.deinit(self.ctx);
     }
 
-    /// One dispatch covers `n_rows` (q-row, kv-stream) pairs where row i is
-    /// (q_row_base + i, kv_stream_base + i), all sharing `t_len`. A caller
-    /// with arbitrary per-row (slot, position) pairs records one single-row
-    /// dispatch per row instead.
+    /// One dispatch covers `n_rows` pairs, where row i is (q_row_base + i, kv_stream_base + i), and
+    /// all share `t_len`. A caller with arbitrary per-row (slot, position) pairs records one
+    /// single-row dispatch per row.
     pub fn recordInto(
         self: *AttentionMultiStream,
         cb: vk.CommandBuffer,
@@ -3582,6 +3509,7 @@ pub const AttentionMultiStream = struct {
         kv_stream_base: u32,
         n_rows: u32,
     ) void {
+        // Check the row and the stream bounds.
         std.debug.assert(t_len >= 1);
         std.debug.assert(t_len <= limits.max_model_ctx);
         std.debug.assert(!attn_split.usesSplit(t_len));
@@ -3596,6 +3524,7 @@ pub const AttentionMultiStream = struct {
             (@as(u64, kv_stream_base) + n_rows) * stream_stride_elems <= limits.max_kv_index_elems,
         );
 
+        // Bind the pipeline and the descriptor set.
         self.ctx.vkd.cmdBindPipeline(cb, .compute, self.pipeline.handle);
         const desc_sets = [_]vk.DescriptorSet{desc_set};
         self.ctx.vkd.cmdBindDescriptorSets(
@@ -3606,6 +3535,8 @@ pub const AttentionMultiStream = struct {
             &desc_sets,
             null,
         );
+
+        // Push the stream geometry and dispatch every (head, row) pair.
         const pc: PushConsts = .{
             .n_heads = n_heads,
             .n_kv_heads = n_kv_heads,
@@ -3627,22 +3558,9 @@ pub const AttentionMultiStream = struct {
     }
 };
 
-/// Narrow the K and V commit scratch of one layer from f32 to f16. Four storage
-/// buffers: f32 k_src, f32 v_src, f16 k_out, f16 v_out. One `u32` push constant
-/// holds the element count of one scratch, which K and V share. One lane per
-/// element at local_size_x = 64.
-///
-/// Record-only, like the batched attention kernel. A fused runner owns the
-/// buffers, the descriptor sets, and the per-token command buffer. One dispatch
-/// covers the commit of a whole layer whatever the row count, because the
-/// scratch is contiguous. The scatter that follows stays a plain copy list.
-///
-/// The shader pins the SPIR-V `RoundingModeRTE` execution mode at width 16, so
-/// the conversion rounds to nearest even by declaration and not by driver
-/// default. One IEEE 754 conversion per element carries no reordering, so the
-/// GPU commit and the CPU commit narrow a value bit for bit alike.
-/// `tests/vulkan_kv_commit_f16_test.zig` gates that identity through
-/// `kvCommitF16OneShot`.
+/// Narrow the K and V commit scratch of one layer from f32 to f16, bit for bit as the CPU commit
+/// does. The kernel is record-only: a fused runner owns the buffers, the sets, and the per-token
+/// command buffer. `kvCommitF16OneShot` drives it for the rounding gate.
 pub const KvCommitF16 = struct {
     ctx: *const vulkan_ctx.Context,
     pipeline: Pipeline,
@@ -3706,14 +3624,10 @@ pub const KvCommitF16 = struct {
     }
 };
 
-/// Gated-DeltaNet decode kernel for one Qwen3.5 GDN layer, one token per call.
-/// This is the standalone bit-check form: host-visible buffers, submit and
-/// wait-idle, then readback. It mirrors `step()` in `src/ops/gdn.zig`. One
-/// workgroup of 128 lanes runs per KEY head, so the grid is n_k_heads.
-/// `head_dim` must be 128, and `n_v_heads` must be a multiple of `n_k_heads`.
-/// It mutates `state` and `conv_state` and writes `o_out`. Eleven storage
-/// bindings, listed in gdn_decode.comp. The declared tolerance is
-/// `.relative = 1e-4`.
+/// Gated-DeltaNet decode kernel for one Qwen3.5 GDN layer. It mirrors `step()` in
+/// `src/ops/gdn.zig`, and `run` is the standalone form of the self-test. `head_dim` must be
+/// `limits.gdn_head_dim`, and `n_v_heads` must be at most `limits.gdn_max_v_per_k` whole multiples
+/// of `n_k_heads`.
 pub const GdnDecode = struct {
     ctx: *const vulkan_ctx.Context,
     pipeline: Pipeline,
@@ -3737,9 +3651,8 @@ pub const GdnDecode = struct {
         n_v: u32,
         eps: f32,
         n_tokens: u32 = 1,
-        // The multi-slot form: the first batched row, plus the ELEMENT offsets
-        // of the region of the slot inside the slot-strided state and conv
-        // buffers. All zero reproduces the single-slot dispatch bit for bit.
+        // The multi-slot form: the first batched row, and the element offsets of the slot region in
+        // the state and conv buffers. All zero reproduces the single-slot dispatch bit for bit.
         row0: u32 = 0,
         state_off: u32 = 0,
         conv_off: u32 = 0,
@@ -3776,11 +3689,9 @@ pub const GdnDecode = struct {
         self.pipeline.deinit(self.ctx);
     }
 
-    /// Record one single-token GDN decode dispatch into a command buffer the
-    /// caller owns, against a descriptor set the caller binds. That set holds
-    /// the 11 bindings listed in gdn_decode.comp, pointing at persistent device
-    /// buffers. This is the fused-runner form: no buffer handling and no submit.
-    /// One workgroup per KEY head, and `head_dim` must be 128.
+    /// Record one single-token GDN decode dispatch, the fused-runner form. The caller owns the
+    /// command buffer, and its set holds the 11 bindings of gdn_decode.comp on persistent device
+    /// buffers.
     pub fn recordInto(
         self: *const GdnDecode,
         cb: vk.CommandBuffer,
@@ -3794,12 +3705,9 @@ pub const GdnDecode = struct {
         self.recordChunk(cb, desc_set, n_k_heads, n_v_heads, head_dim, conv_kernel, eps, 1);
     }
 
-    /// Record the GDN recurrence for a whole prefill chunk as one dispatch. The
-    /// kernel loops `n_tokens` times inside. Token t reads and writes row t of
-    /// the batched projection and output buffers, and the recurrent state and
-    /// the conv ring carry across t. The result is bit-identical to `n_tokens`
-    /// per-token dispatches, and it pays the host dispatch and pipeline-barrier
-    /// cost once rather than per token. That is the prefill win.
+    /// Record the GDN recurrence of a whole prefill chunk as one dispatch. The result is
+    /// bit-identical to `n_tokens` per-token dispatches, and it pays the host dispatch and
+    /// pipeline-barrier cost once. That is the prefill win.
     pub fn recordChunk(
         self: *const GdnDecode,
         cb: vk.CommandBuffer,
@@ -3826,10 +3734,9 @@ pub const GdnDecode = struct {
         );
     }
 
-    /// Record one slot run of a mixed batch. It covers `n_tokens` rows of the
-    /// same slot, starting at batched-buffer row `row0`. It reads the state and
-    /// conv regions of that slot at the given ELEMENT offsets. Runs of different
-    /// slots touch disjoint state and disjoint rows, so they need no barrier.
+    /// Record one slot run of a mixed batch: `n_tokens` rows from batched row `row0`, on the state
+    /// and conv regions of that slot at the given element offsets. Runs of different slots touch
+    /// disjoint state and rows, so they need no barrier.
     pub fn recordRun(
         self: *const GdnDecode,
         cb: vk.CommandBuffer,
@@ -3844,6 +3751,13 @@ pub const GdnDecode = struct {
         state_off: u32,
         conv_off: u32,
     ) void {
+        // Check the head shape: `vconv` of the shader holds one float per value head of a key head.
+        std.debug.assert(head_dim == limits.gdn_head_dim);
+        std.debug.assert(n_k_heads >= 1);
+        std.debug.assert(n_v_heads % n_k_heads == 0);
+        std.debug.assert(n_v_heads / n_k_heads <= limits.gdn_max_v_per_k);
+
+        // Bind the pipeline and the descriptor set.
         self.ctx.vkd.cmdBindPipeline(cb, .compute, self.pipeline.handle);
         const sets = [_]vk.DescriptorSet{desc_set};
         self.ctx.vkd.cmdBindDescriptorSets(
@@ -3854,6 +3768,8 @@ pub const GdnDecode = struct {
             &sets,
             null,
         );
+
+        // Push the run and dispatch one workgroup per key head.
         const push: Push = .{
             .d = head_dim,
             .k = conv_kernel,
@@ -3909,10 +3825,12 @@ pub const GdnDecode = struct {
         conv_state: []f32,
         o_out: []f32,
     ) RunError!void {
+        // Check every slice against the head shape.
         const key_dim: usize = @as(usize, n_k_heads) * head_dim;
         const value_dim: usize = @as(usize, n_v_heads) * head_dim;
         const conv_dim: usize = 2 * key_dim + value_dim;
-        if (head_dim != 128 or n_v_heads % n_k_heads != 0) return error.DimMismatch;
+        if (head_dim != limits.gdn_head_dim or n_v_heads % n_k_heads != 0) return error.DimMismatch;
+        if (n_v_heads / n_k_heads > limits.gdn_max_v_per_k) return error.DimMismatch;
         if (qkv.len != conv_dim or z.len != value_dim or o_out.len != value_dim) {
             return error.DimMismatch;
         }
@@ -3953,6 +3871,7 @@ pub const GdnDecode = struct {
 
         updateStorageBindings(self.ctx, self.oneshot.desc_set, &infos);
 
+        // Record the dispatch at the single-slot push defaults.
         const push: Push = .{
             .d = head_dim,
             .k = conv_kernel,
@@ -3985,6 +3904,7 @@ pub const GdnDecode = struct {
         self.ctx.vkd.cmdDispatch(self.oneshot.cmd_buffer, n_k_heads, 1, 1);
         try self.ctx.vkd.endCommandBuffer(self.oneshot.cmd_buffer);
 
+        // Submit, wait, and read the state, the ring, and the readout back.
         const cmds = [_]vk.CommandBuffer{self.oneshot.cmd_buffer};
         const submits = [_]vk.SubmitInfo{
             .{ .command_buffer_count = 1, .p_command_buffers = &cmds },
@@ -3997,13 +3917,9 @@ pub const GdnDecode = struct {
         @memcpy(o_out, self.bufs[10].sliceTyped(f32, o_out.len));
     }
 
-    /// Run the prefill path: `n_tokens` tokens through one `recordChunk`
-    /// dispatch, with the recurrent state and the conv ring carried inside. The
-    /// batched buffers (qkv, z, alpha, beta_in, o_out) hold n_tokens rows each,
-    /// and the weights, the state, and conv_state hold one. This is the
-    /// bit-check counterpart of `run` for n_tokens above 1. The self-test feeds
-    /// the same token sequence through the CPU `gdn.step` n_tokens times and
-    /// compares.
+    /// Run `n_tokens` tokens through one `recordChunk` dispatch. The batched buffers (qkv, z,
+    /// alpha, beta_in, o_out) hold n_tokens rows each, and the weights, the state, and conv_state
+    /// hold one. The self-test compares it with n_tokens CPU `gdn.step` calls.
     pub fn runChunk(
         self: *GdnDecode,
         n_tokens: u32,
@@ -4024,11 +3940,13 @@ pub const GdnDecode = struct {
         conv_state: []f32,
         o_out: []f32, // [n_tokens*value_dim]
     ) RunError!void {
+        // Check every slice against the head shape.
         const t: usize = n_tokens;
         const key_dim: usize = @as(usize, n_k_heads) * head_dim;
         const value_dim: usize = @as(usize, n_v_heads) * head_dim;
         const conv_dim: usize = 2 * key_dim + value_dim;
-        if (head_dim != 128 or n_v_heads % n_k_heads != 0) return error.DimMismatch;
+        if (head_dim != limits.gdn_head_dim or n_v_heads % n_k_heads != 0) return error.DimMismatch;
+        if (n_v_heads / n_k_heads > limits.gdn_max_v_per_k) return error.DimMismatch;
         if (qkv.len != t * conv_dim or z.len != t * value_dim or o_out.len != t * value_dim) {
             return error.DimMismatch;
         }
@@ -4039,6 +3957,7 @@ pub const GdnDecode = struct {
         if (state.len != value_dim * head_dim) return error.DimMismatch;
         if (conv_state.len != @as(usize, conv_kernel - 1) * conv_dim) return error.DimMismatch;
 
+        // Upload the inputs, as in `run`.
         const inputs = [n_bindings][]const f32{
             qkv,
             z,
@@ -4065,6 +3984,7 @@ pub const GdnDecode = struct {
 
         updateStorageBindings(self.ctx, self.oneshot.desc_set, &infos);
 
+        // Record one dispatch over the whole chunk.
         try self.ctx.vkd.resetCommandBuffer(self.oneshot.cmd_buffer, .{});
         const begin: vk.CommandBufferBeginInfo = .{ .flags = .{ .one_time_submit_bit = true } };
         try self.ctx.vkd.beginCommandBuffer(self.oneshot.cmd_buffer, &begin);
@@ -4080,6 +4000,7 @@ pub const GdnDecode = struct {
         );
         try self.ctx.vkd.endCommandBuffer(self.oneshot.cmd_buffer);
 
+        // Submit, wait, and read the state, the ring, and the readout back.
         const cmds = [_]vk.CommandBuffer{self.oneshot.cmd_buffer};
         const submits = [_]vk.SubmitInfo{
             .{ .command_buffer_count = 1, .p_command_buffers = &cmds },
@@ -4093,16 +4014,9 @@ pub const GdnDecode = struct {
     }
 };
 
-/// Chunked-parallel GDN prefill, a replacement for the serial-over-tokens
-/// `recordChunk` of `GdnDecode`. The conv pass runs one workgroup of 128 lanes
-/// per KEY head. It does the 1-D convolution, the SiLU, and the L2 norm, writes
-/// q_n, k_n, and v_conv, and advances conv_state. The scan pass runs
-/// `limits.gdnScanGroups` workgroups, one per block of `limits.gdn_scan_cols`
-/// state columns of a VALUE head. It does the chunked matrix-form delta-rule
-/// scan, which mirrors `chunkScan` in ops/gdn.zig, and writes the raw readout.
-/// The norm pass runs one workgroup per (value head, token) and applies the
-/// gated norm in place. `head_dim` must be `limits.gdn_head_dim`. The declared
-/// tolerance is `.relative = 1e-4`.
+/// Chunked-parallel GDN prefill in three passes: conv, scan, and norm. `head_dim` must be
+/// `limits.gdn_head_dim`. It replaces the serial-over-tokens `GdnDecode.recordChunk`, at a
+/// tolerance, because the scan reorders the sums.
 pub const GdnChunkParallel = struct {
     ctx: *const vulkan_ctx.Context,
     pipeline_conv: Pipeline,
@@ -4149,6 +4063,7 @@ pub const GdnChunkParallel = struct {
     }
 
     pub fn init(ctx: *const vulkan_ctx.Context) InitError!GdnChunkParallel {
+        // Build the conv and scan pipelines.
         const pipeline_conv = try Pipeline.init(
             ctx,
             &gdn_chunk_conv_spv,
@@ -4165,6 +4080,7 @@ pub const GdnChunkParallel = struct {
         );
         errdefer pipeline_scan.deinit(ctx);
 
+        // Build the norm pipeline on the scan layout.
         const norm_info: vk.ShaderModuleCreateInfo = .{
             .code_size = gdn_chunk_norm_spv.len,
             .p_code = @ptrCast(&gdn_chunk_norm_spv),
@@ -4191,6 +4107,7 @@ pub const GdnChunkParallel = struct {
         const desc_pool = try ctx.vkd.createDescriptorPool(ctx.device, &pool_info, null);
         errdefer ctx.vkd.destroyDescriptorPool(ctx.device, desc_pool, null);
 
+        // Allocate the gate sets, the gate command buffer, and the empty host buffers.
         const conv_set = try allocateOneSet(ctx, desc_pool, pipeline_conv.set_layout);
         const scan_set = try allocateOneSet(ctx, desc_pool, pipeline_scan.set_layout);
         const cmd_buffer = try allocateOnePrimaryCmdBuffer(ctx);
@@ -4241,6 +4158,10 @@ pub const GdnChunkParallel = struct {
         n_tokens: u32,
         eps: f32,
     ) void {
+        std.debug.assert(head_dim == limits.gdn_head_dim);
+        std.debug.assert(n_k_heads >= 1);
+        std.debug.assert(n_v_heads % n_k_heads == 0);
+
         self.ctx.vkd.cmdBindPipeline(cb, .compute, self.pipeline_conv.handle);
         const sets = [_]vk.DescriptorSet{set};
         self.ctx.vkd.cmdBindDescriptorSets(
@@ -4251,6 +4172,7 @@ pub const GdnChunkParallel = struct {
             &sets,
             null,
         );
+
         const push: ConvPush = .{
             .d = head_dim,
             .n_k = n_k_heads,
@@ -4270,11 +4192,9 @@ pub const GdnChunkParallel = struct {
         self.ctx.vkd.cmdDispatch(cb, n_k_heads, 1, 1);
     }
 
-    /// Record the scan pass and then the norm pass, with a barrier between
-    /// them. The caller binds `set` with 11 bindings: q_n, k_n, v_conv, alpha,
-    /// beta_in, ssm_a, dt_bias, ssm_norm, z, state (in and out), o_out. The
-    /// caller also inserts the compute-to-compute barrier between `recordConv`
-    /// and `recordScan`, and the barrier after it.
+    /// Record the scan pass, a barrier, and the norm pass. The caller binds `set` with the 11
+    /// bindings of gdn_chunk_scan.comp. It also records the barrier between `recordConv` and this
+    /// call, and the barrier after this call.
     pub fn recordScan(
         self: *const GdnChunkParallel,
         cb: vk.CommandBuffer,
@@ -4285,6 +4205,7 @@ pub const GdnChunkParallel = struct {
         n_tokens: u32,
         eps: f32,
     ) void {
+        // Check the head shape and the grid.
         std.debug.assert(head_dim == limits.gdn_head_dim);
         std.debug.assert(n_k_heads >= 1);
         std.debug.assert(n_v_heads % n_k_heads == 0);
@@ -4304,6 +4225,7 @@ pub const GdnChunkParallel = struct {
         std.debug.assert(last.head == n_v_heads - 1);
         std.debug.assert(last.column == head_dim - 1);
 
+        // Bind the scan pipeline and the descriptor set.
         self.ctx.vkd.cmdBindPipeline(cb, .compute, self.pipeline_scan.handle);
         const sets = [_]vk.DescriptorSet{set};
         self.ctx.vkd.cmdBindDescriptorSets(
@@ -4314,6 +4236,8 @@ pub const GdnChunkParallel = struct {
             &sets,
             null,
         );
+
+        // Push the chunk shape and dispatch the scan.
         const push: ScanPush = .{
             .d = head_dim,
             .n_k = n_k_heads,
@@ -4333,9 +4257,10 @@ pub const GdnChunkParallel = struct {
 
         // The norm pass reads the raw readout of every column of a head, and
         // it then writes the same elements in place.
-        const mb = [_]vk.MemoryBarrier{
-            .{ .src_access_mask = .{ .shader_write_bit = true }, .dst_access_mask = .{ .shader_read_bit = true, .shader_write_bit = true } },
-        };
+        const mb = [_]vk.MemoryBarrier{.{
+            .src_access_mask = .{ .shader_write_bit = true },
+            .dst_access_mask = .{ .shader_read_bit = true, .shader_write_bit = true },
+        }};
         self.ctx.vkd.cmdPipelineBarrier(
             cb,
             .{ .compute_shader_bit = true },
@@ -4345,6 +4270,7 @@ pub const GdnChunkParallel = struct {
             null,
             null,
         );
+
         // The norm pipeline uses the scan layout, so the set and the push
         // constants stay bound across the pipeline change.
         self.ctx.vkd.cmdBindPipeline(cb, .compute, self.pipeline_norm);
@@ -4353,10 +4279,9 @@ pub const GdnChunkParallel = struct {
 
     pub const RunError = GdnDecode.RunError;
 
-    /// Run the whole chunked prefill, the conv pass then the scan pass, over
-    /// `n_tokens`, and read state, conv_state, and o_out back. It takes the same
-    /// inputs and writes the same outputs as `GdnDecode.runChunk`, so the
-    /// self-test compares both against the CPU `step` run n_tokens times.
+    /// Run the whole chunked prefill over `n_tokens`, and read state, conv_state, and o_out back.
+    /// It takes the inputs and writes the outputs of `GdnDecode.runChunk`, so the self-test
+    /// compares both against the CPU `step` run n_tokens times.
     pub fn runChunkParallel(
         self: *GdnChunkParallel,
         n_tokens: u32,
@@ -4377,6 +4302,7 @@ pub const GdnChunkParallel = struct {
         conv_state: []f32,
         o_out: []f32,
     ) RunError!void {
+        // Check every slice against the head shape.
         const t: usize = n_tokens;
         const key_dim: usize = @as(usize, n_k_heads) * head_dim;
         const value_dim: usize = @as(usize, n_v_heads) * head_dim;
@@ -4410,6 +4336,7 @@ pub const GdnChunkParallel = struct {
             state.len,
             o_out.len,
         };
+
         const uploads = [n_bufs]?[]const f32{
             qkv,
             conv_w,
@@ -4426,6 +4353,8 @@ pub const GdnChunkParallel = struct {
             state,
             null,
         };
+
+        // Size each buffer and upload the inputs.
         var infos: [n_bufs]vk.DescriptorBufferInfo = undefined;
         for (&self.bufs, lens, uploads, 0..) |*buf, len, up, i| {
             const bytes: vk.DeviceSize = @intCast(len * @sizeOf(f32));
@@ -4437,10 +4366,11 @@ pub const GdnChunkParallel = struct {
             infos[i] = .{ .buffer = buf.buffer, .offset = 0, .range = bytes };
         }
 
-        // conv set: qkv(0), conv_w(1), conv_state(2), q_n(3), k_n(4), v_conv(5)
+        // Bind the conv set: qkv(0), conv_w(1), conv_state(2), q_n(3), k_n(4), v_conv(5).
         updateStorageBindings(self.ctx, self.conv_set, infos[0..6]);
-        // scan set: q_n(3), k_n(4), v_conv(5), alpha(6), beta(7), ssm_a(8),
-        // dt_bias(9), ssm_norm(10), z(11), state(12), o_out(13)
+
+        // Bind the scan set: q_n(3), k_n(4), v_conv(5), alpha(6), beta(7), ssm_a(8), dt_bias(9),
+        // ssm_norm(10), z(11), state(12), o_out(13).
         const scan_infos = [scan_bindings]vk.DescriptorBufferInfo{
             infos[3],
             infos[4],
@@ -4456,6 +4386,7 @@ pub const GdnChunkParallel = struct {
         };
         updateStorageBindings(self.ctx, self.scan_set, &scan_infos);
 
+        // Record the conv pass, a barrier, and the scan and norm passes.
         try self.ctx.vkd.resetCommandBuffer(self.cmd_buffer, .{});
         try self.ctx.vkd.beginCommandBuffer(
             self.cmd_buffer,
@@ -4471,9 +4402,11 @@ pub const GdnChunkParallel = struct {
             n_tokens,
             eps,
         );
-        const mb = [_]vk.MemoryBarrier{
-            .{ .src_access_mask = .{ .shader_write_bit = true }, .dst_access_mask = .{ .shader_read_bit = true } },
-        };
+
+        const mb = [_]vk.MemoryBarrier{.{
+            .src_access_mask = .{ .shader_write_bit = true },
+            .dst_access_mask = .{ .shader_read_bit = true },
+        }};
         self.ctx.vkd.cmdPipelineBarrier(
             self.cmd_buffer,
             .{ .compute_shader_bit = true },
@@ -4483,6 +4416,7 @@ pub const GdnChunkParallel = struct {
             null,
             null,
         );
+
         self.recordScan(
             self.cmd_buffer,
             self.scan_set,
@@ -4494,6 +4428,7 @@ pub const GdnChunkParallel = struct {
         );
         try self.ctx.vkd.endCommandBuffer(self.cmd_buffer);
 
+        // Submit, wait, and read the state, the ring, and the readout back.
         const cmds = [_]vk.CommandBuffer{self.cmd_buffer};
         try self.ctx.vkd.queueSubmit(
             self.ctx.queue,
@@ -4508,12 +4443,13 @@ pub const GdnChunkParallel = struct {
     }
 };
 
-/// Per-head QK norm for Qwen3.5 full attention, with an optional de-interleave
-/// of the q and gate halves. Four storage bindings: in, norm_w, out, gate_out.
-/// One workgroup per head, so the grid is n_heads, and `head_dim` must equal the
-/// workgroup width of 256. It mirrors the CPU `fullMixer`. `recordInto` is the
-/// only entry point, because the fused runner is the only caller.
+/// Per-head QK norm of Qwen3.5 full attention, with an optional de-interleave of the q and gate
+/// halves. `head_dim` must equal `head_lanes`. It mirrors the CPU `fullMixer`, and
+/// the fused runner is the only caller.
 pub const QwenQkNorm = struct {
+    /// The `local_size_x` of `qwen_qk_norm.comp`. One lane owns one head index.
+    const head_lanes: u32 = 256;
+
     ctx: *const vulkan_ctx.Context,
     pipeline: Pipeline,
 
@@ -4567,6 +4503,9 @@ pub const QwenQkNorm = struct {
         in_off: u32,
         out_off: u32,
     ) void {
+        std.debug.assert(head_dim == head_lanes);
+
+        // Bind the pipeline and the descriptor set.
         self.ctx.vkd.cmdBindPipeline(cb, .compute, self.pipeline.handle);
         const sets = [_]vk.DescriptorSet{desc_set};
         self.ctx.vkd.cmdBindDescriptorSets(
@@ -4577,6 +4516,8 @@ pub const QwenQkNorm = struct {
             &sets,
             null,
         );
+
+        // Push the row and dispatch one workgroup per head.
         const push: Push = .{
             .head_dim = head_dim,
             .in_stride = in_stride,
@@ -4598,13 +4539,9 @@ pub const QwenQkNorm = struct {
     }
 };
 
-/// Grow-on-demand host-visible and coherent storage buffer. It also carries
-/// `transfer_src_bit`, so it serves as the staging buffer for an upload into a
-/// device-local `DeviceBuffer`.
-///
-/// The memory type is host-cached whenever the driver offers one, because
-/// an uncached host mapping slows every CPU write and read. A driver without a
-/// cached type still works, and `ensure` logs the slow choice at debug level.
+/// Grow-on-demand host-visible and coherent storage buffer, and the staging buffer of a
+/// `DeviceBuffer`. The memory type is host-cached when the driver offers one, because an uncached
+/// mapping slows every CPU write and read.
 pub const HostBuffer = struct {
     ctx: *const vulkan_ctx.Context,
     buffer: vk.Buffer = .null_handle,
@@ -4626,10 +4563,8 @@ pub const HostBuffer = struct {
 
         self.deinit();
 
-        // Host buffer flags: storage (shader-readable), transfer_src
-        // (stage uploads device-ward), transfer_dst (stage readbacks
-        // host-ward, e.g. logits copy or KV swap-out). Setting all
-        // three is free. The driver only differentiates at use time.
+        // Storage for shader reads, plus staged uploads and staged readbacks such as logits or a KV
+        // swap-out. All three flags are free, because the driver differs only at use time.
         const buf_info: vk.BufferCreateInfo = .{
             .size = size,
             .usage = .{
@@ -4642,6 +4577,7 @@ pub const HostBuffer = struct {
         const buffer = try self.ctx.vkd.createBuffer(self.ctx.device, &buf_info, null);
         errdefer self.ctx.vkd.destroyBuffer(self.ctx.device, buffer, null);
 
+        // Pick the host memory type.
         const reqs = self.ctx.vkd.getBufferMemoryRequirements(self.ctx.device, buffer);
         const mem_type = vulkan_ctx.pickHostType(self.ctx.mem_props, reqs.memory_type_bits) orelse
             return error.NoSuitableMemoryType;
@@ -4666,6 +4602,7 @@ pub const HostBuffer = struct {
             );
         }
 
+        // Allocate, bind, and map the memory.
         const alloc_info: vk.MemoryAllocateInfo = .{
             .allocation_size = reqs.size,
             .memory_type_index = mem_type,
@@ -4676,6 +4613,7 @@ pub const HostBuffer = struct {
         try self.ctx.vkd.bindBufferMemory(self.ctx.device, buffer, memory, 0);
         const mapped_opt = try self.ctx.vkd.mapMemory(self.ctx.device, memory, 0, size, .{});
 
+        // Commit the new buffer.
         self.buffer = buffer;
         self.memory = memory;
         self.capacity = size;
@@ -4690,11 +4628,9 @@ pub const HostBuffer = struct {
     }
 };
 
-/// Device-local storage buffer and transfer destination. It is never mapped.
-/// Write to it by copying from a `HostBuffer` staging buffer through
-/// `cmdCopyBuffer`. A shader then reads device-local memory, about 500 GB/s on
-/// an RDNA2 card. The host-visible path instead reads host-visible memory over
-/// the virtualized host bus, about 30 GB/s.
+/// Device-local storage buffer and transfer destination, written by a copy from a `HostBuffer` and
+/// never mapped. A shader reads this memory at about 500 GB/s on an RDNA2 card, against about 30
+/// GB/s for host-visible memory over the virtualized host bus.
 pub const DeviceBuffer = struct {
     ctx: *const vulkan_ctx.Context,
     buffer: vk.Buffer = .null_handle,
@@ -4750,20 +4686,16 @@ pub const DeviceBuffer = struct {
     }
 };
 
-/// The device KV cache: one region per layer and tensor, in the order and the
-/// packing of `kv_index`. Each segment is one device-local `DeviceBuffer` that
-/// holds whole regions, so the device limits bind one region and not the whole
-/// cache. The store places bytes only. The runner maps each `kv_index.fits`
-/// verdict to an error before it calls `init`.
+/// The device KV cache: one region per layer and tensor, in the order and the packing of
+/// `kv_index`. Each segment holds whole regions, so the device limits bind one region and not the
+/// whole cache. The runner maps each `kv_index.fits` verdict to an error before `init`.
 pub const KvStore = struct {
     layout: kv_index.Layout,
     packing: kv_index.Packing,
-    /// The limits that the packing honors. Every descriptor from the store
-    /// starts at a multiple of `offset_alignment` and binds at most
-    /// `storage_range` bytes.
+    /// The limits that the packing honors: each descriptor starts at a multiple of
+    /// `offset_alignment` and binds at most `storage_range` bytes.
     lim: limits.BufferLimits,
-    /// The first `packing.n_segments` entries hold the allocations in segment
-    /// order. The other entries stay empty.
+    /// The first `packing.n_segments` entries hold the allocations in order. The others stay empty.
     segments: [max_segments]DeviceBuffer,
 
     /// One segment per region when no two regions fit one allocation.
@@ -4868,11 +4800,9 @@ pub const KvStore = struct {
         return .{ .buffer = base.buffer, .offset = offset };
     }
 
-    /// The copy list that forks slot `source` into slot `target`: the `window`
-    /// rows of the slot in every region, one copy per region. The slot rows of
-    /// one region never overlap, so each copy stays inside one buffer. A copy
-    /// needs no offset alignment, so the list addresses rows and not
-    /// descriptor views.
+    /// The copy list that forks slot `source` into slot `target`, one copy per region. The slot
+    /// rows of one region never overlap, so each copy stays inside one buffer. A copy needs no
+    /// offset alignment, so the list addresses rows and not descriptor views.
     pub fn cloneCopies(self: *const KvStore, source: u32, target: u32, out: []Copy) []Copy {
         const layout = self.layout;
         std.debug.assert(source != target);
@@ -4903,11 +4833,9 @@ pub const KvStore = struct {
         return out[0..c];
     }
 
-    /// The copy list between the first `n_rows` rows of `slot` in every region
-    /// and a packed host stage. The list keeps the blob order: layers
-    /// ascending, K rows then V rows per layer. `to_host` true reads the device, and false writes
-    /// it. A save and its restore walk one order, so their packed offsets
-    /// agree.
+    /// The copy list between the first `n_rows` rows of `slot` in every region and a packed host
+    /// stage, in blob order: layers ascending, K rows then V rows. `to_host` true reads the device,
+    /// and false writes it. A save and its restore walk one order, so their offsets agree.
     pub fn rowCopies(
         self: *const KvStore,
         slot: u32,
@@ -4920,6 +4848,8 @@ pub const KvStore = struct {
         std.debug.assert(n_rows >= 1);
         std.debug.assert(n_rows <= layout.window);
         std.debug.assert(out.len >= layout.regionCount());
+
+        // Walk the regions in blob order, one copy per region.
         const rows_bytes: u64 = @as(u64, n_rows) * layout.rowBytes();
         var off: u64 = 0;
         var c: usize = 0;
@@ -4948,6 +4878,7 @@ pub const KvStore = struct {
             }
         }
 
+        // Check that the walk covered the blob.
         std.debug.assert(c == layout.regionCount());
         std.debug.assert(off == layout.blobBytes(n_rows));
         return out[0..c];
@@ -4965,24 +4896,8 @@ pub const KvStore = struct {
     }
 };
 
-/// Device-local VRAM arena. It sub-allocates from a small number of large
-/// buffer and memory segments. The buffer usage is a parameter, so one arena
-/// type backs every device-local consumer. The consumers are the Q8_0 scales,
-/// the Q8_0 quants, and the KV cache shards of a tiered cache.
-///
-/// The driver, not the card, sets the constraint. A Llama-8B Q8_0 model holds
-/// 32 layers times 7 matmuls plus one lm_head, which is 225 Q8_0 weights. One
-/// buffer and one memory object each makes 450 device allocations. That count
-/// plus a 512 MB KV cache exhausts the device-local heap of the target driver.
-/// It does so long before the 16 GB of the card is touched. Ten large segments
-/// of about 1 GB each keep the allocation count low.
-///
-/// Each `alloc(size)` returns a `View` shaped like `vk.DescriptorBufferInfo`,
-/// which the caller writes straight into a descriptor update. Offsets align to
-/// the `minStorageBufferOffsetAlignment` of the device, so the binding stays
-/// valid. Allocations are append-only and there is no `free`. An arena lives as
-/// long as its use. Model weights live for the life of the runner, and a
-/// per-session KV pool is reset whole between sessions.
+/// Device-local VRAM arena. It sub-allocates from a small number of large buffer and memory
+/// segments, and it never frees one allocation. See "VRAM arenas" in the header.
 pub const VramArena = struct {
     ctx: *const vulkan_ctx.Context,
     gpa: std.mem.Allocator,
@@ -4998,9 +4913,7 @@ pub const VramArena = struct {
         used: vk.DeviceSize,
     };
 
-    /// A descriptor-binding-shaped view into the arena. Identity match
-    /// with `vk.DescriptorBufferInfo` so callers can write it directly
-    /// into descriptor updates.
+    /// A view of the arena, the shape that a descriptor update takes.
     pub const View = vk.DescriptorBufferInfo;
 
     pub const InitError = std.mem.Allocator.Error;
@@ -5013,12 +4926,9 @@ pub const VramArena = struct {
         vk.DeviceWrapper.AllocateMemoryError ||
         vk.DeviceWrapper.BindBufferMemoryError;
 
-    /// `seg_capacity` is the default size for each new segment. Pick it
-    /// to be at least as large as the largest single allocation you
-    /// expect. Otherwise `alloc` grows individual segments to fit,
-    /// which works but fragments the arena. For Llama-8B Q8_0 quants
-    /// the largest single weight is the lm_head at ~525 MB. 1 GB is a
-    /// safe default.
+    /// `seg_capacity` is the default size of a new segment. Pick at least the largest single
+    /// allocation, or `alloc` grows a segment to fit, which fragments the arena. The largest
+    /// Llama-8B Q8_0 quants weight is the lm_head at about 525 MB, so 1 GB is a safe default.
     pub fn init(
         ctx: *const vulkan_ctx.Context,
         gpa: std.mem.Allocator,
@@ -5044,15 +4954,12 @@ pub const VramArena = struct {
         self.segments.deinit(self.gpa);
     }
 
-    /// Allocate `size` bytes from the arena. Tries to fit in the most
-    /// recent segment first (typical for sequential weight uploads),
-    /// then any other segment, then creates a new one. The new segment
-    /// is at least `seg_capacity` bytes. It grows past that only if the
-    /// request itself is larger.
+    /// Allocate `size` bytes. Try the most recent segment first (typical for sequential weight
+    /// uploads), then any other segment, then a new one. A new segment holds at least
+    /// `seg_capacity` bytes, and more only when the request is larger.
     pub fn alloc(self: *VramArena, size: vk.DeviceSize) AllocError!View {
-        // The alloc sequence at debug scope is the VRAM map. Allocations follow
-        // the deterministic weight-upload order, so a reader pairs each line
-        // with the load sequence.
+        // The alloc sequence at debug scope is the VRAM map. Allocations follow the deterministic
+        // weight-upload order, so a reader pairs each line with the load sequence.
         log.debug(
             "arena alloc: {d} KiB ({d} MiB held before)",
             .{ size / 1024, self.totalUsed() / (1024 * 1024) },
@@ -5145,10 +5052,9 @@ pub const VramArena = struct {
     }
 };
 
-/// The standalone-submit resources a kernel owns on top of its `Pipeline`:
-/// a single-set descriptor pool, the set, and a reusable primary command
-/// buffer. Only kernels with a self-contained `run()` carry one. The
-/// record-only kernels leave sets and command buffers to their caller.
+/// The standalone-submit resources a kernel owns on top of its `Pipeline`: a single-set descriptor
+/// pool, the set, and a reusable primary command buffer. Only a kernel with a self-contained
+/// `run()` carries one.
 pub const OneShot = struct {
     desc_pool: vk.DescriptorPool,
     desc_set: vk.DescriptorSet,
@@ -5178,9 +5084,8 @@ pub const OneShot = struct {
     }
 
     pub fn deinit(self: OneShot, ctx: *const vulkan_ctx.Context) void {
-        // The command buffer came from ctx.command_pool. Free it explicitly
-        // so the pool stays clean for other kernels that share it.
-        // Destroying the descriptor pool frees the set automatically.
+        // The command buffer came from ctx.command_pool, so free it for the other kernels of that
+        // pool. Destroying the descriptor pool frees the set.
         const cmds_to_free = [_]vk.CommandBuffer{self.cmd_buffer};
         ctx.vkd.freeCommandBuffers(ctx.device, ctx.command_pool, &cmds_to_free);
         ctx.vkd.destroyDescriptorPool(ctx.device, self.desc_pool, null);
@@ -5236,10 +5141,9 @@ pub const CopyRecorder = struct {
     }
 };
 
-/// The two costs one staged KV swap pays. `dma_ms` covers the
-/// `runStagingCopies` submit and wait, and `memcpy_ms` covers the copy through
-/// the mapped `HostBuffer`. A bench must report the two apart, because they sit
-/// under different roofs and only the split names the side that costs.
+/// The two costs of one staged KV swap. `dma_ms` covers the `runStagingCopies` submit and wait, and
+/// `memcpy_ms` covers the copy through the mapped `HostBuffer`. A bench reports the two apart,
+/// because they sit under different roofs and only the split names the side that costs.
 pub const SwapSplit = struct {
     dma_ms: f64,
     memcpy_ms: f64,
@@ -5263,9 +5167,7 @@ var staging_submits: std.atomic.Value(u64) = .init(0);
 /// because every caller holds its context through a `*const` pointer.
 var staging_busy: std.atomic.Value(bool) = .init(false);
 
-/// The error of a failed wait. The buffer can still be pending after it, and a
-/// reset of a pending buffer is invalid, so every later call returns it. The
-/// busy flag guards it.
+/// The error of a failed wait. Every later submit returns it. See "One-shot submits" in the header.
 var staging_wait_error: ?SubmitError = null;
 
 // -- api --------------------------------------------------------------------
@@ -5275,22 +5177,15 @@ pub fn stagingSubmitCount() u64 {
     return staging_submits.load(.monotonic);
 }
 
-/// Submit one command buffer of work and block until the queue is idle. It
-/// resets the staging buffer of `ctx`, begins it for one submit, and calls
-/// `recorder.record(cb)`, which returns a `Recorded`. Then it ends the buffer,
-/// submits it, and waits. Once it returns, the GPU has finished the work.
-///
-/// The translation layer makes a native command allocator for each command
-/// buffer, and the paravirtual driver leaks part of it when the buffer is
-/// freed. So every one-shot submit reuses the one buffer of the context. The
-/// wait before the return keeps the buffer idle at the next entry. After a
-/// failed wait, every later call returns that error. The Vulkan host thread is
-/// single, and the busy flag asserts that no call nests in another.
+/// Submit one command buffer of work on the staging buffer of `ctx`, and block until the queue is
+/// idle. `recorder.record(cb)` records the work and returns a `Recorded`. On return the GPU has
+/// finished. See "One-shot submits" in the header.
 pub fn submitOnce(
     ctx: *const vulkan_ctx.Context,
     label: SubmitLabel,
     recorder: anytype,
 ) SubmitError!void {
+    // Take the staging buffer, or refuse after a failed wait.
     const cmd = ctx.staging_cmd;
     std.debug.assert(cmd != .null_handle);
     const was_busy = staging_busy.swap(true, .acquire);
@@ -5302,17 +5197,20 @@ pub fn submitOnce(
         return err;
     }
 
+    // Number this submit and start the laps.
     const number = staging_submits.fetchAdd(1, .monotonic) + 1;
     var phase: SubmitPhase = .reset;
     errdefer |err| log.err("staging: submit {d} failed in phase {t}: {t}", .{ number, phase, err });
 
     var lap: [@typeInfo(SubmitPhase).@"enum".fields.len]f64 = @splat(0);
 
+    // Reset the staging buffer.
     var t = core_log.now();
     const t0 = t;
     try ctx.vkd.resetCommandBuffer(cmd, .{});
     lap[@intFromEnum(SubmitPhase.reset)] = core_log.msSince(t);
 
+    // Record the work, between timestamps when the pool exists.
     phase = .record;
     t = core_log.now();
     const begin: vk.CommandBufferBeginInfo = .{ .flags = .{ .one_time_submit_bit = true } };
@@ -5333,6 +5231,7 @@ pub fn submitOnce(
     try ctx.vkd.endCommandBuffer(cmd);
     lap[@intFromEnum(SubmitPhase.record)] = core_log.msSince(t);
 
+    // Hand the buffer to the queue.
     phase = .submit;
     t = core_log.now();
     const t_submit = t;
@@ -5341,6 +5240,7 @@ pub fn submitOnce(
     try ctx.vkd.queueSubmit(ctx.queue, &submits, .null_handle);
     lap[@intFromEnum(SubmitPhase.submit)] = core_log.msSince(t);
 
+    // Wait for the queue, and keep a failed wait for every later call.
     phase = .wait;
     t = core_log.now();
     const t_wait = t;
@@ -5350,6 +5250,8 @@ pub fn submitOnce(
     }
 
     try waited;
+
+    // Close the laps and record the spans.
     const t_done = core_log.now();
     lap[@intFromEnum(SubmitPhase.wait)] = msBetween(t, t_done);
     span.record(.gpu_submit, t_submit, t_wait);
@@ -5364,28 +5266,30 @@ pub fn submitOnce(
         "(allocate {d:.3}, record {d:.3}, submit {d:.3}, wait {d:.3}, free 0.000 ms)";
     log.debug(
         line_fmt,
-        .{ number, label, recorded.copies, recorded.bytes >> 10, core_log.msSince(t0), lap[0], lap[1], lap[2], lap[3] },
+        .{
+            number,
+            label,
+            recorded.copies,
+            recorded.bytes >> 10,
+            core_log.msSince(t0),
+            lap[0],
+            lap[1],
+            lap[2],
+            lap[3],
+        },
     );
 }
 
-/// Submit one transfer that runs every copy in `copies`, for example from
-/// host-visible staging buffers to device-local destinations, through
-/// `submitOnce`. Once it returns, a compute dispatch can read the destination
-/// buffers. An empty list is a legal submit that records nothing.
+/// Submit one transfer that runs every copy in `copies`, through `submitOnce`. Once it returns, a
+/// compute dispatch can read the destination buffers. An empty list is a legal submit that records
+/// nothing.
 pub fn runStagingCopies(ctx: *const vulkan_ctx.Context, copies: []const Copy) SubmitError!void {
     try submitOnce(ctx, .copy, CopyRecorder{ .ctx = ctx, .copies = copies });
 }
 
-/// Move one packed blob between the device and the host through `stage`, one
-/// chunk at a time. `full` lists the copies of the whole blob in blob order,
-/// with `stage` as the host buffer, as `KvStore.rowCopies` builds them. Evict,
-/// restore, and the prefix snapshot all walk this one loop, so the stage holds
-/// one chunk of at most `chunk_bytes` and never one window.
-///
-/// The walk takes `kv_budget.ChunkWalk.count(blob, chunk)` trips. Each trip
-/// clips `full` to its byte range, submits the clipped copies, and waits. A
-/// save copies the stage out after the wait, and a restore fills the stage
-/// before the submit.
+/// Move one packed blob between the device and the host through `stage`, one chunk at a time.
+/// `full` lists the copies of the whole blob in blob order, with `stage` as the host buffer, as
+/// `KvStore.rowCopies` builds them. See "Staged swaps" in the header.
 pub fn walkStage(
     ctx: *const vulkan_ctx.Context,
     full: []const Copy,
@@ -5393,6 +5297,7 @@ pub fn walkStage(
     side: StageSide,
     chunk_bytes: u64,
 ) !SwapSplit {
+    // Check the chunk and the stage.
     const to_host = side == .to_host;
     const total: u64 = switch (side) {
         inline else => |blob| blob.len,
@@ -5409,6 +5314,7 @@ pub fn walkStage(
         std.debug.assert((if (to_host) c.dst else c.src) == stage.buffer);
     }
 
+    // Walk the blob, one submit per chunk.
     var split: SwapSplit = .{ .dma_ms = 0, .memcpy_ms = 0 };
     var scratch: [KvStore.max_segments]Copy = undefined;
     var walk = kv_budget.ChunkWalk.init(total, chunk);
@@ -5507,15 +5413,9 @@ pub fn updateStorageBindings(
     ctx.vkd.updateDescriptorSets(ctx.device, writes[0..buf_infos.len], null);
 }
 
-/// The one-shot driver for the record-only `KvCommitF16`. It stages the two f32
-/// scratch inputs in host-visible memory, builds a throwaway descriptor pool and
-/// set, dispatches through `recordInto` in one `submitOnce`, and reads the two
-/// narrowed outputs back as raw f16 bits. For the rounding gate alone: the
-/// runners record this kernel into their own per-token command buffer.
-///
-/// The output is bits, not values. The bits are what the cache stores, so a bit
-/// comparison states the rounding property directly and keeps a second
-/// conversion out of the path under test.
+/// The one-shot driver of the record-only `KvCommitF16`, for the rounding gate alone. The output is
+/// raw f16 bits, what the cache stores, so a bit comparison states the rounding property and keeps
+/// a second conversion out of the path under test.
 pub fn kvCommitF16OneShot(
     kernel: *KvCommitF16,
     k_src: []const f32,
@@ -5529,6 +5429,7 @@ pub fn kvCommitF16OneShot(
     std.debug.assert(k_out_bits.len == k_src.len);
     std.debug.assert(v_out_bits.len == k_src.len);
 
+    // Stage the two inputs and size the two outputs.
     const n: u32 = @intCast(k_src.len);
     const ctx = kernel.ctx;
 
@@ -5554,6 +5455,7 @@ pub fn kvCommitF16OneShot(
     @memcpy(buf_k_src.sliceTyped(f32, k_src.len), k_src);
     @memcpy(buf_v_src.sliceTyped(f32, v_src.len), v_src);
 
+    // Build a throwaway pool and set, and bind the four buffers.
     const desc_pool = try createSingleSetPool(ctx, 4);
     defer ctx.vkd.destroyDescriptorPool(ctx.device, desc_pool, null);
 
@@ -5567,6 +5469,7 @@ pub fn kvCommitF16OneShot(
     };
     updateStorageBindings(ctx, desc_set, &infos);
 
+    // Dispatch through `recordInto`, then read the bits back.
     const Rec = struct {
         kernel: *KvCommitF16,
         set: vk.DescriptorSet,
@@ -5585,14 +5488,8 @@ pub fn kvCommitF16OneShot(
 
 // -- helpers ----------------------------------------------------------------
 
-/// Repack a Q8_0 weight matrix from the interleaved GGUF layout into two flat
-/// arrays the shader indexes directly. The GGUF layout holds each block of 32
-/// elements as a 2-byte f16 scale plus 32 i8 quants, contiguous per row. The
-/// flat arrays hold the f16 scales by `(j, blk)` and the i8 quants by `(j, p)`.
-/// The copy keeps every bit pattern, so the GPU `float16_t` and `int8_t` loads
-/// see the bytes the CPU kernel reads through `f16BitsToF32` and
-/// `@bitCast(i8)`. The bit-exact match against the CPU kernel depends on that.
-/// Do not reorder bytes here.
+/// Repack a Q8_0 weight matrix from the interleaved GGUF layout into two flat arrays. See
+/// "Resident weights" in the header. Do not reorder bytes here.
 fn repackQ80ToScalesQuants(
     weight_data: []const u8,
     in_features: usize,
@@ -5604,11 +5501,9 @@ fn repackQ80ToScalesQuants(
     const row_bytes = blocks_per_row * q8_0_block_bytes;
     std.debug.assert(scales_out.len >= out_features * blocks_per_row * 2);
     std.debug.assert(quants_out.len >= out_features * in_features);
-    var j: usize = 0;
-    while (j < out_features) : (j += 1) {
+    for (0..out_features) |j| {
         const row_off = j * row_bytes;
-        var blk: usize = 0;
-        while (blk < blocks_per_row) : (blk += 1) {
+        for (0..blocks_per_row) |blk| {
             const blk_off = row_off + blk * q8_0_block_bytes;
             // 2 bytes of f16 scale -> scales_out at j * blocks_per_row + blk.
             const scales_idx = (j * blocks_per_row + blk) * 2;
@@ -5624,11 +5519,9 @@ fn repackQ80ToScalesQuants(
     }
 }
 
-/// The Q4_0 sibling of `repackQ80ToScalesQuants`. A Q4_0 row holds `in/32`
-/// blocks of 18 bytes, a 2-byte f16 scale plus 16 packed bytes. It separates the
-/// scales, whose f16 layout matches Q8_0, from the 16 packed quant bytes. The
-/// packed bytes keep every bit pattern. The shader extracts the nibbles in the
-/// layout the CPU kernel uses.
+/// The Q4_0 form of `repackQ80ToScalesQuants`. A row holds `in/32` blocks of a 2-byte f16 scale
+/// plus 16 packed bytes. The packed bytes keep every bit pattern, and the shader extracts the
+/// nibbles in the layout of the CPU kernel.
 fn repackQ40ToScalesQuants(
     weight_data: []const u8,
     in_features: usize,
@@ -5640,11 +5533,9 @@ fn repackQ40ToScalesQuants(
     const row_bytes = blocks_per_row * q4_0_block_bytes;
     std.debug.assert(scales_out.len >= out_features * blocks_per_row * 2);
     std.debug.assert(quants_out.len >= out_features * (in_features / 2));
-    var j: usize = 0;
-    while (j < out_features) : (j += 1) {
+    for (0..out_features) |j| {
         const row_off = j * row_bytes;
-        var blk: usize = 0;
-        while (blk < blocks_per_row) : (blk += 1) {
+        for (0..blocks_per_row) |blk| {
             const blk_off = row_off + blk * q4_0_block_bytes;
             const scales_idx = (j * blocks_per_row + blk) * 2;
             scales_out[scales_idx + 0] = weight_data[blk_off + 0];
@@ -5727,12 +5618,7 @@ fn createComputePipeline(
     shader_module: vk.ShaderModule,
     pipeline_layout: vk.PipelineLayout,
 ) !vk.Pipeline {
-    // RDNA2 is natively wave32. A wave64 vector ALU or memory op executes by
-    // issuing the instruction twice. So pin every compute pipeline to wave32
-    // through VK_EXT_subgroup_size_control. The SmolLM2 decode benchmark over
-    // 10 runs showed 31% lower inter-token latency and a 4x lower standard
-    // deviation against the unpinned default. Precondition: the workgroup size
-    // of every shader is a multiple of 32.
+    // Pin wave32. See docs/gpu-rdna2.md section 5.
     const required_size: vk.PipelineShaderStageRequiredSubgroupSizeCreateInfo = .{
         .required_subgroup_size = 32,
     };
@@ -5787,12 +5673,9 @@ fn allocateOneSet(
     return set;
 }
 
-/// The shared one-shot driver for the record-only batch matmul kernels,
-/// `LinearQ80Batch` and `LinearQ80Gemm`. It stages the input and output in
-/// host-visible memory, builds a throwaway descriptor pool and set, dispatches
-/// through `kernel.recordInto` in one `submitOnce`, and reads the result back.
-/// For tests and the bench only. `kernel` points at a kernel that exposes
-/// `.ctx`, `.pipeline`, and `recordInto(cb, set, b, k, n)`.
+/// The shared one-shot driver of `LinearQ80Batch` and `LinearQ80Gemm`, for tests and the bench.
+/// `kernel` points at a kernel that exposes `.ctx`, `.pipeline`, and `recordInto(cb, set, b, k,
+/// n)`.
 fn matmulOneShot(
     kernel: anytype,
     input: []const f32,
@@ -5805,10 +5688,12 @@ fn matmulOneShot(
     std.debug.assert(input.len == b * in_features);
     std.debug.assert(out.len == b * out_features);
 
+    // Build the weight of this call.
     const ctx = kernel.ctx;
     var w = try Q80Weight.init(ctx, weight_bytes, in_features, out_features);
     defer w.deinit();
 
+    // Stage the input and size the output.
     const F = @sizeOf(f32);
     var buf_in: HostBuffer = .{ .ctx = ctx };
     defer buf_in.deinit();
@@ -5820,6 +5705,7 @@ fn matmulOneShot(
     try buf_out.ensure(@intCast(out.len * F));
     @memcpy(buf_in.sliceTyped(f32, input.len), input);
 
+    // Build a throwaway pool and set, and bind the four buffers.
     const pool_sizes = [_]vk.DescriptorPoolSize{
         .{ .type = .storage_buffer, .descriptor_count = 4 },
     };
@@ -5848,6 +5734,7 @@ fn matmulOneShot(
     };
     updateStorageBindings(ctx, set, &infos);
 
+    // Dispatch through `recordInto`, then read the result back.
     const Rec = struct {
         kernel: @TypeOf(kernel),
         set: vk.DescriptorSet,
@@ -5906,6 +5793,7 @@ test "KvStore: every row of every region lands once inside one allocation" {
     try std.testing.expectEqual(@as(u32, 3), store.packing.n_segments);
     try std.testing.expectEqual(layout.totalBytes(), store.deviceBytes());
 
+    // Walk every row, and mark each row position that it lands on.
     const row_bytes = layout.rowBytes();
     const rows_per_segment = 24;
     try std.testing.expectEqual(lim.allocation_size, rows_per_segment * row_bytes);
@@ -5917,6 +5805,7 @@ test "KvStore: every row of every region lands once inside one allocation" {
             const whole = store.region(layer, t);
             try std.testing.expectEqual(layout.regionBytes(), whole.range);
             try std.testing.expectEqual(@as(u64, 0), whole.offset % lim.offset_alignment);
+
             for (0..layout.n_slots) |s| {
                 const slot: u32 = @intCast(s);
                 const view = store.slotView(layer, t, slot);
@@ -5926,6 +5815,7 @@ test "KvStore: every row of every region lands once inside one allocation" {
                     view.offset,
                 );
                 try std.testing.expectEqual(@as(u64, layout.window) * row_bytes, view.range);
+
                 for (0..layout.window) |p| {
                     const row = store.rowAt(layer, t, slot, @intCast(p));
                     try std.testing.expectEqual(view.buffer, row.buffer);
@@ -5951,10 +5841,8 @@ test "KvStore: every row of every region lands once inside one allocation" {
 }
 
 test "KvStore: two 2B sessions under the raised range start slot 1 at 128 MiB in each region" {
-    // Qwen3.5-2B at f16: six full-attention layers of 512-element rows, two
-    // slots of 131072 positions, a storage range of 512 MiB, and allocations
-    // of 2 GiB. Each region holds 256 MiB, so eight regions share the first
-    // allocation and four share the second.
+    // Qwen3.5-2B at f16: six full-attention layers, two slots, and 2 GiB allocations. Each region
+    // holds 256 MiB, so eight regions share the first allocation and four the second.
     const layout = kv_index.Layout.init(2, 131_072, 512, 6, .f16);
     const lim: limits.BufferLimits = .{
         .storage_range = 536_870_912,

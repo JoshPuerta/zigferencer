@@ -1,12 +1,10 @@
-//! GGUF v3 binary parser. The file is a pure datapath: a byte slice goes in and
-//! a structured `Parsed` value comes out, with no I/O. That keeps it testable on
-//! a plain buffer. The parser checks the "GGUF" identifier, the version, the
-//! alignment, and the alignment of each tensor offset. It rejects truncated or
-//! malformed input with a typed Error.
-//! The loader one level up joins the map, this parser, and the
-//! architecture-specific semantic checks.
+//! Role. GGUF v3 binary parser. The file is a pure datapath: a byte slice goes in and a
+//! structured `Parsed` value comes out, with no I/O, so a plain buffer tests it. The parser checks
+//! the "GGUF" identifier, the version, the alignment, and the alignment of each tensor offset. It
+//! rejects truncated or malformed input with a typed `Error`. The loader one level up joins the
+//! map, this parser, and the architecture-specific semantic checks.
 //!
-//! File layout (v3):
+//! File layout (v3).
 //!     magic                "GGUF" (4 bytes)
 //!     version              u32 LE  (asserted == 3)
 //!     tensor_count         u64 LE
@@ -41,14 +39,11 @@ pub const Error = error{
     NameTooLong,
     BadAlignment,
     BadTensorDims,
-    /// A count in the header (kv, tensor, or array length) is larger than the
-    /// remaining bytes can hold. The file is malformed or hostile.
+    /// A header count (kv, tensor, or array length) is larger than the remaining bytes can hold.
     CountExceedsFile,
-    /// Tensor offsets do not rise monotonically, and the loader needs that
-    /// order. The bytes are foreign, so this is a typed error and not a panic.
+    /// Tensor offsets do not rise monotonically. The loader needs that order.
     TensorOffsetsUnordered,
-    /// A tensor offset is not a multiple of `general.alignment`. The loader
-    /// views the data in place, so the offset must keep the file alignment.
+    /// A tensor offset is not a multiple of `general.alignment`. The loader views data in place.
     TensorOffsetUnaligned,
 } || Allocator.Error;
 
@@ -146,11 +141,8 @@ const Reader = struct {
         return r.bytes.len - r.pos;
     }
 
-    /// Reject a header count before the parser allocates for it. Every element
-    /// the count names consumes at least `min_each` bytes, so a count beyond
-    /// `remaining / min_each` cannot fit in the file. The bound ties the
-    /// allocation to the real file size, so a small file cannot claim a
-    /// billion-element array and force a multi-gigabyte `alloc`.
+    /// Reject a header count before the parser allocates for it. Each element takes at least
+    /// `min_each` bytes, so the allocation never exceeds the file size.
     fn boundCount(r: *const Reader, count: u64, min_each: usize) Error!void {
         std.debug.assert(min_each >= 1);
 
@@ -202,6 +194,7 @@ const Reader = struct {
 pub fn parse(arena: Allocator, bytes: []const u8) Error!Parsed {
     var r: Reader = .{ .bytes = bytes };
 
+    // Read the fixed header.
     try r.ensure(4 + 4 + 8 + 8);
     if (!std.mem.eql(u8, bytes[0..4], &magic)) return error.BadMagic;
 
@@ -214,6 +207,7 @@ pub fn parse(arena: Allocator, bytes: []const u8) Error!Parsed {
     const kv_count = try r.read(u64);
     log.debug("header: v{d}, {d} tensors, {d} kv", .{ version, tensor_count, kv_count });
 
+    // Read the metadata pairs.
     try r.boundCount(kv_count, 13); // floor per Kv: 8 (key len) + 4 (value type) + 1 (value)
     const kvs = try arena.alloc(Kv, @intCast(kv_count));
     for (kvs) |*kv| {
@@ -221,6 +215,7 @@ pub fn parse(arena: Allocator, bytes: []const u8) Error!Parsed {
         kv.value = try readValue(&r, arena);
     }
 
+    // Read the tensor table.
     try r.boundCount(
         tensor_count,
         32,
@@ -237,8 +232,7 @@ pub fn parse(arena: Allocator, bytes: []const u8) Error!Parsed {
 
         ti.n_dims = @intCast(n_dims_u32);
         ti.shape = .{ 1, 1, 1, 1 };
-        var i: usize = 0;
-        while (i < ti.n_dims) : (i += 1) {
+        for (0..ti.n_dims) |i| {
             ti.shape[i] = try r.read(u64);
         }
 
@@ -249,6 +243,7 @@ pub fn parse(arena: Allocator, bytes: []const u8) Error!Parsed {
         last_offset = ti.offset_in_data;
     }
 
+    // Find the alignment and check each tensor offset against it.
     var alignment: u64 = default_alignment;
     for (kvs) |kv| {
         if (std.mem.eql(u8, kv.key, "general.alignment")) {
@@ -261,8 +256,7 @@ pub fn parse(arena: Allocator, bytes: []const u8) Error!Parsed {
         }
     }
 
-    // The llama.cpp reader refuses the same two forms. A power of two keeps
-    // every aligned offset aligned for each smaller power of two.
+    // A power of two keeps every aligned offset aligned for each smaller power of two.
     if (alignment == 0 or !std.math.isPowerOfTwo(alignment)) return error.BadAlignment;
 
     for (tensors) |ti| {
@@ -276,6 +270,7 @@ pub fn parse(arena: Allocator, bytes: []const u8) Error!Parsed {
         }
     }
 
+    // Skip the padding to the start of the tensor data.
     const pad = (alignment - (r.pos % alignment)) % alignment;
     try r.skip(std.math.cast(usize, pad) orelse return error.Truncated);
     log.debug("parsed: kv done, tensor table done, data at {d} (align {d})", .{ r.pos, alignment });
@@ -293,9 +288,7 @@ pub fn parse(arena: Allocator, bytes: []const u8) Error!Parsed {
 // -- helpers ----------------------------------------------------------------
 
 /// Smallest number of file bytes that one array element of `t` can consume.
-/// This is the divisor for `boundCount`. A string carries a length prefix, so
-/// its floor is the 8-byte length with an empty payload. A nested array fails
-/// later, so 1 is a harmless loose floor.
+/// A string floor is its 8-byte length. A nested array fails later, so 1 is a loose floor.
 fn elemMinBytes(t: ValueType) usize {
     return switch (t) {
         .u8, .i8, .bool => 1,

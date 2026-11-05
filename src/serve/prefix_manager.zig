@@ -1,20 +1,41 @@
-//! The serve prefix cache: its entries, its counters, and its boot warm-up. A
-//! turn that starts at position zero restores the longest cached prefix and
-//! prefills only the suffix. A completed position-zero prefix is offered back
-//! as a new entry. Every path is best-effort: a refusal or a failure degrades
-//! to a cold prefill.
+//! The serve prefix cache: its entries, its counters, and its boot warm-up. A turn that starts at
+//! position zero restores the longest cached prefix and prefills only the suffix. A completed
+//! position-zero prefix is offered back as a new entry. Every path is best-effort: a refusal or a
+//! failure degrades to a cold prefill.
 //!
-//! The boundary with the scheduler. The scheduler keeps every engine call whose
-//! result a slot's state machine consumes (`restorePrefix` and `restoreReady`
-//! drive `slot.fed`, `endPrefill`, and `acceptToken`). This module keeps every
-//! engine call whose result only the cache consumes (`snapshotBytesFor`,
-//! `snapshotPrefix`, and `copyFinalLogits` travel with the insert body).
+//! Boundary with the scheduler. The scheduler keeps every engine call whose result a slot's state
+//! machine consumes (`restorePrefix` and `restoreReady` drive `slot.fed`, `endPrefill`, and
+//! `acceptToken`). This module keeps every engine call whose result only the cache consumes
+//! (`snapshotBytesFor`, `snapshotPrefix`, and `copyFinalLogits` travel with the insert body).
 //!
-//! `PrefixManager` is a plain struct and not a generic over the engine. The
-//! scheduler's `can_snapshot` then keeps its single definition on the type that
-//! owns the Engine boundary. `insert` takes `engine: anytype`, and only a
-//! `comptime can_snapshot`-guarded call site instantiates it, so this module
-//! also compiles for an engine that cannot snapshot.
+//! Generic shape. `PrefixManager` is a plain struct and not a generic over the engine. So the
+//! scheduler's `can_snapshot` keeps its single definition on the type that owns the Engine
+//! boundary. `insert` takes `engine: anytype`, and only a `comptime can_snapshot`-guarded call
+//! site instantiates it. So this module also compiles for an engine that cannot snapshot.
+//!
+//! Restore. An opening turn can restore its whole prompt, because it wants no logits. A generate
+//! turn whose whole prompt matches an entry with stored logits gets `ready`. A full-length entry
+//! without logits cannot serve a generate turn whole, because blobs restore whole or not at all.
+//! So the search retries below the last token, and the final chunk samples through the engine.
+//! `planRestore` counts nothing. The scheduler counts at its own outcome sites.
+//!
+//! Insert. The copy of the snapshot is symmetric, so its duration is the restore estimate that the
+//! `worthwhile` gate reads. The prefill time is wall time from the turn start, so decode
+//! interleaving inflates it, and the gate over-admits at the margin, which the LRU absorbs. A
+//! generate turn stores the logits of its final row, because this tick is the only one in which
+//! the engine still holds them. An exact-duplicate prompt then needs zero forward rows. An
+//! opening turn stores none. A failed logits allocation downgrades the entry to restore-only.
+//!
+//! Lifetime. A `Hit` points into the cache entry. The caller must spend it before the next insert
+//! reallocates the RAM list. The strings of `CacheConfig.dir` and `preload` must outlive the
+//! manager.
+//!
+//! Preload. `preload` opens, prefills, and closes one session per text through the normal request
+//! path, so the entry tokenizes as live traffic does. The OpenAI launcher pre-wraps each text,
+//! because its codec encodes raw text. It runs single-threaded at boot, before the
+//! engine loop. `sched` reaches this manager through its own `prefix` field, so `self` and `sched`
+//! alias. The body must not hold a manager field across a tick, because a tick can change every
+//! counter and the cache list.
 
 const std = @import("std");
 const Io = std.Io;
@@ -29,52 +50,37 @@ const log = std.log.scoped(.serve);
 
 // -- constants --------------------------------------------------------------
 
-/// A connection id no transport can hold. Preload runs before the engine loop
-/// starts, so no live connection exists to collide with it.
+/// A connection id no transport can hold. Preload runs before any live connection exists.
 const preload_conn: u32 = std.math.maxInt(u32);
 
 // -- types ------------------------------------------------------------------
 
 /// The prefix cache's share of the serve configuration.
 pub const CacheConfig = struct {
-    /// RAM budget for the prefix cache. 0 keeps the cache off. Only an engine
-    /// with a snapshot surface reads it.
+    /// RAM budget for the prefix cache. 0 keeps the cache off.
     ram_bytes: u64 = 0,
-    /// Disk budget for the prefix cache. 0 keeps the disk tier off. The tier
-    /// survives restarts, so it reads `dir` beside the budget.
+    /// Disk budget for the prefix cache. 0 keeps the disk tier off.
     disk_bytes: u64 = 0,
-    /// The on-disk cache directory, as the CLI resolves it from
-    /// `$ZIGFERENCER_CACHE_DIR` or the default. The manager reads it only when
-    /// `disk_bytes > 0`. Its lifetime must cover the manager's.
+    /// The on-disk cache directory. The manager reads it only when `disk_bytes > 0`.
     dir: []const u8 = "",
-    /// Weights identity for prefix-cache keys, backend-qualified for the disk
-    /// tier. A different model or another runner family must never restore
-    /// this cache's state.
+    /// Weights identity in the cache keys. Another model or runner family must never match it.
     model_fp: u64 = 0,
-    /// Boot-time cache warming (`--preload`): one session opens and closes per
-    /// text before the engine loop starts, so the prefill lands in the prefix
-    /// cache. The connector prepares the text. The OpenAI launcher pre-wraps
-    /// it, because its codec encodes raw text. At most
-    /// `limits.serve_preload_max` entries. Its lifetime must cover `preload`.
+    /// Boot warm-up texts (`--preload`), at most `limits.serve_preload_max`.
     preload: []const []const u8 = &.{},
 };
 
-/// One cache entry offered to a restore. The slices point into the entry, so
-/// the caller must spend them before the next insert reallocates the RAM list.
+/// One cache entry offered to a restore. See "Lifetime" in the header.
 const Hit = struct {
     n: u32,
     blob: []const u8,
     logits: []const f32 = &.{},
 };
 
-/// What the cache offers a turn that starts at position zero. `ready` carries
-/// the stored logits of the last row, so the engine samples the first token
-/// with zero forward rows. `rows` restores a prefix, and the suffix still needs
-/// the engine.
+/// What the cache offers a turn at position zero. `ready` holds stored logits, so no row is needed.
+/// `rows` restores a prefix, and the suffix still needs the engine.
 pub const Restore = union(enum) { miss, ready: Hit, rows: Hit };
 
-/// The slot facts an insert reads. The scheduler owns the slot, so it states
-/// them as a value.
+/// The slot facts an insert reads, stated as a value because the scheduler owns the slot.
 const Candidate = struct {
     engine_id: u32,
     proto_id: u32,
@@ -84,8 +90,7 @@ const Candidate = struct {
     t_turn_start: Io.Clock.Timestamp,
 };
 
-/// The boot sink: accept every event, and keep the open result. Nothing parks
-/// here, because `emit` never refuses.
+/// The boot sink: accept every event, and keep the open result. `emit` never refuses.
 const PreloadSink = struct {
     opened: ?struct { sid: u32, kv_pos: u32 } = null,
     err_detail: [64]u8 = undefined,
@@ -120,14 +125,11 @@ pub const PrefixManager = struct {
     hits: u64 = 0,
     misses: u64 = 0,
     inserts: u64 = 0,
-    // Disk-tier splits of the aggregates. A disk hit is also a promotion
-    // into RAM, so no separate promote counter exists.
+    // Disk-tier splits of the aggregates. A disk hit also promotes into RAM.
     disk_hits: u64 = 0,
     disk_inserts: u64 = 0,
 
-    /// `can_snapshot` is the engine's snapshot capability. Without it, or
-    /// without a RAM budget, the cache stays null and every turn takes the cold
-    /// path.
+    /// Without `can_snapshot` or a RAM budget, the cache stays null and every turn runs cold.
     pub fn init(gpa: Allocator, io: Io, cfg: CacheConfig, can_snapshot: bool) PrefixManager {
         var self: PrefixManager = .{
             .gpa = gpa,
@@ -177,15 +179,7 @@ pub const PrefixManager = struct {
         }
     }
 
-    /// The longest cached prefix this turn can restore. An opening turn can
-    /// restore its whole prompt, because it wants no logits. A generate turn
-    /// whose whole prompt matches an entry WITH stored logits gets `ready`. A
-    /// full-length entry without logits cannot serve a generate turn whole
-    /// (blobs restore whole or not at all), so the search retries below the
-    /// last token and the final chunk samples through the engine.
-    ///
-    /// This counts nothing. The scheduler counts at its own outcome sites,
-    /// where the engine has already answered.
+    /// The longest cached prefix this turn can restore. See "Restore" in the header.
     pub fn planRestore(self: *PrefixManager, tokens: []const u32, opening: bool) Restore {
         std.debug.assert(self.cache != null);
 
@@ -200,8 +194,7 @@ pub const PrefixManager = struct {
         return .{ .rows = .{ .n = shorter.n, .blob = shorter.blob } };
     }
 
-    /// Count one served restore. The cache's own record of its last lookup
-    /// names the tier that served it.
+    /// Count one served restore. The cache records which tier served its last lookup.
     pub fn recordHit(self: *PrefixManager) void {
         std.debug.assert(self.cache != null);
 
@@ -215,41 +208,32 @@ pub const PrefixManager = struct {
         self.misses += 1;
     }
 
-    /// Offer a completed position-zero prefix to the cache. This snapshots the
-    /// slot and times the copy. The copy is symmetric, so its duration is the
-    /// restore estimate the measured `worthwhile` gate reads. This runs before
-    /// the turn's token buffer is freed. It is best-effort: an allocation or a
-    /// snapshot failure skips the insert and costs nothing.
+    /// Offer a completed position-zero prefix to the cache. It runs before the turn frees its
+    /// tokens. An allocation or snapshot failure skips the insert. See "Insert" in the header.
     pub fn insert(self: *PrefixManager, engine: anytype, c: Candidate) void {
         const cache = if (self.cache) |*p| p else return;
         const tokens = c.tokens;
         const n: u32 = @intCast(tokens.len);
         const key = prompt_cache_mod.prefixKey(self.model_fp, tokens);
-        // An exact entry already serves this prefix, and the lookup's LRU
-        // bump is the only bookkeeping it needs.
+
+        // Skip a prefix that an exact entry already serves. The lookup bumps its LRU rank.
         if (cache.lookup(key, tokens) != null) return;
 
-        // Wall time from turn start, so decode interleaving inflates it.
-        // The gate then over-admits at the margin, which the LRU absorbs.
+        // Snapshot the slot.
         const prefill_ns = nsBetween(c.t_turn_start, Io.Clock.Timestamp.now(self.io, .awake));
         const bytes: usize = @intCast(engine.snapshotBytesFor(n));
         const buf = self.gpa.alloc(u8, bytes) catch return;
         defer self.gpa.free(buf);
 
-        // The restore estimate times the copy alone. A hit pays the symmetric
-        // device copy, never this transient allocation.
+        // Time the copy alone, because a hit never pays this transient allocation.
         const t_copy = Io.Clock.Timestamp.now(self.io, .awake);
         engine.snapshotPrefix(c.engine_id, n, buf) catch |err| {
             log.debug("prefix snapshot failed: session {d}: {t}", .{ c.proto_id, err });
             return;
         };
         const restore_ns = nsBetween(t_copy, Io.Clock.Timestamp.now(self.io, .awake));
-        // A generate turn's final row just produced the logits the turn
-        // sampled from, and this tick is the one window they survive in
-        // the engine. Store them, so an exact-duplicate prompt is served
-        // with zero forward rows (the regenerate case). An opening turn
-        // computes no logits and stores none. A failed allocation only
-        // downgrades the entry to restore-only.
+
+        // Copy the final logits of a generate turn. See "Insert" in the header.
         var logits: []const f32 = &[_]f32{};
         const logits_buf: []f32 = if (c.opening) &.{} else self.gpa.alloc(
             f32,
@@ -263,6 +247,7 @@ pub const PrefixManager = struct {
             logits = logits_buf;
         }
 
+        // Admit the entry and count it.
         const admitted = cache.admit(key, tokens, buf, logits, prefill_ns, restore_ns);
         if (admitted) {
             self.inserts += 1;
@@ -277,16 +262,8 @@ pub const PrefixManager = struct {
         }
     }
 
-    /// Warm the prefix cache from `texts`: open, prefill, and close one session
-    /// per text through the normal request path, so the entry tokenizes exactly
-    /// as live traffic does. This runs single-threaded at boot, before the
-    /// engine loop. It is best-effort per text. A refusal logs one line and the
-    /// boot proceeds, so the operator reads the outcome per text.
-    ///
-    /// `sched` reaches this same manager through its own `prefix` field, so
-    /// `self` and `sched` alias. The body must therefore not hold a manager
-    /// field across a tick, because a tick can change every counter and the
-    /// cache list.
+    /// Warm the prefix cache from `texts`. A refusal logs one line and the boot proceeds.
+    /// See "Preload" in the header.
     pub fn preload(
         self: *PrefixManager,
         sched: anytype,
@@ -304,6 +281,7 @@ pub const PrefixManager = struct {
         for (texts) |text| {
             std.debug.assert(text.len > 0);
 
+            // Open one session on the text.
             var sink: PreloadSink = .{};
             const dup = self.gpa.dupe(u8, text) catch {
                 log.warn("preload abandoned: out of memory", .{});
@@ -312,8 +290,8 @@ pub const PrefixManager = struct {
             _ = sched.handle(.{ .conn = preload_conn, .request_id = 0, .session_id = 0, .body = .{
                 .session_open = .{ .sampling = protocol.Sampling.greedy, .system_prompt = dup },
             } }, &sink);
-            // One chunk advances per tick, so max_seq ticks cover the
-            // longest legal prefill. The margin covers the open itself.
+
+            // Tick until the prefill ends: one chunk per tick, plus 16 ticks for the open.
             const bound: u32 = max_seq + 16;
             var iters: u32 = 0;
             while (sched.tick(&sink) != .idle) {
@@ -324,6 +302,7 @@ pub const PrefixManager = struct {
                 }
             }
 
+            // Close the session and report the warmed tokens.
             const o = sink.opened orelse {
                 log.warn("preload refused: {s}", .{sink.err_detail[0..sink.err_len]});
                 continue;

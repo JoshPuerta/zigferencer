@@ -1,24 +1,25 @@
-//! The transport-agnostic serve engine: one engine thread around the scheduler,
-//! a bounded request queue in, a bounded out-queue per connection, and the
-//! connection-slot lifecycle. It owns all serve-layer state and never speaks a
-//! wire format. A comptime `Adapter` supplies the per-connection task model.
-//! The model sets how many tasks a connection runs, and how they map wire bytes
-//! to/from the engine's `Request` / `OutEvent` values. `serve/server.zig` is the
-//! binary adapter, and `serve/openai/http_server.zig` is the HTTP one. Both are
-//! thin maps onto this engine.
+//! The transport-agnostic serve engine: one engine thread around the scheduler, a bounded request
+//! queue in, a bounded out-queue per connection, and the connection-slot lifecycle. It owns all
+//! serve-layer state and knows no wire format. A comptime `Adapter` supplies the per-connection
+//! task model: how many tasks a connection runs, and how they map wire bytes to and from the
+//! `Request` and `OutEvent` values. `serve/server.zig` is the binary adapter, and
+//! `serve/openai/http_server.zig` is the HTTP one. Both are thin maps onto this engine.
 //!
 //!     acceptor --accept--> Adapter.onAccept(conn) --decode--> request_queue
 //!                                                                  |
 //!     conn[i] task(s) <--encode-- out_queue[i] <--emit-- ENGINE LOOP (run)
 //!
-//! Bounds: `Config.max_connections` live connections (at most
-//! `limits.max_connections`), one `request_queue_capacity` request queue, one
-//! `out_queue_capacity` event queue per connection. The engine never blocks on
-//! a client. Emission is non-blocking, and a full output queue parks the event
-//! in the session's cell (scheduler-side) while the draining task signals a
-//! `wakeup`.
+//! Bounds. `Config.max_connections` live connections (at most `limits.max_connections`), one
+//! `request_queue_capacity` request queue, and one `out_queue_capacity` event queue per
+//! connection. The engine never blocks on a client. Emission is non-blocking, and a full output
+//! queue parks the event in the cell of the session while the draining task signals a `wakeup`.
 //!
-//! The `Adapter` surface (all methods duck-typed over the engine + a `*Conn`):
+//! Socket close. Exactly one actor closes the socket of a connection. The first to claim it owns
+//! the close. The claim is `live -> task` when the last task exits, or `live -> teardown` when
+//! teardown must shut the fd down to wake a blocked task. The other actor must not touch the fd,
+//! because a `shutdown` or `close` after the other `close` is an EBADF.
+//!
+//! Adapter surface. All methods are duck-typed over the engine and a `*Conn`:
 //!   - `pub const ConnExt`            per-connection state the adapter owns
 //!   - `onAccept(engine, conn) bool`  set `conn.tasks_live`, spawn the task(s)
 //!                                    into `conn.ext`. False (with the stream
@@ -55,11 +56,7 @@ const conn_free: u8 = 0;
 const conn_live: u8 = 1;
 const conn_reclaimable: u8 = 2;
 
-// Which actor finalizes (closes, exactly once) a connection's socket. The first
-// to claim it owns the close. The claim is `live -> task` when the last task
-// exits, or `live -> teardown` when teardown needs to shut the fd down to wake a
-// blocked task. The other actor must not touch the fd. A `shutdown` or `close`
-// after the other actor's `close` is the EBADF that crashed loopback shutdown.
+// The actor that closes the socket of a connection. See "Socket close" in the header.
 const fin_live: u8 = 0;
 const fin_task: u8 = 1;
 const fin_teardown: u8 = 2;
@@ -82,16 +79,14 @@ pub const AcceptAction = enum {
     back_off,
 };
 
-/// `Engine` and `CodecT` are the scheduler's boundaries (see scheduler.zig).
-/// `Adapter` is the transport. A value must not be moved once `run` has started
-/// (tasks hold `*Self`).
+/// `Engine` and `CodecT` are the scheduler boundaries (see scheduler.zig). `Adapter` is the
+/// transport. A value must not move once `run` has started, because tasks hold `*Self`.
 pub fn ServeEngine(comptime Engine: type, comptime CodecT: type, comptime Adapter: type) type {
     return struct {
         const Self = @This();
         const SchedulerT = scheduler_mod.Scheduler(Engine, CodecT);
 
-        /// A connection slot: the generic fields the engine and sink touch, plus
-        /// the adapter's per-connection state (`ext`).
+        /// A connection slot: the fields the engine and sink touch, plus the adapter state (`ext`).
         pub const Conn = struct {
             state: std.atomic.Value(u8) = .init(conn_free),
             id: u32 = 0,
@@ -109,9 +104,8 @@ pub fn ServeEngine(comptime Engine: type, comptime CodecT: type, comptime Adapte
         gpa: Allocator,
         io: Io,
         sched: SchedulerT,
-        /// The codec, also held here so a connection task can read model
-        /// metadata (an adapter that renders/parses needs it, e.g. the OpenAI
-        /// one). The scheduler owns the same pointer for tokenization.
+        /// The codec, also held here so a connection task can read model metadata.
+        /// The scheduler holds the same pointer for tokenization.
         codec: *const CodecT,
         listener: net.Server,
         conns: []Conn,
@@ -119,8 +113,8 @@ pub fn ServeEngine(comptime Engine: type, comptime CodecT: type, comptime Adapte
         next_conn_id: u32 = 1, // acceptor-owned, and ids are never reused
         acceptor_future: ?Io.Future(void) = null,
 
-        /// Binds the endpoint (so `boundAddress` is valid before `run`) and wires
-        /// the scheduler. The returned value can be moved until `run` is called.
+        /// Binds the endpoint, so `boundAddress` is valid before `run`, and wires the scheduler.
+        /// The returned value can move until `run` is called.
         pub fn init(
             arena: Allocator,
             gpa: Allocator,
@@ -164,15 +158,14 @@ pub fn ServeEngine(comptime Engine: type, comptime CodecT: type, comptime Adapte
                 .conns = conns,
                 .request_q = .init(request_buf),
             };
-            // Cache warming runs here, single-threaded, before any connection
-            // can exist. The scheduler holds no interior pointers, so the
-            // returned value still moves freely.
+            // Warm the caches here, single-threaded, before any connection exists.
+            // The scheduler holds no interior pointers, so the value still moves.
             self.sched.preloadPrefixes();
             return self;
         }
 
-        /// The bound address, with the kernel-resolved port after a `port = 0`
-        /// TCP bind. The READY line prints this.
+        /// The bound address, with the kernel-resolved port after a `port = 0` TCP bind.
+        /// The READY line prints it.
         pub fn boundAddress(self: *const Self) net.IpAddress {
             return self.listener.socket.address;
         }
@@ -213,9 +206,8 @@ pub fn ServeEngine(comptime Engine: type, comptime CodecT: type, comptime Adapte
         }
 
         fn dispatch(self: *Self, req: Request, sink: *Sink) scheduler_mod.HandleResult {
-            // A dropped connection's task(s) must exit too. Closing its output
-            // queue is the engine-side half of conn_closed. The scheduler's half
-            // sweeps the sessions.
+            // A dropped connection must end its tasks. Closing the out-queue is the engine half of
+            // conn_closed, and the scheduler half sweeps the sessions.
             if (req.body == .conn_closed) {
                 if (self.findConn(req.conn)) |conn| {
                     self.closeOutput(conn);
@@ -226,33 +218,28 @@ pub fn ServeEngine(comptime Engine: type, comptime CodecT: type, comptime Adapte
         }
 
         fn teardown(self: *Self) void {
+            // Stop the acceptor. Closing the listening fd does not unblock accept(2), so cancel it.
             log.debug("shutdown: tearing down engine", .{});
             self.request_q.close(self.io);
-            // Closing the listening fd does NOT unblock a thread inside accept(2).
-            // The cancellation that std.Io delivers is the documented unblock.
             if (self.acceptor_future) |*f| {
                 f.cancel(self.io);
             }
 
+            // Unblock the tasks. A reclaimable connection already closed its stream.
             self.listener.deinit(self.io);
-            // Only LIVE connections have running tasks to unblock. A reclaimable
-            // one already exited and closed its own stream, so a second shutdown
-            // hits a dead fd.
             for (self.conns) |*conn| {
                 if (conn.state.load(.acquire) == conn_live) {
                     Adapter.beginClose(self, conn);
                 }
             }
 
+            // Await the tasks, and close the sockets that teardown claimed.
             for (self.conns) |*conn| {
                 if (conn.state.load(.acquire) == conn_free) continue;
 
                 Adapter.awaitConn(self, conn);
-                // Exactly one actor has finalized every connection whose tasks
-                // ran: the exited task, or teardown's claim below.
                 std.debug.assert(conn.fin.load(.acquire) != fin_live);
-                // Teardown owns the close only when it claimed the fd (to shut it
-                // down and wake a blocked task). A task-claimed fd is already closed.
+                // A task-claimed fd is already closed.
                 if (conn.fin.load(.acquire) == fin_teardown) {
                     conn.stream.close(self.io);
                 }
@@ -260,7 +247,7 @@ pub fn ServeEngine(comptime Engine: type, comptime CodecT: type, comptime Adapte
                 conn.state.store(conn_free, .release);
             }
 
-            // Requests that never reached the scheduler still own their text.
+            // Free the text of the requests that never reached the scheduler.
             var drain: [16]Request = undefined;
             while (true) {
                 const n = self.request_q.get(self.io, &drain, 0) catch break;
@@ -278,9 +265,8 @@ pub fn ServeEngine(comptime Engine: type, comptime CodecT: type, comptime Adapte
         const Sink = struct {
             engine: *Self,
 
-            /// This never blocks. A missing or closed connection swallows the
-            /// event. A full queue reports false so the scheduler parks, and
-            /// flags the draining task to send a wakeup once it has drained.
+            /// This never blocks. A missing or closed connection swallows the event. A full queue
+            /// reports false so the scheduler parks, and flags the draining task to send a wakeup.
             pub fn emit(s: *Sink, conn_id: u32, ev: OutEvent) bool {
                 const conn = s.engine.findConn(conn_id) orelse return true;
                 const n = conn.out_q.put(s.engine.io, &.{ev}, 0) catch return true;
@@ -304,18 +290,15 @@ pub fn ServeEngine(comptime Engine: type, comptime CodecT: type, comptime Adapte
             return null;
         }
 
-        /// Idempotent: exactly one close reaches the queue. The draining task then
-        /// drains what is buffered, flushes, shuts the socket down, and exits.
+        /// Idempotent: exactly one close reaches the queue. The draining task then drains what is
+        /// buffered, flushes, shuts the socket down, and exits.
         pub fn closeOutput(self: *Self, conn: *Conn) void {
             if (conn.out_closed.swap(true, .acq_rel)) return;
             conn.out_q.close(self.io);
         }
 
-        /// Teardown claims a connection's socket so it can shut it down to wake a
-        /// blocked task. Returns true only if the connection's last task has not
-        /// already claimed it. If that task claimed it, the task closes the fd
-        /// itself, and teardown must not touch it (a shutdown after its close is
-        /// EBADF).
+        /// Teardown claims the socket of a connection so it can shut it down to wake a blocked
+        /// task. Returns true only if the last task has not claimed it. See "Socket close".
         pub fn claimStreamForTeardown(self: *Self, conn: *Conn) bool {
             _ = self;
             return conn.fin.cmpxchgStrong(fin_live, fin_teardown, .acq_rel, .acquire) == null;
@@ -327,9 +310,8 @@ pub fn ServeEngine(comptime Engine: type, comptime CodecT: type, comptime Adapte
             try self.request_q.putOne(self.io, req);
         }
 
-        /// Wake an idle engine so its next tick retries a parked event. A full
-        /// request queue drops the wake, because a busy engine retries parks
-        /// anyway.
+        /// Wake an idle engine so its next tick retries a parked event. A full request queue
+        /// drops the wake, because a busy engine retries parks anyway.
         pub fn wake(self: *Self, conn_id: u32) void {
             log.debug("wake: conn {d}", .{conn_id});
             _ = self.request_q.put(self.io, &.{.{
@@ -340,16 +322,13 @@ pub fn ServeEngine(comptime Engine: type, comptime CodecT: type, comptime Adapte
             }}, 0) catch {};
         }
 
-        /// The last task out of a connection closes the socket and marks the slot
-        /// reclaimable. The acceptor (or teardown) awaits the futures.
+        /// The last task out of a connection closes the socket and marks the slot reclaimable.
+        /// The acceptor or teardown awaits the futures.
         pub fn taskExit(self: *Self, conn: *Conn) void {
             const prev = conn.tasks_live.fetchSub(1, .acq_rel);
             std.debug.assert(prev >= 1); // never exit more tasks than were spawned
             if (prev == 1) {
-                // Last task out. Close the socket unless teardown already claimed
-                // it. If teardown claimed it, teardown shut the fd down to wake
-                // this task, and closes it after the await. The claim makes the
-                // close happen exactly once.
+                // Close the socket unless teardown claimed it. Teardown closes it after the await.
                 if (conn.fin.cmpxchgStrong(fin_live, fin_task, .acq_rel, .acquire) == null) {
                     conn.stream.close(self.io);
                 }

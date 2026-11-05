@@ -1,14 +1,34 @@
-//! Byte-level BPE encode and decode over a `Vocab`. It is a pure datapath: no
-//! Vocab mutation, no I/O, and a `gpa` taken only for the output slice.
-//! `Vocab` (vocab.zig) holds the state. The split keeps encode and decode small
-//! and testable on their own.
+//! Byte-level BPE encode and decode over a `Vocab`. It is a pure datapath: no Vocab mutation, no
+//! I/O, and a `gpa` taken only for the output slice. `Vocab` (vocab.zig) holds the state. The split
+//! keeps encode and decode small and testable on their own.
 //!
-//! Encode: greedy-match the longest special token at the cursor. On a match,
-//! flush the pending segment through BPE merge and emit the special id.
-//! Otherwise consume one byte into `pending` through `vocab.byte_to_id[b]`.
-//! Flush at the end. The flush repeatedly merges the lowest-rank adjacent pair
-//! until none remain. Decode concatenates each token's bytes, walking codepoint
-//! by codepoint to undo the GPT-2 byte-level mapping.
+//! Encode. It greedy-matches the longest special token at the cursor. On a match, it flushes the
+//! pending segment through BPE merge and emits the special id. Otherwise it consumes one byte into
+//! `pending` through `vocab.byte_to_id[b]`. The flush at the end repeatedly merges the lowest-rank
+//! adjacent pair until none remain.
+//!
+//! Decode. It concatenates the bytes of each token, walking codepoint by codepoint to undo the
+//! GPT-2 byte-level mapping.
+//!
+//! Pre-split path. A non-default tokenizer (llama3, qwen, smollm) splits the text on a GPT-2-family
+//! regex before BPE, as llama.cpp does, so merges never cross a pre-token boundary. For example,
+//! llama3 splits "2147" into "214" and "7" (digit runs of 1-3). The default path BPE-merges the
+//! whole inter-special span, and it stays byte-identical because `encodeAlloc` branches first.
+//! `preTokenLen` dispatches the per-family regex: `preSplitLlama` for llama3 and qwen,
+//! `preSplitGpt2` for smollm. `ignore_merges` (llama3 only) emits a whole pre-token directly when
+//! it is a vocab token. A special token is extracted before the regex runs, and `capAtSpecial`
+//! keeps a pre-token from swallowing the start of a special.
+//!
+//! Classification scope. It is ASCII-exact for \p{L}, \p{N}, and \s. Non-ASCII codepoints count as
+//! letters, which covers Latin and CJK words and the `\p{M}` marks of qwen. Non-ASCII digits and
+//! punctuation are a documented gap, because the full Unicode tables are absent.
+//!
+//! Smollm regex. The llama.cpp `smollm` regex is `{ "\p{N}", "'s|'t|'re|'ve|'m|'ll|'d| ?\p{L}+|
+//!  ?\p{N}+| ?[^\s\p{L}\p{N}]+|\s+(?!\S)" }`. The leading `\p{N}` pass isolates every digit, so
+//! digits are single pre-tokens and a digit also bounds the trailing-whitespace lookahead. It
+//! differs from llama3 and qwen in three ways: lowercase contractions, an optional leading char
+//! that is a literal space only, and no `[\r\n]*` after symbols. It has no `\s*[\r\n]+` and no
+//! final `\s+`, so an unmatched char falls back to one codepoint.
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
@@ -28,11 +48,9 @@ const Cp = struct { cp: u21, len: usize };
 
 // -- api --------------------------------------------------------------------
 
-/// Encode `text` to token ids (specials matched greedily, the rest through BPE
-/// merges). BOS is prepended when the model's tokenizer metadata says so
-/// (`vocab.add_bos`) AND `sequence_start` is true, so callers pass text and
-/// never prepend it themselves. Text appended mid-conversation (a follow-up
-/// turn) passes false, so BOS appears only at position 0.
+/// Encode `text` to token ids: specials greedily, the rest through BPE merges. BOS is prepended
+/// when `vocab.add_bos` and `sequence_start` hold. A follow-up turn passes false, so BOS appears
+/// only at position 0.
 pub fn encodeAlloc(
     vocab: *const Vocab,
     gpa: Allocator,
@@ -43,9 +61,7 @@ pub fn encodeAlloc(
     defer sp.end();
 
     std.debug.assert(vocab.tokens.len > 0);
-    // Non-default tokenizers (llama3 / qwen / smollm) split the text on a
-    // GPT-2-style regex before BPE. The default path BPE-merges the whole
-    // inter-special span. Branch first so the default path stays byte-identical.
+    // Take the pre-split path for a non-default tokenizer. See "Pre-split path" in the header.
     if (vocab.pre != .default) {
         const pre_ids = try encodePreSplit(vocab, gpa, text, sequence_start);
         if (std.debug.runtime_safety) {
@@ -57,6 +73,7 @@ pub fn encodeAlloc(
         return pre_ids;
     }
 
+    // Scan the text: specials emit their id, other bytes join the pending segment.
     var ids: std.ArrayList(u32) = .empty;
     errdefer ids.deinit(gpa);
 
@@ -178,9 +195,8 @@ fn flushSegment(
             v.pairKey(pending.items[idx], pending.items[idx + 1]),
         ).?;
         pending.items[idx] = merged;
-        // Shift left to drop the consumed right-hand element.
-        std.mem.copyForwards(
-            u32,
+        // Drop the consumed right-hand element.
+        @memmove(
             pending.items[idx + 1 .. pending.items.len - 1],
             pending.items[idx + 2 ..],
         );
@@ -192,19 +208,6 @@ fn flushSegment(
 }
 
 // -- pre-split path: regex pre-tokenize, then BPE per pre-token -------------
-//
-// llama.cpp pre-tokenizes on a GPT-2-family regex before BPE. Merges therefore
-// never cross a pre-token boundary. For example, llama3 splits "2147" to
-// ["214","7"] (digit runs of 1-3) instead of merging across. `preTokenLen`
-// dispatches the per-family regex (`preSplitLlama` for llama3/qwen,
-// `preSplitGpt2` for smollm).
-// `ignore_merges` (llama3 only) emits a whole pre-token directly when it is a
-// vocab token.
-//
-// Scope: ASCII-exact classification of \p{L}/\p{N}/\s. Non-ASCII codepoints are
-// treated as letters. That covers Latin/CJK words and qwen's `\p{M}` marks.
-// Non-ASCII digits and punctuation are a documented gap, because full Unicode
-// tables are absent.
 
 fn encodePreSplit(
     vocab: *const Vocab,
@@ -227,8 +230,6 @@ fn encodePreSplit(
 
     var pos: usize = 0;
     while (pos < text.len) {
-        // Special tokens are extracted before the regex (llama.cpp does the same).
-        // `capAtSpecial` keeps a pre-token from swallowing a special's start.
         if (matchSpecial(vocab, text, pos)) |m| {
             try ids.append(gpa, m.id);
             pos += m.len;
@@ -264,9 +265,7 @@ fn encodePreSplit(
     return ids.toOwnedSlice(gpa);
 }
 
-/// First special token starting strictly inside `(from, from+seg)` caps the
-/// pre-token there, so the next loop turn matches it at its start. Returns the
-/// (possibly shortened) length.
+/// The pre-token length `seg`, cut at the first special that starts strictly inside it.
 fn capAtSpecial(vocab: *const Vocab, text: []const u8, from: usize, seg: usize) usize {
     var q = from + 1;
     const end = from + seg;
@@ -277,8 +276,7 @@ fn capAtSpecial(vocab: *const Vocab, text: []const u8, from: usize, seg: usize) 
     return seg;
 }
 
-/// ASCII-exact. Any non-ASCII codepoint counts as a letter (see the scope
-/// note above).
+/// ASCII-exact. Any non-ASCII codepoint counts as a letter.
 fn classify(cp: u21) CpClass {
     if (cp < 128) {
         const c: u8 = @intCast(cp);
@@ -305,8 +303,7 @@ fn lowerAscii(c: u8) u8 {
     return if (c >= 'A' and c <= 'Z') c + 32 else c;
 }
 
-/// Byte length of the next pre-token for `vocab.pre` at `from`. Dispatches the
-/// per-family regex. `.default` never reaches here (gated in `encodeAlloc`).
+/// Byte length of the next pre-token for `vocab.pre` at `from`. `.default` never reaches here.
 fn preTokenLen(vocab: *const Vocab, text: []const u8, from: usize) usize {
     return switch (vocab.pre) {
         .llama3 => preSplitLlama(text, from, 3),
@@ -316,10 +313,9 @@ fn preTokenLen(vocab: *const Vocab, text: []const u8, from: usize) usize {
     };
 }
 
-/// Byte length of the next llama3/qwen pre-token at `from` (`from < text.len`).
-/// Always >= 1. The regex alternatives are tried in order, and the first that
-/// matches wins. `digit_max` is the `\p{N}{1,N}` run cap (3 for llama3, 1 for
-/// qwen).
+/// Byte length of the next llama3 or qwen pre-token at `from`, always at least 1. The first regex
+/// alternative that matches wins. `digit_max` is the `\p{N}{1,N}` run cap, 3 for llama3, 1 for
+/// qwen.
 fn preSplitLlama(text: []const u8, from: usize, digit_max: usize) usize {
     const len = text.len;
     const first = nextCp(text, from);
@@ -387,7 +383,7 @@ fn preSplitLlama(text: []const u8, from: usize, digit_max: usize) usize {
         }
     }
 
-    // 5/6/7. whitespace tail (reached only when `first` is whitespace).
+    // 5/6/7. Whitespace tail. Only a whitespace `first` reaches it.
     var j = from;
     var last_nl_end: usize = 0; // byte after the last CR/LF in the run (0 = none)
     var last_ws_start: usize = from;
@@ -410,14 +406,8 @@ fn preSplitLlama(text: []const u8, from: usize, digit_max: usize) usize {
     return j - from; // 7. \s+
 }
 
-/// Byte length of the next smollm (GPT-2) pre-token at `from`. Always >= 1. The
-/// llama.cpp `smollm` regex is `{ "\p{N}", "'s|'t|'re|'ve|'m|'ll|'d| ?\p{L}+|
-///  ?\p{N}+| ?[^\s\p{L}\p{N}]+|\s+(?!\S)" }`. The leading `\p{N}` pass isolates
-/// every digit, so digits are single pre-tokens and a digit also acts as a
-/// boundary for the trailing-whitespace lookahead. It differs from llama3/qwen:
-/// lowercase contractions, and the optional leading char is a literal space
-/// only (not any non-L/N). Symbols carry no trailing `[\r\n]*`, and there is no
-/// `\s*[\r\n]+` or final `\s+` (an unmatched char falls back to one codepoint).
+/// Byte length of the next smollm (GPT-2) pre-token at `from`, always at least 1. See "Smollm
+/// regex" in the header.
 fn preSplitGpt2(text: []const u8, from: usize) usize {
     const len = text.len;
     const first = nextCp(text, from);
@@ -461,9 +451,8 @@ fn preSplitGpt2(text: []const u8, from: usize) usize {
         }
     }
 
-    // 5. \s+(?!\S): the lookahead also holds before a digit (the \p{N} pass
-    //    splits there) and at EOF. A lone non-space whitespace before \S that
-    //    nothing else matched falls back to one codepoint.
+    // 5. \s+(?!\S). The lookahead also holds before a digit and at EOF. A lone whitespace
+    //    before \S that nothing else matched falls back to one codepoint.
     var j = from;
     var last_ws_start: usize = from;
     while (j < len) {
@@ -506,9 +495,8 @@ fn isSymbol(cp: u21) bool {
 const parser = @import("../../io/gguf/parser.zig");
 const prop = @import("../prop.zig");
 
-/// The merges of the synthetic vocab, in rank order, as byte-level strings.
-/// They cover letters, a leading space (U+0120), digits, the two bytes of
-/// U+00E9, and a newline pair (U+010A).
+/// The merges of the synthetic vocab, in rank order, as byte-level strings. They cover letters, a
+/// leading space (U+0120), digits, the two bytes of U+00E9, and a newline pair (U+010A).
 const test_merges = [_][]const u8{
     "a b",
     "ab ab",
@@ -542,7 +530,7 @@ fn testVocab(arena: Allocator, pre: []const u8) !Vocab {
     }
 
     for (test_merges) |m| {
-        const space = std.mem.indexOfScalar(u8, m, ' ').?;
+        const space = std.mem.findScalar(u8, m, ' ').?;
         try tokens.append(arena, try std.mem.concat(arena, u8, &.{ m[0..space], m[space + 1 ..] }));
         try types.append(arena, 1);
     }
@@ -683,7 +671,7 @@ fn byteLevelTable() [256]ByteLevel {
 /// spelling holds no ASCII space, so the line splits at its only space.
 fn naiveRank(left: []const u8, right: []const u8) ?usize {
     for (test_merges, 0..) |line, rank| {
-        const space = std.mem.indexOfScalar(u8, line, ' ').?;
+        const space = std.mem.findScalar(u8, line, ' ').?;
         if (std.mem.eql(u8, line[0..space], left) and std.mem.eql(u8, line[space + 1 ..], right)) {
             return rank;
         }
@@ -696,7 +684,7 @@ fn naiveRank(left: []const u8, right: []const u8) ?usize {
 /// merge line in order.
 fn naiveId(table: *const [256]ByteLevel, symbol: []const u8) u32 {
     for (test_merges, 0..) |line, rank| {
-        const space = std.mem.indexOfScalar(u8, line, ' ').?;
+        const space = std.mem.findScalar(u8, line, ' ').?;
         const left = line[0..space];
         const right = line[space + 1 ..];
         if (symbol.len == left.len + right.len and

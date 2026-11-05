@@ -1,24 +1,21 @@
-//! The attention recorder: the one control unit that turns an
-//! `attn_split.AttnPlan` into dispatches. The fused and hybrid runners call it
-//! for every full-attention layer of a step and of a prefill chunk, so the
-//! record order of the resident rows, the split passes, and the merges has one
-//! home.
+//! The attention recorder: the one control unit that turns an `attn_split.AttnPlan` into
+//! dispatches. The fused and hybrid runners call it for every full-attention layer of a step and
+//! of a prefill chunk, so the record order of the resident rows, the split passes, and the merges
+//! has one home.
 //!
-//! The recorder knows no backend. It records through an attention kit, a type
-//! with a fixed method set: `recordResident`, `recordResidentRun`,
-//! `recordSplit`, `recordMerge`, and `recordBarrier`. A kit also declares two
-//! facts: `order`, the class of its summation order, and `tolerance`, its
-//! declared error against the CPU reference. A kit names its command handle `Cmd`
-//! and its per-layer bindings `Binding`. The build selects the Vulkan kit with
-//! `-Dattn-kernel`.
+//! Kit. The recorder knows no backend. It records through an attention kit, a type with a fixed
+//! method set: `recordResident`, `recordResidentRun`, `recordSplit`, `recordMerge`, and
+//! `recordBarrier`. A kit also declares two facts: `order`, the class of its summation order, and
+//! `tolerance`, its declared error against the CPU reference. A kit names its command handle `Cmd`
+//! and its per-layer bindings `Binding`. The build selects the Vulkan kit with `-Dattn-kernel`.
 //!
-//! The record order of a plan:
-//!   1. The resident rows: one dispatch per row for a step, or one run of the
-//!      resident prefix for a prefill chunk.
-//!   2. Per record group: the split passes, a barrier, then the merges. Entry
-//!      `k` of a group writes scratch row `k` at the stride of the group.
-//!   3. A barrier before each group after the first, because its split passes
-//!      write the scratch rows that the merges before it read.
+//! Record order. A plan records in this order:
+//!   1. The resident rows: one dispatch per row for a step, or one run of the resident prefix for
+//!      a prefill chunk.
+//!   2. Per record group: the split passes, a barrier, then the merges. Entry `k` of a group
+//!      writes scratch row `k` at the stride of the group.
+//!   3. A barrier before each group after the first, because its split passes write the scratch
+//!      rows that the merges before it read.
 //! The caller records the barrier after the last merge.
 
 const std = @import("std");
@@ -31,9 +28,8 @@ const assert = std.debug.assert;
 
 // -- api --------------------------------------------------------------------
 
-/// The plan of the batched rows of one step against a scratch of
-/// `max_splits` splits. Row `i` of `rows` reads its own slot over `pos + 1`
-/// positions.
+/// The plan of the batched rows of one step against a scratch of `max_splits` splits.
+/// Row `i` reads its own slot over `pos + 1` positions.
 pub fn planStep(rows: []const step_row.StepRow, max_splits: u32) attn_split.AttnPlan {
     assert(rows.len >= 1);
     assert(rows.len <= attn_split.max_plan_rows);
@@ -48,8 +44,7 @@ pub fn planStep(rows: []const step_row.StepRow, max_splits: u32) attn_split.Attn
     return plan;
 }
 
-/// Record the attention of one layer of a step: every dispatch of `plan`
-/// through `kit` into `cmd`, with the sets and the shape of `binding`.
+/// Record the attention of one layer of a step: every dispatch of `plan` through `kit` into `cmd`.
 pub fn record(
     comptime Kit: type,
     kit: Kit,
@@ -66,9 +61,8 @@ pub fn record(
     recordGroups(Kit, kit, cmd, plan, binding);
 }
 
-/// Record the attention of one layer of a prefill chunk from `start_pos`.
-/// The resident rows of the chunk are a prefix, so one run of the resident
-/// kernel records them. The split rows take the record groups of `plan`.
+/// Record the attention of one layer of a prefill chunk from `start_pos`. The resident rows are
+/// a prefix, so one run of the resident kernel records them.
 pub fn recordPrefill(
     comptime Kit: type,
     kit: Kit,
@@ -79,6 +73,8 @@ pub fn recordPrefill(
 ) void {
     comptime assertKit(Kit);
     plan.assertValid();
+
+    // Check that the plan matches the chunk: resident rows first, positions ascending.
     const resident = plan.residentRows();
     for (resident, 0..) |r, i| {
         assert(r.row == i);
@@ -90,6 +86,7 @@ pub fn recordPrefill(
         assert(r.t_len == start_pos + r.row + 1);
     }
 
+    // Record the resident prefix as one run.
     if (resident.len > 0) {
         const count: u32 = @intCast(resident.len);
         // The run ends at or before S, the bound of the resident kernel.
@@ -126,8 +123,7 @@ fn recordGroups(
     }
 }
 
-/// A kit must declare the method set and both facts, so a new kit that lacks
-/// one fails the build at the recorder.
+/// A kit must declare the method set and both facts. A kit that lacks one fails the build.
 fn assertKit(comptime Kit: type) void {
     for ([_][]const u8{
         "recordResident",
@@ -225,10 +221,8 @@ const LogKit = struct {
     }
 };
 
-/// The model of the scratch for a replayed log: the row each scratch row
-/// holds, whether a barrier made it visible, and whether its merge read it.
-/// Each split must hold the records of its row inside the budget, read by
-/// its merge at the same stride.
+/// Replay a log against a model of the scratch: the row each scratch row holds, whether a barrier
+/// made it visible, and whether its merge read it. Each merge reads at the stride of its split.
 fn checkLog(
     log: *const LogKit.Log,
     t_lens: []const u32,
@@ -243,8 +237,7 @@ fn checkLog(
         merged: bool = true,
     };
     var cells = [_]Cell{.{}} ** attn_split.max_plan_rows;
-    // A merge since the last barrier marks a read that a later split must
-    // wait for.
+    // A merge since the last barrier marks a read that a later split must wait for.
     var read_since_barrier = false;
     for (log.events[0..log.len]) |e| {
         switch (e) {
@@ -332,7 +325,7 @@ fn checkRecordMerge(_: void, c: prop.Trial) anyerror!void {
     }
 }
 
-test "record: each merge reads the scratch row its split wrote, behind a barrier, and no split overwrites an unread row" {
+test "record: each merge reads its split row behind a barrier, no split clobbers an unread row" {
     try prop.forAll(
         .{ .site = 0x0031_7ec0, .cases = 300, .max_size = 299 },
         {},
@@ -348,8 +341,7 @@ fn checkRecordPrefill(_: void, c: prop.Trial) anyerror!void {
     var t_lens: [attn_split.max_plan_rows]u32 = undefined;
     const trial = c.index;
     const b = random.intRangeAtMost(u32, 1, attn_split.max_plan_rows);
-    // Half the chunks start inside the first split, so the chunk can
-    // straddle S.
+    // Half the chunks start inside the first split, so the chunk can straddle S.
     const start_pos = if (trial % 2 == 0) random.intRangeLessThan(
         u32,
         0,

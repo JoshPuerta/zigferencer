@@ -1,26 +1,26 @@
-//! Equivalence gate for the llama prefix boundary. A runner that `initPrefix` builds at
-//! the layer count of the model runs the same layers as the runner that `init`
-//! builds. Both runners use the same weights and the same KV.
+//! Equivalence gate for the llama prefix boundary. A runner that `initPrefix` builds at the layer
+//! count of the model runs the same layers as the runner that `init` builds. Both runners use the
+//! same weights and the same KV.
 //!
-//! Two runners share one loaded model. The whole-model runner steps through
-//! `stepBatch`. A composing runner drives the prefix runner in two calls, which
-//! embed into `x` and then call `layerForward` per layer. The residual streams
-//! must match byte for byte. The final norm and the lm_head write `x_norm`, so
-//! `x` still holds the output of the layer loop when `stepBatch` returns.
+//! Method. Two runners share one loaded model. The whole-model runner steps through `stepBatch`. A
+//! composing runner drives the prefix runner in two calls, which embed into `x` and then call
+//! `layerForward` per layer. The residual streams must match byte for byte. The final norm and the
+//! lm_head write `x_norm`, so `x` still holds the output of the layer loop when `stepBatch`
+//! returns.
 //!
-//! Nothing here has a tolerance. Both runners call the same kernels in the same
-//! order over the same bytes. A difference means the layer-count parameter
-//! moved something it must not move.
+//! Exactness. Nothing here has a tolerance. Both runners call the same kernels in the same order
+//! over the same bytes. A difference means the layer-count parameter moved something it must not
+//! move.
 //!
-//! The test needs a real GGUF, so it reads the canonical
-//! SmolLM2-135M-Instruct-Q8_0 from `test_fixtures.path`.
+//! Fixture. The test needs a real GGUF, so it reads the canonical SmolLM2-135M-Instruct-Q8_0 from
+//! `test_fixtures.path`.
 
 const std = @import("std");
-const z = @import("zigferencer");
-const tp = @import("test_policy.zig");
-const loader = z.loader;
-const LlamaRunner = z.llama_runner.LlamaRunner;
-const StepRow = z.step_row.StepRow;
+const zigferencer = @import("zigferencer");
+const test_policy = @import("test_policy.zig");
+const loader = zigferencer.loader;
+const LlamaRunner = zigferencer.llama_runner.LlamaRunner;
+const StepRow = zigferencer.step_row.StepRow;
 
 // -- fixtures ---------------------------------------------------------------
 
@@ -33,7 +33,7 @@ const window: u32 = 16;
 /// function on every op backend, so this is the exact call `stepBatch` makes.
 fn driveRow(runner: *LlamaRunner, row: StepRow) !void {
     const d = runner.card.embedding_length;
-    z.ops.embedLookup(runner.embed.*, row.token, d, runner.x[0..d]);
+    zigferencer.ops.embedLookup(runner.embed.*, row.token, d, runner.x[0..d]);
     var layer: u32 = 0;
     while (layer < runner.n_layers) : (layer += 1) {
         runner.layerForward(layer, &.{row});
@@ -54,17 +54,17 @@ test "llama initPrefix at the full layer count reproduces the whole-model residu
     defer arena_state.deinit();
 
     const arena = arena_state.allocator();
-    const fixture = try z.test_fixtures.path(arena, "SmolLM2-135M-Instruct-Q8_0");
+    const fixture = try zigferencer.test_fixtures.path(arena, "SmolLM2-135M-Instruct-Q8_0");
 
     var loaded = try loader.load(io, arena, fixture);
     defer loaded.close();
 
-    const policy: tp.Policy = .{ .n_threads = 1 };
-    var cpu_pool: tp.Pool = undefined;
-    try tp.startPool(&cpu_pool, io, policy);
+    const policy: test_policy.Policy = .{ .n_threads = 1 };
+    var cpu_pool: test_policy.Pool = undefined;
+    try test_policy.startPool(&cpu_pool, io, policy);
     defer cpu_pool.deinit();
 
-    const plan = z.kv_budget.pinned(1, window);
+    const plan = zigferencer.kv_budget.pinned(1, window);
 
     var full = try LlamaRunner.init(arena, &loaded, plan, 0, io, &cpu_pool, policy, .f32);
     var prefix = try LlamaRunner.initPrefix(
@@ -99,17 +99,17 @@ test "llama initPrefix sizes the weight slices and the KV to its own layer count
     defer arena_state.deinit();
 
     const arena = arena_state.allocator();
-    const fixture = try z.test_fixtures.path(arena, "SmolLM2-135M-Instruct-Q8_0");
+    const fixture = try zigferencer.test_fixtures.path(arena, "SmolLM2-135M-Instruct-Q8_0");
 
     var loaded = try loader.load(io, arena, fixture);
     defer loaded.close();
 
-    const policy: tp.Policy = .{ .n_threads = 1 };
-    var cpu_pool: tp.Pool = undefined;
-    try tp.startPool(&cpu_pool, io, policy);
+    const policy: test_policy.Policy = .{ .n_threads = 1 };
+    var cpu_pool: test_policy.Pool = undefined;
+    try test_policy.startPool(&cpu_pool, io, policy);
     defer cpu_pool.deinit();
 
-    const plan = z.kv_budget.pinned(1, window);
+    const plan = zigferencer.kv_budget.pinned(1, window);
     const n_layers = loaded.card.n_layers;
     std.debug.assert(n_layers >= 2); // the split needs a layer on each side
 

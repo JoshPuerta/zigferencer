@@ -1,25 +1,31 @@
-//! The client compaction over a real model and a real socket. A conversation
-//! outgrows a window of 64 positions on SmolLM2. The test drives it with the
-//! rules of the client: it records each turn, and it compacts at once after a
-//! turn that ends `context_full`. The reserve of each compaction follows the
-//! longest turn so far, as in the client. It answers a refused turn with
-//! `retryPlan`, a compaction, and one resend.
+//! The client compaction over a real model and a real socket. A conversation outgrows a window of
+//! 64 positions on SmolLM2. The test drives it with the rules of the client: it records each turn,
+//! and it compacts at once after a turn that ends `context_full`. The reserve of each compaction
+//! follows the longest turn so far, as in the client. It answers a refused turn with `retryPlan`, a
+//! compaction, and one resend.
 //!
-//! Each compaction is one cycle: close the session, open one with the
-//! original system prompt, and append the kept pairs. The open must hit the
-//! prefix cache, so it costs exactly the system rows. The position after the
-//! appends must not pass the estimate of the plan. A second test plants a
-//! turn whose recorded cost is too low, so the append refuses and the cycle
-//! refits with the learned cost. Set `ZIGFERENCER_TEST_VERBOSE` to print one
-//! line for each compaction. The tests return `error.SkipZigTest` when no
+//! Cycle. Each compaction is one cycle: close the session, open one with the original system
+//! prompt, and append the kept pairs. The open must hit the prefix cache, so it costs exactly the
+//! system rows. The position after the appends must not pass the estimate of the plan.
+//!
+//! Refit. A second test plants a turn whose recorded cost is too low, so the append refuses and the
+//! cycle refits with the learned cost.
+//!
+//! Script. Six short turns fill the window while the longest turn stays small, so the adaptive
+//! reserve stays near its floor. The server then refuses the poem prompt, and that refusal
+//! compaction keeps the newest short turn. The turn about flight ends `context_full`. The village
+//! prompt arrives when few positions are left, so the server refuses it too.
+//!
+//! Running. Set `ZIGFERENCER_TEST_VERBOSE` to print one line for each compaction. The tests return
+//! `error.SkipZigTest` when no fixture exists.
 //! fixture exists.
 
 const std = @import("std");
-const z = @import("zigferencer");
-const ct = z.client_transcript;
-const protocol = z.serve_protocol;
-const limits = z.limits;
-const Client = z.serve_client.Client;
+const zigferencer = @import("zigferencer");
+const ct = zigferencer.client_transcript;
+const protocol = zigferencer.serve_protocol;
+const limits = zigferencer.limits;
+const Client = zigferencer.serve_client.Client;
 const harness = @import("serve_harness.zig");
 const Harness = harness.Harness;
 const max_seq = harness.max_seq;
@@ -33,11 +39,12 @@ const opts: harness.Options = .{ .prefix_bytes = 64 << 20 };
 
 const Step = struct { prompt: []const u8, max_tokens: u32 };
 
-/// Six short turns fill the window while the longest turn stays small, so
-/// the adaptive reserve stays near its floor. The server then refuses the poem
-/// prompt, and that refusal compaction keeps the newest short turn. The turn
-/// about flight ends `context_full`. The village prompt arrives when few
-/// positions are left, so the server refuses it too.
+const castle_prompt = "Describe the castle where the old dragon sleeps, " ++
+    "with its towers, gates, walls, and the river around it.";
+const village_prompt = "Describe the village below the mountain, " ++
+    "with its farms, its market, its mill, and the people who live there.";
+
+/// The script of turns. See "Script" in the header.
 const steps = [_]Step{
     .{ .prompt = "Tell me about dragons.", .max_tokens = 5 },
     .{ .prompt = "What do they eat?", .max_tokens = 5 },
@@ -48,10 +55,10 @@ const steps = [_]Step{
     .{ .prompt = "Write a short poem about the brave little dragon.", .max_tokens = 12 },
     .{ .prompt = "Tell me a story about the dragon.", .max_tokens = max_seq },
     .{ .prompt = "Where does it fly at night?", .max_tokens = max_seq },
-    .{ .prompt = "Describe the castle where the old dragon sleeps, with its towers, gates, walls, and the river around it.", .max_tokens = 12 },
+    .{ .prompt = castle_prompt, .max_tokens = 12 },
     .{ .prompt = "Who are its friends?", .max_tokens = 12 },
     .{ .prompt = "How does the story end?", .max_tokens = 12 },
-    .{ .prompt = "Describe the village below the mountain, with its farms, its market, its mill, and the people who live there.", .max_tokens = 12 },
+    .{ .prompt = village_prompt, .max_tokens = 12 },
 };
 
 const Path = enum { context_full, refusal, planted };
@@ -265,9 +272,8 @@ test "a conversation that outgrows its window continues after compaction" {
     try std.testing.expect(chat.resent_after_kept >= 1);
     // A live cost never undercounts, so no append frame was refused.
     try std.testing.expectEqual(@as(u32, 0), chat.refits);
-    // Every re-open restored the system prompt from the prefix cache. The
-    // engine thread wrote the counter before it sent the reply that the
-    // test read last.
+    // Every re-open restored the system prompt from the prefix cache.
+    // The engine thread wrote the counter before it sent the reply that the test read last.
     try std.testing.expect(s.h.server.sched.prefix.hits - hits_before >= full + refusal);
 }
 
@@ -291,9 +297,8 @@ test "an estimate that undercounts a kept pair refits the cycle with the learned
     _ = t.finish(1);
     try std.testing.expectEqual(@as(u32, 3), t.count());
     const p = try s.chat.compact(.planted, ct.reserveFor(max_seq, t.longest_cost));
-    // A refusal names the sum of its frame only, so the excess lands on the
-    // oldest pair of the frame. Each refit drops one pair, until the planted
-    // newest turn stands alone, learns its own cost, and leaves too.
+    // A refusal names the sum of its frame only, so the excess lands on the oldest pair.
+    // Each refit drops one pair, until the planted turn learns its own cost and leaves too.
     try std.testing.expect(s.chat.refits >= 1);
     try std.testing.expect(s.chat.refits <= 3);
     try std.testing.expectEqual(@as(u32, 0), p.kept);

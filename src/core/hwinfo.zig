@@ -1,8 +1,13 @@
-//! The host hardware capabilities relevant to inference: arch and OS strings,
-//! CPU model, core count, total RAM, and a bool-per-feature SIMD card. It is a
-//! boundary value, a plain struct with no hidden state. It feeds
-//! `op_requires.isMetByHost`, which `info` uses to label eligible backends, and
-//! `info` prints it.
+//! The host hardware capabilities relevant to inference: arch and OS strings, CPU model, core
+//! count, total RAM, and a bool-per-feature SIMD card.
+//!
+//! Role. The card is a boundary value, a plain struct with no hidden state. It feeds
+//! `op_requires.isMetByHost`, which `info` uses to label eligible backends, and `info` prints it.
+//!
+//! GPU detection. It links no GPU library, so a CPU build can still answer whether the host can
+//! drive the vulkan backends. Three signals decide, in order: the PCI vendor id of the primary
+//! DRM card on native Linux, the paravirtual compute device `/dev/dxg` on WSL2 (the real GPU is
+//! hidden there), and a render node without a card0 vendor file.
 //!
 //! Sources:
 //!   - `builtin.cpu.features` for the SIMD flags. That is the BUILD target's
@@ -39,9 +44,8 @@ pub const SimdFeatures = struct {
     sve: bool = false,
 };
 
-/// Best-effort GPU presence, detected WITHOUT linking any GPU library, so it
-/// works on a plain CPU build. `present` drives the vulkan op-backends' host
-/// eligibility in `info`. `label` names the vendor when sysfs exposes it.
+/// Best-effort GPU presence. `present` drives the vulkan op-backends' host eligibility in `info`.
+/// `label` names the vendor when sysfs exposes it.
 pub const Gpu = struct {
     present: bool,
     label: []const u8,
@@ -120,10 +124,10 @@ pub fn readMemAvailable(io: Io) ?u64 {
 /// field, a malformed line, or a count past a `u64` gives null.
 pub fn meminfoBytes(text: []const u8, field: []const u8) ?u64 {
     std.debug.assert(field.len >= 1);
-    std.debug.assert(std.mem.indexOfScalar(u8, field, ':') == null);
+    std.debug.assert(std.mem.findScalar(u8, field, ':') == null);
 
     var lines = std.mem.splitScalar(u8, text, '\n');
-    // The loop reads each line once, so the text length bounds it.
+    // Each pass reads one line, so the text length bounds the loop.
     while (lines.next()) |line| {
         if (!std.mem.startsWith(u8, line, field)) continue;
 
@@ -145,12 +149,7 @@ pub fn meminfoBytes(text: []const u8, field: []const u8) ?u64 {
 
 // -- helpers ----------------------------------------------------------------
 
-/// Detect a GPU without a GPU dependency, so a CPU build can still answer "can
-/// the running host drive the vulkan backends?". Three sysfs/devfs signals, in
-/// order:
-///   - native Linux: the primary DRM card's PCI vendor id (`.../card0/.../vendor`).
-///   - WSL2: the real GPU is hidden, but the paravirtual compute device `/dev/dxg`.
-///   - a native render node without a card0 vendor file.
+/// Detect a GPU from sysfs and devfs signals. See "GPU detection" in the header.
 fn detectGpu(io: Io, arena: Allocator) Gpu {
     if (builtin.os.tag != .linux) return .{ .present = false, .label = "unknown (non-Linux)" };
 
@@ -191,11 +190,11 @@ fn readCpuModel(io: Io, arena: Allocator) ?[]const u8 {
     const cwd = Io.Dir.cwd();
     const slice = cwd.readFile(io, "/proc/cpuinfo", &buf) catch return null;
     const needle = "model name";
-    const idx = std.mem.indexOf(u8, slice, needle) orelse return null;
+    const idx = std.mem.find(u8, slice, needle) orelse return null;
     const after_needle = slice[idx + needle.len ..];
-    const colon = std.mem.indexOfScalar(u8, after_needle, ':') orelse return null;
+    const colon = std.mem.findScalar(u8, after_needle, ':') orelse return null;
     const after_colon = after_needle[colon + 1 ..];
-    const end = std.mem.indexOfScalar(u8, after_colon, '\n') orelse return null;
+    const end = std.mem.findScalar(u8, after_colon, '\n') orelse return null;
     const trimmed = std.mem.trim(u8, after_colon[0..end], " \t");
     return arena.dupe(u8, trimmed) catch null;
 }

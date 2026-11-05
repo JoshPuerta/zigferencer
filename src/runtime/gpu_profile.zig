@@ -1,19 +1,20 @@
-//! GPU timestamps for every GPU command buffer of both model families. Each
-//! command buffer holds one `GpuProfile`: the two decode ring buffers, the
-//! batch and prefill buffer of each runner, and the one-shot staging buffer
-//! (through `vulkan_ctx.Context.staging_query_pool`).
+//! GPU timestamps for every GPU command buffer of both model families. Each command buffer holds
+//! one `GpuProfile`: the two decode ring buffers, the batch and prefill buffer of each runner, and
+//! the one-shot staging buffer (through `vulkan_ctx.Context.staging_query_pool`).
 //!
-//! The level comes from `$ZIGFERENCER_TRACE_GPU` (`span.gpuLevel`). At `off`,
-//! the default, `begin`, `mark`, and `end` emit no command, so the command
-//! stream is byte-identical to an unprofiled one. At `submit`, a buffer writes
-//! two timestamps, start and end. At `phases`, it writes every `mark` of the
-//! record functions, and `report` buckets the intervals by `Phase`. `mark`
-//! also carries the `.dispatch` hot trace, which `-Dtrace` gates at build time.
+//! Levels. The level comes from `$ZIGFERENCER_TRACE_GPU` (`span.gpuLevel`). At `off`, the default,
+//! `begin`, `mark`, and `end` emit no command, so the command stream is byte-identical to an
+//! unprofiled one. At `submit`, a buffer writes two timestamps, start and end. At `phases`, it
+//! writes every `mark` of the record functions, and `report` buckets the intervals by `Phase`.
+//! `mark` also carries the `.dispatch` hot trace, which `-Dtrace` gates at build time.
 //!
-//! Query rules. `begin` resets every slot the buffer can write, in the same
-//! command buffer, before the first write. `collect` reads the pool only after
-//! the wait that the submit path already does, so the pool is never read while
-//! its buffer is pending.
+//! Query rules. `begin` resets every slot the buffer can write, in the same command buffer, before
+//! the first write. `collect` reads the pool only after the wait that the submit path already does,
+//! so the pool is never read while its buffer is pending.
+//!
+//! Full bound. `prof_max` bounds the marks of one submit. `dropped` counts the marks past it, and
+//! `report` prints the count, so a full pool never deflates the per-phase percentages in silence.
+//! Each profile warns once, which keeps a long run from writing one line per record.
 
 const std = @import("std");
 const vk = @import("vulkan");
@@ -29,6 +30,10 @@ const log = std.log.scoped(.gpu);
 
 /// Bound on timestamps per profiled submit (64 layers x ~14 marks + tail).
 pub const prof_max: u32 = 1024;
+/// Stdout buffer of one `report`.
+const report_buffer_bytes = 1024;
+/// The longest row label of `report`: a phase name plus its indent.
+const report_label_bytes = 24;
 
 // -- types ------------------------------------------------------------------
 
@@ -84,10 +89,9 @@ pub const Readout = struct {
         return rec;
     }
 
-    /// Print the per-`Phase` table. The output of an opt-in profiler is
-    /// program output (stdout). `hdr` labels the run, as in
-    /// "[qwen prefill warmup] b=411". The two host-side times state the record
-    /// step and the submit-plus-wait step.
+    /// Print the per-`Phase` table on stdout, because the output of an opt-in profiler is program
+    /// output. `hdr` labels the run, as in "[qwen prefill warmup] b=411". The two host times are
+    /// the record step and the submit-plus-wait step.
     pub fn report(
         self: Readout,
         io: std.Io,
@@ -96,10 +100,11 @@ pub const Readout = struct {
         record_ms: f64,
         wait_ms: f64,
     ) !void {
+        // Print the run line.
         const bucket = self.phase_ns.?;
         const total_ns = @as(f64, @floatFromInt(self.gpu_end - self.gpu_start)) * self.period_ns;
 
-        var buf: [1024]u8 = undefined;
+        var buf: [report_buffer_bytes]u8 = undefined;
         var fw: std.Io.File.Writer = .initStreaming(.stdout(), io, &buf);
         const w = &fw.interface;
         try w.print(hdr, hdr_args);
@@ -108,8 +113,8 @@ pub const Readout = struct {
                 "submit+wait={d:.2}ms)\n",
             .{ self.marks, self.dropped, self.backsteps, total_ns / 1e6, record_ms, wait_ms },
         );
-        // The summary lines `matmul` and `gdn` keep their names for scripts.
-        // Each total is followed by its indented parts.
+
+        // Sum the group totals. The summary lines `matmul` and `gdn` keep their names for scripts.
         var matmul_ns: f64 = 0;
         var gdn_ns: f64 = 0;
         inline for (std.meta.fields(Phase)) |fld| {
@@ -123,6 +128,7 @@ pub const Readout = struct {
             }
         }
 
+        // Print each group total, then its indented parts.
         try printLine(w, "matmul", matmul_ns, total_ns, 0);
         inline for (std.meta.fields(Phase)) |fld| {
             const ph = @field(Phase, fld.name);
@@ -139,6 +145,7 @@ pub const Readout = struct {
             }
         }
 
+        // Print the phases outside both groups.
         inline for (std.meta.fields(Phase)) |fld| {
             const ph = @field(Phase, fld.name);
             if (comptime !isMatmul(ph) and !isGdn(ph)) {
@@ -152,10 +159,9 @@ pub const Readout = struct {
 
 /// The timestamps of one command buffer.
 pub const GpuProfile = struct {
-    /// The Context address is stable for the lifetime of the runner that owns
-    /// this profile.
+    /// Stable for the lifetime of the runner that owns this profile.
     ctx: *const vulkan_ctx.Context,
-    /// Null while the level is `off` and no pool was asked for.
+    /// Null while the level is `off` and the caller asked for no pool.
     query_pool: vk.QueryPool = .null_handle,
     capacity: u32 = 0,
     period_ns: f64,
@@ -164,18 +170,15 @@ pub const GpuProfile = struct {
     level: Level,
     /// Timestamps the last record wrote. Zero means nothing to read back.
     n: u32 = 0,
-    /// Marks that passed the `prof_max` bound since `begin`. `report` prints it,
-    /// so a full pool never deflates the per-phase percentages in silence.
+    /// Marks past the `prof_max` bound since `begin`. See "Full bound" in the header.
     dropped: u32 = 0,
-    /// True after the first warning of a full bound. One warning per profile
-    /// keeps a long run from writing one line per record.
+    /// True after the first warning of a full bound.
     warned_full: bool = false,
     labels: [prof_max]Phase = undefined,
 
-    /// A profile at `level`. Its pool holds the slots of `pool_for`, or of
-    /// `level` when that is larger, so a later `setLevel` up to `pool_for`
-    /// creates no pool. A profile at `off` with `pool_for == .off` holds no
-    /// pool.
+    /// A profile at `level`. Its pool holds the slots of `pool_for`, or of `level` when that is
+    /// larger, so a later `setLevel` up to `pool_for` creates no pool. `off` and `pool_for == .off`
+    /// hold no pool.
     pub fn init(ctx: *const vulkan_ctx.Context, level: Level, pool_for: Level) !GpuProfile {
         var self: GpuProfile = .{
             .ctx = ctx,
@@ -198,10 +201,9 @@ pub const GpuProfile = struct {
         self.* = undefined;
     }
 
-    /// Grow the pool to the slots of `level`. The caller guarantees that the
-    /// buffer of this profile is not pending and that no recording that names
-    /// the old pool can be submitted again. A device with no timestamp bits or
-    /// no tick period refuses every level above `off` with a log line.
+    /// Grow the pool to the slots of `level`. The buffer of this profile must not be pending, and
+    /// no recording that names the old pool can be submitted again. A device that cannot time
+    /// refuses every level above `off`.
     pub fn reserve(self: *GpuProfile, level: Level) !void {
         if (level != .off and !self.canTime()) {
             log.err(
@@ -307,6 +309,8 @@ pub const GpuProfile = struct {
         std.debug.assert(n >= 2);
         std.debug.assert(n <= self.capacity);
         self.n = 0;
+
+        // Read the ticks back.
         var ts: [prof_max]u64 = undefined;
         _ = try self.ctx.vkd.getQueryPoolResults(
             self.ctx.device,
@@ -318,6 +322,8 @@ pub const GpuProfile = struct {
             @sizeOf(u64),
             .{ .@"64_bit" = true, .wait_bit = true },
         );
+
+        // Turn the ticks into intervals, and bucket the intervals at `phases`.
         var deltas: [prof_max - 1]u64 = undefined;
         const t = span.tickSpan(ts[0..n], self.tick_mask, deltas[0 .. n - 1]);
         var r: Readout = .{
@@ -406,7 +412,7 @@ fn isGdn(ph: Phase) bool {
 
 /// One report row. A part row sits `indent` spaces in and keeps the columns.
 fn printLine(w: *std.Io.Writer, name: []const u8, ns: f64, total_ns: f64, indent: usize) !void {
-    var label: [24]u8 = undefined;
+    var label: [report_label_bytes]u8 = undefined;
     std.debug.assert(indent + name.len <= label.len);
     @memset(label[0..indent], ' ');
     @memcpy(label[indent..][0..name.len], name);

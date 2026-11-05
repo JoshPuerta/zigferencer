@@ -1,12 +1,14 @@
-//! Golden-id gate for the Qwen (`qwen35`) pre-tokenizer against the real
-//! Qwen3.5-2B-Q8_0 GGUF.
+//! Golden-id gate for the Qwen (`qwen35`) pre-tokenizer against the real Qwen3.5-2B-Q8_0 GGUF.
 //!
-//! The expected ids come from the llama.cpp `llama-tokenize --ids` reference, so
-//! the ids must match it exactly. The Qwen regex is the llama3 regex with
-//! single-digit runs and no `ignore_merges`. So "2147" becomes 2, 1, 4 and 7,
-//! and a multi-space run keeps its grouping. The added tokens of the vocab
-//! (`<think>`, `<tool_call>`) encode to one id each. The tests find the
-//! fixture through `test_fixtures.path`.
+//! Reference. The expected ids come from the llama.cpp `llama-tokenize --ids` reference, so the ids
+//! must match it exactly.
+//!
+//! Regex. The Qwen regex is the llama3 regex with single-digit runs and no `ignore_merges`. So
+//! "2147" becomes 2, 1, 4 and 7, and a multi-space run keeps its grouping.
+//!
+//! Added tokens. The added tokens of the vocab (`<think>`, `<tool_call>`) encode to one id each.
+//!
+//! Fixture. The tests find the fixture through `test_fixtures.path`.
 
 const std = @import("std");
 const zigferencer = @import("zigferencer");

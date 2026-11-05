@@ -1,15 +1,27 @@
-//! Host and device transfer cost, in two sections. `benchCrossingLatency`
-//! measures the fixed price of one crossing at residual-row payloads.
-//! `benchStagedCopy` measures staged-copy bandwidth: each row times one
-//! `runStagingCopies` submission per repetition, in both directions, across the
-//! transfer sizes that the weight uploads and the KV swaps move. The file runs
-//! copies alone, with no model, no kernels, and no dispatch. Both sections need
-//! a device, so `main` calls them under the runner guard.
+//! Host and device transfer cost, in two sections. `benchCrossingLatency` measures the fixed
+//! price of one crossing at residual-row payloads. `benchStagedCopy` measures staged-copy
+//! bandwidth: each row times one `runStagingCopies` submission per repetition, in both
+//! directions, across the transfer sizes that the weight uploads and the KV swaps move. The file
+//! runs copies alone, with no model, no kernels, and no dispatch. Both sections need a device,
+//! so `main` calls them under the runner guard.
+//!
+//! Order. `main` runs the crossing section before `benchStagedCopy`, which returns early when
+//! its 512 MiB pair does not fit.
+//!
+//! Crossing floor. Every staged-copy row carries 8 MiB or more, where the transfer time hides
+//! the fixed submit-and-wait price. The crossing rows carry one hidden row, so the floor is what
+//! is left.
+//!
+//! Missing variant. A persistent-command-buffer variant of `submit_empty` (reset, record, and
+//! submit per repetition) is absent. Recording a copy outside the engine needs the `vk` types,
+//! and the bench module imports the engine alone. So every submission row holds the transient
+//! allocate-and-free cost that `runStagingCopies` pays, and each one ends on `queueWaitIdle`
+//! rather than on a fence.
 
 const std = @import("std");
-const z = @import("zigferencer");
+const zigferencer = @import("zigferencer");
 
-const bu = @import("bench_util.zig");
+const bench_util = @import("bench_util.zig");
 
 // -- constants --------------------------------------------------------------
 
@@ -73,18 +85,18 @@ const crossing_row_fmt = "{s:<18}{d:>12.5}{d:>12.5}{d:>12.5}\n";
 
 const Dir = enum { h2d, d2h };
 
-/// One `runStagingCopies` submission as a `bu.timedOnce` closure. An empty
+/// One `runStagingCopies` submission as a `bench_util.timedOnce` closure. An empty
 /// `copies` slice is a legal submission that records nothing.
 const Submit = struct {
-    ctx: *const z.vulkan_ctx.Context,
-    copies: []const z.ops_vulkan.Copy,
+    ctx: *const zigferencer.vulkan_ctx.Context,
+    copies: []const zigferencer.ops_vulkan.Copy,
 
     pub fn run(self: @This()) !void {
-        try z.ops_vulkan.runStagingCopies(self.ctx, self.copies);
+        try zigferencer.ops_vulkan.runStagingCopies(self.ctx, self.copies);
     }
 };
 
-/// One host-side `@memcpy` as a `bu.timedOnce` closure: the part of a crossing
+/// One host-side `@memcpy` as a `bench_util.timedOnce` closure: the part of a crossing
 /// that never reaches the queue.
 const MemCopy = struct {
     dst: []u8,
@@ -97,12 +109,13 @@ const MemCopy = struct {
 
 // -- api --------------------------------------------------------------------
 
-pub fn benchStagedCopy(io: std.Io, runner: *z.vulkan_runner.Runner) !void {
+pub fn benchStagedCopy(io: std.Io, runner: *zigferencer.vulkan_runner.Runner) !void {
+    // Allocate the buffer pair, or skip the sweep.
     const max_bytes: u64 = @as(u64, max_mib) * bytes_per_mib;
-    var host: z.ops_vulkan.HostBuffer = .{ .ctx = &runner.ctx };
+    var host: zigferencer.ops_vulkan.HostBuffer = .{ .ctx = &runner.ctx };
     defer host.deinit();
 
-    var device: z.ops_vulkan.DeviceBuffer = .{ .ctx = &runner.ctx };
+    var device: zigferencer.ops_vulkan.DeviceBuffer = .{ .ctx = &runner.ctx };
     defer device.deinit();
 
     host.ensure(max_bytes) catch |e| {
@@ -113,13 +126,14 @@ pub fn benchStagedCopy(io: std.Io, runner: *z.vulkan_runner.Runner) !void {
         std.debug.print("\nstaged copy: skipped (device buffer {d} MiB: {t})\n", .{ max_mib, e });
         return;
     };
-    // The transfer never reads the payload, so one fill before the sweep keeps
-    // every row moving the same bytes.
+
+    // Fill the payload once. The transfer never reads it, so every row moves the same bytes.
     const payload = host.sliceTyped(u8, @intCast(max_bytes));
     for (payload, 0..) |*b, i| {
         b.* = @truncate(i);
     }
 
+    // Print the table header.
     std.debug.print(
         "\nzigferencer bench: host<->device staged copy bandwidth (GB/s per submission)\n",
         .{},
@@ -133,6 +147,7 @@ pub fn benchStagedCopy(io: std.Io, runner: *z.vulkan_runner.Runner) !void {
 
     std.debug.print("{s:>10}\n", .{"median"});
 
+    // Time the single-copy rows, then the batched rows.
     for (transfer_mib) |m| {
         try copyRow(io, &runner.ctx, &host, &device, m, .h2d, 1);
         try copyRow(io, &runner.ctx, &host, &device, m, .d2h, 1);
@@ -144,50 +159,37 @@ pub fn benchStagedCopy(io: std.Io, runner: *z.vulkan_runner.Runner) !void {
     }
 }
 
-/// The crossing price at residual-row payloads: what one copy between host and
-/// device costs before any bandwidth term appears. Every staged-copy row carries
-/// 8 MiB or more, where the transfer time hides the fixed submit-and-wait price.
-/// These rows carry one hidden row, so the floor is what is left. `main` calls
-/// this section before `benchStagedCopy`, which returns early when its 512 MiB
-/// pair does not fit.
-///
-/// A persistent-command-buffer variant of `submit_empty` (reset, record, and
-/// submit per repetition) is absent. Recording a copy outside the engine needs
-/// the `vk` types, and the bench module imports the engine alone. Every
-/// submission row therefore holds the transient allocate-and-free cost that
-/// `runStagingCopies` pays, and each one ends on `queueWaitIdle` rather than on
-/// a fence.
-pub fn benchCrossingLatency(io: std.Io, runner: *z.vulkan_runner.Runner) !void {
+/// The crossing price at residual-row payloads: what one copy between host and device costs
+/// before any bandwidth term appears. Each row reports the median, the minimum, and the maximum.
+pub fn benchCrossingLatency(io: std.Io, runner: *zigferencer.vulkan_runner.Runner) !void {
+    // Allocate the three buffers, or skip the section.
     const ctx = &runner.ctx;
-    var up: z.ops_vulkan.HostBuffer = .{ .ctx = ctx };
+    var up: zigferencer.ops_vulkan.HostBuffer = .{ .ctx = ctx };
     defer up.deinit();
 
-    var down: z.ops_vulkan.HostBuffer = .{ .ctx = ctx };
+    var down: zigferencer.ops_vulkan.HostBuffer = .{ .ctx = ctx };
     defer down.deinit();
 
-    var device: z.ops_vulkan.DeviceBuffer = .{ .ctx = ctx };
+    var device: zigferencer.ops_vulkan.DeviceBuffer = .{ .ctx = ctx };
     defer device.deinit();
 
     up.ensure(crossing_capacity) catch |e| return crossingSkip("host upload buffer", e);
     down.ensure(crossing_capacity) catch |e| return crossingSkip("host readback buffer", e);
     device.ensure(crossing_capacity) catch |e| return crossingSkip("device buffer", e);
 
-    // No row reads a payload for its value, so one fill covers every row.
+    // Fill the payload once. No row reads it for its value.
     const upload = up.sliceTyped(u8, @intCast(crossing_capacity));
     for (upload, 0..) |*b, i| {
         b.* = @truncate(i);
     }
 
-    // One full-capacity upload leaves defined bytes across the device buffer, so
-    // no readback row moves memory that was never written.
-    const prime = [_]z.ops_vulkan.Copy{
+    // Prime the device buffer with one full upload, so no readback row moves unwritten memory.
+    const prime = [_]zigferencer.ops_vulkan.Copy{
         .{ .src = up.buffer, .dst = device.buffer, .size = crossing_capacity },
     };
-    try z.ops_vulkan.runStagingCopies(ctx, &prime);
+    try zigferencer.ops_vulkan.runStagingCopies(ctx, &prime);
 
-    // The host end of a crossing is an ordinary CPU allocation. Its address
-    // escapes here, so the compiler keeps the map-row stores instead of eliding
-    // the whole copy.
+    // Fill the host scratch. Its address escapes, so the compiler keeps the map-row stores.
     var scratch: [max_crossing_bytes]u8 = undefined;
     for (&scratch, 0..) |*b, i| {
         b.* = @truncate(i);
@@ -195,23 +197,27 @@ pub fn benchCrossingLatency(io: std.Io, runner: *z.vulkan_runner.Runner) !void {
 
     std.mem.doNotOptimizeAway(&scratch);
 
+    // Print the table header.
     std.debug.print(
         "\nzigferencer bench: host<->device crossing latency (ms per operation, {d} reps)\n",
         .{n_crossing_reps},
     );
     std.debug.print(crossing_header_fmt, .{ "row", "median", "min", "max" });
 
+    // Time the empty submission, then each direction alone.
     try crossingRow(io, "submit_empty", Submit{ .ctx = ctx, .copies = &.{} });
 
     for (crossing_bytes) |n| {
         var label_buf: [24]u8 = undefined;
-        const to_dev = [_]z.ops_vulkan.Copy{.{ .src = up.buffer, .dst = device.buffer, .size = n }};
+        const to_dev = [_]zigferencer.ops_vulkan.Copy{
+            .{ .src = up.buffer, .dst = device.buffer, .size = n },
+        };
         try crossingRow(
             io,
             crossingLabel(&label_buf, "h2d", n),
             Submit{ .ctx = ctx, .copies = &to_dev },
         );
-        const to_host = [_]z.ops_vulkan.Copy{
+        const to_host = [_]zigferencer.ops_vulkan.Copy{
             .{ .src = device.buffer, .dst = down.buffer, .size = n, .src_offset = readback_offset },
         };
         try crossingRow(
@@ -221,12 +227,16 @@ pub fn benchCrossingLatency(io: std.Io, runner: *z.vulkan_runner.Runner) !void {
         );
     }
 
-    // Both directions in one submission: the shape a fused segment boundary
-    // emits when it hands a row down and takes the answer back.
+    // Time both directions in one submission, the shape of a fused segment boundary.
     var fused_label: [24]u8 = undefined;
-    const both = [_]z.ops_vulkan.Copy{
+    const both = [_]zigferencer.ops_vulkan.Copy{
         .{ .src = up.buffer, .dst = device.buffer, .size = crossing_bytes[0] },
-        .{ .src = device.buffer, .dst = down.buffer, .size = crossing_bytes[0], .src_offset = readback_offset },
+        .{
+            .src = device.buffer,
+            .dst = down.buffer,
+            .size = crossing_bytes[0],
+            .src_offset = readback_offset,
+        },
     };
     try crossingRow(
         io,
@@ -234,6 +244,7 @@ pub fn benchCrossingLatency(io: std.Io, runner: *z.vulkan_runner.Runner) !void {
         Submit{ .ctx = ctx, .copies = &both },
     );
 
+    // Time the host-side copies that never reach the queue.
     for (crossing_bytes) |n| {
         var label_buf: [24]u8 = undefined;
         const write: MemCopy = .{ .dst = up.sliceTyped(u8, n), .src = scratch[0..n] };
@@ -249,20 +260,21 @@ pub fn benchCrossingLatency(io: std.Io, runner: *z.vulkan_runner.Runner) !void {
 /// once and then timed `n_reps` times.
 fn copyRow(
     io: std.Io,
-    ctx: *const z.vulkan_ctx.Context,
-    host: *z.ops_vulkan.HostBuffer,
-    device: *z.ops_vulkan.DeviceBuffer,
+    ctx: *const zigferencer.vulkan_ctx.Context,
+    host: *zigferencer.ops_vulkan.HostBuffer,
+    device: *zigferencer.ops_vulkan.DeviceBuffer,
     mib: u32,
     dir: Dir,
     chunks: u32,
 ) !void {
     std.debug.assert(chunks >= 1 and chunks <= batch_copies);
 
+    // Build the copy regions.
     const size: u64 = @as(u64, mib) * bytes_per_mib;
     std.debug.assert(size % chunks == 0);
     const chunk: u64 = size / chunks;
 
-    var copies: [batch_copies]z.ops_vulkan.Copy = undefined;
+    var copies: [batch_copies]zigferencer.ops_vulkan.Copy = undefined;
     for (copies[0..chunks], 0..) |*c, i| {
         const off: u64 = @as(u64, i) * chunk;
         c.* = switch (dir) {
@@ -283,6 +295,7 @@ fn copyRow(
         };
     }
 
+    // Warm up, then time the submission.
     const submit: Submit = .{ .ctx = ctx, .copies = copies[0..chunks] };
 
     try submit.run();
@@ -290,10 +303,11 @@ fn copyRow(
     for (&gbs) |*g| {
         // `runStagingCopies` waits for the queue to go idle, so the wall clock
         // around it holds the whole transfer.
-        const ms = try bu.timedOnce(io, submit);
+        const ms = try bench_util.timedOnce(io, submit);
         g.* = @as(f64, @floatFromInt(size)) / (ms * 1e6);
     }
 
+    // Print the row with its median.
     var sorted = gbs;
     std.mem.sort(f64, &sorted, {}, std.sort.asc(f64));
 
@@ -317,14 +331,13 @@ fn crossingLabel(buf: []u8, name: []const u8, bytes: u32) []const u8 {
     return std.fmt.bufPrint(buf, "{s} {d} KiB", .{ name, bytes >> 10 }) catch unreachable;
 }
 
-/// One crossing row: warm `op` once, then time it `n_crossing_reps` times, one
-/// operation per repetition. `bu.timedOnce` keeps the spread that an averaging
-/// timer folds away, and the spread is the point of this section.
+/// One crossing row: warm `op` once, then time it `n_crossing_reps` times, one operation per
+/// repetition. `bench_util.timedOnce` keeps the spread, which is the point of this section.
 fn crossingRow(io: std.Io, label: []const u8, op: anytype) !void {
     try op.run();
     var ms: [n_crossing_reps]f64 = undefined;
     for (&ms) |*m| {
-        m.* = try bu.timedOnce(io, op);
+        m.* = try bench_util.timedOnce(io, op);
     }
 
     var sorted = ms;

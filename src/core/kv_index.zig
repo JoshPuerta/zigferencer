@@ -1,11 +1,15 @@
-//! The index algebra of the device KV cache. The cache holds one region per
-//! layer and tensor. Region `t * n_layers + layer` holds the rows of every slot
-//! in row-major order: slot, then position, then element. An element offset is
-//! therefore a mixed-radix numeral with the radices `window` and `per_step`
-//! (Knuth, TAOCP vol 1, section 2.2.6). So each coordinate of the index box
-//! gets its own element, and every element stays below the region size. The
-//! device limits bind per region, and the regions pack into few allocations.
-//! The module is pure: no allocation, no device, and no I/O.
+//! The index algebra of the device KV cache. The module is pure: no allocation, no device, and no
+//! I/O.
+//!
+//! Regions. The cache holds one region per layer and tensor. Region `t * n_layers + layer` holds
+//! the rows of every slot in row-major order: slot, then position, then element.
+//!
+//! Offsets. An element offset is a mixed-radix numeral with the radices `window` and `per_step`
+//! (Knuth, TAOCP vol 1, section 2.2.6). So each coordinate of the index box gets its own element,
+//! and every element stays below the region size.
+//!
+//! Limits. The device limits bind per region, and the regions pack into few allocations.
+//! `maxWindowForLimits` and `maxSlotsForLimits` solve the same inequality for opposite unknowns.
 
 const std = @import("std");
 const prop = @import("prop.zig");
@@ -154,8 +158,7 @@ pub const Layout = struct {
     /// Elements between two slots inside a region: the shader stride from one
     /// slot to the next.
     pub fn streamStrideElems(self: Layout) u32 {
-        // The shader multiplies this stride by a slot index in 32 bits, so the
-        // whole region must stay inside the 31-bit index before the narrow.
+        // The shader multiplies this stride by a slot index in 32 bits.
         assert(self.regionElems() <= limits.max_kv_index_elems);
 
         const stride = @as(u64, self.window) * self.per_step;
@@ -273,11 +276,9 @@ pub fn fits(layout: Layout, lim: limits.BufferLimits) limits.BufferVerdict {
     return verdict;
 }
 
-/// The deepest window whose region of `n_slots` slots passes the 31-bit index,
-/// the allocation size, and the storage range. It is not capped by any model
-/// ceiling, so a caller takes the minimum with its own window. It leaves the
-/// alignment out: a row of whole alignment units keeps every window aligned.
-/// Zero means that no window fits.
+/// The deepest window whose region of `n_slots` slots passes the 31-bit index, the allocation
+/// size, and the storage range. No model ceiling caps it. It leaves the alignment out: a row of
+/// whole alignment units keeps every window aligned. Zero means that no window fits.
 pub fn maxWindowForLimits(
     n_slots: u32,
     per_step: u32,
@@ -298,11 +299,8 @@ pub fn maxWindowForLimits(
     return window;
 }
 
-/// The most slots whose region of `window` positions passes the 31-bit index,
-/// the allocation size, and the storage range: the dual of
-/// `maxWindowForLimits`. It is not capped by the slot ceiling, so a caller
-/// takes the minimum with its own. It leaves the alignment out for the same
-/// reason. Zero means that one slot already breaks a limit.
+/// The most slots whose region of `window` positions passes the same limits: the dual of
+/// `maxWindowForLimits`. No slot ceiling caps it. Zero means that one slot already breaks a limit.
 pub fn maxSlotsForLimits(
     window: u32,
     per_step: u32,
@@ -379,6 +377,7 @@ pub fn limitOf(verdict: limits.BufferVerdict, lim: limits.BufferLimits) Limit {
 pub fn pack(layout: Layout, lim: limits.BufferLimits) Packing {
     assert(fits(layout, lim) == .fits);
 
+    // Fill each allocation with as many whole regions as its size admits.
     const region_bytes = layout.regionBytes();
     const n_regions = layout.regionCount();
     // A region inside the allocation size leaves room for one per allocation.
@@ -393,7 +392,8 @@ pub fn pack(layout: Layout, lim: limits.BufferLimits) Packing {
     };
     assert(packing.n_segments >= 1);
     assert(packing.n_segments <= n_regions);
-    // At most `2 * limits.max_layers` segments, one per region at worst.
+
+    // Check that the segments hold every region once. At most `2 * limits.max_layers` segments.
     var sum: u64 = 0;
     var segment: u32 = 0;
     while (segment < packing.n_segments) : (segment += 1) {
@@ -676,9 +676,21 @@ test "Layout: at one slot the regions reproduce the offsets of the CPU KvCache s
     };
     const cases = [_]Case{
         // SmolLM2-135M at f32 in one allocation.
-        .{ .window = 2048, .per_step = 192, .n_layers = 30, .kv_dtype = .f32, .allocation_size = 1 << 40 },
+        .{
+            .window = 2048,
+            .per_step = 192,
+            .n_layers = 30,
+            .kv_dtype = .f32,
+            .allocation_size = 1 << 40,
+        },
         // Llama-3.1-8B at f16, split over allocations of five regions.
-        .{ .window = 512, .per_step = 1024, .n_layers = 32, .kv_dtype = .f16, .allocation_size = 5 * 512 * 2048 },
+        .{
+            .window = 512,
+            .per_step = 1024,
+            .n_layers = 32,
+            .kv_dtype = .f16,
+            .allocation_size = 5 * 512 * 2048,
+        },
     };
     for (cases) |c| {
         const layout = Layout.init(1, c.window, c.per_step, c.n_layers, c.kv_dtype);
@@ -730,11 +742,31 @@ test "kvPlan conservation: the regions plus the fixed state are the plan's KV" {
     qwen_9b.time_step_rank = 32;
     const Shape = struct { shape: kv_budget.KvShape, kv_dtype: KvDtype, model_ctx: u32 };
     const shapes = [_]Shape{
-        .{ .shape = .{ .n_layers = 30, .kv_row_elems = 192 }, .kv_dtype = .f32, .model_ctx = 8192 },
-        .{ .shape = .{ .n_layers = 32, .kv_row_elems = 1024 }, .kv_dtype = .f16, .model_ctx = 131_072 },
-        .{ .shape = .{ .n_layers = 32, .kv_row_elems = 1024 }, .kv_dtype = .f32, .model_ctx = 131_072 },
-        .{ .shape = .{ .n_layers = 24, .kv_row_elems = 512, .recurrent = qwen_2b }, .kv_dtype = .f16, .model_ctx = 262_144 },
-        .{ .shape = .{ .n_layers = 32, .kv_row_elems = 1024, .recurrent = qwen_9b }, .kv_dtype = .f16, .model_ctx = 262_144 },
+        .{
+            .shape = .{ .n_layers = 30, .kv_row_elems = 192 },
+            .kv_dtype = .f32,
+            .model_ctx = 8192,
+        },
+        .{
+            .shape = .{ .n_layers = 32, .kv_row_elems = 1024 },
+            .kv_dtype = .f16,
+            .model_ctx = 131_072,
+        },
+        .{
+            .shape = .{ .n_layers = 32, .kv_row_elems = 1024 },
+            .kv_dtype = .f32,
+            .model_ctx = 131_072,
+        },
+        .{
+            .shape = .{ .n_layers = 24, .kv_row_elems = 512, .recurrent = qwen_2b },
+            .kv_dtype = .f16,
+            .model_ctx = 262_144,
+        },
+        .{
+            .shape = .{ .n_layers = 32, .kv_row_elems = 1024, .recurrent = qwen_9b },
+            .kv_dtype = .f16,
+            .model_ctx = 262_144,
+        },
     };
     // The two anchors: the 2B at its ceiling adds 20201472 bytes of recurrent
     // state to 3 GiB of regions. The 8B at its ceiling is 16 GiB exactly.
@@ -769,7 +801,10 @@ test "kvPlan conservation: the regions plus the fixed state are the plan's KV" {
                         .slots = r.intRangeAtMost(u32, 1, 16),
                     }
                 else
-                    .{ .x_bytes = r.intRangeAtMost(u64, 1 << 20, 64 << 30), .window = r.intRangeAtMost(u32, 1, s.model_ctx) },
+                    .{
+                        .x_bytes = r.intRangeAtMost(u64, 1 << 20, 64 << 30),
+                        .window = r.intRangeAtMost(u32, 1, s.model_ctx),
+                    },
             };
 
             const plan = kv_budget.kvPlan(caps, cost, req) catch |err| {

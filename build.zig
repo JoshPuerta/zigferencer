@@ -198,7 +198,8 @@ const llvm_help = "Build both executables and every test binary with the LLVM co
     "LLVM Debug build.";
 
 const test_bin_help = "The test binary that test-install puts at zig-out/test/<name>: unit (the " ++
-    "tests of src/) or the stem of a tests/*_test.zig file (default unit).";
+    "tests of src/ outside src/dev/), dev_unit (the tests of src/dev/), or the stem of a " ++
+    "tests/*_test.zig file (default unit).";
 
 // -- types ------------------------------------------------------------------
 
@@ -249,7 +250,7 @@ pub fn build(b: *std.Build) void {
     const modules = addModules(b, config);
 
     if (config.runtime == .vulkan) {
-        wireVulkan(b, modules.exe, config.vk_registry);
+        wireVulkan(b, modules, config.vk_registry);
     }
 
     const exe = addExecutables(b, config, modules);
@@ -366,8 +367,9 @@ fn addModules(b: *std.Build, config: Config) Modules {
     });
     // The developer executable builds on `exe` with the same target and optimize mode, so the
     // engine code of the two binaries is equal.
-    const dev = createExeModule(b, config, "src/dev_main.zig", &.{
+    const dev = createExeModule(b, config, "src/dev/dev_main.zig", &.{
         .{ .name = "zigferencer", .module = exe },
+        .{ .name = "build_options", .module = build_options },
     });
 
     return .{
@@ -495,12 +497,21 @@ fn addTests(b: *std.Build, config: Config, modules: Modules) *Step {
         .filters = config.test_filters,
         .use_llvm = config.use_llvm,
     });
-    binaries.append(b.allocator, unit_tests) catch @panic("OOM");
+    const dev_unit_tests = b.addTest(.{
+        .name = "dev_unit",
+        .root_module = modules.dev,
+        .filters = config.test_filters,
+        .use_llvm = config.use_llvm,
+    });
 
-    const run_unit_tests = addTestRun(b, unit_tests);
-    test_step.dependOn(&run_unit_tests.step);
-    test_build_step.dependOn(&unit_tests.step);
-    test_unit_step.dependOn(&run_unit_tests.step);
+    for ([_]*Compile{ unit_tests, dev_unit_tests }) |binary| {
+        binaries.append(b.allocator, binary) catch @panic("OOM");
+
+        const run_binary = addTestRun(b, binary);
+        test_step.dependOn(&run_binary.step);
+        test_build_step.dependOn(&binary.step);
+        test_unit_step.dependOn(&run_binary.step);
+    }
 
     const lint_tests = b.addTest(.{
         .name = "shader_lint",
@@ -744,11 +755,13 @@ fn debugNoteStep(b: *std.Build, comptime note: []const u8) *Step {
 
 /// Add vulkan-zig, link `libvulkan`, and compile `vulkan_shaders` to SPIR-V. Each blob becomes an
 /// anonymous import, so source can call `@embedFile("vec_add.spv")` wherever the build wrote it.
-fn wireVulkan(b: *std.Build, exe_mod: *Module, vk_registry: []const u8) void {
+fn wireVulkan(b: *std.Build, modules: Modules, vk_registry: []const u8) void {
+    const exe_mod = modules.exe;
     // A lazy dependency is null on the first pass. The build runner then fetches it and runs
     // `build` again.
     const vk_dep = b.lazyDependency("vulkan", .{ .registry = vk_registry }) orelse return;
     exe_mod.addImport("vulkan", vk_dep.module("vulkan-zig"));
+    modules.dev.addImport("vulkan", vk_dep.module("vulkan-zig"));
 
     // `link_libc` is load-bearing. The Vulkan loader uses TLS, pthreads, and malloc, and it
     // segfaults inside its own data setup when the executable does not link against libc. With

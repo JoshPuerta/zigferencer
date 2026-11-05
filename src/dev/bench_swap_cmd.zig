@@ -8,28 +8,30 @@
 //! The change in `s` across the slot sizes is the transfer slope.
 
 const std = @import("std");
+const zigferencer = @import("zigferencer");
 const Io = std.Io;
 const build_options = @import("build_options");
 
-const cli = @import("command.zig");
-const args = @import("args.zig");
-const select = @import("select.zig");
-const serve_common = @import("serve_common.zig");
-const family = @import("../engine/family.zig");
-const dtype = @import("../core/dtype.zig");
-const kv_budget = @import("../core/kv_budget.zig");
-const limits = @import("../core/limits.zig");
-const registry = @import("../core/registry.zig");
-const loader = @import("../io/gguf/loader.zig");
-const Sessions = @import("../runtime/session.zig").Sessions;
+const context = zigferencer.cli.context;
+const args = zigferencer.cli.args;
+const select = zigferencer.cli.select;
+const boot_facts = zigferencer.cli.boot_facts;
+const boot_lines = zigferencer.cli.boot_lines;
+const family = zigferencer.family;
+const dtype = zigferencer.dtype;
+const kv_budget = zigferencer.kv_budget;
+const limits = zigferencer.limits;
+const registry = zigferencer.registry;
+const loader = zigferencer.loader;
+const Sessions = zigferencer.session.Sessions;
 
 const log = std.log.scoped(.bench_swap);
 
 const fused_build = build_options.use_vulkan_fused_ops;
 
 // The device code resolves to `void` on a CPU build, which never analyzes it.
-const vulkan_ctx_mod = if (fused_build) @import("../runtime/vulkan_ctx.zig") else void;
-const kernels = if (fused_build) @import("../ops_vulkan/kernels.zig") else void;
+const vulkan_ctx_mod = if (fused_build) zigferencer.vulkan_ctx else void;
+const kernels = if (fused_build) zigferencer.ops_vulkan else void;
 
 // -- constants --------------------------------------------------------------
 
@@ -111,7 +113,7 @@ const Opt = struct {
 
 /// What one bench reads. The arch switch of `runFused` picks the family.
 const Bench = if (fused_build) struct {
-    ctx: cli.Context,
+    ctx: context.Context,
     ctxp: *vulkan_ctx_mod.Context,
     loaded: *const loader.Loaded,
     ceiling: u32,
@@ -139,7 +141,7 @@ const SwapTimes = struct {
 
 // -- api --------------------------------------------------------------------
 
-pub fn run(ctx: cli.Context) !void {
+pub fn run(ctx: context.Context) !void {
     const opt = try args.parseInto(Opt, ctx) orelse return;
     if (opt.streams < 2 or opt.streams > limits.max_batch) {
         return args.fail(
@@ -168,7 +170,7 @@ pub fn run(ctx: cli.Context) !void {
 
 // -- helpers ----------------------------------------------------------------
 
-fn runFused(ctx: cli.Context, opt_in: Opt) !void {
+fn runFused(ctx: context.Context, opt_in: Opt) !void {
     const model = try select.model(ctx, opt_in.pub_name);
     const path = try registry.resolveLoadPath(ctx.arena, ctx.io, ctx.models_root, model.*);
     var loaded = try loader.load(ctx.io, ctx.arena, path);
@@ -177,12 +179,9 @@ fn runFused(ctx: cli.Context, opt_in: Opt) !void {
     // The KV dtype resolves ahead of every price, plan, and device call, so a
     // refusal costs a GGUF map and nothing more.
     var opt = opt_in;
-    opt.resolved_kv_dtype = serve_common.kvDtypeFor(opt.kv_dtype, model);
+    opt.resolved_kv_dtype = boot_facts.kvDtypeFor(opt.kv_dtype, model);
 
-    var stdout_buffer: [cli.stdout_buffer_bytes]u8 = undefined;
-    var stdout_writer: Io.File.Writer = .initStreaming(.stdout(), ctx.io, &stdout_buffer);
-
-    const ctxp = try serve_common.openDevice(ctx);
+    const ctxp = try boot_facts.openDevice(ctx);
     defer ctxp.deinit();
 
     const bench: Bench = .{
@@ -192,7 +191,7 @@ fn runFused(ctx: cli.Context, opt_in: Opt) !void {
         .ceiling = limits.contextCeiling(loaded.card.context_length, model.context_limit),
         .model_name = model.pub_name,
         .opt = opt,
-        .w = &stdout_writer.interface,
+        .w = &ctx.stdout.interface,
     };
     switch (loaded.card.arch) {
         inline else => |arch| return benchOne(family.Of(arch), &bench),
@@ -217,7 +216,7 @@ fn planFor(comptime Family: type, b: *const Bench) !kv_budget.KvPlan {
         .slots = opt.streams,
         .batch = opt.streams,
     });
-    serve_common.logPlan(plan, kv_dtype);
+    boot_lines.logPlan(plan, kv_dtype);
     return plan;
 }
 
@@ -546,7 +545,7 @@ fn statusKib(text: []const u8, key: []const u8) ?u64 {
         if (line[key.len] != ':') continue;
 
         const rest = std.mem.trim(u8, line[key.len + 1 ..], " \t");
-        const unit = std.mem.indexOfScalar(u8, rest, ' ') orelse return null;
+        const unit = std.mem.findScalar(u8, rest, ' ') orelse return null;
         if (!std.mem.eql(u8, std.mem.trimStart(u8, rest[unit..], " "), "kB")) return null;
 
         return std.fmt.parseInt(u64, rest[0..unit], 10) catch null;

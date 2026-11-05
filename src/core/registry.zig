@@ -1,11 +1,22 @@
-//! Hand-curated table of models the engine knows by short name. Each entry
-//! carries the on-disk path, the HF resolve URL, the chat-template family the
-//! model expects, the KV dtype it is verified at, and a lower context ceiling
-//! where the file cannot support its declared context. It is the canonical
-//! list of the models the engine is verified against. `fetch <pub_name>` and the
-//! run/inspect/bench commands resolve a short name through it. An ad-hoc
-//! download still works through `fetch <org>/<repo>/<file>` (see
+//! Hand-curated table of models the engine knows by short name. It is the canonical list of the
+//! models the engine is verified against.
+//!
+//! Entries. Each entry carries the on-disk path, the HF resolve URL, the chat-template family the
+//! model expects, the KV dtype it is verified at, and a lower context ceiling where the file cannot
+//! support its declared context. `fetch <pub_name>` and the run, inspect, and bench commands
+//! resolve a short name through it. An ad-hoc download uses `fetch <org>/<repo>/<file>` (see
 //! `cli/fetch_cmd.zig`) and does not appear here.
+//!
+//! Models store. `ZIGFERENCER_MODELS_DIR` names a secondary store on another disk, such as
+//! `/data/big/models`. The per-model subdirectory (`<org>_<repo>/`) goes underneath it. Reads
+//! check the repo-local `models/` first and then the store (`locate`). When the variable is set,
+//! `fetch` downloads into the store.
+//!
+//! KV defaults. An f16 default means outputs are byte identical to f32 and the reference hashes do
+//! not move. Llama-3.1-8B Q8_0: latency at parity or ahead, double the serve residency, and 1.78x
+//! swap. Qwen 2B: byte identical across backends and dtypes at depth, fused prefill 7 % ahead,
+//! every other arm at parity, and blobs shrink to 0.64x because the GDN state stays f32. Qwen 9B:
+//! the 2B shape at four times the scale, with about 110 slots in free VRAM where f32 fits about 88.
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
@@ -18,8 +29,8 @@ const log = std.log.scoped(.run);
 // -- constants --------------------------------------------------------------
 
 const models = [_]Model{
-    // Primary small model. Llama-family, ByteLevel BPE tokenizer.
-    // The upstream HuggingFaceTB GGUF repo is gated. bartowski's mirror is public.
+    // Primary small model. The upstream HuggingFaceTB GGUF repo is gated, so the entry uses the
+    // public bartowski mirror.
     .{
         .pub_name = "SmolLM2-135M-Instruct-Q8_0",
         .local_path = "bartowski_SmolLM2-135M-Instruct-GGUF",
@@ -34,17 +45,12 @@ const models = [_]Model{
         .file_name = "Meta-Llama-3.1-8B-Instruct-Q8_0.gguf",
         .download_url = "https://huggingface.co/bartowski/Meta-Llama-3.1-8B-Instruct-GGUF/resolve/main/Meta-Llama-3.1-8B-Instruct-Q8_0.gguf",
         .chat_template_kind = .llama3,
-        // f16 KV is the default: outputs are byte identical to f32 on every
-        // arm, latency is at parity or ahead, and the 32-token reference hash
-        // does not move. Half the KV bytes buy double the serve residency and
-        // 1.78x swap.
+        // See "KV defaults" in the header.
         .kv_dtype_default = .f16,
     },
-    // Q4_0 variants for the GPU bandwidth-win measurement (decode is
-    // memory-bound, and Q4_0 halves the weight stream). bartowski ships plain
-    // Q4_0 for SmolLM2. For Llama-3.1-8B bartowski only has the ARM-repacked
-    // Q4_0_4_4/_4_8/_8_8 (incompatible layout), so the entry uses QuantFactory's
-    // plain Q4_0.
+    // Q4_0 variants halve the weight stream of the memory-bound decode. For Llama-3.1-8B, bartowski
+    // ships only the ARM-repacked Q4_0_4_4, _4_8, and _8_8 (incompatible layout), so the entry uses
+    // the plain Q4_0 of QuantFactory.
     .{
         .pub_name = "SmolLM2-135M-Instruct-Q4_0",
         .local_path = "bartowski_SmolLM2-135M-Instruct-GGUF",
@@ -63,10 +69,8 @@ const models = [_]Model{
         // its training.
         .context_limit = 8192,
     },
-    // Qwen3.5 hybrid Gated-DeltaNet + full-attention models. The 2B is the
-    // dev/correctness target (small, fast, low VRAM). The 9B is the
-    // measurement target. ChatML template (see `core/chat.zig`). Only
-    // k-quants + Q8_0 ship (no Q4_0).
+    // Qwen3.5 hybrid models. The 2B is the correctness target, the 9B the measurement target.
+    // Only k-quants and Q8_0 ship, with no Q4_0.
     .{
         .pub_name = "Qwen3.5-2B-Q8_0",
         .local_path = "lmstudio-community_Qwen3.5-2B-GGUF",
@@ -74,10 +78,7 @@ const models = [_]Model{
         .download_url = "https://huggingface.co/lmstudio-community/Qwen3.5-2B-GGUF/resolve/main/Qwen3.5-2B-Q8_0.gguf",
         // The model file's template thinks only when enable_thinking is true.
         .chat_template_kind = .{ .chatml_qwen = .off },
-        // f16 KV is the default: outputs are byte identical across backends
-        // and dtypes at depth, fused prefill is 7% ahead, and every other arm
-        // is at parity. The fixed GDN state stays f32, so blobs shrink to
-        // 0.64x.
+        // See "KV defaults" in the header.
         .kv_dtype_default = .f16,
         // The card values for text tasks, from
         // https://huggingface.co/Qwen/Qwen3.5-2B/raw/main/README.md.
@@ -107,8 +108,7 @@ const models = [_]Model{
         .download_url = "https://huggingface.co/lmstudio-community/Qwen3.5-9B-GGUF/resolve/main/Qwen3.5-9B-Q8_0.gguf",
         // The model file's template thinks unless enable_thinking is false.
         .chat_template_kind = .{ .chatml_qwen = .on },
-        // f16 KV is the default: the 2B shape repeats at four times the scale,
-        // and about 110 slots fit in free VRAM where f32 fits about 88.
+        // See "KV defaults" in the header.
         .kv_dtype_default = .f16,
         // The card values for general tasks, from
         // https://huggingface.co/Qwen/Qwen3.5-9B/raw/main/README.md.
@@ -152,20 +152,15 @@ comptime {
     }
 }
 
-/// Environment variable naming a secondary models store on another (e.g.
-/// bigger) disk: `ZIGFERENCER_MODELS_DIR=/data/big/models`. The per-model
-/// subdirectory (`<org>_<repo>/`) is appended underneath it. Reads check the
-/// repo-local `models/` first and then this store (`locate`). When the
-/// variable is set, `fetch` downloads into the store rather than `models/`.
+/// Environment variable that names the secondary models store. See "Models store" in the header.
 pub const models_dir_env = "ZIGFERENCER_MODELS_DIR";
 
 pub const default_models_root = "models";
 
 // -- types ------------------------------------------------------------------
 
-/// The sampling that a model card recommends for one thinking mode. The
-/// engine has no frequency penalty, so a card value for it stays out. The
-/// card values at their neutral settings change nothing.
+/// The sampling that a model card recommends for one thinking mode. The engine has no frequency
+/// penalty, so a card value for it stays out.
 pub const Recommended = struct {
     temperature: f32,
     top_k: u32,
@@ -186,43 +181,30 @@ pub const SamplingCard = struct {
 /// Static descriptor for a model the engine knows how to fetch and run.
 /// All fields are string slices into the binary's read-only data.
 pub const Model = struct {
-    /// Stable name the user types on the CLI. Match the `gguf` filename
-    /// stem (without the `.gguf` extension) where reasonable.
+    /// Stable name the user types on the CLI. It matches the `gguf` filename stem where possible.
     pub_name: []const u8,
-    /// Per-model subdirectory under the models root (see `modelDir`).
-    /// Convention: `<org>_<repo>`. The root is `models/` by default, or
-    /// `$ZIGFERENCER_MODELS_DIR` when set.
+    /// Per-model subdirectory under the models root, as `<org>_<repo>`. See `modelDir`.
     local_path: []const u8,
     /// Bare filename of the GGUF on disk.
     file_name: []const u8,
-    /// Raw download URL. For Hugging Face, this must be the
-    /// `/resolve/<rev>/<file>` form, not the `/blob/<rev>/<file>` form.
+    /// Raw download URL. For Hugging Face, it must use the `/resolve/<rev>/<file>` form.
     download_url: []const u8,
-    /// Which prompt wrap `--chat` applies. `.none` means pass-through (callers
-    /// can inline their own template). A Qwen entry carries the thinking mode
-    /// that its model file defaults to. See `core/chat.zig`.
+    /// Which prompt wrap `--chat` applies. `.none` passes the prompt through. See `core/chat.zig`.
     chat_template_kind: chat.Kind = .none,
-    /// The KV dtype this model is verified to run when no flag names one. An
-    /// entry changes only on its own verification record, which re-anchors that
-    /// model's no-flag token hashes alone. It follows the `chat_template_kind`
-    /// precedent: one behavioral default per entry, recorded where the verified
-    /// facts already live.
+    /// The KV dtype this model is verified at when no flag names one. A change re-anchors that
+    /// model's no-flag token hashes.
     kv_dtype_default: dtype.KvDtype = .f32,
-    /// A lower window ceiling than the context the file declares, for a file
-    /// that cannot support its declared context. Null keeps the declared
-    /// context. `limits.contextCeiling` applies it.
+    /// A lower window ceiling than the declared context. Null keeps it. `limits.contextCeiling`
+    /// applies it.
     context_limit: ?u32 = null,
-    /// The sampling the model card recommends. Null is a model with no card
-    /// values, and a client then keeps greedy.
+    /// The sampling the model card recommends. Null keeps a client greedy.
     sampling: ?SamplingCard = null,
 };
 
 // -- api --------------------------------------------------------------------
 
-/// Apply the default policy to a raw env value: null (unset) or empty maps
-/// to `models`. The env itself is read once at startup (the Io model threads
-/// it through `std.process.Init.environ_map`), and the resolved root goes with
-/// the CLI Context. These path helpers therefore stay pure string joins.
+/// Map a raw env value to the models root: null or empty gives `models`. The caller reads the env
+/// once at startup, so the path helpers stay pure string joins.
 pub fn resolveRoot(env_value: ?[]const u8) []const u8 {
     const v = env_value orelse return default_models_root;
     return if (v.len == 0) default_models_root else v;
@@ -230,19 +212,16 @@ pub fn resolveRoot(env_value: ?[]const u8) []const u8 {
 
 /// Directory holding `model`'s GGUF under `root`: `<root>/<local_path>`.
 pub fn modelDir(arena: Allocator, root: []const u8, model: Model) Allocator.Error![]const u8 {
-    return std.fs.path.join(arena, &.{ root, model.local_path });
+    return std.Io.Dir.path.join(arena, &.{ root, model.local_path });
 }
 
-/// Full path where `model`'s GGUF is written / read under `root`.
+/// Full path where `model`'s GGUF is written and read under `root`.
 pub fn modelFilePath(arena: Allocator, root: []const u8, model: Model) Allocator.Error![]const u8 {
-    return std.fs.path.join(arena, &.{ root, model.local_path, model.file_name });
+    return std.Io.Dir.path.join(arena, &.{ root, model.local_path, model.file_name });
 }
 
-/// The path `model`'s GGUF is actually on disk at, or null when it is absent.
-/// Checks the default `models/` location first, then the configured `root` (the
-/// `$ZIGFERENCER_MODELS_DIR` store) when that differs, so a repo-local file
-/// wins over the external store. A non-null result guarantees the file exists
-/// there. It is not a guess at where a download lands.
+/// The path `model`'s GGUF is on disk at, or null when it is absent. The repo-local `models/`
+/// wins over the store at `root`. A non-null result names a file that exists.
 pub fn locate(
     arena: Allocator,
     io: Io,
@@ -250,7 +229,7 @@ pub fn locate(
     model: Model,
 ) Allocator.Error!?[]const u8 {
     var cwd = Io.Dir.cwd();
-    const local = try std.fs.path.join(
+    const local = try std.Io.Dir.path.join(
         arena,
         &.{ default_models_root, model.local_path, model.file_name },
     );
@@ -269,9 +248,8 @@ pub fn locate(
     return null;
 }
 
-/// Path to LOAD `model` from: where it is, or, when it is absent, the
-/// configured target a fresh download lands in, so a load failure names that
-/// location.
+/// Path to load `model` from: where it is, or the target of a fresh download when it is absent,
+/// so a load failure names that location.
 pub fn resolveLoadPath(
     arena: Allocator,
     io: Io,
@@ -286,18 +264,16 @@ pub fn all() []const Model {
 }
 
 pub fn lookup(pub_name: []const u8) ?*const Model {
-    // Index-based on purpose: `&m` from `for (models) |m|` points at a stack
-    // copy of the loop variable, which dangles when the function returns.
-    var i: usize = 0;
-    while (i < models.len) : (i += 1) {
+    // Index the table. `&m` from `for (models) |m|` points at a stack copy that dangles.
+    for (0..models.len) |i| {
         if (std.mem.eql(u8, models[i].pub_name, pub_name)) return &models[i];
     }
 
     return null;
 }
 
-/// The card sampling of the model `pub_name` for one thinking mode. Returns
-/// null for an unknown name and for an entry with no card values.
+/// The card sampling of model `pub_name` for one thinking mode. Null for an unknown name or an
+/// entry with no card values.
 pub fn recommendedSampling(pub_name: []const u8, thinking: bool) ?Recommended {
     const m = lookup(pub_name) orelse return null;
     const card = m.sampling orelse return null;
@@ -322,9 +298,8 @@ test "lookup returns null for unknown" {
 }
 
 test "the KV and context defaults match each entry's verification record" {
-    // Every no-flag byte and token hash stands on these rows. A change to one
-    // must break this test on purpose and cite its own verification record.
-    // Every entry the list omits stays f32.
+    // Every no-flag byte and token hash stands on these rows. A change to one must break this test
+    // on purpose and cite its own verification record. Every entry the list omits stays f32.
     const flipped = [_][]const u8{
         "Meta-Llama-3.1-8B-Instruct-Q8_0",
         "Qwen3.5-2B-Q8_0",

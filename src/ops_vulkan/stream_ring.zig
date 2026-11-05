@@ -1,21 +1,27 @@
-//! A double-buffered host-to-device ring for plain byte segments. The producer
-//! fills one mapped segment while the device uploads the other, and the ring
-//! hands each finished segment back as a descriptor view. The ring knows nothing
-//! about weights, layers, or quantization. A segment is bytes, so any consumer
-//! that moves bytes device-ward can drive it.
+//! A double-buffered host-to-device ring for plain byte segments. The producer fills one mapped
+//! segment while the device uploads the other, and the ring hands each finished segment back as a
+//! descriptor view. The ring knows nothing about weights, layers, or quantization. A segment is
+//! bytes, so any consumer that moves bytes device-ward can drive it.
 //!
-//! This is the only place in the engine that owns fences. Every other Vulkan
-//! path submits with a null fence and blocks on `queueWaitIdle`, so no other
-//! path tracks a submission. A ring cannot submit that way, because its whole
-//! point is to leave one upload outstanding. So the ring carries its own fences
-//! and its own command pool. The pool matters for the same reason:
-//! `ctx.command_pool` is externally synchronized and shared with the wait-idle
-//! paths, and recording into it while an upload is pending couples the two. The
-//! ring drains every outstanding fence at `deinit`, so it destroys no handle
-//! that the device still reads.
+//! Fences. This is the only place in the engine that owns fences. Every other Vulkan path submits
+//! with a null fence and blocks on `queueWaitIdle`, so no other path tracks a submission. A ring
+//! cannot submit that way, because its whole point is to leave one upload outstanding. The ring
+//! drains every outstanding fence at `deinit`, so it destroys no handle that the device still
+//! reads.
 //!
-//! `core/ring_fsm.zig` holds the slot state table. Every state change here
-//! routes through it, so the ring and the table cannot drift apart.
+//! Command pool. `ctx.command_pool` is externally synchronized and shared with the wait-idle paths,
+//! and recording into it while an upload is pending couples the two. So the ring owns its pool.
+//!
+//! Buffers. `ensure` grows by destroying and remapping, which invalidates a slot that the device
+//! reads. So the ring calls it once per buffer, for the whole life of the ring.
+//!
+//! Slot states. `core/ring_fsm.zig` holds the slot state table. Every state change here routes
+//! through `transition`, so the ring and the table cannot drift apart. A fence is signaled or
+//! pending exactly when its slot is `in_flight`.
+//!
+//! Consumers. A slot is readable only after its fence has signaled. A consumer that overlaps its
+//! dispatch with a later reuse of the slot must record its own compute-to-transfer barrier. Every
+//! submit-and-wait consumer on this one-queue stack meets that duty by its wait.
 
 const std = @import("std");
 const vk = @import("vulkan");
@@ -41,8 +47,7 @@ pub const StreamRing = struct {
     fences: [depth]vk.Fence,
     states: [depth]ring_fsm.SlotState,
     lens: [depth]vk.DeviceSize,
-    /// Zero marks a deinitialized ring, which is what makes `deinit`
-    /// idempotent.
+    /// Zero marks a deinitialized ring, which makes `deinit` idempotent.
     segment_capacity: vk.DeviceSize,
     stride: vk.DeviceSize,
     host: kernels.HostBuffer,
@@ -70,9 +75,8 @@ pub const StreamRing = struct {
     pub const WaitError = vk.DeviceWrapper.WaitForFencesError ||
         vk.DeviceWrapper.ResetFencesError;
 
-    /// `segment_capacity` is the largest upload one slot can carry. The ring
-    /// allocates `depth` segments of that size up front and never grows, so
-    /// pick the capacity from the consumer's largest expected chunk.
+    /// `segment_capacity` is the largest upload of one slot. The ring allocates `depth` segments of
+    /// that size up front and never grows, so pick the capacity from the largest expected chunk.
     pub fn init(
         ctx: *const vulkan_ctx.Context,
         segment_capacity: vk.DeviceSize,
@@ -85,6 +89,7 @@ pub const StreamRing = struct {
         const stride = alignUp(segment_capacity, alignment);
         const total: vk.DeviceSize = @as(vk.DeviceSize, depth) * stride;
 
+        // Create the command pool and one command buffer per slot.
         const pool_info: vk.CommandPoolCreateInfo = .{
             .flags = .{ .transient_bit = true, .reset_command_buffer_bit = true },
             .queue_family_index = ctx.queue_family,
@@ -100,20 +105,17 @@ pub const StreamRing = struct {
         };
         try ctx.vkd.allocateCommandBuffers(ctx.device, &cmd_info, &cmd_bufs);
 
+        // Create one unsignaled fence per slot.
         var fences: [depth]vk.Fence = @splat(.null_handle);
         var created: usize = 0;
         errdefer for (fences[0..created]) |f| ctx.vkd.destroyFence(ctx.device, f, null);
 
-        // Unsignaled at birth. The invariant the ring keeps is that a fence is
-        // signaled or pending exactly when its slot is `in_flight`.
         const fence_info: vk.FenceCreateInfo = .{};
         while (created < depth) : (created += 1) {
             fences[created] = try ctx.vkd.createFence(ctx.device, &fence_info, null);
         }
 
-        // One `ensure` each, for the whole life of the ring. `ensure` grows by
-        // destroying and remapping, which invalidates a slot the device reads.
-        // So the ring never calls it twice.
+        // Reserve the host and device buffers, once.
         var host: kernels.HostBuffer = .{ .ctx = ctx };
         errdefer host.deinit();
 
@@ -124,6 +126,7 @@ pub const StreamRing = struct {
 
         try device_buf.ensure(total);
 
+        // Check the slot geometry.
         std.debug.assert(stride >= segment_capacity);
         if (alignment != 0) std.debug.assert(stride % alignment == 0);
 
@@ -178,6 +181,7 @@ pub const StreamRing = struct {
         std.debug.assert(len > 0);
         std.debug.assert(len <= self.segment_capacity);
 
+        // Record the upload of this slot.
         const offset: vk.DeviceSize = @as(vk.DeviceSize, slot) * self.stride;
         const cmd = self.cmd_bufs[slot];
 
@@ -191,9 +195,8 @@ pub const StreamRing = struct {
         };
         self.ctx.vkd.cmdCopyBuffer(cmd, self.host.buffer, self.device_buf.buffer, &regions);
 
-        // This barrier replaces the `queueWaitIdle` the rest of the engine
-        // leans on. The transfer-read part covers a consumer that stages the
-        // segment back host-ward instead of dispatching on it.
+        // This barrier replaces the `queueWaitIdle` of the other paths. The transfer-read part
+        // covers a consumer that stages the segment back host-ward instead of dispatching on it.
         const mb = [_]vk.MemoryBarrier{.{
             .src_access_mask = .{ .transfer_write_bit = true },
             .dst_access_mask = .{ .shader_read_bit = true, .transfer_read_bit = true },
@@ -209,6 +212,7 @@ pub const StreamRing = struct {
         );
         try self.ctx.vkd.endCommandBuffer(cmd);
 
+        // Submit with the fence of this slot.
         const cmds = [_]vk.CommandBuffer{cmd};
         const submits = [_]vk.SubmitInfo{
             .{ .command_buffer_count = 1, .p_command_buffers = &cmds },
@@ -246,13 +250,8 @@ pub const StreamRing = struct {
         std.debug.assert(self.states[slot] == .ready);
     }
 
-    /// The uploaded bytes of `slot`, shaped for a descriptor write. The state
-    /// assert is the no-consume-before-signal obligation: a slot is readable
-    /// only after its fence has signaled.
-    ///
-    /// A consumer that overlaps its dispatch with a later reuse of the slot
-    /// must record its own compute-to-transfer barrier. Every submit-and-wait
-    /// consumer on this one-queue stack satisfies that obligation trivially.
+    /// The uploaded bytes of `slot`, shaped for a descriptor write. The state assert keeps a
+    /// consumer from reading before the fence signals. See "Consumers" in the header.
     pub fn view(self: *const StreamRing, slot: Slot) vk.DescriptorBufferInfo {
         std.debug.assert(self.segment_capacity > 0);
         std.debug.assert(slot < depth);
@@ -293,9 +292,8 @@ pub const StreamRing = struct {
     pub fn deinit(self: *StreamRing) void {
         if (self.segment_capacity == 0) return;
 
-        // A `free`, `filling`, or `ready` slot has no pending fence. The
-        // submit path guarantees it: a failed submit leaves the slot
-        // `filling` with nothing recorded.
+        // Drain the pending fences. A `free`, `filling`, or `ready` slot has none, because a failed
+        // submit leaves the slot `filling` with nothing recorded.
         drain: for (self.states, 0..) |s, i| {
             if (s != .in_flight) continue;
             const waited = [_]vk.Fence{self.fences[i]};
@@ -305,14 +303,14 @@ pub const StreamRing = struct {
                 .true,
                 std.math.maxInt(u64),
             ) catch {
-                // A lost device fails every later fence wait too. One
-                // queue-wide drain is the last chance to let outstanding work
-                // settle before the handles go.
+                // A lost device fails every later fence wait too. One queue-wide drain is the last
+                // chance to let outstanding work settle before the handles go.
                 self.ctx.vkd.queueWaitIdle(self.ctx.queue) catch {};
                 break :drain;
             };
         }
 
+        // Move every drained slot out of `in_flight`.
         var slot: Slot = 0;
         while (slot < depth) : (slot += 1) {
             if (self.states[slot] == .in_flight) {
@@ -322,6 +320,7 @@ pub const StreamRing = struct {
 
         std.debug.assert(self.inFlightCount() == 0);
 
+        // Destroy the fences, the pool, and the buffers.
         for (self.fences) |f| {
             self.ctx.vkd.destroyFence(self.ctx.device, f, null);
         }

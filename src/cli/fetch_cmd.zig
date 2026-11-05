@@ -9,7 +9,7 @@ const std = @import("std");
 const Io = std.Io;
 const Allocator = std.mem.Allocator;
 
-const cli = @import("command.zig");
+const context = @import("context.zig");
 const args = @import("args.zig");
 const style = @import("style.zig");
 const prompt = @import("prompt.zig");
@@ -74,7 +74,7 @@ const Flags = struct {
 
 // -- api --------------------------------------------------------------------
 
-pub fn run(ctx: cli.Context) !void {
+pub fn run(ctx: context.Context) !void {
     const flags = try args.parseInto(Flags, ctx) orelse return;
     var arg = flags.model;
     if (arg == null and prompt.stdinIsTty(ctx.io)) {
@@ -88,7 +88,7 @@ pub fn run(ctx: cli.Context) !void {
 
     const a = arg.?;
 
-    const model: registry.Model = if (std.mem.indexOfScalar(u8, a, '/') != null) m: {
+    const model: registry.Model = if (std.mem.findScalar(u8, a, '/') != null) m: {
         const spec = parseHfPath(a) catch |err| {
             try printHfPathError(ctx.io, a, err);
             return error.BadHfPath;
@@ -130,7 +130,7 @@ pub fn run(ctx: cli.Context) !void {
 
 /// Ask before a second fetch of a model already on disk. A stdin that is not a TTY
 /// refuses and points at `--force`.
-fn confirmRefetch(ctx: cli.Context, model: registry.Model, found: []const u8) !bool {
+fn confirmRefetch(ctx: context.Context, model: registry.Model, found: []const u8) !bool {
     const dest = try registry.modelFilePath(ctx.arena, ctx.models_root, model);
     const overwrites = std.mem.eql(u8, found, dest);
 
@@ -157,13 +157,11 @@ fn confirmRefetch(ctx: cli.Context, model: registry.Model, found: []const u8) !b
 }
 
 /// Print the plan of a fetch and download nothing. The size probe is one head-only GET.
-fn printPlan(ctx: cli.Context, model: registry.Model) !void {
+fn printPlan(ctx: context.Context, model: registry.Model) !void {
     const dest = try registry.modelFilePath(ctx.arena, ctx.models_root, model);
     const found = try registry.locate(ctx.arena, ctx.io, ctx.models_root, model);
 
-    var stdout_buffer: [notice_buffer_bytes]u8 = undefined;
-    var stdout_writer: Io.File.Writer = .initStreaming(.stdout(), ctx.io, &stdout_buffer);
-    const w = &stdout_writer.interface;
+    const w = &ctx.stdout.interface;
     try w.print("plan for fetch: {s}\n", .{model.pub_name});
     try w.print("  from:   {s}\n", .{model.download_url});
     try w.print("  to:     {s}\n", .{dest});
@@ -203,8 +201,8 @@ fn printPlan(ctx: cli.Context, model: registry.Model) !void {
 fn parseHfPath(s: []const u8) HfPathError!HfSpec {
     if (!std.mem.endsWith(u8, s, gguf_suffix)) return error.NotAGguf;
 
-    const slash1 = std.mem.indexOfScalar(u8, s, '/') orelse return error.NoRepoSegment;
-    const slash2 = std.mem.indexOfScalarPos(
+    const slash1 = std.mem.findScalar(u8, s, '/') orelse return error.NoRepoSegment;
+    const slash2 = std.mem.findScalarPos(
         u8,
         s,
         slash1 + 1,
@@ -221,7 +219,7 @@ fn parseHfPath(s: []const u8) HfPathError!HfSpec {
 }
 
 fn buildSyntheticModel(arena: Allocator, spec: HfSpec) Allocator.Error!registry.Model {
-    const file_basename = std.fs.path.basename(spec.file_in_repo);
+    const file_basename = std.Io.Dir.path.basename(spec.file_in_repo);
     const pub_name = file_basename[0 .. file_basename.len - gguf_suffix.len];
 
     const local_path = try std.fmt.allocPrint(arena, "{s}_{s}", .{ spec.org, spec.repo });

@@ -1,11 +1,11 @@
-//! The record ring of the decode step: two command buffers, each keyed by the
-//! step it holds. While the GPU runs the submitted buffer, the runner records
-//! the predicted next step into the other buffer. The next step then submits
-//! that buffer with no record on its critical path. This file holds the control
-//! state alone: no Vulkan, no allocation, no I/O. The fused runners own the
-//! command buffers and call these transitions around each Vulkan action.
+//! The record ring of the decode step: two command buffers, each keyed by the step it holds.
 //!
-//! A buffer is `free`, `recorded k`, or `pending k`. `recorded k` holds the
+//! Role. While the GPU runs the submitted buffer, the runner records the predicted next step into
+//! the other buffer. The next step then submits that buffer with no record on its critical path.
+//! This file holds the control state alone: no Vulkan, no allocation, no I/O. The fused runners
+//! own the command buffers and call these transitions around each Vulkan action.
+//!
+//! States. A buffer is `free`, `recorded k`, or `pending k`. `recorded k` holds the
 //! commands of key `k` that the GPU has not seen. `pending k` is submitted and
 //! not yet complete. The invariants, which every transition asserts:
 //!
@@ -14,10 +14,11 @@
 //!   3. A step starts only when no buffer is pending.
 //!   4. A hit submits a buffer whose key equals the wanted key.
 //!
-//! A record is two transitions here, `beginRecord` and `endRecord`, so a record
-//! that fails half way leaves the buffer `free` and never a stale `recorded`.
-//! A key holds everything the record reads that can change between steps, so
-//! equal keys give equal command streams.
+//! Records. A record is two transitions, `beginRecord` and `endRecord`, so a record that fails
+//! half way leaves the buffer `free` and never a stale `recorded`. A key holds everything the
+//! record reads that can change between steps, so equal keys give equal command streams.
+//! The token is data in the staging buffer, and the descriptor sets are fixed at init. The level
+//! is part of the key, so a recording made at one level never replays at another.
 
 const std = @import("std");
 const prop = @import("prop.zig");
@@ -38,19 +39,15 @@ pub const Buf = enum(u1) {
     }
 };
 
-/// How the decode record pass frames its command buffer. The default is the
-/// shipped form: one-time submit, at the process level. Only the
-/// `bench-decode-host` hooks change `one_time`.
+/// How the decode record pass frames its command buffer. The default is one-time submit at the
+/// process level. Only the `bench-decode-host` hooks change `one_time`.
 pub const RecordOpts = struct {
     one_time: bool = true,
     level: span.GpuLevel = .off,
 };
 
-/// The key of the decode record ring: everything a decode record reads that
-/// can change between two steps. The token is data in the staging buffer, and
-/// the descriptor sets are fixed at init, so equal keys record equal commands.
-/// The level is part of the key, so a recording made at one level never
-/// replays at another.
+/// The key of the decode record ring: everything a decode record reads that can change between
+/// two steps. See "Records" in the header.
 pub const DecodeKey = struct {
     pos: u32,
     opts: RecordOpts = .{},
@@ -114,7 +111,7 @@ pub fn RecordRing(comptime Key: type) type {
         pub fn prepare(self: *const Self, w: Key) Prepared {
             std.debug.assert(self.pendingCount() == 0);
 
-            inline for (.{ Buf.a, Buf.b }) |c| {
+            for ([_]Buf{ .a, .b }) |c| {
                 switch (self.get(c)) {
                     .recorded => |k| if (std.meta.eql(k, w)) return .{ .buf = c, .hit = true },
                     else => {},
@@ -353,8 +350,7 @@ test "DecodeKey: a key at one level never equals the key at another" {
             const ka = decodeKey(7, a);
             const kb = decodeKey(7, b);
             try std.testing.expectEqual(a == b, std.meta.eql(ka, kb));
-            // The next key keeps the level, so a speculative record never
-            // crosses levels either.
+            // The next key keeps the level, so a speculative record never crosses levels.
             try std.testing.expectEqual(a == b, std.meta.eql(ka.next(64).?, kb.next(64).?));
         }
     }

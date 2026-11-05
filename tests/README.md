@@ -67,7 +67,7 @@ simplest to the widest.
 
 | File | Invariant it pins |
 | --- | --- |
-| `tidy_test.zig` | No test waits on a clock, and non-test code does not print to stderr. Every source file keeps the shape rules: braces, 100 columns, and the section order. The test reads the source tree from the build root, and a short allow list names the files that break a rule on purpose. |
+| `tidy_test.zig` | No test waits on a clock, and non-test code does not print to stderr. Every source file keeps the shape rules: braces, 100 columns, and the section order. The test reads the source tree from the build root, and a short allow list names the files that break a rule on purpose. Every import points down the layers. |
 
 ### GPU kernel gates, a kernel against its CPU reference
 

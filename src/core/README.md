@@ -1,10 +1,11 @@
 # src/core
 
 This directory holds the values the rest of the engine is written in, and the
-pure helpers that read or build them. Those values are the tensor view, the quant geometry, and the static engine ceilings. They also include the two memory planners, the device KV layout, and the split geometry of decode attention. They also include the host
-hardware card, what each op variant needs from the target, the model table, and
-the chat wraps. The layer is the datapath end of
-the split that [docs/architecture.md](../../docs/architecture.md) describes. No
+pure helpers that read or build them. Those values are the tensor view, the quant
+geometry, and the static engine ceilings. They also include the two memory planners, the
+device KV layout, the split geometry of decode attention, the host hardware card, what each
+op variant needs from the target, the model table, and the chat wraps. The layer is the
+datapath end of the split that [docs/architecture.md](../../docs/architecture.md) describes. No
 module here owns engine state, and what crosses its edges is a plain immutable
 struct. Four files touch the outside and take an `Io` for it. `log.zig` writes
 the diagnostics to stderr, `span.zig` writes the trace file, `hwinfo.zig` reads
@@ -16,7 +17,7 @@ the host details from `/proc`, and `registry.locate` checks a path on disk.
 | --- | --- |
 | `tensor.zig` | `Tensor`, the immutable rank-4 byte view that crosses every op boundary. `data` is a borrow, the rank is fixed at `limits.max_n_dims`, and `assertValid` checks the rank, the positive dims, and the byte length. |
 | `dtype.zig` | `GgmlType` and the per-type block geometry (`hasBlockGeometry`, `blockSize`, `bytesPerBlock`, `bytesForNumel`). It also holds `KvDtype`, whose `rowBytes` is the single product every KV size site derives from. |
-| `limits.zig` | The static engine ceilings, one home per bound. It holds the rank, the layer, vocabulary, batch, slot, and session caps, the request caps of the HTTP surface, and the usable-VRAM fraction. It sets the window rules: the engine context bound (`max_model_ctx`), the model ceiling (`contextCeiling`), and the window granule of 256 positions. It holds the KV byte budget of one session: 2 GiB for `run` and 128 MiB for serve. It holds the usable-RAM fraction, the swap stage chunk of 256 MiB (`swap_stage_chunk_bytes`), and the 128 MiB headroom a printed RAM fit keeps (`ram_fit_headroom_bytes`). It also holds the device buffer limits (`BufferLimits`, `bufferFits`, the `ZIGFERENCER_VK_STORAGE_RANGE` override) and the bounds on one KV row and one KV region. The shader geometry that the host and the GLSL must read as one number lives here too. That geometry has these parts: the split length of GPU attention (`attn_split_len`, `ATTN_SPLIT`), the widest head and the query heads of one split workgroup (`ATTN_D_MAX`, `ATTN_QUERIES`), the Q8_0 and Q4_0 batch tiles, the GEMM tile, the GDN scan geometry (`CSUB`, `W`, `DH`), and the subgroup shared-memory capacity. The build passes each one to `glslc` as a define. `gdnScanGroups` and `gdnScanCell` give the grid and the column owner of the GDN scan. It also holds `attn_split_rows`, the rows of the split-attention scratch. The CPU attention geometry lives here too: `attn_cpu_tile`, the positions of one tile of the kernel stack score row, and `attn_cpu_parts`, the part ceiling of one row. |
+| `limits.zig` | The static engine ceilings, one home per bound. They cover the rank, the layer, vocabulary, batch, slot, and session caps, the request caps of the HTTP surface, and the usable VRAM and RAM fractions. The window rules live here: the engine context bound (`max_model_ctx`), the model ceiling (`contextCeiling`), the window granule of 256 positions, and the KV byte budget of one session (2 GiB for `run`, 128 MiB for serve). The swap stage chunk (`swap_stage_chunk_bytes`) and the headroom of a printed RAM fit (`ram_fit_headroom_bytes`) live here too. So do the device buffer limits (`BufferLimits`, `bufferFits`, the `ZIGFERENCER_VK_STORAGE_RANGE` override) and the bounds on one KV row and one KV region. The shader geometry that the host and the GLSL read as one number lives here, and the build passes each value to `glslc` as a define: the GPU attention split length (`ATTN_SPLIT`), its head width and query heads (`ATTN_D_MAX`, `ATTN_QUERIES`), the Q8_0 and Q4_0 batch tiles, the GEMM tile, the GDN scan geometry (`CSUB`, `W`, `DH`), and the subgroup shared-memory capacity. `gdnScanGroups` and `gdnScanCell` give the grid and the column owner of the GDN scan. The CPU attention geometry (`attn_cpu_tile`, `attn_cpu_parts`) and the split scratch rows (`attn_split_rows`) live here as well. The doc of each constant holds its facts. |
 | `attn_split.zig` | The geometry of split-depth decode attention. `splitCount` and `usesSplit` follow a row length alone, so a row gets the same splits at every window, batch, and slot. `Scratch` lays out the partial records, one per row, query head, and split, and `fits` checks the scratch against the device buffer limits through `limits.bufferFits`. It is pure: no allocation, no device, and no I/O. |
 | `attn_cpu.zig` | The geometry of CPU attention. `partCount` and `partRange` follow a row length alone, so a row gets the same parts and the same bits at every thread count, window, batch, and slot. `recordOffset`, `recordStride`, and `partialLen` lay out the partial buffer. It holds one record per query head and part, and the records of one head sit next to each other in part order. It is pure: no allocation, no threads, and no I/O. |
 | `kv_budget.zig` | Two planners over one usable-VRAM rule. `kvPlan` turns a byte budget into `n_slots x window` plus named reservations, and it refuses a named window past the model ceiling. `costModel` prices one slot from the model dimensions. `defaultWindow` turns a session byte budget into the default window, and `fitWindow` shrinks a default window to the free VRAM. `placementPlan` prices a weight placement, the host layer prefix against the GPU layer suffix, from a per-layer cost vector. `quoteRam` prices the host RAM of every serve placement at one split and funds the blob need of an unset `--kv-ram`, or refuses. `ChunkWalk` and `clipCopies` cut a swap blob into the chunks one stage moves. Both planners are pure arithmetic. |
@@ -66,8 +67,10 @@ here.
 - `Tensor` owns nothing and frees nothing. The storage, the map, the arena, the
   scratch and KV slabs, lives in the control layer.
 - `dtype.hasBlockGeometry` names the wire types the two geometry functions can
-  size. The loader asks it first and refuses the rest with a typed error. A file the engine cannot read fails at the trust boundary and never returns a wrong size in silence. `blockSize` and `bytesPerBlock` panic past that gate,
-  which is a caller mistake, not untrusted input.
+  size. The loader asks it first and refuses the rest with a typed error. A file the engine
+  cannot read fails at the trust boundary and never returns a wrong size in silence.
+  `blockSize` and `bytesPerBlock` panic past that gate, which is a caller mistake, not
+  untrusted input.
 - The loader raises a typed error on a `limits` breach and never truncates in
   silence. The context is the one bound it caps: a file that declares more than
   `max_model_ctx` loads at that bound, and the log names both numbers. A

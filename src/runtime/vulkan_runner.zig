@@ -1,15 +1,12 @@
-//! A Vulkan `Context` and the compute pipelines that act on it, kept together at
-//! a fixed heap address. Every GPU kernel captures `*const Context` at init time,
-//! so the address that Context lives at must not change for as long as any kernel
-//! holds the pointer. The `Runner` makes that guarantee structural instead of a
-//! convention each caller has to remember.
+//! A Vulkan `Context` and the compute pipelines that act on it, kept together at a fixed heap
+//! address.
 //!
-//! The hazard it closes is move-invalidates-pointer. `LinearQ80.init`
-//! stores `&ctx`. A `ctx` that then moves, returned by value from a factory or
-//! copied across a function boundary, leaves the stored pointer dangling, and
-//! the next `cmdBindPipeline` reads through it into freed stack.
-//! Heap-allocating the whole bundle behind the `Runner.init` factory fixes the
-//! address by construction:
+//! Stable address. Every GPU kernel captures `*const Context` at init time, so the address of that
+//! Context must not change while a kernel holds the pointer. `LinearQ80.init` stores `&ctx`. A
+//! `ctx` can move: a factory returns it by value, or a call copies it across a function boundary.
+//! That leaves the stored pointer dangling, and the next `cmdBindPipeline` reads through it into
+//! freed stack. The `Runner.init` factory allocates the whole bundle on the heap, so the
+//! construction fixes the address, not a rule that each caller has to remember:
 //!
 //!     gpa.create(Runner) -> stable address on the heap
 //!       Runner
@@ -17,11 +14,10 @@
 //!         +-- linear_q8_0 : LinearQ80 ----> captures &runner.ctx
 //!         +-- vec_add     : VecAdd    ----> captures &runner.ctx
 //!
-//! The pipelines the Runner holds (`vec_add`, `rope`,
-//! `linear_q8_0_subgroup`, `linear_q8_0`, and their siblings) are the per-op
-//! set. They serve the per-op reference path in `ops_vulkan/wrap.zig`, the
-//! benches, and the GPU tests. Each fused runner builds its own kernels on a
-//! `Context` of its own, so none of these pipelines runs during inference.
+//! Per-op set. The pipelines of the Runner (`vec_add`, `rope`, `linear_q8_0_subgroup`,
+//! `linear_q8_0`, and their siblings) are the per-op set. They serve the per-op reference path in
+//! `ops_vulkan/wrap.zig`, the benches, and the GPU tests. Each fused runner builds its own kernels
+//! on a `Context` of its own, so none of these pipelines runs during inference.
 
 const std = @import("std");
 const build_options = @import("build_options");
@@ -63,14 +59,14 @@ pub const Runner = struct {
         kernels.VecAdd.InitError ||
         std.mem.Allocator.Error;
 
-    /// The bundle on a context with the reported device limits. A kernel test
-    /// or a bench states no override.
+    /// The bundle on a context with the reported device limits. A kernel test or a bench states no
+    /// override.
     pub fn init(gpa: std.mem.Allocator) InitError!*Runner {
         return initWith(gpa, .{});
     }
 
-    /// The bundle on a context opened with `options`. The per-op backend passes
-    /// the override that the CLI resolved.
+    /// The bundle on a context opened with `options`. The per-op backend passes the override that
+    /// the CLI resolved.
     pub fn initWith(gpa: std.mem.Allocator, options: vulkan_ctx.Options) InitError!*Runner {
         const self = try gpa.create(Runner);
         errdefer gpa.destroy(self);
@@ -79,8 +75,8 @@ pub const Runner = struct {
         self.ctx = try vulkan_ctx.Context.init(gpa, options);
         errdefer self.ctx.deinit();
 
-        // From here on, `&self.ctx` is a stable pointer for the runner's
-        // lifetime. Each kernel below stores it.
+        // From here on, `&self.ctx` is stable for the lifetime of the runner. Each kernel below
+        // stores it.
         self.vec_add = try kernels.VecAdd.init(&self.ctx);
         errdefer self.vec_add.deinit();
 

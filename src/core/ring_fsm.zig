@@ -1,9 +1,10 @@
 //! The slot state machine of the double-buffered host-to-device upload ring in
-//! `ops_vulkan/stream_ring.zig`, checked at compile time here. This file holds
-//! the control table alone: no Vulkan, no allocation, no I/O. The GPU type
+//! `ops_vulkan/stream_ring.zig`, checked at compile time here.
+//!
+//! Role. This file holds the control table alone: no Vulkan, no allocation, no I/O. The GPU type
 //! mirrors this table, and the anchor trace below replays step for step in it.
 //!
-//! Every state change in the ring routes through `next`. A transition the
+//! Legality. Every state change in the ring routes through `next`. A transition the
 //! table does not name is a bug in the caller, not a runtime condition, so
 //! `next` returns null and the caller asserts.
 
@@ -15,9 +16,8 @@ const std = @import("std");
 /// device while the host fills the next one.
 pub const depth: u32 = 2;
 
-/// Two full rotations of a depth-2 ring, ending drained. The trace fills the
-/// ring three times, so it exercises the backpressure point that a shorter
-/// trace never reaches.
+/// Two full rotations of a depth-2 ring, ending drained. It fills the ring three times, so it
+/// reaches the backpressure point.
 pub const anchor_trace = [16]Step{
     .{ .slot = 0, .op = .acquire },
     .{ .slot = 0, .op = .submit },
@@ -76,13 +76,11 @@ pub fn next(s: SlotState, op: OpTag) ?SlotState {
 
 // -- tests ------------------------------------------------------------------
 
-// The three tests below run entirely at comptime, so any drift in the table
-// or in the trace fails the build instead of a test run.
+// The three tests below run at comptime, so drift in the table or the trace fails the build.
 test "ring_fsm: the transition table, exhaustively" {
     comptime {
-        // Rows follow the `SlotState` declaration order, columns the `OpTag`
-        // order. The nulls are the load-bearing half. They pin the negative
-        // space that the asserts in the ring depend on.
+        // Rows follow `SlotState` order, columns follow `OpTag` order. The nulls pin the negative
+        // space that the ring asserts depend on.
         const expected = [4][4]?SlotState{
             .{ .filling, null, null, null },
             .{ null, .in_flight, null, null },
@@ -111,8 +109,8 @@ test "ring_fsm: the transition table, exhaustively" {
 
 test "ring_fsm: ready is entered only by wait" {
     comptime {
-        // The ring exposes a slot's bytes only in `ready`. A second door into
-        // that state lets a consumer read a buffer the device still owns.
+        // The ring exposes a slot's bytes only in `ready`. A second way in lets a consumer read
+        // a buffer that the device still owns.
         for (std.enums.values(SlotState)) |s| {
             for (std.enums.values(OpTag)) |op| {
                 if (next(s, op) == .ready and (op != .wait or s != .in_flight)) {
@@ -175,8 +173,7 @@ test "ring_fsm: the anchor trace replays" {
                     );
                 }
 
-                // A full ring must refuse every acquire. That is the
-                // backpressure the ring reports to its caller as a null.
+                // A full ring must refuse every acquire. The ring reports that as a null.
                 for (states) |s| {
                     if (next(s, .acquire) != null) {
                         @compileError(

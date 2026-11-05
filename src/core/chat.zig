@@ -1,15 +1,18 @@
-//! Per-model chat-template wrap: a raw user message in, tokenizer-ready text
-//! out. The wrap interpolates the message into the right scaffolding for the
-//! model's family (SmolLM2 ChatML, Llama-3 chat, Qwen ChatML, or pass-through).
-//! The GGUF embeds a full Jinja2 template, but a Jinja interpreter costs
-//! hundreds of LOC against zero deps for marginal value. Hand-coded templates
-//! per family stay legible. They also pair-validate against the special tokens
-//! the BPE encoder matches greedily: a template that uses
-//! `<|start_header_id|>` works only because `specials_sorted` carries it. To
-//! add a family, add a tag to the `Kind` union. A family with a mode carries
-//! the mode as the payload, as `chatml_qwen` carries `Thinking`. Then add a
-//! template literal, dispatch in each wrap, and set `Model.chat_template_kind`
-//! in `registry.zig`.
+//! Per-model chat-template wrap: a raw user message in, tokenizer-ready text out. The wrap
+//! interpolates the message into the scaffolding of the model's family (SmolLM2 ChatML, Llama-3
+//! chat, Qwen ChatML, or pass-through).
+//!
+//! Hand-coded templates. The GGUF embeds a full Jinja2 template, but a Jinja interpreter costs
+//! hundreds of lines against zero deps for marginal value. The hand-coded templates stay legible.
+//! They also pair-validate against the special tokens the BPE encoder matches greedily: a template
+//! that uses `<|start_header_id|>` works only because `specials_sorted` carries it.
+//!
+//! BOS. No template writes a BOS token. The encoder prepends it per the model's tokenizer metadata
+//! (`vocab.add_bos`). A second BOS in the template doubles it.
+//!
+//! New family. Add a tag to the `Kind` union. A family with a mode carries the mode as the
+//! payload, as `chatml_qwen` carries `Thinking`. Then add a template literal, dispatch in each
+//! wrap, and set `Model.chat_template_kind` in `registry.zig`.
 
 const std = @import("std");
 const prop = @import("prop.zig");
@@ -18,10 +21,8 @@ const log = std.log.scoped(.run);
 
 // -- constants --------------------------------------------------------------
 
-/// The system prompt SmolLM2-Instruct was trained with. The `chatml_smollm2`
-/// template of `wrapAlloc` embeds it. `wrapMessagesAlloc` injects it when a
-/// conversation carries no system message, so a bare user turn reproduces the
-/// `wrapAlloc` text exactly (pair-validated in tests).
+/// The system prompt SmolLM2-Instruct was trained with. `wrapMessagesAlloc` injects it when a
+/// conversation has no system message, so a bare user turn equals the `wrapAlloc` text.
 const smollm2_default_system = "You are a helpful AI assistant named SmolLM, trained by " ++
     "Hugging Face";
 
@@ -47,16 +48,12 @@ const chatml_first_turn =
     \\
 ;
 
-// No BOS for the same reason as `llama3` below: the encoder owns it.
 const llama3_system =
     \\<|start_header_id|>system<|end_header_id|>
     \\
     \\{s}<|eot_id|>
 ;
 
-// No <|begin_of_text|> here: the encoder prepends BOS per the model's
-// tokenizer metadata (vocab.add_bos), and a template that carries it too
-// doubles it.
 const llama3 =
     \\<|start_header_id|>user<|end_header_id|>
     \\
@@ -65,8 +62,8 @@ const llama3 =
     \\
 ;
 
-// Follow-up turns carry no BOS. Lead with <|eot_id|> to close the previous
-// assistant reply (its terminating <|eot_id|> was never decoded into the KV).
+// A follow-up turn leads with the turn-end token, because the KV never decoded the terminating
+// token of the previous assistant reply.
 const chatml_smollm2_continuation =
     \\<|im_end|>
     \\<|im_start|>user
@@ -118,20 +115,13 @@ const qwen_think_closed = qwen_think_text.open ++ "\n\n" ++ qwen_think_text.clos
 pub const Thinking = enum { off, on };
 
 pub const Kind = union(enum) {
-    /// No wrap. `--chat` passes the prompt through unchanged (callers can
-    /// inline their own template). The right default for base models or for
-    /// running an instruct model in plain-text-continuation mode.
+    /// No wrap. `--chat` passes the prompt through. Fits base models and plain-text continuation.
     none,
-    /// SmolLM2-Instruct's ChatML wrap, including the trained system message.
-    /// Without this exact wrap, SmolLM2 generates raw text and loops quickly.
+    /// SmolLM2-Instruct ChatML with the trained system message. Without it, SmolLM2 loops.
     chatml_smollm2,
-    /// Llama-3 chat format: BOS + `<|start_header_id|>user<|end_header_id|>`
-    /// + content + `<|eot_id|>` + assistant header. EOS is `<|eot_id|>`
-    /// (id 128009 for Llama-3.1), which the existing eos-stop logic catches.
+    /// Llama-3 chat format. EOS is `<|eot_id|>` (id 128009 for Llama-3.1).
     llama3,
-    /// Qwen ChatML: `<|im_start|>user\n...<|im_end|>\n<|im_start|>assistant\n`,
-    /// then the thinking tail of the mode. No BOS (Qwen sets
-    /// add_bos_token=false). EOS is `<|im_end|>`.
+    /// Qwen ChatML, then the thinking tail of the mode. EOS is `<|im_end|>`.
     chatml_qwen: Thinking,
 };
 
@@ -252,11 +242,8 @@ pub fn wrapAlloc(arena: Allocator, kind: Kind, user_msg: []const u8) Allocator.E
     };
 }
 
-/// Wrap a follow-up user turn for an ongoing conversation. Unlike `wrapAlloc`,
-/// it emits no BOS or system scaffolding (already in the KV cache from turn 0).
-/// It opens with the turn-end token that closes the previous assistant reply.
-/// `bench-model --turns N` uses it so follow-up turns produce real responses
-/// instead of degenerating to immediate EOS.
+/// Wrap a follow-up user turn. It emits no system scaffolding, because the KV holds it from turn
+/// 0. It opens with the turn-end token that closes the previous assistant reply.
 pub fn wrapContinuationAlloc(
     arena: Allocator,
     kind: Kind,
@@ -274,12 +261,9 @@ pub fn wrapContinuationAlloc(
     };
 }
 
-/// Wrap a system prompt as the conversation's opening system block, with no
-/// user turn. The serving layer prefills this once at session open. The first
-/// user turn then arrives through `wrapFirstTurnAlloc`. For ChatML-family
-/// templates, system + first-turn concatenated reproduce the full `wrapAlloc`
-/// text exactly (pair-validated in tests). `.none` passes the system prompt
-/// through as a raw preamble.
+/// Wrap a system prompt as the opening system block, with no user turn. The serving layer
+/// prefills it at session open. For ChatML templates, it plus `wrapFirstTurnAlloc` equals
+/// `wrapAlloc`.
 pub fn wrapSystemAlloc(
     arena: Allocator,
     kind: Kind,
@@ -293,16 +277,13 @@ pub fn wrapSystemAlloc(
     };
 }
 
-/// Wrap the FIRST user turn after an opening system block. The result is the
-/// full template's user+assistant scaffolding without its system block, and
-/// without a leading turn-close (the system block closed itself). Later turns
-/// use `wrapContinuationAlloc`.
+/// Wrap the first user turn after an opening system block, with no system block and no leading
+/// turn-close. Later turns use `wrapContinuationAlloc`.
 pub fn wrapFirstTurnAlloc(arena: Allocator, kind: Kind, user_msg: []const u8) Allocator.Error![]u8 {
     return switch (kind) {
         .none => arena.dupe(u8, user_msg),
         .chatml_smollm2 => std.fmt.allocPrint(arena, chatml_first_turn, .{user_msg}),
-        // Llama-3's base template carries no system block, so its first turn
-        // after one is exactly the full wrap.
+        // The Llama-3 template has no system block, so its first turn is the full wrap.
         .llama3 => std.fmt.allocPrint(arena, llama3, .{user_msg}),
         .chatml_qwen => |mode| std.fmt.allocPrint(
             arena,
@@ -312,11 +293,8 @@ pub fn wrapFirstTurnAlloc(arena: Allocator, kind: Kind, user_msg: []const u8) Al
     };
 }
 
-/// The user part of a kept (user, assistant) pair: the user wrap of a live
-/// turn at `place`, with the closed think tail. The template of the model file
-/// drops the reasoning of an earlier turn, so a pair never opens a block. The
-/// caller encodes the assistant text apart and appends it. The wrap writes no
-/// end of the assistant turn, because the next wrap opens with it.
+/// The user part of a kept (user, assistant) pair: the live user wrap at `place`, with the closed
+/// think tail. The wrap writes no end of the assistant turn, because the next wrap opens with it.
 pub fn wrapPairUserAlloc(
     arena: Allocator,
     kind: Kind,
@@ -337,15 +315,9 @@ pub fn wrapPairUserAlloc(
     };
 }
 
-/// Render a whole conversation into one tokenizer-ready string for `kind`,
-/// ending with the open assistant turn. The result is the OpenAI connector's
-/// prefill: an ephemeral session has an empty KV, so the whole history renders
-/// at once. Built from the same per-family fragments as the single-turn
-/// wrappers, and pair-validated against them: `[user]` equals
-/// `wrapAlloc(user)`, and `[system, user]` equals
-/// `wrapSystemAlloc(system) ++ wrapFirstTurnAlloc(user)`. BOS is the encoder's
-/// job (`sequence_start`), never the template's. A Qwen assistant message
-/// renders without its think block (`stripThink`).
+/// Render a whole conversation into one string for `kind`, ending with the open assistant turn.
+/// `[user]` equals `wrapAlloc(user)`. `[system, user]` equals the system wrap plus the first-turn
+/// wrap. A Qwen assistant message renders without its think block.
 pub fn wrapMessagesAlloc(
     arena: Allocator,
     kind: Kind,
@@ -353,6 +325,7 @@ pub fn wrapMessagesAlloc(
 ) Allocator.Error![]u8 {
     std.debug.assert(messages.len >= 1);
 
+    // Render the messages in the format of the family.
     var out: std.ArrayList(u8) = .empty;
     switch (kind) {
         .none => for (messages, 0..) |m, i| {
@@ -363,9 +336,7 @@ pub fn wrapMessagesAlloc(
             try out.appendSlice(arena, m.content);
         },
         .chatml_smollm2, .chatml_qwen => {
-            // SmolLM2 expects its trained system block. Inject it when the
-            // caller sent none, so a bare user turn equals `wrapAlloc`. Qwen's
-            // base wrap carries no system block, so it injects nothing.
+            // Inject the SmolLM2 system block when the caller sent none. Qwen injects nothing.
             if (kind == .chatml_smollm2 and !hasSystem(messages)) {
                 try out.appendSlice(arena, "<|im_start|>system\n");
                 try out.appendSlice(arena, smollm2_default_system);
@@ -402,6 +373,7 @@ pub fn wrapMessagesAlloc(
         },
     }
 
+    // Log the result.
     std.debug.assert(out.items.len > 0);
     log.debug(
         "chat template: {t}, think open {}, {d} messages, {d} chars",
@@ -465,11 +437,11 @@ fn checkWrap(c: WrapCase) !void {
     }
 
     for (c.has) |v| {
-        try std.testing.expect(std.mem.indexOf(u8, out, v) != null);
+        try std.testing.expect(std.mem.find(u8, out, v) != null);
     }
 
     for (c.lacks) |v| {
-        try std.testing.expect(std.mem.indexOf(u8, out, v) == null);
+        try std.testing.expect(std.mem.find(u8, out, v) == null);
     }
 }
 
@@ -477,8 +449,7 @@ test "wrapAlloc: each template wraps its scaffolding around the text" {
     const cases = [_]WrapCase{
         .{ .kind = .none, .text = "Hello", .exact = "Hello" },
         .{ .kind = .chatml_smollm2, .text = "Hi", .has = &.{"<|im_start|>user\nHi<|im_end|>"}, .ends = "<|im_start|>assistant\n" },
-        // BOS comes from the encoder (vocab.add_bos), never from the template. A
-        // template that carries it too doubles it.
+        // No template writes a BOS token. See "BOS" in the header.
         .{
             .kind = .llama3,
             .text = "Hi",
@@ -499,9 +470,7 @@ test "wrapSystemAlloc + wrapFirstTurnAlloc reconstruct the full SmolLM2 wrap byt
 
     const arena = arena_state.allocator();
 
-    // The trained system prompt through the split path must equal the
-    // monolithic template. That is the pair validation that the boundary
-    // introduces nothing.
+    // The split path must equal the monolithic template, so the boundary adds nothing.
     const sys = try wrapSystemAlloc(
         arena,
         .chatml_smollm2,
@@ -521,14 +490,14 @@ test "wrapSystemAlloc .llama3 emits a lone system block, no BOS" {
     const arena = arena_state.allocator();
 
     const sys = try wrapSystemAlloc(arena, .llama3, "You are a helpful assistant.");
-    try std.testing.expect(std.mem.indexOf(u8, sys, "<|begin_of_text|>") == null);
+    try std.testing.expect(std.mem.find(u8, sys, "<|begin_of_text|>") == null);
     try std.testing.expect(
         std.mem.startsWith(u8, sys, "<|start_header_id|>system<|end_header_id|>"),
     );
     try std.testing.expect(std.mem.endsWith(u8, sys, "You are a helpful assistant.<|eot_id|>"));
     // First turn after it carries no system scaffolding of its own.
     const turn = try wrapFirstTurnAlloc(arena, .llama3, "Hi");
-    try std.testing.expect(std.mem.indexOf(u8, turn, "system") == null);
+    try std.testing.expect(std.mem.find(u8, turn, "system") == null);
     try std.testing.expect(
         std.mem.startsWith(u8, turn, "<|start_header_id|>user<|end_header_id|>"),
     );
@@ -541,9 +510,8 @@ test "wrapMessagesAlloc reconstructs the single-turn wrappers byte-for-byte" {
 
     const arena = arena_state.allocator();
 
-    // A bare user turn equals the monolithic wrap (SmolLM2 injects its trained
-    // system, Qwen injects nothing). The OpenAI path produces the same tokens
-    // as the native serve path, so the cross-backend token hash holds.
+    // A bare user turn equals the monolithic wrap, so the OpenAI path and the native serve path
+    // produce the same tokens.
     for (templated_kinds) |kind| {
         const msgs = [_]Message{.{ .role = .user, .content = "Hi" }};
         const whole = try wrapMessagesAlloc(arena, kind, &msgs);
@@ -573,11 +541,11 @@ test "wrapContinuationAlloc .llama3 omits BOS and closes the prior turn" {
     const arena = arena_state.allocator();
 
     const out = try wrapContinuationAlloc(arena, .llama3, "More?");
-    try std.testing.expect(std.mem.indexOf(u8, out, "<|begin_of_text|>") == null);
+    try std.testing.expect(std.mem.find(u8, out, "<|begin_of_text|>") == null);
     try std.testing.expect(
         std.mem.startsWith(u8, out, "<|eot_id|><|start_header_id|>user<|end_header_id|>"),
     );
-    try std.testing.expect(std.mem.indexOf(u8, out, "More?<|eot_id|>") != null);
+    try std.testing.expect(std.mem.find(u8, out, "More?<|eot_id|>") != null);
     try std.testing.expect(
         std.mem.endsWith(u8, out, "<|start_header_id|>assistant<|end_header_id|>\n\n"),
     );
@@ -776,8 +744,7 @@ test "a kept pair renders the live user wrap of its place with the closed think 
 
     const arena = arena_state.allocator();
 
-    // A pair equals the live turn of a server with thinking off, whatever the
-    // mode of the server.
+    // A pair equals the live turn of a server with thinking off, whatever the server mode.
     const qwen_off: Kind = .{ .chatml_qwen = .off };
     for (all_kinds) |kind| {
         const live: Kind = if (kind == .chatml_qwen) qwen_off else kind;

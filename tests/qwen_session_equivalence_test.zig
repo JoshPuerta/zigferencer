@@ -1,44 +1,54 @@
-//! Session gate for the qwen CPU runner. Time-sliced multi-session decode must
-//! be bit-identical to running each session alone.
+//! Session gate for the qwen CPU runner. Time-sliced multi-session decode must be bit-identical to
+//! running each session alone.
 //!
-//! Rows execute one at a time through the exact single-row forward, against the
-//! KV and the GDN state of their own slot. Nothing numeric is left to differ,
-//! so this test pins the state routing. A slot that reads the recurrent state
-//! of another slot changes the tokens at once. Seven passes state the claim:
+//! Routing. Rows execute one at a time through the exact single-row forward, against the KV and the
+//! GDN state of their own slot. Nothing numeric is left to differ, so this test pins the state
+//! routing. A slot that reads the recurrent state of another slot changes the tokens at once.
+//!
+//! Passes. Seven passes state the claim.
 //!
 //!   A. each prompt alone on a 1-slot runner, the `run` shape.
 //!   B. one 2-slot runner with both sessions interleaved per tick.
 //!   C. chunk-fed prefill on the 2-slot runner.
-//!   D. slot reuse. The pass destroys a session, creates a new one on the same
-//!      slot and replays prompt 0, which pins `resetSlotState`. The GDN scan is
-//!      a running accumulator, so stale state corrupts a fresh conversation.
-//!   E. continuous. Prompt 1 re-prefills through `advance` chunks that share
-//!      the decode ticks of prompt 0, the composed-tick shape of the serve
-//!      scheduler. Mixed rows must not disturb the GDN state routing of either
-//!      slot.
-//!   F. clone. A session forked partway through a conversation continues
-//!      bit-identically to its source, which pins the KV row copy and the GDN
-//!      slab copy.
-//!   G. forced parallelism. Pass B with the row-parallel matmuls and the
-//!      attention units forced on. A unit is one KV group over one part of
-//!      an attention row.
+//!   D. slot reuse. The pass destroys a session, creates a new one on the same slot and replays
+//!      prompt 0, which pins `resetSlotState`. The GDN scan is a running accumulator, so stale
+//!      state corrupts a fresh conversation.
+//!   E. continuous. Prompt 1 re-prefills through `advance` chunks that share the decode ticks of
+//!      prompt 0, the composed-tick shape of the serve scheduler. Mixed rows must not disturb the
+//!      GDN state routing of either slot.
+//!   F. clone. A session forked partway through a conversation continues bit-identically to its
+//!      source, which pins the KV row copy and the GDN slab copy.
+//!   G. forced parallelism. Pass B with the row-parallel matmuls and the attention units forced
+//!      on. A unit is one KV group over one part of an attention row.
 //!
-//! The token streams and the logits-row hashes must equal pass A exactly.
+//! Exactness. The token streams and the logits-row hashes must equal pass A exactly. Pass G sets
+//! `min_parallel_flops = 0`, which spreads the row-parallel matmuls and the attention units
+//! (parallel.attentionTyped) across 4 threads, even at short rows. The matmul partition keeps the
+//! reduction order of every output. An attention unit writes the same records on any worker, and
+//! the merge adds them in part order.
 //!
-//! The Qwen3.5-2B fixture comes from `test_fixtures.path`. The model is 2 GB,
-//! and a Debug test binary runs these tests for minutes. Run them in
-//! ReleaseSafe:
+//! Compact logits. A single-session feed lands its final row at logits[0]. In an `advance` tick the
+//! decode row of the front session follows the final row of the chunk only when that row took an
+//! lm_head. It sits at base, which is 1 on the final chunk and 0 otherwise.
+//!
+//! Prefix restore. This is the CPU twin of the warm-equals-cold rule that the hybrid runner
+//! carries. The blob holds the full-attention KV rows and the whole recurrent and conv slabs of
+//! every GDN layer, so the test pins the slab capture. A missed or misplaced region diverges the
+//! greedy streams at once.
+//!
+//! Running. The Qwen3.5-2B fixture comes from `test_fixtures.path`. The model is 2 GB, and a Debug
+//! test binary runs these tests for minutes. Run them in ReleaseSafe:
 //!   zig build test -Doptimize=ReleaseSafe
 
 const std = @import("std");
-const z = @import("zigferencer");
-const tp = @import("test_policy.zig");
-const loader = z.loader;
-const vocab_mod = z.vocab;
-const bpe = z.bpe;
-const QwenRunner = z.qwen_runner.QwenRunner;
-const Sessions = z.session.Sessions;
-const KvDtype = z.dtype.KvDtype;
+const zigferencer = @import("zigferencer");
+const test_policy = @import("test_policy.zig");
+const loader = zigferencer.loader;
+const vocab_mod = zigferencer.vocab;
+const bpe = zigferencer.bpe;
+const QwenRunner = zigferencer.qwen_runner.QwenRunner;
+const Sessions = zigferencer.session.Sessions;
+const KvDtype = zigferencer.dtype.KvDtype;
 
 // -- fixtures ---------------------------------------------------------------
 
@@ -58,7 +68,7 @@ fn hashLogitsRow(runner: *const QwenRunner, row: usize) u64 {
 
 /// The thread policy of every runner here but pass G: the `-Dtest-threads`
 /// pool with a floor of zero.
-const default_policy: tp.Policy = tp.policy();
+const default_policy: test_policy.Policy = test_policy.policy();
 
 /// A CPU runner over the fixture at a stated KV dtype and thread policy. Every
 /// test here builds through this one, so the dtype and the policy reach the
@@ -66,16 +76,16 @@ const default_policy: tp.Policy = tp.policy();
 fn cpuRunner(
     arena: std.mem.Allocator,
     io: std.Io,
-    cpu_pool: *tp.Pool,
+    cpu_pool: *test_policy.Pool,
     loaded: *const loader.Loaded,
     n_slots: u32,
     kv_dtype: KvDtype,
-    policy: tp.Policy,
+    policy: test_policy.Policy,
 ) !QwenRunner {
     return QwenRunner.init(
         arena,
         loaded,
-        z.kv_budget.pinned(n_slots, z.test_fakes.test_window),
+        zigferencer.kv_budget.pinned(n_slots, zigferencer.test_fakes.test_window),
         0,
         io,
         cpu_pool,
@@ -90,8 +100,8 @@ fn soloStream(
     loaded: *const loader.Loaded,
     ids: []const u32,
 ) !Stream {
-    var cpu_pool: tp.Pool = undefined;
-    try tp.startPool(&cpu_pool, io, default_policy);
+    var cpu_pool: test_policy.Pool = undefined;
+    try test_policy.startPool(&cpu_pool, io, default_policy);
     defer cpu_pool.deinit();
 
     var runner = try cpuRunner(arena, io, &cpu_pool, loaded, 1, .f32, default_policy);
@@ -121,8 +131,8 @@ fn greedyProbe(
 ) !void {
     std.debug.assert(out.len >= 1);
 
-    var cpu_pool: tp.Pool = undefined;
-    try tp.startPool(&cpu_pool, io, default_policy);
+    var cpu_pool: test_policy.Pool = undefined;
+    try test_policy.startPool(&cpu_pool, io, default_policy);
     defer cpu_pool.deinit();
 
     var runner = try cpuRunner(arena, io, &cpu_pool, loaded, 1, kv_dtype, default_policy);
@@ -145,7 +155,7 @@ test "qwen time-sliced sessions are bit-identical to solo runs, and slot reuse s
     defer arena_state.deinit();
 
     const arena = arena_state.allocator();
-    const fixture = try z.test_fixtures.path(arena, "Qwen3.5-2B-Q8_0");
+    const fixture = try zigferencer.test_fixtures.path(arena, "Qwen3.5-2B-Q8_0");
 
     var loaded = try loader.load(io, arena, fixture);
     defer loaded.close();
@@ -162,8 +172,8 @@ test "qwen time-sliced sessions are bit-identical to solo runs, and slot reuse s
     }
 
     // -- B: interleaved on one 2-slot runner --------------------------------
-    var cpu_pool: tp.Pool = undefined;
-    try tp.startPool(&cpu_pool, io, default_policy);
+    var cpu_pool: test_policy.Pool = undefined;
+    try test_policy.startPool(&cpu_pool, io, default_policy);
     defer cpu_pool.deinit();
 
     var runner = try cpuRunner(arena, io, &cpu_pool, &loaded, prompts.len, .f32, default_policy);
@@ -173,8 +183,6 @@ test "qwen time-sliced sessions are bit-identical to solo runs, and slot reuse s
         sids[p] = try pool.create(0, .{});
         const first = (try pool.feed(sids[p], ids, true)).?;
         try std.testing.expectEqual(reference[p].tokens[0], first);
-        // Under compact logits a single-session feed lands its final row at
-        // logits[0].
         try std.testing.expectEqual(reference[p].logits_hash[0], hashLogitsRow(&runner, 0));
     }
 
@@ -251,9 +259,7 @@ test "qwen time-sliced sessions are bit-identical to solo runs, and slot reuse s
             .tokens = prompt_ids[1][fed..][0..1],
             .final = final,
         }, &.{front}, &out);
-        // Under compact logits the decode row of the front session follows the
-        // final row of the chunk only when that row took an lm_head. It sits at
-        // base, which is 1 on the final chunk and 0 otherwise.
+        // The decode row sits at base. See "Compact logits" in the header.
         const base: usize = if (final) 1 else 0;
         try std.testing.expectEqual(reference[0].tokens[k], out[0]);
         try std.testing.expectEqual(reference[0].logits_hash[k], hashLogitsRow(&runner, base));
@@ -275,9 +281,7 @@ test "qwen time-sliced sessions are bit-identical to solo runs, and slot reuse s
     }
 
     // -- F: clone -----------------------------------------------------------
-    // Fork a session partway through a conversation. The greedy continuation of
-    // the fork must equal the solo stream of the source exactly. That pins the
-    // KV row copy and the GDN recurrent-slab copy.
+    // The greedy continuation of the fork must equal the solo stream of the source.
     pool.destroy(front);
     pool.destroy(late);
     const source = try pool.create(0, .{});
@@ -300,15 +304,11 @@ test "qwen time-sliced sessions are bit-identical to solo runs, and slot reuse s
     }
 
     // -- G: forced parallelism ----------------------------------------------
-    // `min_parallel_flops = 0` spreads the row-parallel matmuls and the
-    // attention units (parallel.attentionTyped) across 4 threads, even at these
-    // short rows. The matmul partition keeps the reduction order of every
-    // output. An attention unit writes the same records on any worker, and the
-    // merge adds them in part order. So both streams must equal pass A exactly.
+    // Both streams must equal pass A exactly. See "Exactness" in the header.
     {
-        const forced: tp.Policy = .{ .n_threads = 4, .min_parallel_flops = 0 };
-        var par_cpu_pool: tp.Pool = undefined;
-        try tp.startPool(&par_cpu_pool, io, forced);
+        const forced: test_policy.Policy = .{ .n_threads = 4, .min_parallel_flops = 0 };
+        var par_cpu_pool: test_policy.Pool = undefined;
+        try test_policy.startPool(&par_cpu_pool, io, forced);
         defer par_cpu_pool.deinit();
 
         var par_runner = try cpuRunner(
@@ -326,8 +326,6 @@ test "qwen time-sliced sessions are bit-identical to solo runs, and slot reuse s
             par_sids[p] = try par_pool.create(0, .{});
             const first = (try par_pool.feed(par_sids[p], ids, true)).?;
             try std.testing.expectEqual(reference[p].tokens[0], first);
-            // Under compact logits a single-session feed lands its final row
-            // at logits[0].
             try std.testing.expectEqual(reference[p].logits_hash[0], hashLogitsRow(&par_runner, 0));
         }
 
@@ -346,18 +344,13 @@ test "qwen time-sliced sessions are bit-identical to solo runs, and slot reuse s
 }
 
 test "qwen prefix restore: a warm-restored prefix continues bit-exactly" {
-    // This is the CPU twin of the warm-equals-cold rule the hybrid runner
-    // carries. The blob holds the full-attention KV rows and the whole
-    // recurrent and conv slabs of every GDN layer, so the test pins the slab
-    // capture. A missed or misplaced region diverges the greedy streams at
-    // once.
     const io = std.testing.io;
     const gpa = std.testing.allocator;
     var arena_state = std.heap.ArenaAllocator.init(gpa);
     defer arena_state.deinit();
 
     const arena = arena_state.allocator();
-    const fixture = try z.test_fixtures.path(arena, "Qwen3.5-2B-Q8_0");
+    const fixture = try zigferencer.test_fixtures.path(arena, "Qwen3.5-2B-Q8_0");
 
     var loaded = try loader.load(io, arena, fixture);
     defer loaded.close();
@@ -367,15 +360,14 @@ test "qwen prefix restore: a warm-restored prefix continues bit-exactly" {
     std.debug.assert(ids.len >= 2); // the split needs a prefix row and a suffix row
     const n: u32 = @intCast(ids.len - 1);
 
-    var cpu_pool: tp.Pool = undefined;
-    try tp.startPool(&cpu_pool, io, default_policy);
+    var cpu_pool: test_policy.Pool = undefined;
+    try test_policy.startPool(&cpu_pool, io, default_policy);
     defer cpu_pool.deinit();
 
     var runner = try cpuRunner(arena, io, &cpu_pool, &loaded, 2, .f32, default_policy);
     var pool = try Sessions(QwenRunner).init(arena, &runner);
 
-    // Cold: feed the prefix without asking for logits, snapshot those rows,
-    // then feed the suffix and decode on.
+    // Cold: feed the prefix without logits, snapshot those rows, then feed the suffix.
     var cold_stream: [n_tokens]u32 = undefined;
     const cold = try pool.create(0, .{});
     _ = try pool.feed(cold, ids[0..n], false);
@@ -411,7 +403,7 @@ test "qwen kv f16: the kv slab halves and the blob round-trips" {
     defer arena_state.deinit();
 
     const arena = arena_state.allocator();
-    const fixture = try z.test_fixtures.path(arena, "Qwen3.5-2B-Q8_0");
+    const fixture = try zigferencer.test_fixtures.path(arena, "Qwen3.5-2B-Q8_0");
 
     var loaded = try loader.load(io, arena, fixture);
     defer loaded.close();
@@ -419,8 +411,8 @@ test "qwen kv f16: the kv slab halves and the blob round-trips" {
     var v = try vocab_mod.buildFromParsed(arena, loaded.parsed);
     const ids = try bpe.encodeAlloc(&v, arena, prompts[0], true);
 
-    var cpu_pool: tp.Pool = undefined;
-    try tp.startPool(&cpu_pool, io, default_policy);
+    var cpu_pool: test_policy.Pool = undefined;
+    try test_policy.startPool(&cpu_pool, io, default_policy);
     defer cpu_pool.deinit();
 
     var wide = try cpuRunner(arena, io, &cpu_pool, &loaded, 1, .f32, default_policy);
@@ -429,9 +421,7 @@ test "qwen kv f16: the kv slab halves and the blob round-trips" {
     // The slab prices whole rows, so f16 halves the storage exactly.
     try std.testing.expectEqual(wide.kv_slots[0].sizeBytes(), 2 * narrow.kv_slots[0].sizeBytes());
 
-    // The blob narrows its KV half only. The GDN recurrent state stays f32
-    // under every KV dtype, so it is the exact remainder that both blobs
-    // share.
+    // The blob narrows its KV half only. The GDN state stays f32, so both blobs share it.
     const n_rows: u32 = @intCast(ids.len);
     const per_step: u32 = wide.n_kv_heads * wide.head_dim;
     const n_full: u32 = wide.kv_slots[0].n_layers;
@@ -464,7 +454,7 @@ test "qwen kv f16: greedy divergence against f32 stays coherent" {
     defer arena_state.deinit();
 
     const arena = arena_state.allocator();
-    const fixture = try z.test_fixtures.path(arena, "Qwen3.5-2B-Q8_0");
+    const fixture = try zigferencer.test_fixtures.path(arena, "Qwen3.5-2B-Q8_0");
 
     var loaded = try loader.load(io, arena, fixture);
     defer loaded.close();
@@ -486,12 +476,9 @@ test "qwen kv f16: greedy divergence against f32 stays coherent" {
         }
     }
 
-    // A narrower cache can diverge later, because an argmax tie flips on the
-    // last bit. Token 0 reads only the prefill rows this pair just wrote, so a
-    // disagreement there means the commit or the attention read the wrong
-    // bytes. The index reaches the failure message alone. The build runner
-    // labels any test that writes to stderr as a failed command. An
-    // unconditional print therefore makes a green run read as a red one.
+    // A narrower cache can diverge later, because an argmax tie flips on the last bit.
+    // A divergence at token 0 means the commit or the attention read the wrong bytes.
+    // Print only on failure, because the build runner labels any stderr write as a failure.
     if (diverge == 0) {
         std.debug.print(
             "qwen kv f16 vs f32: greedy diverged at index {d} of {d} (f32 {d}, f16 {d})\n",

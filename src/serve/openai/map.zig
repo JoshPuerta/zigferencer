@@ -1,12 +1,31 @@
-//! The pure datapath of the OpenAI connector. It parses and validates an
-//! untrusted request body into a value, and it maps a rejection to an HTTP
-//! error. It routes each token of a turn to `reasoning_content` or `content`,
-//! and it splits streamed token bytes on UTF-8 boundaries for SSE. These
-//! functions do no I/O. The HTTP shell (`http_server.zig`) calls them and owns
-//! the transport.
+//! The pure datapath of the OpenAI frontend. It parses and validates an untrusted request body
+//! into a value, and it maps a rejection to an HTTP error. These functions do no I/O. The HTTP
+//! shell (`http_server.zig`) calls them and owns the transport.
 //!
-//! The trust boundary lives here. Every guard turns malformed input into a
-//! typed `ReqError` the shell renders as a 4xx, never into an assert.
+//! Trust boundary. Every guard turns malformed input into a typed `ReqError` that the shell
+//! renders as a 4xx, never into an assert.
+//!
+//! Parse. `parseChatRequest` rejects the input the server cannot answer correctly, such as
+//! `n > 1`, a sampling field out of its range, or a frequency penalty. It ignores the other
+//! fields it does not support (stop, tools), so a generic OpenAI client works, and it logs each
+//! ignored name once per process. The `model` string passes through for the shell to check. A
+//! known field with a value of the wrong type is `error.BadField`, and `diag` names it. Each
+//! sampling guard reads as the range it accepts, so a NaN fails it. The ranges are the binary
+//! wire guards, so the scheduler accepts every value that passes.
+//!
+//! Thinking. A budget of 0 turns thinking off, the vLLM rule, so it wins over `enable_thinking`.
+//! A model with no think tags accepts only the closed modes, the rule of the binary wire. A
+//! budget above 0 also needs the ids of a forced close, or the scheduler refuses it.
+//!
+//! Reasoning split. `ReasoningSplit` routes the token events of one turn to `reasoning_content`
+//! and `content`. Each think tag is one token, so a two-state machine over the token ids splits
+//! the stream, and a tag never straddles two events. It drops the tags and the newlines that lead
+//! the reply after a close. A close outside the block is plain reply text, so a turn that opens
+//! closed and never sees `<think>` keeps every byte as content.
+//!
+//! UTF-8. A streamed token can be a partial multi-byte sequence (byte-fallback tokens, emoji). A
+//! JSON string must be valid UTF-8, so the shell emits the prefix that `completeUtf8Len` returns
+//! and carries the remainder of at most three bytes into the next chunk.
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
@@ -42,8 +61,7 @@ const budget_no_forced_close_message = "thinking_token_budget above 0 does not a
 
 pub const ReqError = error{
     BadJson,
-    /// A known field holds a JSON value of the wrong type. `Diag.field`
-    /// names it.
+    /// A known field holds a JSON value of the wrong type. `Diag.field` names it.
     BadField,
     NoMessages,
     TooManyMessages,
@@ -190,19 +208,15 @@ pub const TurnMode = struct {
     think_budget: ?u32,
 };
 
-/// A validated chat request: the conversation rendered-ready as `chat.Message`
-/// values (arena-owned), plus the sampling fields and the budgets.
+/// A validated chat request: arena-owned `chat.Message` values, the sampling fields, the budgets.
 pub const Request = struct {
-    /// The `model` string as the client sent it, empty when the body omits it.
-    /// The shell compares it against the served model and answers 404 on a
-    /// mismatch, so one server never answers for another model id.
+    /// The `model` string as sent, empty when omitted. The shell answers 404 on a mismatch.
     model: []const u8,
     messages: []const chat.Message,
     sampling: SamplingFields,
     max_tokens: u32,
     stream: bool,
-    /// `chat_template_kwargs.enable_thinking`: true is `on`, false is `off`,
-    /// and an absent or null value is `auto`, the server's mode.
+    /// `enable_thinking`: true is `on`, false is `off`, absent or null is `auto`.
     thinking: chat.ThinkingFlag,
     think_budget: ThinkBudget,
 };
@@ -223,16 +237,11 @@ pub const Field = enum { reasoning, content };
 pub const Routed = struct { field: Field, text: []const u8 };
 
 /// Routes the token events of one turn to `reasoning_content` and `content`.
-/// Each think tag is one token, so a two-state machine over the token ids
-/// splits the stream. A tag never straddles two events. The splitter drops the
-/// tags and the newlines that lead the reply after a close. A close outside
-/// the block is plain reply text, so a turn that opens closed and never sees
-/// `<think>` keeps every byte as content.
+/// See "Reasoning split" in the header.
 pub const ReasoningSplit = struct {
     tags: ?chat.ThinkIds,
     field: Field,
-    /// A close sets it. The first piece with a byte that is not a newline
-    /// clears it.
+    /// A close sets it. The first piece with a byte other than a newline clears it.
     trim: bool = false,
 
     /// `open` is true when the turn opens inside the think block. Only a
@@ -368,10 +377,7 @@ pub fn reqErrorToHttp(e: ReqError, diag: Diag) HttpError {
     return .{ .status = 400, .type = "invalid_request_error", .message = message };
 }
 
-/// Resolve the thinking of a turn. A budget of 0 turns thinking off, the
-/// vLLM rule, so it wins over `enable_thinking`. A model with no think tags
-/// accepts only the closed modes, the rule of the binary wire. A budget
-/// above 0 also needs the ids of a forced close, or the scheduler refuses it.
+/// Resolve the thinking of a turn against the model. See "Thinking" in the header.
 pub fn resolveTurn(
     server_kind: chat.Kind,
     flag: chat.ThinkingFlag,
@@ -428,14 +434,8 @@ pub fn resolveSampling(
     return out;
 }
 
-/// Parse and validate `body` into a `Request`. `default_max_tokens` covers a
-/// request that omits a budget. `max_seq` is the session's hard ceiling.
-/// This rejects the input the server cannot answer correctly, such as
-/// `n > 1`, a sampling field out of its range, or a frequency penalty. It
-/// ignores the other fields it does not support (stop, tools), so a generic
-/// OpenAI client works. It logs each ignored field name once per process.
-/// The `model` string passes through for the shell to check. A known field
-/// with a value of the wrong type is `error.BadField`, and `diag` names it.
+/// Parse and validate `body` into a `Request`. `default_max_tokens` covers a request that omits
+/// a budget. `max_seq` is the session's hard ceiling. See "Parse" in the header.
 pub fn parseChatRequest(
     arena: Allocator,
     body: []const u8,
@@ -446,11 +446,8 @@ pub fn parseChatRequest(
     return parseChatRequestWith(&unknown_fields, arena, body, default_max_tokens, max_seq, diag);
 }
 
-/// Length of the longest prefix of `bytes` that ends on a UTF-8 codepoint
-/// boundary. A streamed token can be a partial multi-byte sequence
-/// (byte-fallback tokens, emoji). A JSON string must be valid UTF-8, so the
-/// shell emits this prefix now and carries the remainder of at most three
-/// bytes into the next chunk.
+/// Length of the longest prefix of `bytes` that ends on a UTF-8 codepoint boundary.
+/// See "UTF-8" in the header.
 pub fn completeUtf8Len(bytes: []const u8) usize {
     if (bytes.len == 0) return 0;
 
@@ -501,6 +498,8 @@ fn parseChatRequestWith(
     diag: *Diag,
 ) ReqError!Request {
     diag.* = .{};
+
+    // Parse the JSON into a tree.
     const tree = std.json.parseFromSliceLeaky(
         std.json.Value,
         arena,
@@ -512,6 +511,7 @@ fn parseChatRequestWith(
     };
     if (tree != .object) return error.BadJson;
 
+    // Map the tree onto the request struct. A wrong type names its field.
     const req = std.json.parseFromValueLeaky(
         types.ChatRequest,
         arena,
@@ -524,6 +524,8 @@ fn parseChatRequestWith(
             return error.BadField;
         },
     };
+
+    // Report each unknown field name once.
     for (tree.object.keys()) |key| {
         const known = inline for (@typeInfo(types.ChatRequest).@"struct".fields) |f| {
             if (std.mem.eql(u8, key, f.name)) break true;
@@ -534,6 +536,7 @@ fn parseChatRequestWith(
         }
     }
 
+    // Check the messages and `n`.
     if (req.messages.len == 0) return error.NoMessages;
     if (req.messages.len > limits.openai_max_messages) return error.TooManyMessages;
 
@@ -546,6 +549,7 @@ fn parseChatRequestWith(
         dst.* = .{ .role = parseRole(src.role), .content = src.content };
     }
 
+    // Resolve the sampling, the budgets, and the thinking switch.
     const sampling = try parseSampling(req);
     const think_budget = try parseThinkBudget(req.thinking_token_budget);
 
@@ -593,9 +597,7 @@ fn wrongTypedField(arena: Allocator, object: std.json.ObjectMap) error{OutOfMemo
     return null;
 }
 
-/// Each guard reads as the range that it accepts, so a NaN fails it. The
-/// ranges are the binary wire guards, so the scheduler accepts every value
-/// that passes here.
+/// Check each sampling guard. See "Parse" in the header.
 fn parseSampling(req: types.ChatRequest) ReqError!SamplingFields {
     var out: SamplingFields = .{ .seed = req.seed };
     if (req.temperature) |t| {
@@ -629,8 +631,7 @@ fn parseSampling(req: types.ChatRequest) ReqError!SamplingFields {
         out.repetition_penalty = r;
     }
 
-    // The engine has no frequency penalty. The refusal tells the client that
-    // the server did not apply the value.
+    // The engine has no frequency penalty, so the refusal says the server did not apply it.
     if (req.frequency_penalty) |f| {
         if (f != 0) return error.FrequencyUnsupported;
     }
@@ -680,6 +681,26 @@ const ParseCase = struct {
 /// A body with one user message and the `extra` fields.
 fn withExtra(comptime extra: []const u8) []const u8 {
     return "{\"messages\":[{\"role\":\"user\",\"content\":\"x\"}]" ++ extra ++ "}";
+}
+
+/// A case whose body holds `extra`, and whose parse must fail with `err`.
+fn refuse(comptime extra: []const u8, err: ReqError) ParseCase {
+    return .{ .body = withExtra(extra), .want = .{ .err = err } };
+}
+
+/// A case whose body holds `extra`, and whose parse must refuse the type of `field`.
+fn refuseType(comptime extra: []const u8, field: ChatField) ParseCase {
+    return .{ .body = withExtra(extra), .want = .{ .err = error.BadField, .field = field } };
+}
+
+/// A case whose body holds `extra`, and whose think budget must read `budget`.
+fn budgetCase(comptime extra: []const u8, budget: ThinkBudget) ParseCase {
+    return .{ .body = withExtra(extra), .want = .{ .think_budget = budget } };
+}
+
+/// A case whose body holds `extra`, and whose thinking switch must read `flag`.
+fn thinkingCase(comptime extra: []const u8, flag: chat.ThinkingFlag) ParseCase {
+    return .{ .body = withExtra(extra), .want = .{ .thinking = flag } };
 }
 
 /// A request field maps to its value, or its refusal. A field that the
@@ -802,10 +823,22 @@ test "unknownName: the log prints the capped name with no raw control byte" {
 
 test "parseChatRequest: each field maps to its value, and a value past its edge is refused" {
     const kwargs_think = ",\"chat_template_kwargs\":{\"enable_thinking\":";
+    const body_full =
+        \\{"model":"m","messages":[{"role":"user","content":"hi"}],"frequency_penalty":0,"tools":[],"stop":["x"]}
+    ;
+    const body_two_messages =
+        \\{"messages":[{"role":"system","content":"s"},{"role":"user","content":"u"}],"stream":true,"temperature":0.7,"max_tokens":99999}
+    ;
+    const body_no_role =
+        \\{"messages":[{"content":"x"}]}
+    ;
+    const body_text_messages =
+        \\{"messages":"hi"}
+    ;
     const cases = [_]ParseCase{
         // Shape of the body.
         .{
-            .body = "{\"model\":\"m\",\"messages\":[{\"role\":\"user\",\"content\":\"hi\"}],\"frequency_penalty\":0,\"tools\":[],\"stop\":[\"x\"]}",
+            .body = body_full,
             .default_max_tokens = 128,
             .want = .{
                 .model = "m",
@@ -819,7 +852,7 @@ test "parseChatRequest: each field maps to its value, and a value past its edge 
             },
         },
         .{
-            .body = "{\"messages\":[{\"role\":\"system\",\"content\":\"s\"},{\"role\":\"user\",\"content\":\"u\"}],\"stream\":true,\"temperature\":0.7,\"max_tokens\":99999}",
+            .body = body_two_messages,
             .default_max_tokens = 128,
             .want = .{
                 .messages = 2,
@@ -830,38 +863,39 @@ test "parseChatRequest: each field maps to its value, and a value past its edge 
         },
         .{ .body = "{not json", .want = .{ .err = error.BadJson } },
         .{ .body = "{\"messages\":[]}", .want = .{ .err = error.NoMessages } },
-        .{ .body = "{\"messages\":[{\"role\":\"user\",\"content\":\"x\"}],\"n\":2}", .want = .{ .err = error.NTooLarge } },
+        refuse(",\"n\":2", error.NTooLarge),
         // Sampling fields: the edges, and the first value past each.
         .{ .body = withExtra(",\"temperature\":0") },
-        .{ .body = withExtra(",\"temperature\":-1"), .want = .{ .err = error.BadTemperature } },
+        refuse(",\"temperature\":-1", error.BadTemperature),
         .{ .body = withExtra(",\"top_p\":1") },
-        .{ .body = withExtra(",\"top_p\":0"), .want = .{ .err = error.BadTopP } },
-        .{ .body = withExtra(",\"top_p\":1.01"), .want = .{ .err = error.BadTopP } },
+        refuse(",\"top_p\":0", error.BadTopP),
+        refuse(",\"top_p\":1.01", error.BadTopP),
         .{ .body = withExtra(",\"top_k\":0"), .want = .{ .sampling = .{ .top_k = 0 } } },
         .{ .body = withExtra(",\"top_k\":256") },
-        .{ .body = withExtra(",\"top_k\":257"), .want = .{ .err = error.BadTopK } },
+        refuse(",\"top_k\":257", error.BadTopK),
         .{ .body = withExtra(",\"top_k\":-1"), .want = .{ .sampling = .{ .top_k = 0 } } },
-        .{ .body = withExtra(",\"top_k\":-2"), .want = .{ .err = error.BadTopK } },
+        refuse(",\"top_k\":-2", error.BadTopK),
         .{ .body = withExtra(",\"min_p\":0") },
         .{ .body = withExtra(",\"min_p\":1") },
-        .{ .body = withExtra(",\"min_p\":-0.01"), .want = .{ .err = error.BadMinP } },
-        .{ .body = withExtra(",\"min_p\":1.5"), .want = .{ .err = error.BadMinP } },
+        refuse(",\"min_p\":-0.01", error.BadMinP),
+        refuse(",\"min_p\":1.5", error.BadMinP),
         .{ .body = withExtra(",\"presence_penalty\":-2") },
         .{ .body = withExtra(",\"presence_penalty\":2") },
-        .{ .body = withExtra(",\"presence_penalty\":2.5"), .want = .{ .err = error.BadPresencePenalty } },
-        .{ .body = withExtra(",\"presence_penalty\":-3"), .want = .{ .err = error.BadPresencePenalty } },
+        refuse(",\"presence_penalty\":2.5", error.BadPresencePenalty),
+        refuse(",\"presence_penalty\":-3", error.BadPresencePenalty),
         .{ .body = withExtra(",\"repetition_penalty\":2") },
         .{ .body = withExtra(",\"repetition_penalty\":0.01") },
-        .{ .body = withExtra(",\"repetition_penalty\":0"), .want = .{ .err = error.BadRepetitionPenalty } },
-        .{ .body = withExtra(",\"repetition_penalty\":2.5"), .want = .{ .err = error.BadRepetitionPenalty } },
-        .{ .body = withExtra(",\"repetition_penalty\":-1"), .want = .{ .err = error.BadRepetitionPenalty } },
+        refuse(",\"repetition_penalty\":0", error.BadRepetitionPenalty),
+        refuse(",\"repetition_penalty\":2.5", error.BadRepetitionPenalty),
+        refuse(",\"repetition_penalty\":-1", error.BadRepetitionPenalty),
         .{ .body = withExtra(",\"frequency_penalty\":0") },
-        .{ .body = withExtra(",\"frequency_penalty\":0.5"), .want = .{ .err = error.FrequencyUnsupported } },
-        .{ .body = withExtra(",\"frequency_penalty\":-2"), .want = .{ .err = error.FrequencyUnsupported } },
-        .{ .body = withExtra(",\"frequency_penalty\":7"), .want = .{ .err = error.FrequencyUnsupported } },
+        refuse(",\"frequency_penalty\":0.5", error.FrequencyUnsupported),
+        refuse(",\"frequency_penalty\":-2", error.FrequencyUnsupported),
+        refuse(",\"frequency_penalty\":7", error.FrequencyUnsupported),
         .{
             .body = withExtra(",\"temperature\":0.5,\"top_k\":40,\"top_p\":0.9,\"min_p\":0.05," ++
-                "\"presence_penalty\":1.5,\"repetition_penalty\":1.1,\"seed\":7,\"frequency_penalty\":0"),
+                "\"presence_penalty\":1.5,\"repetition_penalty\":1.1,\"seed\":7," ++
+                "\"frequency_penalty\":0"),
             .want = .{ .sampling = .{
                 .temperature = 0.5,
                 .top_k = 40,
@@ -873,30 +907,30 @@ test "parseChatRequest: each field maps to its value, and a value past its edge 
             } },
         },
         // The think budget: -1 and absent are the server value, 0 is off, N is N.
-        .{ .body = withExtra(""), .want = .{ .think_budget = .server } },
-        .{ .body = withExtra(",\"thinking_token_budget\":null"), .want = .{ .think_budget = .server } },
-        .{ .body = withExtra(",\"thinking_token_budget\":-1"), .want = .{ .think_budget = .server } },
-        .{ .body = withExtra(",\"thinking_token_budget\":0"), .want = .{ .think_budget = .off } },
-        .{ .body = withExtra(",\"thinking_token_budget\":64"), .want = .{ .think_budget = .{ .tokens = 64 } } },
-        .{ .body = withExtra(",\"thinking_token_budget\":-2"), .want = .{ .err = error.BadThinkingBudget } },
-        .{ .body = withExtra(budgetField(limits.max_model_ctx)), .want = .{ .think_budget = .{ .tokens = limits.max_model_ctx } } },
-        .{ .body = withExtra(budgetField(limits.max_model_ctx + 1)), .want = .{ .err = error.BadThinkingBudget } },
+        budgetCase("", .server),
+        budgetCase(",\"thinking_token_budget\":null", .server),
+        budgetCase(",\"thinking_token_budget\":-1", .server),
+        budgetCase(",\"thinking_token_budget\":0", .off),
+        budgetCase(",\"thinking_token_budget\":64", .{ .tokens = 64 }),
+        refuse(",\"thinking_token_budget\":-2", error.BadThinkingBudget),
+        budgetCase(budgetField(limits.max_model_ctx), .{ .tokens = limits.max_model_ctx }),
+        refuse(budgetField(limits.max_model_ctx + 1), error.BadThinkingBudget),
         // The budget lives at the top level only. The template switches carry no budget.
-        .{ .body = withExtra(",\"chat_template_kwargs\":{\"thinking_token_budget\":0}"), .want = .{ .think_budget = .server } },
+        budgetCase(",\"chat_template_kwargs\":{\"thinking_token_budget\":0}", .server),
         // The thinking switch.
-        .{ .body = withExtra(""), .want = .{ .thinking = .auto } },
-        .{ .body = withExtra(",\"chat_template_kwargs\":null"), .want = .{ .thinking = .auto } },
-        .{ .body = withExtra(",\"chat_template_kwargs\":{}"), .want = .{ .thinking = .auto } },
-        .{ .body = withExtra(kwargs_think ++ "null}"), .want = .{ .thinking = .auto } },
-        .{ .body = withExtra(kwargs_think ++ "true}"), .want = .{ .thinking = .on } },
-        .{ .body = withExtra(kwargs_think ++ "false,\"other\":1}"), .want = .{ .thinking = .off } },
+        thinkingCase("", .auto),
+        thinkingCase(",\"chat_template_kwargs\":null", .auto),
+        thinkingCase(",\"chat_template_kwargs\":{}", .auto),
+        thinkingCase(kwargs_think ++ "null}", .auto),
+        thinkingCase(kwargs_think ++ "true}", .on),
+        thinkingCase(kwargs_think ++ "false,\"other\":1}", .off),
         // A known field with a value of the wrong type is refused by name.
-        .{ .body = withExtra(kwargs_think ++ "\"yes\"}"), .want = .{ .err = error.BadField, .field = .chat_template_kwargs } },
-        .{ .body = withExtra(",\"temperature\":\"hot\""), .want = .{ .err = error.BadField, .field = .temperature } },
-        .{ .body = withExtra(",\"max_tokens\":4294967296"), .want = .{ .err = error.BadField, .field = .max_tokens } },
-        .{ .body = withExtra(",\"stream\":null"), .want = .{ .err = error.BadField, .field = .stream } },
-        .{ .body = "{\"messages\":[{\"content\":\"x\"}]}", .want = .{ .err = error.BadField, .field = .messages } },
-        .{ .body = "{\"messages\":\"hi\"}", .want = .{ .err = error.BadField, .field = .messages } },
+        refuseType(kwargs_think ++ "\"yes\"}", .chat_template_kwargs),
+        refuseType(",\"temperature\":\"hot\"", .temperature),
+        refuseType(",\"max_tokens\":4294967296", .max_tokens),
+        refuseType(",\"stream\":null", .stream),
+        .{ .body = body_no_role, .want = .{ .err = error.BadField, .field = .messages } },
+        .{ .body = body_text_messages, .want = .{ .err = error.BadField, .field = .messages } },
         .{ .body = "[1]", .want = .{ .err = error.BadJson } },
     };
     for (cases, 0..) |c, i| {
@@ -908,17 +942,24 @@ test "parseChatRequest: each field maps to its value, and a value past its edge 
 
 test "reqErrorToHttp: every field refusal is a 400 that names the field and its range" {
     const Case = struct { e: ReqError, want: []const u8 };
+    const want_no_forced_close = "thinking_token_budget above 0 does not apply to this model, " ++
+        "because the server has no forced close for its think block";
+    const want_no_thinking_mode = "thinking_token_budget above 0 does not apply to this model, " ++
+        "because its chat template has no thinking mode";
+    const want_repetition = "repetition_penalty must be more than 0 and at most 2";
+    const want_frequency = "frequency_penalty is not supported. The only accepted value is 0";
+    const want_budget_range = "thinking_token_budget must be -1, 0, or a count from 1 to 262144";
     const cases = [_]Case{
         .{ .e = error.BadTemperature, .want = "temperature must be a finite number of 0 or more" },
         .{ .e = error.BadTopP, .want = "top_p must be more than 0 and at most 1" },
         .{ .e = error.BadTopK, .want = "top_k must be -1 or in the range 0 to 256" },
-        .{ .e = error.BudgetNoForcedClose, .want = "thinking_token_budget above 0 does not apply to this model, because the server has no forced close for its think block" },
+        .{ .e = error.BudgetNoForcedClose, .want = want_no_forced_close },
         .{ .e = error.BadMinP, .want = "min_p must be in the range 0 to 1" },
         .{ .e = error.BadPresencePenalty, .want = "presence_penalty must be in the range -2 to 2" },
-        .{ .e = error.BadRepetitionPenalty, .want = "repetition_penalty must be more than 0 and at most 2" },
-        .{ .e = error.FrequencyUnsupported, .want = "frequency_penalty is not supported. The only accepted value is 0" },
-        .{ .e = error.BadThinkingBudget, .want = "thinking_token_budget must be -1, 0, or a count from 1 to 262144" },
-        .{ .e = error.BudgetUnsupported, .want = "thinking_token_budget above 0 does not apply to this model, because its chat template has no thinking mode" },
+        .{ .e = error.BadRepetitionPenalty, .want = want_repetition },
+        .{ .e = error.FrequencyUnsupported, .want = want_frequency },
+        .{ .e = error.BadThinkingBudget, .want = want_budget_range },
+        .{ .e = error.BudgetUnsupported, .want = want_no_thinking_mode },
     };
     const bad_top_k = reqErrorToHttp(error.BadField, .{ .field = .top_k });
     try std.testing.expectEqual(@as(u16, 400), bad_top_k.status);
@@ -1279,8 +1320,8 @@ fn checkReasoningSplit(_: void, seed: u64) anyerror!void {
     var prng = std.Random.DefaultPrng.init(seed);
     const r = prng.random();
     const arena = arena_state.allocator();
-    // The shapes the scheduler emits: an open turn starts with the echo
-    // and can close, and a closed turn carries no tag.
+
+    // Build the shapes the scheduler emits: an open turn echoes the tag and can close.
     const open = r.boolean();
     const closes = open and r.boolean();
     var events: std.ArrayList(TestEvent) = .empty;
@@ -1310,6 +1351,7 @@ fn checkReasoningSplit(_: void, seed: u64) anyerror!void {
         }
     }
 
+    // Check the split against the model.
     const want_content = if (closes) std.mem.trimStart(u8, tail.items, "\n") else tail.items;
     const dropped = tail.items.len - want_content.len;
 
@@ -1330,7 +1372,7 @@ fn checkReasoningSplit(_: void, seed: u64) anyerror!void {
     try std.testing.expectEqualStrings(kept, joined);
 }
 
-test "ReasoningSplit property: reasoning then content is the stream without the tags and the dropped newlines" {
+test "ReasoningSplit property: the two fields equal the stream minus tags and dropped newlines" {
     try prop.forAll(
         .{ .site = 0x5E1D_7A65, .cases = 2000 },
         {},
@@ -1363,10 +1405,14 @@ fn refusedField(e: ReqError, diag: Diag) []const u8 {
     };
 }
 
+const valid_messages =
+    \\[{"role":"system","content":"s"},{"role":"user","content":"u"}]
+;
+
 /// Each field of a chat body with a value that the parse accepts.
 const body_fields = [_]struct { name: []const u8, valid: []const u8 }{
     .{ .name = "model", .valid = "\"m\"" },
-    .{ .name = "messages", .valid = "[{\"role\":\"system\",\"content\":\"s\"},{\"role\":\"user\",\"content\":\"u\"}]" },
+    .{ .name = "messages", .valid = valid_messages },
     .{ .name = "temperature", .valid = "0.7" },
     .{ .name = "top_p", .valid = "0.9" },
     .{ .name = "top_k", .valid = "40" },
@@ -1427,10 +1473,11 @@ fn checkChatMutation(_: void, seed: u64) anyerror!void {
 
     const arena = arena_state.allocator();
 
+    // Build a body whose fields keep their value, take an edge value, or drop out.
     var body: std.ArrayList(u8) = .empty;
     try body.append(arena, '{');
     var first = true;
-    var edged: std.StaticBitSet(body_fields.len) = .initEmpty();
+    var edged: std.StaticBitSet(body_fields.len) = .empty;
     for (body_fields, 0..) |field, i| {
         const value = switch (r.uintLessThan(u8, 6)) {
             0 => continue,
@@ -1450,6 +1497,8 @@ fn checkChatMutation(_: void, seed: u64) anyerror!void {
     }
 
     try body.append(arena, '}');
+
+    // Corrupt some bodies with raw byte writes.
     const raw = r.uintLessThan(u8, 4) == 0;
     if (raw) {
         for (0..1 + r.uintLessThan(usize, 4)) |_| {
@@ -1457,15 +1506,15 @@ fn checkChatMutation(_: void, seed: u64) anyerror!void {
         }
     }
 
+    // Parse. A refusal must name its field.
     const window = 1 + r.uintLessThan(u32, 4096);
     const default_max = 1 + r.uintLessThan(u32, window);
     var diag: Diag = .{};
     const req = parseChatRequest(arena, body.items, default_max, window, &diag) catch |err| {
         const http = reqErrorToHttp(err, diag);
         try std.testing.expectEqual(@as(u16, 400), http.status);
-        try std.testing.expect(std.mem.indexOf(u8, http.message, refusedField(err, diag)) != null);
-        // A body with whole JSON syntax is never malformed JSON, and a wrong
-        // type refusal names a field that took an edge value.
+        try std.testing.expect(std.mem.find(u8, http.message, refusedField(err, diag)) != null);
+        // Whole JSON syntax is never malformed, and a wrong type names an edged field.
         if (!raw) {
             try std.testing.expect(err != error.BadJson);
         }
@@ -1481,6 +1530,8 @@ fn checkChatMutation(_: void, seed: u64) anyerror!void {
 
         return;
     };
+
+    // Resolve the accepted request for every model kind.
     try std.testing.expect(req.messages.len >= 1);
     try std.testing.expect(req.max_tokens >= 1 and req.max_tokens <= window);
     const kinds = [_]chat.Kind{
@@ -1501,7 +1552,7 @@ fn checkChatMutation(_: void, seed: u64) anyerror!void {
                 const http = reqErrorToHttp(err, .{});
                 try std.testing.expectEqual(@as(u16, 400), http.status);
                 try std.testing.expect(
-                    std.mem.indexOf(u8, http.message, refusedField(err, .{})) != null,
+                    std.mem.find(u8, http.message, refusedField(err, .{})) != null,
                 );
                 continue;
             };
@@ -1516,7 +1567,7 @@ fn checkChatMutation(_: void, seed: u64) anyerror!void {
     }
 }
 
-test "property: a mutated chat body is a 400 that names its field, or a request every resolver accepts" {
+test "property: a mutated body is a 400 that names its field, or a request all resolvers accept" {
     try prop.forAll(
         .{ .site = 0x0A1_B0D1, .cases = 1500 },
         {},

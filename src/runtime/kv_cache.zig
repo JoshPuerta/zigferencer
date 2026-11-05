@@ -1,18 +1,26 @@
-//! Static-allocation KV cache for positional attention. Both families store
-//! their attention rows in it. One flat byte slab holds both halves (K then
-//! V), each shaped `[n_layers][max_seq][n_kv_heads * head_dim]` and addressed
-//! by slice math.
-//! `init` sizes the slab once from (n_layers, n_kv_heads, head_dim, max_seq,
-//! kv_dtype), so there is no per-step churn. Ops never see the struct. They get
-//! plain typed K/V slices for the current decode step, because boundaries are
-//! values.
+//! Static-allocation KV cache for positional attention. Both families store their attention rows
+//! in it. One flat byte slab holds both halves (K then V), each shaped
+//! `[n_layers][max_seq][n_kv_heads * head_dim]` and addressed by slice math. `init` sizes the slab
+//! once from (n_layers, n_kv_heads, head_dim, max_seq, kv_dtype), so there is no per-step churn.
+//! Ops never see the struct. They get plain typed K/V slices for the current decode step, because
+//! boundaries are values.
 //!
-//! The slab is bytes tagged with the element type it was framed at. The `As`
-//! accessors take that element type and hand back a typed view. The f32-named
-//! accessors are the same views pinned to f32.
+//! Tag. The slab is bytes tagged with the element type it was framed at. The `As` accessors take
+//! that element type and hand back a typed view, and they assert against the tag. A view at any
+//! other type is a framing bug. The f32-named accessors are the same views pinned to f32. The
+//! 4-byte alignment of the slab covers every element type the tag can name.
 //!
-//! Slab layout: one flat slab, K half then V half. Each (layer, position) cell
-//! is one row of `n_kv_heads * head_dim` elements.
+//! Byte ranges. The transport family reads bytes because a blob is storage bytes. Evict, restore,
+//! and the prefix snapshots move whatever the rows are framed at, so they never name an element
+//! type. A byte range and a typed view of the same rows share `byteOff`, so they address the same
+//! bytes by construction.
+//!
+//! Clone. `copyFrom` copies the leading positions of a session fork. Attention reads only the
+//! `0..=pos` range of the owning session, the same rewrite-before-read argument that lets slot
+//! reuse skip the scrub. The copy is dtype-blind, because both slabs frame their rows alike.
+//!
+//! Slab layout. One flat slab, K half then V half. Each (layer, position) cell is one row of
+//! `n_kv_heads * head_dim` elements.
 //!
 //!     |<-------------- K half -------------->|<-------------- V half ------------>|
 //!     +----------------+----------------+-...-+----------------+-...
@@ -39,12 +47,9 @@ pub const KvCache = struct {
     n_kv_heads: u32,
     head_dim: u32,
     max_seq: u32,
-    /// Storage: `[2][n_layers][max_seq][n_kv_heads][head_dim]` elements of
-    /// `kv_dtype`, flattened to bytes. The 4-byte alignment covers every
-    /// element type the tag can name, so a typed view never needs a fixup.
+    /// `[2][n_layers][max_seq][n_kv_heads][head_dim]` elements of `kv_dtype`, flattened to bytes.
     storage: []align(4) u8,
-    /// The element type the rows are framed at. A view at any other type is a
-    /// framing bug, so the accessors assert against this tag.
+    /// The element type the rows are framed at. The header describes the tag.
     kv_dtype: dtype.KvDtype,
     /// Elements per (layer, seq_pos): n_kv_heads * head_dim.
     per_step_elems: u32,
@@ -72,12 +77,13 @@ pub const KvCache = struct {
         const per_layer_wide: u64 = @as(u64, max_seq) * per_step_elems;
         std.debug.assert(per_layer_wide <= std.math.maxInt(u32));
         const per_layer_elems: u32 = @intCast(per_layer_wide);
-        // Rows, not elements: the slab is a K row and a V row for every
-        // (layer, position), and the dtype prices one row.
+
+        // Price whole rows: a K row and a V row for every (layer, position).
         const n_rows: u64 = 2 * @as(u64, n_layers) * max_seq;
         const total_bytes: usize = @intCast(n_rows * kv_dtype.rowBytes(per_step_elems));
         const storage = try arena.alignedAlloc(u8, .@"4", total_bytes);
         @memset(storage, 0);
+
         return .{
             .n_layers = n_layers,
             .n_kv_heads = n_kv_heads,
@@ -96,9 +102,7 @@ pub const KvCache = struct {
 
     // -- typed views --------------------------------------------------------
 
-    /// Slice of K-cache rows for `layer` covering positions `0..=pos`, viewed at
-    /// `E`. Each row is `n_kv_heads * head_dim` elements. Returned length =
-    /// `(pos + 1) * per_step_elems`.
+    /// K rows of `layer` at `0..=pos`, viewed at `E`. Length is `(pos + 1) * per_step_elems`.
     pub fn kSliceAs(self: *const KvCache, comptime E: type, layer: u32, pos: u32) []const E {
         std.debug.assert(layer < self.n_layers);
         std.debug.assert(pos < self.max_seq);
@@ -114,8 +118,7 @@ pub const KvCache = struct {
         return self.viewConst(E, self.vBase(layer), (@as(usize, pos) + 1) * self.per_step_elems);
     }
 
-    /// Mutable K destination row for (layer, pos), viewed at `E`. Length =
-    /// per_step_elems.
+    /// Mutable K destination row for (layer, pos), viewed at `E`. Length is `per_step_elems`.
     pub fn kDstAs(self: *KvCache, comptime E: type, layer: u32, pos: u32) []E {
         std.debug.assert(layer < self.n_layers);
         std.debug.assert(pos < self.max_seq);
@@ -155,10 +158,7 @@ pub const KvCache = struct {
 
     // -- byte ranges --------------------------------------------------------
 
-    /// Byte range of positions `0..n_rows` of one layer's K half. The transport
-    /// family reads bytes because a blob is storage bytes. Evict, restore, and
-    /// the prefix snapshots move whatever the rows are framed at, so they must
-    /// never name an element type.
+    /// Byte range of positions `0..n_rows` of one layer's K half. The header explains why bytes.
     pub fn kRowsBytes(self: *const KvCache, layer: u32, n_rows: u32) []const u8 {
         std.debug.assert(layer < self.n_layers);
 
@@ -188,11 +188,8 @@ pub const KvCache = struct {
 
     // -- clone --------------------------------------------------------------
 
-    /// Copy the `n_pos` leading positions of every layer's K and V rows from
-    /// `source` (a session fork). Rows past `n_pos` keep their old bytes.
-    /// Attention reads only the `0..=pos` range of the owning session, the same
-    /// rewrite-before-read argument that lets slot reuse skip the scrub.
-    /// The copy is dtype-blind, because both slabs frame their rows the same way.
+    /// Copy the `n_pos` leading positions of every layer's K and V rows from `source`.
+    /// Rows past `n_pos` keep their old bytes. Both slabs must have the same shape and dtype.
     pub fn copyFrom(self: *KvCache, source: *const KvCache, n_pos: u32) void {
         std.debug.assert(self.storage.len == source.storage.len);
         std.debug.assert(self.per_step_elems == source.per_step_elems);
@@ -213,33 +210,29 @@ pub const KvCache = struct {
     // -- addressing ---------------------------------------------------------
 
     fn kBase(self: *const KvCache, layer: u32) usize {
-        // K-half starts at offset 0. The layer block stride is per_layer_elems.
+        // The K half starts at offset 0.
         return @as(usize, layer) * self.per_layer_elems;
     }
 
     fn vBase(self: *const KvCache, layer: u32) usize {
-        // V-half starts after all K-layers.
+        // The V half starts after all K layers.
         return @as(
             usize,
             self.n_layers,
         ) * self.per_layer_elems + @as(usize, layer) * self.per_layer_elems;
     }
 
-    /// Bytes one stored element occupies: 4 at f32, 2 at f16. It comes from the
-    /// one row-cost function, so this file carries no element width of its own.
+    /// Bytes one stored element occupies: 4 at f32, 2 at f16. The row-cost function owns the width.
     fn elemBytes(self: *const KvCache) usize {
         return @intCast(self.kv_dtype.rowBytes(1));
     }
 
-    /// Byte offset of element index `elems`. Every byte address here comes from
-    /// this one product, which keeps the element-stride vocabulary above intact.
+    /// Byte offset of element index `elems`. Every byte address in this file comes from here.
     fn byteOff(self: *const KvCache, elems: usize) usize {
         return elems * self.elemBytes();
     }
 
-    /// The byte range of `n_rows` rows starting at element base `base`. It
-    /// shares `byteOff` with the typed views, so a transport range and a typed
-    /// view of the same rows address the same bytes by construction.
+    /// The byte range of `n_rows` rows starting at element base `base`.
     fn rangeConst(self: *const KvCache, base: usize, n_rows: u32) []const u8 {
         std.debug.assert(n_rows >= 1);
         std.debug.assert(n_rows <= self.max_seq);
@@ -258,8 +251,7 @@ pub const KvCache = struct {
         )];
     }
 
-    /// The one tag check. Every typed view funnels through `viewConst` or
-    /// `viewMut`, so no accessor can hand out a view the tag does not name.
+    /// The one tag check. Every typed view funnels through `viewConst` or `viewMut`.
     fn assertTag(self: *const KvCache, comptime E: type) void {
         std.debug.assert(self.kv_dtype == tagOf(E));
     }
@@ -284,8 +276,7 @@ pub const KvCache = struct {
 
 // -- helpers ----------------------------------------------------------------
 
-/// The tag a view element type names. Any other element type fails to compile,
-/// which keeps the storage set and the view set one set.
+/// The tag a view element type names. Any other element type fails to compile.
 fn tagOf(comptime E: type) dtype.KvDtype {
     if (E == f32) return .f32;
     if (E == f16) return .f16;
@@ -316,9 +307,7 @@ test "KvCache shapes and slice math" {
     try std.testing.expectEqual(@as(f32, 100), k_view[2 * 12]); // pos 2 starts at offset 24
 }
 
-// A view at the wrong element type trips the `assertTag` precondition, the same
-// way an out-of-range layer trips its own. An assert failure is not a testable
-// outcome here, so that check stays a precondition and gets no case.
+// A view at the wrong element type trips `assertTag`. An assert failure is not testable here.
 test "KvCache at f16 halves the slab and round-trips a row" {
     const gpa = std.testing.allocator;
     var arena_state = std.heap.ArenaAllocator.init(gpa);
@@ -352,8 +341,7 @@ test "KvCache byte ranges price the rows at the storage dtype" {
 
     const arena = arena_state.allocator();
 
-    // The transport family sizes a blob from these ranges, so a range must
-    // halve with the dtype and must cover exactly the rows the typed view does.
+    // The transport family sizes a blob from these ranges. A range must halve with the dtype.
     var wide = try KvCache.init(arena, 2, 3, 4, 8, .f32);
     var narrow = try KvCache.init(arena, 2, 3, 4, 8, .f16);
     try std.testing.expectEqual(@as(usize, 3 * 12 * 4), wide.kRowsBytes(1, 3).len);

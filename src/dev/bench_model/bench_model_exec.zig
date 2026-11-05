@@ -3,18 +3,19 @@
 //! runner type, so each family and each placement reach the same body.
 
 const std = @import("std");
+const zigferencer = @import("zigferencer");
 const Io = std.Io;
 const build_options = @import("build_options");
 
-const cli = @import("command.zig");
+const context = zigferencer.cli.context;
 const common = @import("bench_model_common.zig");
 const report = @import("bench_model_report.zig");
-const bpe = @import("../core/tokenizer/bpe.zig");
-const chat_mod = @import("../core/chat.zig");
-const span = @import("../core/span.zig");
-const vocab_mod = @import("../core/tokenizer/vocab.zig");
-const generate = @import("../runtime/generate.zig");
-const step_row = @import("../runtime/step_row.zig");
+const bpe = zigferencer.bpe;
+const chat_mod = zigferencer.chat;
+const span = zigferencer.span;
+const vocab_mod = zigferencer.vocab;
+const generate = zigferencer.generate;
+const step_row = zigferencer.step_row;
 
 const Bench = common.Bench;
 const RunResult = common.RunResult;
@@ -88,7 +89,7 @@ pub fn warmup(runner: anytype, prompt_ids: []const u32) !void {
 /// Prefill the prompt from position zero, then decode up to `turn.decode_len`
 /// tokens. The hash takes every generated token, so it is the determinism and
 /// cross-backend signature of the run.
-pub fn runOnce(runner: anytype, turn: Turn, ctx: cli.Context) !RunResult {
+pub fn runOnce(runner: anytype, turn: Turn, ctx: context.Context) !RunResult {
     std.debug.assert(turn.prompt_ids.len >= 1);
 
     // TTFT spans the prefill and the first token.
@@ -153,15 +154,15 @@ pub fn runSeries(
 
 /// Print `results` in the format of the flags.
 pub fn printReport(b: *const Bench, prompt_len: usize, results: []const RunResult) !void {
-    const io = b.ctx.io;
+    const w = &b.ctx.stdout.interface;
     const name = b.model.pub_name;
     const decode_len = b.opt.max_tokens;
 
     if (b.opt.json) {
-        return report.printJson(io, name, prompt_len, decode_len, results, b.policy);
+        return report.printJson(w, name, prompt_len, decode_len, results, b.policy);
     }
 
-    return report.printTable(io, name, b.opt.prompt, prompt_len, decode_len, results, b.policy);
+    return report.printTable(w, name, b.opt.prompt, prompt_len, decode_len, results, b.policy);
 }
 
 // -- helpers ----------------------------------------------------------------

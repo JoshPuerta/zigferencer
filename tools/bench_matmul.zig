@@ -1,42 +1,59 @@
-//! Matmul benchmarks: the Q8_0 decode kernel and its CPU and GPU variants, the
-//! Q4_0 decode kernel, and the batched (prefill) Q8_0 kernels. The matmul is the
-//! bandwidth-bound op that decides decode speed, so every variant reports
-//! GFLOP/s next to its relative error against `naive`, the scalar reference.
-//! `runQ80` owns the variant table and the eligibility report that the decode
-//! matmul rows share.
+//! Matmul benchmarks: the Q8_0 decode kernel and its CPU and GPU variants, the Q4_0 decode
+//! kernel, and the batched (prefill) Q8_0 kernels. The matmul is the bandwidth-bound op that
+//! decides decode speed, so every variant reports GFLOP/s next to its relative error against
+//! `naive`, the scalar reference. `runQ80` owns the variant table and the eligibility report
+//! that the decode matmul rows share.
+//!
+//! Cases. Three hidden-dim scales span the supported model families: 576 (SmolLM2), 2048
+//! (Llama-3.2-1B and Qwen3.5-2B), and 4096 (Llama-3.1-8B and Qwen3.5-9B). Each scale covers a
+//! square (attn_q), a wide-out rectangle (ffn_gate), a wide-in rectangle (ffn_down), and the
+//! very wide lm_head. The four shapes show how a variant scales: a narrow shape underuses the
+//! parallelism of the GPU, and a wide one lets it stretch. The kernel reads (in, out) and not
+//! the source model, so each label states the shape alone.
+//!
+//! Skipped variants. A variant declines a case it cannot serve, such as an LDS-staged input
+//! kernel at k past the LDS capacity. The bench buffers a `skip(<reason>)` row and goes on.
+//!
+//! Q4_0. Decode is bandwidth-bound, and Q4_0 reads about half the weight bytes of Q8_0. On the
+//! large shapes the Q4_0 GFLOP/s therefore reaches about 2x the Q8_0 GFLOP/s.
+//!
+//! Batched. `benchBatchedMatmul` runs B input rows per dispatch, so the weight streams once for
+//! B outputs. Compare its GFLOP/s against the decode `vk_q8_0_re` row to see the prefill
+//! amortization. It is GPU-only, because no batched CPU op exists. The CPU reference is the
+//! naive kernel looped over the B rows.
 
 const std = @import("std");
 const builtin = @import("builtin");
 const build_options = @import("build_options");
-const z = @import("zigferencer");
-const Tensor = z.tensor.Tensor;
-const op_requires = z.op_requires;
+const zigferencer = @import("zigferencer");
+const Tensor = zigferencer.tensor.Tensor;
+const op_requires = zigferencer.op_requires;
+const ops_vulkan = zigferencer.ops_vulkan;
 
-const h = @import("bench_util.zig");
-const Case = h.Case;
-const cpuRow = h.cpuRow;
-const gpuRow = h.gpuRow;
-const rawRow = h.rawRow;
-const skipRow = h.skipRow;
-const flush = h.flush;
-const hashOut = h.hashOut;
-const computeErrors = h.computeErrors;
-const Errors = h.Errors;
-const printSectionHeader = h.printSectionHeader;
-const pickIters = h.pickIters;
-const f32_flops_per_mac = h.f32_flops_per_mac;
+const bench_util = @import("bench_util.zig");
+const Case = bench_util.Case;
+const cpuRow = bench_util.cpuRow;
+const gpuRow = bench_util.gpuRow;
+const rawRow = bench_util.rawRow;
+const skipRow = bench_util.skipRow;
+const flush = bench_util.flush;
+const hashOut = bench_util.hashOut;
+const computeErrors = bench_util.computeErrors;
+const Errors = bench_util.Errors;
+const printSectionHeader = bench_util.printSectionHeader;
+const pickIters = bench_util.pickIters;
+const f32_flops_per_mac = bench_util.f32_flops_per_mac;
 
 // -- types ------------------------------------------------------------------
 
-/// Where the kernel lives. CPU side is a function pointer with the signature
-/// `linearF32Q80`. GPU side is one of the `*LinearQ80*` kernel structs on the
-/// heap-owned Runner. The GPU branches consume a `*const Q80Weight` built once
-/// per case.
+/// Where the kernel lives: a function pointer with the `linearF32Q80` signature, or a
+/// `*LinearQ80*` kernel struct on the heap-owned Runner. GPU branches use a `Q80Weight` built
+/// once per case.
 const Kernel = union(enum) {
     cpu: *const fn ([]const f32, Tensor, []f32) void,
-    gpu_q8_0: if (build_options.use_vulkan) *z.ops_vulkan.LinearQ80 else void,
-    gpu_q8_0_reduce: if (build_options.use_vulkan) *z.ops_vulkan.LinearQ80Reduce else void,
-    gpu_q8_0_subgroup: if (build_options.use_vulkan) *z.ops_vulkan.LinearQ80Subgroup else void,
+    gpu_q8_0: if (build_options.use_vulkan) *ops_vulkan.LinearQ80 else void,
+    gpu_q8_0_reduce: if (build_options.use_vulkan) *ops_vulkan.LinearQ80Reduce else void,
+    gpu_q8_0_subgroup: if (build_options.use_vulkan) *ops_vulkan.LinearQ80Subgroup else void,
 };
 
 const Variant = struct {
@@ -50,53 +67,55 @@ const BenchResult = struct { ms: f64, gflops: f64, hash: u64 };
 
 // -- api --------------------------------------------------------------------
 
-/// Q8_0 decode matmul across three shape scales, every eligible variant per
-/// case. Builds the variant table (borrowing GPU kernels from `runner`), prints
-/// the eligibility report, then walks the cases.
+/// Q8_0 decode matmul across three shape scales, every eligible variant per case. It borrows
+/// the GPU kernels from `runner`.
 pub fn runQ80(gpa: std.mem.Allocator, io: std.Io, runner: anytype) !void {
+    // Build the variant table with the CPU variants.
     var variants_buf: [16]Variant = undefined;
     var n: usize = 0;
     variants_buf[n] = .{
         .name = "naive",
         .desc = "scalar f32 reference",
-        .requires = z.ops.requires,
-        .kernel = .{ .cpu = z.ops.linearF32Q80 },
+        .requires = zigferencer.ops.requires,
+        .kernel = .{ .cpu = zigferencer.ops.linearF32Q80 },
     };
     n += 1;
     variants_buf[n] = .{
         .name = "simd",
         .desc = "@Vector(8), AVX2 + FMA",
-        .requires = z.ops_simd.requires,
-        .kernel = .{ .cpu = z.ops_simd.linearF32Q80 },
+        .requires = zigferencer.ops_simd.requires,
+        .kernel = .{ .cpu = zigferencer.ops_simd.linearF32Q80 },
     };
     n += 1;
     variants_buf[n] = .{
         .name = "simd_pf",
         .desc = "register-blocked (MR=4) + prefetch",
-        .requires = z.ops_simd_pf.requires,
-        .kernel = .{ .cpu = z.ops_simd_pf.linearF32Q80 },
+        .requires = zigferencer.ops_simd_pf.requires,
+        .kernel = .{ .cpu = zigferencer.ops_simd_pf.linearF32Q80 },
     };
     n += 1;
+
+    // Add the GPU variants.
     if (comptime build_options.use_vulkan) {
         if (runner) |r| {
             variants_buf[n] = .{
                 .name = "vk_q8_0",
                 .desc = "GPU: 1 invocation per output row",
-                .requires = z.ops_vulkan.LinearQ80.requires,
+                .requires = zigferencer.ops_vulkan.LinearQ80.requires,
                 .kernel = .{ .gpu_q8_0 = &r.linear_q8_0 },
             };
             n += 1;
             variants_buf[n] = .{
                 .name = "vk_q8_0_re",
                 .desc = "GPU: workgroup-per-row LDS reduce",
-                .requires = z.ops_vulkan.LinearQ80Reduce.requires,
+                .requires = zigferencer.ops_vulkan.LinearQ80Reduce.requires,
                 .kernel = .{ .gpu_q8_0_reduce = &r.linear_q8_0_reduce },
             };
             n += 1;
             variants_buf[n] = .{
                 .name = "vk_q8_0_sg",
                 .desc = "GPU: subgroup reduce, LDS-staged input",
-                .requires = z.ops_vulkan.LinearQ80Subgroup.requires,
+                .requires = zigferencer.ops_vulkan.LinearQ80Subgroup.requires,
                 .kernel = .{ .gpu_q8_0_subgroup = &r.linear_q8_0_subgroup },
             };
             n += 1;
@@ -105,17 +124,11 @@ pub fn runQ80(gpa: std.mem.Allocator, io: std.Io, runner: anytype) !void {
 
     const variants = variants_buf[0..n];
 
+    // Print the eligibility report and the table header.
     printEligibility(variants);
     printSectionHeader("linearF32Q80 (matmul)");
 
-    // Three hidden-dim scales span the supported model families: small (576),
-    // medium (2048), and large (4096). SmolLM2 is about 576. Llama-3.2-1B and
-    // Qwen3.5-2B are about 2048. Llama-3.1-8B and Qwen3.5-9B are about 4096.
-    // Each scale covers a square (attn_q), a wide-out rectangle (ffn_gate), a
-    // wide-in rectangle (ffn_down), and the very wide lm_head. The four shapes
-    // expose how each variant scales: a narrow shape underuses the parallelism
-    // of the GPU, and a wide one lets it stretch. Each label states the shape
-    // alone, because the kernel reads (in, out) and not the source model.
+    // Walk the shape cases.
     const cases = [_]Case{
         .{ .label = "attn_q    576 -> 576", .in = 576, .out = 576 },
         .{ .label = "ffn_gate  576 -> 1536", .in = 576, .out = 1536 },
@@ -132,9 +145,8 @@ pub fn runQ80(gpa: std.mem.Allocator, io: std.Io, runner: anytype) !void {
     };
 
     for (cases) |c| {
-        // Per-case fixtures: input, CPU-layout weight bytes, the Tensor wrapper
-        // (for CPU kernels), and a `Q80Weight` upload (for GPU kernels). Built
-        // once and reused across every eligible variant in this case.
+        // Build the fixtures once per case: input, weight bytes, the Tensor wrapper for CPU
+        // kernels, and the `Q80Weight` upload for GPU kernels.
         std.debug.assert(c.in % 32 == 0);
 
         const row_bytes = (c.in / 32) * 34;
@@ -157,7 +169,7 @@ pub fn runQ80(gpa: std.mem.Allocator, io: std.Io, runner: anytype) !void {
         };
 
         const GpuWeightOpt = if (build_options.use_vulkan)
-            ?z.ops_vulkan.Q80Weight
+            ?zigferencer.ops_vulkan.Q80Weight
         else
             void;
 
@@ -170,10 +182,16 @@ pub fn runQ80(gpa: std.mem.Allocator, io: std.Io, runner: anytype) !void {
 
         if (comptime build_options.use_vulkan) {
             if (runner != null) {
-                gpu_weight = try z.ops_vulkan.Q80Weight.init(&runner.?.ctx, w_bytes, c.in, c.out);
+                gpu_weight = try ops_vulkan.Q80Weight.init(
+                    &runner.?.ctx,
+                    w_bytes,
+                    c.in,
+                    c.out,
+                );
             }
         }
 
+        // Time every eligible variant against the naive reference.
         std.debug.assert(std.mem.eql(u8, variants[0].name, "naive"));
         const ref_out = try gpa.alignedAlloc(f32, .of(f32), c.out);
         defer gpa.free(ref_out);
@@ -193,9 +211,6 @@ pub fn runQ80(gpa: std.mem.Allocator, io: std.Io, runner: anytype) !void {
                 v.kernel,
                 out,
             ) catch |e| switch (e) {
-                // A variant declines a case it cannot serve, such as an
-                // LDS-staged input kernel at k past the LDS capacity. The bench
-                // buffers a "skip(<reason>)" row and goes on to the next row.
                 error.InFeaturesTooLargeForLdsKernel => {
                     skipRow(c.label, v.name, "skip(lds)");
                     continue;
@@ -216,14 +231,12 @@ pub fn runQ80(gpa: std.mem.Allocator, io: std.Io, runner: anytype) !void {
             rawRow(c.label, v.name, r.ms, r.gflops, errs.rel, r.hash, status);
         }
 
-        flush(); // colors the fastest/slowest variant for this shape
+        flush();
     }
 }
 
-/// Q4_0 decode-matvec section: it measures the Q4_0 reduce kernel against the
-/// naive Q4_0 CPU reference, at the shapes the Q8_0 section uses. Decode is
-/// bandwidth-bound, and Q4_0 reads about half the weight bytes of Q8_0. On the
-/// large shapes the Q4_0 GFLOP/s therefore reaches about 2x the Q8_0 GFLOP/s.
+/// Q4_0 decode matvec: the Q4_0 reduce kernel against the naive Q4_0 CPU reference, at shapes
+/// of the Q8_0 section.
 pub fn benchQ40(gpa: std.mem.Allocator, io: std.Io, runner: anytype) !void {
     printSectionHeader("linearF32Q40 (compare GFLOP/s vs the q8_0 section)");
     const cases = [_]Case{
@@ -235,6 +248,7 @@ pub fn benchQ40(gpa: std.mem.Allocator, io: std.Io, runner: anytype) !void {
     };
 
     for (cases) |c| {
+        // Build the fixtures.
         std.debug.assert(c.in % 32 == 0);
 
         const row_bytes = (c.in / 32) * 18;
@@ -259,11 +273,11 @@ pub fn benchQ40(gpa: std.mem.Allocator, io: std.Io, runner: anytype) !void {
         const ref_out = try gpa.alignedAlloc(f32, .of(f32), c.out);
         defer gpa.free(ref_out);
 
-        const work = @as(f64, @floatFromInt(c.in * c.out * f32_flops_per_mac));
+        const work: f64 = @floatFromInt(c.in * c.out * f32_flops_per_mac);
         const scale = c.in * c.out;
 
-        // The CPU reference row (naive_q4) runs on every build.
-        z.ops.linearF32Q40(input, w_tensor, ref_out);
+        // Time the CPU reference row, which every build runs.
+        zigferencer.ops.linearF32Q40(input, w_tensor, ref_out);
         const ref_hash = hashOut(ref_out);
         const CpuQ4 = struct {
             input: []const f32,
@@ -271,7 +285,7 @@ pub fn benchQ40(gpa: std.mem.Allocator, io: std.Io, runner: anytype) !void {
             out: []f32,
 
             pub fn run(self: @This()) !void {
-                z.ops.linearF32Q40(self.input, self.w, self.out);
+                zigferencer.ops.linearF32Q40(self.input, self.w, self.out);
             }
         };
         try cpuRow(
@@ -284,18 +298,24 @@ pub fn benchQ40(gpa: std.mem.Allocator, io: std.Io, runner: anytype) !void {
             CpuQ4{ .input = input, .w = w_tensor, .out = ref_out },
         );
 
+        // Time the GPU row.
         if (comptime build_options.use_vulkan) {
             if (runner) |r| {
-                var gpu_weight = try z.ops_vulkan.Q80Weight.initQ40(&r.ctx, w_bytes, c.in, c.out);
+                var gpu_weight = try ops_vulkan.Q80Weight.initQ40(
+                    &r.ctx,
+                    w_bytes,
+                    c.in,
+                    c.out,
+                );
                 defer gpu_weight.deinit();
 
                 const gpu_out = try gpa.alignedAlloc(f32, .of(f32), c.out);
                 defer gpa.free(gpu_out);
 
-                const tol = z.ops_vulkan.LinearQ40Reduce.requires.tolerance;
+                const tol = zigferencer.ops_vulkan.LinearQ40Reduce.requires.tolerance;
                 const GpuQ4 = struct {
-                    r: *z.vulkan_runner.Runner,
-                    w: *const z.ops_vulkan.Q80Weight,
+                    r: *zigferencer.vulkan_runner.Runner,
+                    w: *const zigferencer.ops_vulkan.Q80Weight,
                     input: []const f32,
                     out: []f32,
 
@@ -322,14 +342,11 @@ pub fn benchQ40(gpa: std.mem.Allocator, io: std.Io, runner: anytype) !void {
     }
 }
 
-/// Batched (prefill) Q8_0 matmul: B input rows per dispatch, so the weight is
-/// streamed once for B outputs. Compare GFLOP/s against the decode `vk_q8_0_re`
-/// to see the prefill amortization. GPU-only (no batched CPU op). The CPU
-/// reference is the naive kernel looped over the B rows.
+/// Batched (prefill) Q8_0 matmul: B input rows per dispatch, GPU-only.
 pub fn benchBatchedMatmul(
     gpa: std.mem.Allocator,
     io: std.Io,
-    runner: *z.vulkan_runner.Runner,
+    runner: *zigferencer.vulkan_runner.Runner,
 ) !void {
     printSectionHeader("linearF32Q80 batched (prefill: B rows / dispatch)");
     const B: usize = 64;
@@ -338,13 +355,14 @@ pub fn benchBatchedMatmul(
         .{ .label = "attn_q    4096 -> 4096", .in = 4096, .out = 4096 },
         .{ .label = "ffn_down  14336 -> 4096", .in = 14336, .out = 4096 },
     };
-    var batch = try z.ops_vulkan.LinearQ80Batch.init(&runner.ctx);
+    var batch = try zigferencer.ops_vulkan.LinearQ80Batch.init(&runner.ctx);
     defer batch.deinit();
 
-    var gemm = try z.ops_vulkan.LinearQ80Gemm.init(&runner.ctx);
+    var gemm = try zigferencer.ops_vulkan.LinearQ80Gemm.init(&runner.ctx);
     defer gemm.deinit();
 
     for (cases) |c| {
+        // Build the fixtures.
         std.debug.assert(c.in % 32 == 0);
 
         const row_bytes = (c.in / 32) * 34;
@@ -354,7 +372,7 @@ pub fn benchBatchedMatmul(
         const w_bytes = try gpa.alignedAlloc(u8, .@"32", c.out * row_bytes);
         defer gpa.free(w_bytes);
 
-        // Fill the weight (first arg gets one input row, overwritten below).
+        // Fill the weight. The input rows get their own values below.
         fillSyntheticInputAndWeight(input[0..c.in], w_bytes, c.in, c.out);
         for (input, 0..) |*v, i| {
             v.* = @sin(@as(f32, @floatFromInt(i)) * 0.001);
@@ -371,8 +389,9 @@ pub fn benchBatchedMatmul(
         const ref_out = try gpa.alignedAlloc(f32, .of(f32), B * c.out);
         defer gpa.free(ref_out);
 
+        // Compute the CPU reference over the B rows.
         for (0..B) |bi| {
-            z.ops.linearF32Q80(
+            zigferencer.ops.linearF32Q80(
                 input[bi * c.in ..][0..c.in],
                 w_tensor,
                 ref_out[bi * c.out ..][0..c.out],
@@ -380,18 +399,18 @@ pub fn benchBatchedMatmul(
         }
 
         const ref_hash = hashOut(ref_out);
-        const work = @as(f64, @floatFromInt(B * c.in * c.out * f32_flops_per_mac));
+        const work: f64 = @floatFromInt(B * c.in * c.out * f32_flops_per_mac);
         const scale = B * c.in * c.out;
-        // The batched matmul fuses its multiply and add over the full K, so it
-        // drifts from the unfused naive reference more than a decode kernel
-        // does. The tolerance against naive is therefore 5e-3.
+        // The batched matmul fuses multiply and add over the full K, so it drifts from the
+        // unfused naive reference more than a decode kernel. The tolerance is 5e-3.
         const tol: op_requires.Tolerance = .{ .relative = 5e-3 };
 
         const gpu_out = try gpa.alignedAlloc(f32, .of(f32), B * c.out);
         defer gpa.free(gpu_out);
 
+        // Time the batch kernel.
         const Batch = struct {
-            k: *z.ops_vulkan.LinearQ80Batch,
+            k: *zigferencer.ops_vulkan.LinearQ80Batch,
             input: []const f32,
             w: []const u8,
             b: usize,
@@ -424,8 +443,9 @@ pub fn benchBatchedMatmul(
             },
         );
 
+        // Time the gemm kernel.
         const Gemm = struct {
-            k: *z.ops_vulkan.LinearQ80Gemm,
+            k: *zigferencer.ops_vulkan.LinearQ80Gemm,
             input: []const f32,
             w: []const u8,
             b: usize,
@@ -489,8 +509,8 @@ fn printEligibility(variants: []const Variant) void {
     }
 }
 
-/// Warm-up + `pickIters` timed iterations of `kernel`, against fixtures built
-/// once for the case. Returns ms/G/s/hash.
+/// Warm up `kernel`, then time `pickIters` runs against the fixtures of the case. Returns the
+/// ms per call, the GFLOP/s, and the output hash.
 fn runVariant(
     io: std.Io,
     input: []const f32,
@@ -506,8 +526,7 @@ fn runVariant(
 
     const iters: usize = pickIters(in_features * out_features);
     const t_start = std.Io.Clock.Timestamp.now(io, .awake);
-    var k: usize = 0;
-    while (k < iters) : (k += 1) {
+    for (0..iters) |_| {
         try callKernel(kernel, input, w_tensor, gpu_weight, out);
     }
 
@@ -516,7 +535,9 @@ fn runVariant(
     const elapsed_ns_i96 = t_start.durationTo(t_end).raw.toNanoseconds();
     const elapsed_ns: f64 = @floatFromInt(@as(i64, @intCast(elapsed_ns_i96)));
     const per_call_ms = elapsed_ns / @as(f64, @floatFromInt(iters)) / 1e6;
-    const flops_per_call = @as(f64, @floatFromInt(in_features * out_features * f32_flops_per_mac));
+    const flops_per_call: f64 = @floatFromInt(
+        in_features * out_features * f32_flops_per_mac,
+    );
     const gflops = (flops_per_call * @as(f64, @floatFromInt(iters))) / elapsed_ns;
 
     return .{ .ms = per_call_ms, .gflops = gflops, .hash = hashOut(out) };
@@ -546,6 +567,7 @@ fn callKernel(
     }
 }
 
+/// Fill `input` with a sine and `w_bytes` with q8_0 blocks: scale 1.0 and a period-13 pattern.
 fn fillSyntheticInputAndWeight(
     input: []f32,
     w_bytes: []u8,
@@ -559,12 +581,10 @@ fn fillSyntheticInputAndWeight(
     const row_bytes = (in_features / 32) * 34;
     for (0..out_features) |row| {
         const off = row * row_bytes;
-        var blk: usize = 0;
-        while (blk < in_features / 32) : (blk += 1) {
+        for (0..in_features / 32) |blk| {
             const blk_off = off + blk * 34;
             std.mem.writeInt(u16, w_bytes[blk_off..][0..2], 0x3c00, .little);
-            var i: usize = 0;
-            while (i < 32) : (i += 1) {
+            for (0..32) |i| {
                 const v_i32: i32 = @as(i32, @intCast((row + blk * 32 + i) % 13)) - 6;
                 const v: i8 = @intCast(v_i32);
                 w_bytes[blk_off + 2 + i] = @bitCast(v);
@@ -573,6 +593,7 @@ fn fillSyntheticInputAndWeight(
     }
 }
 
+/// Fill `input` with a sine and `w_bytes` with q4_0 blocks: scale 1.0 and a period-16 pattern.
 fn fillSyntheticInputAndWeightQ4(
     input: []f32,
     w_bytes: []u8,
@@ -586,13 +607,11 @@ fn fillSyntheticInputAndWeightQ4(
     const row_bytes = (in_features / 32) * 18;
     for (0..out_features) |row| {
         const off = row * row_bytes;
-        var blk: usize = 0;
-        while (blk < in_features / 32) : (blk += 1) {
+        for (0..in_features / 32) |blk| {
             const blk_off = off + blk * 18;
             std.mem.writeInt(u16, w_bytes[blk_off..][0..2], 0x3c00, .little); // fp16 1.0
-            var i: usize = 0;
-            while (i < 16) : (i += 1) {
-                // Two 4-bit nibbles per byte. Pattern in [0,15].
+            for (0..16) |i| {
+                // Pack two 4-bit nibbles per byte, each in [0, 15].
                 const lo: u8 = @intCast((row + blk * 16 + i) % 16);
                 const hi: u8 = @intCast((row + blk * 16 + i + 7) % 16);
                 w_bytes[blk_off + 2 + i] = lo | (hi << 4);

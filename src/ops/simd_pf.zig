@@ -1,26 +1,34 @@
-//! A register-blocked f32 x Q8_0 microkernel with software prefetch on
-//! `linearF32Q80`. Each inner block computes `mr = 4` output rows with
-//! `@Vector(8)` AVX2 and FMA. Attention runs the vector part kernel of
-//! `attention_simd.zig`, with a prefetch of the K and V rows 16 positions
-//! ahead. The module re-exports the rest of the op API from `naive`. This is
-//! the auto default on a target with AVX2 and FMA.
+//! A register-blocked f32 x Q8_0 microkernel with software prefetch on `linearF32Q80`. Each inner
+//! block computes `mr = 4` output rows with `@Vector(8)` AVX2 and FMA. Attention runs the vector
+//! part kernel of `attention_simd.zig`, with a prefetch of the K and V rows 16 positions ahead.
+//! The module re-exports the rest of the op API from `naive`. This is the auto default on a
+//! target with AVX2 and FMA.
 //!
-//! Memory-bound shapes stream past L3, where plain SIMD reaches only about 30%
-//! of peak DRAM bandwidth. Those shapes are `lm_head`, which streams about
-//! 30 MB of Q8_0 per forward pass, and every Llama-3.1-8B matmul. Each
-//! inner-block iteration prefetches the same block in the next 4-row group. It
-//! uses `.locality = 0`, because those bytes are read once per pass. The
-//! prefetch stages the next group's cache lines, so they are warm when the outer
-//! loop reaches them. On cache-resident shapes the prefetch is plus or minus 5%
-//! noise. On lm_head and the 8B matmuls the win is large.
+//! Prefetch. Memory-bound shapes stream past L3, where plain SIMD reaches only about 30% of peak
+//! DRAM bandwidth. Those shapes are `lm_head`, which streams about 30 MB of Q8_0 per forward
+//! pass, and every Llama-3.1-8B matmul. Each inner-block iteration prefetches the same block in
+//! the next 4-row group. It uses `.locality = 0`, because those bytes are read once per pass, so
+//! they do not pollute L1. The prefetch stages the next group's cache lines, so they are warm
+//! when the outer loop reaches them. The `4 * n_blocks` prefetches spread evenly across the
+//! pass. On cache-resident shapes the prefetch is plus or minus 5% noise. On lm_head and the 8B
+//! matmuls the win is large.
 //!
-//! `linearF32Q80Batch` is the same microkernel with a batch loop per 4-row
-//! group. The group's rows stay cache-resident across all batch inputs, so the
-//! weight matrix streams from DRAM once per batch instead of once per row. That
-//! is why the engine batches decode. The B=1 entry point delegates to it, so
-//! exactly one kernel body exists. For one (row, output) pair the accumulation
-//! order does not depend on the batch size. Batched output is bit-identical to
-//! per-row calls, and the tests assert it.
+//! Batch. `linearF32Q80Batch` is the same microkernel with a batch loop per 4-row group. The
+//! group's rows stay cache-resident across all batch inputs, so the weight matrix streams from
+//! DRAM once per batch instead of once per row. That is why the engine batches decode. The B=1
+//! entry point delegates to it, so exactly one kernel body exists. The prefetch fires only on
+//! the last batch row of a group, which keeps one group-pass of lookahead, the same distance the
+//! B=1 kernel keeps. For one (row, output) pair the accumulation order does not depend on the
+//! batch size. Batched output is bit-identical to per-row calls, and the tests assert it.
+//!
+//! Tail. The rows left when `out_features % mr != 0` take `rowPass`: one row, no prefetch, and
+//! the same vector walk.
+//!
+//! Requirements. Every AVX2 target also carries F16C. Without F16C the f16 widening stays
+//! correct and runs scalar, so `requires` does not list it.
+//!
+//! Q4 and Q6_K. The q4 CPU path exists for completeness, so it reuses the naive scalar
+//! dequant-and-dot. The runner still parallelizes it across rows.
 
 const std = @import("std");
 const attention_simd = @import("attention_simd.zig");
@@ -35,8 +43,7 @@ const lanes = 8;
 
 const mr = 4;
 
-/// Every AVX2 target also carries F16C. Without F16C the f16 widening stays
-/// correct and runs scalar, so the requirement does not list it.
+/// AVX2 and FMA on x86_64.
 pub const requires: op_requires.OpRequires = .{
     .arch = .x86_64,
     .min_simd = .avx2,
@@ -64,8 +71,7 @@ pub const attentionPartTyped = attention_simd.prefetched.attentionPartTyped;
 pub const attentionMerge = attention_simd.prefetched.attentionMerge;
 pub const attentionRowTyped = attention_simd.prefetched.attentionRowTyped;
 
-// The q4 CPU path exists for completeness, so it reuses the naive scalar
-// dequant-and-dot. The runner still parallelizes it across rows.
+// See "Q4 and Q6_K" in the header.
 pub const linearF32Q40 = naive.linearF32Q40;
 pub const linearF32Q40Batch = naive.linearF32Q40Batch;
 pub const linearF32Q41 = naive.linearF32Q41;
@@ -77,10 +83,8 @@ pub fn linearF32Q80(input: []const f32, weight: Tensor, out: []f32) void {
     linearF32Q80Batch(input, weight, out, 1, @intCast(weight.shape[1]));
 }
 
-/// Batched linear with Q8_0 weights. Row b reads `inputs[b * in_features ..]`
-/// and writes `outs[b * out_stride ..]`, the same rule as `naive.linearF32Batch`.
-/// The prefetch fires only on a group's last batch row. That keeps one
-/// group-pass of lookahead, the same distance the B=1 kernel keeps.
+/// Batched linear with Q8_0 weights. Row b reads `inputs[b * in_features ..]` and writes
+/// `outs[b * out_stride ..]`, the same rule as `naive.linearF32Batch`.
 pub fn linearF32Q80Batch(
     inputs: []const f32,
     weight: Tensor,
@@ -102,13 +106,13 @@ pub fn linearF32Q80Batch(
     const row_bytes = (in_features / 32) * 34;
     const n_blocks = in_features / 32;
 
+    // Take the full 4-row groups.
     var j: usize = 0;
     while (j + mr <= out_features) : (j += mr) {
         const row_offs: [mr]usize = .{
             (j + 0) * row_bytes, (j + 1) * row_bytes, (j + 2) * row_bytes, (j + 3) * row_bytes,
         };
-        // The prefetch targets the next 4-row group. The last outer pass has no
-        // next group, so it skips the prefetch.
+        // The last group has no next group to prefetch.
         const has_next = j + 2 * mr <= out_features;
         const pf_offs: [mr]usize = .{
             (j + mr + 0) * row_bytes,
@@ -135,6 +139,7 @@ pub fn linearF32Q80Batch(
         }
     }
 
+    // Take the tail rows one at a time.
     while (j < out_features) : (j += 1) {
         const row_off = j * row_bytes;
         var b: usize = 0;
@@ -144,6 +149,7 @@ pub fn linearF32Q80Batch(
         }
     }
 
+    // Check that every output is finite.
     if (std.debug.runtime_safety) {
         var b: usize = 0;
         while (b < batch) : (b += 1) {
@@ -157,9 +163,7 @@ pub fn linearF32Q80Batch(
 // -- helpers ----------------------------------------------------------------
 
 /// One input row against one 4-row weight group, the register-blocked core.
-/// `do_prefetch` stages the next group's matching block on each iteration, so
-/// the `4 * n_blocks` cache-line prefetches spread evenly across the pass.
-/// Locality 0 means stream once and do not pollute L1.
+/// `do_prefetch` stages the next group's matching block on each iteration.
 inline fn groupPass(
     input: []const f32,
     data: []const u8,
@@ -177,6 +181,7 @@ inline fn groupPass(
     while (blk < n_blocks) : (blk += 1) {
         const blk_off_in_row = blk * 34;
 
+        // Prefetch the matching block of the next group.
         if (do_prefetch) {
             @prefetch(
                 &data[pf_offs[0] + blk_off_in_row],
@@ -196,6 +201,7 @@ inline fn groupPass(
             );
         }
 
+        // Load the four block scales.
         const s0v: Vec = @splat(
             f16BitsToF32(
                 std.mem.readInt(u16, data[row_offs[0] + blk_off_in_row ..][0..2], .little),
@@ -219,6 +225,7 @@ inline fn groupPass(
 
         const in_base = blk * 32;
 
+        // Accumulate the four rows, 8 lanes at a time.
         inline for (0..4) |q| {
             const in_v: Vec = input[in_base + q * lanes ..][0..lanes].*;
 
@@ -250,8 +257,7 @@ inline fn groupPass(
     return .{ @reduce(.Add, acc0), @reduce(.Add, acc1), @reduce(.Add, acc2), @reduce(.Add, acc3) };
 }
 
-/// The tail rows left when `out_features % mr != 0`. One row, no prefetch, and
-/// the same vector walk.
+/// One tail row. See "Tail" in the header.
 inline fn rowPass(input: []const f32, data: []const u8, row_off: usize, n_blocks: usize) f32 {
     var acc: Vec = @splat(0);
     var blk: usize = 0;

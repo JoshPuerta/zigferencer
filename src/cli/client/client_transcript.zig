@@ -8,8 +8,8 @@
 //! one, so each restart keeps fewer pairs.
 
 const std = @import("std");
-const protocol = @import("../serve/protocol.zig");
-const limits = @import("../core/limits.zig");
+const protocol = @import("../../serve/protocol.zig");
+const limits = @import("../../core/limits.zig");
 
 const assert = std.debug.assert;
 
@@ -234,7 +234,7 @@ pub const Transcript = struct {
         const raw = t.text[reply_at..][0..p.reply_len];
         const kept = std.mem.trimStart(u8, raw, "\n");
         const offset = raw.len - kept.len;
-        std.mem.copyForwards(u8, t.text[reply_at..][0..kept.len], raw[offset..][0..kept.len]);
+        @memmove(t.text[reply_at..][0..kept.len], raw[offset..][0..kept.len]);
         p.reply_len = @intCast(kept.len);
 
         const size = @as(u64, pair_overhead_bytes) + p.prompt_len + p.reply_len;
@@ -329,14 +329,14 @@ pub const Transcript = struct {
         const held_end = t.heldTextLen();
         const shift = if (k < t.n) t.turns[k].start else held_end;
         const used = held_end + t.pendingTextLen();
-        std.mem.copyForwards(u8, t.text[0 .. used - shift], t.text[shift..used]);
+        @memmove(t.text[0 .. used - shift], t.text[shift..used]);
 
         var dropped: u32 = 0;
         for (t.turns[0..k]) |turn| {
             dropped += turn.pairBytes();
         }
 
-        std.mem.copyForwards(Turn, t.turns[0 .. t.n - k], t.turns[k..t.n]);
+        @memmove(t.turns[0 .. t.n - k], t.turns[k..t.n]);
         t.n -= k;
         for (t.turns[0..t.n]) |*turn| {
             turn.start -= shift;

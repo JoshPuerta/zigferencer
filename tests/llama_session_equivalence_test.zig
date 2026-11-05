@@ -1,39 +1,49 @@
-//! Batch-equivalence gate for the llama family. Batched decode must produce
-//! tokens and logits that are bit-identical to running each session alone.
+//! Batch-equivalence gate for the llama family. Batched decode must produce tokens and logits that
+//! are bit-identical to running each session alone.
 //!
-//! Three prompts run six ways against a real llama-family GGUF.
+//! Passes. Three prompts run six ways against a real llama-family GGUF.
 //!
 //!   a. alone: one 1-slot runner per prompt, the single-sequence shape.
-//!   b. batched: one 3-slot runner, whole prompts, one `decodeBatch` tick per
-//!      token.
-//!   c. chunk-fed: pass b with each prompt split over several `feed` calls,
-//!      the chunked-prefill shape.
-//!   d. continuous: a late prompt prefills through `advance` chunks that share
-//!      the decode ticks of the other two sessions, the composed-tick shape of
-//!      the serve scheduler.
-//!   e. clone: a session forked partway through a conversation continues
-//!      bit-identically to its source, which pins the KV row copy.
-//!   f. forced parallelism: pass b with the row-parallel matmuls and the
-//!      attention units forced on. A unit is one KV group over one part of
-//!      an attention row.
+//!   b. batched: one 3-slot runner, whole prompts, one `decodeBatch` tick per token.
+//!   c. chunk-fed: pass b with each prompt split over several `feed` calls, the chunked-prefill
+//!      shape.
+//!   d. continuous: a late prompt prefills through `advance` chunks that share the decode ticks of
+//!      the other two sessions, the composed-tick shape of the serve scheduler.
+//!   e. clone: a session forked partway through a conversation continues bit-identically to its
+//!      source, which pins the KV row copy.
+//!   f. forced parallelism: pass b with the row-parallel matmuls and the attention units forced on.
+//!      A unit is one KV group over one part of an attention row.
 //!
-//! The token streams and the FNV-1a hashes of the raw logits bytes must match
-//! pass a exactly, and not within a tolerance. The batch linear kernels repeat
-//! the per-(row, output) reduction order of their B=1 siblings. Every per-row
-//! op reads exactly the inputs a lone call produces. Greedy sampling uses no
-//! RNG. Nothing is left to differ.
+//! Exactness. The token streams and the FNV-1a hashes of the raw logits bytes must match pass a
+//! exactly, and not within a tolerance. The batch linear kernels repeat the per-(row, output)
+//! reduction order of their B=1 siblings. Every per-row op reads exactly the inputs a lone call
+//! produces. Greedy sampling uses no RNG. Nothing is left to differ.
 //!
-//! The tests read the canonical SmolLM2-135M-Instruct-Q8_0 from
-//! `test_fixtures.path`.
-
+//! Compact logits. A single-session feed lands its final row at logits[0]. In an `advance` tick the
+//! want-logits rows pack at logits[0..]. The decode rows follow the final row of the chunk only
+//! when that row took an lm_head. So they sit at base+p, where base is 1 on the final chunk and 0
+//! otherwise.
+//!
+//! Forced parallelism. `min_parallel_flops = 0` spreads the row-parallel matmuls and the attention
+//! units (parallel.attentionTyped) across `n_threads`. The matmul partition keeps the reduction
+//! order of every output. An attention unit writes the same records on any worker, and the merge
+//! adds them in part order. So multi-slot and multi-thread output is bit-exact. This pins the
+//! determinism of the parallel paths that the serve runner uses.
+//!
+//! Prefix restore. This is the prefix-cache path of the serve scheduler on the CPU runner. The GPU
+//! equivalence file pins the twin path for the fused runner. A cold session feeds the whole prompt
+//! and snapshots its first `n` rows. A warm session restores those rows from the blob and prefills
+//! the one-token suffix only. Warm must equal cold token for token.
+//!
+//! The tests read the canonical SmolLM2-135M-Instruct-Q8_0 from `test_fixtures.path`.
 const std = @import("std");
-const z = @import("zigferencer");
-const tp = @import("test_policy.zig");
-const loader = z.loader;
-const vocab_mod = z.vocab;
-const bpe = z.bpe;
-const LlamaRunner = z.llama_runner.LlamaRunner;
-const Sessions = z.session.Sessions;
+const zigferencer = @import("zigferencer");
+const test_policy = @import("test_policy.zig");
+const loader = zigferencer.loader;
+const vocab_mod = zigferencer.vocab;
+const bpe = zigferencer.bpe;
+const LlamaRunner = zigferencer.llama_runner.LlamaRunner;
+const Sessions = zigferencer.session.Sessions;
 
 // -- fixtures ---------------------------------------------------------------
 
@@ -61,18 +71,18 @@ test "llama batched and chunk-fed decode are bit-identical to single-session run
     defer arena_state.deinit();
 
     const arena = arena_state.allocator();
-    const fixture = try z.test_fixtures.path(arena, "SmolLM2-135M-Instruct-Q8_0");
+    const fixture = try zigferencer.test_fixtures.path(arena, "SmolLM2-135M-Instruct-Q8_0");
 
     var loaded = try loader.load(io, arena, fixture);
     defer loaded.close();
 
     var v = try vocab_mod.buildFromParsed(arena, loaded.parsed);
-    const cfg: tp.Policy = .{ .n_threads = 1 };
-    var cpu_pool: tp.Pool = undefined;
-    try tp.startPool(&cpu_pool, io, cfg);
+    const cfg: test_policy.Policy = .{ .n_threads = 1 };
+    var cpu_pool: test_policy.Pool = undefined;
+    try test_policy.startPool(&cpu_pool, io, cfg);
     defer cpu_pool.deinit();
 
-    const max_seq = @min(loaded.card.context_length, z.test_fakes.test_window);
+    const max_seq = @min(loaded.card.context_length, zigferencer.test_fakes.test_window);
 
     var prompt_ids: [n_prompts][]const u32 = undefined;
     for (prompts, 0..) |p, i| {
@@ -85,7 +95,7 @@ test "llama batched and chunk-fed decode are bit-identical to single-session run
         var runner = try LlamaRunner.init(
             arena,
             &loaded,
-            z.kv_budget.pinned(1, max_seq),
+            zigferencer.kv_budget.pinned(1, max_seq),
             0,
             io,
             &cpu_pool,
@@ -109,7 +119,7 @@ test "llama batched and chunk-fed decode are bit-identical to single-session run
         var runner = try LlamaRunner.init(
             arena,
             &loaded,
-            z.kv_budget.pinned(n_prompts, max_seq),
+            zigferencer.kv_budget.pinned(n_prompts, max_seq),
             0,
             io,
             &cpu_pool,
@@ -122,8 +132,6 @@ test "llama batched and chunk-fed decode are bit-identical to single-session run
             sids[p] = try pool.create(0, .{});
             const first = (try pool.feed(sids[p], ids, true)).?;
             try std.testing.expectEqual(reference[p].tokens[0], first);
-            // Under compact logits a single-session feed lands its final row
-            // at logits[0].
             try std.testing.expectEqual(reference[p].logits_hash[0], hashLogitsRow(&runner, 0));
         }
 
@@ -142,7 +150,7 @@ test "llama batched and chunk-fed decode are bit-identical to single-session run
         var runner = try LlamaRunner.init(
             arena,
             &loaded,
-            z.kv_budget.pinned(n_prompts, max_seq),
+            zigferencer.kv_budget.pinned(n_prompts, max_seq),
             0,
             io,
             &cpu_pool,
@@ -177,15 +185,13 @@ test "llama batched and chunk-fed decode are bit-identical to single-session run
     }
 
     // -- pass d: continuous batching ----------------------------------------
-    // Prompt 2 arrives late and prefills through `advance` chunks that share
-    // the decode ticks of prompts 0 and 1. The tokens and the logits of the
-    // decode rows must stay exactly the solo streams while the chunk shares
-    // their forward call.
+    // Prompt 2 arrives late and prefills through `advance` chunks that share the decode ticks.
+    // The decode rows must stay exactly the solo streams.
     {
         var runner = try LlamaRunner.init(
             arena,
             &loaded,
-            z.kv_budget.pinned(n_prompts, max_seq),
+            zigferencer.kv_budget.pinned(n_prompts, max_seq),
             0,
             io,
             &cpu_pool,
@@ -213,10 +219,7 @@ test "llama batched and chunk-fed decode are bit-identical to single-session run
                 .tokens = ids_late[fed..][0..1],
                 .final = final,
             }, &sids, &out);
-            // Under compact logits the want-logits rows pack at logits[0..].
-            // The decode rows follow the final row of the chunk only when that
-            // row took an lm_head. They sit at base+p, where base is 1 on the
-            // final chunk, which puts the late row at 0, and 0 otherwise.
+            // The decode rows sit at base+p. See "Compact logits" in the header.
             const base: usize = if (final) 1 else 0;
             for (0..2) |p| {
                 try std.testing.expectEqual(reference[p].tokens[k], out[p]);
@@ -255,14 +258,13 @@ test "llama batched and chunk-fed decode are bit-identical to single-session run
     }
 
     // -- pass e: clone ------------------------------------------------------
-    // Fork a session partway through a conversation. The greedy continuation
-    // of the fork must equal the solo stream of the source exactly, which pins
-    // the KV row copy. The source must stay undisturbed.
+    // The greedy continuation of the fork must equal the solo stream of the source.
+    // The source must stay undisturbed.
     {
         var runner = try LlamaRunner.init(
             arena,
             &loaded,
-            z.kv_budget.pinned(2, max_seq),
+            zigferencer.kv_budget.pinned(2, max_seq),
             0,
             io,
             &cpu_pool,
@@ -293,24 +295,18 @@ test "llama batched and chunk-fed decode are bit-identical to single-session run
     }
 
     // -- pass f: forced parallelism -----------------------------------------
-    // Batched decode under forced parallelism must stay bit-identical to the
-    // serial reference. `min_parallel_flops = 0` spreads the row-parallel
-    // matmuls and the attention units (parallel.attentionTyped) across
-    // `n_threads`. The matmul partition keeps the reduction order of every
-    // output. An attention unit writes the same records on any worker, and the
-    // merge adds them in part order. So multi-slot and multi-thread output is
-    // bit-exact. This pins the determinism of the parallel paths that the
-    // serve runner uses.
+    // Batched decode under forced parallelism must equal the serial reference.
+    // See "Forced parallelism" in the header.
     {
-        const cfg_par: tp.Policy = .{ .n_threads = 4, .min_parallel_flops = 0 };
-        var par_cpu_pool: tp.Pool = undefined;
-        try tp.startPool(&par_cpu_pool, io, cfg_par);
+        const cfg_par: test_policy.Policy = .{ .n_threads = 4, .min_parallel_flops = 0 };
+        var par_cpu_pool: test_policy.Pool = undefined;
+        try test_policy.startPool(&par_cpu_pool, io, cfg_par);
         defer par_cpu_pool.deinit();
 
         var runner = try LlamaRunner.init(
             arena,
             &loaded,
-            z.kv_budget.pinned(n_prompts, max_seq),
+            zigferencer.kv_budget.pinned(n_prompts, max_seq),
             0,
             io,
             &par_cpu_pool,
@@ -323,8 +319,6 @@ test "llama batched and chunk-fed decode are bit-identical to single-session run
             sids[p] = try pool.create(0, .{});
             const first = (try pool.feed(sids[p], ids, true)).?;
             try std.testing.expectEqual(reference[p].tokens[0], first);
-            // Under compact logits a single-session feed lands its final row
-            // at logits[0].
             try std.testing.expectEqual(reference[p].logits_hash[0], hashLogitsRow(&runner, 0));
         }
 
@@ -340,31 +334,24 @@ test "llama batched and chunk-fed decode are bit-identical to single-session run
 }
 
 test "llama CPU prefix restore: a warm-restored prefix continues bit-exactly" {
-    // This is the prefix-cache path of the serve scheduler on the CPU runner.
-    // The GPU equivalence file pins the twin path for the fused runner.
-    // A cold session feeds the whole prompt and snapshots its first `n` rows.
-    // A warm session restores those rows from the blob and prefills the
-    // one-token suffix only. Greedy decode has no RNG, so warm must equal cold
-    // token for token. A restored prefix is indistinguishable from the rows it
-    // copies.
     const io = std.testing.io;
     const gpa = std.testing.allocator;
     var arena_state = std.heap.ArenaAllocator.init(gpa);
     defer arena_state.deinit();
 
     const arena = arena_state.allocator();
-    const fixture = try z.test_fixtures.path(arena, "SmolLM2-135M-Instruct-Q8_0");
+    const fixture = try zigferencer.test_fixtures.path(arena, "SmolLM2-135M-Instruct-Q8_0");
 
     var loaded = try loader.load(io, arena, fixture);
     defer loaded.close();
 
     var v = try vocab_mod.buildFromParsed(arena, loaded.parsed);
-    const cfg: tp.Policy = .{ .n_threads = 1 };
-    var cpu_pool: tp.Pool = undefined;
-    try tp.startPool(&cpu_pool, io, cfg);
+    const cfg: test_policy.Policy = .{ .n_threads = 1 };
+    var cpu_pool: test_policy.Pool = undefined;
+    try test_policy.startPool(&cpu_pool, io, cfg);
     defer cpu_pool.deinit();
 
-    const max_seq = @min(loaded.card.context_length, z.test_fakes.test_window);
+    const max_seq = @min(loaded.card.context_length, zigferencer.test_fakes.test_window);
     const ids = try bpe.encodeAlloc(&v, arena, prompts[1], true);
     std.debug.assert(ids.len >= 2); // the split needs a prefix row and a suffix row
     const n: u32 = @intCast(ids.len - 1);
@@ -372,7 +359,7 @@ test "llama CPU prefix restore: a warm-restored prefix continues bit-exactly" {
     var runner = try LlamaRunner.init(
         arena,
         &loaded,
-        z.kv_budget.pinned(2, max_seq),
+        zigferencer.kv_budget.pinned(2, max_seq),
         0,
         io,
         &cpu_pool,
@@ -381,9 +368,7 @@ test "llama CPU prefix restore: a warm-restored prefix continues bit-exactly" {
     );
     var pool = try Sessions(LlamaRunner).init(arena, &runner);
 
-    // Cold: feed the prefix without asking for logits, snapshot those rows,
-    // then feed the suffix and decode on. The snapshot is a read, so the cold
-    // session goes on running.
+    // Cold: feed the prefix without logits, snapshot those rows, then feed the suffix.
     var cold_stream: [n_tokens]u32 = undefined;
     const cold = try pool.create(0, .{});
     _ = try pool.feed(cold, ids[0..n], false);

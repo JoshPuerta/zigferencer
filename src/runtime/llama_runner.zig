@@ -1,22 +1,46 @@
-//! Llama-family forward pass over a bounded set of KV slots. There is no Graph
-//! IR: the layer is inlined as straight-line Zig. This file is the Control
-//! Unit. It holds the KV slots, the scratch buffers, and the per-call row
-//! bookkeeping. Every numerical op it calls (`ops.*`) is pure and writes into a
-//! slice the runner owns. The build binds the op backend (`build_options`), so
-//! the runner imports the resolved variant module and calls it directly. There
-//! is no dispatch in the hot path.
+//! Llama-family forward pass over a bounded set of KV slots. There is no Graph IR: the layer is
+//! inlined as straight-line Zig. This file is the Control Unit. It holds the KV slots, the scratch
+//! buffers, and the per-call row bookkeeping. Every numerical op it calls (`ops.*`) is pure and
+//! writes into a slice the runner owns.
 //!
-//! `stepBatch` advances a batch of rows, each row a (slot, token, pos) triple:
-//! B decode rows from B independent sessions, or several consecutive rows of
-//! ONE session (chunked prefill). Within a layer the runner writes the K/V of
-//! every row before any row attends, and row i attends over `0..=pos_i`, so
-//! causality holds by construction. The weight projections run as one batched
-//! pass per matrix, so a weight streams from DRAM once per call instead of once
-//! per row. Every per-row step (norms, rope, attention) takes exactly the
-//! inputs of the solo call for that row, so batched output is bit-identical to
-//! running each row alone. `step` is the B=1 wrapper over that one forward path.
+//! Backend. `-Dops-backend=naive|simd|simd_pf|vulkan|auto` binds the op backend at build time. The
+//! default `auto` picks the strongest eligible CPU variant. The runner imports the resolved
+//! variant module and calls it directly, so the hot path has no dispatch. The `vulkan` backend
+//! needs `-Druntime=vulkan`. It wraps the GPU kernels behind the same op API, and it is the
+//! integration boundary for end-to-end GPU inference. On any other GPU build this runner rides
+//! along as CPU capability, so it takes the `cpu_ops` variant the build resolved.
 //!
-//! One decoder layer, pre-norm residual form. `x` is the residual stream, the
+//! Batched step. `stepBatch` advances a batch of rows, each row a (slot, token, pos) triple: B
+//! decode rows from B independent sessions, or several consecutive rows of ONE session (chunked
+//! prefill). Within a layer the runner writes the K/V of every row before any row attends, and row
+//! i attends over `0..=pos_i`, so causality holds by construction. The weight projections run as
+//! one batched pass per matrix, so a weight streams from DRAM once per call instead of once per
+//! row. Every per-row step (norms, rope, attention) takes exactly the inputs of the solo call for
+//! that row, so batched output is bit-identical to running each row alone. `step` is the B=1
+//! wrapper over that one forward path.
+//!
+//! Scratch. Init preallocates the scratch buffers, sized by `max_rows`. Row i of a batched call
+//! owns the i-th stripe of each. `max_rows` is decoupled from `n_slots`, so a prefill chunk can be
+//! wider than the session count, and it is never narrower. One row of attention part records
+//! serves every row of a step, because the rows attend one at a time. The per-op GPU attention
+//! keeps its own records, so that build holds none.
+//!
+//! Compact logits. Only the `want_logits` rows get an lm_head: the decode rows and the last row of
+//! a prefill chunk. They number at most `n_slots`, so `logits` has `n_slots` rows. The j-th such
+//! row lands at `logits[j * vocab_size ..]`, and `Sessions.advance` reads it at the same index.
+//!
+//! KV commit. The f32 scratch pipeline never learns the KV dtype. One conversion boundary narrows
+//! the finished K/V rows at commit. Zen 3 carries F16C, so the compiler vectorizes the narrowing
+//! into hardware round-to-nearest-even.
+//!
+//! Blobs. Prefix snapshots move the rows of a slot to and from a host blob. The CPU cache already
+//! lives in host memory, so both directions are memcpys. The layout, the region order, and the
+//! sizes are identical whichever backend wrote the blob: ascending layers, K rows then V rows per
+//! layer. A blob therefore restores through any runner at the same dtype. The bytes themselves are
+//! executor-specific. The presence of `evictSlot` lights `Sessions.can_snapshot` and
+//! `Residency.can_evict` for this runner.
+//!
+//! Layer. One decoder layer, pre-norm residual form. `x` is the residual stream, the
 //! top line is the bypass, the lower path is the transform, and they rejoin at +:
 //!
 //!     x ---------------------------------------------------+ (bypass)
@@ -55,19 +79,13 @@ const ProfileCat = cpu_profile.ProfileCat;
 const Error = step_row.Error;
 const StepRow = step_row.StepRow;
 
-// All four runners share the tensor-by-name lookup. `findTensor` is the
-// required form, and `findOptional` is the optional one.
+// The four runners share the lookup: `findTensor` is required, `findOptional` is optional.
 const fp32View = tensor_lookup.fp32View;
 const findTensor = tensor_lookup.findRequired;
 const findOptional = tensor_lookup.find;
 const findByFmt = tensor_lookup.findByFmt;
 
-/// Backend selected at build time by `-Dops-backend=naive|simd|simd_pf|vulkan|auto`.
-/// The default is `auto`, which picks the strongest eligible CPU variant. The
-/// `vulkan` backend needs `-Druntime=vulkan`. It wraps the GPU kernels behind
-/// the same op API, and it is the integration boundary for end-to-end GPU
-/// inference. On any other GPU build this runner rides along as CPU capability,
-/// so it takes the `cpu_ops` variant the build resolved.
+/// The op backend that the build resolved. The header describes the choices.
 const ops = if (build_options.use_vulkan_ops)
     @import("../ops_vulkan/wrap.zig")
 else if (build_options.cpu_ops_simd_pf)
@@ -82,38 +100,28 @@ const log_layer = std.log.scoped(.layer);
 
 // -- types ------------------------------------------------------------------
 
-/// Llama forward-pass state over `n_slots` independent KV slots (the Control
-/// Unit). `n_slots = 1` is the single-sequence CLI shape.
+/// Llama forward-pass state over `n_slots` independent KV slots. One slot is the CLI shape.
 pub const LlamaRunner = struct {
     card: loader.ModelCard,
 
     /// The clock source of the CPU timer.
     io: std.Io,
-    /// The pool and the policy together control the row-parallel matmul
-    /// dispatch and the attention fan-out. A pool of one thread runs every
-    /// kernel call serially, with zero pool overhead. The caller owns the
-    /// pool, and the pool must outlive the runner.
+    /// Row-parallel matmul and attention fan-out. The caller owns the pool and must outlive it.
     pool: *Pool,
     policy: parallel.Policy,
 
-    /// Per-op CPU timer, present only in a `-Dtrace` build. Null on every
-    /// production path. A bench command installs one to measure the serial-op
-    /// fraction. See `cpu_profile.CpuProfile`.
+    /// Per-op CPU timer, present only in a `-Dtrace` build. A bench command installs one.
     profile: cpu_profile.Slot = cpu_profile.slot_off,
 
     embed: *const Tensor,
     output_norm: *const Tensor,
-    /// lm_head (the un-embedding). If the model ties embeddings, this is the
-    /// same pointer as `embed`.
+    /// The lm_head. The same pointer as `embed` when the model ties embeddings.
     output: *const Tensor,
-    /// Per-pair RoPE frequency divisors from `rope_freqs.weight` (Llama-3.1
-    /// long-context scaling). Null when the model ships none.
+    /// Per-pair RoPE frequency divisors from `rope_freqs.weight`. Null when the model ships none.
     rope_factors: ?[]const f32,
 
-    /// Layers this runner executes: `[0..n_layers)`. It equals the card's count
-    /// on every whole-model path, and only a prefix runner narrows it. The
-    /// weight slices and the KV slabs below are sized by this count, not by the
-    /// card.
+    /// Layers this runner executes. Only a prefix runner narrows it below the card count.
+    /// The weight slices and the KV slabs use this count.
     n_layers: u32,
 
     attn_norm_w: []const *const Tensor,
@@ -126,26 +134,18 @@ pub const LlamaRunner = struct {
     ffn_up_w: []const *const Tensor,
     ffn_down_w: []const *const Tensor,
 
-    /// One independent KV slab per slot. A session owns a slot for its
-    /// lifetime. All slots share `max_seq`.
+    /// One independent KV slab per slot. A session owns a slot for its lifetime.
     kv_slots: []KvCache,
-    /// The element type every KV row is framed at. One process holds one dtype,
-    /// so a blob this runner writes frames the same way a GPU runner frames it.
+    /// The element type every KV row is framed at. One process holds one dtype.
     kv_dtype: dtype.KvDtype,
     n_slots: u32,
-    /// Max rows in one `stepBatch`, which is the row-scratch capacity. It is
-    /// decoupled from `n_slots` (the KV-slot count) so a prefill chunk can be
-    /// wider than the session count: decode rows (<= max_batch) plus a prefill
-    /// chunk fill up to here. `>= n_slots`. It equals `n_slots` unless serve
-    /// sizes it bigger.
+    /// Max rows in one `stepBatch`, the row-scratch capacity. At least `n_slots`.
     max_rows: u32,
-    /// Max prompt rows in one `prefillBatch`: `max_rows`, clamped to the stack
-    /// row array of `prefillBatch`.
+    /// Max prompt rows in one `prefillBatch`: `max_rows`, clamped to the stack row array.
     prefill_batch_max: u32,
     max_seq: u32,
 
-    // Scratch buffers, preallocated at init and sized x max_rows: row i of a
-    // batched call owns the i-th stripe of each. One arena allocation each.
+    // Scratch buffers. The header describes their layout.
     x: []f32,
     x_norm: []f32,
     q: []f32,
@@ -164,9 +164,7 @@ pub const LlamaRunner = struct {
 
     // -- init ---------------------------------------------------------------
 
-    /// The whole-model constructor. The caller states the KV dtype. The flag
-    /// resolves one dtype per process, and the resolution gates it against the
-    /// model before this runs.
+    /// The whole-model constructor. Flag resolution has already gated `kv_dtype` against the model.
     pub fn init(
         arena: Allocator,
         loaded: *const loader.Loaded,
@@ -190,10 +188,8 @@ pub const LlamaRunner = struct {
         );
     }
 
-    /// A prefix runner executes layers `[0..n_layers)` with weights and KV sized
-    /// to match. The hybrid runner composes through it. The caller states the
-    /// KV dtype. The whole init chain funnels here, so one body sizes and
-    /// frames every slab.
+    /// A prefix runner executes layers `[0..n_layers)` with weights and KV sized to match.
+    /// The hybrid runner composes through it. Every init funnels here, so one body sizes each slab.
     pub fn initPrefix(
         arena: Allocator,
         loaded: *const loader.Loaded,
@@ -205,19 +201,23 @@ pub const LlamaRunner = struct {
         policy: parallel.Policy,
         kv_dtype: dtype.KvDtype,
     ) Error!LlamaRunner {
+        // Check the limits and refuse a dtype that no kernel reads.
         const n_slots: u32 = plan.n_slots;
         const max_seq: u32 = plan.window;
         std.debug.assert(n_slots >= 1);
         std.debug.assert(n_slots <= limits.max_batch);
         std.debug.assert(pool.threads() == @max(policy.n_threads, 1));
-        // Row-scratch holds the widest stepBatch (decode + a prefill chunk). It is
-        // never narrower than the KV-slot count.
+
+        // The row scratch holds the widest stepBatch, and never fewer rows than the slots.
         const rows_cap: u32 = @max(n_slots, max_rows);
         std.debug.assert(rows_cap <= limits.max_batch + limits.max_prefill_chunk);
+
         const c = loaded.card;
         std.debug.assert(n_layers >= 1);
         std.debug.assert(n_layers <= c.n_layers);
         try linear_dispatch.requireWeights(loaded.tensors, n_layers);
+
+        // Find the weights that no layer owns.
         const embed = try findTensor(loaded.tensors, "token_embd.weight");
         const output_norm = try findTensor(loaded.tensors, "output_norm.weight");
         const output = findOptional(loaded.tensors, "output.weight") orelse embed;
@@ -231,6 +231,7 @@ pub const LlamaRunner = struct {
 
         if (rope_factors) |ff| std.debug.assert(ff.len >= c.rope_dim_count / 2);
 
+        // Find the weights of each layer.
         const attn_norm_w = try arena.alloc(*const Tensor, n_layers);
         const attn_q_w = try arena.alloc(*const Tensor, n_layers);
         const attn_k_w = try arena.alloc(*const Tensor, n_layers);
@@ -280,11 +281,13 @@ pub const LlamaRunner = struct {
             );
         }
 
+        // Allocate one KV slab per slot.
         const kv_slots = try arena.alloc(KvCache, n_slots);
         for (kv_slots) |*slot| {
             slot.* = try KvCache.init(arena, n_layers, c.n_kv_heads, c.head_dim, max_seq, kv_dtype);
         }
 
+        // Log the KV size.
         const kv_bytes: u64 = 2 * @as(u64, n_slots) * n_layers * max_seq * kv_dtype.rowBytes(
             c.n_kv_heads * c.head_dim,
         );
@@ -293,6 +296,7 @@ pub const LlamaRunner = struct {
             @as(f64, @floatFromInt(kv_bytes)) / (1024.0 * 1024.0),
         });
 
+        // Allocate the scratch and build the runner.
         return .{
             .card = c,
             .io = io,
@@ -324,10 +328,6 @@ pub const LlamaRunner = struct {
             .k_scratch = try arena.alloc(f32, rows_cap * c.n_kv_heads * c.head_dim),
             .v_scratch = try arena.alloc(f32, rows_cap * c.n_kv_heads * c.head_dim),
             .attn_out = try arena.alloc(f32, rows_cap * c.n_heads * c.head_dim),
-            // The part records of one attention row. The rows attend one at a
-            // time, and each call ends before the next starts, so one row of
-            // records serves every row of a step. The per-op GPU attention
-            // keeps its own records, so that build holds none here.
             .attn_parts = try arena.alloc(
                 f32,
                 if (build_options.use_vulkan_ops) 0 else attn_cpu.partialLen(c.n_heads, c.head_dim),
@@ -335,15 +335,11 @@ pub const LlamaRunner = struct {
             .ffn_gate = try arena.alloc(f32, rows_cap * c.feed_forward_length),
             .ffn_up = try arena.alloc(f32, rows_cap * c.feed_forward_length),
             .ffn_down = try arena.alloc(f32, rows_cap * c.embedding_length),
-            // Logits stay sized by the KV-slot count, not `rows_cap`: only the
-            // `want_logits` rows (decode rows + a prefill chunk's last row) get an
-            // lm_head, and those number <= n_slots. The runner writes them compactly.
             .logits = try arena.alloc(f32, n_slots * c.vocab_size),
         };
     }
 
-    /// Max rows one `stepBatch` accepts (the row-scratch capacity). The scheduler
-    /// fills decode + a prefill chunk up to this.
+    /// Max rows one `stepBatch` accepts. The scheduler fills decode rows plus a prefill chunk.
     pub fn maxStepRows(self: *const LlamaRunner) u32 {
         return self.max_rows;
     }
@@ -362,19 +358,15 @@ pub const LlamaRunner = struct {
 
     // -- step ---------------------------------------------------------------
 
-    /// One forward step on slot 0: consume `token_id` at sequence position
-    /// `pos`, and return a slice of `vocab_size` logits. The runner owns the
-    /// slice and reuses it on the next call. This is the single-sequence shape,
-    /// a thin wrapper over `stepBatch`.
+    /// One forward step on slot 0: consume `token_id` at `pos`, and return `vocab_size` logits.
+    /// The runner owns the slice and reuses it on the next call.
     pub fn step(self: *LlamaRunner, token_id: u32, pos: u32) Error![]f32 {
         try self.stepBatch(&.{.{ .slot = 0, .token = token_id, .pos = pos, .want_logits = true }});
         return self.logits[0..self.card.vocab_size];
     }
 
-    /// Consume `ids` on slot 0 at positions `pos..pos + ids.len` in one batched
-    /// step, and return the logits of the last row only. The runner owns the
-    /// slice and reuses it on the next call. Callers chunk a longer prompt by
-    /// `prefill_batch_max`.
+    /// Consume `ids` on slot 0 at `pos..pos + ids.len` in one batched step, and return the
+    /// logits of the last row only. Callers chunk a longer prompt by `prefill_batch_max`.
     pub fn prefillBatch(self: *LlamaRunner, ids: []const u32, pos: u32) Error![]f32 {
         std.debug.assert(ids.len >= 1);
 
@@ -402,10 +394,8 @@ pub const LlamaRunner = struct {
         return out;
     }
 
-    /// Advance every row one position: embed, all layers, then final norm +
-    /// lm_head for the `want_logits` suffix only (prompt rows skip the most
-    /// costly projection in the model). The logits are compact: the j-th
-    /// `want_logits` row lands at `logits[j * vocab_size ..][0..vocab_size]`.
+    /// Advance every row one position: embed, all layers, then final norm and lm_head for the
+    /// `want_logits` suffix only. The header describes the compact logits.
     pub fn stepBatch(self: *LlamaRunner, rows: []const StepRow) Error!void {
         _ = try step_row.validateRows(rows, self.n_slots, self.max_rows, self.max_seq);
         log.debug(
@@ -420,6 +410,7 @@ pub const LlamaRunner = struct {
             }
         }
 
+        // Embed each token.
         const t_embed = self.tBegin();
         for (rows, 0..) |r, i| {
             ops.embedLookup(self.embed.*, r.token, d, self.x[i * d ..][0..d]);
@@ -427,6 +418,7 @@ pub const LlamaRunner = struct {
 
         self.tEnd(t_embed, .embed);
 
+        // Run all layers.
         const live = (comptime core_log.hot) and core_log.enabled(.layer, .debug);
         var layer: u32 = 0;
         while (layer < self.n_layers) : (layer += 1) {
@@ -444,6 +436,7 @@ pub const LlamaRunner = struct {
             }
         }
 
+        // Project the want-logits suffix, if any.
         var first: usize = rows.len;
         while (first > 0 and rows[first - 1].want_logits) {
             first -= 1;
@@ -463,10 +456,6 @@ pub const LlamaRunner = struct {
 
         self.tEnd(t_norm, .rmsnorm);
         const n_logits = rows.len - first;
-        // Compact: the `n_logits` want-logits rows go to logits[0..], not to
-        // their batch-row offset, so the buffer needs `n_slots` rows and not
-        // `max_rows`. `Sessions.advance` reads them back at the same compact
-        // index.
         self.linearBatch(
             self.x_norm[first * d .. rows.len * d],
             self.output.*,
@@ -477,23 +466,28 @@ pub const LlamaRunner = struct {
         std.debug.assert(first + n_logits == rows.len);
     }
 
-    /// One decoder layer over all rows. The layer writes KV for every row before
-    /// any row attends. Consecutive rows of one slot (chunked prefill) therefore
-    /// see exactly their causal prefix, no more. It is public so a composing
-    /// runner can drive the layers itself.
+    /// One decoder layer over all rows. It writes KV for every row before any row attends, so
+    /// consecutive rows of one slot see exactly their causal prefix. Public for a composing runner.
     pub fn layerForward(self: *LlamaRunner, layer: u32, rows: []const StepRow) void {
         const sp = span.beginHot(.layer_forward);
         defer sp.end();
 
+        std.debug.assert(layer < self.n_layers);
+        std.debug.assert(rows.len <= self.max_rows);
+
+        self.attentionBlock(layer, rows);
+        self.ffnBlock(layer, rows.len);
+    }
+
+    /// The first half of a layer: norm, QKV, RoPE, KV commit, attention, and the residual add.
+    fn attentionBlock(self: *LlamaRunner, layer: u32, rows: []const StepRow) void {
         const c = self.card;
         const d = c.embedding_length;
         const qd = c.n_heads * c.head_dim;
         const kvd = c.n_kv_heads * c.head_dim;
         const n = rows.len;
-        std.debug.assert(layer < self.n_layers);
-        std.debug.assert(n <= self.max_rows);
 
-        // -- attention block ------------------------------------------------
+        // Normalize the residual stream.
         const t_an = self.tBegin();
         for (0..n) |i| {
             ops.rmsnorm(
@@ -505,6 +499,8 @@ pub const LlamaRunner = struct {
         }
 
         self.tEnd(t_an, .rmsnorm);
+
+        // Project Q, K, and V.
         self.linearBatch(self.x_norm[0 .. n * d], self.attn_q_w[layer].*, self.q, n, .qkv_proj);
         self.linearBatch(
             self.x_norm[0 .. n * d],
@@ -521,7 +517,7 @@ pub const LlamaRunner = struct {
             .qkv_proj,
         );
 
-        // RoPE each row at its own position, then commit K/V to its slot.
+        // Rotate each row at its own position, then commit its K/V to its slot.
         const t_rope = self.tBegin();
         for (rows, 0..) |r, i| {
             var h: u32 = 0;
@@ -550,10 +546,7 @@ pub const LlamaRunner = struct {
                 );
             }
 
-            // The one conversion boundary: the f32 scratch pipeline never learns
-            // the dtype, and the commit narrows the finished rows. Zen 3 carries
-            // F16C, so the compiler vectorizes this into hardware
-            // round-to-nearest-even.
+            // The one conversion boundary. The header describes the KV commit.
             switch (self.kv_dtype) {
                 .f32 => {
                     @memcpy(
@@ -580,9 +573,7 @@ pub const LlamaRunner = struct {
 
         self.tEnd(t_rope, .rope);
 
-        // Causal attention per row over its slot's positions 0..=pos. On the
-        // CPU, `parallel.attentionTyped` spreads the parts of the row over the
-        // threads. The GPU per-op wrap dispatches the row to one kernel.
+        // Attend causally per row over positions 0..=pos. The CPU path fans the parts over threads.
         const t_attn = self.tBegin();
         for (rows, 0..) |r, i| {
             const t_len: usize = @intCast(r.pos + 1);
@@ -639,7 +630,7 @@ pub const LlamaRunner = struct {
 
         self.tEnd(t_attn, .attention);
 
-        // Project + residual.
+        // Project the attention output and add the residual.
         self.linearBatch(
             self.attn_out[0 .. n * qd],
             self.attn_o_w[layer].*,
@@ -653,8 +644,14 @@ pub const LlamaRunner = struct {
         }
 
         self.tEnd(t_res1, .residual);
+    }
 
-        // -- FFN / SwiGLU block ---------------------------------------------
+    /// The second half of a layer: norm, SwiGLU feed-forward, and the residual add.
+    fn ffnBlock(self: *LlamaRunner, layer: u32, n: usize) void {
+        const c = self.card;
+        const d = c.embedding_length;
+
+        // Normalize for the feed-forward block.
         const t_fn = self.tBegin();
         for (0..n) |i| {
             ops.rmsnorm(
@@ -666,6 +663,8 @@ pub const LlamaRunner = struct {
         }
 
         self.tEnd(t_fn, .rmsnorm);
+
+        // Gate and up projections, then SwiGLU.
         self.linearBatch(
             self.x_norm[0 .. n * d],
             self.ffn_gate_w[layer].*,
@@ -691,6 +690,8 @@ pub const LlamaRunner = struct {
         }
 
         self.tEnd(t_sg, .swiglu);
+
+        // Down projection and the second residual add.
         self.linearBatch(
             self.ffn_gate[0 .. n * fd],
             self.ffn_down_w[layer].*,
@@ -706,10 +707,8 @@ pub const LlamaRunner = struct {
         self.tEnd(t_res2, .residual);
     }
 
-    /// Copy slot state for a session fork: KV rows `0..pos` of the target
-    /// become the rows of the source. Rows past `pos` stay stale, because
-    /// attention reads only the `0..=pos` range of the owning session. That is
-    /// the slot-reuse argument. `Sessions.clone` calls this when present.
+    /// Copy KV rows `0..pos` of the source slot into the target slot, for a session fork.
+    /// Rows past `pos` stay stale, because attention reads only `0..=pos`.
     pub fn cloneSlotState(self: *LlamaRunner, source_slot: u32, target_slot: u32, pos: u32) void {
         std.debug.assert(source_slot < self.n_slots);
         std.debug.assert(target_slot < self.n_slots);
@@ -721,16 +720,7 @@ pub const LlamaRunner = struct {
 
     // -- tiered kv ----------------------------------------------------------
 
-    // Prefix snapshots move the rows of a slot to and from a host blob. The
-    // CPU cache already lives in host memory, so both directions are memcpys.
-    // The layout, the region order, and the sizes are identical whichever
-    // backend wrote the blob: ascending layers, K rows then V rows per layer.
-    // A blob therefore restores through any runner at the same dtype. The bytes
-    // themselves are executor-specific. The presence of `evictSlot` is what
-    // lights `Sessions.can_snapshot` and `Residency.can_evict` for this runner.
-
-    /// Bytes that the first `n_rows` KV positions of one slot occupy in a host
-    /// blob.
+    /// Bytes that the first `n_rows` KV positions of one slot occupy in a host blob.
     pub fn evictSlotBytesFor(self: *const LlamaRunner, n_rows: u32) u64 {
         const c = self.card;
         const row_bytes: u64 = self.kv_dtype.rowBytes(c.n_kv_heads * c.head_dim);
@@ -785,11 +775,8 @@ pub const LlamaRunner = struct {
 
     // -- matmul dispatch ----------------------------------------------------
 
-    /// See the shared `linear_dispatch.linearBatchDispatch`. The method binds
-    /// the pool and the policy of this runner. It is also the one interface
-    /// every row-parallel matmul of the step passes through, so the CPU timer
-    /// charges all five matmul categories here and the layer body stays a
-    /// straight datapath sequence.
+    /// Bind the pool and the policy to `linear_dispatch.linearBatchDispatch`. Every matmul of the
+    /// step passes through here, so the CPU timer charges the matmul categories in one place.
     fn linearBatch(
         r: *const LlamaRunner,
         inputs: []const f32,
@@ -813,8 +800,7 @@ const test_fakes = @import("test_fakes.zig");
 const test_fixtures = @import("../core/test_fixtures.zig");
 
 test "cpu profile: the categories partition one decode step" {
-    // The instrument exists only in a `-Dtrace` build, and the GPU per-op
-    // backend dispatches to a device this test must not touch.
+    // The instrument exists only in a `-Dtrace` build. The GPU per-op backend touches a device.
     if (comptime !core_log.hot or build_options.use_vulkan_ops) {
         return error.SkipZigTest;
     } else {
@@ -844,8 +830,7 @@ test "cpu profile: the categories partition one decode step" {
             .f32,
         );
 
-        // One unprofiled step faults in the weight pages, so the measured step
-        // pays no first-touch cost the brackets cannot see.
+        // One unprofiled step faults in the weight pages, so the measured step pays no first touch.
         _ = try r.step(1, 0);
 
         var prof: cpu_profile.CpuProfile = .{ .family = .llama };
@@ -857,9 +842,7 @@ test "cpu profile: the categories partition one decode step" {
         const wall: u64 = @intCast(t0.durationTo(t1).raw.toNanoseconds());
 
         try std.testing.expectEqual(@as(u64, 1), prof.steps);
-        // Cover: one decode step charges every llama category, so no category
-        // is dead and no op of the step escapes the partition. A qwen category
-        // stays at zero.
+        // Cover: one decode step charges every llama category, and a qwen category stays at zero.
         for (std.enums.values(ProfileCat)) |cat| {
             if (cat.usedBy(.llama)) {
                 try std.testing.expect(prof.nsOf(cat) > 0);
@@ -868,14 +851,11 @@ test "cpu profile: the categories partition one decode step" {
             }
         }
 
-        // Disjoint: two overlapping brackets charge one nanosecond twice, which
-        // pushes the sum past the wall time of the step.
+        // Disjoint: two overlapping brackets charge one nanosecond twice, past the wall time.
         try std.testing.expect(prof.total() <= wall);
-        // Whole: the uncounted remainder is row validation and loop
-        // bookkeeping, so the categories carry the greater part of the step.
+        // Whole: the uncounted remainder is row validation and loop bookkeeping.
         try std.testing.expect(prof.total() * 2 >= wall);
-        // The pool share is a subset of the whole, because the step also
-        // runs serial categories.
+        // The pool share is a subset of the whole, because the step also runs serial categories.
         try std.testing.expect(prof.nsParallel() > 0);
         try std.testing.expect(prof.nsParallel() < prof.total());
     }

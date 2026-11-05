@@ -1,15 +1,31 @@
-//! The device arms of a boot as pure values: the fused fit, the serve budget
-//! arms, and the hybrid placement. The CLI measures the device once
-//! (`ModelFacts`, `DeviceFacts`), `resolve` calls `arm`, and the CLI logs the
-//! value and constructs the runner it names. Nothing here reads a device or
-//! logs, so a table test runs every device row with no GPU.
+//! Role. The device arms of a boot as pure values: the fused fit, the serve budget arms, and the
+//! hybrid placement. The CLI measures the device once (`ModelFacts`, `DeviceFacts`), `resolve`
+//! calls `arm`, and the CLI logs the value and constructs the runner it names. Nothing here reads
+//! a device or logs, so a table test runs every device row with no GPU.
 //!
-//! The value keeps the order of the boot lines. A `Placed` value holds the
-//! lines before the split and the split itself. The arm holds the lines of the
-//! runner the split selects. A refusal follows every line before it, so the
-//! CLI logs the `Placed` lines first and then formats the refusal.
+//! Log order. The value keeps the order of the boot lines. A `Placed` value holds the lines before
+//! the split and the split itself. The arm holds the lines of the runner the split selects. A
+//! refusal follows every line before it, so the CLI logs the `Placed` lines first and then formats
+//! the refusal.
 //!
-//! The per-kind rules of the device arms:
+//! Budget arms. One KV region holds every slot at the window, so the device buffer limits bound
+//! the product of the two. With pinned slots the money buys the window, so the clamp runs on the
+//! plan and a cut window replans at the same slot count. With unpinned slots the window is known
+//! first: the flag, or the serve default the limits leave for one slot. The money buys the slots,
+//! so the limits cap the slot count. The limits never shrink a named window, and a shape they
+//! refuse at any slot count reaches the runner, which refuses it with the numbers. With pinned
+//! slots the money can still lower a named window, which is a cap there
+//! (`kv_budget.resolveWindow`).
+//!
+//! Window fits. A named window passes through every fit, so the planner or the runner refuses it
+//! with the numbers. A default window shrinks, first to the device buffer limits and then to the
+//! VRAM figure. When no granule fits, the default stands and the runner refuses it.
+//!
+//! Slots. The llama fused runner keeps a spare stream, so it never plans one slot. The hybrid
+//! runner indexes its device suffix by `limits.max_batch`, so a hybrid slot count past that
+//! ceiling refuses when a flag pinned it and clamps when the serve options derived it.
+//!
+//! Per-kind rules.
 //!
 //!   rule                      run            serve                 bench
 //!   slots of the fused arm    1              the structural slots  1
@@ -38,10 +54,8 @@ const Result = resolve.Result;
 
 // -- types ------------------------------------------------------------------
 
-/// The reservations the fused runners make for one model. The CLI measures
-/// each field with the function the runner calls, so the plan and the runner
-/// preflight price one figure. A build without the fused ops measures only
-/// the weight census and states zero for the rest.
+/// The reservations the fused runners make for one model. The CLI measures each field with the
+/// function the runner calls. A build without the fused ops states zero past the weight census.
 pub const ModelFacts = struct {
     n_layers: u32,
     /// `tensor_lookup.layerWeightBytes`. The first `n_layers` entries hold.
@@ -65,14 +79,12 @@ pub const ModelFacts = struct {
 
 /// What the device context states.
 pub const DeviceFacts = struct {
-    /// The one VRAM figure: the live budget, or the heap size on a driver
-    /// without the budget extension.
+    /// The live VRAM budget, or the heap size on a driver without the budget extension.
     vram: u64,
     buffer_limits: limits.BufferLimits,
 };
 
-/// A default window that the device buffer limits cut, with the figures of its
-/// log line.
+/// A default window that the device buffer limits cut, with the figures of its log line.
 pub const Clamp = struct {
     n_slots: u32,
     base: u32,
@@ -217,8 +229,7 @@ pub fn caps(
     };
 }
 
-/// The placement line of `plan`: the split the auto planner takes at `c`. The
-/// line only reports, and no runner reads it.
+/// The placement line of `plan`: the split the auto planner takes at `c`. No runner reads it.
 pub fn report(
     c: kv_budget.Caps,
     card: loader.ModelCard,
@@ -231,8 +242,7 @@ pub fn report(
         .window = plan.window,
         .costs = kv_cost.costVector(card, kv_dtype),
     };
-    // The auto planner never refuses, because the all-host split reserves no
-    // device bytes.
+    // The all-host split reserves no device bytes, so the auto planner cannot refuse.
     return kv_budget.placementPlan(
         c,
         m.layers(),
@@ -243,11 +253,8 @@ pub fn report(
     ) catch unreachable;
 }
 
-/// The window a fused or hybrid arm plans at, before any VRAM fit. A named
-/// window passes through, so the runner refuses it when one region breaks a
-/// device limit. A default window whose region breaks a limit shrinks to
-/// `kv_index.maxGranuleWindow`. When no granule fits, the default stands and
-/// the runner refuses it with the same numbers.
+/// The window a fused or hybrid arm plans at, before any VRAM fit. A default window whose region
+/// breaks a device limit shrinks to `kv_index.maxGranuleWindow`. See "Window fits" in the header.
 pub fn clampDefault(
     n_slots: u32,
     kv_row_elems: u32,
@@ -268,15 +275,14 @@ pub fn clampDefault(
     const deepest = kv_index.maxWindowForLimits(n_slots, kv_row_elems, kv_dtype, lim);
     if (base <= deepest) return .{ .window = base, .clamp = null };
 
-    // The granule floor of `deepest` is `kv_index.maxGranuleWindow`, without a
-    // second solve.
+    // This is `kv_index.maxGranuleWindow` without a second solve.
     const window: u32 = @intCast(limits.floorToGranule(deepest));
     if (window == 0) return .{ .window = base, .clamp = null };
 
     std.debug.assert(window < base);
-    // Every region has one size at any layer count, so one layer stands for
-    // them all. The first limit one position past `deepest` breaks is a limit
-    // that binds the window.
+
+    // Name the limit that binds the window. One layer stands for all, because every region has
+    // one size.
     const at_base = kv_index.Layout.init(n_slots, base, kv_row_elems, 1, kv_dtype);
     const verdict = kv_index.fits(
         kv_index.Layout.init(n_slots, deepest + 1, kv_row_elems, 1, kv_dtype),
@@ -302,10 +308,8 @@ pub fn clampDefault(
     };
 }
 
-/// The window a whole-model fused arm plans at. A named window passes
-/// through, so the planner or the preflight refuses it when it does not fit. A
-/// default window shrinks to the widest window the VRAM figure funds for
-/// `n_slots` slots.
+/// The window a whole-model fused arm plans at: the widest window the VRAM figure funds for
+/// `n_slots` slots. See "Window fits" in the header.
 pub fn fitDefault(
     c: kv_budget.Caps,
     cost: kv_budget.KvCostModel,
@@ -326,9 +330,7 @@ pub fn fitDefault(
     return .{ .window = fit, .cut = .{ .n_slots = n_slots, .base = base, .window = fit } };
 }
 
-/// The slots a hybrid placement can hold. The hybrid runner indexes its
-/// device suffix by `limits.max_batch`, so a count past that ceiling refuses
-/// when a flag pinned it, and clamps when the serve options derived it.
+/// The slots a hybrid placement can hold. See "Slots" in the header.
 pub fn hybridSlots(structural: u32, pinned: bool) error{HybridSlotsPinned}!u32 {
     std.debug.assert(structural >= 1);
 
@@ -338,11 +340,8 @@ pub fn hybridSlots(structural: u32, pinned: bool) error{HybridSlotsPinned}!u32 {
     return limits.max_batch;
 }
 
-/// The arm a serve split selects. An absent flag keeps the whole-model arm. A
-/// split that leaves no host layer is the whole-model arm again, and every
-/// other split is the hybrid, except that an auto split with no GPU layer is
-/// the all-host arm. A zero count never reaches here: it takes the host arm
-/// before the boot opens a device.
+/// The arm a serve split selects. A split with no host layer is the whole-model arm again.
+/// An auto split with no GPU layer is the all-host arm. A zero count never reaches here.
 pub fn armFor(gpu_layers: ?kv_budget.GpuLayers, split: u32, n_layers: u32) ArmTag {
     std.debug.assert(n_layers >= 1);
     std.debug.assert(split <= n_layers);
@@ -365,8 +364,7 @@ pub fn armFor(gpu_layers: ?kv_budget.GpuLayers, split: u32, n_layers: u32) ArmTa
 
 // -- helpers ----------------------------------------------------------------
 
-/// The serve arms: a split when `--gpu-layers` names one, then the fused arm
-/// for a split that funds the whole model or for a boot that names none.
+/// The serve arms: a split when `--gpu-layers` names one, else the fused arm.
 fn serveArm(
     input: Input,
     card: loader.ModelCard,
@@ -378,8 +376,10 @@ fn serveArm(
     const flag = input.engine.gpu_layers orelse return .{
         .arm = fusedOk(serveFused(input, card, kv_dtype, window, facts)),
     };
-    // A zero count takes the host arm with no device.
+    // A zero count takes the host arm before the boot opens a device.
     std.debug.assert(!flag.isZeroCount());
+
+    // Refuse a pin past the model.
     const m = facts.model.?;
     const d = facts.device.?;
     const n_layers: u32 = card.n_layers;
@@ -394,6 +394,7 @@ fn serveArm(
         }
     }
 
+    // Plan the slots and the window the split prices.
     const slots = hybridSlots(shape.structural_slots, shape.slots_req != null) catch
         return .{ .arm = .{ .refused = .{ .hybrid_slots = shape.structural_slots } } };
     const c = caps(card, m, d.vram, window.ceiling, slots, kv_dtype);
@@ -415,10 +416,10 @@ fn serveArm(
         .n_logical = shape.max_sessions,
     });
     const prefix_default = withPrefixDefault(&plan, shape.kv_ram_bytes);
-    // Mode B passes the structure through, so the placement prices the shape
-    // this plan states.
     std.debug.assert(plan.n_slots == slots);
     std.debug.assert(plan.window == clamped.window);
+
+    // Record the lines before the split.
     var placed: Placed = .{
         .pin = pin,
         .slots_from = if (slots < shape.structural_slots) shape.structural_slots else null,
@@ -428,13 +429,13 @@ fn serveArm(
     };
     placed.window.base = clamped.window;
     placed.window.device_clamped = clamped.clamp != null;
+
+    // Price the split. A residency pool moves blobs through both swap stages, so it prices both.
     const kv: kv_budget.KvStructure = .{
         .n_slots = slots,
         .window = clamped.window,
         .costs = kv_cost.costVector(card, kv_dtype),
     };
-    // A serve arm holds a residency pool, which evicts, restores, and
-    // snapshots prefixes through both swap stages, so the split prices them.
     const host: kv_budget.HostRequest = .{ .ram_split = plan.ram, .residency = true };
     const split = kv_budget.placementPlan(c, m.layers(), m.head_weights, kv, host, pin) catch
         return .{
@@ -442,6 +443,8 @@ fn serveArm(
             .arm = .{ .refused = placementRefusal(.serve, c, m, kv, pin.?) },
         };
     placed.split = split;
+
+    // Build the arm that the split selects.
     const selects = armFor(flag, split.split, n_layers);
     placed.selects = selects;
     return .{ .placed = placed, .arm = switch (selects) {
@@ -468,10 +471,8 @@ fn serveArm(
     } };
 }
 
-/// The whole-model serve arm. A budget flag spends a device budget. Otherwise
-/// every session holds a slot at the base window, which a default shrinks to
-/// the device limits and then to the VRAM figure. The llama fused runner keeps
-/// a spare stream, so it never plans one slot.
+/// The whole-model serve arm. A budget flag spends a device budget. Otherwise every session holds
+/// a slot at the base window, fitted as the header says.
 fn serveFused(
     input: Input,
     card: loader.ModelCard,
@@ -487,10 +488,8 @@ fn serveFused(
     const kv_row_elems = card.kvShape().kv_row_elems;
     var out: Fused = undefined;
     if (shape.slots_req != null or shape.kv_vram_bytes != null) {
-        // Weights-aware sizing for both budget flags. `--kv-vram` states X and
-        // the planner buys the slots. `--vram-slots` pins the count, and the
-        // derived X, what usable VRAM leaves after the other reservations,
-        // buys its window.
+        // Plan a budget arm. `--kv-vram` states X and buys the slots. `--vram-slots` pins the
+        // count, and the VRAM left after the other reservations buys the window.
         const req_batch: u32 = if (llama) @max(2, @as(u32, shape.batch)) else shape.batch;
         const c = caps(card, m, d.vram, window.ceiling, req_batch + 1, kv_dtype);
         const slots: ?u32 = if (shape.slots_req) |s| (if (llama) @max(
@@ -519,6 +518,7 @@ fn serveFused(
             .quote = undefined,
         };
     } else {
+        // Plan one slot per session at the base window.
         const n_slots: u32 = if (llama) @max(
             2,
             @as(u32, shape.structural_slots),
@@ -550,6 +550,7 @@ fn serveFused(
         };
     }
 
+    // Quote the RAM that the plan needs.
     out.prefix_default = withPrefixDefault(&out.plan, shape.kv_ram_bytes);
     const kv: kv_budget.KvStructure = .{
         .n_slots = out.plan.n_slots,
@@ -567,9 +568,8 @@ fn serveFused(
     return .{ .ok = out };
 }
 
-/// The `run` and `bench-model` arms: one stream. With no `--gpu-layers` the
-/// fused arm runs. A split prices one slot at the window the device limits
-/// leave.
+/// The `run` and `bench-model` arms: one stream. A split prices one slot at the window the
+/// device limits leave.
 fn sessionArm(
     kind: Kind,
     input: Input,
@@ -583,10 +583,10 @@ fn sessionArm(
     const flag = input.engine.gpu_layers orelse return .{
         .arm = .{ .ok = .{ .fused = sessionFused(kind, input, card, kv_dtype, window, facts) } },
     };
-    // A zero count of `run` takes the host arm with no device. The bench
-    // places a zero count, and the split refuses it as a whole model.
+    // A zero count of `run` takes the host arm. The bench places it, and the split refuses it.
     if (kind == .run) std.debug.assert(!flag.isZeroCount());
 
+    // Refuse a pin past the model.
     const m = facts.model.?;
     const d = facts.device.?;
     const n_layers: u32 = card.n_layers;
@@ -603,18 +603,15 @@ fn sessionArm(
 
     if (input.force_hybrid) std.debug.assert(pin != null);
 
+    // Price the split at the window the device limits leave.
     const c = caps(card, m, d.vram, window.ceiling, 1, kv_dtype);
-    // The device suffix holds the same regions as the fused runner, so the
-    // split prices the window the device limits leave.
     const clamped = clampSession(window, card, kv_dtype, d.buffer_limits);
     const kv: kv_budget.KvStructure = .{
         .n_slots = 1,
         .window = clamped.window.base,
         .costs = kv_cost.costVector(card, kv_dtype),
     };
-    // One stream holds no residency pool, so it never evicts and the stages
-    // price zero. It states no RAM budget, so the host vector carries only what
-    // the split implies.
+    // One stream holds no residency pool, so the stages price zero.
     const host: kv_budget.HostRequest = .{
         .ram_split = .{ .blobs = 0, .prefix = 0 },
         .residency = false,
@@ -626,9 +623,10 @@ fn sessionArm(
             .arm = .{ .refused = placementRefusal(kind, c, m, kv, pin.?) },
         };
     placed.split = split;
+
+    // Select the arm.
     if (kind == .bench) {
-        // A whole-model split is the fused or the CPU runner, which the bench
-        // already measures without the flag.
+        // A whole-model split is a runner that the bench measures without the flag.
         if (!input.force_hybrid and (split.split == 0 or split.split == n_layers)) {
             return .{ .placed = placed, .arm = .{ .refused = .{ .whole_model_split = pin } } };
         }
@@ -644,7 +642,7 @@ fn sessionArm(
                     .ok = .{ .cpu = resolve.cpuArm(.run, input, card, kv_dtype, window, facts) },
                 },
             },
-            // The second clamp of the clamped window cuts nothing.
+            // The clamped window clamps again to itself.
             .fused => return .{
                 .placed = placed,
                 .arm = .{
@@ -657,12 +655,11 @@ fn sessionArm(
         }
     }
 
+    // Quote the hybrid.
     const q = quoteOf(kv, split.split, host, 1, false, facts.ram_free);
     var plan = pricedOf(split, q);
     if (plan) |*p| {
-        // The forced all-host split prices no device bytes, and the forced
-        // hybrid still uploads the head, so the plan carries the head bytes
-        // for the init asserts to hold.
+        // A forced all-host split prices no device bytes, but the hybrid still uploads the head.
         if (p.split == n_layers) {
             p.weight_resident = m.head_weights;
         }
@@ -674,8 +671,7 @@ fn sessionArm(
     };
 }
 
-/// The whole-model arm of one stream: the base window, which a default shrinks
-/// to the device limits and then to the VRAM figure.
+/// The whole-model arm of one stream, fitted as the header says.
 fn sessionFused(
     kind: Kind,
     input: Input,
@@ -692,12 +688,10 @@ fn sessionFused(
     std.debug.assert(kv_budget.windowCeil(c) == window.ceiling);
     const fitted = fitDefault(c, cost, 1, clamped.window.base, clamped.window.flag);
     std.debug.assert(fitted.window <= clamped.window.base);
-    // The llama bench names its one slot, and the other arms let the batch
-    // state it. Mode B passes either through as one slot.
+    // The llama bench names its one slot, and the other arms let the batch state it.
     const slots: ?u32 = if (kind == .bench and card.gdn == null) 1 else null;
     const plan = planShape(c, cost, .{ .window = fitted.window, .slots = slots, .batch = 1 });
-    // The prompt cache holds its RAM budget of snapshots, and each snapshot
-    // moves through the stages, so the qwen run quote prices both.
+    // The qwen run quote prices the prompt cache snapshots and their stages.
     const cache = kind == .run and card.gdn != null and input.prompt_cache;
     const ram_split: kv_budget.KvPlan.Ram = if (card.gdn != null)
         .{ .blobs = 0, .prefix = if (cache) limits.prompt_cache_ram_default else 0 }
@@ -709,6 +703,8 @@ fn sessionFused(
         .window = plan.window,
         .costs = kv_cost.costVector(card, kv_dtype),
     };
+
+    // Assemble the arm.
     return .{
         .caps = c,
         .clamp = clamped.clamp,
@@ -733,8 +729,7 @@ fn sessionFused(
     };
 }
 
-/// `clampDefault` for one stream. The result records the cut, so the window
-/// line does not name a second source. A second call cuts nothing.
+/// `clampDefault` for one stream. The result records the cut, and a second call cuts nothing.
 fn clampSession(
     w: Window,
     card: loader.ModelCard,
@@ -752,8 +747,8 @@ fn clampSession(
     return .{ .window = out, .clamp = clamped.clamp };
 }
 
-/// A plan that buys no slot with money: the structure passes through. The
-/// window lies under the ceiling, so the planner cannot refuse it.
+/// A plan that buys no slot with money. The window lies under the ceiling, so the planner never
+/// refuses.
 fn planShape(
     c: kv_budget.Caps,
     cost: kv_budget.KvCostModel,
@@ -765,17 +760,15 @@ fn planShape(
     return kv_budget.kvPlan(c, cost, req) catch unreachable;
 }
 
-/// Zero-config serve keeps the prefix cache. When no `--kv-ram` names a Y to
-/// split, the prefix budget takes the serve default, and the RAM quote funds
-/// the full blob need beside it or refuses.
+/// Zero-config serve keeps the prefix cache. With no `--kv-ram`, the prefix budget takes the serve
+/// default, and the RAM quote funds the full blob need beside it or refuses.
 fn withPrefixDefault(plan: *kv_budget.KvPlan, kv_ram_bytes: ?u64) bool {
     if (kv_ram_bytes != null) return false;
     plan.ram.prefix = limits.serve_prefix_ram_default;
     return true;
 }
 
-/// Turn a KV VRAM byte budget into `n_slots x window`, or a refusal that
-/// names the numbers that refused it.
+/// Turn a KV VRAM byte budget into `n_slots x window`, or a refusal with the numbers.
 fn planBudget(
     caps_in: kv_budget.Caps,
     cost: kv_budget.KvCostModel,
@@ -789,16 +782,14 @@ fn planBudget(
 
     var r = req;
     r.n_logical = n_logical;
+    // Cap the slots at the session count, because a slot no session can occupy is dead VRAM.
+    // `req.batch` can carry the llama spare-stream floor, so the max keeps that floor legal.
     var c = caps_in;
-    // A budget never buys past the logical session count: a slot no session
-    // can occupy is VRAM bought and left dead. `req.batch` can carry the llama
-    // spare-stream floor, so the max keeps that floor legal when the session
-    // count sits under it. A caller can state a lower slot ceiling, and the
-    // minimum keeps it.
     c.max_vram_slots = @min(caps_in.max_vram_slots, @max(req.batch, n_logical));
-    // The planner reads a decode row as a row that owns a slot, so the width
-    // ceiling never exceeds the slot ceiling.
+    // A decode row owns a slot, so the width ceiling never exceeds the slot ceiling.
     c.max_batch = @min(c.max_batch, c.max_vram_slots);
+
+    // Plan, or refuse with the numbers.
     const plan = kv_budget.kvPlan(c, cost, r) catch |err| switch (err) {
         error.WindowExceedsCeiling => return .{
             .refused = .{
@@ -806,8 +797,7 @@ fn planBudget(
             },
         },
         error.KvVramBudgetTooSmall => {
-            // The window resolved before the budget refused, so the quote
-            // resolves the same window.
+            // The window resolved before the refusal, so the quote resolves the same one.
             const q = kv_budget.quote(c, cost, r) catch unreachable;
             return .{ .refused = .{ .kv_vram_small = .{
                 .x_bytes = r.x_bytes.?,
@@ -818,9 +808,9 @@ fn planBudget(
             } } };
         },
     };
+
+    // Cap and signal: the ceiling cut the slot count, so the remainder buys nothing.
     var out: Budgeted = .{ .plan = plan, .clamp = clamp };
-    // Cap and signal: the ceiling cut the slot count the money bought, so the
-    // remainder buys nothing.
     if (plan.slots_clamped) {
         out.stranded = .{
             .max_slots = c.max_vram_slots,
@@ -832,18 +822,7 @@ fn planBudget(
     return .{ .ok = out };
 }
 
-/// Plan a budget arm inside the device buffer limits. One KV region holds
-/// every slot at the window, so the limits bound the product of the two. The
-/// flag that the money follows gives way.
-///
-/// With pinned slots the money buys the window, so the clamp runs on the plan.
-/// A cut window replans at the same slot count, which the budget already funds
-/// at the wider window. With unpinned slots the window is known first: the
-/// flag, or the serve default the limits leave for one slot. The money buys
-/// the slots, so the limits cap the slot count. The limits never shrink a named
-/// window, and a shape they refuse at any slot count reaches the runner, which
-/// refuses it with the numbers. With pinned slots, the money can still lower a
-/// named window, which is a cap there (`kv_budget.resolveWindow`).
+/// Plan a budget arm inside the device buffer limits. See "Budget arms" in the header.
 fn planBudgetOnDevice(
     caps_in: kv_budget.Caps,
     cost: kv_budget.KvCostModel,
@@ -853,6 +832,7 @@ fn planBudgetOnDevice(
     kv_dtype: dtype.KvDtype,
     lim: limits.BufferLimits,
 ) Result(Budgeted) {
+    // Pinned slots: the money buys the window, so the clamp runs on the plan.
     if (req.slots != null) {
         const first = switch (planBudget(caps_in, cost, req, n_logical, null)) {
             .ok => |b| b,
@@ -885,6 +865,7 @@ fn planBudgetOnDevice(
         return .{ .ok = second };
     }
 
+    // Unpinned slots: fix the window first, then let the limits cap the slot count.
     var c = caps_in;
     var clamp: ?Clamp = null;
     if (req.window == null) {
@@ -896,8 +877,7 @@ fn planBudgetOnDevice(
     std.debug.assert(c.serve_default <= c.default_ceil);
     const window = @min(req.window orelse c.serve_default, kv_budget.windowCeil(c));
     const device_slots = kv_index.maxSlotsForLimits(window, kv_row_elems, kv_dtype, lim);
-    // Fewer slots than decode rows cannot give each row a slot, so the cap
-    // stays off and the runner refuses the shape.
+    // Fewer slots than decode rows leaves a row with no slot, so the runner refuses the shape.
     if (device_slots < req.batch) return planBudget(c, cost, req, n_logical, clamp);
 
     c.max_vram_slots = @min(c.max_vram_slots, device_slots);
@@ -915,8 +895,7 @@ fn planBudgetOnDevice(
     return .{ .ok = out };
 }
 
-/// The device limit that caps a budget at `slots` slots of `window`
-/// positions: the first limit one more slot breaks.
+/// The device limit that caps a budget at `slots` slots of `window` positions.
 fn deviceSlotsOf(
     window: u32,
     slots: u32,
@@ -926,9 +905,7 @@ fn deviceSlotsOf(
 ) DeviceSlots {
     std.debug.assert(slots >= 1);
 
-    // One more slot can pass the slot ceiling, so the region of one slot
-    // scales instead of a layout of `slots + 1` slots. One layer stands for
-    // every region.
+    // Scale the region of one slot, because a layout of `slots + 1` slots can pass the ceiling.
     const one_slot = kv_index.Layout.init(1, window, kv_row_elems, 1, kv_dtype);
     const next: u64 = @as(u64, slots) + 1;
     const verdict = limits.bufferFits(
@@ -971,9 +948,7 @@ fn pricedOf(
     };
 }
 
-/// A pinned split the VRAM figure cannot fund, with what it costs. Only a
-/// count reaches it, because the auto scan always ends on a split the budget
-/// funds.
+/// A pinned split the VRAM figure cannot fund, with its cost. Only a count reaches it.
 fn placementRefusal(
     kind: Kind,
     c: kv_budget.Caps,
@@ -1175,7 +1150,7 @@ test "planBudgetOnDevice: pinned slots cut the window, and bought slots stop at 
     ).ok.plan;
     try std.testing.expectEqual(@as(u32, 7), small.n_slots);
     try std.testing.expect(!small.slots_clamped);
-    // A named window never shrinks, pinned or bought, and it c the slots.
+    // A named window never shrinks, pinned or bought, and it caps the slots.
     const named = planBudgetOnDevice(
         c,
         cost,

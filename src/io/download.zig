@@ -1,4 +1,4 @@
-//! Fetch a model GGUF over HTTPS with `std.http.Client` and write it to
+//! Flow. Fetch a model GGUF over HTTPS with `std.http.Client` and write it to
 //! `<root>/<model.local_path>/<model.file_name>`. The write lands through an
 //! atomic rename, and the parent directories get created first. The body
 //! streams in chunks so a TTY gets a live progress bar. `remoteSize` reads only
@@ -14,10 +14,9 @@
 //! `<file>.partial` temp, and only a success renames it. A failed fetch never
 //! truncates a good GGUF.
 //!
-//! The four refusals this module raises are `error.HttpStatusNotOk`,
-//! `error.UnexpectedEncoding`, `error.NotAGguf` and `error.DownloadTruncated`.
-//! Each one logs what went wrong before it returns, so the CLI exits without a
-//! trace.
+//! Refusals. This module raises `error.HttpStatusNotOk`, `error.UnexpectedEncoding`,
+//! `error.NotAGguf` and `error.DownloadTruncated`. Each refusal logs what went wrong before it
+//! returns, so the CLI exits without a trace.
 
 const std = @import("std");
 const registry = @import("../core/registry.zig");
@@ -96,10 +95,8 @@ const Progress = struct {
 
 // -- api --------------------------------------------------------------------
 
-/// Download `model` from `model.download_url` to
-/// `<root>/<local_path>/<file_name>` and replace any existing file through an
-/// atomic rename. The call creates the parent directory first. The body streams
-/// in chunks and updates a progress bar on a TTY.
+/// Download `model` to `<root>/<local_path>/<file_name>` and replace any existing file through an
+/// atomic rename. The call creates the parent directory first.
 pub fn fetchModel(
     io: Io,
     arena: Allocator,
@@ -107,11 +104,11 @@ pub fn fetchModel(
     root: []const u8,
     model: registry.Model,
 ) !void {
+    // Resolve the target and the temp path.
     var cwd = Io.Dir.cwd();
     try cwd.createDirPath(io, try registry.modelDir(arena, root, model));
     const file_path = try registry.modelFilePath(arena, root, model);
-    // A sibling temp keeps a failed fetch from truncating a good GGUF, and a
-    // rename inside one directory is atomic.
+    // A sibling temp keeps a failed fetch from truncating a good GGUF.
     const tmp_path = try std.fmt.allocPrint(arena, "{s}.partial", .{file_path});
 
     log.info("fetching {s}", .{model.download_url});
@@ -121,6 +118,7 @@ pub fn fetchModel(
     defer client.deinit();
 
     {
+        // Open the temp file and send the request.
         const file = try cwd.createFile(io, tmp_path, .{});
         errdefer cwd.deleteFile(io, tmp_path) catch {};
         defer file.close(io);
@@ -140,6 +138,7 @@ pub fn fetchModel(
         try req.sendBodiless();
         var response = try req.receiveHead(&redirect_buf);
 
+        // Refuse a bad status or a compressed body.
         if (response.head.status != .ok) {
             log.err("HTTP {d} {t}", .{ @intFromEnum(response.head.status), response.head.status });
             if (response.head.status == .unauthorized or response.head.status == .forbidden) {
@@ -149,8 +148,7 @@ pub fn fetchModel(
             return error.HttpStatusNotOk;
         }
 
-        // A compressed encoding lands a wrong file on disk and breaks the
-        // content-length progress.
+        // A compressed encoding writes a wrong file and breaks the progress count.
         if (response.head.content_encoding != .identity) {
             log.err(
                 "unexpected content-encoding {t}. Refusing to write",
@@ -159,13 +157,14 @@ pub fn fetchModel(
             return error.UnexpectedEncoding;
         }
 
+        // Stream the body to the temp file and keep the leading bytes.
         var prog = Progress.init(io, response.head.content_length);
         var transfer_buf: [4 * 1024]u8 = undefined;
         const reader = response.reader(&transfer_buf);
         var chunk: [128 * 1024]u8 = undefined;
         var downloaded: u64 = 0;
-        // A gated repo or an error page can arrive with status 200, so the
-        // leading bytes must still carry the GGUF identifier the parser names.
+
+        // A gated repo can answer status 200 with a page, so the magic bytes must match.
         var magic: [parser.magic.len]u8 = undefined;
         var magic_len: usize = 0;
         while (true) {
@@ -186,6 +185,7 @@ pub fn fetchModel(
         try file_writer.interface.flush();
         prog.finish();
 
+        // Check that the body is a whole GGUF.
         if (magic_len < magic.len or !std.mem.eql(u8, &magic, &parser.magic)) {
             log.err(
                 "response is not a GGUF (wrong magic). A gated repo can serve an HTML page instead",
@@ -204,15 +204,14 @@ pub fn fetchModel(
         log.info("done: {d:.1} MiB", .{mib(downloaded)});
     }
 
+    // Replace the target in one rename.
     errdefer cwd.deleteFile(io, tmp_path) catch {};
 
     try cwd.rename(tmp_path, cwd, file_path, io);
 }
 
-/// Read the Content-Length of `url` for the `fetch --dry-run` size preview, or
-/// null when the server reports no length. The call uses a GET and reads only
-/// the response head, because the Hugging Face CDN rejects HEAD on `/resolve/`.
-/// The body stays unread, so the call downloads nothing.
+/// Read the Content-Length of `url` for `fetch --dry-run`, or null when the server sends none.
+/// The call sends a GET and reads only the head, because the CDN rejects HEAD on `/resolve/`.
 pub fn remoteSize(io: Io, gpa: Allocator, url: []const u8) !?u64 {
     var client: std.http.Client = .{ .allocator = gpa, .io = io };
     defer client.deinit();

@@ -1,12 +1,24 @@
-//! `Vocab`, a boundary value derived from the GGUF tokenizer KVs. It is built
-//! once at load time and consumed by `bpe.encodeAlloc` and `bpe.decodeAlloc`,
-//! which stay pure over Vocab with storage on the caller's arena. GPT-2
-//! byte-level BPE: every byte 0..255 maps to a printable Unicode codepoint and
-//! the model only ever sees those. The byte-to-codepoint table is fixed and
-//! lives in `comptime` (see `gpt2_byte_table`). The encode-time speed lives in
-//! the data, not the code: `byte_to_id` is a flat [256]u32 lookup, the merge
-//! maps are u64-keyed, and `specials_sorted` is length-descending so the
-//! encoder greedy-matches the longest special token first.
+//! `Vocab`, a boundary value derived from the GGUF tokenizer KVs. It is built once at load time and
+//! consumed by `bpe.encodeAlloc` and `bpe.decodeAlloc`, which stay pure over Vocab with storage on
+//! the caller's arena.
+//!
+//! Byte level. GPT-2 byte-level BPE maps every byte 0..255 to a printable Unicode codepoint, and
+//! the model only ever sees those. The byte-to-codepoint table is fixed and lives in `comptime`
+//! (see `gpt2_byte_table`). The table must produce exactly 68 escape codepoints, which is what the
+//! GPT-2 byte-to-unicode algorithm produces.
+//!
+//! Encode speed. It lives in the data, not the code: `byte_to_id` is a flat [256]u32 lookup, the
+//! merge maps are u64-keyed, and `specials_sorted` is length-descending so the encoder
+//! greedy-matches the longest special token first.
+//!
+//! Pre-tokenization. `tokenizer.ggml.pre` selects a `PreType` that mirrors the per-family regexes
+//! of llama.cpp. `.default` BPE-merges the whole inter-special span as one segment, which is
+//! correct only for a tokenizer that does no pre-split. The other types split the text into
+//! pre-tokens first, so merges never cross a boundary. `.llama3` (`llama-bpe`) uses the GPT-2 and
+//! llama3 regex with digit runs of 1-3, plus `ignore_merges`: a whole pre-token that is a token
+//! is emitted directly. `.qwen` (`qwen35`, `qwen2`) uses the same regex with single-digit runs and
+//! no `ignore_merges`. `.smollm` uses the classic GPT-2 regex with a space-only leading char,
+//! lowercase contractions, single-digit runs, and simpler whitespace.
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
@@ -14,15 +26,12 @@ const parser = @import("../../io/gguf/parser.zig");
 
 // -- constants --------------------------------------------------------------
 
-/// GGUF `tokenizer.ggml.token_type` values of the added tokens that the
-/// encoder matches whole. Type 1 is a normal token.
+/// GGUF `tokenizer.ggml.token_type` values of the added tokens that the encoder matches whole.
 const token_type_control: i32 = 3;
 
 const token_type_user_defined: i32 = 4;
 
-/// Fixed bijection: byte 0..255 -> GPT-2 byte-level codepoint and its UTF-8 bytes.
-/// Pair-validation: asserts exactly 68 escape codepoints, which is what the
-/// GPT-2 byte-to-unicode algorithm produces.
+/// Fixed bijection: byte 0..255 to its GPT-2 byte-level codepoint and the UTF-8 bytes of it.
 const gpt2_byte_table: [256]ByteEntry = blk: {
     @setEvalBranchQuota(10_000);
     var t: [256]ByteEntry = undefined;
@@ -47,8 +56,8 @@ const gpt2_byte_table: [256]ByteEntry = blk: {
     break :blk t;
 };
 
-/// Sentinel for `Vocab.byte_to_id` slots whose GPT-2 char does not exist in the
-/// vocab. `bpe.encodeAlloc` returns `error.UntokenizableByte` if encountered.
+/// Sentinel for a `Vocab.byte_to_id` slot whose GPT-2 char is not in the vocab. `bpe.encodeAlloc`
+/// returns `error.UntokenizableByte` on it.
 pub const no_token: u32 = std.math.maxInt(u32);
 
 // -- types ------------------------------------------------------------------
@@ -65,21 +74,11 @@ pub const Special = struct {
     bytes: []const u8,
 };
 
-/// Pre-tokenization regime, from `tokenizer.ggml.pre`, mirroring llama.cpp's
-/// per-family regexes. `.default` BPE-merges the whole inter-special span as one
-/// segment (only correct for a tokenizer that truly does no pre-split). The rest
-/// split the text into pre-tokens first so merges never cross a boundary:
-///   - `.llama3` (`llama-bpe`): GPT-2/llama3 regex, digit runs of 1-3, plus
-///     `ignore_merges` (a whole pre-token that is a token is emitted directly).
-///   - `.qwen` (`qwen35`/`qwen2`): the same regex but single-digit runs, no
-///     `ignore_merges`.
-///   - `.smollm` (`smollm`): the classic GPT-2 regex, with a space-only leading
-///     char, lowercase contractions, single-digit runs, simpler whitespace.
+/// Pre-tokenization regime, from `tokenizer.ggml.pre`. See "Pre-tokenization" in the header.
 pub const PreType = enum { default, llama3, qwen, smollm };
 
 pub const Vocab = struct {
-    /// id -> token bytes (in GPT-2 byte-level encoding for normal tokens, raw
-    /// UTF-8 for special tokens like `<|im_start|>`). Backed by the GGUF mmap.
+    /// id to token bytes: byte-level for normal tokens, raw UTF-8 for specials. Backed by the mmap.
     tokens: []const []const u8,
     /// (left_id << 32 | right_id) -> rank. Lower = earlier merge.
     merge_rank: std.AutoHashMap(u64, u32),
@@ -87,24 +86,21 @@ pub const Vocab = struct {
     merge_to_id: std.AutoHashMap(u64, u32),
     /// byte 0..255 -> vocab id of that byte's GPT-2 byte-level character.
     byte_to_id: [256]u32,
-    /// Codepoint 0..0x143ish -> original byte. Used during decode to undo the
-    /// byte-level encoding.
+    /// Codepoint to original byte. Decode uses it to undo the byte-level encoding.
     codepoint_to_byte: std.AutoHashMap(u21, u8),
     /// Special tokens sorted by length DESC for longest-first greedy match.
     specials_sorted: []const Special,
 
     bos_id: u32,
     eos_id: u32,
-    /// Whether `bpe.encodeAlloc` prepends `bos_id`. It comes from the model's
-    /// tokenizer metadata, not from the caller (see `addBos`).
+    /// Whether `bpe.encodeAlloc` prepends `bos_id`. It comes from the model metadata (see
+    /// `addBos`).
     add_bos: bool,
     /// Pre-tokenization regime (see `PreType`). Selects the encode path in `bpe`.
     pre: PreType,
-    /// llama3: emit a whole pre-token directly when it is itself a vocab token,
-    /// rather than BPE-merging its bytes. Mirrors llama.cpp `ignore_merges`.
+    /// llama3: emit a whole pre-token directly when it is a vocab token. Mirrors `ignore_merges`.
     ignore_merges: bool,
-    /// Byte-level token string -> id. Built for merge resolution either way and
-    /// kept for the llama3 whole-pre-token (`ignore_merges`) lookup.
+    /// Byte-level token string to id. Merge resolution and the `ignore_merges` lookup use it.
     token_to_id: std.StringHashMap(u32),
 };
 
@@ -123,9 +119,8 @@ pub fn pairKey(left: u32, right: u32) u64 {
     return (@as(u64, left) << 32) | @as(u64, right);
 }
 
-/// The UTF-8 bytes of byte `b`'s GPT-2 byte-level character (e.g. space -> codepoint U+0120).
-/// `bpe` assembles a pre-token's byte-level string from these for the
-/// `ignore_merges` whole-pre-token lookup against `token_to_id`.
+/// The UTF-8 bytes of the GPT-2 byte-level character of byte `b`, such as U+0120 for a space.
+/// `bpe` builds the byte-level string of a pre-token from these.
 pub fn byteLevel(b: u8) []const u8 {
     const e = &gpt2_byte_table[b];
     return e.bytes[0..e.len];
@@ -136,39 +131,35 @@ pub fn buildFromParsed(arena: Allocator, p: parser.Parsed) Error!Vocab {
     const tokens = try lookupStringArray(p, "tokenizer.ggml.tokens");
     const merges = try lookupStringArray(p, "tokenizer.ggml.merges");
     const token_types = try lookupI32Array(p, "tokenizer.ggml.token_type");
-    // BOS id is optional: ChatML models (Qwen3.5) set add_bos_token=false and
-    // can omit it. Whether the encoder prepends it is the model's call (addBos).
+    // The BOS id is optional, because ChatML models such as Qwen3.5 can omit it.
     const bos = try lookupU32Or(p, "tokenizer.ggml.bos_token_id", 0);
     const eos = try lookupU32(p, "tokenizer.ggml.eos_token_id");
     const add_bos = addBos(p);
     const pre = preType(p);
-    // llama.cpp enables ignore_merges for the llama3 (llama-bpe) pre-tokenizer.
+    // llama.cpp enables ignore_merges for the llama3 pre-tokenizer.
     const ignore_merges = (pre == .llama3);
 
     std.debug.assert(tokens.len == token_types.len);
     std.debug.assert(tokens.len > 0);
 
-    // 1. String -> id (used for merge & byte resolution).
+    // Map each token string to its id.
     var string_to_id = std.StringHashMap(u32).init(arena);
     try string_to_id.ensureTotalCapacity(@intCast(tokens.len));
     for (tokens, 0..) |t, i| {
-        // `putNoClobber` faults on a duplicate token, which is a GGUF defect.
-        // The loader tolerates the rare duplicate by keeping the *first* id.
+        // A duplicate token is a GGUF defect. The first id wins.
         if (!string_to_id.contains(t)) {
-            try string_to_id.put(t, @intCast(i));
+            string_to_id.putAssumeCapacity(t, @intCast(i));
         }
     }
 
-    // 2. Special-flag list, local to this build. Step 5 turns it into
-    //    `specials_sorted`, the one form the encoder reads. The reference
-    //    tokenizer matches user-defined added tokens such as `<think>` as
-    //    specials, so each one encodes to one id.
+    // Flag the specials. The reference tokenizer matches user-defined added tokens such as
+    // `<think>` as specials, so each one encodes to one id.
     const is_special = try arena.alloc(bool, tokens.len);
     for (token_types, is_special) |tt, *b| {
         b.* = (tt == token_type_control or tt == token_type_user_defined);
     }
 
-    // 3. Walk merges in order, and record rank + the merged id.
+    // Record the rank and the merged id of each merge, in order.
     var merge_rank = std.AutoHashMap(u64, u32).init(arena);
     var merge_to_id = std.AutoHashMap(u64, u32).init(arena);
     try merge_rank.ensureTotalCapacity(@intCast(merges.len));
@@ -176,7 +167,7 @@ pub fn buildFromParsed(arena: Allocator, p: parser.Parsed) Error!Vocab {
 
     var key_buf: [512]u8 = undefined;
     for (merges, 0..) |m, rank| {
-        const space = std.mem.indexOfScalar(u8, m, ' ') orelse return error.InvalidMerge;
+        const space = std.mem.findScalar(u8, m, ' ') orelse return error.InvalidMerge;
         const left_str = m[0..space];
         const right_str = m[space + 1 ..];
         const left_id = string_to_id.get(left_str) orelse return error.InvalidMerge;
@@ -190,26 +181,24 @@ pub fn buildFromParsed(arena: Allocator, p: parser.Parsed) Error!Vocab {
         const merged_id = string_to_id.get(key_buf[0..total]) orelse return error.InvalidMerge;
 
         const key = pairKey(left_id, right_id);
-        try merge_rank.put(key, @intCast(rank));
-        try merge_to_id.put(key, merged_id);
+        merge_rank.putAssumeCapacity(key, @intCast(rank));
+        merge_to_id.putAssumeCapacity(key, merged_id);
     }
 
-    // 4. byte->id and codepoint->byte tables. The byte->codepoint map and its
-    //    UTF-8 encoding are both fixed math and live in `comptime` (see
-    //    `gpt2_byte_table`). At runtime only the vocab string lookup remains.
+    // Build the byte to id and codepoint to byte tables. Only the vocab lookup runs at runtime.
     var byte_to_id: [256]u32 = undefined;
     var codepoint_to_byte = std.AutoHashMap(u21, u8).init(arena);
     try codepoint_to_byte.ensureTotalCapacity(256);
 
     inline for (gpt2_byte_table, 0..) |entry, b| {
         const utf8 = entry.bytes[0..entry.len];
-        // Tolerate vocab gaps: SmolLM2 drops a handful of rare bytes from the
-        // 256-char base set. Mark them, so `bpe.encodeAlloc` fails loud on one.
+        // SmolLM2 drops a few rare bytes from the 256-char base set. Mark the gap, so
+        // `bpe.encodeAlloc` fails loud on one.
         byte_to_id[b] = string_to_id.get(utf8) orelse no_token;
-        try codepoint_to_byte.put(entry.cp, @intCast(b));
+        codepoint_to_byte.putAssumeCapacity(entry.cp, @intCast(b));
     }
 
-    // 5. specials_sorted (longest first).
+    // Sort the specials, longest first.
     var n_specials: usize = 0;
     for (is_special) |s| {
         if (s) {
@@ -249,20 +238,16 @@ pub fn buildFromParsed(arena: Allocator, p: parser.Parsed) Error!Vocab {
 
 // -- helpers ----------------------------------------------------------------
 
-/// Whether the encoder prepends BOS, mirroring llama.cpp (`llama-vocab.cpp`).
-/// The pre-tokenizer type sets the default, true for the llama3 family and
-/// false otherwise, and an explicit `tokenizer.ggml.add_bos_token` wins. The
-/// default is load-bearing: Llama-3 GGUFs ship the `llama-bpe` pre type with no
-/// explicit key, and without their BOS anchor short raw prompts decode to
-/// garbage.
+/// Whether the encoder prepends BOS, as in llama.cpp. The pre type sets the default, true for
+/// llama3. An explicit `tokenizer.ggml.add_bos_token` wins. Llama-3 GGUFs carry no explicit key,
+/// and without their BOS anchor short raw prompts decode to garbage.
 fn addBos(p: parser.Parsed) bool {
     if (lookupBool(p, "tokenizer.ggml.add_bos_token")) |explicit| return explicit;
     return preType(p) == .llama3;
 }
 
-/// Map `tokenizer.ggml.pre` to a `PreType`, mirroring llama.cpp's name -> pre-type
-/// table for the families this engine supports. An unrecognized name maps
-/// to `.default` (whole-span BPE) rather than guessing a regex.
+/// Map `tokenizer.ggml.pre` to a `PreType`, as the llama.cpp table does for the supported
+/// families. An unrecognized name maps to `.default` rather than guessing a regex.
 fn preType(p: parser.Parsed) PreType {
     const pre = lookupString(p, "tokenizer.ggml.pre") orelse return .default;
     const table = [_]struct { name: []const u8, t: PreType }{

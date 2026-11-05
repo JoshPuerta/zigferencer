@@ -5,16 +5,17 @@
 //! one list of categories, so a new category reaches the table with no edit here.
 
 const std = @import("std");
+const zigferencer = @import("zigferencer");
 const Io = std.Io;
 const build_options = @import("build_options");
 
 const common = @import("bench_model_common.zig");
-const kv_budget = @import("../core/kv_budget.zig");
-const limits = @import("../core/limits.zig");
-const cpu_profile = @import("../runtime/cpu_profile.zig");
-const parallel = @import("../runtime/parallel.zig");
-const Pool = @import("../runtime/pool.zig").Pool;
-const sampler = @import("../runtime/sampler.zig");
+const kv_budget = zigferencer.kv_budget;
+const limits = zigferencer.limits;
+const cpu_profile = zigferencer.cpu_profile;
+const parallel = zigferencer.parallel;
+const Pool = zigferencer.pool.Pool;
+const sampler = zigferencer.sampler;
 
 const CpuProfile = cpu_profile.CpuProfile;
 const ProfileCat = cpu_profile.ProfileCat;

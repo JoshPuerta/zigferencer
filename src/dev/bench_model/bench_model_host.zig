@@ -2,22 +2,23 @@
 //! Each run builds a fresh runner, which starts the KV cache at zero.
 
 const std = @import("std");
+const zigferencer = @import("zigferencer");
 const build_options = @import("build_options");
 
 const common = @import("bench_model_common.zig");
 const exec = @import("bench_model_exec.zig");
 const profile = @import("bench_model_profile.zig");
-const serve_common = @import("serve_common.zig");
-const resolve_mod = @import("../engine/resolve.zig");
-const core_log = @import("../core/log.zig");
-const kv_budget = @import("../core/kv_budget.zig");
-const limits = @import("../core/limits.zig");
-const vocab_mod = @import("../core/tokenizer/vocab.zig");
-const parallel = @import("../runtime/parallel.zig");
-const Pool = @import("../runtime/pool.zig").Pool;
+const boot_lines = zigferencer.cli.boot_lines;
+const resolve_mod = zigferencer.resolve;
+const core_log = zigferencer.log;
+const kv_budget = zigferencer.kv_budget;
+const limits = zigferencer.limits;
+const vocab_mod = zigferencer.vocab;
+const parallel = zigferencer.parallel;
+const Pool = zigferencer.pool.Pool;
 
 const per_op_build = build_options.use_vulkan_ops;
-const vulkan_ops_wrap = if (per_op_build) @import("../ops_vulkan/wrap.zig") else void;
+const vulkan_ops_wrap = if (per_op_build) zigferencer.ops_vulkan_wrap else void;
 
 const Bench = common.Bench;
 const RunResult = common.RunResult;
@@ -54,7 +55,7 @@ pub fn bench(comptime Family: type, b: *const Bench) !void {
     };
 
     const max_seq = b.resolved.window.base;
-    serve_common.logSessionWindow(b.resolved.window);
+    boot_lines.logSessionWindow(b.resolved.window);
     try logHostRam(b);
 
     const v = try vocab_mod.buildFromParsed(ctx.arena, b.loaded.parsed);
@@ -110,7 +111,7 @@ fn logHostRam(b: *const Bench) !void {
             facts,
         );
     switch (host) {
-        .ok => |placed| serve_common.logRamQuote(placed.quote, false),
-        .refused => |r| return serve_common.refuse(io, b.model.pub_name, r),
+        .ok => |placed| boot_lines.logRamQuote(placed.quote, false),
+        .refused => |r| return boot_lines.refuse(io, b.model.pub_name, r),
     }
 }

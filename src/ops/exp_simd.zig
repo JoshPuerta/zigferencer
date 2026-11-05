@@ -1,8 +1,33 @@
-//! The vector exponential of the CPU datapath, `@Vector(8, f32)` lanes, for
-//! inputs at or below 0. CPU decode attention takes it for the online softmax
-//! fold, and the sampler takes it for the full-vocab weights. Each lane is a
-//! function of the input of that lane alone, so a value gets the same bits at
-//! any lane position and in any caller.
+//! The vector exponential of the CPU datapath, `@Vector(8, f32)` lanes, for inputs at or below 0.
+//! CPU decode attention takes it for the online softmax fold, and the sampler takes it for the
+//! full-vocab weights. Each lane is a function of the input of that lane alone, so a value gets
+//! the same bits at any lane position and in any caller.
+//!
+//! Callers. The attention fold takes it for a score minus the running maximum, and for an old
+//! maximum minus a new one. The sampler takes it for a scaled logit minus the row maximum. No NaN
+//! arrives. Each lane runs one fixed sequence of IEEE operations on its own input.
+//!
+//! Method. This is the method of Cody and Waite, with the Cephes `expf` constants of Moshier.
+//! 1. Range reduction. `n = floor(x * log2(e) + 1/2)` is the integer nearest to `x / ln 2`. Then
+//!    `r = x - n * ln 2` lies in `[-ln 2 / 2, ln 2 / 2]` up to one rounding, and
+//!    `exp(x) = 2^n * exp(r)`.
+//! 2. Two-part `ln 2`. `ln2_hi` holds 9 significant bits, so `n * ln2_hi` is exact for every `n`
+//!    here, and the first step rounds nothing. `ln2_lo` holds the rest of `ln 2`, and the second
+//!    step rounds once. A one-part f32 `ln 2` errs by 1.9e-9, which at `n = -126` moves the result
+//!    by 2 to 4 ulps.
+//! 3. The polynomial. `exp(r) = 1 + r + r^2 * P(r)`, with `P` of degree 5 in Horner form. The
+//!    Cephes coefficients are a minimax fit with a relative error of at most 4.2e-9 on
+//!    `[-1/2, 1/2]`. Each Horner step is one fused multiply-add, which rounds once.
+//! 4. The scale. The f32 with the exponent field `n + 127` and a zero significand is `2^n`. The
+//!    clamp to `exp_cut` holds `n` in `[-126, 0]`, so the field stays in `[1, 127]`. The product
+//!    with `exp(r)` is then a normal f32 and exact.
+//! 5. The cut. Below `exp_cut` the exact result is under the smallest normal f32, and the lane
+//!    gives 0. So no result is subnormal, and `-inf` gives 0. `0` and `-0` give exactly 1, so the
+//!    term at the maximum adds exactly 1.
+//!
+//! Error. From the cut to 0 the error against the f64 `exp` measures at most 1.0103 ulps, at
+//! `0xc0bc17a1` (-5.8778844). Only 14 of those 1.1e9 inputs err by more than 1 ulp. `exp_ulp_tol`
+//! rounds that maximum up.
 
 const std = @import("std");
 const prop = @import("../core/prop.zig");
@@ -13,15 +38,10 @@ const assert = std.debug.assert;
 
 pub const lanes = 8;
 
-/// The smallest f32 whose exact exponential is a normal f32. Its exponential
-/// is `2^-126` times 1.0000045, and `expNeg` gives 0 below it.
+/// The smallest f32 whose exact exponential is a normal f32, `2^-126` times 1.0000045.
 pub const exp_cut: f32 = @bitCast(@as(u32, 0xc2aeac4f));
 
-/// The largest error of `expNeg` against the f64 `exp` that the exp tests
-/// accept, in ulps of the exact result. Over every f32 from the cut to 0, the
-/// error measures at most 1.0103 ulps, at `0xc0bc17a1` (-5.8778844). Only 14
-/// of those 1.1e9 inputs err by more than 1 ulp. The bound rounds that
-/// maximum up.
+/// The largest error of `expNeg` against the f64 `exp` that the tests accept, in ulps.
 pub const exp_ulp_tol: f64 = 1.02;
 
 // -- types ------------------------------------------------------------------
@@ -30,35 +50,8 @@ pub const Vec = @Vector(lanes, f32);
 
 // -- api --------------------------------------------------------------------
 
-/// `exp(x)` in each lane, for `x <= 0`. The attention fold takes it for a
-/// score minus the running maximum, and for an old maximum minus a new one.
-/// The sampler takes it for a scaled logit minus the row maximum. No NaN
-/// arrives. Each lane runs one fixed sequence of IEEE operations on its own
-/// input, so a lane never depends on its position or its neighbors.
-///
-/// The method is that of Cody and Waite, with the Cephes `expf` constants of
-/// Moshier:
-/// 1. Range reduction. `n = floor(x * log2(e) + 1/2)` is the integer nearest
-///    to `x / ln 2`. Then `r = x - n * ln 2` lies in `[-ln 2 / 2, ln 2 / 2]`
-///    up to one rounding, and `exp(x) = 2^n * exp(r)`.
-/// 2. Two-part `ln 2`. `ln2_hi` holds 9 significant bits, so `n * ln2_hi` is
-///    exact for every `n` here, and the first step rounds nothing. `ln2_lo`
-///    holds the rest of `ln 2`, and the second step rounds once. A one-part
-///    f32 `ln 2` errs by 1.9e-9, which at `n = -126` moves the result by 2 to
-///    4 ulps.
-/// 3. The polynomial. `exp(r) = 1 + r + r^2 * P(r)`, with `P` of degree 5 in
-///    Horner form. The Cephes coefficients are a minimax fit with a relative
-///    error of at most 4.2e-9 on `[-1/2, 1/2]`. Each Horner step is one fused
-///    multiply-add, which rounds once.
-/// 4. The scale. The f32 with the exponent field `n + 127` and a zero
-///    significand is `2^n`. The clamp to `exp_cut` holds `n` in `[-126, 0]`,
-///    so the field stays in `[1, 127]`. The product with `exp(r)` is then a
-///    normal f32 and exact.
-/// 5. The cut. Below `exp_cut` the exact result is under the smallest normal
-///    f32, and the lane gives 0. So no result is subnormal, and `-inf` gives 0.
-///    `0` and `-0` give exactly 1, so the term at the maximum adds exactly 1.
-/// From the cut to 0 the error against the f64 `exp` measures at most
-/// `exp_ulp_tol` ulps.
+/// `exp(x)` in each lane, for `x <= 0`. No NaN arrives.
+/// The result is within `exp_ulp_tol` ulps of the f64 `exp`. See "Method" in the header.
 pub inline fn expNeg(x: Vec) Vec {
     const Int = @Vector(lanes, i32);
     const log2e: Vec = @splat(std.math.log2e);
@@ -76,9 +69,12 @@ pub inline fn expNeg(x: Vec) Vec {
     const cut: Vec = @splat(exp_cut);
     if (std.debug.runtime_safety) assert(@reduce(.And, x <= @as(Vec, @splat(0))));
 
+    // Reduce the input to r, with exp(x) = 2^n * exp(r).
     const xc = @max(x, cut);
     const n = @floor(@mulAdd(Vec, xc, log2e, @splat(0.5)));
     const r = @mulAdd(Vec, -n, ln2_lo, @mulAdd(Vec, -n, ln2_hi, xc));
+
+    // Evaluate exp(r) with the Horner polynomial.
     var poly: Vec = @splat(coeffs[0]);
     inline for (coeffs[1..]) |c| {
         poly = @mulAdd(Vec, poly, r, @splat(c));
@@ -86,6 +82,7 @@ pub inline fn expNeg(x: Vec) Vec {
 
     const exp_r = @mulAdd(Vec, poly, r * r, r) + @as(Vec, @splat(1));
 
+    // Build 2^n from the exponent field, and cut the lanes under the cut.
     const n_int: Int = @intFromFloat(n);
     if (std.debug.runtime_safety) {
         assert(@reduce(.And, n_int >= @as(Int, @splat(-126))));
@@ -95,8 +92,7 @@ pub inline fn expNeg(x: Vec) Vec {
     const field: @Vector(lanes, u32) = @intCast(n_int + @as(Int, @splat(127)));
     const two_n: Vec = @bitCast(field << @splat(23));
     const y = @select(f32, x < cut, @as(Vec, @splat(0)), exp_r * two_n);
-    // The attention fold and the sampler CDF rely on both ends: no term is
-    // negative, and no term exceeds the term at the maximum.
+    // The attention fold and the sampler CDF need both ends of this range.
     if (std.debug.runtime_safety) {
         assert(@reduce(.And, y >= @as(Vec, @splat(0))));
         assert(@reduce(.And, y <= @as(Vec, @splat(1))));

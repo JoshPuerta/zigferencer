@@ -1,19 +1,21 @@
-//! The interop oracle for the serve wire. The reference client is a port of
-//! the protocol, so a test that uses it alone proves only that the two ports
-//! agree. A real libzmq DEALER proves that the server speaks the ZMQ wire
-//! that other bindings speak. Each test drives the server through the system
-//! libzmq and compares the stream with the stream of the reference client.
+//! The interop oracle for the serve wire.
 //!
-//! The tests open `libzmq.so.5` at run time, so the build needs no ZMQ
-//! headers or link step. A test skips where the library is absent, and it
-//! logs the libzmq version it drove at the info level. Every test also
-//! returns `error.SkipZigTest` when no fixture exists.
+//! Oracle. The reference client is a port of the protocol, so a test that uses it alone proves only
+//! that the two ports agree. A real libzmq DEALER proves that the server speaks the ZMQ wire that
+//! other bindings speak. Each test drives the server through the system libzmq and compares the
+//! stream with the stream of the reference client.
+//!
+//! Library. The tests open `libzmq.so.5` at run time, so the build needs no ZMQ headers or link
+//! step. A test skips where the library is absent, and it logs the libzmq version it drove at the
+//! info level.
+//!
+//! Skips. Every test also returns `error.SkipZigTest` when no fixture exists.
 
 const std = @import("std");
-const z = @import("zigferencer");
-const protocol = z.serve_protocol;
-const Client = z.serve_client.Client;
-const Event = z.serve_client.Event;
+const zigferencer = @import("zigferencer");
+const protocol = zigferencer.serve_protocol;
+const Client = zigferencer.serve_client.Client;
+const Event = zigferencer.serve_client.Event;
 const harness = @import("serve_harness.zig");
 const Harness = harness.Harness;
 const Stream = harness.Stream;
@@ -36,7 +38,7 @@ const zmq_sndtimeo: c_int = 28;
 const io_timeout_ms: c_int = 30_000;
 
 /// The largest message either side sends.
-const max_message_bytes: usize = z.serve_zmtp.max_message_bytes;
+const max_message_bytes: usize = zigferencer.serve_zmtp.max_message_bytes;
 
 /// The function pointers the tests call, looked up in the system libzmq.
 /// Every field after `lib` is the libzmq symbol `zmq_<field name>`.
@@ -256,7 +258,7 @@ fn dealerTurn(dealer: *Dealer, prompt: []const u8) !Stream {
 }
 
 fn tcpEndpoint(buf: []u8, h: *const Harness) ![:0]const u8 {
-    return std.fmt.bufPrintZ(buf, "tcp://127.0.0.1:{d}", .{h.address.getPort()});
+    return std.fmt.bufPrintSentinel(buf, "tcp://127.0.0.1:{d}", .{h.address.getPort()}, 0);
 }
 
 // -- tests ------------------------------------------------------------------
@@ -301,10 +303,11 @@ test "a libzmq DEALER drives the server over ipc" {
     // The socket path is relative to the cwd, and libzmq resolves an `ipc://`
     // path against the same cwd.
     var endpoint_buf: [16 + std.Io.net.UnixAddress.max_len]u8 = undefined;
-    const endpoint = try std.fmt.bufPrintZ(
+    const endpoint = try std.fmt.bufPrintSentinel(
         &endpoint_buf,
         "ipc://{s}",
         .{h.path_buf[0..h.path_len]},
+        0,
     );
     var dealer = try Dealer.init(&zmq, endpoint);
     defer dealer.deinit();

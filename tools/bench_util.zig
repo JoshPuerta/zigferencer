@@ -1,16 +1,14 @@
-//! Shared bench helpers: timing, error measurement, and the colored table
-//! reporter. No section logic lives here. It is the common datapath that the
-//! per-op files build their rows on.
+//! Shared bench helpers: timing, error measurement, and the colored table reporter. No section
+//! logic lives here. It is the common datapath that the per-op files build their rows on.
 //!
-//! The reporter buffers a group of rows, the variants benched for one case, and
-//! prints them together. The fastest row tints green and the slowest red. The
-//! buffer is display state local to the bench tool: a single-threaded
-//! accumulator, reset after every group, never read outside this file. Color
-//! stays off unless stderr is a terminal, so piped output stays plain.
+//! Reporter. The reporter buffers a group of rows, the variants benched for one case, and prints
+//! them together. The fastest row tints green and the slowest red. The buffer is display state
+//! local to the bench tool: a single-threaded accumulator, reset after every group, never read
+//! outside this file. Color stays off unless stderr is a terminal, so piped output stays plain.
 
 const std = @import("std");
-const z = @import("zigferencer");
-const op_requires = z.op_requires;
+const zigferencer = @import("zigferencer");
+const op_requires = zigferencer.op_requires;
 
 // -- constants --------------------------------------------------------------
 
@@ -51,16 +49,13 @@ var color_on: bool = false;
 
 // -- api --------------------------------------------------------------------
 
-/// Warm-up plus `pickIters` timed iterations of the closure `ctx`. The closure
-/// must expose `pub fn run(self: @This()) !void`. A CPU closure that cannot fail
-/// simply does not `try` in its body. The `!void` return keeps it callable
-/// through the same helper.
+/// Warm up once, then time `pickIters` runs of the closure `ctx`. The closure must expose
+/// `pub fn run(self: @This()) !void`. A CPU closure that cannot fail returns `!void` anyway.
 pub fn timed(io: std.Io, iters_scale: usize, ctx: anytype) !Timed {
     try ctx.run();
     const iters: usize = pickIters(iters_scale);
     const t_start = std.Io.Clock.Timestamp.now(io, .awake);
-    var k: usize = 0;
-    while (k < iters) : (k += 1) {
+    for (0..iters) |_| {
         try ctx.run();
     }
 
@@ -71,10 +66,8 @@ pub fn timed(io: std.Io, iters_scale: usize, ctx: anytype) !Timed {
     return .{ .ms = elapsed_ns / @as(f64, @floatFromInt(iters)) / 1e6, .iters = iters };
 }
 
-/// Wall-clock milliseconds for one `ctx.run()`, with no warm-up and no
-/// averaging. A section whose unit of work is a single blocking submission
-/// reports the spread across repetitions, which the averaging `timed` folds
-/// away.
+/// Wall-clock milliseconds of one `ctx.run()`, with no warm-up and no averaging.
+/// A section of single blocking submissions reports the spread, which `timed` averages away.
 pub fn timedOnce(io: std.Io, ctx: anytype) !f64 {
     const t_start = std.Io.Clock.Timestamp.now(io, .awake);
     try ctx.run();
@@ -91,19 +84,20 @@ pub fn rate(t: Timed, work_per_call: f64) f64 {
     return work_per_call / (t.ms * 1e6);
 }
 
+/// Wyhash of the output bytes, the token that a row carries to show bit equality.
 pub fn hashOut(out: []const f32) u64 {
     const bytes = std.mem.sliceAsBytes(out);
     return std.hash.Wyhash.hash(0, bytes);
 }
 
+/// The largest absolute and the largest relative difference of `got` against `ref`.
 pub fn computeErrors(ref: []const f32, got: []const f32) Errors {
     std.debug.assert(ref.len == got.len);
 
-    // Denominator floor: below this expected magnitude a value counts as zero
-    // for rel_err. Without the floor, a near-cancellation output inflates
-    // rel_err by 4 to 5 orders of magnitude, while the absolute drift there
-    // stays f32 noise. 1e-5 sits well below the typical output magnitude of
-    // every op, so the floor reaches genuine near-zero outputs alone.
+    // Denominator floor: an expected magnitude below it counts as zero for rel_err.
+    // Without it, a near-cancellation output inflates rel_err by 4 to 5 orders of
+    // magnitude, while the absolute drift stays f32 noise. 1e-5 is far below the
+    // typical output of every op.
     const abs_floor: f32 = 1e-5;
     var max_abs: f32 = 0;
     var max_rel: f32 = 0;
@@ -124,6 +118,7 @@ pub fn computeErrors(ref: []const f32, got: []const f32) Errors {
     return .{ .abs = max_abs, .rel = max_rel };
 }
 
+/// Timed iterations for a case of `scale` work units. Larger cases run fewer.
 pub fn pickIters(scale: usize) usize {
     if (scale > 100_000_000) return 4; // llama8b lm_head + ffn class
     if (scale > 10_000_000) return 16; // llama8b attn / llama1b ffn class
@@ -133,6 +128,7 @@ pub fn pickIters(scale: usize) usize {
     return 16384;
 }
 
+/// The status cell of a row: `ok` when the tolerance holds, `FAIL` otherwise.
 pub fn opStatus(tol: op_requires.Tolerance, rel: f32, hash_match: bool) []const u8 {
     return if (op_requires.toleranceSatisfied(tol, rel, hash_match)) "ok" else "FAIL";
 }
@@ -142,6 +138,7 @@ pub fn setColor(on: bool) void {
     color_on = on;
 }
 
+/// Print the section title and the column header.
 pub fn printSectionHeader(name: []const u8) void {
     std.debug.print("\nzigferencer bench: {s}\n", .{name});
     std.debug.print(header_fmt, .{ "case", "variant", "ms", "G/s", "rel_err", "hash", "status" });
@@ -150,9 +147,16 @@ pub fn printSectionHeader(name: []const u8) void {
 /// Buffer a row that records a declined case, such as an LDS too small for the
 /// variant. The ranking over fastest and slowest skips it.
 pub fn skipRow(label: []const u8, variant: []const u8, reason: []const u8) void {
-    add(
-        .{ .label = label, .variant = variant, .ms = 0, .gops = 0, .rel = 0, .hash = 0, .status = reason, .ranked = false },
-    );
+    add(.{
+        .label = label,
+        .variant = variant,
+        .ms = 0,
+        .gops = 0,
+        .rel = 0,
+        .hash = 0,
+        .status = reason,
+        .ranked = false,
+    });
 }
 
 /// Buffer a pre-timed row, for a section that times by hand.
@@ -165,14 +169,20 @@ pub fn rawRow(
     hash: u64,
     status: []const u8,
 ) void {
-    add(
-        .{ .label = label, .variant = variant, .ms = ms, .gops = gops, .rel = rel, .hash = hash, .status = status, .ranked = true },
-    );
+    add(.{
+        .label = label,
+        .variant = variant,
+        .ms = ms,
+        .gops = gops,
+        .rel = rel,
+        .hash = hash,
+        .status = status,
+        .ranked = true,
+    });
 }
 
-/// Print the buffered group, then clear the buffer. The fastest row (min ms)
-/// tints green and the slowest red, once the group holds more than one ranked
-/// row.
+/// Print the buffered group, then clear it. With more than one ranked row, the
+/// fastest tints green and the slowest red.
 pub fn flush() void {
     defer group_len = 0;
 

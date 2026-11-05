@@ -1,70 +1,97 @@
-//! The serve layer's control unit: a fixed table of protocol sessions over
-//! the engine's session pool, advanced one engine call per `tick`. All state
-//! lives here and in the engine. Frame encode/decode and the batched forward
-//! are the pure datapaths on either side.
+//! The control unit of the serve layer: a fixed table of protocol sessions over the session pool
+//! of the engine, advanced by one engine call per `tick`. All state lives here and in the engine.
+//! Frame encode and decode and the batched forward pass are the pure datapaths on either side.
 //!
-//! One tick, in order: retry parked emits, finalize stopped turns (emit
-//! `done`), then ONE composed engine call. That call takes every admissible
-//! decode row (round-robin up to `max_batch`) plus a prefill chunk of the
-//! longest-waiting feeding turn. The chunk fills the rows the decode admission
-//! left free, with a floor of one row, so saturated decode can never starve a
-//! waiting turn. Prefill uses the same weight pass as decode, so a long turn
-//! never preempts a decoding session. It advances in the batch's spare width
-//! while every decoder keeps its tick cadence. An empty tick returns `.idle`.
-//! The server then blocks on its request queue and the process uses zero CPU.
+//! Tick order. One tick runs four steps in order. It expires leases and retries parked emits. It
+//! finalizes stopped turns, which emits `done`. It then makes ONE composed engine call. That call
+//! takes every admissible decode row (round-robin up to `max_batch`) plus a prefill chunk of the
+//! longest-waiting feeding turn. The chunk fills the rows that decode left free. Its floor of one
+//! row keeps saturated decode from starving a waiting turn, and it can exceed `max_batch`. A long
+//! prefill never preempts a decoder. An empty tick returns `.idle`, and the server then blocks.
 //!
-//! The scheduler never blocks on a client. Every session event goes through
-//! a non-blocking sink. On a full queue the event parks in the session's
-//! single `pending_event` cell, and the session leaves the batch until the
-//! writer drains. Control replies (hello_ack, pong, ...) have no cell. A
-//! client whose queue is full while it keeps sending requests is broken, and
-//! the sink's `disconnect` is the bounded answer.
+//! Slot states. An open or a clone moves a slot from free to idle. A turn, an opening, or an append
+//! moves it from idle to prefill. A turn leaves prefill for decode at its first token or at a
+//! cancel, so the finalize emits `done`. An opening or an append leaves prefill for idle. A turn
+//! leaves decode for idle at its `done`. A close, a drop with no lease, an expiry, or a yield frees
+//! a slot from any state.
 //!
-//! Stop discipline replicates `generate.decode`. The scheduler emits EOS and
-//! then ends the turn without stepping it. The token budget ends the turn with
-//! the last token sampled but uncommitted. That token carries into the next
-//! turn's feed, which is the engine's pending-token rule. A full context ends
-//! the turn before the step that does not fit.
+//! Backpressure. The scheduler never blocks on a client. Every session event goes through a
+//! non-blocking sink. On a full queue the event parks in the single `pending_event` cell of the
+//! session, and the session leaves the batch until the writer drains. Control replies have no
+//! cell. A client that keeps sending requests with a full queue is broken, and the `disconnect`
+//! of the sink is the bounded answer.
 //!
-//! A turn can open inside a think block. Its first event is then the echo:
-//! the `<think>` id alone, which counts as no generated token and never enters
-//! the KV. While the echo waits in the parked cell, the turn skips the prefix
-//! restore, because a full hit emits the first token at once. A skipped
-//! restore is a cold prefill. A think budget forces ids. At the budget, the
-//! next accepted tokens are the close tag and its separator, in place of the
-//! sampled ones. The scheduler writes each forced id into the pending token of
-//! the engine. The next step then commits the forced id, and a carry holds it.
-//! The stop decision reads the forced id like any other. A new turn resets the
-//! think state, so ids that a stopped turn still owed never reach it.
+//! Parked turns. A tick parks a prefill when no slot can take it, or when the RAM tier cannot fund
+//! a victim. `fed` stays unchanged, so the next tick picks it again, and the decode rows run alone.
+//! A decode row parks too when its restore needs an eviction that the budget refuses. Its state
+//! stays intact, so a later credit admits it. A finished decoder frees a slot, and a closed
+//! session credits its blob. Only an external event does the rest. So a parked tick reports no
+//! work, because a report of work spins the engine loop. `parks` matches the park log lines.
 //!
-//! Each token event carries a channel. The flag `think_open` before the think
-//! bookkeeping decides it. Inside the block, the close id is a close tag and
-//! every other id is reasoning. Outside the block, every id is content. The
-//! echo is the open tag. `done` counts the reasoning events.
+//! Stop rules. Stop discipline replicates `generate.decode`. The scheduler emits EOS and then ends
+//! the turn without stepping it. The token budget ends the turn with the last token sampled but
+//! uncommitted, and that token carries into the feed of the next turn. A full context ends the
+//! turn before the step that does not fit. The stop reason of a turn is written once, so a natural
+//! stop keeps its reason and its carry while it waits for `done`.
 //!
-//! An append feeds kept (user, assistant) pairs into an idle session. It is
-//! all or nothing at admission, it samples nothing, emits no token, inserts
-//! no prefix, and leaves the think state alone. It ends with one `appended`
-//! reply, and it moves `turns_done` by the pair count, so the next turn takes
-//! the continuation wrap.
+//! Think block. A turn can open inside a think block. Its first event is the echo: the `<think>`
+//! id alone, which counts as no generated token and never enters the KV. A parked echo holds the
+//! one event cell, so the turn skips the prefix restore and prefills cold. A think budget forces
+//! ids: at the budget, the close tag and its separator replace the sampled ones. Each forced id
+//! goes into the pending token of the engine, and a carry holds it. The stop decision reads a
+//! forced id like any other. A new turn resets the think state. `done` counts reasoning events.
 //!
-//! A lease lets a session outlive its connection. The owner of a slot is a
-//! connection or a deadline. `keepLease` gives an attached session a token
-//! and a time to live, clamped to `Config.resume_ttl_max_ms`. At a drop, a
-//! leased slot detaches until the drop time plus its time to live, and every
-//! other slot frees as before. The drop cuts a turn by the cancel rule. An
-//! opening or append prefill runs on, and the events of a detached slot go.
-//! `resumeLease` attaches the slot of a token to a new connection and rotates
-//! the token. It also takes an attached slot, so the newest holder wins. A
-//! resume of a busy slot waits and ends at the idle transition. Until then,
-//! every request on the session but a close gets `session_busy`. The
-//! expiry scan at the tick head and at each admission frees every detached
-//! slot at its deadline. A live open with no free slot takes the detached
-//! slot with the earliest deadline. Both stop a prefill in flight before the
-//! release. The maximum 0 turns resumption off. Then no slot holds a lease,
-//! and every drop frees its sessions. The wire handlers draw every token
-//! from the secure source. A `resumed` reply goes out when the slot is idle,
-//! at once or at the idle transition, so the position it names is final.
+//! Append. An append feeds kept (user, assistant) pairs into an idle session. It is all or nothing
+//! at admission. It samples nothing, emits no token, inserts no prefix, and leaves the think state
+//! alone. It ends with one `appended` reply and moves `turns_done` by the pair count.
+//!
+//! Id sets. Each slot owns two id sets of `set_words` words at its slot index. The presence set
+//! holds the ids accepted since the turn began (the penalty counts this completion only, as OpenAI
+//! and vLLM do), and it clears at each admission. The context set
+//! holds every id fed to the session since it opened. The engine reads both through the sampling
+//! params, and the scheduler marks them. They live outside `Slot`, so a slot reset keeps them.
+//!
+//! Prefix cache. The cache is best-effort. Any failure counts a miss and the cold path proceeds.
+//! A `ready` plan finishes the prefill with zero forward rows, and the engine samples the first
+//! token from the stored logits. `prefix_manager.planRestore` states the plan of each turn shape.
+//! An append neither restores nor inserts a prefix, because its rows follow a live session.
+//!
+//! Leases. A lease lets a session outlive its connection. The owner of a slot is free, attached
+//! to a connection, or detached with a deadline. `keepLease` gives an attached session a token and
+//! a time to live, clamped to `Config.resume_ttl_max_ms`. At a drop, a leased slot detaches and
+//! every other slot frees. The drop cuts a turn by the cancel rule. An opening or append prefill
+//! runs on, and the events of a detached slot go. A maximum of 0 turns resumption off: no slot
+//! holds a lease, every drop frees its sessions, and a keep with a positive time to live fails.
+//!
+//! Lease expiry. Every transition is a guarded write that keeps `checkLeases`. The expiry scan at
+//! the tick head and at each admission frees every detached slot at its deadline. A live open with
+//! no free slot takes the detached slot with the earliest deadline. Both stop a prefill in flight
+//! before the release. `expired` and `pickYield` are pure. A scan reads the clock once.
+//!
+//! Resume. `resumeLease` attaches the slot of a token to a new connection and rotates the token.
+//! It also takes an attached slot after the drop effect, so the newest holder wins. A resume of a
+//! busy slot waits for the idle transition, and every request on the session gets `session_busy`
+//! until then. A `resumed` reply goes out when the slot is idle, so the position it names is final.
+//!
+//! Lease table. Tokens are unique. Live session ids are unique, nonzero, and below the counter. A
+//! free slot holds no lease and id 0. A detached slot holds a lease. Every lease has a positive
+//! time to live at or below the server maximum.
+//!
+//! Shares. `Config.sessions_per_connection` below `max_sessions` keeps one client from taking every
+//! session. Open, clone, and resume check it before they take a slot.
+//!
+//! Shutdown. A server that several clients share must not stop on the request of one client. With
+//! `allow_shutdown` off, a wire request gets `forbidden`. Connection 0 never comes from the wire,
+//! because the acceptor numbers from 1. A request on it is the process owner, and it always stops.
+//!
+//! Card sampling. `hello_ack` carries the sampling that the model card recommends inside and
+//! outside the think block. A client picks the row of the mode of each turn. The launcher reads the
+//! model registry, so the engine holds no per-model table. The default is greedy.
+//!
+//! Engine boundary. `Engine` is the session pool of the runtime (`Sessions(RunnerT)`, `Residency`,
+//! or a test fake). The scheduler calls only its composed `advance`. `CodecT` is the text-to-token
+//! boundary. `sink` is any value with `emit(conn: u32, ev: OutEvent) bool` and
+//! `disconnect(conn: u32) void`.
 
 const std = @import("std");
 const Io = std.Io;
@@ -89,10 +116,20 @@ const log_token = std.log.scoped(.token);
 
 // -- constants --------------------------------------------------------------
 
-/// Draws before a keep or a resume gives up on a token that a slot holds.
-/// Two equal draws of 128 bits do not occur in practice, so the bound only
-/// makes the retry loop finite, and its end is an `internal` refusal.
+/// Draws before a keep or a resume gives up on a token that a slot holds. Two equal draws of 128
+/// bits do not occur in practice. The bound only makes the retry loop finite, and its end is an
+/// `internal` refusal.
 const token_draws_max: u32 = 4;
+
+/// Working ticks between two stats lines. A decode tick costs milliseconds, so the period keeps
+/// the line a milestone and not a per-token trace.
+const stats_period_ticks: u64 = 512;
+
+/// The refusal of a connection at its share of the session table.
+const detail_share_full = "session share of this connection is full";
+
+/// The refusal of a row that an engine call failed.
+const detail_advance_failed = "engine advance failed";
 
 /// The pin value of a scheduler that reads the real clock.
 const clock_unpinned: i64 = std.math.minInt(i64);
@@ -104,28 +141,18 @@ pub const no_token: u32 = std.math.maxInt(u32);
 
 pub const Config = struct {
     max_sessions: u16,
-    /// Sessions one connection can hold at once, <= max_sessions. A share below
-    /// `max_sessions` keeps one client from taking every session. 0 selects
-    /// `max_sessions`, and `Scheduler.init` resolves it, so the scheduler body
-    /// never reads the sentinel.
+    /// Sessions of one connection, <= max_sessions. `Scheduler.init` resolves 0 to `max_sessions`.
     sessions_per_connection: u16 = 0,
     max_batch: u16,
     max_seq: u32,
-    /// Max rows one forward pass advances: decode rows (<= max_batch) plus a
-    /// prefill chunk. The runner's row-scratch is sized for exactly this, so it
-    /// is the hard cap on a composed tick.
+    /// Max rows of one forward pass: decode rows (<= max_batch) plus a prefill chunk.
+    /// The row scratch of the runner has exactly this size, so it is the hard cap of a tick.
     max_step_rows: u32,
-    /// How many prompt rows a pass takes from the feeding turn. See
-    /// `prefill_chunk.zig`. The serve commands resolve the `--prefill-chunk`
-    /// flag into this rule. A `derived` width must fit in `max_step_rows`.
+    /// The prompt rows of one pass, from `--prefill-chunk`. A `derived` width fits `max_step_rows`.
     prefill: prefill_chunk.Rule = .spare_rows,
-    /// Live client connections, in 1..limits.max_connections. The engine sizes
-    /// its connection table with it, and the scheduler never reads it.
+    /// Live client connections, in 1..limits.max_connections. Only the engine reads it.
     max_connections: u32 = 8,
-    /// Whether a wire client can stop the server with a `shutdown` request.
-    /// When it is off, the request gets `forbidden` and the server keeps
-    /// running. A request on connection 0, the process owner's own, always
-    /// stops the server.
+    /// A wire client can stop the server with a `shutdown` request. See "Shutdown" in the header.
     allow_shutdown: bool = false,
     /// Lifetime must cover the scheduler's. Must be <= limits.max_model_name_bytes.
     model_name: []const u8,
@@ -133,19 +160,13 @@ pub const Config = struct {
     eos_id: u32,
     /// Every prefix-cache option, in the one group `prefix_manager.zig` reads.
     cache: prefix_manager.CacheConfig = .{},
-    /// The think block of a model that reasons before it answers. The default
-    /// holds no tags, so a turn never opens a block.
+    /// The think block of the model. The default holds no tags, so a turn never opens a block.
     think: Think = .{},
-    /// The sampling that the model card recommends for a turn inside the
-    /// think block and for a turn outside it. `hello_ack` carries both, so a
-    /// client picks the row of the mode of each turn. The launcher reads the
-    /// model registry, so the engine holds no per-model table. The default
-    /// is greedy.
+    /// The sampling for a turn inside the think block. See "Card sampling" in the header.
     recommended_think: protocol.Sampling = protocol.Sampling.greedy,
+    /// The sampling for a turn outside the think block.
     recommended_plain: protocol.Sampling = protocol.Sampling.greedy,
-    /// The longest lease a client can keep, at most
-    /// `limits.max_resume_ttl_ms`. 0 turns resumption off: every keep with a
-    /// positive time to live is refused, and every drop frees its sessions.
+    /// The longest lease a client can keep, at most `limits.max_resume_ttl_ms`. 0 turns it off.
     resume_ttl_max_ms: u32 = 0,
 };
 
@@ -209,25 +230,16 @@ pub const HandleResult = enum { ok, shutdown };
 
 const SlotState = enum { free, idle, prefill, decode };
 
-/// What a prefill feeds. A `turn` samples its first token at the end. An
-/// `opening` system prompt and an `append` of kept pairs sample nothing and
-/// return the slot to idle with one reply.
+/// What a prefill feeds. A `turn` samples its first token at the end. An `opening` system prompt
+/// and an `append` of kept pairs sample nothing. They return the slot to idle with one reply.
 const PrefillKind = enum { turn, opening, append };
 
-/// `Engine` is the runtime session pool boundary (`Sessions(RunnerT)` or a test
-/// fake): create/destroy/setParams/reseed/overridePending/posOf/capacityRemaining/
-/// advance, the composed tick. The scheduler calls only the composed `tick`,
-/// not the `feed`/`decodeBatch` shells other callers use.
-/// `CodecT` is the text<->token boundary (`event.Codec` or a test fake).
-/// `sink` is any value with `emit(conn: u32, ev: OutEvent) bool` and
-/// `disconnect(conn: u32) void`.
+/// The session table over `Engine` and `CodecT`. See "Engine boundary" in the header.
 pub fn Scheduler(comptime Engine: type, comptime CodecT: type) type {
     return struct {
         const Self = @This();
 
-        /// Whether the engine can snapshot and restore a KV prefix. Without
-        /// it the prefix-cache paths compile away and the manager holds no
-        /// cache.
+        /// The engine can snapshot a KV prefix. Without it the prefix-cache paths compile away.
         const can_snapshot = @hasDecl(Engine, "can_snapshot") and Engine.can_snapshot;
 
         /// The owner of a slot that is not free. A detached slot holds the
@@ -269,17 +281,14 @@ pub fn Scheduler(comptime Engine: type, comptime CodecT: type) type {
             turns_done: u32 = 0,
             kind: PrefillKind = .turn,
             /// The pairs of the append in flight, and the position after each.
-            /// Admission computes them from the token counts.
             append_n: u16 = 0,
             append_pos: [limits.max_append_pairs]u32 = undefined,
             request_id: u32 = 0,
             turn_tokens: []u32 = &.{},
-            /// Prompt size of the in-flight turn. It survives the token buffer
-            /// (freed at end of prefill) for the `done` report.
+            /// Prompt size of the turn. It outlives the token buffer for the `done` report.
             turn_prompt_len: u32 = 0,
             fed: usize = 0,
-            /// The in-flight turn started at position zero, so its completed
-            /// prefix is a prefix-cache insert candidate.
+            /// The turn started at position zero, so its prefix is a cache insert candidate.
             caches_prefix: bool = false,
             prefill_seq: u64 = 0,
             max_tokens_turn: u32 = 0,
@@ -291,8 +300,7 @@ pub fn Scheduler(comptime Engine: type, comptime CodecT: type) type {
             think_open: bool = false,
             /// Tokens accepted inside the block, the close excluded.
             think_n: u32 = 0,
-            /// Think tokens before the forced close for the turn in flight,
-            /// from the request or the server value. Zero is unbounded.
+            /// Think tokens before the forced close, from the request or the server.
             think_budget: u32 = 0,
             /// The forced ids still owed are `forced[forced_head..forced_len]`.
             /// A turn loads the queue once, so it needs no wraparound.
@@ -304,47 +312,64 @@ pub fn Scheduler(comptime Engine: type, comptime CodecT: type) type {
             t_prefill_end: Io.Clock.Timestamp = undefined,
         };
 
+        /// The decode rows of one composed step, in admission order.
+        const DecodeRows = struct {
+            ids: [limits.max_batch]u32 = undefined,
+            members: [limits.max_batch]*Slot = undefined,
+            out: [limits.max_batch]u32 = undefined,
+            n: usize = 0,
+
+            fn engineIds(self: *const DecodeRows) []const u32 {
+                return self.ids[0..self.n];
+            }
+
+            fn slots(self: *const DecodeRows) []const *Slot {
+                return self.members[0..self.n];
+            }
+
+            fn tokens(self: *const DecodeRows) []const u32 {
+                return self.out[0..self.n];
+            }
+
+            fn tokensOut(self: *DecodeRows) []u32 {
+                return self.out[0..self.n];
+            }
+        };
+
+        /// One cache entry that a restore plan offers.
+        const PrefixHit = @FieldType(prefix_manager.Restore, "ready");
+
         gpa: Allocator,
         io: Io,
         engine: *Engine,
         codec: *const CodecT,
         cfg: Config,
         slots: []Slot,
-        /// Two id sets per slot, `set_words` words each, at the slot index.
-        /// The presence set holds the ids accepted since the turn began. The
-        /// context set holds every id fed to the session since it opened:
-        /// the system prompt, the turns, the appends, the restored prefixes,
-        /// and the accepted ids. The engine reads both through the sampling
-        /// params, and the scheduler marks them. They live outside `Slot`,
-        /// because a slot reset must not lose the storage.
+        /// One id set per slot. See "Id sets" in the header.
         presence: []u64,
         context: []u64,
         set_words: usize,
-        /// Session ids only grow, so the server never reuses one. A resume
-        /// keeps the id, and a yield or an expiry never returns it.
+        /// Session ids only grow. A resume keeps the id, and a yield or an expiry never returns it.
         next_proto_id: u32 = 1,
         next_prefill_seq: u64 = 1,
-        /// Detached slots freed at their deadline, and detached slots freed
-        /// for a live open.
+        /// Detached slots freed at their deadline.
         lease_expires: u64 = 0,
+        /// Detached slots freed for a live open.
         lease_yields: u64 = 0,
-        /// Yields that lost a detached session to an open or a clone that the
-        /// engine then refused, and prefills that a yield or an expiry cut.
+        /// Yields before an open or a clone that the engine then refused.
         lease_yields_lost: u64 = 0,
+        /// Prefills that a yield or an expiry cut.
         lease_prefills_cut: u64 = 0,
-        /// When not `clock_unpinned`, every lease clock read returns this
-        /// point in nanoseconds. Tests pin the clock, so a deadline never
-        /// depends on the speed of the host. The value is atomic, because a
-        /// test thread moves the pin while the engine thread reads it.
+        /// Every lease clock read returns this point in nanoseconds, unless it is `clock_unpinned`.
+        /// Tests pin it, and it is atomic because a test thread moves it under the engine thread.
         clock_pin_ns: std.atomic.Value(i64) = .init(clock_unpinned),
         rr_cursor: usize = 0,
         tokens_generated_total: u64 = 0,
-        /// Ticks that parked a turn on KV residency, and ticks that produced
-        /// engine work. Both feed the periodic stats line only.
+        /// Park log lines, one to one. Only the periodic stats line reads it.
         parks: u64 = 0,
+        /// Ticks that produced engine work. Only the periodic stats line reads it.
         ticks_worked: u64 = 0,
-        /// The prefix cache and its counters. The cache lives on the scheduler
-        /// because the scheduler owns the tokens it keys on.
+        /// The prefix cache and its counters. The scheduler owns the tokens that the cache keys on.
         prefix: prefix_manager.PrefixManager,
         t_init: Io.Clock.Timestamp,
 
@@ -356,11 +381,13 @@ pub fn Scheduler(comptime Engine: type, comptime CodecT: type) type {
             codec: *const CodecT,
             cfg_in: Config,
         ) Allocator.Error!Self {
+            // Resolve the share, so the scheduler body never reads the sentinel.
             var cfg = cfg_in;
             if (cfg.sessions_per_connection == 0) {
                 cfg.sessions_per_connection = cfg.max_sessions;
             }
 
+            // Check the config.
             std.debug.assert(cfg.max_sessions >= 1);
             std.debug.assert(cfg.sessions_per_connection >= 1);
             std.debug.assert(cfg.sessions_per_connection <= cfg.max_sessions);
@@ -368,8 +395,9 @@ pub fn Scheduler(comptime Engine: type, comptime CodecT: type) type {
             std.debug.assert(cfg.max_batch <= limits.max_batch);
             std.debug.assert(cfg.model_name.len <= limits.max_model_name_bytes);
             std.debug.assert(cfg.resume_ttl_max_ms <= limits.max_resume_ttl_ms);
-            // The CLI builds one base Config and patches the engine-derived
-            // fields per backend branch. These two catch an unpatched base.
+
+            // The CLI patches the engine-derived fields per backend.
+            // These two catch an unpatched base.
             std.debug.assert(cfg.max_seq >= 1);
             std.debug.assert(cfg.max_step_rows >= 1);
             switch (cfg.prefill) {
@@ -379,6 +407,8 @@ pub fn Scheduler(comptime Engine: type, comptime CodecT: type) type {
             }
 
             assertThinkConfig(cfg.think, cfg.eos_id, cfg.vocab_size);
+
+            // Allocate the slot table and its id sets.
             const slots = try arena.alloc(Slot, cfg.max_sessions);
             for (slots) |*s| {
                 s.* = .{};
@@ -389,6 +419,7 @@ pub fn Scheduler(comptime Engine: type, comptime CodecT: type) type {
             @memset(presence, 0);
             const context = try arena.alloc(u64, words * cfg.max_sessions);
             @memset(context, 0);
+
             return .{
                 .gpa = gpa,
                 .io = io,
@@ -453,39 +484,14 @@ pub fn Scheduler(comptime Engine: type, comptime CodecT: type) type {
                 .conn_closed => self.sweepConn(req.conn),
                 .wakeup => {}, // the tick that follows does the actual retry
 
-                .shutdown => {
-                    // A server that several clients share must not stop on
-                    // the request of one client. Connection 0 never comes from
-                    // the wire, because the acceptor numbers from 1. A request
-                    // on it is the process owner's own, and it always stops the
-                    // server.
-                    if (!self.cfg.allow_shutdown and req.conn != 0) {
-                        self.reply(
-                            sink,
-                            req,
-                            OutEvent.fail(req.request_id, 0, .forbidden, "shutdown not allowed"),
-                        );
-                        return .ok;
-                    }
-
-                    self.cancelAll(sink);
-                    self.logStats();
-                    self.reply(
-                        sink,
-                        req,
-                        .{ .request_id = req.request_id, .session_id = 0, .body = .shutdown_ack },
-                    );
-                    return .shutdown;
-                },
+                .shutdown => return self.handleShutdown(req, sink),
             }
 
             return .ok;
         }
 
-        /// One unit of engine work. `.idle` when nothing is runnable. A parked
-        /// event is NOT runnable work, because it waits on the writer. A
-        /// stopped turn awaiting its `done` is runnable work, and the next tick
-        /// finalizes it.
+        /// One unit of engine work. `.idle` when nothing is runnable. A parked event waits on the
+        /// writer, so it is not runnable. A stopped turn that awaits its `done` is runnable.
         pub fn tick(self: *Self, sink: anytype) Tick {
             // An idle tick records no span, so a polling engine fills no ring.
             const sp = span.begin(.sched_tick);
@@ -517,12 +523,10 @@ pub fn Scheduler(comptime Engine: type, comptime CodecT: type) type {
             return .idle;
         }
 
-        /// Count a working tick, and emit the stats line every 512th one. A
-        /// decode tick costs milliseconds, so the period keeps the line a
-        /// milestone rather than a per-token trace.
+        /// Count a working tick, and emit the stats line every `stats_period_ticks`.
         fn worked(self: *Self) Tick {
             self.ticks_worked += 1;
-            if (self.ticks_worked % 512 == 0) {
+            if (self.ticks_worked % stats_period_ticks == 0) {
                 self.logStats();
             }
 
@@ -535,6 +539,7 @@ pub fn Scheduler(comptime Engine: type, comptime CodecT: type) type {
             if (comptime @hasDecl(Engine, "stats")) {
                 const s = self.engine.stats();
                 const mib = 1024 * 1024;
+
                 // Only a bounded tier has a ceiling to print. A zero budget
                 // prints as zero MiB, never as one of the other two tiers.
                 var budget_buf: [32]u8 = undefined;
@@ -559,6 +564,7 @@ pub fn Scheduler(comptime Engine: type, comptime CodecT: type) type {
                 else
                     "";
 
+                // Emit the line, then the per-entry and per-blob detail.
                 log.info(
                     "stats: resident {d}/{d} slots, {d} logical, ram {d} MiB of {s}, evicts " ++
                         "{d} ({d:.0} ms avg), restores {d} ({d:.0} ms avg), parks {d}, " ++
@@ -594,6 +600,91 @@ pub fn Scheduler(comptime Engine: type, comptime CodecT: type) type {
 
         // -- request handlers -----------------------------------------------
 
+        /// Stop the server: cancel every turn, log the stats, and acknowledge.
+        fn handleShutdown(self: *Self, req: Request, sink: anytype) HandleResult {
+            // Connection 0 is the process owner. See "Shutdown" in the header.
+            if (!self.cfg.allow_shutdown and req.conn != 0) {
+                self.refuseNoSession(req, sink, .forbidden, "shutdown not allowed");
+                return .ok;
+            }
+
+            self.cancelAll(sink);
+            self.logStats();
+            self.reply(
+                sink,
+                req,
+                .{ .request_id = req.request_id, .session_id = 0, .body = .shutdown_ack },
+            );
+            return .shutdown;
+        }
+
+        /// Refuse `req` with an error event on its session.
+        fn refuse(
+            self: *Self,
+            req: Request,
+            sink: anytype,
+            code: protocol.ErrorCode,
+            detail: []const u8,
+        ) void {
+            self.reply(sink, req, OutEvent.fail(req.request_id, req.session_id, code, detail));
+        }
+
+        /// Refuse `req` with an error event that names no session.
+        fn refuseNoSession(
+            self: *Self,
+            req: Request,
+            sink: anytype,
+            code: protocol.ErrorCode,
+            detail: []const u8,
+        ) void {
+            self.reply(sink, req, OutEvent.fail(req.request_id, 0, code, detail));
+        }
+
+        /// The slot of the session that `req` names. A refusal goes out when none matches.
+        fn sessionOf(self: *Self, req: Request, sink: anytype) ?*Slot {
+            return self.slotByProto(req.session_id, req.conn) orelse {
+                self.refuse(req, sink, .unknown_session, "no such session");
+                return null;
+            };
+        }
+
+        /// The slot of a session between turns, with its parked event sent. A refusal or a
+        /// disconnect ends the request when the session is not ready for a new one.
+        fn idleSession(self: *Self, req: Request, sink: anytype) ?*Slot {
+            const slot = self.sessionOf(req, sink) orelse return null;
+            if (slot.resume_wait != null) {
+                self.refuseWaiting(req, sink);
+                return null;
+            }
+
+            if (!self.flushParked(slot, sink)) return null;
+
+            std.debug.assert(slot.pending_event == null);
+            if (slot.state != .idle) {
+                self.refuse(req, sink, .session_busy, "turn in flight");
+                return null;
+            }
+
+            return slot;
+        }
+
+        /// A slot for a new session, within the share of the connection, or a refusal.
+        fn admitSlot(self: *Self, req: Request, sink: anytype) ?Taken {
+            if (self.leaseNow()) |now| {
+                self.expireDetached(now);
+            }
+
+            if (self.shareFull(req.conn)) {
+                self.refuseNoSession(req, sink, .sessions_exhausted, detail_share_full);
+                return null;
+            }
+
+            return self.freeSlot() orelse {
+                self.refuseNoSession(req, sink, .sessions_exhausted, "no free session");
+                return null;
+            };
+        }
+
         /// The server has no frequency penalty yet. A request that asks for
         /// one fails whole and changes nothing, so the value is never dropped.
         /// Returns true when it refused the request.
@@ -607,16 +698,7 @@ pub fn Scheduler(comptime Engine: type, comptime CodecT: type) type {
 
             if (sampling.frequency_penalty == 0) return false;
 
-            self.reply(
-                sink,
-                req,
-                OutEvent.fail(
-                    req.request_id,
-                    req.session_id,
-                    .forbidden,
-                    protocol.frequency_unsupported_detail,
-                ),
-            );
+            self.refuse(req, sink, .forbidden, protocol.frequency_unsupported_detail);
             return true;
         }
 
@@ -627,43 +709,15 @@ pub fn Scheduler(comptime Engine: type, comptime CodecT: type) type {
             system_prompt: []const u8,
             sink: anytype,
         ) void {
-            if (self.leaseNow()) |now| {
-                self.expireDetached(now);
-            }
-
-            if (self.shareFull(req.conn)) {
-                self.reply(
-                    sink,
-                    req,
-                    OutEvent.fail(
-                        req.request_id,
-                        0,
-                        .sessions_exhausted,
-                        "session share of this connection is full",
-                    ),
-                );
-                return;
-            }
-
-            const taken = self.freeSlot() orelse {
-                self.reply(
-                    sink,
-                    req,
-                    OutEvent.fail(req.request_id, 0, .sessions_exhausted, "no free session"),
-                );
-                return;
-            };
+            // Bind a slot to a new engine session.
+            const taken = self.admitSlot(req, sink) orelse return;
             const slot = taken.slot;
             const engine_id = self.engine.create(
                 sampling.seed,
                 self.samplerParams(slot, sampling),
             ) catch {
                 self.yieldLost(taken, "open");
-                self.reply(
-                    sink,
-                    req,
-                    OutEvent.fail(req.request_id, 0, .sessions_exhausted, "no free session"),
-                );
+                self.refuseNoSession(req, sink, .sessions_exhausted, "no free session");
                 return;
             };
             slot.* = .{
@@ -682,15 +736,10 @@ pub fn Scheduler(comptime Engine: type, comptime CodecT: type) type {
             );
             self.next_proto_id += 1;
 
-            if (system_prompt.len == 0) {
-                self.emitOrPark(slot, sink, .{
-                    .request_id = req.request_id,
-                    .session_id = slot.proto_id,
-                    .body = .{ .session_opened = .{ .kv_pos = 0 } },
-                });
-                return;
-            }
+            // An empty system prompt ends the open here.
+            if (system_prompt.len == 0) return self.emitOpened(slot, sink);
 
+            // Tokenize the system prompt, and refuse one past the window.
             // A system block has no think tail, so the switch changes no id.
             const tokens = self.codec.turnTokens(
                 self.gpa,
@@ -699,11 +748,7 @@ pub fn Scheduler(comptime Engine: type, comptime CodecT: type) type {
                 self.cfg.think.open_default,
             ) catch {
                 self.dropSlot(slot);
-                self.reply(
-                    sink,
-                    req,
-                    OutEvent.fail(req.request_id, 0, .internal, "tokenize failed"),
-                );
+                self.refuseNoSession(req, sink, .internal, "tokenize failed");
                 return;
             };
             const window = self.engine.capacityRemaining(engine_id);
@@ -711,16 +756,8 @@ pub fn Scheduler(comptime Engine: type, comptime CodecT: type) type {
                 self.gpa.free(tokens);
                 self.dropSlot(slot);
                 var detail: [detail_max]u8 = undefined;
-                self.reply(
-                    sink,
-                    req,
-                    OutEvent.fail(
-                        req.request_id,
-                        0,
-                        .turn_too_long,
-                        systemTooLongDetail(&detail, tokens.len, window),
-                    ),
-                );
+                const msg = systemTooLongDetail(&detail, tokens.len, window);
+                self.refuseNoSession(req, sink, .turn_too_long, msg);
                 return;
             }
 
@@ -728,137 +765,59 @@ pub fn Scheduler(comptime Engine: type, comptime CodecT: type) type {
             self.startPrefill(slot, req.request_id, tokens, .opening, sink);
         }
 
-        /// Fork an open session: shared context (the engine copies slot
-        /// state), fresh seed and sampling, fresh protocol id. The source must
-        /// be between turns. A fork of a half-written conversation is not a
-        /// state a client can reason about.
+        /// Fork an open session: shared context, new seed and sampling, new protocol id. The source
+        /// must be between turns, because a client cannot reason about a half-written fork.
         fn handleClone(self: *Self, req: Request, sampling: protocol.Sampling, sink: anytype) void {
-            if (comptime Engine.can_clone) {
-                const source = self.slotByProto(req.session_id, req.conn) orelse {
-                    self.reply(
-                        sink,
-                        req,
-                        OutEvent.fail(
-                            req.request_id,
-                            req.session_id,
-                            .unknown_session,
-                            "no such session",
-                        ),
-                    );
-                    return;
-                };
-                if (source.resume_wait != null) return self.refuseWaiting(req, sink);
-                if (!self.flushParked(source, sink)) return;
-
-                std.debug.assert(source.pending_event == null);
-                if (source.state != .idle) {
-                    self.reply(
-                        sink,
-                        req,
-                        OutEvent.fail(
-                            req.request_id,
-                            req.session_id,
-                            .session_busy,
-                            "turn in flight",
-                        ),
-                    );
-                    return;
-                }
-
-                if (self.refuseFrequency(req, sampling, sink)) return;
-
-                if (self.leaseNow()) |now| {
-                    self.expireDetached(now);
-                }
-
-                if (self.shareFull(req.conn)) {
-                    self.reply(
-                        sink,
-                        req,
-                        OutEvent.fail(
-                            req.request_id,
-                            0,
-                            .sessions_exhausted,
-                            "session share of this connection is full",
-                        ),
-                    );
-                    return;
-                }
-
-                const taken = self.freeSlot() orelse {
-                    self.reply(
-                        sink,
-                        req,
-                        OutEvent.fail(req.request_id, 0, .sessions_exhausted, "no free session"),
-                    );
-                    return;
-                };
-                const slot = taken.slot;
-                const engine_id = self.engine.clone(
-                    source.engine_id,
-                    sampling.seed,
-                    self.samplerParams(slot, sampling),
-                ) catch |err| {
-                    // A fork needs both sides VRAM-resident, so tiered KV can
-                    // refuse for a reason the logical pool knows nothing about.
-                    // Name it: a client that reads "no free session" for a
-                    // spent RAM budget retries the wrong thing. The comparisons
-                    // are statically false for engines whose `clone` cannot
-                    // return these (CPU, test fakes), so those arms compile
-                    // away for them.
-                    const detail: []const u8 = if (err == error.RamBudgetExceeded)
-                        "kv ram budget refused the clone"
-                    else if (err == error.NoEvictableSlot)
-                        "no evictable slot for the clone"
-                    else
-                        "no free session";
-
-                    self.yieldLost(taken, "clone");
-                    self.reply(
-                        sink,
-                        req,
-                        OutEvent.fail(req.request_id, 0, .sessions_exhausted, detail),
-                    );
-                    return;
-                };
-                slot.* = .{
-                    .state = .idle,
-                    .proto_id = self.next_proto_id,
-                    .engine_id = engine_id,
-                    .owner = .{ .attached = req.conn },
-                    .has_system_prompt = source.has_system_prompt,
-                    .turns_done = source.turns_done,
-                    .carry = source.carry,
-                    .request_id = req.request_id,
-                };
-                // A clone starts with an empty presence set of its own. It
-                // shares the context of the source, so it copies the context
-                // set.
-                @memset(self.presenceOf(slot), 0);
-                @memcpy(self.contextOf(slot), self.contextOf(source));
-                self.yieldDone(taken, slot.proto_id);
-                log.info(
-                    "clone: session {d} from {d} engine {d}",
-                    .{ slot.proto_id, source.proto_id, engine_id },
-                );
-                self.next_proto_id += 1;
-                self.emitOrPark(slot, sink, .{
-                    .request_id = req.request_id,
-                    .session_id = slot.proto_id,
-                    .body = .{ .session_opened = .{ .kv_pos = self.engine.posOf(engine_id) } },
-                });
-            } else {
-                self.reply(
-                    sink,
-                    req,
-                    OutEvent.fail(
-                        req.request_id,
-                        req.session_id,
-                        .internal,
-                        "clone unsupported on this backend",
-                    ),
-                );
+            if (comptime !Engine.can_clone) {
+                return self.refuse(req, sink, .internal, "clone unsupported on this backend");
             }
+
+            const source = self.idleSession(req, sink) orelse return;
+            if (self.refuseFrequency(req, sampling, sink)) return;
+
+            // Fork the engine session into a slot.
+            const taken = self.admitSlot(req, sink) orelse return;
+            const slot = taken.slot;
+            const engine_id = self.engine.clone(
+                source.engine_id,
+                sampling.seed,
+                self.samplerParams(slot, sampling),
+            ) catch |err| {
+                // A fork needs both sides VRAM-resident, so tiered KV can refuse. Name the
+                // reason: a client that reads "no free session" retries the wrong thing.
+                const detail: []const u8 = if (err == error.RamBudgetExceeded)
+                    "kv ram budget refused the clone"
+                else if (err == error.NoEvictableSlot)
+                    "no evictable slot for the clone"
+                else
+                    "no free session";
+
+                self.yieldLost(taken, "clone");
+                self.refuseNoSession(req, sink, .sessions_exhausted, detail);
+                return;
+            };
+
+            // Fill the slot from the source.
+            slot.* = .{
+                .state = .idle,
+                .proto_id = self.next_proto_id,
+                .engine_id = engine_id,
+                .owner = .{ .attached = req.conn },
+                .has_system_prompt = source.has_system_prompt,
+                .turns_done = source.turns_done,
+                .carry = source.carry,
+                .request_id = req.request_id,
+            };
+            // A clone shares the context of its source, but its presence set starts empty.
+            @memset(self.presenceOf(slot), 0);
+            @memcpy(self.contextOf(slot), self.contextOf(source));
+            self.yieldDone(taken, slot.proto_id);
+            log.info(
+                "clone: session {d} from {d} engine {d}",
+                .{ slot.proto_id, source.proto_id, engine_id },
+            );
+            self.next_proto_id += 1;
+            self.emitOpened(slot, sink);
         }
 
         fn handleGenerate(
@@ -867,33 +826,7 @@ pub fn Scheduler(comptime Engine: type, comptime CodecT: type) type {
             m: @FieldType(Request.Body, "generate"),
             sink: anytype,
         ) void {
-            const max_tokens = m.max_tokens;
-            const text = m.text;
-            const slot = self.slotByProto(req.session_id, req.conn) orelse {
-                self.reply(
-                    sink,
-                    req,
-                    OutEvent.fail(
-                        req.request_id,
-                        req.session_id,
-                        .unknown_session,
-                        "no such session",
-                    ),
-                );
-                return;
-            };
-            if (slot.resume_wait != null) return self.refuseWaiting(req, sink);
-            if (!self.flushParked(slot, sink)) return;
-
-            std.debug.assert(slot.pending_event == null);
-            if (slot.state != .idle) {
-                self.reply(
-                    sink,
-                    req,
-                    OutEvent.fail(req.request_id, req.session_id, .session_busy, "turn in flight"),
-                );
-                return;
-            }
+            const slot = self.idleSession(req, sink) orelse return;
 
             if (m.sampling) |sampling| {
                 if (self.refuseFrequency(req, sampling, sink)) return;
@@ -902,83 +835,27 @@ pub fn Scheduler(comptime Engine: type, comptime CodecT: type) type {
             // The switch resolves once. The render and the slot read this one
             // value, so the tail of the wrap and the think state agree.
             const open = m.think_open orelse self.cfg.think.open_default;
-            // A request can ask for a block or a budget that the model has no
-            // tags for, and request data must never reach an assert. A switch
-            // that keeps the block closed is the only mode of such a model,
-            // so it passes.
+
+            // Request data must never reach an assert, so a model with no tags refuses a block
+            // or a budget. A closed block is its only mode, so that switch passes.
             if ((open or m.think_budget != null) and !self.cfg.think.hasTags()) {
-                self.reply(
-                    sink,
-                    req,
-                    OutEvent.fail(
-                        req.request_id,
-                        req.session_id,
-                        .forbidden,
-                        "this model has no think tags",
-                    ),
-                );
-                return;
+                return self.refuse(req, sink, .forbidden, "this model has no think tags");
             }
 
+            // A budget needs a forced close.
             const budget = m.think_budget orelse self.cfg.think.budget;
             std.debug.assert(budget <= limits.max_model_ctx);
             if (budget > 0 and self.cfg.think.force_len == 0) {
-                self.reply(
-                    sink,
-                    req,
-                    OutEvent.fail(
-                        req.request_id,
-                        req.session_id,
-                        .forbidden,
-                        "this model has no forced close",
-                    ),
-                );
-                return;
+                return self.refuse(req, sink, .forbidden, "this model has no forced close");
             }
 
             if (m.reseed) std.debug.assert(m.sampling != null);
 
-            const turn = turnKind(slot.has_system_prompt, slot.turns_done);
-            const encoded = self.codec.turnTokens(self.gpa, turn, text, open) catch {
-                self.reply(
-                    sink,
-                    req,
-                    OutEvent.fail(req.request_id, req.session_id, .internal, "tokenize failed"),
-                );
-                return;
-            };
-            const carry_before = slot.carry;
-            const tokens = self.withCarry(slot, encoded) catch {
-                self.gpa.free(encoded);
-                self.reply(
-                    sink,
-                    req,
-                    OutEvent.fail(req.request_id, req.session_id, .internal, "oom"),
-                );
-                return;
-            };
-            const room = self.engine.capacityRemaining(slot.engine_id);
-            if (tokens.len > room) {
-                self.gpa.free(tokens);
-                // The turn never entered the context. The carried token is
-                // still owed to the next successful turn.
-                slot.carry = carry_before;
-                var detail: [detail_max]u8 = undefined;
-                self.reply(
-                    sink,
-                    req,
-                    OutEvent.fail(
-                        req.request_id,
-                        req.session_id,
-                        .turn_too_long,
-                        turnTooLongDetail(&detail, tokens.len, room),
-                    ),
-                );
-                return;
-            }
+            // Encode the turn, with any carried token first.
+            const tokens = self.encodeTurn(req, slot, m.text, open, sink) orelse return;
 
             // Every refusal is behind, so a refused turn leaves the sampler
-            // of the session as it was.
+            // of the session unchanged.
             if (m.sampling) |sampling| {
                 self.engine.setParams(slot.engine_id, self.samplerParams(slot, sampling));
                 // Only an explicit reseed restarts the stream, so a client
@@ -988,7 +865,8 @@ pub fn Scheduler(comptime Engine: type, comptime CodecT: type) type {
                 }
             }
 
-            slot.max_tokens_turn = max_tokens;
+            // Reset the turn state.
+            slot.max_tokens_turn = m.max_tokens;
             slot.generated = 0;
             slot.think_open = open;
             slot.think_budget = budget;
@@ -996,9 +874,9 @@ pub fn Scheduler(comptime Engine: type, comptime CodecT: type) type {
             slot.forced_len = 0;
             slot.forced_head = 0;
             slot.t_turn_start = Io.Clock.Timestamp.now(self.io, .awake);
-            // The penalty counts the ids of this completion only, the OpenAI
-            // and vLLM rule, so the set clears at each admission.
             @memset(self.presenceOf(slot), 0);
+
+            // The echo goes out before the prefill.
             if (open) {
                 self.emitEcho(slot, req.request_id, sink);
             }
@@ -1009,10 +887,41 @@ pub fn Scheduler(comptime Engine: type, comptime CodecT: type) type {
             self.startPrefill(slot, req.request_id, tokens, .turn, sink);
         }
 
-        /// Feed kept pairs into an idle session. The guards are those of
-        /// `handleGenerate`. Every pair renders and tokenizes before any row
-        /// moves, so a set that does not fit refuses whole. A carried token
-        /// of a cut turn joins the first pair, as it joins the next turn.
+        /// The tokens of a turn, with any carried token first, or a refusal. A turn that does not
+        /// fit keeps the carry, because the carried token stays owed to the next turn.
+        fn encodeTurn(
+            self: *Self,
+            req: Request,
+            slot: *Slot,
+            text: []const u8,
+            open: bool,
+            sink: anytype,
+        ) ?[]u32 {
+            const turn = turnKind(slot.has_system_prompt, slot.turns_done);
+            const encoded = self.codec.turnTokens(self.gpa, turn, text, open) catch {
+                self.refuse(req, sink, .internal, "tokenize failed");
+                return null;
+            };
+            const carry_before = slot.carry;
+            const tokens = self.withCarry(slot, encoded) catch {
+                self.gpa.free(encoded);
+                self.refuse(req, sink, .internal, "oom");
+                return null;
+            };
+
+            const room = self.engine.capacityRemaining(slot.engine_id);
+            if (tokens.len <= room) return tokens;
+
+            self.gpa.free(tokens);
+            slot.carry = carry_before;
+            var detail: [detail_max]u8 = undefined;
+            const msg = turnTooLongDetail(&detail, tokens.len, room);
+            self.refuse(req, sink, .turn_too_long, msg);
+            return null;
+        }
+
+        /// Feed kept pairs into an idle session, with the guards of `handleGenerate`. A set that
+        /// does not fit refuses whole. A carried token of a cut turn joins the first pair.
         fn handleAppend(
             self: *Self,
             req: Request,
@@ -1022,77 +931,13 @@ pub fn Scheduler(comptime Engine: type, comptime CodecT: type) type {
             std.debug.assert(pairs.n >= 1);
             std.debug.assert(pairs.n <= limits.max_append_pairs);
 
-            const slot = self.slotByProto(req.session_id, req.conn) orelse {
-                self.reply(
-                    sink,
-                    req,
-                    OutEvent.fail(
-                        req.request_id,
-                        req.session_id,
-                        .unknown_session,
-                        "no such session",
-                    ),
-                );
-                return;
-            };
-            if (slot.resume_wait != null) return self.refuseWaiting(req, sink);
-            if (!self.flushParked(slot, sink)) return;
+            const slot = self.idleSession(req, sink) orelse return;
 
-            std.debug.assert(slot.pending_event == null);
-            if (slot.state != .idle) {
-                self.reply(
-                    sink,
-                    req,
-                    OutEvent.fail(req.request_id, req.session_id, .session_busy, "turn in flight"),
-                );
-                return;
-            }
-
-            var ids: std.ArrayList(u32) = .empty;
+            // Render every pair before any row moves.
             var ends: [limits.max_append_pairs]u32 = undefined;
-            if (slot.carry) |c| {
-                ids.append(self.gpa, c) catch return self.appendFailed(
-                    req,
-                    &ids,
-                    sink,
-                    .internal,
-                    "oom",
-                );
-            }
+            var ids = self.renderPairs(req, slot, pairs, &ends, sink) orelse return;
 
-            var it = pairs.iterator();
-            var i: u16 = 0;
-            // One pass per pair. The decoder bounds the count.
-            while (it.next()) |pair| : (i += 1) {
-                const place = turnPlace(slot.has_system_prompt, slot.turns_done + i);
-                const toks = self.codec.pairTokens(
-                    self.gpa,
-                    place,
-                    pair.user,
-                    pair.assistant,
-                ) catch |err| {
-                    // The comparison is statically false for a codec whose
-                    // render cannot refuse, so the arm compiles away there.
-                    const detail: []const u8 = if (err == error.AppendUnsupported)
-                        "append unsupported"
-                    else
-                        "tokenize failed";
-
-                    return self.appendFailed(req, &ids, sink, .internal, detail);
-                };
-                defer self.gpa.free(toks);
-
-                ids.appendSlice(self.gpa, toks) catch return self.appendFailed(
-                    req,
-                    &ids,
-                    sink,
-                    .internal,
-                    "oom",
-                );
-                ends[i] = @intCast(ids.items.len);
-            }
-
-            std.debug.assert(i == pairs.n);
+            // Refuse a set past the room.
             const room = self.engine.capacityRemaining(slot.engine_id);
             if (ids.items.len > room) {
                 var detail: [detail_max]u8 = undefined;
@@ -1100,6 +945,7 @@ pub fn Scheduler(comptime Engine: type, comptime CodecT: type) type {
                 return self.appendFailed(req, &ids, sink, .turn_too_long, msg);
             }
 
+            // Record the position after each pair.
             const pos0 = self.engine.posOf(slot.engine_id);
             for (ends[0..pairs.n], slot.append_pos[0..pairs.n]) |end, *pos| {
                 pos.* = pos0 + end;
@@ -1110,13 +956,11 @@ pub fn Scheduler(comptime Engine: type, comptime CodecT: type) type {
                 "append: session {d}, {d} pairs, {d} tokens, pos {d} -> {d}",
                 .{ slot.proto_id, pairs.n, ids.items.len, pos0, slot.append_pos[pairs.n - 1] },
             );
-            const tokens = ids.toOwnedSlice(self.gpa) catch return self.appendFailed(
-                req,
-                &ids,
-                sink,
-                .internal,
-                "oom",
-            );
+
+            // Start the prefill.
+            const tokens = ids.toOwnedSlice(self.gpa) catch {
+                return self.appendFailed(req, &ids, sink, .internal, "oom");
+            };
             if (tokens.len == 0) {
                 // Empty pairs of a template-free family render to no token.
                 self.gpa.free(tokens);
@@ -1130,6 +974,56 @@ pub fn Scheduler(comptime Engine: type, comptime CodecT: type) type {
             self.startPrefill(slot, req.request_id, tokens, .append, sink);
         }
 
+        /// The ids of `pairs` after any carried token, or a refusal. `ends` gets the id count after
+        /// each pair.
+        fn renderPairs(
+            self: *Self,
+            req: Request,
+            slot: *const Slot,
+            pairs: protocol.AppendPairs,
+            ends: *[limits.max_append_pairs]u32,
+            sink: anytype,
+        ) ?std.ArrayList(u32) {
+            var ids: std.ArrayList(u32) = .empty;
+            if (slot.carry) |c| {
+                ids.append(self.gpa, c) catch {
+                    self.appendFailed(req, &ids, sink, .internal, "oom");
+                    return null;
+                };
+            }
+
+            var it = pairs.iterator();
+            var i: u16 = 0;
+            // One pass per pair. The decoder bounds the count.
+            while (it.next()) |pair| : (i += 1) {
+                const place = turnPlace(slot.has_system_prompt, slot.turns_done + i);
+                const toks = self.codec.pairTokens(
+                    self.gpa,
+                    place,
+                    pair.user,
+                    pair.assistant,
+                ) catch |err| {
+                    const detail: []const u8 = if (err == error.AppendUnsupported)
+                        "append unsupported"
+                    else
+                        "tokenize failed";
+
+                    self.appendFailed(req, &ids, sink, .internal, detail);
+                    return null;
+                };
+                defer self.gpa.free(toks);
+
+                ids.appendSlice(self.gpa, toks) catch {
+                    self.appendFailed(req, &ids, sink, .internal, "oom");
+                    return null;
+                };
+                ends[i] = @intCast(ids.items.len);
+            }
+
+            std.debug.assert(i == pairs.n);
+            return ids;
+        }
+
         /// A refused append feeds no row and keeps the carry.
         fn appendFailed(
             self: *Self,
@@ -1140,7 +1034,16 @@ pub fn Scheduler(comptime Engine: type, comptime CodecT: type) type {
             detail: []const u8,
         ) void {
             ids.deinit(self.gpa);
-            self.reply(sink, req, OutEvent.fail(req.request_id, req.session_id, code, detail));
+            self.refuse(req, sink, code, detail);
+        }
+
+        /// The reply of a finished open or clone. It names the position of the session.
+        fn emitOpened(self: *Self, slot: *Slot, sink: anytype) void {
+            self.emitOrPark(slot, sink, .{
+                .request_id = slot.request_id,
+                .session_id = slot.proto_id,
+                .body = .{ .session_opened = .{ .kv_pos = self.engine.posOf(slot.engine_id) } },
+            });
         }
 
         fn emitAppended(self: *Self, slot: *Slot, sink: anytype) void {
@@ -1156,8 +1059,7 @@ pub fn Scheduler(comptime Engine: type, comptime CodecT: type) type {
             });
         }
 
-        /// The sampling params of `slot`, which read the two id sets of the
-        /// slot.
+        /// The sampling params of `slot`, which read the two id sets of the slot.
         fn samplerParams(self: *Self, slot: *Slot, s: protocol.Sampling) sampler.Params {
             return .{
                 .temperature = s.temperature,
@@ -1191,10 +1093,8 @@ pub fn Scheduler(comptime Engine: type, comptime CodecT: type) type {
             sampler.markIds(self.contextOf(slot), self.cfg.vocab_size, ids);
         }
 
-        /// The first event of an open turn: the `<think>` id alone, before the
-        /// prefill. It counts as no generated token and never enters the KV.
-        /// The admission check above left the cell empty, so this one event
-        /// can park but never collide.
+        /// The first event of an open turn: the `<think>` id alone, before the prefill. The
+        /// admission check left the cell empty, so this one event can park but never collide.
         fn emitEcho(self: *Self, slot: *Slot, request_id: u32, sink: anytype) void {
             std.debug.assert(slot.state == .idle);
             std.debug.assert(slot.pending_event == null);
@@ -1210,19 +1110,7 @@ pub fn Scheduler(comptime Engine: type, comptime CodecT: type) type {
         }
 
         fn handleCancel(self: *Self, req: Request, sink: anytype) void {
-            const slot = self.slotByProto(req.session_id, req.conn) orelse {
-                self.reply(
-                    sink,
-                    req,
-                    OutEvent.fail(
-                        req.request_id,
-                        req.session_id,
-                        .unknown_session,
-                        "no such session",
-                    ),
-                );
-                return;
-            };
+            const slot = self.sessionOf(req, sink) orelse return;
             if (slot.resume_wait != null) return self.refuseWaiting(req, sink);
             switch (slot.state) {
                 .prefill => if (slot.kind == .append) self.cancelAppend(
@@ -1239,8 +1127,7 @@ pub fn Scheduler(comptime Engine: type, comptime CodecT: type) type {
             std.debug.assert(slot.state == .prefill or slot.state == .decode);
 
             if (slot.state == .prefill) {
-                // The partial turn stays in context (documented). A client
-                // that cares closes the session instead.
+                // The partial turn stays in context. A client that cares closes the session.
                 std.debug.assert(slot.kind != .append);
 
                 log.info("stop: session {d} cancelled (prefill state)", .{slot.proto_id});
@@ -1253,18 +1140,16 @@ pub fn Scheduler(comptime Engine: type, comptime CodecT: type) type {
                 return;
             }
 
-            // The scheduler writes the stop reason of a turn once, so a
-            // natural stop that waits for its done keeps its reason and carry.
+            // A natural stop keeps its reason. See "Stop rules" in the header.
             if (slot.stop == null) {
                 log.info("stop: session {d} cancelled (decode state)", .{slot.proto_id});
                 slot.stop = .cancelled;
             }
         }
 
-        /// A cancelled append frees the unfed tokens and returns the slot to
-        /// idle. The rows already fed stay, but `turns_done` does not move.
-        /// The next wrap of the session is then wrong, so the client must
-        /// close it. The `err` says so.
+        /// A cancelled append frees the unfed tokens and returns the slot to idle. The fed rows
+        /// stay, but `turns_done` does not move. The next wrap is then wrong, so the `err` tells
+        /// the client to close.
         fn cancelAppend(self: *Self, slot: *Slot, sink: anytype) void {
             std.debug.assert(slot.state == .prefill);
             std.debug.assert(slot.kind == .append);
@@ -1286,19 +1171,7 @@ pub fn Scheduler(comptime Engine: type, comptime CodecT: type) type {
         }
 
         fn handleClose(self: *Self, req: Request, sink: anytype) void {
-            const slot = self.slotByProto(req.session_id, req.conn) orelse {
-                self.reply(
-                    sink,
-                    req,
-                    OutEvent.fail(
-                        req.request_id,
-                        req.session_id,
-                        .unknown_session,
-                        "no such session",
-                    ),
-                );
-                return;
-            };
+            const slot = self.sessionOf(req, sink) orelse return;
             // The client has no `resumed` reply yet, so it cannot know the
             // session it closes. It closes it after the reply.
             if (slot.resume_wait != null) return self.refuseWaiting(req, sink);
@@ -1306,11 +1179,11 @@ pub fn Scheduler(comptime Engine: type, comptime CodecT: type) type {
             // releases the slot.
             if (!self.flushParked(slot, sink)) return;
 
-            self.reply(
-                sink,
-                req,
-                .{ .request_id = req.request_id, .session_id = slot.proto_id, .body = .session_closed },
-            );
+            self.reply(sink, req, .{
+                .request_id = req.request_id,
+                .session_id = slot.proto_id,
+                .body = .session_closed,
+            });
             self.releaseSlot(slot);
         }
 
@@ -1323,24 +1196,13 @@ pub fn Scheduler(comptime Engine: type, comptime CodecT: type) type {
         /// because the client has no `resumed` reply yet. The handler draws
         /// a new token for a collision, and it never sends that refusal.
         fn handleKeep(self: *Self, req: Request, ttl_ms: u32, sink: anytype) void {
-            const slot = self.slotByProto(req.session_id, req.conn) orelse {
-                self.reply(
-                    sink,
-                    req,
-                    OutEvent.fail(
-                        req.request_id,
-                        req.session_id,
-                        .unknown_session,
-                        "no such session",
-                    ),
-                );
-                return;
-            };
+            const slot = self.sessionOf(req, sink) orelse return;
             if (slot.resume_wait != null) return self.refuseWaiting(req, sink);
             // A failed flush disconnects, and the sweep of that connection
             // handles the slot.
             if (!self.flushParked(slot, sink)) return;
 
+            // Keep with a new token, and retry a draw that a slot already holds.
             var draws: u32 = 0;
             while (draws < token_draws_max) : (draws += 1) {
                 // A keep that drops the lease or that resumption refuses
@@ -1349,17 +1211,7 @@ pub fn Scheduler(comptime Engine: type, comptime CodecT: type) type {
                     @splat(0)
                 else
                     drawToken(self.io) catch {
-                        self.reply(
-                            sink,
-                            req,
-                            OutEvent.fail(
-                                req.request_id,
-                                req.session_id,
-                                .internal,
-                                "no secure random source",
-                            ),
-                        );
-                        return;
+                        return self.refuse(req, sink, .internal, "no secure random source");
                     };
 
                 const granted = self.keepLease(slot.proto_id, req.conn, ttl_ms, token) catch |err| {
@@ -1371,12 +1223,7 @@ pub fn Scheduler(comptime Engine: type, comptime CodecT: type) type {
                             "no such session",
                         },
                     };
-                    self.reply(
-                        sink,
-                        req,
-                        OutEvent.fail(req.request_id, req.session_id, code, detail),
-                    );
-                    return;
+                    return self.refuse(req, sink, code, detail);
                 };
                 const sent: Token = if (granted > 0) token else @splat(0);
                 if (granted > 0) std.debug.assert(std.mem.eql(u8, &slot.lease.?.token, &token));
@@ -1391,77 +1238,32 @@ pub fn Scheduler(comptime Engine: type, comptime CodecT: type) type {
                 return;
             }
 
-            self.reply(
-                sink,
-                req,
-                OutEvent.fail(req.request_id, req.session_id, .internal, "token draws collided"),
-            );
+            self.refuse(req, sink, .internal, "token draws collided");
         }
 
-        /// The wire form of `resumeLease`. One answer covers an unknown, a
-        /// rotated, and an expired token. A slot that is idle answers at
-        /// once. Any other slot answers at its idle transition. The guards
-        /// run in the order of `resumeLease`, and the handler draws a token
-        /// only for a match, so a probe costs the source nothing.
+        /// The wire form of `resumeLease`. One answer covers an unknown, a rotated, and an expired
+        /// token. The guards run in the order of `resumeLease`. Only a match draws a token, so a
+        /// probe costs the source nothing.
         fn handleResume(self: *Self, req: Request, token: Token, sink: anytype) void {
             // With resumption off no slot holds a lease, so no draw is due.
             if (self.cfg.resume_ttl_max_ms == 0) {
-                self.reply(
-                    sink,
-                    req,
-                    OutEvent.fail(
-                        req.request_id,
-                        req.session_id,
-                        .unknown_session,
-                        "no such lease",
-                    ),
-                );
-                return;
+                return self.refuse(req, sink, .unknown_session, "no such lease");
             }
 
             self.expireDetached(self.readClock());
             if (self.shareFull(req.conn)) {
-                self.reply(
-                    sink,
-                    req,
-                    OutEvent.fail(
-                        req.request_id,
-                        req.session_id,
-                        .sessions_exhausted,
-                        "session share of this connection is full",
-                    ),
-                );
-                return;
+                return self.refuse(req, sink, .sessions_exhausted, detail_share_full);
             }
 
             if (self.slotByToken(token) == null) {
-                self.reply(
-                    sink,
-                    req,
-                    OutEvent.fail(
-                        req.request_id,
-                        req.session_id,
-                        .unknown_session,
-                        "no such lease",
-                    ),
-                );
-                return;
+                return self.refuse(req, sink, .unknown_session, "no such lease");
             }
 
+            // Rotate the token, and retry a draw that a slot already holds.
             var draws: u32 = 0;
             while (draws < token_draws_max) : (draws += 1) {
                 const new_token = drawToken(self.io) catch {
-                    self.reply(
-                        sink,
-                        req,
-                        OutEvent.fail(
-                            req.request_id,
-                            req.session_id,
-                            .internal,
-                            "no secure random source",
-                        ),
-                    );
-                    return;
+                    return self.refuse(req, sink, .internal, "no secure random source");
                 };
                 const r = self.resumeLease(
                     req.conn,
@@ -1473,18 +1275,12 @@ pub fn Scheduler(comptime Engine: type, comptime CodecT: type) type {
                     const code: protocol.ErrorCode, const detail: []const u8 = switch (err) {
                         error.TokenInUse => continue,
                         error.NoSuchLease => .{ .unknown_session, "no such lease" },
-                        error.ShareFull => .{
-                            .sessions_exhausted,
-                            "session share of this connection is full",
-                        },
+                        error.ShareFull => .{ .sessions_exhausted, detail_share_full },
                     };
-                    self.reply(
-                        sink,
-                        req,
-                        OutEvent.fail(req.request_id, req.session_id, code, detail),
-                    );
-                    return;
+                    return self.refuse(req, sink, code, detail);
                 };
+
+                // Answer at once, or at the idle transition.
                 const slot = self.slotByProto(r.session_id, req.conn).?;
                 if (r.ready) {
                     std.debug.assert(slot.state == .idle);
@@ -1497,11 +1293,7 @@ pub fn Scheduler(comptime Engine: type, comptime CodecT: type) type {
                 return;
             }
 
-            self.reply(
-                sink,
-                req,
-                OutEvent.fail(req.request_id, req.session_id, .internal, "token draws collided"),
-            );
+            self.refuse(req, sink, .internal, "token draws collided");
         }
 
         /// The `resumed` reply of an idle slot. It names the token, the final
@@ -1531,19 +1323,10 @@ pub fn Scheduler(comptime Engine: type, comptime CodecT: type) type {
         }
 
         // -- the session lease ----------------------------------------------
-        //
-        // A lease lets a session outlive its connection. The lease is an FSM
-        // over the slot owner: free, attached to a connection, or detached
-        // with a deadline. Every transition below is a guarded write that
-        // keeps `checkLeases`. The pure choices (`expired`, `pickYield`)
-        // take no scheduler state. The caller reads the clock once per scan
-        // and passes `now` down, so one scan sees one instant.
 
-        /// Keep session `proto_id` of connection `conn` with `token` for at
-        /// most `ttl_ms`. A zero time to live drops the lease. A new token
-        /// replaces the old one, which then opens nothing. Returns the
-        /// granted time to live. The wire handler draws `token` with
-        /// `drawToken` and no other source.
+        /// Keep session `proto_id` of connection `conn` with `token` for at most `ttl_ms`. Returns
+        /// the granted time to live. A zero drops the lease. A new token replaces the old one. The
+        /// wire handler draws `token` with `drawToken` and no other source.
         pub fn keepLease(
             self: *Self,
             proto_id: u32,
@@ -1566,9 +1349,8 @@ pub fn Scheduler(comptime Engine: type, comptime CodecT: type) type {
             }
 
             if (self.cfg.resume_ttl_max_ms == 0) return error.ResumptionOff;
-            // Unique tokens make the holder of a token the only holder. The
-            // check stays in every build mode, because a duplicate gives one
-            // client the session of another.
+            // The check stays in every build mode, because a duplicate token gives one client
+            // the session of another.
             if (self.slotByToken(token) != null) return error.TokenInUse;
 
             // A zero token is the wire form of no lease.
@@ -1580,13 +1362,9 @@ pub fn Scheduler(comptime Engine: type, comptime CodecT: type) type {
             return granted;
         }
 
-        /// Connection `conn` presents `token` at `now`. A detached slot before
-        /// its deadline attaches to `conn`. An attached slot moves to `conn`
-        /// after the drop effect, the takeover rule: the newest holder wins.
-        /// The slot then holds `new_token`, so the old token opens nothing.
-        /// The wire handler draws `new_token` with `drawToken` and no other
-        /// source. A slot that is not idle answers later: the resume waits
-        /// in the slot until the slot is idle.
+        /// Connection `conn` presents `token` at `now`, and the slot then holds `new_token`. See
+        /// "Resume" in the header. The wire handler draws `new_token` with `drawToken` and no other
+        /// source.
         pub fn resumeLease(
             self: *Self,
             conn: u32,
@@ -1598,12 +1376,14 @@ pub fn Scheduler(comptime Engine: type, comptime CodecT: type) type {
             defer self.checkLeases();
 
             std.debug.assert(!std.mem.allEqual(u8, &new_token, 0));
+
             // A resume is an admission, so it runs the expiry scan first. A
             // slot at its deadline is then free, and its token is gone.
             self.expireDetached(now);
             if (self.slotByToken(new_token) != null) return error.TokenInUse;
             if (self.shareFull(conn)) return error.ShareFull;
 
+            // Move the slot to the new connection.
             const slot = self.slotByToken(token) orelse return error.NoSuchLease;
             switch (slot.owner) {
                 .attached => |c| {
@@ -1616,6 +1396,8 @@ pub fn Scheduler(comptime Engine: type, comptime CodecT: type) type {
 
             slot.owner = .{ .attached = conn };
             slot.lease.?.token = new_token;
+
+            // Answer at once, or wait in the slot until it is idle.
             const ready = slot.state == .idle;
             std.debug.assert(slot.resume_wait == null);
             std.debug.assert(slot.pending_event == null);
@@ -1629,9 +1411,8 @@ pub fn Scheduler(comptime Engine: type, comptime CodecT: type) type {
             return .{ .session_id = slot.proto_id, .ready = ready };
         }
 
-        /// The end of connection `conn` at `now`. A slot with no lease frees
-        /// as before. A leased slot detaches until `now` plus its time to
-        /// live, after the drop effect.
+        /// The end of connection `conn` at `now`. A slot with no lease frees. A leased slot
+        /// detaches until `now` plus its time to live, after the drop effect.
         pub fn detachConn(self: *Self, conn: u32, now: Io.Clock.Timestamp) void {
             defer self.checkLeases();
 
@@ -1666,10 +1447,9 @@ pub fn Scheduler(comptime Engine: type, comptime CodecT: type) type {
             }
         }
 
-        /// The drop effect on one slot. A turn takes the cancel rule. An
-        /// opening or append prefill runs on, because it rebuilds context
-        /// that the client asked for. A parked event and a waiting resume
-        /// belong to the old connection, so they go.
+        /// The drop effect on one slot. A turn takes the cancel rule. An opening or append prefill
+        /// runs on, because it rebuilds context that the client asked for. A parked event and a
+        /// waiting resume belong to the old connection, so they go.
         fn dropEffect(self: *Self, slot: *Slot) void {
             std.debug.assert(slot.state != .free);
             std.debug.assert(slot.owner == .attached);
@@ -1709,10 +1489,9 @@ pub fn Scheduler(comptime Engine: type, comptime CodecT: type) type {
             self.releaseSlot(slot);
         }
 
-        /// Send a waiting resume at the moment its slot becomes idle. The
-        /// position of the session is then final. Every idle transition
-        /// calls it, so no request can reach the slot between the two. The
-        /// events before it went, so the cell is empty for the reply.
+        /// Send a waiting resume at the moment its slot becomes idle. Every idle transition calls
+        /// it, so no request can reach the slot between the two. The events before it went, so the
+        /// cell is empty.
         fn deliverResume(self: *Self, slot: *Slot, sink: anytype) void {
             std.debug.assert(slot.state == .idle);
 
@@ -1730,11 +1509,7 @@ pub fn Scheduler(comptime Engine: type, comptime CodecT: type) type {
         /// The refusal of a request on a slot whose resume still waits. The
         /// client has no `resumed` answer yet, so the session is busy.
         fn refuseWaiting(self: *Self, req: Request, sink: anytype) void {
-            self.reply(
-                sink,
-                req,
-                OutEvent.fail(req.request_id, req.session_id, .session_busy, "resume in flight"),
-            );
+            self.refuse(req, sink, .session_busy, "resume in flight");
         }
 
         /// The lease clock for a scan, or null when resumption is off. No
@@ -1802,15 +1577,12 @@ pub fn Scheduler(comptime Engine: type, comptime CodecT: type) type {
             return slot.owner.attached;
         }
 
-        /// The lease rules of the table, checked after each event. Tokens are
-        /// unique. Live session ids are unique, nonzero, and below the
-        /// counter. A free slot holds no lease and id 0. A detached slot holds
-        /// a lease. Every lease has a positive time to live at or below the
-        /// server maximum.
+        /// Check the rules of "Lease table" in the header after each event.
         fn checkLeases(self: *const Self) void {
             if (!std.debug.runtime_safety) return;
             std.debug.assert(self.next_proto_id >= 1);
             for (self.slots, 0..) |*slot, i| {
+                // A free slot holds nothing.
                 if (slot.state == .free) {
                     std.debug.assert(slot.lease == null);
                     std.debug.assert(slot.proto_id == 0);
@@ -1819,6 +1591,7 @@ pub fn Scheduler(comptime Engine: type, comptime CodecT: type) type {
                     continue;
                 }
 
+                // A live slot holds a counted id, and a detached slot holds a lease.
                 std.debug.assert(slot.proto_id >= 1);
                 std.debug.assert(slot.proto_id < self.next_proto_id);
                 if (slot.owner == .detached) {
@@ -1840,6 +1613,7 @@ pub fn Scheduler(comptime Engine: type, comptime CodecT: type) type {
                     std.debug.assert(lease.ttl_ms <= self.cfg.resume_ttl_max_ms);
                 }
 
+                // No two live slots share a session id or a token.
                 for (self.slots[i + 1 ..]) |*other| {
                     if (other.state == .free) continue;
                     std.debug.assert(other.proto_id != slot.proto_id);
@@ -1869,7 +1643,7 @@ pub fn Scheduler(comptime Engine: type, comptime CodecT: type) type {
                     std.debug.assert(slot.stop == null);
                 }
 
-                // A natural stop keeps its reason here too, by the rule in handleCancel.
+                // A natural stop keeps its reason. See "Stop rules" in the header.
                 if (slot.stop == null) {
                     slot.stop = .cancelled;
                 }
@@ -1900,11 +1674,14 @@ pub fn Scheduler(comptime Engine: type, comptime CodecT: type) type {
                     continue;
                 }
 
+                // A cut turn carries its last token.
                 const reason = slot.stop.?;
                 slot.carry = switch (reason) {
                     .max_tokens, .cancelled => if (slot.generated > 0) slot.last_token else null,
                     .eos, .context_full => null,
                 };
+
+                // Report the turn to the client and to a later resume.
                 self.emitOrPark(slot, sink, .{
                     .request_id = slot.request_id,
                     .session_id = slot.proto_id,
@@ -1935,6 +1712,8 @@ pub fn Scheduler(comptime Engine: type, comptime CodecT: type) type {
                         msBetween(slot.t_prefill_end, now),
                     },
                 );
+
+                // End the turn. The idle transition delivers a waiting resume.
                 slot.stop = null;
                 slot.state = .idle;
                 slot.turns_done += 1;
@@ -1942,21 +1721,60 @@ pub fn Scheduler(comptime Engine: type, comptime CodecT: type) type {
             }
         }
 
+        /// The one composed engine call of a tick. Returns whether the tick did work.
         fn runComposedStep(self: *Self, sink: anytype) bool {
             const sp = span.begin(.composed_step);
             defer sp.end();
 
-            // Decode rows: round-robin admission up to max_batch. A session
-            // out of KV stops here and finalizes on the next tick.
-            var ids: [limits.max_batch]u32 = undefined;
-            var members: [limits.max_batch]*Slot = undefined;
-            var n_decode: usize = 0;
+            var rows: DecodeRows = .{};
+            self.admitDecodeRows(&rows);
+            const feeding = self.pickFeeding();
+            if (feeding == null and rows.n == 0) return false;
+
+            const feed_chunk: ?session_mod.FeedChunk =
+                if (feeding) |slot| self.nextChunk(slot, rows.n) else null;
+            const chunk: usize = if (feed_chunk) |fc| fc.tokens.len else 0;
+            logBatch(&rows, feeding, chunk);
+
+            const first = self.engine.advance(
+                feed_chunk,
+                rows.engineIds(),
+                rows.tokensOut(),
+            ) catch |err| {
+                // The tiers are over-subscribed: park this turn. See "Parked turns" in the header.
+                if (isParkError(err)) {
+                    // A failed call of decode rows alone needs no retry: it is the same call.
+                    const f = feeding orelse return self.parkDecodeRows(rows.n);
+                    return self.parkPrefill(f, &rows, err, sink);
+                }
+
+                // Any other error fails every row of the call.
+                if (feeding) |slot| {
+                    self.failTurn(slot, sink, detail_advance_failed);
+                }
+
+                self.failDecodeRows(&rows, sink);
+                return true;
+            };
+
+            if (feeding) |slot| {
+                self.finishChunk(slot, chunk, first, sink);
+            }
+
+            self.acceptDecodeRows(&rows, sink);
+            return true;
+        }
+
+        /// Admit decode rows by round-robin up to `max_batch`. A session out of KV stops here and
+        /// finalizes on the next tick.
+        fn admitDecodeRows(self: *Self, rows: *DecodeRows) void {
+            std.debug.assert(rows.n == 0);
+
             for (0..self.slots.len) |k| {
-                if (n_decode == self.cfg.max_batch) break;
+                if (rows.n == self.cfg.max_batch) break;
 
                 const slot = &self.slots[(self.rr_cursor + k) % self.slots.len];
-                // The drop cancelled the turn of a detached slot, so it
-                // takes no decode row.
+                // The drop cancelled the turn of a detached slot, so it takes no decode row.
                 if (slot.state == .decode and slot.owner == .detached) {
                     std.debug.assert(slot.stop != null);
                 }
@@ -1974,17 +1792,16 @@ pub fn Scheduler(comptime Engine: type, comptime CodecT: type) type {
                     continue;
                 }
 
-                ids[n_decode] = slot.engine_id;
-                members[n_decode] = slot;
-                n_decode += 1;
+                rows.ids[rows.n] = slot.engine_id;
+                rows.members[rows.n] = slot;
+                rows.n += 1;
             }
 
             self.rr_cursor = (self.rr_cursor + 1) % self.slots.len;
+        }
 
-            // The longest-waiting feeding turn uses the same weight pass. It
-            // runs in the rows the decode admission left free, with a floor of
-            // one row, so saturated decode cannot starve it. That one extra row
-            // can exceed max_batch, and progress outranks the dial by it.
+        /// The longest-waiting feeding turn. A parked event holds its turn back.
+        fn pickFeeding(self: *Self) ?*Slot {
             var feeding: ?*Slot = null;
             for (self.slots) |*slot| {
                 if (slot.state != .prefill or slot.pending_event != null) continue;
@@ -1994,47 +1811,40 @@ pub fn Scheduler(comptime Engine: type, comptime CodecT: type) type {
                 }
             }
 
-            if (feeding == null and n_decode == 0) return false;
+            return feeding;
+        }
 
-            var chunk: usize = 0;
-            var feed_chunk: ?session_mod.FeedChunk = null;
-            if (feeding) |slot| {
-                // The pass must stay within the runner's capacity
-                // (`max_step_rows`). The rule in `prefill_chunk.zig` picks the
-                // prompt rows.
-                const remaining = slot.turn_tokens.len - slot.fed;
-                chunk = prefill_chunk.chunk(
-                    self.cfg.prefill,
-                    remaining,
-                    n_decode,
-                    self.cfg.max_batch,
-                    self.cfg.max_step_rows,
-                );
-                // A saturated decode batch (cap == 0) leaves no room this tick.
-                // Compose decode alone and re-pick this turn next tick. Never
-                // forward a zero-length chunk. `advance` asserts tokens.len >= 1.
-                if (chunk > 0) {
-                    feed_chunk = .{
-                        .id = slot.engine_id,
-                        .tokens = slot.turn_tokens[slot.fed..][0..chunk],
-                        .final = slot.kind == .turn and slot.fed + chunk == slot.turn_tokens.len,
-                    };
-                }
+        /// The next chunk of `slot` beside `n_decode` rows, by the rule in `prefill_chunk.zig`.
+        /// Null when a saturated decode batch leaves no room, so the turn waits for the next tick.
+        fn nextChunk(self: *Self, slot: *Slot, n_decode: usize) ?session_mod.FeedChunk {
+            const chunk = prefill_chunk.chunk(
+                self.cfg.prefill,
+                slot.turn_tokens.len - slot.fed,
+                n_decode,
+                self.cfg.max_batch,
+                self.cfg.max_step_rows,
+            );
+            // Never forward a zero-length chunk: `advance` asserts tokens.len >= 1.
+            if (chunk == 0) return null;
 
-                // The engine samples the first token of a turn inside the
-                // advance, so the chunk enters the context set before it. A
-                // parked chunk feeds again later, and a second mark is a no-op.
-                if (feed_chunk) |fc| {
-                    self.markFed(slot, fc.tokens);
-                }
-            }
+            // The engine samples the first token of a turn inside the advance, so the chunk
+            // enters the context set first. A second mark of a parked chunk is a no-op.
+            const tokens = slot.turn_tokens[slot.fed..][0..chunk];
+            self.markFed(slot, tokens);
+            return .{
+                .id = slot.engine_id,
+                .tokens = tokens,
+                .final = slot.kind == .turn and slot.fed + chunk == slot.turn_tokens.len,
+            };
+        }
 
+        fn logBatch(rows: *const DecodeRows, feeding: ?*const Slot, chunk: usize) void {
             if (feeding) |f| {
                 log.debug(
                     "batch: decode {d} engines {any}, prefill {d} rows (session {d} fed {d}/{d})",
                     .{
-                        n_decode,
-                        ids[0..n_decode],
+                        rows.n,
+                        rows.engineIds(),
                         chunk,
                         f.proto_id,
                         f.fed + chunk,
@@ -2042,130 +1852,95 @@ pub fn Scheduler(comptime Engine: type, comptime CodecT: type) type {
                     },
                 );
             } else {
-                log.debug("batch: decode {d} engines {any}", .{ n_decode, ids[0..n_decode] });
+                log.debug("batch: decode {d} engines {any}", .{ rows.n, rows.engineIds() });
+            }
+        }
+
+        /// The errors that park a turn. The CPU pool and the test fakes cannot return some of
+        /// them, so a compare with such an error is statically false and its arm compiles away.
+        inline fn isParkError(err: anytype) bool {
+            return err == error.NoEvictableSlot or err == error.RamBudgetExceeded;
+        }
+
+        /// Park the decode rows of a tick. A parked tick reports no work, so this returns false.
+        fn parkDecodeRows(self: *Self, n_decode: usize) bool {
+            log.debug("park: {d} decode rows blocked on kv residency", .{n_decode});
+            self.parks += 1;
+            return false;
+        }
+
+        /// Park the prefill of `f`, and retry the decode rows alone. Returns whether the tick
+        /// did work.
+        fn parkPrefill(self: *Self, f: *Slot, rows: *DecodeRows, err: anytype, sink: anytype) bool {
+            if (err == error.RamBudgetExceeded) {
+                log.debug("park: prefill session {d}, ram budget exhausted", .{f.proto_id});
+            } else {
+                log.debug(
+                    "park: prefill session {d}, no evictable slot ({d} decoding)",
+                    .{ f.proto_id, rows.n },
+                );
             }
 
-            var out: [limits.max_batch]u32 = undefined;
-            const first = self.engine.advance(
-                feed_chunk,
-                ids[0..n_decode],
-                out[0..n_decode],
-            ) catch |err| {
-                // Tiered KV, over-subscribed: the pool cannot make a session
-                // VRAM-resident. Either every slot is decoding this tick, or
-                // the RAM tier cannot fund the victim's blob. Park the prefill
-                // and decode alone. Its `fed` stays untouched, so the next tick
-                // re-picks it. The decode-only retry can still fault when a
-                // decode row's restore needs an eviction the budget refuses,
-                // and that parks too. A later event lets a parked turn in: a
-                // decoder finished, or a closed session credited its blob. The
-                // comparisons are statically false for engines whose `advance`
-                // cannot return these (CPU, test fakes), so this arm compiles
-                // away for them.
-                if (err == error.NoEvictableSlot or err == error.RamBudgetExceeded) {
-                    // A parked tick that produced nothing must report no work.
-                    // Reporting work spins the engine loop hot, because only an
-                    // external event credits the ledger or frees a slot and
-                    // lets a parked turn in: a request, a close, a disconnect.
-                    const f = feeding orelse {
-                        // The failed call was already decode-only, so a retry is
-                        // the same call. A decode row parks when restoring it
-                        // must evict a session the budget cannot fund. It must
-                        // not fail the turn: the state is intact and a later
-                        // credit admits it.
-                        log.debug("park: {d} decode rows blocked on kv residency", .{n_decode});
-                        self.parks += 1;
-                        return false;
-                    };
-                    if (err == error.RamBudgetExceeded) {
-                        log.debug("park: prefill session {d}, ram budget exhausted", .{f.proto_id});
-                    } else {
-                        log.debug(
-                            "park: prefill session {d}, no evictable slot ({d} decoding)",
-                            .{ f.proto_id, n_decode },
-                        );
-                    }
+            self.parks += 1;
+            if (rows.n == 0) return false;
 
-                    // The counter matches the park log lines one to one, so a
-                    // prefill parked beside a running decode still counts.
-                    self.parks += 1;
-                    if (n_decode == 0) return false;
+            const decoded = self.engine.advance(
+                null,
+                rows.engineIds(),
+                rows.tokensOut(),
+            ) catch |retry_err| {
+                if (isParkError(retry_err)) return self.parkDecodeRows(rows.n);
 
-                    const decoded = self.engine.advance(
-                        null,
-                        ids[0..n_decode],
-                        out[0..n_decode],
-                    ) catch |retry_err| {
-                        if (retry_err == error.NoEvictableSlot or retry_err ==
-                            error.RamBudgetExceeded)
-                        {
-                            log.debug("park: {d} decode rows blocked on kv residency", .{n_decode});
-                            self.parks += 1;
-                            return false;
-                        }
-
-                        for (members[0..n_decode]) |slot| {
-                            self.failTurn(slot, sink, "engine advance failed");
-                        }
-
-                        return true;
-                    };
-                    std.debug.assert(decoded == null);
-                    logAdvanceTokens(members[0..n_decode], out[0..n_decode]);
-                    for (members[0..n_decode], out[0..n_decode]) |slot, token| {
-                        self.acceptToken(slot, sink, token);
-                    }
-
-                    return true;
-                }
-
-                if (feeding) |slot| {
-                    self.failTurn(slot, sink, "engine advance failed");
-                }
-
-                for (members[0..n_decode]) |slot| {
-                    self.failTurn(slot, sink, "engine advance failed");
-                }
-
+                self.failDecodeRows(rows, sink);
                 return true;
             };
+            std.debug.assert(decoded == null);
 
-            if (feeding) |slot| {
-                slot.fed += chunk;
-                if (slot.fed == slot.turn_tokens.len) {
-                    self.maybeInsertPrefix(slot);
-                    switch (slot.kind) {
-                        .opening => {
-                            self.emitOrPark(slot, sink, .{
-                                .request_id = slot.request_id,
-                                .session_id = slot.proto_id,
-                                .body = .{
-                                    .session_opened = .{
-                                        .kv_pos = self.engine.posOf(slot.engine_id),
-                                    },
-                                },
-                            });
-                            self.endPrefill(slot, .idle, sink);
-                        },
-                        .append => {
-                            self.emitAppended(slot, sink);
-                            self.endPrefill(slot, .idle, sink);
-                        },
-                        .turn => {
-                            slot.t_prefill_end = Io.Clock.Timestamp.now(self.io, .awake);
-                            self.endPrefill(slot, .decode, sink);
-                            self.acceptToken(slot, sink, first.?);
-                        },
-                    }
-                }
+            self.acceptDecodeRows(rows, sink);
+            return true;
+        }
+
+        fn failDecodeRows(self: *Self, rows: *const DecodeRows, sink: anytype) void {
+            for (rows.slots()) |slot| {
+                self.failTurn(slot, sink, detail_advance_failed);
             }
+        }
 
-            logAdvanceTokens(members[0..n_decode], out[0..n_decode]);
-            for (members[0..n_decode], out[0..n_decode]) |slot, token| {
+        fn acceptDecodeRows(self: *Self, rows: *const DecodeRows, sink: anytype) void {
+            logAdvanceTokens(rows.slots(), rows.tokens());
+            for (rows.slots(), rows.tokens()) |slot, token| {
                 self.acceptToken(slot, sink, token);
             }
+        }
 
-            return true;
+        /// Count the fed chunk of `slot`. The last chunk ends the prefill. A turn then takes
+        /// `first`, the token that the engine sampled.
+        fn finishChunk(
+            self: *Self,
+            slot: *Slot,
+            chunk: usize,
+            first: ?u32,
+            sink: anytype,
+        ) void {
+            slot.fed += chunk;
+            if (slot.fed != slot.turn_tokens.len) return;
+
+            self.maybeInsertPrefix(slot);
+            switch (slot.kind) {
+                .opening => {
+                    self.emitOpened(slot, sink);
+                    self.endPrefill(slot, .idle, sink);
+                },
+                .append => {
+                    self.emitAppended(slot, sink);
+                    self.endPrefill(slot, .idle, sink);
+                },
+                .turn => {
+                    slot.t_prefill_end = Io.Clock.Timestamp.now(self.io, .awake);
+                    self.endPrefill(slot, .decode, sink);
+                    self.acceptToken(slot, sink, first.?);
+                },
+            }
         }
 
         /// One line per tick with the produced tokens, so the serve stream
@@ -2186,15 +1961,14 @@ pub fn Scheduler(comptime Engine: type, comptime CodecT: type) type {
 
         // -- shared turn machinery ------------------------------------------
 
-        /// Record one accepted token. An owed forced id replaces the sampled
-        /// one. Then the event goes out or parks, the turn decides whether it
-        /// stops, and the think block updates. The token itself is the
-        /// engine's pending token, and it stays uncommitted until the next step.
+        /// Record one accepted token. An owed forced id replaces the sampled one. The token is the
+        /// pending token of the engine, and it stays uncommitted until the next step.
         fn acceptToken(self: *Self, slot: *Slot, sink: anytype, sampled: u32) void {
             std.debug.assert(slot.state == .decode);
             std.debug.assert(slot.stop == null);
             std.debug.assert(slot.forced_head <= slot.forced_len);
 
+            // Take the token, and mark it in both id sets.
             const token = if (slot.forced_head < slot.forced_len) self.popForced(slot) else sampled;
             slot.generated += 1;
             slot.last_token = token;
@@ -2210,6 +1984,7 @@ pub fn Scheduler(comptime Engine: type, comptime CodecT: type) type {
                 );
             }
 
+            // The event goes out or parks before the stop decision.
             const channel = tokenChannel(slot.think_open, token, self.cfg.think.close_id);
             self.emitOrPark(
                 slot,
@@ -2222,6 +1997,8 @@ pub fn Scheduler(comptime Engine: type, comptime CodecT: type) type {
                     self.codec.piece(token),
                 ),
             );
+
+            // Decide the stop, then update the think block.
             if (token == self.cfg.eos_id) {
                 slot.stop = .eos;
             } else if (slot.generated >= slot.max_tokens_turn) {
@@ -2258,10 +2035,9 @@ pub fn Scheduler(comptime Engine: type, comptime CodecT: type) type {
             return id;
         }
 
-        /// The think bookkeeping. Inside the block, the close id closes it and
-        /// counts nothing. Every other id counts, and the count that reaches a
-        /// nonzero budget owes the forced ids. The close leads the forced ids,
-        /// so the count never passes the budget.
+        /// The think bookkeeping. The close id closes the block and counts nothing. Every other id
+        /// counts, and a count at a nonzero budget owes the forced ids. The close leads them, so
+        /// the count stays in the budget.
         fn acceptThink(self: *const Self, slot: *Slot, token: u32) void {
             if (!slot.think_open) return;
 
@@ -2295,6 +2071,7 @@ pub fn Scheduler(comptime Engine: type, comptime CodecT: type) type {
             std.debug.assert(tokens.len > 0);
             std.debug.assert(slot.state == .idle);
 
+            // Move the slot to prefill.
             log.debug(
                 "prefill: session {d}, {d} prompt tokens ({t}, budget {d})",
                 .{ slot.proto_id, tokens.len, kind, slot.max_tokens_turn },
@@ -2313,8 +2090,7 @@ pub fn Scheduler(comptime Engine: type, comptime CodecT: type) type {
                 slot.t_turn_start = Io.Clock.Timestamp.now(self.io, .awake);
             }
 
-            // An append neither restores nor inserts a prefix. Its rows follow
-            // a live session, so no cache entry keys them.
+            // An append takes no prefix. See "Prefix cache" in the header.
             if (kind == .append) return;
 
             if (comptime can_snapshot) {
@@ -2331,88 +2107,74 @@ pub fn Scheduler(comptime Engine: type, comptime CodecT: type) type {
             }
         }
 
-        /// Prefix-cache admission for a turn that starts at position zero:
-        /// restore the prefix the manager offers and prefill only the suffix.
-        /// The cache is best-effort. Any failure counts a miss and the cold
-        /// path proceeds untouched. A `ready` plan finishes the prefill with
-        /// zero forward rows, because the engine samples the first token from
-        /// the entry's stored logits (the regenerate case).
-        /// `prefix_manager.planRestore` states which plan each turn shape gets.
+        /// Prefix-cache admission for a turn that starts at position zero: restore the prefix that
+        /// the manager offers and prefill only the suffix. See "Prefix cache" in the header.
         fn tryRestorePrefix(self: *Self, slot: *Slot, sink: anytype) void {
             if (!self.prefix.enabled()) return;
             if (self.engine.posOf(slot.engine_id) != 0) return;
 
             slot.caches_prefix = true;
-            const tokens = slot.turn_tokens;
-            // The plan's slices are used inside this call only: the RAM list
-            // reallocates on later inserts.
-            switch (self.prefix.planRestore(tokens, slot.kind == .opening)) {
+            // The slices of the plan live inside this call only: later inserts reallocate the list.
+            switch (self.prefix.planRestore(slot.turn_tokens, slot.kind == .opening)) {
                 .miss => self.prefix.recordMiss(),
-                .ready => |hit| {
-                    // The engine samples the first token inside the restore, so
-                    // the prefix enters the context set before it. A failed
-                    // restore falls back to the cold path, which feeds the
-                    // same ids.
-                    self.markFed(slot, tokens[0..hit.n]);
-                    const first = self.engine.restoreReady(
-                        slot.engine_id,
-                        hit.n,
-                        hit.blob,
-                        hit.logits,
-                    ) catch |err| {
-                        log.debug(
-                            "prefix full restore failed: session {d}: {t}",
-                            .{ slot.proto_id, err },
-                        );
-                        self.prefix.recordMiss();
-                        return;
-                    };
-                    self.prefix.recordHit();
-                    // The exact entry already serves this prefix: nothing to insert.
-                    slot.caches_prefix = false;
-                    log.info(
-                        "prefix full hit: session {d} restored {d} prompt tokens, zero " ++
-                            "forward rows",
-                        .{ slot.proto_id, hit.n },
-                    );
-                    slot.t_prefill_end = Io.Clock.Timestamp.now(self.io, .awake);
-                    self.endPrefill(slot, .decode, sink);
-                    self.acceptToken(slot, sink, first);
-                },
-                .rows => |hit| {
-                    self.engine.restorePrefix(slot.engine_id, hit.n, hit.blob) catch |err| {
-                        log.debug(
-                            "prefix restore failed: session {d}: {t}",
-                            .{ slot.proto_id, err },
-                        );
-                        self.prefix.recordMiss();
-                        return;
-                    };
-                    self.markFed(slot, tokens[0..hit.n]);
-                    self.prefix.recordHit();
-                    slot.fed = hit.n;
-                    log.info(
-                        "prefix hit: session {d} restored {d} of {d} prompt tokens",
-                        .{ slot.proto_id, hit.n, tokens.len },
-                    );
-                    if (slot.fed == slot.turn_tokens.len) {
-                        // Only an opening turn can restore its whole prompt
-                        // through this path (the generate full hit is the
-                        // `ready` arm). Nothing new to insert.
-                        std.debug.assert(slot.kind == .opening);
-
-                        slot.caches_prefix = false;
-                        self.emitOrPark(slot, sink, .{
-                            .request_id = slot.request_id,
-                            .session_id = slot.proto_id,
-                            .body = .{
-                                .session_opened = .{ .kv_pos = self.engine.posOf(slot.engine_id) },
-                            },
-                        });
-                        self.endPrefill(slot, .idle, sink);
-                    }
-                },
+                .ready => |hit| self.restoreFull(slot, hit, sink),
+                .rows => |hit| self.restoreRows(slot, hit, sink),
             }
+        }
+
+        /// A full hit: restore the rows, and take the first token from the stored logits.
+        fn restoreFull(self: *Self, slot: *Slot, hit: PrefixHit, sink: anytype) void {
+            // The engine samples the first token inside the restore, so the prefix enters
+            // the context set first. The cold path of a failed restore feeds the same ids.
+            self.markFed(slot, slot.turn_tokens[0..hit.n]);
+            const first = self.engine.restoreReady(
+                slot.engine_id,
+                hit.n,
+                hit.blob,
+                hit.logits,
+            ) catch |err| {
+                log.debug(
+                    "prefix full restore failed: session {d}: {t}",
+                    .{ slot.proto_id, err },
+                );
+                self.prefix.recordMiss();
+                return;
+            };
+            self.prefix.recordHit();
+            // The exact entry already serves this prefix, so nothing inserts.
+            slot.caches_prefix = false;
+            log.info(
+                "prefix full hit: session {d} restored {d} prompt tokens, zero forward rows",
+                .{ slot.proto_id, hit.n },
+            );
+            slot.t_prefill_end = Io.Clock.Timestamp.now(self.io, .awake);
+            self.endPrefill(slot, .decode, sink);
+            self.acceptToken(slot, sink, first);
+        }
+
+        /// A partial hit: restore the rows, and leave the suffix to the prefill.
+        fn restoreRows(self: *Self, slot: *Slot, hit: PrefixHit, sink: anytype) void {
+            self.engine.restorePrefix(slot.engine_id, hit.n, hit.blob) catch |err| {
+                log.debug("prefix restore failed: session {d}: {t}", .{ slot.proto_id, err });
+                self.prefix.recordMiss();
+                return;
+            };
+            self.markFed(slot, slot.turn_tokens[0..hit.n]);
+            self.prefix.recordHit();
+            slot.fed = hit.n;
+            log.info(
+                "prefix hit: session {d} restored {d} of {d} prompt tokens",
+                .{ slot.proto_id, hit.n, slot.turn_tokens.len },
+            );
+            if (slot.fed != slot.turn_tokens.len) return;
+
+            // Only an opening restores its whole prompt here. A generate full hit is
+            // `restoreFull`. Nothing inserts.
+            std.debug.assert(slot.kind == .opening);
+
+            slot.caches_prefix = false;
+            self.emitOpened(slot, sink);
+            self.endPrefill(slot, .idle, sink);
         }
 
         /// Offer a completed position-zero prefix to the cache. The manager
@@ -2436,8 +2198,6 @@ pub fn Scheduler(comptime Engine: type, comptime CodecT: type) type {
         fn endPrefill(self: *Self, slot: *Slot, state: SlotState, sink: anytype) void {
             log.debug("prefill done: session {d} -> {t}", .{ slot.proto_id, state });
             self.gpa.free(slot.turn_tokens);
-            // done events report the turn's prompt size after the buffer is
-            // gone. Keep the count, drop the bytes.
             slot.turn_tokens = &.{};
             slot.state = state;
             // A turn reaches idle through its `done`, and an opening adds no
@@ -2502,10 +2262,9 @@ pub fn Scheduler(comptime Engine: type, comptime CodecT: type) type {
             }
         }
 
-        /// Send a parked event of `slot` before a reply that names the
-        /// session, so no reply overtakes it. A failed flush means a client
-        /// that sends requests and never reads, so the connection goes, the
-        /// rule of `reply`. Returns false after a disconnect.
+        /// Send a parked event of `slot` before a reply that names the session, so no reply
+        /// overtakes it. Returns false after a disconnect: a failed flush takes the rule of
+        /// `reply`.
         fn flushParked(self: *Self, slot: *Slot, sink: anytype) bool {
             _ = self;
             const ev = slot.pending_event orelse return true;
@@ -2589,7 +2348,7 @@ pub fn Scheduler(comptime Engine: type, comptime CodecT: type) type {
         // -- slot table -----------------------------------------------------
 
         /// A slot for a live open or clone. `yielded` names the detached
-        /// session that gave its slot up, or is 0 for a slot that was free.
+        /// session that gave its slot up, or is 0 for a free slot.
         const Taken = struct { slot: *Slot, yielded: u32 };
 
         /// The first free slot, else the detached slot that yields. A lease
@@ -2620,11 +2379,9 @@ pub fn Scheduler(comptime Engine: type, comptime CodecT: type) type {
             );
         }
 
-        /// A yield before an engine refusal loses the detached session. The
-        /// release must come first, because the engine has no free session
-        /// before it. The open itself cannot fail here, because the engine
-        /// holds one session for each slot. A clone on tiered KV can still
-        /// fail on residency.
+        /// A yield before an engine refusal loses the detached session. The release must come
+        /// first, because the engine has no free session before it. An open cannot fail then,
+        /// because the engine holds one session per slot. A clone on tiered KV can.
         fn yieldLost(self: *Self, taken: Taken, what: []const u8) void {
             if (taken.yielded == 0) return;
 
@@ -2718,8 +2475,8 @@ pub fn Scheduler(comptime Engine: type, comptime CodecT: type) type {
 
 // -- api --------------------------------------------------------------------
 
-/// Draw a lease token from the secure random source. A failure refuses the
-/// keep. The server never falls back to a weaker source.
+/// Draw a lease token from the secure random source. A failure refuses the keep or the resume. The
+/// server never falls back to a weaker source.
 pub fn drawToken(io: Io) error{EntropyUnavailable}!Token {
     var t: Token = undefined;
     io.randomSecure(&t) catch return error.EntropyUnavailable;
@@ -2736,7 +2493,7 @@ pub fn slotSetBytes(vocab_size: u32) u64 {
 
 /// The place of a turn at index `turns_done`. The first turn of a session
 /// takes the first-turn wrap, after a system prompt or with BOS. Later turns
-/// continue. A kept pair takes the place of the turn it was.
+/// continue. A kept pair takes the place of the turn that it replays.
 fn turnPlace(has_system_prompt: bool, turns_done: u32) chat.PairPlace {
     if (turns_done > 0) return .continuation;
     return if (has_system_prompt) .first_after_system else .open_first;
@@ -2815,15 +2572,15 @@ comptime {
     std.debug.assert(protocol.header_bytes + 2 + 2 + detail_max <= protocol.max_server_frame_bytes);
 }
 
-/// The refusal of a turn that does not fit. At the widest counts a usize and
-/// a u32 can hold, the text still fits the bound, so the fallback never runs.
+/// The refusal of a turn that does not fit. The text fits the bound at the widest usize and u32, so
+/// the fallback never runs.
 fn turnTooLongDetail(buf: *[detail_max]u8, tokens: usize, room: u32) []const u8 {
     return std.fmt.bufPrint(buf, protocol.turn_too_long_fmt, .{ tokens, room }) catch
         "turn does not fit the window";
 }
 
-/// The refusal of a system prompt that does not fit. A request frame holds at
-/// most 64 KiB, so the counts stay at six digits and the text fits the bound.
+/// The refusal of a system prompt that does not fit. A request frame holds at most 64 KiB, so the
+/// counts stay at six digits. The text then fits the bound.
 fn systemTooLongDetail(buf: *[detail_max]u8, tokens: usize, window: u32) []const u8 {
     return std.fmt.bufPrint(buf, protocol.system_too_long_fmt, .{ tokens, window }) catch
         "system prompt does not fit the window";
@@ -2831,28 +2588,25 @@ fn systemTooLongDetail(buf: *[detail_max]u8, tokens: usize, window: u32) []const
 
 // -- tests ------------------------------------------------------------------
 
+// Test fixtures. The tests drive the control unit against a real `Sessions` pool over a
+// canned-logits runner. The fake model chains `next = (token + 1) % 8`. The fake codec maps each
+// text byte to `byte % 8` with no template wrap, and eos_id is 7. So byte 6 stops on EOS at once,
+// and byte 'x' (120 -> 0) walks 1, 2, 3. A reader derives every expected stream by hand.
 //
-// The tests drive the control unit against a real `Sessions` pool over a
-// canned-logits runner. The fake model's chain is `next = (token + 1) % 8`
-// (see `TestRunner`). The fake codec maps each text byte to `byte % 8` with no
-// template wrap, and eos_id is 7. Feeding byte 6 therefore stops on EOS at
-// once, while byte 'x' (120 -> 0) walks 1, 2, 3, and so on. A reader derives
-// every expected stream below by hand.
+// `TestScheduler` runs over the plain pool. `ResScheduler` runs over the residency with three
+// logical sessions over two physical VRAM slots, so the third open forces an eviction. Three turns
+// at once (max_batch 2) make the scheduler swap the odd one out each tick. Two decoders that hold
+// both slots also reach the `NoEvictableSlot` park when a third turn wants to prefill. Every
+// stream must still walk the chain, because the residency keeps each carried pending token across
+// an eviction. `TestRunner.markers` stands in for KV content and the output ignores it, so a
+// correct stream proves the bookkeeping survives swaps. The GPU equivalence test proves the KV
+// bytes. The presence of `evictSlot` makes `Residency` able to evict.
 //
-// Three engine shapes appear. `TestScheduler` runs over the plain pool.
-// `ResScheduler` runs over the residency, over-subscribed: three logical
-// sessions over two physical VRAM slots, so opening the third forces an
-// eviction. Running all three at once (max_batch 2 < 3) makes the scheduler
-// swap the odd one out each tick. That also exercises the `NoEvictableSlot`
-// park path, where two decoders hold both slots and a third turn wants to
-// prefill. Every stream must still walk the fake's chain, because the
-// residency keeps each session's carried pending token across an eviction.
-//
-// `NoSnapScheduler` is the other side of the `can_snapshot` gate.
-// `Sessions(RunnerT).can_snapshot` reads `@hasDecl(RunnerT, "evictSlot")`, so
-// a runner without the swap surface compiles every prefix-cache path away.
-// `NoSnapRunner` is `TestRunner` minus that surface, and its test is the one
-// compiled instantiation that analyzes the guarded arms of the gate.
+// `NoSnapScheduler` is the other side of the `can_snapshot` gate. `Sessions(RunnerT).can_snapshot`
+// reads `@hasDecl(RunnerT, "evictSlot")`, so a runner without the swap surface compiles every
+// prefix-cache path away. `NoSnapRunner` is `TestRunner` minus that surface. Its test is the one
+// instantiation that analyzes the guarded arms.
+
 const Sessions = session_mod.Sessions;
 const Residency = @import("residency.zig").Residency;
 const StepRow = @import("../runtime/step_row.zig").StepRow;
@@ -2866,11 +2620,7 @@ const TestRunner = struct {
     logits: []f32,
     rows_log: [256]StepRow = undefined,
     rows_log_len: usize = 0,
-    // Tiered-KV boundary: a per-physical-slot marker stands in for KV content
-    // so a swap is observable. Output ignores it (logits are a function of the row's
-    // token), so a correct stream under over-subscription proves the residency
-    // BOOKKEEPING survives swaps. The GPU equivalence test proves the KV BYTES
-    // do. Presence of `evictSlot` is what makes `Residency` able to evict.
+    // One marker per physical slot. See "Test fixtures" below.
     markers: [limits.max_vram_slots]u32 = .{0} ** limits.max_vram_slots,
     evicts: u32 = 0,
     restores: u32 = 0,
@@ -2895,8 +2645,8 @@ const TestRunner = struct {
         test_fakes.writeCannedLogits(self.logits, rows);
     }
 
-    // The fake holds no per-slot state. The copy is a no-op. Present so
-    // `Sessions(TestRunner).can_clone` holds and handleClone is testable.
+    // The fake holds no per-slot state, so the copy is a no-op. It exists so that
+    // `Sessions(TestRunner).can_clone` holds and a test can reach `handleClone`.
     pub fn cloneSlotState(self: *TestRunner, source_slot: u32, target_slot: u32, pos: u32) void {
         _ = self;
         _ = source_slot;
@@ -2904,8 +2654,7 @@ const TestRunner = struct {
         _ = pos;
     }
 
-    // A fixed blob size, independent of the committed rows: this fake holds one
-    // marker per slot, so a budget stated here counts whole sessions.
+    // This fake holds one marker per slot, so a budget stated here counts whole sessions.
     pub fn evictSlotBytesFor(self: *const TestRunner, n_rows: u32) u64 {
         _ = self;
         _ = n_rows;
@@ -2946,8 +2695,7 @@ const NoSnapRunner = struct {
 
 const FakeCodec = struct {
     piece_table: [test_vocab][1]u8,
-    /// The turn kinds the scheduler asked for, in order, when a test reads
-    /// them.
+    /// The turn kinds that the scheduler asked for, in order, when a test reads them.
     kinds: ?*KindLog = null,
     /// The think switch of each render, in order, when a test reads it.
     opens: ?*OpenLog = null,
@@ -3146,6 +2894,7 @@ const Fixture = struct {
 
         const arena = arena_state.allocator();
 
+        // Build the runner, the engine, and the codec in the arena.
         const runner = try arena.create(TestRunner);
         runner.* = .{
             .n_slots = n_slots,
@@ -3157,6 +2906,8 @@ const Fixture = struct {
         engine.* = try TestEngine.init(arena, runner);
         const codec = try arena.create(FakeCodec);
         codec.* = FakeCodec.initFake();
+
+        // Build the scheduler and the sink.
         const sched = try arena.create(TestScheduler);
         sched.* = try TestScheduler.init(arena, gpa, std.testing.io, engine, codec, .{
             .max_sessions = @intCast(n_slots),
@@ -3173,6 +2924,7 @@ const Fixture = struct {
         });
         const sink = try arena.create(FakeSink);
         sink.* = .{};
+
         return .{
             .arena_state = arena_state,
             .runner = runner,
@@ -3271,9 +3023,8 @@ test "composed tick: a waiting turn's chunk rides the decode forward call" {
     _ = fx.sched.tick(fx.sink); // a: turn prefilled + first token; decoding
     try fx.generate(2, sb, "xxxx", 6); // b's 4-token turn arrives mid-decode
 
-    // One tick advances BOTH: b's chunk and a's decode row share one engine
-    // call. The row layout is [chunk row (no logits) | decode row (logits)],
-    // chunk width = max_batch - decode rows = 1.
+    // One tick advances BOTH: [chunk row (no logits) | decode row (logits)] in one engine call.
+    // The chunk width is max_batch - decode rows = 1.
     const rows_before = fx.runner.rows_log_len;
     const a_tokens_before = countTokens(fx.sink.seen(), sa);
     _ = fx.sched.tick(fx.sink);
@@ -3318,14 +3069,13 @@ test "decode at max_batch cannot starve a waiting turn: floor of one chunk row" 
     try std.testing.expectEqualSlices(u32, &.{ 1, 2, 3, 4, 5, 6 }, toks_b[0..6]);
 }
 
-test "explicit prefill_chunk widens a turn's chunk past max_batch, decoupled from the decode width" {
-    // n_slots 6 gives the runner room for a wide chunk. max_batch 2 is the decode
-    // width. prefill_chunk 4 makes the chunk 4 rows, TWICE max_batch, which proves
-    // the chunk width is the explicit budget and not the spare-decode-rows default.
+test "explicit prefill_chunk widens a chunk past max_batch, apart from the decode width" {
+    // Six slots give the runner room. The chunk of 4 rows is TWICE the decode width, so it is the
+    // explicit budget and not the spare rows.
     var fx = try Fixture.setUp(std.testing.allocator, 6, 64, 2);
     defer fx.tearDown();
 
-    fx.sched.cfg.prefill = .{ .fixed = 4 }; // the --prefill-chunk dial
+    fx.sched.cfg.prefill = .{ .fixed = 4 }; // the --prefill-chunk flag
 
     const sid = try fx.openSession(1, "a"); // 1-token system prompt prefilled on open
     try fx.generate(1, sid, "xxxxx", 6); // a 5-token prompt, one feeding turn
@@ -3352,8 +3102,8 @@ test "explicit prefill_chunk widens a turn's chunk past max_batch, decoupled fro
     try std.testing.expectEqual(true, c1[0].want_logits);
 
     fx.drain();
-    // 'x' % 8 = 0 -> the fake chain samples 1,2,3,4,5,6 (clear of eos 7). The wide
-    // chunk left the compact-logits readback and the stream exactly as the default.
+    // 'x' % 8 = 0, so the chain samples 1,2,3,4,5,6 (clear of eos 7). The wide chunk
+    // leaves the compact-logits readback and the stream of the default.
     const toks = tokenIds(fx.sink.seen(), sid);
     try std.testing.expectEqualSlices(u32, &.{ 1, 2, 3, 4, 5, 6 }, toks[0..6]);
 }
@@ -3399,7 +3149,7 @@ test "EOS stops the turn after emitting the EOS token, with no carry" {
     try std.testing.expectEqual(protocol.FinishReason.eos, done.ev.body.done.finish_reason);
     try std.testing.expectEqual(@as(u32, 1), done.ev.body.done.gen_tokens);
 
-    // EOS was never stepped. The next turn carries nothing.
+    // The engine never stepped EOS, so the next turn carries nothing.
     const rows_before = fx.runner.rows_log_len;
     try fx.generate(1, sid, "z", 1); // 'z'%8=2
     fx.drain();
@@ -3614,9 +3364,8 @@ test "a cancel after a natural stop keeps the natural finish reason" {
 
     const sid = try fx.openSession(1, "a");
     try fx.generate(1, sid, "x", 1);
-    // One tick feeds the one-token turn in one final chunk and samples token
-    // 1, which spends the budget of one. The tick sets the stop, and the done waits
-    // for the finalize at the start of the next tick.
+    // One tick feeds the turn in one final chunk and samples token 1, which spends the budget.
+    // The tick sets the stop, and the done waits for the finalize of the next tick.
     _ = fx.sched.tick(fx.sink);
     const slot = &fx.sched.slots[0];
     try std.testing.expectEqual(SlotState.decode, slot.state);
@@ -3830,8 +3579,8 @@ test "over-subscription: three logical sessions over two VRAM slots stream corre
 
     try std.testing.expect(runner.evicts >= 1);
 
-    // All three generate at once: three decoders, two slots. The scheduler
-    // round-robins and swaps. Each stream is byte 'x' (=0) -> 1,2,3,4,5,6.
+    // Three decoders over two slots: the scheduler round-robins and swaps.
+    // Each stream is byte 'x' (=0) -> 1,2,3,4,5,6.
     for (0..3) |k| {
         const dup = try gpa.dupe(u8, "x");
         _ = sched.handle(
@@ -3860,10 +3609,12 @@ test "over-subscription: three logical sessions over two VRAM slots stream corre
     // Close each session so the residency frees its gpa-owned eviction blob
     // (in production releaseSlot does this on session_close/conn_closed).
     for (sids, 0..) |sid, k| {
-        _ = sched.handle(
-            .{ .conn = @intCast(k + 1), .request_id = 0, .session_id = sid, .body = .session_close },
-            &sink,
-        );
+        _ = sched.handle(.{
+            .conn = @intCast(k + 1),
+            .request_id = 0,
+            .session_id = sid,
+            .body = .session_close,
+        }, &sink);
     }
 }
 
@@ -3874,9 +3625,8 @@ test "over-subscription: slots decoupled from the decode width, 12 logical / 6 s
 
     const arena = arena_state.allocator();
 
-    // Six physical slots but a decode width of two: breadth past the batch,
-    // the shape the slot/width decoupling buys. Twelve logical sessions
-    // over-subscribe the six slots, so the run also swaps.
+    // Six physical slots with a decode width of two: breadth past the batch.
+    // Twelve logical sessions over-subscribe the six slots, so the run also swaps.
     var runner: TestRunner = .{
         .n_slots = 6,
         .max_seq = 64,
@@ -3943,10 +3693,12 @@ test "over-subscription: slots decoupled from the decode width, 12 logical / 6 s
     try std.testing.expect(runner.restores >= 6); // the evicted six decoded again
 
     for (sids, 0..) |sid, k| {
-        _ = sched.handle(
-            .{ .conn = @intCast(k + 1), .request_id = 0, .session_id = sid, .body = .session_close },
-            &sink,
-        );
+        _ = sched.handle(.{
+            .conn = @intCast(k + 1),
+            .request_id = 0,
+            .session_id = sid,
+            .body = .session_close,
+        }, &sink);
     }
 }
 
@@ -4001,9 +3753,8 @@ test "over-subscription: a ram budget of one blob parks a prefill, and the loop 
     // The third session spent the whole budget on the first session's blob.
     try std.testing.expectEqual(@as(u32, 1), runner.evicts);
 
-    // The two resident sessions ask first, so the evicted one is the turn that
-    // has to wait. No tick can admit its prefill, because the swap holds the
-    // victim's blob beside its own and the budget refuses that.
+    // The evicted session asks last. No tick can admit its prefill. The swap holds the blob of the
+    // victim beside its own, and the budget refuses that.
     for ([_]usize{ 1, 2, 0 }) |k| {
         const dup = try gpa.dupe(u8, "x");
         _ = sched.handle(
@@ -4036,10 +3787,12 @@ test "over-subscription: a ram budget of one blob parks a prefill, and the loop 
     // Closing the two finished sessions frees their slots, so the parked turn
     // needs no eviction at all. The tick loop then drains.
     for ([_]usize{ 1, 2 }) |k| {
-        _ = sched.handle(
-            .{ .conn = @intCast(k + 1), .request_id = 0, .session_id = sids[k], .body = .session_close },
-            &sink,
-        );
+        _ = sched.handle(.{
+            .conn = @intCast(k + 1),
+            .request_id = 0,
+            .session_id = sids[k],
+            .body = .session_close,
+        }, &sink);
     }
 
     iters = 0;
@@ -4062,9 +3815,8 @@ test "prefix cache: a repeated system prompt restores with zero engine rows" {
     var fx = try Fixture.setUpPrefix(std.testing.allocator, 2, 64, null, 1 << 20);
     defer fx.tearDown();
 
-    // The cold open pays the opening prefill and offers the prefix. The
-    // measured admission gate compares a multi-tick prefill against a
-    // four-byte snapshot copy, so it admits.
+    // The cold open offers the prefix. The measured admission gate compares a
+    // multi-tick prefill against a four-byte snapshot copy, so it admits.
     const sa = try fx.openSession(1, "abcdefab");
     try std.testing.expectEqual(@as(u64, 0), fx.sched.prefix.hits);
     try std.testing.expectEqual(@as(u64, 1), fx.sched.prefix.misses);
@@ -4123,10 +3875,8 @@ test "prefix cache: a generate turn restores the longest prefix and feeds only t
     const toks_b = tokenIds(fx.sink.seen(), sb);
     try std.testing.expectEqualSlices(u32, &.{ 1, 2 }, toks_b[0..2]);
 
-    // An exact duplicate is a FULL hit (the regenerate case): the 5-token
-    // generate entry stored its final-row logits, so the engine restores the
-    // rows and samples the first token from the store. Zero forward rows,
-    // and the stream equals the cold path's.
+    // An exact duplicate is a FULL hit (the regenerate case): the engine restores the rows and
+    // samples the first token from the stored logits. No forward row, and the same stream.
     _ = fx.sched.handle(
         .{ .conn = 2, .request_id = 3, .session_id = sb, .body = .session_close },
         fx.sink,
@@ -4144,12 +3894,10 @@ test "prefix cache: a generate turn restores the longest prefix and feeds only t
 }
 
 test "prefix cache: a stateless multi-turn ladder climbs the cached boundaries" {
-    // The OpenAI connector maps every chat request to an ephemeral session:
-    // open(""), one generate carrying the whole rendered history, close.
-    // Request k+1's tokens extend request k's, so each request restores the
-    // previous request's entry and prefills only its new turn. Nothing here
-    // depends on a system prompt: the eligibility predicate is position zero,
-    // and the cache keys on token ids alone.
+    // The OpenAI frontend maps each chat request to an ephemeral session: open(""), one generate
+    // with the whole rendered history, close. So each request restores the entry of the previous
+    // request and prefills only its new turn. The eligibility predicate is position zero, and the
+    // cache keys on token ids alone.
     var fx = try Fixture.setUpPrefix(std.testing.allocator, 3, 64, null, 1 << 20);
     defer fx.tearDown();
 
@@ -4165,9 +3913,8 @@ test "prefix cache: a stateless multi-turn ladder climbs the cached boundaries" 
         fx.sink,
     );
 
-    // Request 2 extends request 1: [1,2,3,4,5]. The 3-token boundary serves
-    // it, so the fed rows start at position 3, and its own completion adds
-    // the 5-token boundary.
+    // Request 2 extends request 1: [1,2,3,4,5]. The fed rows start at position 3,
+    // and its own completion adds the 5-token boundary.
     const s2 = try fx.openSession(2, "");
     var rows_before = fx.runner.rows_log_len;
     try fx.generate(2, s2, "abcde", 1);
@@ -4196,10 +3943,8 @@ test "prefix cache: a stateless multi-turn ladder climbs the cached boundaries" 
 }
 
 test "prefix cache: the disk tier survives a scheduler restart" {
-    // The prefix-persistence rule: boot one inserts an opening boundary in RAM
-    // and on disk. Boot two brings up a fresh scheduler, engine, and cache over
-    // the same directory. It indexes the file at init and serves the same open
-    // from the promoted entry with zero engine rows.
+    // Boot one inserts an opening boundary in RAM and on disk. Boot two indexes the same directory
+    // at init and serves the same open with zero engine rows.
     const gpa = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -4251,8 +3996,7 @@ test "prefix cache: preload warms the cache at boot" {
         try std.testing.expectEqual(SlotState.free, s.state);
     }
 
-    // The first client's open with the same text restores with zero engine
-    // rows, which is the whole point of the flag.
+    // The first open of a client with the same text restores with zero engine rows.
     const rows_before = fx.runner.rows_log_len;
     _ = try fx.openSession(1, "abcdefab");
     try std.testing.expectEqual(rows_before, fx.runner.rows_log_len);
@@ -4322,10 +4066,9 @@ test "scheduler: an engine that cannot snapshot serves without a cache" {
     try std.testing.expectEqual(@as(u64, 0), sched.prefix.inserts);
 }
 
-// The think tests run the fake chain with the tags of a fake vocab.
-// `<think>` is 2, `</think>` is 3, and a spent budget forces 3 then 0. A reader
-// derives each stream by hand. The prompt "4" feeds the one token 4, so the
-// first token is 5, and it lands inside the block when the turn opens.
+// The think tests run the fake chain with the tags of a fake vocab. `<think>` is 2, `</think>` is
+// 3, and a spent budget forces 3 then 0. A reader derives each stream by hand. The prompt "4" feeds
+// the one token 4, so the first token is 5. It lands inside the block when the turn opens.
 
 const Client = @import("client.zig").Client;
 
@@ -4399,12 +4142,9 @@ const ThinkCase = struct {
     reasoning: u32 = 0,
 };
 
-/// Run one turn and check the events, the finish reason, the count, and the
-/// rows the model stepped. The model steps the fed ids, then every accepted
-/// token but the last. A forced id therefore shows in the rows as well as in
-/// the events. The events alone cannot prove the budget case. A model that
-/// steps the sampled 7 in place of the forced 3 samples 0 next, the same id
-/// the queue forces.
+/// Run one turn and check the events, the finish reason, the count, and the stepped rows. The rows
+/// prove the budget case. A model that steps the sampled 7 in place of the forced 3 samples 0 next.
+/// The queue forces the same id, so the events alone cannot show it.
 fn expectThinkTurn(fx: *Fixture, sid: u32, c: ThinkCase) !void {
     const rows_before = fx.runner.rows_log_len;
     const turn = try runTurn(fx, 1, sid, c.prompt, c.max_tokens);
@@ -4446,8 +4186,7 @@ test "think budget: the budget forces the close, and the model steps the forced 
     const sid = try fx.openSession(1, "");
 
     // 5 and 6 spend the budget of two, so 3 and 0 replace the sampled 7 and 4.
-    // The channels: the forced close is a close tag, and the
-    // later sampled 3 is content because the block is closed.
+    // The forced close is a close tag. The later sampled 3 is content, because the block is closed.
     try expectThinkTurn(&fx, sid, .{
         .open = true,
         .prompt = "4",
@@ -4484,8 +4223,7 @@ test "think budget: a close before the budget leaves the unbounded stream" {
         defer fx.tearDown();
 
         const sid = try fx.openSession(1, "");
-        // A sampled 2 inside the block is reasoning, although it
-        // equals the open id.
+        // A sampled 2 inside the block is reasoning, although it equals the open id.
         try expectThinkTurn(&fx, sid, .{
             .open = true,
             .prompt = "1",
@@ -4532,8 +4270,7 @@ test "think budget: the cap lands inside the forced ids, and the next turn owes 
 
     const sid = try fx.openSession(1, "");
 
-    // The forced 3 is the third token, so the cap of three stops the turn
-    // with the forced 0 still owed.
+    // The forced 3 is the third token, so the cap of three leaves the forced 0 owed.
     try expectThinkTurn(&fx, sid, .{
         .open = true,
         .prompt = "4",
@@ -4616,8 +4353,7 @@ test "think echo: a parked echo holds the prefill and skips the prefix restore" 
     var fx = try Fixture.setUpThink(std.testing.allocator, 64, 1 << 20, tags);
     defer fx.tearDown();
 
-    // A cold turn caches its prompt, so the same prompt on a new session is a
-    // full hit when nothing blocks it.
+    // A cold turn caches its prompt, so the same prompt on a new session is a full hit.
     const sa = try fx.openSession(1, "");
     const a = try runTurn(&fx, 1, sa, "44444", 8);
     try std.testing.expectEqualSlices(u32, &.{ 2, 5, 6, 7 }, a.tokens());
@@ -5036,6 +4772,7 @@ test "hello: the think mode, the budget, and the card sampling of the model" {
     var fx = try Fixture.setUp(std.testing.allocator, 1, 64, null);
     defer fx.tearDown();
 
+    // A model with no tags reports none, the greedy default, and no resumption.
     var ack = fx.sched.helloAck(
         .{ .conn = 1, .request_id = 1, .session_id = 0, .body = .hello },
     ).body.hello_ack;
@@ -5047,6 +4784,7 @@ test "hello: the think mode, the budget, and the card sampling of the model" {
     var think = try Fixture.setUpThink(std.testing.allocator, 64, 0, think_tags);
     defer think.tearDown();
 
+    // A model with tags reports its mode, its budget, and its card.
     const card: protocol.Sampling = .{
         .temperature = 1,
         .top_k = 20,
@@ -5074,6 +4812,8 @@ test "hello: the think mode, the budget, and the card sampling of the model" {
     try std.testing.expectEqual(card, ack.recommended_think);
     try std.testing.expectEqual(plain, ack.recommended_plain);
     try std.testing.expectEqual(@as(u32, 60_000), ack.resume_ttl_max_ms);
+
+    // A closed default reports off.
     think.sched.cfg.think.open_default = false;
     ack = think.sched.helloAck(
         .{ .conn = 1, .request_id = 1, .session_id = 0, .body = .hello },
@@ -5086,8 +4826,8 @@ test "presence penalty: the set counts this completion only" {
     defer fx.tearDown();
 
     const sid = try fx.openSession(1, "a");
-    // A negative penalty favors the ids already drawn. The canned logits put
-    // 1 on the next id and 0 elsewhere, so a drawn id at 0 + 2 wins.
+    // A negative penalty favors the ids already drawn. The canned logits put 1 on the next id and 0
+    // elsewhere. So a drawn id at 0 + 2 wins.
     var s = protocol.Sampling.greedy;
     s.presence_penalty = -2;
     const dup = try std.testing.allocator.dupe(u8, "x");
@@ -5447,10 +5187,12 @@ fn checkLease(c: LeaseCase) !void {
                 fx.sched.resumeLease(s.conn, s.request, tok(s.token), atMs(s.at), tok(s.fresh)),
             ),
             .close => |s| {
-                _ = fx.sched.handle(
-                    .{ .conn = s.conn, .request_id = 5, .session_id = s.sid, .body = .session_close },
-                    fx.sink,
-                );
+                _ = fx.sched.handle(.{
+                    .conn = s.conn,
+                    .request_id = 5,
+                    .session_id = s.sid,
+                    .body = .session_close,
+                }, fx.sink);
                 if (s.refused) {
                     try std.testing.expectEqual(
                         protocol.ErrorCode.unknown_session,
@@ -5490,6 +5232,66 @@ const view_attached_1_plain: SlotView = .{
     .ttl = 0,
 };
 
+/// Slot 1 after a live open took it from a detached session.
+const view_yield_taken: SlotView = .{
+    .owner = .{ .attached = 2 },
+    .pid = 5,
+    .token = null,
+    .ttl = 0,
+};
+const view_detached_30: SlotView = .{
+    .owner = .{ .detached = 30 },
+    .pid = 1,
+    .token = 5,
+    .ttl = 30,
+};
+const view_attached_9: SlotView = .{
+    .owner = .{ .attached = 9 },
+    .pid = 3,
+    .token = null,
+    .ttl = 0,
+};
+const view_detached_20: SlotView = .{
+    .owner = .{ .detached = 20 },
+    .pid = 4,
+    .token = 7,
+    .ttl = 20,
+};
+const view_clamped: SlotView = .{
+    .owner = .{ .attached = 1 },
+    .pid = 1,
+    .token = 7,
+    .ttl = 100,
+};
+
+/// The resume of `detached_anchor` before its deadline.
+const resume_before_deadline: LeaseStep = .{ .resumed = .{
+    .conn = 2,
+    .request = 5,
+    .token = 7,
+    .at = 59,
+    .fresh = 8,
+    .sid = 1,
+} };
+
+/// The resume of `detached_anchor` at its deadline.
+const resume_at_deadline: LeaseStep = .{ .no_such_lease = .{
+    .conn = 2,
+    .request = 5,
+    .token = 7,
+    .at = 60,
+    .fresh = 8,
+} };
+
+/// A replay of token 7 after `resume_before_deadline`.
+const resume_replayed: LeaseStep = .{ .no_such_lease = .{
+    .conn = 3,
+    .request = 6,
+    .token = 7,
+    .at = 59,
+    .fresh = 9,
+} };
+
 /// Open on connection 1, keep with 50 and token 7, drop at 10.
 const detached_anchor = [_]LeaseStep{
     .{ .open = .{ .conn = 1, .sid = 1 } },
@@ -5505,7 +5307,7 @@ test "lease anchors: the deadline, the token, the takeover order, the share, and
             .n_slots = 2,
             .share = 2,
             .steps = &(detached_anchor ++ [_]LeaseStep{
-                .{ .resumed = .{ .conn = 2, .request = 5, .token = 7, .at = 59, .fresh = 8, .sid = 1 } },
+                resume_before_deadline,
                 .{ .view = .{ .slot = 0, .want = view_attached_2_resumed } },
             }),
         },
@@ -5516,7 +5318,7 @@ test "lease anchors: the deadline, the token, the takeover order, the share, and
             .steps = &(detached_anchor ++ [_]LeaseStep{
                 .{ .expire = 59 },
                 .{ .view = .{ .slot = 0, .want = view_detached_60 } },
-                .{ .no_such_lease = .{ .conn = 2, .request = 5, .token = 7, .at = 60, .fresh = 8 } },
+                resume_at_deadline,
                 .{ .view = .{ .slot = 0, .want = free_view } },
                 .{ .counts = .{ .expires = 1, .yields = 0 } },
             }),
@@ -5526,8 +5328,8 @@ test "lease anchors: the deadline, the token, the takeover order, the share, and
             .n_slots = 2,
             .share = 2,
             .steps = &(detached_anchor ++ [_]LeaseStep{
-                .{ .resumed = .{ .conn = 2, .request = 5, .token = 7, .at = 59, .fresh = 8, .sid = 1 } },
-                .{ .no_such_lease = .{ .conn = 3, .request = 6, .token = 7, .at = 59, .fresh = 9 } },
+                resume_before_deadline,
+                resume_replayed,
                 .{ .view = .{ .slot = 0, .want = view_attached_2_resumed } },
             }),
         },
@@ -5548,10 +5350,10 @@ test "lease anchors: the deadline, the token, the takeover order, the share, and
                 .{ .detach = .{ .conn = 1, .at = 0 } },
                 .{ .pin = 5 },
                 .{ .open = .{ .conn = 2, .sid = 5 } },
-                .{ .view = .{ .slot = 1, .want = .{ .owner = .{ .attached = 2 }, .pid = 5, .token = null, .ttl = 0 } } },
-                .{ .view = .{ .slot = 0, .want = .{ .owner = .{ .detached = 30 }, .pid = 1, .token = 5, .ttl = 30 } } },
-                .{ .view = .{ .slot = 2, .want = .{ .owner = .{ .attached = 9 }, .pid = 3, .token = null, .ttl = 0 } } },
-                .{ .view = .{ .slot = 3, .want = .{ .owner = .{ .detached = 20 }, .pid = 4, .token = 7, .ttl = 20 } } },
+                .{ .view = .{ .slot = 1, .want = view_yield_taken } },
+                .{ .view = .{ .slot = 0, .want = view_detached_30 } },
+                .{ .view = .{ .slot = 2, .want = view_attached_9 } },
+                .{ .view = .{ .slot = 3, .want = view_detached_20 } },
                 .{ .counts = .{ .expires = 0, .yields = 1 } },
             },
         },
@@ -5599,7 +5401,7 @@ test "lease anchors: the deadline, the token, the takeover order, the share, and
                 .{ .keep = .{ .sid = 1, .conn = 1, .ttl = 0, .token = 9, .granted = 0 } },
                 .{ .view = .{ .slot = 0, .want = view_attached_1_plain } },
                 .{ .keep = .{ .sid = 1, .conn = 1, .ttl = 500, .token = 7, .granted = 100 } },
-                .{ .view = .{ .slot = 0, .want = .{ .owner = .{ .attached = 1 }, .pid = 1, .token = 7, .ttl = 100 } } },
+                .{ .view = .{ .slot = 0, .want = view_clamped } },
                 // A dropped lease returns the session to the sweep rule.
                 .{ .keep = .{ .sid = 1, .conn = 1, .ttl = 0, .token = 9, .granted = 0 } },
                 .{ .detach = .{ .conn = 1, .at = 10 } },
@@ -5673,8 +5475,8 @@ test "lease: the three keep refusals each take their own path" {
         viewOf(&fx.sched.slots[0]),
     );
 
-    // Resumption off: the keep is refused, the lease does not change, and the
-    // drop frees the session as before.
+    // Resumption off: the keep is refused, the lease does not change, and the drop frees the
+    // session.
     var off = try Fixture.setUp(std.testing.allocator, 2, 64, null);
     defer off.tearDown();
 
@@ -5901,7 +5703,7 @@ test "lease: a yield cancels an opening prefill in flight before it releases the
     try std.testing.expectEqual(@as(u32, 0), fx.engine.posOf(slot.engine_id));
 }
 
-test "lease: an expiry at the tick head cancels an append prefill in flight before it releases the slot" {
+test "lease: an expiry at the tick head cancels an append prefill before the release" {
     var fx = try leaseFixture(1, 1);
     defer fx.tearDown();
 
@@ -5967,7 +5769,7 @@ fn appendInFlight(fx: *Fixture) !u32 {
     return sid;
 }
 
-test "lease: a waiting resume refuses each request, ends at the idle transition, and the next request streams" {
+test "lease: a waiting resume refuses each request, ends at idle, and the next one streams" {
     var fx = try leaseFixture(2, 2);
     defer fx.tearDown();
 
@@ -6050,6 +5852,7 @@ test "lease: a takeover mid-turn cuts the turn, keeps the carry, and the old tok
         _ = fx.sched.tick(fx.sink);
     }
 
+    // The resume waits for the stop of the cut turn, and a cancel on it is busy.
     const r = try fx.sched.resumeLease(2, 5, tok(7), atMs(5), tok(8));
     try std.testing.expectEqual(Resumed{ .session_id = sid, .ready = false }, r);
     try std.testing.expectEqual(protocol.ErrorCode.session_busy, refusalOf(&fx, 2, sid, .cancel));
@@ -6077,6 +5880,7 @@ test "lease: a takeover mid-turn cuts the turn, keeps the carry, and the old tok
         fx.sched.resumeLease(3, 6, tok(7), atMs(6), tok(9)),
     );
 
+    // The next turn feeds the carry first.
     const rows_before = fx.runner.rows_log_len;
     try fx.generate(2, sid, "z", 1);
     fx.drain();
@@ -6211,8 +6015,7 @@ test "lease: a token that a slot already holds is refused in every build mode" {
     );
 }
 
-/// `TestEngine` with a switch that refuses each create and clone, the way a
-/// full pool or a tiered KV refusal does.
+/// `TestEngine` with a switch that refuses each create and clone, as a full pool or tiered KV can.
 const RefusingEngine = struct {
     inner: TestEngine,
     refuse: bool = false,
@@ -6274,8 +6077,7 @@ const RefusingEngine = struct {
 
 const RefusingScheduler = Scheduler(RefusingEngine, FakeCodec);
 
-/// A table of `n_slots` over the refusing engine, resumption on, the clock at
-/// zero, and a detached session in the last slot.
+/// A table of `n_slots` over the refusing engine, with resumption on and the clock at zero.
 const RefusingFixture = struct {
     arena_state: std.heap.ArenaAllocator,
     engine: *RefusingEngine,
@@ -6589,8 +6391,9 @@ test "per-turn budget: a request budget forces the close at its count, not at th
         .reasoning = 2,
     });
 
+    const want_budget_3 = [_]u32{ 2, 4, 5, 6, 3, 0, 1, 2, 3, 4, 5, 6, 7 };
     const cases = [_]struct { budget: u32, want: []const u32, reasoning: u32, open_after: bool }{
-        .{ .budget = 3, .want = &.{ 2, 4, 5, 6, 3, 0, 1, 2, 3, 4, 5, 6, 7 }, .reasoning = 3, .open_after = false },
+        .{ .budget = 3, .want = &want_budget_3, .reasoning = 3, .open_after = false },
         .{ .budget = 0, .want = &.{ 2, 4, 5, 6, 7 }, .reasoning = 4, .open_after = true },
     };
     for (cases) |c| {
@@ -6647,7 +6450,7 @@ test "per-turn switch: the render and the slot read the one resolved value" {
     try std.testing.expectEqual(cases.len, opens.n);
 }
 
-test "per-turn guards: a budget or an open switch on a model with no tags is refused, a closed switch passes" {
+test "per-turn guards: a budget or an open switch needs tags, a closed switch passes" {
     var fx = try Fixture.setUp(std.testing.allocator, 1, 64, null);
     defer fx.tearDown();
 
@@ -6688,7 +6491,7 @@ fn generateSampled(
     } } }, fx.sink);
 }
 
-test "per-turn sampling: only the reseed bit restarts the stream, and min_p and repetition reach the sampler" {
+test "per-turn sampling: only reseed restarts the stream, min_p and repetition land" {
     var fx = try Fixture.setUp(std.testing.allocator, 1, 64, null);
     defer fx.tearDown();
 
@@ -6752,7 +6555,7 @@ test "per-turn sampling: a refused turn leaves the params and the stream of the 
     try std.testing.expectEqual(params.min_p, fx.engine.table[eid].params.min_p);
 }
 
-test "frequency penalty: a nonzero value fails the request, and the connection and the session live" {
+test "frequency penalty: a nonzero value fails the request, and the session lives" {
     var fx = try Fixture.setUp(std.testing.allocator, 2, 64, null);
     defer fx.tearDown();
 
@@ -6794,7 +6597,7 @@ test "wire lease: a close on a waiting resume is busy, and the close after the r
     try std.testing.expectEqual(SlotState.free, fx.sched.slots[0].state);
 }
 
-test "wire lease: a resume whose connection drops before the reply strands the lease until its time to live" {
+test "wire lease: a drop before the resume reply strands the lease until its time to live" {
     var fx = try leaseFixture(2, 2);
     defer fx.tearDown();
 
@@ -6853,18 +6656,15 @@ const trace_ttl_max_ms = 100;
 const SessionModel = struct {
     /// The connection that owns the session, or null when it is detached.
     conn: ?u32 = null,
-    /// The token that a client holds. Null while a resume waits for its reply
-    /// and after the lease ends.
+    /// The token that a client holds. Null while a resume waits, and after the lease ends.
     token: ?Token = null,
     ttl_ms: u32 = 0,
     deadline: ?i64 = null,
     pending_resume: bool = false,
     gone: bool = false,
-    /// The `session_opened` reply came. A request can name a session by a
-    /// guessed id while its opening prefill still runs.
+    /// The `session_opened` reply came. A guessed id can name a session in its opening prefill.
     opened: bool = false,
-    /// The count of open requests at the detach. A later open can take the
-    /// slot of a detached session, so the model cannot tell which one yields.
+    /// Open requests at the detach. A later open can take the slot, so the model cannot tell.
     opens_at_detach: u32 = 0,
     /// The `kv_pos` of the last `resumed` reply.
     last_pos: u64 = 0,
@@ -6884,8 +6684,7 @@ const LeaseTrace = struct {
     n_sids: usize = 0,
     /// The connection of each request, to name the owner of an opened session.
     req_conn: [trace_steps]u32 = @splat(0),
-    /// An open holds a slot of its connection until its prefill ends in
-    /// `session_opened`, so it counts against the share before the event.
+    /// An open holds a slot until its `session_opened`, so it counts against the share.
     open_pending: [trace_steps]bool = @splat(false),
     n_opens: u32 = 0,
     /// The session that a resume with a live token must reach.
@@ -6916,11 +6715,11 @@ const LeaseTrace = struct {
         unreachable;
     }
 
-    /// A resume of `token` from `conn`. A full share refuses first, then an
-    /// unknown, replayed, or expired token. Any other token reaches its own
-    /// session and rotates. The reply is checked here when it is immediate
-    /// and in `absorbEvents` when it waits for the idle transition.
+    /// A resume of `token` from `conn`. A full share refuses first, then an unknown, replayed, or
+    /// expired token. Any other token reaches its session and rotates. `absorbEvents` checks a
+    /// reply that waits.
     fn resumeWith(t: *LeaseTrace, conn: u32, token: Token) !void {
+        // Predict the answer from the model alone.
         var attached: usize = 0;
         var found: ?u32 = null;
         for (t.sids[0..t.n_sids], t.models[0..t.n_sids]) |sid, *m| {
@@ -6943,6 +6742,8 @@ const LeaseTrace = struct {
         }
 
         const full = attached >= t.fx.sched.cfg.sessions_per_connection;
+
+        // Send the resume, and check any immediate reply.
         t.request(conn, 0, .{ .session_resume = .{ .token = token } });
         var replies: usize = 0;
         for (t.fx.sink.seen()) |e| {
@@ -6974,6 +6775,7 @@ const LeaseTrace = struct {
             return;
         }
 
+        // Record the rotation. The new token reaches the model with the `resumed` reply.
         try std.testing.expect(replies <= 1);
         const m = t.modelOf(found.?);
         m.conn = conn;
@@ -7035,9 +6837,7 @@ const LeaseTrace = struct {
 
                     const m = t.modelOf(e.ev.session_id);
                     if (!m.opened) {
-                        // The close hit a session in its opening prefill. That
-                        // open is one pending open of the connection, and its
-                        // `session_opened` never comes.
+                        // The close hit an opening prefill, so its `session_opened` never comes.
                         const used = t.next_request - trace_request_base;
                         for (t.open_pending[0..used], t.req_conn[0..used]) |*pending, c| {
                             if (pending.* and c == t.req_conn[rid - trace_request_base]) {
@@ -7167,9 +6967,10 @@ const LeaseTrace = struct {
         }
     }
 
-    /// A drop detaches each kept session of `conn` with a deadline of its
-    /// time to live after now, and frees each other session of `conn`.
+    /// A drop detaches each kept session of `conn`, with a deadline of its time to live after the
+    /// clock. It frees each other session of `conn`.
     fn drop(t: *LeaseTrace, k: usize) !void {
+        // Record what each slot of the connection holds.
         const conn = t.conns[k];
         const slots = t.fx.sched.slots;
         var kept: [limits.max_vram_slots]?u32 = @splat(null);
@@ -7181,8 +6982,8 @@ const LeaseTrace = struct {
             kept[i] = if (slot.lease) |l| l.ttl_ms else 0;
         }
 
+        // Drop the connection. A session without a lease frees, even in its opening prefill.
         t.request(conn, 0, .conn_closed);
-        // A session without a lease frees at the drop, even in its opening prefill.
         const requests = t.next_request - trace_request_base;
         for (t.open_pending[0..requests], t.req_conn[0..requests]) |*pending, c| {
             if (c == conn) {
@@ -7190,12 +6991,11 @@ const LeaseTrace = struct {
             }
         }
 
+        // Update the model. A waiting resume dies with its connection and its new token. The lease
+        // still runs, and a token that the client holds stays valid.
         for (t.models[0..t.n_sids]) |*m| {
             if (m.gone or m.conn == null or m.conn.? != conn) continue;
 
-            // A waiting resume dies with its connection, so its new token never
-            // reaches a client. The lease still runs. A token that the client
-            // holds stays valid.
             const has_lease = m.token != null or m.pending_resume;
             m.conn = null;
             m.pending_resume = false;
@@ -7207,6 +7007,7 @@ const LeaseTrace = struct {
             }
         }
 
+        // Each kept slot detached at its deadline, and every other slot is free.
         for (slots, 0..) |*slot, i| {
             const ttl = kept[i] orelse continue;
             if (ttl == 0) {
@@ -7220,15 +7021,15 @@ const LeaseTrace = struct {
             }
         }
 
+        // A dropped connection id never returns.
         t.conns[k] = t.next_conn;
         t.next_conn += 1;
     }
 };
 
-/// A random wire trace keeps the lease table and the streams sound: the live
-/// sessions fit the slots and the shares, no token sits on two slots, no
-/// token event follows a finish, and every lease ends within its time to
-/// live plus one tick.
+/// A random wire trace keeps the lease table and the streams sound. Live sessions fit the slots and
+/// the shares. No token sits on two slots, and no token event follows a finish. Every lease ends
+/// within its time to live plus one tick.
 fn checkLeaseTrace(_: void, seed: u64) anyerror!void {
     var prng = std.Random.DefaultPrng.init(seed);
     const r = prng.random();
@@ -7240,13 +7041,13 @@ fn checkLeaseTrace(_: void, seed: u64) anyerror!void {
 
     const gpa = std.testing.allocator;
 
+    // Run one random step, a few ticks, and the checks.
     for (0..trace_steps) |_| {
         switch (r.uintLessThan(u8, 9)) {
-            0 => t.request(
-                t.pickConn(r),
-                0,
-                .{ .session_open = .{ .sampling = protocol.Sampling.greedy, .system_prompt = try gpa.dupe(u8, "s") } },
-            ),
+            0 => t.request(t.pickConn(r), 0, .{ .session_open = .{
+                .sampling = protocol.Sampling.greedy,
+                .system_prompt = try gpa.dupe(u8, "s"),
+            } }),
             1 => t.request(t.pickConn(r), t.pickSid(r), .{ .generate = .{
                 .max_tokens = 1 + r.uintLessThan(u32, 6),
                 .sampling = null,
@@ -7272,9 +7073,8 @@ fn checkLeaseTrace(_: void, seed: u64) anyerror!void {
             },
             6 => t.request(t.pickConn(r), t.pickSid(r), .session_close),
             7 => {
-                // Half the steps land on the earliest deadline, the edge of
-                // the expiry rule. A deadline that passed without a tick stays
-                // behind the clock.
+                // Half the steps land on the earliest deadline, the edge of the expiry rule.
+                // A deadline that passed without a tick stays behind the clock.
                 const deadline = t.earliestDeadline();
                 if (deadline != null and r.boolean()) {
                     t.pinAt(@max(deadline.?, t.now));
@@ -7297,13 +7097,12 @@ fn checkLeaseTrace(_: void, seed: u64) anyerror!void {
     t.pinAt(t.now + trace_ttl_max_ms);
     try t.tickOnce();
     try std.testing.expect(t.earliestDeadline() == null);
-    // Teardown does not run a turn in flight, so the drain ends it and its events pass the stream
-    // checks.
+    // Teardown does not run a turn in flight, so the drain ends it under the stream checks.
     t.fx.drain();
     try t.absorbEvents();
 }
 
-test "property: random wire traces keep the lease table, end every lease in time, and stream no token after a finish" {
+test "property: random wire traces keep the table, end leases, and stop tokens at a finish" {
     try prop.forAll(
         .{ .site = 0x1EA5_E001, .cases = 300 },
         {},

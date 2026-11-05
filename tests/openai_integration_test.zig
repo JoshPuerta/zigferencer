@@ -1,47 +1,43 @@
-//! End-to-end gate for the OpenAI HTTP connector over a real model and real
-//! sockets. The test starts an in-process `serve-openai` on an ephemeral TCP
-//! port and drives it with `std.http.Client`.
+//! End-to-end gate for the OpenAI HTTP connector over a real model and real sockets. The test
+//! starts an in-process `serve-openai` on an ephemeral TCP port and drives it with
+//! `std.http.Client`.
 //!
-//! The wire shape must be exact: a 200 that carries a `chat.completion` object
-//! with non-empty content and a finish reason. The gate therefore catches a
-//! regression in the HTTP framing, in the JSON, or along the render, tokenize
-//! and decode path. A body that names another model must get a 404 that carries
-//! the `model_not_found` type, and the served id must pass the same check. Two
-//! concurrent requests must also return the text each request returns alone,
-//! which is the batch-equivalence rule on the HTTP path. A streamed reply must
-//! carry the text of the buffered reply.
+//! Wire shape. The wire shape must be exact: a 200 that carries a `chat.completion` object with
+//! non-empty content and a finish reason. The gate therefore catches a regression in the HTTP
+//! framing, in the JSON, or along the render, tokenize and decode path. A body that names another
+//! model must get a 404 that carries the `model_not_found` type, and the served id must pass the
+//! same check. Two concurrent requests must also return the text each request returns alone, which
+//! is the batch-equivalence rule on the HTTP path. A streamed reply must carry the text of the
+//! buffered reply.
 //!
-//! The window rules hold on the same fixture. A turn whose budget passes the
-//! room fills the window and ends with `length`. A request that names no budget
-//! gets the whole window. A prompt past the window gets a 400 that names both
+//! Window. A turn whose budget passes the room fills the window and ends with `length`. A request
+//! that names no budget gets the whole window. A prompt past the window gets a 400 that names both
 //! numbers, and a streamed request gets the same JSON body and no event stream.
 //!
-//! A request switches the thinking mode with `chat_template_kwargs`. The
-//! fixture has no thinking mode, so `enable_thinking: true` gets a 400 in one
-//! sentence.
-//! `false` and an absent switch give the plain reply, byte for byte.
+//! Thinking. A request switches the thinking mode with `chat_template_kwargs`. The fixture has no
+//! thinking mode, so `enable_thinking: true` gets a 400 in one sentence. `false` and an absent
+//! switch give the plain reply, byte for byte.
 //!
-//! The fixture serves a sampled card row as the default of each omitted
-//! field, the shape of a model with a card under `--sampling model`.
-//! Every test that compares reply text therefore sends `temperature: 0`. Two
-//! requests without a seed give two replies, one fixed seed gives one reply,
-//! and the greedy defaults give one reply. A sampling field out of its range
-//! and a frequency penalty get a 400 that names the field. A repetition
-//! penalty changes the greedy reply, so the server never drops it.
+//! Sampling. The fixture serves a sampled card row as the default of each omitted field, the shape
+//! of a model with a card under `--sampling model`. Every test that compares reply text therefore
+//! sends `temperature: 0`. Two requests without a seed give two replies, one fixed seed gives one
+//! reply, and the greedy defaults give one reply. A sampling field out of its range and a frequency
+//! penalty get a 400 that names the field. A repetition penalty changes the greedy reply, so the
+//! server never drops it.
 //!
-//! The test reads the canonical SmolLM2 Q8_0 from `test_fixtures.path`.
+//! Fixture. The test reads the canonical SmolLM2 Q8_0 from `test_fixtures.path`.
 
 const std = @import("std");
-const z = @import("zigferencer");
-const tp = @import("test_policy.zig");
-const loader = z.loader;
-const vocab_mod = z.vocab;
-const bpe = z.bpe;
-const LlamaRunner = z.llama_runner.LlamaRunner;
-const Sessions = z.session.Sessions;
-const limits = z.limits;
-const http_server = z.serve_openai_http;
-const RawCodec = z.serve_openai_raw_codec.RawCodec;
+const zigferencer = @import("zigferencer");
+const test_policy = @import("test_policy.zig");
+const loader = zigferencer.loader;
+const vocab_mod = zigferencer.vocab;
+const bpe = zigferencer.bpe;
+const LlamaRunner = zigferencer.llama_runner.LlamaRunner;
+const Sessions = zigferencer.session.Sessions;
+const limits = zigferencer.limits;
+const http_server = zigferencer.serve_openai_http;
+const RawCodec = zigferencer.serve_openai_raw_codec.RawCodec;
 
 // -- fixtures ---------------------------------------------------------------
 
@@ -55,10 +51,10 @@ const long_message = "the quick brown fox jumps over the lazy dog " ** 20;
 const near_full_message = "the quick brown fox jumps over the lazy dog " ** 9;
 
 const OpenAiServer = http_server.Server(Sessions(LlamaRunner));
-const map = z.serve_openai_map;
+const map = zigferencer.serve_openai_map;
 
 /// A sampled row in both modes. SmolLM2 has no card, so the test supplies one.
-const card_row: z.serve_protocol.Sampling = .{
+const card_row: zigferencer.serve_protocol.Sampling = .{
     .temperature = 1.5,
     .top_k = 40,
     .top_p = 0.95,
@@ -74,7 +70,7 @@ const Fixture = struct {
     arena_state: std.heap.ArenaAllocator,
     loaded: loader.Loaded,
     vocab: vocab_mod.Vocab,
-    cpu_pool: tp.Pool,
+    cpu_pool: test_policy.Pool,
     runner: LlamaRunner,
     sessions: Sessions(LlamaRunner),
     codec: RawCodec,
@@ -95,7 +91,7 @@ const Fixture = struct {
         errdefer fx.arena_state.deinit();
 
         const arena = fx.arena_state.allocator();
-        const fixture = try z.test_fixtures.path(arena, "SmolLM2-135M-Instruct-Q8_0");
+        const fixture = try zigferencer.test_fixtures.path(arena, "SmolLM2-135M-Instruct-Q8_0");
 
         fx.loaded = try loader.load(io, arena, fixture);
         errdefer fx.loaded.close();
@@ -108,14 +104,14 @@ const Fixture = struct {
             try std.testing.expect(piece.len <= limits.max_token_text_bytes);
         }
 
-        const policy = tp.policy();
-        try tp.startPool(&fx.cpu_pool, io, policy);
+        const policy = test_policy.policy();
+        try test_policy.startPool(&fx.cpu_pool, io, policy);
         errdefer fx.cpu_pool.deinit();
 
         fx.runner = try LlamaRunner.init(
             arena,
             &fx.loaded,
-            z.kv_budget.pinned(4, max_seq),
+            zigferencer.kv_budget.pinned(4, max_seq),
             0,
             io,
             &fx.cpu_pool,
@@ -337,35 +333,36 @@ test "openai loopback: a chat completion returns a valid chat.completion object"
     );
     try std.testing.expectEqual(std.http.Status.ok, reply.status);
     try std.testing.expect(
-        std.mem.indexOf(u8, reply.body, "\"object\":\"chat.completion\"") != null,
+        std.mem.find(u8, reply.body, "\"object\":\"chat.completion\"") != null,
     );
-    try std.testing.expect(std.mem.indexOf(u8, reply.body, "\"finish_reason\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, reply.body, "\"role\":\"assistant\"") != null);
+    try std.testing.expect(std.mem.find(u8, reply.body, "\"finish_reason\"") != null);
+    try std.testing.expect(std.mem.find(u8, reply.body, "\"role\":\"assistant\"") != null);
     // A non-empty reply: usage reports at least one completion token.
-    try std.testing.expect(std.mem.indexOf(u8, reply.body, "\"completion_tokens\":0,") == null);
+    try std.testing.expect(std.mem.find(u8, reply.body, "\"completion_tokens\":0,") == null);
 
-    // One server answers for one model. A body that names another model gets a
-    // 404 before any session opens, the way the OpenAI API answers it.
+    // A body that names another model gets a 404 before any session opens.
     const wrong = try post(
         &fx,
         arena,
-        "{\"model\":\"wrong\",\"messages\":[{\"role\":\"user\",\"content\":\"Hello\"}],\"max_tokens\":16,\"stream\":false}",
+        \\{"model":"wrong","messages":[{"role":"user","content":"Hello"}],
+        \\"max_tokens":16,"stream":false}
+        ,
     );
     try std.testing.expectEqual(std.http.Status.not_found, wrong.status);
-    try std.testing.expect(std.mem.indexOf(u8, wrong.body, "\"type\":\"model_not_found\"") != null);
+    try std.testing.expect(std.mem.find(u8, wrong.body, "\"type\":\"model_not_found\"") != null);
 
-    // The served id passes the same check, so the refusal above compares the
-    // two strings and never rejects every named model.
+    // The served id passes the same check, so the refusal compares two strings.
     const served = try post(
         &fx,
         arena,
-        "{\"model\":\"fixture\",\"messages\":[{\"role\":\"user\",\"content\":\"Hello\"}],\"max_tokens\":4,\"stream\":false}",
+        \\{"model":"fixture","messages":[{"role":"user","content":"Hello"}],
+        \\"max_tokens":4,"stream":false}
+        ,
     );
     try std.testing.expectEqual(std.http.Status.ok, served.status);
 
-    // Two concurrent requests batch through the shared scheduler and still
-    // return the text each request returns alone. The requests pin greedy, so
-    // the reply is deterministic.
+    // Two concurrent requests batch through the shared scheduler and return the solo text.
+    // The requests pin greedy, so the reply is deterministic.
     const prompt_a = "Name one primary color.";
     const prompt_b = "What is two plus two?";
     var a_solo: ContentBuf = .{};
@@ -481,8 +478,7 @@ test "openai loopback: a budget past the room fills the window and ends with len
     );
     try std.testing.expect(parsed.usage.prompt_tokens < max_seq);
     try std.testing.expectEqualStrings("length", parsed.choices[0].finish_reason);
-    // The prefill samples the first token, and each decode step commits one
-    // row until the window is full. The last token never enters the window.
+    // The prefill samples the first token, and the last token never enters the window.
     try std.testing.expectEqual(
         max_seq - parsed.usage.prompt_tokens + 1,
         parsed.usage.completion_tokens,
@@ -572,7 +568,7 @@ test "openai loopback: a streamed prompt past the window gets the same 400 and n
     try std.testing.expectEqualStrings(buffered.body, streamed.body);
 }
 
-test "openai loopback: enable_thinking true on a model with no thinking mode gets 400 in one sentence" {
+test "openai loopback: enable_thinking true without a thinking mode gets 400" {
     var fx: Fixture = undefined;
     try fx.setUp();
     defer fx.tearDown();
@@ -606,7 +602,7 @@ test "openai loopback: enable_thinking true on a model with no thinking mode get
     try std.testing.expectEqualStrings(buffered.body, streamed.body);
 }
 
-test "openai loopback: enable_thinking false and an absent switch give the plain reply byte for byte" {
+test "openai loopback: enable_thinking false or absent gives the plain reply" {
     var fx: Fixture = undefined;
     try fx.setUp();
     defer fx.tearDown();
@@ -670,7 +666,7 @@ fn replyText(
 
 const open_prompt = "Write a short story about a sea captain.";
 
-test "openai loopback: an omitted seed draws a new one, a fixed seed reproduces, and temperature 0 pins greedy" {
+test "openai loopback: seed omitted draws, seed fixed reproduces, temperature 0 pins greedy" {
     var fx: Fixture = undefined;
     try fx.setUp();
     defer fx.tearDown();
@@ -724,14 +720,19 @@ test "openai loopback: a refused sampling or budget field gets a 400 that names 
 
     const arena = arena_state.allocator();
 
+    const msg_frequency = "frequency_penalty is not supported. The only accepted value is 0";
+    const msg_repetition = "repetition_penalty must be more than 0 and at most 2";
+    const msg_budget_range = "thinking_token_budget must be -1, 0, or a count from 1 to 262144";
+    const msg_budget_no_think = "thinking_token_budget above 0 does not apply to this model, " ++
+        "because its chat template has no thinking mode";
     const Case = struct { extra: []const u8, message: []const u8 };
     const cases = [_]Case{
-        .{ .extra = ",\"frequency_penalty\":0.5", .message = "frequency_penalty is not supported. The only accepted value is 0" },
+        .{ .extra = ",\"frequency_penalty\":0.5", .message = msg_frequency },
         .{ .extra = ",\"top_k\":257", .message = "top_k must be -1 or in the range 0 to 256" },
         .{ .extra = ",\"min_p\":2", .message = "min_p must be in the range 0 to 1" },
-        .{ .extra = ",\"repetition_penalty\":0", .message = "repetition_penalty must be more than 0 and at most 2" },
-        .{ .extra = ",\"thinking_token_budget\":-5", .message = "thinking_token_budget must be -1, 0, or a count from 1 to 262144" },
-        .{ .extra = ",\"thinking_token_budget\":16", .message = "thinking_token_budget above 0 does not apply to this model, because its chat template has no thinking mode" },
+        .{ .extra = ",\"repetition_penalty\":0", .message = msg_repetition },
+        .{ .extra = ",\"thinking_token_budget\":-5", .message = msg_budget_range },
+        .{ .extra = ",\"thinking_token_budget\":16", .message = msg_budget_no_think },
     };
     for (cases) |c| {
         const reply = try post(

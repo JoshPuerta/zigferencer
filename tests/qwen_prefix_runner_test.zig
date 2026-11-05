@@ -1,29 +1,27 @@
-//! Equivalence gate for the qwen prefix boundary. A runner that
-//! `initPrefix` builds at `k` runs layers `[0..k)` exactly as the
-//! whole-model runner runs them. Both runners use the same weights, the same
-//! KV rows and the same GDN slabs.
+//! Equivalence gate for the qwen prefix boundary. A runner that `initPrefix` builds at `k` runs
+//! layers `[0..k)` exactly as the whole-model runner runs them. Both runners use the same weights,
+//! the same KV rows and the same GDN slabs.
 //!
-//! Two runners share one loaded model, and a composing runner drives both the
-//! same way, which embeds into `x` and then calls `layerForward` per layer. The
-//! residual streams must match byte for byte. Nothing here has a tolerance.
-//! Both runners call the same kernels in the same order over the same bytes. A
-//! difference means the layer-count parameter moved something it must not move.
+//! Method. Two runners share one loaded model, and a composing runner drives both the same way,
+//! which embeds into `x` and then calls `layerForward` per layer. The residual streams must match
+//! byte for byte. Nothing here has a tolerance. Both runners call the same kernels in the same
+//! order over the same bytes. A difference means the layer-count parameter moved something it must
+//! not move.
 //!
-//! The blob check is the load-bearing one for the composed runner. The snapshot
-//! walks layers in model order. The whole blob of the prefix must therefore
-//! equal the leading span of the blob of the whole model. That is the boundary
-//! offset the hybrid needs, stated as a test.
+//! Blob. The blob check is the load-bearing one for the composed runner. The snapshot walks layers
+//! in model order. The whole blob of the prefix must therefore equal the leading span of the blob
+//! of the whole model. That is the boundary offset the hybrid needs, stated as a test.
 //!
-//! The Qwen3.5-2B fixture and the SmolLM2 fixture of the one non-qwen case come
-//! from `test_fixtures.path`.
+//! Fixtures. The Qwen3.5-2B fixture and the SmolLM2 fixture of the one non-qwen case come from
+//! `test_fixtures.path`.
 
 const std = @import("std");
-const z = @import("zigferencer");
-const tp = @import("test_policy.zig");
-const loader = z.loader;
-const QwenRunner = z.qwen_runner.QwenRunner;
-const StepRow = z.step_row.StepRow;
-const KvDtype = z.dtype.KvDtype;
+const zigferencer = @import("zigferencer");
+const test_policy = @import("test_policy.zig");
+const loader = zigferencer.loader;
+const QwenRunner = zigferencer.qwen_runner.QwenRunner;
+const StepRow = zigferencer.step_row.StepRow;
+const KvDtype = zigferencer.dtype.KvDtype;
 
 // -- fixtures ---------------------------------------------------------------
 
@@ -32,7 +30,7 @@ const KvDtype = z.dtype.KvDtype;
 const window: u32 = 16;
 
 /// Every runner here runs serially.
-const serial: tp.Policy = .{ .n_threads = 1 };
+const serial: test_policy.Policy = .{ .n_threads = 1 };
 
 /// The splits under test. 6 holds one full-attention layer (absolute index 3),
 /// 12 holds three. Both land mid-model on the 2B, where the compaction index and
@@ -48,7 +46,7 @@ const tokens = [_]u32{ 1, 2 };
 fn prefixRunner(
     arena: std.mem.Allocator,
     io: std.Io,
-    cpu_pool: *tp.Pool,
+    cpu_pool: *test_policy.Pool,
     loaded: *const loader.Loaded,
     n_layers: u32,
     n_slots: u32,
@@ -57,7 +55,7 @@ fn prefixRunner(
     return QwenRunner.initPrefix(
         arena,
         loaded,
-        z.kv_budget.pinned(n_slots, window),
+        zigferencer.kv_budget.pinned(n_slots, window),
         n_layers,
         0,
         io,
@@ -67,13 +65,11 @@ fn prefixRunner(
     );
 }
 
-/// Drive one row through the first `k` layers of a runner from the outside. The
-/// call does the embedding and then `layerForward` per layer. `embedLookup` is
-/// the naive function on every op backend, so this is the exact call
-/// `stepBatch` makes.
+/// Drive one row through the first `k` layers of a runner from the outside. `embedLookup` is the
+/// naive function on every op backend, so this is the exact call `stepBatch` makes.
 fn driveRow(runner: *QwenRunner, k: u32, row: StepRow) !void {
     const d = runner.hidden;
-    z.ops.embedLookup(runner.embed.*, row.token, d, runner.x[0..d]);
+    zigferencer.ops.embedLookup(runner.embed.*, row.token, d, runner.x[0..d]);
     var layer: u32 = 0;
     while (layer < k) : (layer += 1) {
         runner.layerForward(layer, &.{row});
@@ -89,8 +85,8 @@ fn residual(runner: *const QwenRunner) []const u8 {
 
 test "qwen initPrefix reproduces the whole-model layers, KV, and GDN state" {
     const io = std.testing.io;
-    var cpu_pool: tp.Pool = undefined;
-    try tp.startPool(&cpu_pool, io, serial);
+    var cpu_pool: test_policy.Pool = undefined;
+    try test_policy.startPool(&cpu_pool, io, serial);
     defer cpu_pool.deinit();
 
     const gpa = std.testing.allocator;
@@ -98,7 +94,7 @@ test "qwen initPrefix reproduces the whole-model layers, KV, and GDN state" {
     defer arena_state.deinit();
 
     const arena = arena_state.allocator();
-    const fixture = try z.test_fixtures.path(arena, "Qwen3.5-2B-Q8_0");
+    const fixture = try zigferencer.test_fixtures.path(arena, "Qwen3.5-2B-Q8_0");
 
     var loaded = try loader.load(io, arena, fixture);
     defer loaded.close();
@@ -108,13 +104,11 @@ test "qwen initPrefix reproduces the whole-model layers, KV, and GDN state" {
     for (splits) |k| {
         std.debug.assert(k < n_layers); // a prefix test needs a layer left over
 
-        // Each split gets a fresh pair. The GDN state is a running
-        // accumulator, so a reused runner carries the history of the previous
-        // split.
+        // Each split gets a fresh pair, because the GDN state is a running accumulator.
         var full = try QwenRunner.init(
             arena,
             &loaded,
-            z.kv_budget.pinned(1, window),
+            zigferencer.kv_budget.pinned(1, window),
             0,
             io,
             &cpu_pool,
@@ -165,8 +159,8 @@ test "qwen initPrefix reproduces the whole-model layers, KV, and GDN state" {
 
 test "qwen prefix shapes: KV height, GDN slabs, and the compacted kv_slot" {
     const io = std.testing.io;
-    var cpu_pool: tp.Pool = undefined;
-    try tp.startPool(&cpu_pool, io, serial);
+    var cpu_pool: test_policy.Pool = undefined;
+    try test_policy.startPool(&cpu_pool, io, serial);
     defer cpu_pool.deinit();
 
     const gpa = std.testing.allocator;
@@ -174,7 +168,7 @@ test "qwen prefix shapes: KV height, GDN slabs, and the compacted kv_slot" {
     defer arena_state.deinit();
 
     const arena = arena_state.allocator();
-    const fixture = try z.test_fixtures.path(arena, "Qwen3.5-2B-Q8_0");
+    const fixture = try zigferencer.test_fixtures.path(arena, "Qwen3.5-2B-Q8_0");
 
     var loaded = try loader.load(io, arena, fixture);
     defer loaded.close();
@@ -230,8 +224,8 @@ test "qwen prefix shapes: KV height, GDN slabs, and the compacted kv_slot" {
 
 test "qwen prefix below the attention interval holds no KV and still steps" {
     const io = std.testing.io;
-    var cpu_pool: tp.Pool = undefined;
-    try tp.startPool(&cpu_pool, io, serial);
+    var cpu_pool: test_policy.Pool = undefined;
+    try test_policy.startPool(&cpu_pool, io, serial);
     defer cpu_pool.deinit();
 
     const gpa = std.testing.allocator;
@@ -239,7 +233,7 @@ test "qwen prefix below the attention interval holds no KV and still steps" {
     defer arena_state.deinit();
 
     const arena = arena_state.allocator();
-    const fixture = try z.test_fixtures.path(arena, "Qwen3.5-2B-Q8_0");
+    const fixture = try zigferencer.test_fixtures.path(arena, "Qwen3.5-2B-Q8_0");
 
     var loaded = try loader.load(io, arena, fixture);
     defer loaded.close();
@@ -291,8 +285,8 @@ test "qwen prefix below the attention interval holds no KV and still steps" {
 
 test "qwen prefix resetSlotState zeroes its own slot's slabs only" {
     const io = std.testing.io;
-    var cpu_pool: tp.Pool = undefined;
-    try tp.startPool(&cpu_pool, io, serial);
+    var cpu_pool: test_policy.Pool = undefined;
+    try test_policy.startPool(&cpu_pool, io, serial);
     defer cpu_pool.deinit();
 
     const gpa = std.testing.allocator;
@@ -300,7 +294,7 @@ test "qwen prefix resetSlotState zeroes its own slot's slabs only" {
     defer arena_state.deinit();
 
     const arena = arena_state.allocator();
-    const fixture = try z.test_fixtures.path(arena, "Qwen3.5-2B-Q8_0");
+    const fixture = try zigferencer.test_fixtures.path(arena, "Qwen3.5-2B-Q8_0");
 
     var loaded = try loader.load(io, arena, fixture);
     defer loaded.close();
@@ -345,22 +339,20 @@ test "qwen prefix resetSlotState zeroes its own slot's slabs only" {
 
 test "qwen prefix init reports an allocation failure and leaves nothing behind" {
     const io = std.testing.io;
-    var cpu_pool: tp.Pool = undefined;
-    try tp.startPool(&cpu_pool, io, serial);
+    var cpu_pool: test_policy.Pool = undefined;
+    try test_policy.startPool(&cpu_pool, io, serial);
     defer cpu_pool.deinit();
 
     const gpa = std.testing.allocator;
     var load_arena = std.heap.ArenaAllocator.init(gpa);
     defer load_arena.deinit();
 
-    const fixture = try z.test_fixtures.path(load_arena.allocator(), "Qwen3.5-2B-Q8_0");
+    const fixture = try zigferencer.test_fixtures.path(load_arena.allocator(), "Qwen3.5-2B-Q8_0");
     var loaded = try loader.load(io, load_arena.allocator(), fixture);
     defer loaded.close();
 
-    // The arena of the runner draws from a failing allocator, so the
-    // constructor meets OutOfMemory partway. `std.testing.allocator` fails this
-    // test when the deinit of the arena leaves one byte behind. That rule is
-    // the whole leak duty of an arena-owned constructor.
+    // The arena of the runner draws from a failing allocator, so the constructor meets
+    // OutOfMemory partway. The arena deinit must leave no byte behind. That is the whole leak duty.
     var fail_index: usize = 0;
     while (fail_index < 3) : (fail_index += 1) {
         var failing = std.testing.FailingAllocator.init(gpa, .{ .fail_index = fail_index });
@@ -381,8 +373,8 @@ test "qwen prefix init reports an allocation failure and leaves nothing behind" 
 
 test "qwen prefix init refuses a non-qwen model before it sizes anything" {
     const io = std.testing.io;
-    var cpu_pool: tp.Pool = undefined;
-    try tp.startPool(&cpu_pool, io, serial);
+    var cpu_pool: test_policy.Pool = undefined;
+    try test_policy.startPool(&cpu_pool, io, serial);
     defer cpu_pool.deinit();
 
     const gpa = std.testing.allocator;
@@ -390,7 +382,7 @@ test "qwen prefix init refuses a non-qwen model before it sizes anything" {
     defer arena_state.deinit();
 
     const arena = arena_state.allocator();
-    const fixture = try z.test_fixtures.path(arena, "SmolLM2-135M-Instruct-Q8_0");
+    const fixture = try zigferencer.test_fixtures.path(arena, "SmolLM2-135M-Instruct-Q8_0");
 
     var loaded = try loader.load(io, arena, fixture);
     defer loaded.close();

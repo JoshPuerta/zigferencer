@@ -1,21 +1,20 @@
-//! The geometry of CPU attention. A row of `t_len` positions splits into tiles
-//! of `limits.attn_cpu_tile` positions, and the tiles group into
-//! `min(limits.attn_cpu_parts, tiles)` contiguous parts. Part `p` of `c` parts
-//! owns the tiles `[p * n / c, (p + 1) * n / c)` of the `n` tiles. The part
-//! count never passes the tile count, so every tile lands in one part and no
-//! part is empty. Each part writes one record per query head: the value sums,
-//! then the maximum score, then the sum of the shifted exponentials. A merge
-//! adds the records in part order. The geometry is a function of `t_len`
-//! alone. So a row gets the same parts and the same bits at every thread
-//! count, window, batch, and slot.
+//! The geometry of CPU attention. The module is pure: no allocation, no threads, and no I/O.
 //!
-//! The tiles are the split geometry of `attn_split.zig` at a split length of
-//! `attn_cpu_tile`. The partial buffer holds one record per query head and
-//! part. A record offset is a mixed-radix numeral with the radices `n_heads`,
-//! `attn_cpu_parts`, and the record width (Knuth, TAOCP vol 1, section 2.2.6).
-//! So the records of one head lie next to each other in part order, and the
-//! merge reads them as one run. The module is pure: no allocation, no threads,
-//! and no I/O.
+//! Parts. A row of `t_len` positions splits into tiles of `limits.attn_cpu_tile` positions. The
+//! tiles group into `min(limits.attn_cpu_parts, tiles)` contiguous parts. Part `p` of `c` parts
+//! owns the tiles `[p * n / c, (p + 1) * n / c)` of the `n` tiles. The part count never passes the
+//! tile count, so every tile lands in one part and no part is empty. The geometry is a function of
+//! `t_len` alone. So a row gets the same parts and the same bits at every thread count, window,
+//! batch, and slot.
+//!
+//! Records. Each part writes one record per query head: the value sums, then the maximum score,
+//! then the sum of the shifted exponentials. A merge adds the records in part order.
+//!
+//! Partial buffer. It holds one record per query head and part. A record offset is a mixed-radix
+//! numeral with the radices `n_heads`, `attn_cpu_parts`, and the record width (Knuth, TAOCP vol 1,
+//! section 2.2.6). So the records of one head lie next to each other in part order, and the merge
+//! reads them as one run. The tiles are the split geometry of `attn_split.zig` at a split length of
+//! `attn_cpu_tile`.
 
 const std = @import("std");
 const limits = @import("limits.zig");
@@ -120,9 +119,7 @@ pub fn partialLen(n_heads: u32, head_dim: u32) usize {
     assert(n_heads >= 1);
 
     const record = recordElems(head_dim);
-    // The engine sets no bound on the head count or the head width. So the
-    // function checks the byte total in 128 bits, and every 64-bit product
-    // stays exact.
+    // The engine sets no bound on the head count or width, so check the byte total in 128 bits.
     const widest = @as(u128, n_heads) * max_parts * record * elem_bytes;
     assert(widest <= std.math.maxInt(u64));
     const len: usize = @intCast(@as(u64, n_heads) * max_parts * record);

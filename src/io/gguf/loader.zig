@@ -1,12 +1,18 @@
-//! Build a `ModelCard` and a tensor list from a GGUF file. The loader maps the
-//! file, calls the parser, and then reads the architecture-specific KV keys.
-//! The card is the typed view of the metadata the engine needs, and each
-//! `TensorRef` holds a `Tensor` whose `data` slices into the mapped region.
+//! Role. Build a `ModelCard` and a tensor list from a GGUF file. The loader maps the file, calls
+//! the parser, and reads the architecture-specific KV keys. The card is the typed view of the
+//! metadata the engine needs. Each `TensorRef` holds a `Tensor` whose `data` slices into the map.
 //!
-//! The two layers validate in pairs. The parser asserts the byte-level form.
-//! This layer asserts semantic completeness: every architecture key resolves,
-//! the dtype and shape make sense, and the engine bounds in `limits.zig` hold.
-//! Neither side trusts the other.
+//! Validation in pairs. The parser asserts the byte-level form. This layer asserts semantic
+//! completeness: every architecture key resolves, the dtype and shape make sense, and the engine
+//! bounds in `limits.zig` hold. Neither side trusts the other.
+//!
+//! Refusals. A refusal of a file value logs once with the file name and the tensor name, and
+//! returns a typed `Error`. A test of a refusal logs at `debug`, because the test runner fails a
+//! test that logs an error.
+//!
+//! Alignment. The kernels view tensor data in place. A scalar dtype needs its element width as the
+//! address alignment, and a quant block type needs none. The parser proves only the offset a
+//! multiple of `general.alignment`, so `bindTensors` checks the address.
 
 const std = @import("std");
 const dtype = @import("../../core/dtype.zig");
@@ -41,8 +47,7 @@ pub const Error = error{
     UnsupportedTensorDtype,
     BadTensorShape,
     TensorSizeOverflow,
-    /// A tensor starts at an address that breaks the alignment of its element
-    /// type. The kernels view such data as typed slices in place.
+    /// A tensor starts at an address that breaks the alignment of its element type.
     TensorDataUnaligned,
 } || parser.Error;
 
@@ -50,13 +55,10 @@ pub const Error = error{
 pub const LoadError = Error || Allocator.Error || Io.File.OpenError || Io.File.LengthError ||
     Io.File.MemoryMap.CreateError;
 
-/// Architectures the engine understands. The GGUF `general.architecture`
-/// string is also the KV-key prefix (`llama.block_count`, `qwen35.ssm.*`).
+/// Architectures the engine understands. The `general.architecture` string is the KV-key prefix.
 pub const Arch = enum { llama, qwen35 };
 
-/// Gated-DeltaNet (linear-attention) parameters. llama.cpp keys Qwen3.5 GDN
-/// under its SSM namespace (`qwen35.ssm.*`). These params are present only when
-/// arch is .qwen35. The op lives in `ops/gdn.zig`.
+/// Gated-DeltaNet (linear-attention) parameters, under `qwen35.ssm.*`. Present only for `.qwen35`.
 pub const GdnParams = struct {
     /// Causal depthwise conv kernel width over the q|k|v channels (= 4).
     conv_kernel: u32,
@@ -100,8 +102,7 @@ pub const ModelCard = struct {
     eos_token_id: u32,
     chat_template: []const u8,
 
-    /// Gated-DeltaNet params, present only when arch is .qwen35. They drive the
-    /// hybrid per-layer schedule and the GDN op. The field is null for Llama.
+    /// Gated-DeltaNet params. Null for Llama.
     gdn: ?GdnParams = null,
 
     /// The dimensions the KV price reads, as a plain value for the planner.
@@ -137,27 +138,23 @@ pub const Loaded = struct {
 };
 
 pub const LoadOptions = struct {
-    /// Prefault all pages at map time. The default is on for inference, because
-    /// resident weights keep page faults out of the decode loop. Turn it off for
-    /// a metadata-only reader such as `inspect`, which reads the descriptors but
-    /// never the multi-gigabyte weight data, so a lazy map opens in milliseconds.
+    /// Prefault all pages at map time. Turn it off for a metadata-only reader such as `inspect`.
     prefault: bool = true,
-    /// Suppress the `loading...` and `loaded...` info logs. Use it for a caller
-    /// that reads several models' metadata as a side effect, such as the model
-    /// picker that reads each context window, where a per-load announce is noise.
+    /// Suppress the `loading...` and `loaded...` info logs, for a caller that reads many models.
     quiet: bool = false,
 };
 
-/// A value that does not fit a `u32` is a bad value, not a narrowing cast.
 /// One dimension of the model card, named by its key after the arch prefix.
 const Dim = struct { key: []const u8, value: u32 };
 
 // -- api --------------------------------------------------------------------
 
+/// Load `path` with the default options: a prefaulted map and the info logs.
 pub fn load(io: Io, arena: Allocator, path: []const u8) LoadError!Loaded {
     return loadWith(io, arena, path, .{});
 }
 
+/// Map `path`, parse it, and build the card and the tensor list. The arena owns every slice.
 pub fn loadWith(
     io: Io,
     arena: Allocator,
@@ -167,10 +164,9 @@ pub fn loadWith(
     const sp = span.begin(.model_load);
     defer sp.end();
 
-    // For a multi-gigabyte model the prefault, not the metadata parse, is the
-    // visible wait, so announce the load before the map.
+    // Map the file. The prefault is the visible wait, so the announce comes first.
     if (!opts.quiet) {
-        log.info("loading {s}...", .{std.fs.path.basename(path)});
+        log.info("loading {s}...", .{std.Io.Dir.path.basename(path)});
     }
 
     const t_start = Io.Clock.Timestamp.now(io, .awake);
@@ -184,15 +180,17 @@ pub fn loadWith(
     const bytes = map.bytes();
     const t_mapped = Io.Clock.Timestamp.now(io, .awake);
 
+    // Parse the bytes.
     const parsed = parser.parse(arena, bytes) catch |err| {
         log.err(
             "{s}: the GGUF file is not valid: {s}",
-            .{ std.fs.path.basename(path), @errorName(err) },
+            .{ std.Io.Dir.path.basename(path), @errorName(err) },
         );
         return err;
     };
     const t_parsed = Io.Clock.Timestamp.now(io, .awake);
 
+    // Read the architecture and the shape keys.
     const arch_str = try lookupString(parsed, "general.architecture");
     const arch: Arch = if (std.mem.eql(u8, arch_str, "llama"))
         .llama
@@ -201,8 +199,7 @@ pub fn loadWith(
     else
         return error.UnsupportedArchitecture;
 
-    // The architecture string is also the KV-key prefix. One reused buffer is
-    // safe because each lookup consumes the key before the next key overwrites it.
+    // One key buffer is safe because each lookup consumes its key before the next write.
     var kb: [96]u8 = undefined;
     const n_layers = try lookupU32(parsed, pk(&kb, arch_str, ".block_count"));
     const n_heads = try lookupU32(parsed, pk(&kb, arch_str, ".attention.head_count"));
@@ -217,6 +214,7 @@ pub fn loadWith(
     const embedding_length = try lookupU32(parsed, pk(&kb, arch_str, ".embedding_length"));
     const ffn_length = try lookupU32(parsed, pk(&kb, arch_str, ".feed_forward_length"));
     const ctx_declared = try lookupU32(parsed, pk(&kb, arch_str, ".context_length"));
+
     const head_dim_explicit = try lookupU32Or(
         parsed,
         pk(&kb, arch_str, ".attention.key_length"),
@@ -233,7 +231,7 @@ pub fn loadWith(
         pk(&kb, arch_str, ".attention.layer_norm_rms_epsilon"),
     );
 
-    // Gated-DeltaNet params live under the SSM namespace for qwen35.
+    // Read the Gated-DeltaNet keys, which only qwen35 has.
     const gdn: ?GdnParams = if (arch == .qwen35) GdnParams{
         .conv_kernel = try lookupU32(parsed, pk(&kb, arch_str, ".ssm.conv_kernel")),
         .state_size = try lookupU32(parsed, pk(&kb, arch_str, ".ssm.state_size")),
@@ -248,8 +246,7 @@ pub fn loadWith(
 
     const tokens = try lookupStringArray(parsed, "tokenizer.ggml.tokens");
 
-    // Reject early with a typed error instead of allocating past the scratch
-    // buffer sizes that `core/limits.zig` fixes.
+    // Check the bounds. A typed error here keeps a file from sizing past `core/limits.zig`.
     if (n_layers > limits.max_layers) return error.TooManyLayers;
     if (tokens.len > limits.max_vocab) return error.VocabTooLarge;
 
@@ -265,33 +262,31 @@ pub fn loadWith(
         .{ .key = "attention.key_length", .value = head_dim_explicit },
     };
     if (zeroDim(&dims, gdn)) |key| {
-        log.err("{s}: the card value {s} is 0", .{ std.fs.path.basename(path), key });
+        log.err("{s}: the card value {s} is 0", .{ std.Io.Dir.path.basename(path), key });
         return error.BadKeyValue;
     }
 
-    // Each KV head serves a whole group of query heads.
+    // Check the head grouping: each KV head serves a whole group of query heads.
     if (n_heads % n_kv_heads != 0) {
         log.err(
             "{s}: {d} attention heads do not split into groups over {d} KV heads",
-            .{ std.fs.path.basename(path), n_heads, n_kv_heads },
+            .{ std.Io.Dir.path.basename(path), n_heads, n_kv_heads },
         );
         return error.BadKeyValue;
     }
 
-    // A context past the engine bound is a model fact the engine cannot use
-    // whole. The file loads with the bound, and the log names both numbers.
+    // Cap the context. The file loads with the bound, and the log names both numbers.
     const ctx_length = limits.contextCeiling(ctx_declared, null);
     if (ctx_length < ctx_declared) {
         log.warn(
             "{s}: the file declares a context of {d} positions, and the engine caps it at {d}",
             .{
-                std.fs.path.basename(path), ctx_declared, ctx_length,
+                std.Io.Dir.path.basename(path), ctx_declared, ctx_length,
             },
         );
     }
 
-    // Scaling that the engine does not apply puts every position at the wrong
-    // angle, and nothing downstream can detect it.
+    // Refuse RoPE scaling that the engine does not apply, because nothing downstream detects it.
     const scaling_key = pk(&kb, arch_str, ".rope.scaling.type");
     const scaling_type: ?[]const u8 = if (lookupKv(parsed, scaling_key) != null)
         try lookupString(parsed, scaling_key)
@@ -307,14 +302,13 @@ pub fn loadWith(
             "{s}: RoPE scaling type {s} is not supported. The engine applies only the " ++
                 "llama3 factors of a " ++ rope_freqs_tensor ++ " tensor",
             .{
-                std.fs.path.basename(path), scaling_type.?,
+                std.Io.Dir.path.basename(path), scaling_type.?,
             },
         );
         return error.UnsupportedRopeScaling;
     }
 
-    // BOS is optional: ChatML models (qwen35) set add_bos_token=false and can
-    // omit the id entirely. The chat template injects boundaries instead.
+    // Read the special tokens and build the card. BOS is optional: ChatML models omit it.
     const bos = try lookupU32Or(parsed, "tokenizer.ggml.bos_token_id", 0);
     const eos = try lookupU32(parsed, "tokenizer.ggml.eos_token_id");
     const chat = lookupStringOptional(parsed, "tokenizer.chat_template") orelse "";
@@ -342,7 +336,8 @@ pub fn loadWith(
         .gdn = gdn,
     };
 
-    const refs = try bindTensors(arena, parsed, bytes, std.fs.path.basename(path), .err);
+    // Bind the tensors and log the timings.
+    const refs = try bindTensors(arena, parsed, bytes, std.Io.Dir.path.basename(path), .err);
 
     const t_done = Io.Clock.Timestamp.now(io, .awake);
     if (!opts.quiet) {
@@ -363,11 +358,9 @@ pub fn loadWith(
     };
 }
 
-/// Turn each parsed tensor descriptor into a `Tensor` that borrows its bytes
-/// from `bytes`. The descriptor comes from the file, so every dimension,
-/// size, range, and alignment is checked here before it reaches the `Tensor`
-/// asserts. A refusal logs the file and the tensor name once, at
-/// `refusal_level`.
+/// Turn each tensor descriptor into a `Tensor` that borrows its bytes from `bytes`.
+/// The file supplies every dimension, size, range, and alignment, so each gets a check here.
+/// A refusal logs the file and the tensor name once, at `refusal_level`.
 pub fn bindTensors(
     arena: Allocator,
     parsed: parser.Parsed,
@@ -379,8 +372,7 @@ pub fn bindTensors(
     for (parsed.tensors, refs) |ti, *ref| {
         std.debug.assert(ti.n_dims >= 1 and ti.n_dims <= 4);
 
-        // The wire model keeps every ggml type id representable, and only a
-        // subset carries block geometry. Refuse the rest at the boundary.
+        // Refuse a dtype without block geometry, because only a subset can be sized.
         if (!dtype.hasBlockGeometry(ti.dtype)) {
             refuse(
                 refusal_level,
@@ -395,6 +387,7 @@ pub fn bindTensors(
             return error.UnsupportedTensorDtype;
         }
 
+        // Check the dimensions and count the elements.
         var shape32: [4]u32 = .{ 0, 0, 0, 0 };
         var numel: u64 = 1;
         for (0..ti.n_dims) |i| {
@@ -426,6 +419,7 @@ pub fn bindTensors(
             };
         }
 
+        // Check that the row holds whole blocks and size the tensor.
         const block = dtype.blockSize(ti.dtype);
         if (shape32[0] % block != 0) {
             refuse(
@@ -439,8 +433,7 @@ pub fn bindTensors(
             return error.BadTensorShape;
         }
 
-        // Every axis past the row counts whole rows, so a whole row is a
-        // whole number of blocks and so is the tensor.
+        // Every axis past the row counts whole rows, so the tensor is a whole number of blocks.
         const total_bytes = dtype.bytesForNumelChecked(ti.dtype, numel) orelse {
             refuse(
                 refusal_level,
@@ -452,6 +445,7 @@ pub fn bindTensors(
         const row_bytes = dtype.bytesForNumelChecked(ti.dtype, shape32[0]).?;
         std.debug.assert(row_bytes <= total_bytes);
 
+        // Check that the byte range lies inside the file.
         const start = std.math.add(u64, parsed.data_offset, ti.offset_in_data) catch {
             refuse(
                 refusal_level,
@@ -477,10 +471,8 @@ pub fn bindTensors(
             return error.NotEnoughBytes;
         }
 
+        // Check the address alignment of the view. See "Alignment" in the header.
         const data = bytes[@intCast(start)..@intCast(end)];
-        // The kernels cast an f32 view of the data with `@alignCast`. The
-        // parser only proves the offset a multiple of `general.alignment`,
-        // and a power of two below the element width passes that check.
         const need = elementAlign(ti.dtype);
         if (@intFromPtr(data.ptr) % need != 0) {
             refuse(
@@ -492,6 +484,7 @@ pub fn bindTensors(
             return error.TensorDataUnaligned;
         }
 
+        // Build the tensor.
         const stride = std.math.cast(u32, row_bytes) orelse {
             refuse(
                 refusal_level,
@@ -518,10 +511,8 @@ pub fn bindTensors(
     return refs;
 }
 
-/// Whether the engine applies the RoPE scaling a file declares. No scaling
-/// type, or `none`, needs nothing. The engine applies the llama3 factors, but
-/// only from a `rope_freqs.weight` tensor it reads. It applies no YaRN and no
-/// linear scaling.
+/// Whether the engine applies the RoPE scaling a file declares. It applies none, or the llama3
+/// factors from a `rope_freqs.weight` tensor. It applies no YaRN and no linear scaling.
 pub fn ropeScalingSupported(scaling_type: ?[]const u8, has_rope_freqs: bool) bool {
     const kind = scaling_type orelse return true;
     if (std.mem.eql(u8, kind, "none")) return true;
@@ -532,9 +523,7 @@ pub fn ropeScalingSupported(scaling_type: ?[]const u8, has_rope_freqs: bool) boo
 
 // -- helpers ----------------------------------------------------------------
 
-/// Log one refusal at `level`. The loader logs at `err`. A test of a
-/// refusal logs at `debug`, because the test runner fails a test that logs
-/// an error.
+/// Log one refusal at `level`. See "Refusals" in the header.
 fn refuse(comptime level: std.log.Level, comptime format: []const u8, args: anytype) void {
     switch (level) {
         .err => log.err(format, args),
@@ -544,9 +533,7 @@ fn refuse(comptime level: std.log.Level, comptime format: []const u8, args: anyt
     }
 }
 
-/// The address alignment that a typed in-place view of `t` needs. A scalar
-/// type is viewed as a slice of its element, so it needs the element width.
-/// A quant block type is read byte-wise, so it needs none.
+/// The address alignment that a typed in-place view of `t` needs. See "Alignment" in the header.
 fn elementAlign(t: dtype.GgmlType) usize {
     std.debug.assert(dtype.hasBlockGeometry(t));
 
@@ -572,8 +559,7 @@ fn elapsedMs(t0: Io.Clock.Timestamp, t1: Io.Clock.Timestamp) f64 {
     return @as(f64, @floatFromInt(ns)) / 1e6;
 }
 
-/// Build a prefixed KV key such as `<arch>.block_count` into `buf`. The arch
-/// string is llama or qwen35 and the suffix is a literal, so the key always fits.
+/// Build a prefixed KV key such as `<arch>.block_count` into `buf`. The key always fits.
 fn pk(buf: []u8, prefix: []const u8, suffix: []const u8) []const u8 {
     return std.fmt.bufPrint(buf, "{s}{s}", .{ prefix, suffix }) catch unreachable;
 }
@@ -602,8 +588,7 @@ fn lookupStringOptional(p: parser.Parsed, key: []const u8) ?[]const u8 {
     };
 }
 
-/// The first card dimension or GDN parameter that holds 0, or null. A zero
-/// divides or sizes a buffer downstream, so the loader refuses it here.
+/// The first card dimension or GDN parameter that holds 0, or null. A zero breaks a division later.
 fn zeroDim(dims: []const Dim, gdn: ?GdnParams) ?[]const u8 {
     for (dims) |d| {
         if (d.value == 0) return d.key;
@@ -617,6 +602,7 @@ fn zeroDim(dims: []const Dim, gdn: ?GdnParams) ?[]const u8 {
     return null;
 }
 
+/// A value that does not fit a `u32` is a bad value, not a narrowing cast.
 fn lookupU32(p: parser.Parsed, key: []const u8) Error!u32 {
     const v = lookupKv(p, key) orelse return error.MissingKey;
     const value: ?u32 = switch (v.*) {
@@ -630,8 +616,7 @@ fn lookupU32(p: parser.Parsed, key: []const u8) Error!u32 {
     return value orelse error.BadKeyValue;
 }
 
-/// The value of an optional key. Only an absent key takes `default`, so a
-/// key with a bad value fails and does not fall back in silence.
+/// The value of an optional key. Only an absent key takes `default`. A bad value fails.
 fn lookupU32Or(p: parser.Parsed, key: []const u8, default: u32) Error!u32 {
     return lookupU32(p, key) catch |err| switch (err) {
         error.MissingKey => default,
@@ -648,8 +633,7 @@ fn lookupF32(p: parser.Parsed, key: []const u8) Error!f32 {
     };
 }
 
-/// The value of an optional key. Only an absent key takes `default`, so a
-/// key of the wrong type fails and does not fall back in silence.
+/// The value of an optional key. Only an absent key takes `default`. A wrong type fails.
 fn lookupF32Or(p: parser.Parsed, key: []const u8, default: f32) Error!f32 {
     return lookupF32(p, key) catch |err| switch (err) {
         error.MissingKey => default,

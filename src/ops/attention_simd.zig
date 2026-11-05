@@ -1,30 +1,52 @@
-//! The vector part kernel of CPU decode attention, for the AVX2 and FMA
-//! backends. It computes the record of `naive.attentionPartTyped` over the same
-//! part, with `@Vector(8, f32)` lanes over the head width. The tiles, the online
-//! fold, the head blocks, and the record layout are those of naive. The dot
-//! products, the value sums, the exponentials, and the exponential sums run in
-//! lanes, so the record bits differ from naive inside a measured tolerance.
-//! naive stays the reference.
+//! The vector part kernel of CPU decode attention, for the AVX2 and FMA backends. It computes the
+//! record of `naive.attentionPartTyped` over the same part, with `@Vector(8, f32)` lanes over the
+//! head width. The tiles, the online fold, the head blocks, and the record layout are those of
+//! naive. The dot products, the value sums, the exponentials, and the exponential sums run in
+//! lanes, so the record bits differ from naive inside a measured tolerance. naive stays the
+//! reference.
 //!
-//! The bits of one head are a function of its query, its part, and the KV rows
-//! alone. Five rules hold that:
-//! 1. Lane j of a score accumulator adds the products of dims j, j + 8, j + 16,
-//!    and so on, one fused multiply-add each, in ascending order.
+//! Bit rules. The bits of one head are a function of its query, its part, and the KV rows alone.
+//! Five rules hold that:
+//! 1. Lane j of a score accumulator adds the products of dims j, j + 8, j + 16, and so on, one
+//!    fused multiply-add each, in ascending order.
 //! 2. One fixed tree folds the 8 lanes of a score:
-//!    `((x0 + x1) + (x2 + x3)) + ((x4 + x5) + (x6 + x7))`. `transposeAdd` folds
-//!    up to 8 accumulators at once with this tree, and it pads a short set with
-//!    zero vectors. So the head block size, the position step, and a short last
-//!    tile do not change a score.
-//! 3. Lane d of a value sum adds the weighted V rows in ascending position
-//!    order, one fused multiply-add each. A store and a reload between two runs
-//!    of positions are exact.
+//!    `((x0 + x1) + (x2 + x3)) + ((x4 + x5) + (x6 + x7))`. `transposeAdd` folds up to 8
+//!    accumulators at once with this tree, and it pads a short set with zero vectors. A pad lane
+//!    never meets a real lane. So the head block size, the position step, and a short last tile
+//!    do not change a score.
+//! 3. Lane d of a value sum adds the weighted V rows in ascending position order, one fused
+//!    multiply-add each. A store and a reload between two runs of positions are exact.
 //! 4. The exponential sum of a tile folds its 8 lane sums with the same tree.
-//! 5. `expNeg` of `exp_simd.zig` computes each lane from the input of that
-//!    lane alone, with one fixed sequence of IEEE operations. So a score gets
-//!    the same exponential at any lane position, and a short last tile changes
-//!    no exponential.
-//! So a head split, a block split, and a thread split give the same record
-//! bytes, and software prefetch changes no bit.
+//! 5. `expNeg` of `exp_simd.zig` computes each lane from the input of that lane alone, with one
+//!    fixed sequence of IEEE operations. So a score gets the same exponential at any lane
+//!    position, and a short last tile changes no exponential.
+//!
+//! So a head split, a block split, and a thread split give the same record bytes, and software
+//! prefetch changes no bit.
+//!
+//! Head blocks. A block holds one score row per head on the stack, 64 KiB at 8 heads. That bound
+//! holds per block instance. A Debug build can keep every inlined block instance in one frame.
+//! The 8 block instances unroll their chunk and head loops into the one `partKernel` body.
+//!
+//! Register blocks. `block_accs` is 8 because a core with two FMA pipes at a latency of about 4
+//! cycles needs 8 independent chains to keep both busy. AVX2 names 16 ymm registers, and the
+//! other 8 hold the loaded K or V chunks. A block of n heads walks `8 / n` positions or chunks
+//! per step, so 4 heads walk 2 and 1 head walks 8.
+//!
+//! Value runs. A run of the value pass reads one 64-byte line from each of its V rows per chunk
+//! step, so a short run keeps few streams open. At depth 8192 and a tile of 256, runs of 32
+//! measure 8 to 18 percent faster on one worker than runs of the whole tile, and 1 to 5 percent
+//! faster with the units spread over 16 workers.
+//!
+//! Prefetch distance. At depth 8192 with the units spread over 16 workers, distance 16 measures
+//! 6 to 26 percent faster on the three bench rows that stream from DRAM, and 2 to 4 percent
+//! faster on the row that stays in the last-level cache. At a tile of 256 the same rows measured
+//! 4 to 33 percent, one worker gained 21 to 38 percent, and distances 8 and 32 measured within 6
+//! percent of 16.
+//!
+//! Inlining. `partKernel` inlines into `Kernels.attentionPartTyped`, and every helper below it
+//! inlines into `partKernel`. So each kernel set holds one copy of the kernel, and
+//! `tools/simd_probe.zig` reads the whole body under one name.
 
 const std = @import("std");
 const attn_cpu = @import("../core/attn_cpu.zig");
@@ -45,29 +67,17 @@ const tile: usize = limits.attn_cpu_tile;
 /// up to it, and a wider head runs the naive kernel.
 const max_head_dim: usize = limits.attn_max_head_dim;
 
-/// The widest head block. A block holds one score row per head on the stack,
-/// 64 KiB at 8 heads. That bound holds per block instance. A Debug build can
-/// keep every inlined block instance in one frame.
+/// The widest head block. See "Head blocks" in the header.
 const max_group: usize = limits.attn_max_group;
 
-/// Accumulators one register block holds. A core with two FMA pipes at a
-/// latency of about 4 cycles needs 8 independent chains to keep both busy.
-/// AVX2 names 16 ymm registers, and the other 8 hold the loaded K or V chunks.
+/// Accumulators one register block holds. See "Register blocks" in the header.
 const block_accs = 8;
 
-/// Positions one register run of the value pass walks. A run reads one 64-byte
-/// line from each of its V rows per chunk step, so a short run keeps few
-/// streams open. At depth 8192 and a tile of 256, runs of 32 measure 8 to 18
-/// percent faster on one worker than runs of the whole tile, and 1 to 5 percent
-/// faster with the units spread over 16 workers.
+/// Positions one register run of the value pass walks. See "Value runs" in the header.
 const value_run = 32;
 
 /// How far ahead the prefetching kernels fetch the K and V rows, in positions.
-/// At depth 8192 with the units spread over 16 workers, distance 16 measures 6
-/// to 26 percent faster on the three bench rows that stream from DRAM, and 2 to
-/// 4 percent faster on the row that stays in the last-level cache. At a tile of
-/// 256 the same rows measured 4 to 33 percent, one worker gained 21 to 38
-/// percent, and distances 8 and 32 measured within 6 percent of 16.
+/// See "Prefetch distance" in the header.
 const prefetch_positions = 16;
 
 comptime {
@@ -90,8 +100,7 @@ const Vec = exp_simd.Vec;
 
 /// The compile-time choices of one kernel set.
 const Options = struct {
-    /// Prefetch the K and V rows this many positions ahead. Null prefetches
-    /// nothing.
+    /// Prefetch the K and V rows this many positions ahead. Null prefetches nothing.
     prefetch: ?usize = null,
 };
 
@@ -108,8 +117,7 @@ fn Block(comptime E: type) type {
         kv_off: usize,
         t_lo: usize,
         t_hi: usize,
-        /// The record of the first block head. Head g starts at
-        /// `g * rec_stride`.
+        /// The record of the first block head. Head g starts at `g * rec_stride`.
         recs: []f32,
         rec_stride: usize,
         scale: f32,
@@ -130,9 +138,8 @@ const Start = enum {
 /// attention names of an ops backend.
 fn Kernels(comptime opts: Options) type {
     return struct {
-        /// One part of a decode attention row, with the asserts and the record
-        /// layout of `naive.attentionPartTyped`. A head width that is not a
-        /// multiple of 8, or one over 256, runs the naive kernel.
+        /// One part of a decode attention row, with the asserts and the record layout of
+        /// `naive.attentionPartTyped`. A head width off the lane grid, or over 256, runs naive.
         pub fn attentionPartTyped(
             comptime E: type,
             q: []const f32,
@@ -168,9 +175,8 @@ fn Kernels(comptime opts: Options) type {
 
         pub const attentionMerge = naive.attentionMerge;
 
-        /// The attention row of every query head, serial: each part of the row
-        /// in order through this part kernel, then `attentionMerge`. The
-        /// arguments and the buffer sizes are those of `naive.attentionRowTyped`.
+        /// The attention row of every query head, serial: each part in order, then the merge.
+        /// The arguments and the buffer sizes are those of `naive.attentionRowTyped`.
         pub fn attentionRowTyped(
             comptime E: type,
             q: []const f32,
@@ -202,9 +208,7 @@ fn Kernels(comptime opts: Options) type {
 
 // -- helpers ----------------------------------------------------------------
 
-/// The body of `Kernels.attentionPartTyped`. It inlines there, and every
-/// helper below inlines into it. So each kernel set holds one copy of the
-/// kernel, and `tools/simd_probe.zig` reads the whole body under one name.
+/// The body of `Kernels.attentionPartTyped`. See "Inlining" in the header.
 inline fn partKernel(
     comptime E: type,
     comptime opts: Options,
@@ -221,9 +225,10 @@ inline fn partKernel(
     recs: []f32,
     rec_stride: usize,
 ) void {
-    // The 8 block instances unroll their chunk and head loops into this one
-    // body, past the default quota of 1000 comptime branches.
+    // The block instances unroll past the default quota of 1000 comptime branches.
     @setEvalBranchQuota(20_000);
+
+    // Check the arguments.
     comptime assert(E == f32 or E == f16);
     assert(h_lo < h_hi);
     assert(h_hi <= n_heads);
@@ -239,6 +244,8 @@ inline fn partKernel(
     const rec_len: usize = attn_cpu.recordElems(@intCast(head_dim));
     assert(rec_stride >= rec_len);
     assert(recs.len >= (h_hi - h_lo - 1) * rec_stride + rec_len);
+
+    // Run the naive kernel on a head width off the lane grid.
     if (head_dim % lanes != 0 or head_dim > max_head_dim) {
         naive.attentionPartTyped(
             E,
@@ -263,6 +270,7 @@ inline fn partKernel(
     // The tile loop of `foldBlock` runs at most this many times.
     assert((t_hi - t_lo + tile - 1) / tile <= limits.max_model_ctx / tile);
 
+    // Cut each KV group of heads into blocks of at most `max_group`.
     const group_size = n_heads / n_kv_heads;
     const scale: f32 = 1.0 / @sqrt(@as(f32, @floatFromInt(head_dim)));
     var kv_h = h_lo / group_size;
@@ -293,6 +301,7 @@ inline fn partKernel(
         }
     }
 
+    // Check that every record is finite.
     if (std.debug.runtime_safety) {
         var h = h_lo;
         while (h < h_hi) : (h += 1) {
@@ -312,13 +321,13 @@ inline fn foldBlock(
     blk: Block(E),
 ) void {
     comptime assert(n >= 1 and n <= max_group);
-    // Row g holds the scores of head g over one tile, and the fold replaces
-    // them with the shifted exponentials.
+    // Row g holds the scores of head g over one tile, then the shifted exponentials.
     var scores: [n][tile]f32 = undefined;
     var m_run: [n]f32 = undefined;
     var l_run: [n]f32 = undefined;
     var rescale: [n]f32 = undefined;
 
+    // Fold the tiles in order.
     var tile_lo = blk.t_lo;
     while (tile_lo < blk.t_hi) : (tile_lo += tile) {
         const tile_n = @min(blk.t_hi - tile_lo, tile);
@@ -331,6 +340,7 @@ inline fn foldBlock(
         valueTile(E, n, opts, blk, tile_lo, tile_n, &scores, first, rescale);
     }
 
+    // Store the running maximum and sum of each head.
     for (0..n) |g| {
         const rec = blk.recs[g * blk.rec_stride ..][0..attn_cpu.recordElems(
             @intCast(blk.head_dim),
@@ -351,7 +361,7 @@ inline fn scoreTile(
     tile_n: usize,
     scores: *[n][tile]f32,
 ) void {
-    // 4 heads walk 2 positions per step, and 1 head walks 8.
+    // See "Register blocks" in the header.
     const step: usize = comptime @max(1, block_accs / n);
     var t: usize = 0;
     while (t + step <= tile_n) : (t += step) {
@@ -379,6 +389,8 @@ inline fn scoreStep(
     const line_elems = 64 / @sizeOf(E);
     const pos = tile_lo + t;
     var acc = [_]Vec{@splat(0)} ** (n * step);
+
+    // Accumulate the dot products one lane chunk at a time.
     var d: usize = 0;
     while (d < blk.head_dim) : (d += lanes) {
         if (opts.prefetch) |dist| {
@@ -406,6 +418,7 @@ inline fn scoreStep(
         }
     }
 
+    // Fold the lanes and store the scaled scores.
     const sums = transposeAdd(n * step, acc) * @as(Vec, @splat(blk.scale));
     inline for (0..n) |g| {
         inline for (0..step) |p| {
@@ -414,14 +427,13 @@ inline fn scoreStep(
     }
 }
 
-/// Fold one tile of scores into the running state of one head. The row turns
-/// into the shifted exponentials. Returns the factor that the value sums of
-/// the head take before the tile adds to them: 1 when the tile does not raise
-/// the maximum.
+/// Fold one tile of scores into the running state of one head. The row turns into the shifted
+/// exponentials. Returns the factor for the value sums: 1 when the tile does not raise the maximum.
 inline fn foldScores(row: *[tile]f32, tile_n: usize, first: bool, m_run: *f32, l_run: *f32) f32 {
     assert(tile_n >= 1);
     assert(tile_n <= tile);
 
+    // Take the maximum of the tile.
     const padded = (tile_n + lanes - 1) / lanes * lanes;
     if (std.debug.runtime_safety) {
         for (row[0..tile_n]) |s| {
@@ -429,8 +441,7 @@ inline fn foldScores(row: *[tile]f32, tile_n: usize, first: bool, m_run: *f32, l
         }
     }
 
-    // A pad of -inf leaves the maximum alone. The maximum is exact in any
-    // order.
+    // A pad of -inf leaves the maximum alone. The maximum is exact in any order.
     @memset(row[tile_n..padded], -std.math.inf(f32));
     var max_v: Vec = row[0..lanes].*;
     var i: usize = lanes;
@@ -440,6 +451,7 @@ inline fn foldScores(row: *[tile]f32, tile_n: usize, first: bool, m_run: *f32, l
 
     const m_tile = @reduce(.Max, max_v);
 
+    // Rescale the running sum when the maximum rises.
     var factor: f32 = 1;
     if (first) {
         m_run.* = m_tile;
@@ -450,9 +462,8 @@ inline fn foldScores(row: *[tile]f32, tile_n: usize, first: bool, m_run: *f32, l
         m_run.* = m_tile;
     }
 
+    // Turn the row into exponentials. `expNeg` maps the -inf pad to 0, which leaves the sums alone.
     const m: Vec = @splat(m_run.*);
-    // `expNeg` turns the -inf pad into 0, and a zero leaves the lane sums
-    // alone. The value pass reads no pad.
     var sum_v: Vec = @splat(0);
     i = 0;
     while (i < padded) : (i += lanes) {
@@ -467,6 +478,7 @@ inline fn foldScores(row: *[tile]f32, tile_n: usize, first: bool, m_run: *f32, l
         }
     }
 
+    // Add the tile sum to the running sum.
     const l = l_run.* + transposeAdd(1, .{sum_v})[0];
     // The term at the maximum adds exp(0) = 1, and no term is negative.
     assert(l >= 1);
@@ -474,8 +486,7 @@ inline fn foldScores(row: *[tile]f32, tile_n: usize, first: bool, m_run: *f32, l
     return factor;
 }
 
-/// Add the weighted V rows of one tile to the value sums of the block heads,
-/// in runs of `value_run` positions.
+/// Add the weighted V rows of one tile to the value sums of the block heads, in runs.
 inline fn valueTile(
     comptime E: type,
     comptime n: usize,
@@ -487,7 +498,7 @@ inline fn valueTile(
     first: bool,
     rescale: [n]f32,
 ) void {
-    // 4 heads walk 2 chunks per step, and 1 head walks 8.
+    // See "Register blocks" in the header.
     const chunks: usize = comptime @max(1, block_accs / n);
     var run_lo: usize = 0;
     while (run_lo < tile_n) : (run_lo += value_run) {
@@ -504,9 +515,8 @@ inline fn valueTile(
     }
 }
 
-/// The value sums of the block heads over `chunks` lane chunks from `d`, for
-/// one run of positions. The accumulators stay in registers across the run.
-/// One V chunk load and one widening feed every head of the block.
+/// The value sums of the block heads over `chunks` lane chunks from `d`, for one run of
+/// positions. The accumulators stay in registers across the run.
 inline fn valueStep(
     comptime E: type,
     comptime n: usize,
@@ -523,12 +533,13 @@ inline fn valueStep(
 ) void {
     comptime assert(n * chunks <= lanes);
     const line_elems = 64 / @sizeOf(E);
+
+    // Load the accumulators from the records.
     var acc: [n * chunks]Vec = undefined;
     inline for (0..n) |g| {
         const a = blk.recs[g * blk.rec_stride + d ..][0 .. chunks * lanes];
         inline for (0..chunks) |j| {
-            // A factor of 1 is exact, so a tile that does not raise the
-            // maximum leaves the sums alone.
+            // A factor of 1 is exact, so a tile without a new maximum leaves the sums alone.
             acc[g * chunks + j] = switch (start) {
                 .zero => @splat(0),
                 .rescale => @as(Vec, a[j * lanes ..][0..lanes].*) * @as(Vec, @splat(rescale[g])),
@@ -537,6 +548,7 @@ inline fn valueStep(
         }
     }
 
+    // Add the weighted V rows. One V chunk load and one widening feed every head.
     var t = run_lo;
     while (t < run_lo + run_n) : (t += 1) {
         const off = (tile_lo + t) * blk.kv_stride + blk.kv_off + d;
@@ -566,6 +578,7 @@ inline fn valueStep(
         }
     }
 
+    // Store the accumulators back to the records.
     inline for (0..n) |g| {
         const a = blk.recs[g * blk.rec_stride + d ..][0 .. chunks * lanes];
         inline for (0..chunks) |j| {
@@ -581,11 +594,8 @@ inline fn loadRow(comptime E: type, src: []const E, off: usize) Vec {
     return if (E == f32) raw else @floatCast(raw);
 }
 
-/// Fold the lanes of each of `m` accumulators: lane i of the result is the sum
-/// of the lanes of `accs[i]`. Every lane takes the tree
-/// `((x0 + x1) + (x2 + x3)) + ((x4 + x5) + (x6 + x7))`. A zero vector pads a
-/// set of fewer than 8, and a pad lane never meets a real lane. So a lane gets
-/// the same bits at any `m`.
+/// Fold the lanes of each of `m` accumulators: lane i of the result is the sum of the lanes
+/// of `accs[i]`. See bit rule 2 in the header. A lane gets the same bits at any `m`.
 inline fn transposeAdd(comptime m: usize, accs: [m]Vec) Vec {
     comptime assert(m >= 1 and m <= lanes);
     var a = [_]Vec{@splat(0)} ** lanes;
@@ -638,15 +648,12 @@ const AttnShape = attention_ref.AttnShape;
 const Lead = attention_ref.Lead;
 const cpu_tile = attention_ref.cpu_tile;
 
-/// The largest gap between a vector part and the naive part over the same
-/// range that the part test accepts. The gap reads the two numbers of a record
-/// that the merge weighs: the value average `a / l` and the log-sum-exp
-/// `m + ln(l)`. Over the cases of the test, the gap measures at most 2.53e-6.
-/// The bound is 11.9 times that maximum.
+/// The largest gap to the naive part that the part test accepts, over the value average
+/// `a / l` and the log-sum-exp `m + ln(l)`. The cases measure at most 2.53e-6, so the bound
+/// is 11.9 times that.
 const simd_part_abs_tol: f64 = 3.0e-5;
 
-/// Run the vector part and the naive part over one range and return the
-/// largest gap in the value averages and the log-sum-exps.
+/// Run the vector part and the naive part over one range and return the largest gap.
 fn partGapToNaive(
     comptime E: type,
     r: std.Random,

@@ -122,7 +122,7 @@ duck-typed surface, and `serve/residency.zig` reaches the swap hooks through
 | `chunked_prefill` | `bool` | `step_row.chunkedPrefill`, which picks the chunked prefill loop in `run_cmd.prefillAndStream` and `bench_model_exec.doOneTurn` | the Llama fused runner, both hybrid runners, and the two CPU runners in a build without GPU ops. Absent or false, the prefill loop calls `step` per token. The Qwen fused runner has its own `run` loop |
 | `prefillBatch` | `fn (*Self, []const u32, u32) ![]f32` | `run_cmd.prefillAndStream`, `run_cmd.prefillCachedAndStream`, and `bench_model_exec.prefillChunks`, which pass chunks of slot 0 at consecutive positions | every runner: the two CPU runners, both fused runners, and both hybrid runners |
 | `prefill_batch_max` | `u32` | the same two loops, which cut the prompt into chunks of at most this many rows | every runner |
-| `maxStepRows` | `fn (*const Self) u32` | `Sessions.init` sizes the row scratch with it. `cli/serve_common` clamps the prefill chunk to it | every runner |
+| `maxStepRows` | `fn (*const Self) u32` | `Sessions.init` sizes the row scratch with it. `cli/boot/serve_boot` clamps the prefill chunk to it | every runner |
 | `logits` | `[]f32` | `Sessions.init` derives the vocab stride from its length. `advance` and `copyFinalLogits` read the compact rows | every runner |
 | `n_slots` | `u32` | `Sessions.init` sizes the session table. `Residency.init` reads it as the physical slot count | every runner |
 | `max_seq` | `u32` | `feed`, `advance`, and `Residency.capacityRemaining` gate the window on it | every runner |

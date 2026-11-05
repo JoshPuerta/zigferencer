@@ -1,11 +1,21 @@
-//! The binary wire protocol as a serve-engine adapter. `serve/engine.zig` owns
-//! the engine thread, queues, sink, and connection lifecycle. This file supplies
-//! the binary transport: two tasks per connection. A frame reader decodes
-//! `protocol.zig` into `Request` values, and a frame writer encodes `OutEvent`
-//! values back. The binary `serve` is thus a thin map onto the shared engine,
-//! the sibling of the OpenAI HTTP adapter. The connection speaks ZMTP 3.x: the
-//! server answers a DEALER peer as a ROUTER, and one ZMTP message carries one
-//! `protocol.zig` frame.
+//! The binary wire protocol as a serve-engine adapter. `serve/engine.zig` owns the engine thread,
+//! queues, sink, and connection lifecycle. This file supplies the binary transport: two tasks per
+//! connection. A frame reader decodes `protocol.zig` into `Request` values, and a frame writer
+//! encodes `OutEvent` values back. The connection uses ZMTP 3.x: the server answers a DEALER peer
+//! as a ROUTER, and one ZMTP message carries one `protocol.zig` frame.
+//!
+//! Task roots. `io.concurrent` builds an argument tuple for the function it spawns, and it cannot
+//! do that for an `anytype` parameter. So the spawned reader and writer live in a struct keyed on
+//! the engine type (`BinaryTasks`). The helpers they call (`readerLoop`, `fatalFrame`) stay
+//! `anytype`, because a caller invokes them and no spawn takes them.
+//!
+//! Handshake order. ZMTP lets each peer send its greeting and READY before it reads those of the
+//! other peer. So the writer and the reader need no new synchronization.
+//!
+//! Loopback tests. They drive the whole adapter over 127.0.0.1: accept, frame decode, the queues,
+//! the engine loop, the writer, and the shutdown handshake. The fake model is the scheduler tests'
+//! one. Its chain is `next = (token + 1) % 8`, its codec maps `byte % 8`, a piece is '0' + id, and
+//! eos is 7. A test skips when the sandbox forbids a loopback bind.
 
 const std = @import("std");
 const Io = std.Io;
@@ -27,14 +37,13 @@ const log = std.log.scoped(.serve);
 /// The long ZMTP frame head: one flags byte and an 8-byte size.
 const zmtp_head_bytes: usize = 9;
 
-/// One frame head plus the largest body the server sends, so
-/// `zmtp_head_bytes + protocol.max_server_frame_bytes`. The PONG and ERROR
-/// command bodies are smaller than that body.
+/// One frame head plus the largest body the server sends. The PONG and ERROR command bodies are
+/// smaller than that body.
 const writer_frame_bytes: usize = zmtp_head_bytes + protocol.max_server_frame_bytes;
 
 // -- types ------------------------------------------------------------------
 
-/// Where to bind (TCP or unix). Re-exported so callers keep one name.
+/// Where to bind: TCP or a unix socket.
 pub const Transport = engine_mod.Endpoint;
 
 /// The reader maps these errors to a silent close or to a ZMTP ERROR.
@@ -49,9 +58,8 @@ const BinaryAdapter = struct {
         writer_future: Io.Future(void) = undefined,
     };
 
-    /// Spawn the writer then the reader, storing their futures in `conn.ext`. On
-    /// a spawn failure this leaves the stream closed and returns false (the
-    /// engine reclaims the slot).
+    /// Spawn the writer then the reader, and store their futures in `conn.ext`. A spawn failure
+    /// leaves the stream closed and returns false, so the engine reclaims the slot.
     pub fn onAccept(engine: anytype, conn: anytype) bool {
         log.debug("accept: conn {d}", .{conn.id});
         const Tasks = BinaryTasks(@TypeOf(engine.*));
@@ -61,7 +69,7 @@ const BinaryAdapter = struct {
             return false;
         };
         conn.ext.reader_future = engine.io.concurrent(Tasks.reader, .{ engine, conn }) catch {
-            // The writer is up: close its queue, let it shut the stream down.
+            // The writer is up, so close its queue and let it shut the stream down.
             engine.closeOutput(conn);
             conn.ext.writer_future.await(engine.io);
             conn.stream.close(engine.io);
@@ -70,8 +78,8 @@ const BinaryAdapter = struct {
         return true;
     }
 
-    /// Close the out-queue. The writer drains it, shuts the stream down (waking
-    /// the reader), and both tasks exit.
+    /// Close the out-queue. The writer drains it and shuts the stream down, which wakes the
+    /// reader, and both tasks exit.
     pub fn beginClose(engine: anytype, conn: anytype) void {
         log.debug("close: conn {d}", .{conn.id});
         engine.closeOutput(conn);
@@ -82,9 +90,8 @@ const BinaryAdapter = struct {
         conn.ext.writer_future.await(engine.io);
     }
 
-    /// Sends the greeting and READY of the ROUTER side, then the refusal as
-    /// one message, and closes. It reads nothing, so a silent peer cannot
-    /// stall the acceptor.
+    /// Sends the greeting and READY of the ROUTER side, then the refusal as one message, and
+    /// closes. It reads nothing, so a silent peer cannot stall the acceptor.
     pub fn refuse(io: Io, stream: *net.Stream) void {
         log.debug("refuse: connection slots full", .{});
         const ev = OutEvent.fail(0, 0, .connections_exhausted, "connection slots full");
@@ -97,33 +104,25 @@ const BinaryAdapter = struct {
             w.interface.flush() catch break :send;
         }
 
-        // A close over the unread peer handshake resets the connection. The
-        // FIN of the send shutdown reaches the peer first, so the peer reads
-        // the refusal and then the end of the stream.
+        // A close over the unread peer handshake resets the connection. Shut the send side first,
+        // so the peer reads the refusal and then the end of the stream.
         stream.shutdown(io, .send) catch {};
         stream.close(io);
     }
 };
 
-/// The serve engine wearing the binary transport.
+/// The serve engine with the binary transport.
 pub fn Server(comptime Engine: type, comptime CodecT: type) type {
     return engine_mod.ServeEngine(Engine, CodecT, BinaryAdapter);
 }
 
-//
-// The per-connection tasks are concrete over the engine type. `io.concurrent`
-// builds an argument tuple for the function it spawns, and it cannot do that
-// for an `anytype` parameter. The spawned reader and writer therefore live in
-// a struct keyed on the engine. The helpers they call (`readerLoop`,
-// `fatalFrame`) stay `anytype`, because a caller invokes them and no spawn
-// takes them.
+/// The per-connection task roots, concrete over the engine type. See "Task roots" in the header.
 fn BinaryTasks(comptime Eng: type) type {
     return struct {
         fn reader(engine: *Eng, conn: *Eng.Conn) void {
             span.nameThread("zf-read");
             readerLoop(engine, conn);
-            // The engine must hear about the drop exactly once, even when the
-            // queue is briefly full. A closed queue means teardown already runs.
+            // Tell the engine about the drop. A closed queue means teardown already runs.
             engine.submit(.{
                 .conn = conn.id,
                 .request_id = 0,
@@ -139,9 +138,7 @@ fn BinaryTasks(comptime Eng: type) type {
             var w = conn.stream.writer(engine.io, &write_buf);
             var frame: [writer_frame_bytes]u8 = undefined;
             send: {
-                // ZMTP lets each peer send its greeting and READY before it
-                // reads those of the other peer. The writer and the reader
-                // therefore need no new synchronization.
+                // Send the opening first. See "Handshake order" in the header.
                 writeOpening(&w.interface, &frame) catch break :send;
                 w.interface.flush() catch break :send;
                 log.debug("handshake: conn {d} sent greeting and READY", .{conn.id});
@@ -167,6 +164,7 @@ fn BinaryTasks(comptime Eng: type) type {
 // -- helpers ----------------------------------------------------------------
 
 fn readerLoop(engine: anytype, conn: anytype) void {
+    // Read the peer handshake, or refuse it with a ZMTP ERROR.
     var read_buf: [4096]u8 = undefined;
     var r = conn.stream.reader(engine.io, &read_buf);
     const peer = readHandshake(&r.interface, &conn.ext.payload_buf) catch |e| {
@@ -186,9 +184,8 @@ fn readerLoop(engine: anytype, conn: anytype) void {
     };
     log.debug("handshake: conn {d} accepted peer type '{s}'", .{ conn.id, peer });
 
-    // Each pass reads one frame head and one body. A command body holds at
-    // most `zmtp.max_ready_bytes`, and a message at most
-    // `zmtp.max_message_bytes`.
+    // Read one frame per pass. A command body holds at most `zmtp.max_ready_bytes`, and a message
+    // at most `zmtp.max_message_bytes`.
     while (true) {
         const head = readFrameHead(&r.interface) catch |e| switch (e) {
             error.ReadFailed, error.EndOfStream => return,
@@ -198,6 +195,7 @@ fn readerLoop(engine: anytype, conn: anytype) void {
         const sp = span.begin(.socket_read);
         defer sp.end();
 
+        // Answer a PING, and ignore the other commands.
         if (head.command) {
             if (head.size > zmtp.max_ready_bytes) {
                 return fatalFrame(engine, conn, .frame_too_large, "command too large");
@@ -223,6 +221,7 @@ fn readerLoop(engine: anytype, conn: anytype) void {
             continue;
         }
 
+        // Read one whole message and check its header.
         if (head.more or head.size < protocol.header_bytes) {
             return fatalFrame(engine, conn, .malformed_frame, "not one frame");
         }
@@ -240,6 +239,7 @@ fn readerLoop(engine: anytype, conn: anytype) void {
             return fatalFrame(engine, conn, .malformed_frame, "payload_len mismatch");
         }
 
+        // Decode the payload and hand the request to the engine.
         const msg = protocol.decodeClientPayload(h.msg_type, payload) catch |e| {
             return fatalFrame(engine, conn, decodeErrorCode(e), @errorName(e));
         };
@@ -254,9 +254,8 @@ fn readerLoop(engine: anytype, conn: anytype) void {
     }
 }
 
-/// Reads the peer greeting and READY, which hold at most
-/// `zmtp.greeting_bytes`, one frame head, and `zmtp.max_ready_bytes`. Returns
-/// the peer socket type, which borrows `body_buf`.
+/// Reads the peer greeting and READY, which hold at most `zmtp.greeting_bytes`, one frame head,
+/// and `zmtp.max_ready_bytes`. Returns the peer socket type, which borrows `body_buf`.
 fn readHandshake(r: *Io.Reader, body_buf: []u8) HandshakeError![]const u8 {
     std.debug.assert(body_buf.len >= zmtp.max_ready_bytes);
 
@@ -276,8 +275,8 @@ fn readHandshake(r: *Io.Reader, body_buf: []u8) HandshakeError![]const u8 {
     return ready.socket_type;
 }
 
-/// Reads the flags byte, then the rest of the head that the flags announce,
-/// at most `zmtp_head_bytes` in all.
+/// Reads the flags byte, then the rest of the head that the flags announce.
+/// The head holds at most `zmtp_head_bytes`.
 fn readFrameHead(r: *Io.Reader) (Io.Reader.Error || zmtp.Error)!zmtp.FrameHead {
     var head: [zmtp_head_bytes]u8 = undefined;
     head[0] = try r.takeByte();
@@ -304,16 +303,14 @@ fn decodeErrorCode(e: protocol.DecodeError) protocol.ErrorCode {
     };
 }
 
-/// A refused handshake answers with one ZMTP ERROR, then closes THAT
-/// connection.
+/// A refused handshake answers with one ZMTP ERROR, then closes THAT connection.
 fn fatalHandshake(engine: anytype, conn: anytype, reason: []const u8) void {
     log.debug("handshake: conn {d} refused, {s}", .{ conn.id, reason });
     _ = conn.out_q.put(engine.io, &.{OutEvent.zmtpError(reason)}, 0) catch {};
     engine.closeOutput(conn);
 }
 
-/// Writes the greeting and the READY command of the ROUTER side. `frame`
-/// holds the READY frame during the encode.
+/// Writes the greeting and the READY command of the ROUTER side. `frame` holds the READY frame.
 fn writeOpening(w: *Io.Writer, frame: *[writer_frame_bytes]u8) Io.Writer.Error!void {
     var greeting: [zmtp.greeting_bytes]u8 = undefined;
     zmtp.encodeGreeting(&greeting);
@@ -325,9 +322,8 @@ fn writeOpening(w: *Io.Writer, frame: *[writer_frame_bytes]u8) Io.Writer.Error!v
     try w.writeAll(body[0..n]);
 }
 
-/// Writes one event as one ZMTP frame. A ZMTP variant becomes a command
-/// frame, and every other variant becomes a message that holds one
-/// `protocol.zig` frame.
+/// Writes one event as one ZMTP frame. A ZMTP variant becomes a command frame, and every other
+/// variant becomes a message that holds one `protocol.zig` frame.
 fn writeEvent(
     w: *Io.Writer,
     frame: *[writer_frame_bytes]u8,
@@ -347,8 +343,8 @@ fn writeEvent(
     try w.writeAll(body[0..n]);
 }
 
-/// Lift a borrowed wire message into an owned Request. This dupes the text into
-/// the gpa, and the scheduler frees it.
+/// Lift a borrowed wire message into an owned Request. The text goes into the gpa, and the
+/// scheduler frees it.
 fn toRequest(
     gpa: Allocator,
     conn_id: u32,
@@ -391,12 +387,11 @@ fn toRequest(
     };
 }
 
-/// OutEvent -> wire frame. The inline arrays become borrowed slices for the
-/// duration of the encode.
+/// OutEvent -> wire frame. The inline arrays become borrowed slices for the encode.
 fn encodeMessage(ev: *const OutEvent, frame: []u8) usize {
     const msg: protocol.ServerMsg = switch (ev.body) {
-        // Pointer captures where a slice borrows from the event: a by-value
-        // capture dies at the arm's end, before the encode reads it.
+        // Capture by pointer where a slice borrows from the event, because a by-value capture
+        // dies at the end of the arm.
         .hello_ack => |*m| .{ .hello_ack = .{
             .protocol_version = protocol.protocol_version,
             .max_seq = m.max_seq,
@@ -450,13 +445,6 @@ fn encodeMessage(ev: *const OutEvent, frame: []u8) usize {
 
 // -- tests ------------------------------------------------------------------
 
-//
-// The test drives the whole adapter over 127.0.0.1. It covers accept, frame
-// decode, the queues, the engine loop, the writer, and the shutdown handshake.
-// The fake model is the scheduler tests' one. Its chain is
-// `next = (token + 1) % 8`, its codec maps `byte % 8`, a piece is '0' + id,
-// and eos is 7. Every suite run includes this test. It skips when the sandbox
-// forbids a loopback bind.
 const Sessions = @import("../runtime/session.zig").Sessions;
 const StepRow = @import("../runtime/step_row.zig").StepRow;
 const Client = @import("client.zig").Client;
@@ -589,9 +577,8 @@ test "loopback: hello, system-prompt session, one turn, clean shutdown" {
     try std.testing.expectEqual(@as(usize, 3), turn.n_tokens);
     try std.testing.expectEqualSlices(u32, &.{ 1, 2, 3 }, ids[0..3]);
     try std.testing.expectEqualStrings("123", text[0..turn.text_len]);
-    // System prompt "abc" (3 tokens) + turn "x" (1) + two committed of the
-    // three sampled. The third stays pending, because a sampled token commits
-    // on the next step.
+    // Prompt "abc" (3) + turn "x" (1) + two of the three sampled tokens. The third commits on
+    // the next step.
     try std.testing.expectEqual(@as(u32, 6), turn.kv_pos);
 
     // EOS path: feeding byte 6 makes the first sampled token 7 == eos.
@@ -599,8 +586,7 @@ test "loopback: hello, system-prompt session, one turn, clean shutdown" {
     const turn2 = try client.collectTurn(&ids, &text);
     try std.testing.expectEqual(protocol.FinishReason.eos, turn2.finish_reason);
 
-    // A refused request surfaces the server's reason: the typed error plus
-    // the recorded code and detail, in the server's words.
+    // A refused request gives the typed error, plus the recorded code and detail.
     _ = try client.generate(999, "x", 1, null);
     try std.testing.expectError(error.ServerError, client.collectTurn(&ids, &text));
     const le = client.last_error.?;
@@ -608,8 +594,7 @@ test "loopback: hello, system-prompt session, one turn, clean shutdown" {
     try std.testing.expectEqualStrings("no such session", le.detail());
     try std.testing.expectEqual(false, le.truncated);
 
-    // An append over the wire returns the position after each pair. The fake
-    // codec maps each byte to one id.
+    // An append returns the position after each pair. The fake codec maps each byte to one id.
     const kept = try client.openSession("", protocol.Sampling.greedy);
     const appended = try client.append(
         kept,
@@ -622,7 +607,7 @@ test "loopback: hello, system-prompt session, one turn, clean shutdown" {
     run_future.await(io);
 }
 
-test "loopback: keep, hang up, resume on a new connection, and the next turn equals an undropped twin" {
+test "loopback: keep, hang up, resume, and the next turn equals an undropped twin" {
     const gpa = std.testing.allocator;
     const io = std.testing.io;
     var arena_state = std.heap.ArenaAllocator.init(gpa);
@@ -707,8 +692,7 @@ test "loopback: keep, hang up, resume on a new connection, and the next turn equ
     try std.testing.expectEqual(protocol.ErrorCode.unknown_session, second.last_error.?.code);
     try std.testing.expectEqualStrings("no such lease", second.last_error.?.detail());
 
-    // Turn 2 on the resumed session equals turn 2 of the twin, ids and
-    // position, the carried token included.
+    // Turn 2 on the resumed session equals turn 2 of the twin, in ids and position.
     _ = try second.generate(resumed.id, "x", 3, null);
     var got: [8]u32 = undefined;
     const r2 = try second.collectTurn(&got, &text);

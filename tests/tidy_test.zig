@@ -15,6 +15,9 @@
 //!    `api`, `helpers`, `tests`. A function in `api` is public, a function in
 //!    `helpers` is private, and neither section declares a type.
 //! 6. Every script keeps the rules that tools/README.md states and a program can check.
+//! 7. An import points down the layers. The engine reads no CLI file. The CLI
+//!    building blocks read no command. No command reads another command. No
+//!    file outside `src/dev/` reads a developer file.
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
@@ -30,14 +33,32 @@ const testing_token = "std." ++ "testing";
 const print_token = "std.debug." ++ "print(";
 
 /// Files that import `std.testing` and sleep in production code on purpose.
-const sleep_allowed = [_][]const u8{ "cli/client_cmd.zig", "core/span.zig" };
+const sleep_allowed = [_][]const u8{ "cli/client/client_reconnect.zig", "core/span.zig" };
 
 /// Files whose job is to print on a test failure.
 const print_allowed = [_][]const u8{ "core/prop.zig", "core/test_fixtures.zig" };
 
+/// The files that hold a command table. They name every command on purpose.
+const table_files = [_][]const u8{ "cli/command.zig", "dev/dev_command.zig" };
+
+/// The CLI files that every command reads. Each one sits below all commands.
+const building_blocks = [_][]const u8{
+    "cli/args.zig",
+    "cli/context.zig",
+    "cli/flag_groups.zig",
+    "cli/prompt.zig",
+    "cli/select.zig",
+    "cli/style.zig",
+};
+
+/// The directories of the engine. No file under one reads the CLI.
+const engine_dirs = [_][]const u8{
+    "core/", "engine/", "io/", "ops/", "ops_vulkan/", "runtime/", "serve/",
+};
+
 // -- types ------------------------------------------------------------------
 
-const Rule = enum { sleep, debug_print, braces, width, section, script };
+const Rule = enum { sleep, debug_print, braces, width, section, script, layer };
 
 /// The sections in file order. Every label under `tests` counts as `tests`.
 const Section = enum { constants, types, state, api, helpers, tests };
@@ -265,6 +286,89 @@ fn checkShapes(gpa: Allocator, root: []const u8) !void {
     }
 }
 
+/// The first import of `source` that points up the layers. `path` is relative to `src/`.
+fn layerViolation(path: []const u8, source: []const u8) ?Violation {
+    const opener = "@import(\"";
+    var line_no: usize = 0;
+    var lines = std.mem.splitScalar(u8, source, '\n');
+    while (lines.next()) |line| {
+        line_no += 1;
+        if (std.mem.startsWith(u8, std.mem.trimStart(u8, line, " "), "//")) continue;
+
+        const at = std.mem.indexOf(u8, line, opener) orelse continue;
+        const rest = line[at + opener.len ..];
+        const end = std.mem.indexOfScalar(u8, rest, '"') orelse continue;
+        if (importBreaksLayer(path, rest[0..end])) return .{ .rule = .layer, .line = line_no };
+    }
+
+    return null;
+}
+
+fn importBreaksLayer(path: []const u8, target: []const u8) bool {
+    const in_dev = std.mem.startsWith(u8, path, "dev/");
+    const names_dev = std.mem.indexOf(u8, target, "dev/") != null or
+        std.mem.indexOf(u8, target, "dev_") != null or
+        std.mem.endsWith(u8, target, "-dev");
+    if (!in_dev and names_dev) return true;
+
+    const names_cli = std.mem.indexOf(u8, target, "cli/") != null;
+    if (startsWithAny(path, &engine_dirs) and names_cli) return true;
+
+    if (containsString(&table_files, path)) return false;
+
+    const names_command = std.mem.endsWith(u8, target, "_cmd.zig") or
+        std.mem.endsWith(u8, target, "command.zig");
+    if (std.mem.endsWith(u8, path, "_cmd.zig") and names_command) {
+        return !std.mem.endsWith(u8, path, std.fs.path.basename(target));
+    }
+
+    const below_commands = containsString(&building_blocks, path) or
+        std.mem.startsWith(u8, path, "cli/boot/");
+    if (below_commands) return names_command or std.mem.indexOf(u8, target, "client/") != null;
+
+    return false;
+}
+
+fn startsWithAny(path: []const u8, prefixes: []const []const u8) bool {
+    for (prefixes) |prefix| {
+        if (std.mem.startsWith(u8, path, prefix)) return true;
+    }
+
+    return false;
+}
+
+fn containsString(list: []const []const u8, item: []const u8) bool {
+    for (list) |entry| {
+        if (std.mem.eql(u8, entry, item)) return true;
+    }
+
+    return false;
+}
+
+fn checkLayers(gpa: Allocator, root: []const u8) !void {
+    const io = std.testing.io;
+    var dir = try std.Io.Dir.cwd().openDir(io, root, .{ .iterate = true });
+    defer dir.close(io);
+
+    var walker = try dir.walk(gpa);
+    defer walker.deinit();
+
+    while (try walker.next(io)) |entry| {
+        if (entry.kind != .file or !std.mem.endsWith(u8, entry.path, ".zig")) continue;
+
+        const source = try dir.readFileAlloc(io, entry.path, gpa, .limited(max_file_bytes));
+        defer gpa.free(source);
+
+        if (layerViolation(entry.path, source)) |v| {
+            std.debug.print(
+                "tidy: {s}/{s}:{d} breaks rule {s}\n",
+                .{ root, entry.path, v.line, @tagName(v.rule) },
+            );
+            return error.TidyViolation;
+        }
+    }
+}
+
 fn checkTree(gpa: Allocator, root: []const u8, whole_file_is_test: bool) !void {
     const io = std.testing.io;
     var dir = try std.Io.Dir.cwd().openDir(io, root, .{ .iterate = true });
@@ -405,6 +509,38 @@ test "every source file keeps the shape rules" {
     defer gpa.free(build_zig);
 
     try std.testing.expectEqual(@as(?Violation, null), try shapeViolation(gpa, build_zig));
+}
+
+test "the layer rule finds an import that points up" {
+    const bad = [_]struct { path: []const u8, target: []const u8 }{
+        .{ .path = "cli/run_cmd.zig", .target = "../dev/tokens_cmd.zig" },
+        .{ .path = "cli/run_cmd.zig", .target = "zigferencer-dev" },
+        .{ .path = "serve/server.zig", .target = "../cli/args.zig" },
+        .{ .path = "cli/args.zig", .target = "command.zig" },
+        .{ .path = "cli/select.zig", .target = "run_cmd.zig" },
+        .{ .path = "cli/boot/boot_lines.zig", .target = "../serve_cmd.zig" },
+        .{ .path = "cli/boot/serve_boot.zig", .target = "../client/client_cmd.zig" },
+        .{ .path = "cli/run_cmd.zig", .target = "serve_cmd.zig" },
+    };
+    for (bad) |case| {
+        try std.testing.expect(importBreaksLayer(case.path, case.target));
+    }
+
+    const good = [_]struct { path: []const u8, target: []const u8 }{
+        .{ .path = "cli/command.zig", .target = "run_cmd.zig" },
+        .{ .path = "dev/dev_command.zig", .target = "tokens_cmd.zig" },
+        .{ .path = "dev/tokens_cmd.zig", .target = "zigferencer" },
+        .{ .path = "cli/run_cmd.zig", .target = "boot/boot_facts.zig" },
+        .{ .path = "cli/boot/boot_facts.zig", .target = "../args.zig" },
+        .{ .path = "serve/server.zig", .target = "client.zig" },
+    };
+    for (good) |case| {
+        try std.testing.expect(!importBreaksLayer(case.path, case.target));
+    }
+}
+
+test "every import points down the layers" {
+    try checkLayers(std.testing.allocator, "src");
 }
 
 test "no test sleeps and no non-test code prints" {

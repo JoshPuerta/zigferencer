@@ -1,21 +1,34 @@
-//! The reference client for the serve wire format. A port to another language
-//! copies this file, and the integration tests and `bench-serve` drive the
-//! server through it. The client speaks ZMTP 3.x as a DEALER, and a ZMQ
-//! binding in any language can replace it. Each request method is send-only
-//! or terminal-wait. A send-only method writes one frame and returns its
-//! request id. The caller then reads frames through `next` or `collectTurn`.
-//! A terminal-wait method writes one frame, consumes frames until the
-//! terminal message of that request, and returns the reply as a value.
-//! Terminal-wait methods assume one request in flight. A caller that
-//! multiplexes sessions loops over `next` itself.
+//! The reference client for the serve wire format. A port to another language copies this file,
+//! and the integration tests and `bench-serve` drive the server through it. The client uses
+//! ZMTP 3.x as a DEALER, and a ZMQ binding in any language can replace it.
 //!
-//! `next` and `send` touch disjoint fields, so one task can read while another
-//! task writes. `deinit` must run after both tasks return.
+//! Methods. Each request method is send-only or terminal-wait. A send-only method writes one
+//! frame and returns its request id. The caller then reads frames through `next` or
+//! `collectTurn`. A terminal-wait method writes one frame, consumes frames until the terminal
+//! message of that request, and returns the reply as a value. Terminal-wait methods assume one
+//! request in flight. A caller that multiplexes sessions loops over `next` itself.
 //!
-//! `next` returns a message whose text slices BORROW the client's payload
-//! buffer. Copy a slice before the next call to keep it. Token text is raw
-//! bytes and can hold a partial UTF-8 sequence. Join a whole turn before you
-//! display it.
+//! Tasks. `next` and `send` touch disjoint fields, so one task can read while another task
+//! writes. `deinit` must run after both tasks return.
+//!
+//! Borrowing. `next` returns a message whose text slices BORROW the client's payload buffer. Copy
+//! a slice before the next call to keep it. Token text is raw bytes and can hold a partial UTF-8
+//! sequence. Join a whole turn before you display it.
+//!
+//! Refusals. A refusal is `error.ServerError` with the reason in `last_error`. Read it
+//! immediately after that error, because a later call overwrites it.
+//!
+//! Leases. A keep issues a new token, and the old one opens nothing. A resume also rotates the
+//! token, so the caller stores the token of the reply. `unknown_session` answers an unknown,
+//! rotated, or expired token.
+//!
+//! Cancel. A cancel ends the turn in flight, and that turn's `done` carries `cancelled` under the
+//! request id of its `generate`, unless the turn ends first. A cancel on an idle session produces
+//! no frame. An unknown session produces an `err` frame under the returned request id.
+//!
+//! Collected turns. `collectTurn` fills `ids_out` and `text_out` each as far as it fits, and
+//! `n_tokens` and `text_total` stay the true totals. Once `hello` has run, the text of the
+//! end-of-sequence token is not copied, and its id still lands in `ids_out`.
 
 const std = @import("std");
 const Io = std.Io;
@@ -44,8 +57,7 @@ pub const Event = struct {
     msg: protocol.ServerMsg,
 };
 
-/// A fixed-size copy of a borrowed `Event` for a caller that hands frames
-/// across a task boundary.
+/// A fixed-size copy of a borrowed `Event`, for a caller that hands frames across tasks.
 pub const OwnedEvent = struct {
     header: protocol.Header,
     body: Body,
@@ -84,18 +96,13 @@ pub const Client = struct {
     /// The pair records of one `session_append`, written before the frame.
     pair_buf: []u8,
     next_request_id: u32 = 1,
-    /// The end-of-sequence token id from `hello_ack`. The server sends that
-    /// token as a token frame too, and `collectTurn` skips its text.
+    /// The end-of-sequence token id from `hello_ack`. `collectTurn` skips its text.
     eos_id: ?u32 = null,
-    /// The last `err` frame a convenience call consumed, kept as a value so a
-    /// caller can report the refusal in the server's words after the typed
-    /// `error.ServerError`. Read it immediately after that error. A later call
-    /// overwrites it.
+    /// The last `err` frame a convenience call consumed, for the server's words of a refusal.
     last_error: ?LastError = null,
 
-    /// A recorded server error. The buffer matches the server's own detail
-    /// bound (`OutEvent.fail` caps at 64 bytes). The client cuts a foreign
-    /// server's longer detail at the bound and sets `truncated`.
+    /// A recorded server error. The buffer matches the 64-byte detail bound of `OutEvent.fail`.
+    /// A longer detail from a foreign server is cut at the bound, and `truncated` is set.
     pub const LastError = struct {
         code: protocol.ErrorCode,
         len: u8,
@@ -109,8 +116,8 @@ pub const Client = struct {
         }
     };
 
-    /// `HandshakeRefused` is a server that answers the greeting with a ZMTP
-    /// ERROR. `PeerTypeRefused` is a server that is not a ROUTER.
+    /// `HandshakeRefused` is a server that answers the greeting with a ZMTP ERROR.
+    /// `PeerTypeRefused` is a server that is not a ROUTER.
     pub const HandshakeError = error{
         HandshakeRefused,
         PeerTypeRefused,
@@ -197,9 +204,9 @@ pub const Client = struct {
         return client;
     }
 
-    /// Sends the greeting and READY of the DEALER side, then reads the
-    /// greeting and READY of the server. The reads hold at most
-    /// `zmtp.greeting_bytes`, one frame head, and `zmtp.max_ready_bytes`.
+    /// Sends the greeting and READY of the DEALER side, then reads the greeting and READY of the
+    /// server. The reads hold at most `zmtp.greeting_bytes`, one frame head, and
+    /// `zmtp.max_ready_bytes`.
     fn handshake(self: *Client) HandshakeError!void {
         const w = &self.writer.interface;
         var greeting: [zmtp.greeting_bytes]u8 = undefined;
@@ -272,9 +279,7 @@ pub const Client = struct {
     /// Block for the next server frame. Slices borrow `payload_buf`.
     pub fn next(self: *Client) NextError!Event {
         const r = &self.reader.interface;
-        // Each pass reads one frame. This client sends no PING, so the server
-        // sends no command after the handshake, and the loop ends at the
-        // first message.
+        // Each pass reads one frame. This client sends no PING, so the first message ends the loop.
         while (true) {
             const head = try readFrameHead(r);
             if (head.command) {
@@ -370,8 +375,7 @@ pub const Client = struct {
     /// The id of a new session and the positions it uses, from `session_opened`.
     pub const Opened = struct { id: u32, kv_pos: u32 };
 
-    /// Opens a session (system prompt prefilled server-side). Returns its id.
-    /// A refusal is `error.ServerError` with the reason in `last_error`.
+    /// Opens a session with the system prompt prefilled on the server. Returns its id.
     pub fn openSession(
         self: *Client,
         system_prompt: []const u8,
@@ -397,9 +401,8 @@ pub const Client = struct {
         return .{ .id = ev.header.session_id, .kv_pos = ev.msg.session_opened.kv_pos };
     }
 
-    /// Fork an open session server-side: shared system prompt + conversation
-    /// so far, its own sampling and seed. Returns the new session's id. A
-    /// refusal is `error.ServerError` with the reason in `last_error`.
+    /// Fork an open session on the server. The fork shares the context but has its own sampling
+    /// and seed. Returns the new session id.
     pub fn cloneSession(
         self: *Client,
         source_id: u32,
@@ -422,9 +425,8 @@ pub const Client = struct {
         return .{ .id = ev.header.session_id, .kv_pos = ev.msg.session_opened.kv_pos };
     }
 
-    /// Close a session and wait for `session_closed`. The server closes a
-    /// session mid-turn without a `done`. The frames it queued for that turn
-    /// arrive first, and this call skips them.
+    /// Close a session and wait for `session_closed`. A close mid-turn sends no `done`.
+    /// The frames queued for that turn arrive first, and this call skips them.
     pub fn closeSession(self: *Client, session_id: u32) ReplyError!void {
         _ = try self.send(.session_close, session_id);
         while (true) {
@@ -441,12 +443,9 @@ pub const Client = struct {
         }
     }
 
-    /// Feed kept (user, assistant) pairs into an idle session and wait for
-    /// `appended`. The pairs must fit one frame: at most
-    /// `limits.max_append_pairs` pairs and `protocol.append_pairs_bytes_max`
-    /// bytes of records. Returns the position after each pair. A refusal is
-    /// `error.ServerError` with the reason in `last_error`. A `turn_too_long`
-    /// refusal fed no pair.
+    /// Feed kept pairs into an idle session and wait for `appended`. The pairs must fit one
+    /// frame: `limits.max_append_pairs` pairs and `protocol.append_pairs_bytes_max` bytes.
+    /// Returns the position after each pair. A `turn_too_long` refusal fed no pair.
     pub fn append(
         self: *Client,
         session_id: u32,
@@ -461,8 +460,8 @@ pub const Client = struct {
         return ev.msg.appended;
     }
 
-    /// Send kept pairs and return the request id. The caller reads the
-    /// `appended` or `err` reply through `next`. The bounds of `append` hold.
+    /// Send kept pairs and return the request id. The caller reads the reply through `next`.
+    /// The bounds of `append` hold.
     pub fn sendAppend(
         self: *Client,
         session_id: u32,
@@ -478,7 +477,7 @@ pub const Client = struct {
         );
     }
 
-    /// Fire a turn. The caller then loops `next` for token/done events.
+    /// Send a turn. The caller then loops `next` for `token` and `done` events.
     pub fn generate(
         self: *Client,
         session_id: u32,
@@ -493,26 +492,22 @@ pub const Client = struct {
         );
     }
 
-    /// The per-turn fields of a `generate`. A null field takes the session
-    /// or server value. A sampling block replaces the sampling of the
-    /// session, and its seed restarts the sampling stream only with
+    /// The per-turn fields of a `generate`. A null field takes the session or server value.
+    /// A sampling block replaces the session sampling, and its seed restarts the stream only with
     /// `reseed`.
     pub const TurnOptions = struct {
         max_tokens: u32,
         sampling: ?protocol.Sampling = null,
-        /// Restart the sampling stream at the seed of `sampling`, so the
-        /// turn replays. It needs `sampling`.
+        /// Restart the sampling stream at the seed of `sampling`, so the turn replays.
         reseed: bool = false,
         /// The think switch of the turn.
         think_open: ?bool = null,
-        /// Think tokens before the forced close, at most
-        /// `limits.max_model_ctx`. 0 is unbounded.
+        /// Think tokens before the forced close, at most `limits.max_model_ctx`. 0 is unbounded.
         think_budget: ?u32 = null,
     };
 
     /// `generate` with every per-turn field of the wire. A text past
-    /// `protocol.generate_text_bytes_max` is `error.TextTooLong`, and no
-    /// frame goes out.
+    /// `protocol.generate_text_bytes_max` is `error.TextTooLong`, and no frame goes out.
     pub fn generateWith(
         self: *Client,
         session_id: u32,
@@ -535,15 +530,11 @@ pub const Client = struct {
         } }, session_id);
     }
 
-    /// The grant of a keep: the time to live and the token. A grant of 0
-    /// holds no lease, and its token is all zero.
+    /// The grant of a keep: the time to live and the token. A grant of 0 holds no lease.
     pub const Kept = @FieldType(protocol.ServerMsg, "kept");
 
-    /// Keep `session_id` past a drop of this connection for at most
-    /// `ttl_ms`, and wait for `kept`. A `ttl_ms` of 0 drops the lease. Store
-    /// the token to resume on a new connection. Each keep issues a new
-    /// token, and the old one opens nothing. A refusal is
-    /// `error.ServerError` with the reason in `last_error`.
+    /// Keep `session_id` past a drop of this connection for at most `ttl_ms`, and wait for
+    /// `kept`. A `ttl_ms` of 0 drops the lease. Store the token to resume on a new connection.
     pub fn keepSession(self: *Client, session_id: u32, ttl_ms: u32) ReplyError!Kept {
         const request_id = try self.send(.{ .session_keep = .{ .ttl_ms = ttl_ms } }, session_id);
         const ev = try self.replyTo(request_id);
@@ -556,12 +547,8 @@ pub const Client = struct {
     /// The session of a resume and its state at the moment it became idle.
     pub const ResumedSession = struct { id: u32, state: protocol.Resumed };
 
-    /// Attach the session of `token` to this connection, and wait for
-    /// `resumed`. The server answers when the session is idle. Store the
-    /// new token of the reply, because the presented token opens nothing
-    /// after a resume. A refusal is `error.ServerError` with the reason in
-    /// `last_error`: `unknown_session` for an unknown, rotated, or expired
-    /// token.
+    /// Attach the session of `token` to this connection, and wait for `resumed`.
+    /// The server answers when the session is idle. Store the new token of the reply.
     pub fn resumeSession(self: *Client, token: protocol.Token) ReplyError!ResumedSession {
         const request_id = try self.send(.{ .session_resume = .{ .token = token } }, 0);
         const ev = try self.replyTo(request_id);
@@ -571,9 +558,8 @@ pub const Client = struct {
         return .{ .id = ev.header.session_id, .state = ev.msg.resumed };
     }
 
-    /// The reply to `request_id`. A turn of the same session can still
-    /// stream, and this call skips its token and done frames. Every other
-    /// frame is an unexpected reply.
+    /// The reply to `request_id`. A turn of the same session can still stream, and this call
+    /// skips its `token` and `done` frames. Every other frame is an unexpected reply.
     fn replyTo(self: *Client, request_id: u32) !Event {
         while (true) {
             const ev = try self.next();
@@ -585,11 +571,8 @@ pub const Client = struct {
         }
     }
 
-    /// Stop the turn in flight on `session_id`. That turn's `done` then
-    /// carries `finish_reason = cancelled` under the request id of its
-    /// `generate`, unless the turn ends first. A cancel on an idle session
-    /// produces no frame, so a turn of that session must be in flight. An
-    /// unknown session produces an `err` frame under the returned request id.
+    /// Stop the turn in flight on `session_id`. A turn of that session must be in flight.
+    /// See "Cancel" in the header.
     pub fn cancel(self: *Client, session_id: u32) SendError!u32 {
         return self.send(.cancel, session_id);
     }
@@ -598,11 +581,9 @@ pub const Client = struct {
         finish_reason: protocol.FinishReason,
         /// The token frames of the turn, the end-of-sequence frame included.
         n_tokens: usize,
-        /// The text bytes in `text_out`. The copy stops at the first token
-        /// that does not fit, so no later token fills the gap.
+        /// The text bytes in `text_out`. The copy stops at the first token that does not fit.
         text_len: usize,
-        /// The text bytes of the whole reply. A cut reply has more than
-        /// `text_len`.
+        /// The text bytes of the whole reply. A cut reply has more than `text_len`.
         text_total: usize,
         kv_pos: u32,
         /// The server's count from `done`.
@@ -613,19 +594,15 @@ pub const Client = struct {
         decode_ms: f32,
     };
 
-    /// Collect one whole turn after `generate`. Token ids go into `ids_out`,
-    /// and text bytes go into `text_out`, each as far as it fits. The counts
-    /// `n_tokens` and `text_total` are the true totals. Returns on `done`.
-    /// The text of the end-of-sequence token is not copied once `hello` has
-    /// run, and its id still lands in `ids_out`.
+    /// Collect one whole turn after `generate`, and return on `done`. See "Collected turns" in
+    /// the header.
     pub fn collectTurn(self: *Client, ids_out: []u32, text_out: []u8) CollectError!Turn {
         return self.collectTurnWith(ids_out, text_out, NoTokenHook{});
     }
 
-    /// `collectTurn` with a per-token hook. `on_token.onToken(token_id,
-    /// channel, text)` runs once for each token frame, in order, the
-    /// end-of-sequence frame included, so the caller decides what to do with
-    /// it. The text borrows the payload buffer until the hook returns.
+    /// `collectTurn` with a per-token hook. `on_token.onToken(token_id, channel, text)` runs once
+    /// for each token frame, in order, the end-of-sequence frame included. The text borrows the
+    /// payload buffer until the hook returns.
     pub fn collectTurnWith(
         self: *Client,
         ids_out: []u32,
@@ -639,6 +616,7 @@ pub const Client = struct {
             const ev = try self.next();
             switch (ev.msg) {
                 .token => |t| {
+                    // Count the token and keep its id while the buffer has room.
                     on_token.onToken(t.token_id, t.channel, t.text);
                     if (n_tokens < ids_out.len) {
                         ids_out[n_tokens] = t.token_id;
@@ -647,6 +625,7 @@ pub const Client = struct {
                     n_tokens += 1;
                     if (self.eos_id != null and t.token_id == self.eos_id.?) continue;
 
+                    // Copy the text only while no earlier token was cut.
                     if (text_len == text_total and text_len + t.text.len <= text_out.len) {
                         @memcpy(text_out[text_len..][0..t.text.len], t.text);
                         text_len += t.text.len;
@@ -674,9 +653,8 @@ pub const Client = struct {
         }
     }
 
-    /// Ask the server to exit. This waits for the ack. A server that does not
-    /// allow a wire shutdown answers `err{forbidden}` under this request id,
-    /// which becomes `error.ServerError` with the reason in `last_error`.
+    /// Ask the server to exit, and wait for the ack. A server that bars a wire shutdown answers
+    /// `err{forbidden}` under this request id.
     pub fn shutdown(self: *Client) ReplyError!void {
         const request_id = try self.send(.shutdown, 0);
         while (true) {
@@ -690,8 +668,7 @@ pub const Client = struct {
         }
     }
 
-    /// If `msg` is an `err` frame, record it into `last_error`. Returns true
-    /// when it records one, so a reply check reads as one guard line.
+    /// Record `msg` into `last_error` when it is an `err` frame. Returns true when it records one.
     fn recordErr(self: *Client, msg: protocol.ServerMsg) bool {
         const e = switch (msg) {
             .err => |e| e,
@@ -781,8 +758,8 @@ pub fn toOwned(ev: Event) OwnedEvent {
 
 // -- helpers ----------------------------------------------------------------
 
-/// Reads the flags byte, then the rest of the head that the flags announce,
-/// at most `zmtp_head_bytes` in all.
+/// Reads the flags byte, then the rest of the head that the flags announce.
+/// The head holds at most `zmtp_head_bytes`.
 fn readFrameHead(r: *Io.Reader) (Io.Reader.Error || zmtp.Error)!zmtp.FrameHead {
     var head: [zmtp_head_bytes]u8 = undefined;
     head[0] = try r.takeByte();
@@ -826,7 +803,7 @@ fn appendServerFrame(gpa: Allocator, out: *std.ArrayList(u8), msg: protocol.Serv
     try out.appendSlice(gpa, body[0..n]);
 }
 
-test "collectTurnWith: the hook sees every token frame in order, the end-of-sequence frame included" {
+test "collectTurnWith: the hook sees every token frame, the end-of-sequence frame included" {
     const gpa = std.testing.allocator;
     var frames: std.ArrayList(u8) = .empty;
     defer frames.deinit(gpa);
@@ -857,8 +834,7 @@ test "collectTurnWith: the hook sees every token frame in order, the end-of-sequ
         .reasoning_tokens = 1,
     } });
 
-    // A turn reads only the reader, the payload buffer, and the
-    // end-of-sequence id, so the test sets those three fields.
+    // A turn reads only the reader, the payload buffer, and the end-of-sequence id.
     const payload = try gpa.alloc(u8, protocol.max_frame_payload_bytes);
     defer gpa.free(payload);
 
@@ -912,8 +888,7 @@ test "generateWith: a text past the frame bound is refused before any frame goes
     defer gpa.free(text);
 
     @memset(text, 'a');
-    // The refusal reads no field of the client, so an unset client shows
-    // that no write ran.
+    // The refusal reads no field of the client, so an unset client shows that no write ran.
     var client: Client = undefined;
     try std.testing.expectError(error.TextTooLong, client.generateWith(1, text, .{
         .max_tokens = 1,

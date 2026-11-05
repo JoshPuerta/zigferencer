@@ -52,7 +52,7 @@ same way, but a CPU debugger cannot step through a shader.
 1. Build one test binary with only the tests whose name contains the filter: `make debug-test TEST=unit FILTER="decode: greedy walk"`.
 2. From the repository root, run `lldb zig-out/test/unit -o "breakpoint set --file generate.zig --line 154" -o run`.
 
-`TEST=unit` selects the tests of `src/`. The stem of a `tests/*_test.zig` file
+`TEST=unit` selects the tests of `src/` outside `src/dev/`, and `TEST=dev_unit` selects the tests of `src/dev/`. The stem of a `tests/*_test.zig` file
 selects that integration test, for example `TEST=snapshot_smollm2_test`. An
 unknown name fails the build with the list of names. An integration test finds
 its model files through `$ZIGFERENCER_MODELS_DIR` (default `models/`). Run the

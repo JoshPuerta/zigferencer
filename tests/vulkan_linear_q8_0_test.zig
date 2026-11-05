@@ -1,34 +1,32 @@
 //! Bit-fidelity gate for the GPU Q8_0 matmul.
 //!
-//! The gate runs `linearF32Q80` through `ops_vulkan.LinearQ80`, and the result
-//! must equal the CPU naive op `z.ops.linearF32Q80` bit for bit. That op is the
-//! correctness reference of the project.
+//! Oracle. The gate runs `linearF32Q80` through `ops_vulkan.LinearQ80`, and the result must equal
+//! the CPU naive op `zigferencer.ops.linearF32Q80` bit for bit. That op is the correctness
+//! reference of the project.
 //!
-//! Bit equality is reachable, so the gate asks for it. The kernel reproduces
-//! the exact f32 reduction order of the naive op: a scalar accumulate,
-//! block-major and i-minor, with one invocation per output row. Vulkan mandates
-//! IEEE 754 single precision for f32 multiply and add without FMA contraction
-//! unless `precise` is set. A divergence therefore names one of three faults.
-//! The reduction order does not match, the f16 to f32 decode of the scale
-//! differs, or the i8 byte decode differs. A tolerance absorbs all three.
+//! Bit equality. Bit equality is reachable, so the gate asks for it. The kernel reproduces the
+//! exact f32 reduction order of the naive op: a scalar accumulate, block-major and i-minor, with
+//! one invocation per output row. Vulkan mandates IEEE 754 single precision for f32 multiply and
+//! add without FMA contraction unless `precise` is set.
 //!
-//! The test returns `error.SkipZigTest` when Vulkan cannot start, which covers
-//! a host with no driver and a device with a missing feature.
+//! Faults. A divergence names one of three faults. The reduction order does not match, the f16 to
+//! f32 decode of the scale differs, or the i8 byte decode differs. A tolerance absorbs all three.
+//!
+//! Skips. The test returns `error.SkipZigTest` when Vulkan cannot start, which covers a host with
+//! no driver and a device with a missing feature.
 
 const std = @import("std");
-const z = @import("zigferencer");
-const cpu_ops = z.ops;
-const Tensor = z.tensor.Tensor;
+const zigferencer = @import("zigferencer");
+const cpu_ops = zigferencer.ops;
+const Tensor = zigferencer.tensor.Tensor;
 
 // -- fixtures ---------------------------------------------------------------
 
 const q8_0_block_elems: usize = 32;
 const q8_0_block_bytes: usize = 34;
 
-/// Fill `weight_data` with a deterministic synthetic Q8_0 weight. Every block
-/// takes the f16 scale 1.0, and the quants step through the signed i8 range
-/// with a per-row offset. The result covers the full i8 range and drives the
-/// sign-extension path.
+/// Fill `weight_data` with a synthetic Q8_0 weight. Every block takes the f16 scale 1.0, and the
+/// quants step through the full signed i8 range with a per-row offset, which drives sign extension.
 fn buildSyntheticWeight(
     weight_data: []u8,
     in_features: usize,
@@ -59,7 +57,7 @@ fn runLinearQ80Check(
     in_features: usize,
     out_features: usize,
 ) !void {
-    const runner = z.vulkan_runner.Runner.init(allocator) catch |e| switch (e) {
+    const runner = zigferencer.vulkan_runner.Runner.init(allocator) catch |e| switch (e) {
         error.NoVulkanDevice,
         error.InitializationFailed,
         error.IncompatibleDriver,

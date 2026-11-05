@@ -1,42 +1,45 @@
 //! The rounding gate for the f16 KV cache.
 //!
-//! The quant kernels already read `float16_t` buffers, so f16 loads are proven
-//! on this stack. Nothing proved an f16 STORE, and the KV cache needs one: the
-//! commit narrows f32 rows into f16 storage. `kv_commit_f16.comp` is the kernel
-//! that does it on every f16 token, and this file gates it.
+//! Background. The quant kernels read `float16_t` buffers, which proves f16 loads on this stack.
+//! The KV cache also needs an f16 store: the commit narrows f32 rows into f16 storage.
+//! `kv_commit_f16.comp` does it on every f16 token, and this file gates it.
 //!
-//! The gate is bits, not values. The CPU commit narrows with F16C, which rounds
-//! to nearest even. The shader pins SPIR-V `RoundingModeRTE` at width 16 to ask
-//! the device for the same rule. Two executors that round the same way are
-//! the property under test. The bits are what the cache stores, so comparing
-//! them states that property directly and keeps a second conversion out of the
+//! Bits. The gate is bits, not values. The CPU commit narrows with F16C, which rounds to nearest
+//! even. The shader pins SPIR-V `RoundingModeRTE` at width 16 to ask the device for the same rule.
+//! Two executors that round the same way are the property under test. The bits are what the cache
+//! stores, so comparing them states that property directly and keeps a second conversion out of the
 //! path under test.
 //!
-//! Each fixture below carries the f16 bit pattern that IEEE 754 requires,
-//! written out by hand. The first check is that the `@floatCast` of Zig
-//! produces it, so a mistyped fixture cannot pass as a device fault. The second
-//! check is that the device produces the same. Together they witness the
-//! rounding identity that the CPU commit and the device commit must share. One
-//! KV cache then reads the same on both.
+//! Fixtures. Each fixture carries the f16 bit pattern that IEEE 754 requires, written out by hand.
+//! The first check is that the `@floatCast` of Zig produces it, so a mistyped fixture cannot pass
+//! as a device fault. The second check is that the device produces the same. Together they witness
+//! the rounding identity that the CPU commit and the device commit must share. One KV cache then
+//! reads the same on both.
 //!
-//! The kernel narrows K and V under one element count and one dispatch, so
-//! every test drives both buffers. V carries the fixtures in reverse order, so
-//! a kernel that feeds one source into both outputs fails the gate.
+//! Both buffers. The kernel narrows K and V under one element count and one dispatch, so every test
+//! drives both buffers. V carries the fixtures in reverse order, so a kernel that feeds one source
+//! into both outputs fails the gate.
 //!
-//! The three tests cover the finite range, the dispatch tail and overflow. The
-//! 18 finite fixtures hold exact values and both directions of ordinary
-//! rounding. They also hold ties that resolve up and down to an even
-//! significand, and a tie that carries into the exponent. The last of them
-//! cover the subnormal range with its tie to even zero, and the
-//! subnormal-to-normal boundary. The sweep runs 1000 elements, so the dispatch
-//! takes 16 groups of 64 plus a tail whose invocations take the early-return
-//! path. The overflow test is an observation and not an equality gate, for the
-//! reason its own comment states.
+//! Coverage. The three tests cover the finite range, the dispatch tail and overflow. The 18 finite
+//! fixtures hold exact values and both directions of ordinary rounding. They also hold ties that
+//! resolve up and down to an even significand, and a tie that carries into the exponent. The last
+//! of them cover the subnormal range with its tie to even zero, and the subnormal-to-normal
+//! boundary.
 //!
-//! The tests return `error.SkipZigTest` when Vulkan cannot start.
+//! Tail. The sweep runs 1000 elements, so the dispatch takes 16 groups of 64 plus a tail whose
+//! invocations take the early-return path.
+//!
+//! Overflow. The overflow test is an observation and not an equality gate. The device property
+//! `shaderSignedZeroInfNanPreserveFloat16 = false` is the reason. Vulkan then permits an
+//! implementation to saturate a narrowing overflow to the largest finite value instead of producing
+//! an infinity, and both outcomes are legal. The KV cache is unaffected, because its values are
+//! finite by construction. The test asserts the two permitted outcomes and prints the one the
+//! device chose. A gate pinned to one outcome makes a legal device read as a broken one.
+//!
+//! Skips. The tests return `error.SkipZigTest` when Vulkan cannot start.
 
 const std = @import("std");
-const z = @import("zigferencer");
+const zigferencer = @import("zigferencer");
 
 // -- fixtures ---------------------------------------------------------------
 
@@ -60,10 +63,8 @@ const finite_cases = [_]Case{
     // 1 + 2^-11 is the halfway point itself. The neighbors are 0x3C00 and
     // 0x3C01, and the even significand is 0x3C00, so the tie rounds down.
     .{ .v = 1.00048828125, .bits = 0x3C00 },
-    // 1 + 2^-10 + 2^-11 is the next halfway point up. Its neighbors are 0x3C01
-    // and 0x3C02, and now the even significand is the upper one, so the same
-    // rule sends this tie up. A truncating device fails here, and a
-    // round-half-away device fails the fixture above.
+    // 1 + 2^-10 + 2^-11 is the next halfway point up. The even neighbor is 0x3C02, so the tie
+    // rounds up. A truncating device fails here, and a round-half-away device fails above.
     .{ .v = 1.00146484375, .bits = 0x3C02 },
     .{ .v = -1.00048828125, .bits = 0xBC00 },
     .{ .v = -1.00146484375, .bits = 0xBC02 },
@@ -100,8 +101,8 @@ const overflow_cases = [_]Case{
     .{ .v = -70000.0, .bits = 0xFC00 },
 };
 
-fn initCtx() !z.vulkan_ctx.Context {
-    return z.vulkan_ctx.Context.init(std.testing.allocator, .{}) catch |e| switch (e) {
+fn initCtx() !zigferencer.vulkan_ctx.Context {
+    return zigferencer.vulkan_ctx.Context.init(std.testing.allocator, .{}) catch |e| switch (e) {
         error.NoVulkanDevice,
         error.NoComputeQueue,
         error.InitializationFailed,
@@ -115,16 +116,16 @@ fn initCtx() !z.vulkan_ctx.Context {
 /// Narrow `k_src` and `v_src` on the device and write the raw f16 bits into
 /// `k_bits` and `v_bits`.
 fn deviceBits(
-    ctx: *const z.vulkan_ctx.Context,
+    ctx: *const zigferencer.vulkan_ctx.Context,
     k_src: []const f32,
     v_src: []const f32,
     k_bits: []u16,
     v_bits: []u16,
 ) !void {
-    var kernel = try z.ops_vulkan.KvCommitF16.init(ctx);
+    var kernel = try zigferencer.ops_vulkan.KvCommitF16.init(ctx);
     defer kernel.deinit();
 
-    try z.ops_vulkan.kvCommitF16OneShot(&kernel, k_src, v_src, k_bits, v_bits);
+    try zigferencer.ops_vulkan.kvCommitF16OneShot(&kernel, k_src, v_src, k_bits, v_bits);
 }
 
 /// Write `src` in reverse order into `dst`, the V-side source of every test.
@@ -200,10 +201,8 @@ test "kv_commit_f16: a sweep straddles the workgroup boundary" {
     const allocator = std.testing.allocator;
     const n: usize = 1000;
 
-    // A deterministic sweep across the exponent range, dense enough that a
-    // sizeable share of the values land on or beside a rounding boundary. The
-    // count is not a multiple of the 64-wide workgroup, so the tail
-    // invocations take the early-return path and must leave nothing behind.
+    // A deterministic sweep across the exponent range, dense enough to hit rounding boundaries.
+    // The count is not a multiple of the 64-wide workgroup, so the tail must leave nothing behind.
     var prng = std.Random.DefaultPrng.init(0x16F16);
     const rand = prng.random();
     const k_src = try allocator.alloc(f32, n);
@@ -250,15 +249,7 @@ test "kv_commit_f16: a sweep straddles the workgroup boundary" {
 test "kv_commit_f16: overflow leaves the finite range" {
     const n = overflow_cases.len;
 
-    // This one is an observation, not an equality gate, and the reason is a
-    // recorded device property: the float controls report
-    // `shaderSignedZeroInfNanPreserveFloat16 = false`. Vulkan then permits an
-    // implementation to saturate a narrowing overflow to the largest finite
-    // value instead of producing an infinity, and both outcomes are legal. The
-    // KV cache is unaffected either way, because its values are finite by
-    // construction. The test therefore asserts the two permitted outcomes and
-    // prints the one the device chose. A gate pinned to one outcome makes a
-    // legal device read as a broken one.
+    // This test observes and does not gate on equality. See "Overflow" in the header.
     var k_src: [n]f32 = undefined;
     for (overflow_cases, 0..) |c, i| {
         k_src[i] = c.v;

@@ -32,6 +32,31 @@
 //!       ^                 ^                       |
 //!       |                 +------- feed ----------+   (next turn)
 //!       +---- destroy ----+-----------------------+
+//!
+//! Atomic capacity. `feed`, `decodeBatch`, and `advance` check the KV capacity of the whole call
+//! before they step any row. On `error.ContextFull` no session changes.
+//!
+//! Compact logits. The runner writes logits only for the want-logits rows: the final row of the
+//! chunk when `final`, then every decode row. They land at `logits[0..]` in that order, not at
+//! their batch-row offset. So the buffer needs `logitRows` rows even for a wider batch.
+//!
+//! Prefix seeding. `restorePrefix` makes a fresh session read as one that fed `n_rows` non-final
+//! tokens: the rows are committed, the turn is open, and no token is pending. `pos` is the one
+//! variable the rest of the engine reads, so the suffix feed and the capacity checks work
+//! unchanged. A snapshot is a read, because a committed row is never rewritten and `pos` only
+//! ascends.
+//!
+//! KV reuse. A slot needs no KV scrub on destroy or create, because a new session rewrites each
+//! position before it reads it. A runner with non-positional recurrent state, such as the GDN
+//! scan, must zero that state through `resetSlotState`.
+//!
+//! Runner surface. `Sessions` reaches a runner through a duck-typed surface. A renamed member
+//! breaks only the call sites that instantiate it, and a GPU-only runner can break where no CPU
+//! test looks. So `Sessions(RunnerT)` checks the rows it reads when the pool type is built, and
+//! the surface test instantiates the whole surface against every runner of the build. A runner
+//! that holds recurrent state must declare `has_recurrent_state` and both slot hooks, because
+//! `@hasDecl` alone lets a runner omit `resetSlotState` and inherit the state of the last
+//! conversation.
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
@@ -68,57 +93,39 @@ pub const Session = struct {
     state: State,
 };
 
-/// Fixed pool of sessions over `RunnerT`'s KV slots. Session id == slot index.
-/// `RunnerT` provides `stepBatch(rows)`, `logits` (rows at vocab stride),
-/// `n_slots`, and `max_seq`. The type is duck-typed, so the CPU runners, the
-/// fused GPU runners, and the test fakes all fit.
+/// Fixed pool of sessions over the KV slots of `RunnerT`. Session id == slot index.
+/// `RunnerT` is duck-typed: `stepBatch(rows)`, `logits` (rows at vocab stride), `n_slots`, and
+/// `max_seq`.
 pub fn Sessions(comptime RunnerT: type) type {
     return struct {
         const Self = @This();
 
-        /// The runner type, exposed so layers above (the serve residency pool)
-        /// can gate on its capabilities (`evictSlot`, `cloneSlotState`).
+        /// The runner type, so the layers above can gate on its hooks.
         pub const Runner = RunnerT;
 
-        // The rows this pool reads, checked when the type is built. A drifted
-        // runner therefore fails to compile in every build that names a pool.
+        // Check the runner surface. See "Runner surface" in the header.
         comptime {
             requireSessionsSurface(RunnerT);
         }
 
-        /// Whether `clone` is available: the runner must know how to copy the
-        /// state of a slot (KV rows, recurrent slabs). Every shipped runner
-        /// declares the hook. The gate stays for a runner that cannot copy a
-        /// slot, and a caller gates the feature on it.
+        /// Whether `clone` is available: the runner must copy the state of a slot.
         pub const can_clone = @hasDecl(RunnerT, "cloneSlotState");
 
-        /// Whether the prefix snapshot/restore surface is available: the runner
-        /// must know how to move a slot's committed rows to and from a host
-        /// blob. It is the same hook the residency tier evicts with, so a
-        /// runner that can swap can also seed a session from a cached prefix.
+        /// Whether prefix snapshot and restore are available. It uses the hooks of the swap tier.
         pub const can_snapshot = @hasDecl(RunnerT, "evictSlot");
 
         runner: *RunnerT,
         table: []Session,
-        /// Scratch rows for one stepBatch call. len == n_slots.
+        /// Scratch rows for one `stepBatch` call.
         rows: []StepRow,
-        /// The vocab stride of the runner's compact logits rows, derived once
-        /// at init from the runner's logits allocation.
+        /// The vocab stride of the compact logits rows, derived once at init.
         vocab: usize,
-        /// The sampler scratch: one row for a penalty fix-up or the full-vocab
-        /// weights, plus the weight block sums. The pool samples one row at a
-        /// time on one thread, so one scratch serves every session.
+        /// The sampler scratch. The pool samples one row at a time, so one scratch serves all.
         sample_scratch: []f32,
-        /// The session whose final chunk the LATEST successful advance
-        /// completed, or null. While it is set, compact logits row zero holds
-        /// the final-row logits of that session. `copyFinalLogits` asserts that
-        /// timing rule.
+        /// The session whose final chunk the latest advance completed. Its logits sit in row zero.
         last_final: ?u32 = null,
 
-        /// Rows of the runner's compact logits buffer. A fused GPU runner can
-        /// hold fewer logits rows than KV slots (breadth past the decode
-        /// width), and declares the count. Everything else sizes logits per
-        /// slot.
+        /// Rows of the compact logits buffer. A fused GPU runner can declare fewer than its slots.
         fn logitRows(runner: *const RunnerT) u32 {
             if (comptime @hasDecl(RunnerT, "logitRowsMax")) return runner.logitRowsMax();
             return runner.n_slots;
@@ -134,7 +141,7 @@ pub fn Sessions(comptime RunnerT: type) type {
                 s.* = .{
                     .pos = 0,
                     .token_pending = 0,
-                    .rng = std.Random.DefaultPrng.init(0),
+                    .rng = .init(0),
                     .params = .{},
                     .state = .free,
                 };
@@ -150,8 +157,7 @@ pub fn Sessions(comptime RunnerT: type) type {
             };
         }
 
-        /// Claim a free slot. The seed is explicit, always: replayable
-        /// generation is a feature, ambient entropy is not.
+        /// Claim a free slot. The seed is explicit, so generation replays.
         pub fn create(self: *Self, seed: u64, params: sampler.Params) error{NoFreeSession}!u32 {
             std.debug.assert(params.temperature >= 0);
             std.debug.assert(params.top_p > 0);
@@ -159,9 +165,7 @@ pub fn Sessions(comptime RunnerT: type) type {
             for (self.table, 0..) |*s, id| {
                 if (s.state != .free) continue;
 
-                // KV needs no scrub on reuse (rewrite-before-read), but a
-                // runner with NON-positional recurrent state (qwen's GDN
-                // scan) must zero it for a fresh conversation.
+                // See "KV reuse" in the header.
                 if (comptime @hasDecl(RunnerT, "resetSlotState")) {
                     self.runner.resetSlotState(@intCast(id));
                 }
@@ -169,7 +173,7 @@ pub fn Sessions(comptime RunnerT: type) type {
                 s.* = .{
                     .pos = 0,
                     .token_pending = 0,
-                    .rng = std.Random.DefaultPrng.init(seed),
+                    .rng = .init(seed),
                     .params = params,
                     .state = .feeding,
                 };
@@ -183,12 +187,8 @@ pub fn Sessions(comptime RunnerT: type) type {
             return error.NoFreeSession;
         }
 
-        /// Fork a session: claim a free slot and copy `source_id`'s
-        /// conversation of `source_id` into it: KV rows `0..pos` plus any
-        /// recurrent state runner-side, and pos plus the pending token here.
-        /// The clone gets its
-        /// OWN seed and sampling: one prefilled context, divergent sessions.
-        /// The source is untouched and both sessions decode on independently.
+        /// Fork a session into a free slot: KV rows `0..pos`, `pos`, and the pending token.
+        /// The clone gets its own seed and params. The source stays untouched.
         pub fn clone(
             self: *Self,
             source_id: u32,
@@ -201,6 +201,7 @@ pub fn Sessions(comptime RunnerT: type) type {
             std.debug.assert(source.state != .free);
             std.debug.assert(params.temperature >= 0);
             std.debug.assert(params.top_p > 0);
+
             for (self.table, 0..) |*s, id| {
                 if (s.state != .free) continue;
 
@@ -209,7 +210,7 @@ pub fn Sessions(comptime RunnerT: type) type {
                 s.* = .{
                     .pos = source.pos,
                     .token_pending = source.token_pending,
-                    .rng = std.Random.DefaultPrng.init(seed),
+                    .rng = .init(seed),
                     .params = params,
                     .state = source.state,
                 };
@@ -220,9 +221,7 @@ pub fn Sessions(comptime RunnerT: type) type {
             return error.NoFreeSession;
         }
 
-        /// Bytes a prefix snapshot of `n_rows` occupies, which is the blob
-        /// size of the runner for those rows. A caller sizes a cache entry with
-        /// it before it holds a session.
+        /// Bytes of a prefix snapshot of `n_rows`. A caller sizes a cache entry with it.
         pub fn snapshotBytesFor(self: *const Self, n_rows: u32) u64 {
             if (comptime !can_snapshot) @compileError("runner cannot snapshot slot state");
 
@@ -231,14 +230,8 @@ pub fn Sessions(comptime RunnerT: type) type {
             return self.runner.evictSlotBytesFor(n_rows);
         }
 
-        /// Seed a FRESH session with a cached KV prefix. The session then reads
-        /// exactly as one that fed `n_rows` non-final tokens: rows `0..n_rows`
-        /// are committed, the turn is still open, and no token is pending. That
-        /// equivalence is the whole point. `pos` is the one variable the rest of
-        /// the engine consults, so the suffix feed, the capacity checks, and an
-        /// eviction before the first feed all keep working unchanged. `blob`
-        /// must come from `snapshotPrefix` at the same `n_rows`, and it stays
-        /// caller-owned.
+        /// Seed a fresh session with a cached KV prefix. See "Prefix seeding" in the header.
+        /// `blob` must come from `snapshotPrefix` at the same `n_rows`. The caller keeps it.
         pub fn restorePrefix(self: *Self, id: u32, n_rows: u32, blob: []const u8) !void {
             if (comptime !can_snapshot) @compileError("runner cannot snapshot slot state");
 
@@ -252,13 +245,9 @@ pub fn Sessions(comptime RunnerT: type) type {
             log.debug("engine restore prefix: id {d}, slot {d}, {d} rows", .{ id, id, n_rows });
         }
 
-        /// Seed a FRESH session with a cached prefix AND its final-row
-        /// logits: restore the rows, then sample the first response token
-        /// from `logits` with the session's own RNG and params, exactly as a
-        /// final feed samples. The session leaves `.ready` with the token
-        /// pending, so a full-prompt cache hit costs zero forward rows. The
-        /// sample runs here, inside the engine, so the sampling path stays
-        /// single. Returns the sampled token.
+        /// Seed a fresh session with a prefix and its final-row logits, then sample the first
+        /// response token like a final feed. The session becomes `ready`, so a full hit costs
+        /// no forward row. Returns the sampled token.
         pub fn restoreReady(
             self: *Self,
             id: u32,
@@ -282,10 +271,8 @@ pub fn Sessions(comptime RunnerT: type) type {
             return s.token_pending;
         }
 
-        /// Copy the final prefill row's logits of the latest advance into
-        /// `out`. Legal only in the tick that completed a final chunk for
-        /// `id` (asserted): compact row zero holds that session's final
-        /// logits exactly until the next forward overwrites it.
+        /// Copy the final-row logits of the latest advance into `out`. Legal only for the
+        /// session that the latest advance completed, until the next forward overwrites them.
         pub fn copyFinalLogits(self: *const Self, id: u32, out: []f32) void {
             std.debug.assert(self.last_final != null);
             std.debug.assert(self.last_final.? == id);
@@ -294,10 +281,8 @@ pub fn Sessions(comptime RunnerT: type) type {
             @memcpy(out, self.runner.logits[0..self.vocab]);
         }
 
-        /// Copy the first `n_rows` of a live session's slot into `out` (device
-        /// to host). The session is untouched, because a committed row is never
-        /// rewritten and `pos` only ascends. The caller therefore snapshots a
-        /// session that goes on decoding.
+        /// Copy the first `n_rows` of a live session's slot into `out`. The session goes on
+        /// decoding unchanged.
         pub fn snapshotPrefix(self: *Self, id: u32, n_rows: u32, out: []u8) !void {
             if (comptime !can_snapshot) @compileError("runner cannot snapshot slot state");
 
@@ -313,8 +298,7 @@ pub fn Sessions(comptime RunnerT: type) type {
             );
         }
 
-        /// Release a slot. No KV scrub: attention reads only positions
-        /// `0..=pos`, and a new session rewrites each before reading it.
+        /// Release a slot. See "KV reuse" in the header.
         pub fn destroy(self: *Self, id: u32) void {
             std.debug.assert(id < self.table.len);
             std.debug.assert(self.table[id].state != .free);
@@ -324,8 +308,7 @@ pub fn Sessions(comptime RunnerT: type) type {
             self.table[id].pos = 0;
         }
 
-        /// KV positions still unwritten. The pending token of a `ready`
-        /// session consumes one of these at its next step.
+        /// KV positions still unwritten. The pending token of a `ready` session takes one.
         pub fn capacityRemaining(self: *const Self, id: u32) u32 {
             std.debug.assert(id < self.table.len);
             std.debug.assert(self.table[id].state != .free);
@@ -333,7 +316,7 @@ pub fn Sessions(comptime RunnerT: type) type {
             return self.runner.max_seq - self.table[id].pos;
         }
 
-        /// Committed KV length: how many positions this conversation occupies.
+        /// Committed KV length of the conversation.
         pub fn posOf(self: *const Self, id: u32) u32 {
             std.debug.assert(id < self.table.len);
             std.debug.assert(self.table[id].state != .free);
@@ -341,9 +324,7 @@ pub fn Sessions(comptime RunnerT: type) type {
             return self.table[id].pos;
         }
 
-        /// Replace the pending token of a decoding session. The next step then
-        /// commits `token` in place of the sampled id. The serve scheduler
-        /// forces the close of a think block this way.
+        /// Replace the pending token of a decoding session. The scheduler closes a think block so.
         pub fn overridePending(self: *Self, id: u32, token: u32) void {
             std.debug.assert(id < self.table.len);
 
@@ -353,19 +334,16 @@ pub fn Sessions(comptime RunnerT: type) type {
             s.token_pending = token;
         }
 
-        /// Restart the sampling stream of session `id` at `seed`. A serve
-        /// turn with the reseed bit calls it, so a client can replay a turn.
+        /// Restart the sampling stream of session `id` at `seed`, so a client can replay a turn.
         /// A greedy draw reads no stream, so greedy output never moves.
         pub fn reseed(self: *Self, id: u32, seed: u64) void {
             std.debug.assert(id < self.table.len);
             std.debug.assert(self.table[id].state != .free);
 
-            self.table[id].rng = std.Random.DefaultPrng.init(seed);
+            self.table[id].rng = .init(seed);
         }
 
-        /// Re-aim the sampler for subsequent turns (a per-generate override).
-        /// The RNG stream continues. A caller that wants a new stream calls
-        /// `reseed`.
+        /// Replace the sampler params for later turns. The RNG stream continues.
         pub fn setParams(self: *Self, id: u32, params: sampler.Params) void {
             std.debug.assert(id < self.table.len);
             std.debug.assert(self.table[id].state != .free);
@@ -378,13 +356,9 @@ pub fn Sessions(comptime RunnerT: type) type {
             });
         }
 
-        /// Append a turn's prompt tokens, in same-slot chunks of up to
-        /// `n_slots` rows per forward call. `final = true` computes logits for
-        /// the last token only, samples the first response token, and returns
-        /// it (the session becomes `ready`). Otherwise it returns null and the
-        /// session stays `feeding`. `feed` validates capacity for the WHOLE
-        /// slice before it steps any row. On `error.ContextFull` the session
-        /// is unmodified.
+        /// Append a turn's prompt tokens in same-slot chunks. With `final`, sample and return the
+        /// first response token and make the session `ready`. Otherwise return null.
+        /// Fails with `error.ContextFull` before any step, as the header states.
         pub fn feed(self: *Self, id: u32, tokens: []const u32, final: bool) !?u32 {
             std.debug.assert(id < self.table.len);
             std.debug.assert(tokens.len > 0);
@@ -415,34 +389,24 @@ pub fn Sessions(comptime RunnerT: type) type {
             return first;
         }
 
-        /// Advance each listed session one token: step its pending token
-        /// (committing that token's KV), sample the next from the fresh
-        /// logits, and write it to `tokens_out` in `ids` order. `decodeBatch`
-        /// validates capacity for ALL ids before it steps any row. On
-        /// `error.ContextFull` every session is unmodified.
+        /// Advance each listed session one token: commit its pending token, sample the next,
+        /// and write it to `tokens_out` in `ids` order.
         pub fn decodeBatch(self: *Self, ids: []const u32, tokens_out: []u32) !void {
             std.debug.assert(ids.len >= 1);
 
             _ = try self.advance(null, ids, tokens_out);
         }
 
-        /// The composed tick: the one row-assembly path under `feed` and
-        /// `decodeBatch`, and the continuous-batching boundary for the serve
-        /// scheduler. It runs one prefill chunk plus a decode step for `ids`,
-        /// in ONE batched forward. The chunk's rows then use the same weight
-        /// pass as the decode rows. Row order is [chunk rows... | decode rows...].
-        /// `want_logits` rows form a suffix (the chunk's last row asks only
-        /// when `final`). Returns the fed session's first response token when
-        /// the chunk is final, null otherwise. Decode tokens land in
-        /// `tokens_out` in `ids` order. `advance` validates capacity for the
-        /// chunk and ALL ids before it steps any row. On `error.ContextFull`
-        /// every session is unmodified.
+        /// The composed tick under `feed` and `decodeBatch`: one prefill chunk plus a decode
+        /// step for `ids` in one forward, so the chunk shares the weight pass. Rows are
+        /// [chunk | decode]. Returns the first response token when the chunk is final.
         pub fn advance(
             self: *Self,
             feed_chunk: ?FeedChunk,
             ids: []const u32,
             tokens_out: []u32,
         ) !?u32 {
+            // Check the capacity of the whole call.
             const n_feed: usize = if (feed_chunk) |fc| fc.tokens.len else 0;
             std.debug.assert(n_feed + ids.len >= 1);
             std.debug.assert(n_feed + ids.len <= self.rows.len);
@@ -470,6 +434,7 @@ pub fn Sessions(comptime RunnerT: type) type {
                 if (self.table[id].pos >= self.runner.max_seq) return error.ContextFull;
             }
 
+            // Assemble the rows: the chunk first, then one decode row per session.
             if (feed_chunk) |fc| {
                 const s = &self.table[fc.id];
                 s.state = .feeding;
@@ -492,18 +457,15 @@ pub fn Sessions(comptime RunnerT: type) type {
                 };
             }
 
+            // Step the runner once.
             try self.runner.stepBatch(self.rows[0 .. n_feed + ids.len]);
             self.last_final = if (feed_chunk) |fc| (if (fc.final) fc.id else null) else null;
 
+            // Sample from the compact logits. `base` skips the final chunk row.
             const vocab = self.vocab;
-            // The runner writes logits COMPACTLY. Only the want-logits rows get
-            // an lm_head: the final row of the chunk when `final`, then every
-            // decode row. They land at logits[0..] in that order, not at their
-            // batch-row offset. The buffer therefore needs `logitRows` rows
-            // even when the batch is much wider. `base` skips the slot of the
-            // final prefill row.
             const base: usize = if (feed_chunk) |fc| (if (fc.final) @as(usize, 1) else 0) else 0;
             var first: ?u32 = null;
+            // Sample the first token of a final chunk.
             if (feed_chunk) |fc| {
                 const s = &self.table[fc.id];
                 s.pos += @intCast(fc.tokens.len);
@@ -526,6 +488,7 @@ pub fn Sessions(comptime RunnerT: type) type {
                 }
             }
 
+            // Sample the next token of each decoded session.
             for (ids, 0..) |id, i| {
                 const s = &self.table[id];
                 s.pos += 1;
@@ -552,15 +515,6 @@ pub fn Sessions(comptime RunnerT: type) type {
 
 // -- helpers ----------------------------------------------------------------
 
-// The runner surface, pinned at compile time.
-//
-// `Sessions` reaches a runner through a duck-typed surface, and the serve
-// residency reaches the swap hooks through `Sessions`. Neither names an
-// interface type, so a renamed member or a changed argument breaks only the
-// call sites that instantiate it, and a GPU-only runner can break where no CPU
-// test looks. `Sessions` checks the rows it reads when a pool type is built.
-// The test below instantiates the whole surface against every runner this
-// build holds. `README.md` states the same table in prose.
 /// One field of the surface: the name and the exact type a consumer reads.
 fn requireField(comptime T: type, comptime name: []const u8, comptime Want: type) void {
     if (!@hasField(T, name)) {
@@ -586,8 +540,7 @@ fn requireFn(
     checkFn(T, name, params, Payload);
 }
 
-/// A method `Sessions` gates on `@hasDecl`. Absence is legal, and a wrong shape
-/// is not: the gate reads the name alone, so it cannot catch a drifted argument.
+/// A method that `Sessions` gates on `@hasDecl`. Absence is legal, and a wrong shape is not.
 fn optionalFn(
     comptime T: type,
     comptime name: []const u8,
@@ -599,9 +552,8 @@ fn optionalFn(
     }
 }
 
-/// The receiver, the arguments after it, and the value the method yields. An
-/// error union counts as its payload, because each runner family declares its
-/// own error set.
+/// The receiver, the arguments after it, and the value the method yields.
+/// An error union counts as its payload, because each family declares its own error set.
 fn checkFn(
     comptime T: type,
     comptime name: []const u8,
@@ -650,12 +602,8 @@ fn checkFn(
     }
 }
 
-/// The slot hooks a runner with non-positional state must carry. `Sessions`
-/// gates both on `@hasDecl`, so a runner that holds a recurrent accumulator
-/// can omit `resetSlotState`, compile, and inherit the state of the previous
-/// conversation on a slot reuse. The `has_recurrent_state` marker closes that
-/// hole. A family that declares it states the hooks are load bearing, and this
-/// check then needs them by name.
+/// The slot hooks of a runner with recurrent state. The `has_recurrent_state` marker makes
+/// the check require both hooks by name.
 fn requireRecurrentHooks(comptime T: type) void {
     if (!@hasDecl(T, "has_recurrent_state")) return;
     if (@TypeOf(T.has_recurrent_state) != bool) {
@@ -672,9 +620,7 @@ fn requireRecurrentHooks(comptime T: type) void {
     }
 }
 
-/// The marker itself, for a family whose state makes it load bearing. Without
-/// this the `requireRecurrentHooks` check passes vacuously on a runner that
-/// dropped the marker along with a hook.
+/// The marker itself. Without it, `requireRecurrentHooks` passes on a runner that dropped both.
 fn requireRecurrentState(comptime T: type) void {
     if (!@hasDecl(T, "has_recurrent_state") or !T.has_recurrent_state) {
         @compileError("runner surface: " ++ @typeName(T) ++ " holds recurrent state, " ++
@@ -682,12 +628,8 @@ fn requireRecurrentState(comptime T: type) void {
     }
 }
 
-/// The surface `Sessions` itself reads. `Sessions(RunnerT)` checks it when the
-/// pool type is built, so a drifted runner fails to compile in every build that
-/// names a pool, test fakes included. The optional rows are gated on `@hasDecl`
-/// at the call site, so a runner can omit them, unless it declares the
-/// recurrent-state marker. `evictSlot` is the gate the pools test for, so the
-/// whole swap surface must arrive with it.
+/// The surface `Sessions` reads. The optional rows can be absent. `evictSlot` brings the swap
+/// surface with it.
 fn requireSessionsSurface(comptime T: type) void {
     requireFn(T, "stepBatch", &.{[]const StepRow}, void);
     requireFn(T, "maxStepRows", &.{}, u32);
@@ -703,26 +645,21 @@ fn requireSessionsSurface(comptime T: type) void {
     }
 }
 
-/// The step surface every shipped runner carries: the pool surface plus the
-/// single-row `step` that `generate.decode` and the `run` prefill loop reach.
+/// The pool surface plus the single-row `step` that `generate.decode` and `run` call.
 fn requireStepSurface(comptime T: type) void {
     requireSessionsSurface(T);
     requireFn(T, "step", &.{ u32, u32 }, []f32);
 }
 
-/// The swap surface a runner carries to serve a tiered pool. `evictSlot` is the
-/// gate the pools test for, so the sizing hook and the restore hook must arrive
-/// with it.
+/// The swap surface of a tiered pool: size, evict, and restore.
 fn requireSwapSurface(comptime T: type) void {
     requireFn(T, "evictSlotBytesFor", &.{u32}, u64);
     requireFn(T, "evictSlot", &.{ u32, u32, []u8 }, void);
     requireFn(T, "restoreSlot", &.{ u32, u32, []const u8 }, void);
 }
 
-/// The plan-value rule: a runner takes its resource plan as a value at init and
-/// cannot outgrow it. The position of that argument differs per family, so the
-/// check states only that the constructor reads one. Every family names that
-/// constructor `init`.
+/// A runner takes its resource plan as a value at `init` and cannot outgrow it.
+/// The argument position differs per family, so the check finds the plan by type.
 fn requirePlanValue(comptime T: type, comptime Plan: type) void {
     if (!@hasDecl(T, "init")) {
         @compileError("runner surface: " ++ @typeName(T) ++ " has no declaration 'init'");
@@ -750,11 +687,8 @@ fn requirePlanValue(comptime T: type, comptime Plan: type) void {
 
 // -- tests ------------------------------------------------------------------
 
-// The FSM and the bookkeeping run against a canned-logits fake. Canned logits
-// make the "model" a pure function of the token of the last row. Argmax of the
-// logits of row i = (rows[i].token + 1) % vocab. Greedy params then give fully
-// predictable streams, and the recorded rows pin the chunking, the slot, and
-// the position bookkeeping.
+// Canned logits make the model a pure function of the row token: argmax of row i is
+// (rows[i].token + 1) % vocab. Greedy params then give predictable streams.
 const test_fakes = @import("test_fakes.zig");
 const test_vocab = test_fakes.vocab;
 
@@ -810,12 +744,8 @@ const FakeRunner = struct {
     }
 };
 
-/// A second fake, with the swap hooks the first one lacks. The two together
-/// pin both sides of `can_snapshot`. It holds one u32 marker per slot as a
-/// stand-in for KV content, and `stepBatch` moves the marker to the row's token
-/// like the first fake's chain. A blob costs one u32 per committed row and
-/// carries the marker in its first four bytes, so a round trip is observable.
-/// Mirrors the residency pool's fake.
+/// A fake with the swap hooks. A u32 marker per slot stands in for KV content.
+/// A blob costs one u32 per row and carries the marker in its first four bytes.
 const SnapFakeRunner = struct {
     n_slots: u32,
     max_seq: u32,
@@ -874,12 +804,10 @@ const SnapFakeRunner = struct {
 test "runner surface: the session seam holds for every runner in this build" {
     const build_options = @import("build_options");
     const kv_budget = @import("../core/kv_budget.zig");
-    // The check names every shipped runner, so this test is the one place the
-    // pool reaches a concrete runner type.
+    // This test is the one place that names every shipped runner.
     const llama_runner = @import("llama_runner.zig");
     const qwen_runner = @import("qwen_runner.zig");
-    // The fused GPU modules compile only under a vulkan build, so the checks
-    // gate the way every construction site gates.
+    // The fused GPU modules compile only under a vulkan build.
     const llama_fused = if (build_options.use_vulkan_fused_ops)
         @import("llama_fused.zig")
     else
@@ -908,9 +836,8 @@ test "runner surface: the session seam holds for every runner in this build" {
             requirePlanValue(T, kv_budget.KvPlan);
         }
 
-        // The qwen family holds the GDN recurrent slabs, so every one of its
-        // runners carries the marker and both hooks. The llama family holds no
-        // non-positional state, so it carries neither.
+        // The qwen family holds GDN recurrent state and carries the marker. The llama family
+        // does not.
         requireRecurrentState(qwen_runner.QwenRunner);
         if (@hasDecl(llama_runner.LlamaRunner, "has_recurrent_state")) {
             @compileError(

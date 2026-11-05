@@ -9,19 +9,19 @@
 //!   act 4  open a fresh session d with the same system prompt, served by the prefix cache.
 
 const std = @import("std");
+const zigferencer = @import("zigferencer");
 const builtin = @import("builtin");
 const Io = std.Io;
-const time = @import("../core/time.zig");
+const time = zigferencer.time;
 
-const cli = @import("command.zig");
-const args = @import("args.zig");
-const style = @import("style.zig");
-const select = @import("select.zig");
-const protocol = @import("../serve/protocol.zig");
-const Client = @import("../serve/client.zig").Client;
-const corelog = @import("../core/log.zig");
-const dtype = @import("../core/dtype.zig");
-const serve_common = @import("serve_common.zig");
+const context = zigferencer.cli.context;
+const args = zigferencer.cli.args;
+const style = zigferencer.cli.style;
+const select = zigferencer.cli.select;
+const protocol = zigferencer.serve_protocol;
+const Client = zigferencer.serve_client.Client;
+const corelog = zigferencer.log;
+const dtype = zigferencer.dtype;
 
 const log = std.log.scoped(.serve_demo);
 
@@ -86,7 +86,7 @@ const ScriptOptions = struct {
 
 /// What the acts share: the output, the connection, and the running token count.
 const Script = struct {
-    ctx: cli.Context,
+    ctx: context.Context,
     w: *Io.Writer,
     p: style.Palette,
     client: *Client,
@@ -171,13 +171,11 @@ const Flags = struct {
 
 // -- api --------------------------------------------------------------------
 
-pub fn run(ctx: cli.Context) !void {
+pub fn run(ctx: context.Context) !void {
     const flags = try args.parseInto(Flags, ctx) orelse return;
     try validate(ctx, flags);
 
-    var stdout_buffer: [cli.stdout_buffer_bytes]u8 = undefined;
-    var stdout_writer: Io.File.Writer = .initStreaming(.stdout(), ctx.io, &stdout_buffer);
-    const w = &stdout_writer.interface;
+    const w = &ctx.stdout.interface;
 
     // Cyan is the input the demo sends, green the text the model generates, dim the annotation.
     const pal = style.Palette.init(ctx.color);
@@ -221,7 +219,7 @@ pub fn run(ctx: cli.Context) !void {
 
 // -- helpers ----------------------------------------------------------------
 
-fn validate(ctx: cli.Context, flags: Flags) !void {
+fn validate(ctx: context.Context, flags: Flags) !void {
     if (flags.turns == 0 or flags.turns > turns_max) {
         return args.fail(ctx.io, "--turns must be in 1..8", .{});
     }
@@ -261,13 +259,13 @@ fn validate(ctx: cli.Context, flags: Flags) !void {
 
 /// The address of the running server from `--connect`, or of a child that this call spawns.
 fn serverAddress(
-    ctx: cli.Context,
+    ctx: context.Context,
     w: *Io.Writer,
     flags: Flags,
     child: *?std.process.Child,
 ) !Io.net.IpAddress {
     if (flags.connect) |hostport| {
-        const colon = std.mem.lastIndexOfScalar(u8, hostport, ':') orelse
+        const colon = std.mem.findScalarLast(u8, hostport, ':') orelse
             return args.fail(ctx.io, "--connect wants host:port", .{});
         const port = std.fmt.parseInt(u16, hostport[colon + 1 ..], 10) catch
             return args.fail(ctx.io, "--connect wants host:port", .{});
@@ -288,7 +286,7 @@ fn serverAddress(
 /// line off its stdout. The child inherits stderr, unless `$ZIGFERENCER_LOG` is set.
 /// Then its stderr goes to `serve_trace_file`.
 fn spawnServer(
-    ctx: cli.Context,
+    ctx: context.Context,
     w: *Io.Writer,
     opt: SpawnOptions,
     child: *?std.process.Child,
@@ -360,7 +358,7 @@ fn spawnServer(
 
 /// The command line of the child. Only a flag that the operator gave goes on it, so
 /// a resolved default does not override the child's own registry lookup.
-fn serverArgv(ctx: cli.Context, opt: SpawnOptions) ![]const []const u8 {
+fn serverArgv(ctx: context.Context, opt: SpawnOptions) ![]const []const u8 {
     var argv: std.ArrayList([]const u8) = .empty;
     const self_exe = try std.process.executablePathAlloc(ctx.io, ctx.arena);
     const max_sessions = try std.fmt.allocPrint(ctx.arena, "{d}", .{opt.max_sessions});
@@ -401,7 +399,7 @@ fn parseReady(line: []const u8) ?Io.net.IpAddress {
     const hostport = it.next() orelse return null;
     if (!std.mem.eql(u8, ready, "READY") or !std.mem.eql(u8, transport, "tcp")) return null;
 
-    const colon = std.mem.lastIndexOfScalar(u8, hostport, ':') orelse return null;
+    const colon = std.mem.findScalarLast(u8, hostport, ':') orelse return null;
     const port = std.fmt.parseInt(u16, hostport[colon + 1 ..], 10) catch return null;
     return Io.net.IpAddress.parse(hostport[0..colon], port) catch null;
 }
@@ -409,7 +407,7 @@ fn parseReady(line: []const u8) ?Io.net.IpAddress {
 /// Run the four acts and return the total generated tokens. Every turn caps its
 /// generation to fit the server's window, so the script runs the same on any model.
 fn playScript(
-    ctx: cli.Context,
+    ctx: context.Context,
     w: *Io.Writer,
     p: style.Palette,
     client: *Client,

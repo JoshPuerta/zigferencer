@@ -1,9 +1,10 @@
-//! The property driver. `forAll` generates `opts.cases` cases and checks each
-//! one. Case i has size min(i, max_size), so the first failing case is a small
+//! The property driver. `forAll` generates `opts.cases` cases and checks each one.
+//!
+//! Cases. Case i has size min(i, max_size), so the first failing case is a small
 //! one. Each case draws from its own generator, seeded from the call site, the
 //! test seed, and the case index. One case therefore replays alone.
 //!
-//! The seed is `std.testing.random_seed`, which the build runner passes to the
+//! Seed. It is `std.testing.random_seed`, which the build runner passes to the
 //! test binary. A plain `zig build test` takes a new seed on each run and
 //! explores new cases. A gate pins `--seed`, so its cases never change.
 
@@ -20,9 +21,8 @@ pub const Options = struct {
     max_size: u32 = 64,
 };
 
-/// A case that knows its number, for a property that alternates its shape by
-/// parity. The number is the size, so the options must set `max_size` to
-/// `cases - 1`.
+/// A case that knows its number, for a property that alternates its shape by parity.
+/// The number is the size, so the options must set `max_size` to `cases - 1`.
 pub const Trial = struct { index: u32, seed: u64 };
 
 const Failure = struct { index: u32, size: u32, err: anyerror };

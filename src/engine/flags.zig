@@ -1,5 +1,5 @@
 //! The options of one engine boot as a plain value. `resolve` reads them, so they
-//! live outside the CLI. The CLI attaches the help text in `cli/flags.zig`.
+//! live outside the CLI. The CLI attaches the help text in `cli/flag_groups.zig`.
 
 const dtype = @import("../core/dtype.zig");
 const chat = @import("../core/chat.zig");

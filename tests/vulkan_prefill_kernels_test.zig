@@ -1,32 +1,30 @@
 //! Digest gate for the batched-prefill kernels of the Qwen3.5-2B shapes.
 //!
-//! A kernel change that must keep the output bytes proves it here. Each test
-//! runs today's kernels on fixed seeded inputs and compares a 64-bit FNV-1a
-//! digest of the output bytes with a table that a device run minted. A null
-//! entry fails the test and prints the table to paste into the source. A
-//! digest that moved fails and names the case.
+//! Digests. A kernel change that must keep the output bytes proves it here. Each test runs the
+//! current kernels on fixed seeded inputs and compares a 64-bit FNV-1a digest of the output bytes
+//! with a table that a device run minted. A null entry fails the test and prints the table to paste
+//! into the source. A digest that moved fails and names the case.
 //!
-//! GDN. The chunked-parallel prefill runs a conv pass and a scan pass at the
-//! 2B shape: 16 key heads, 16 value heads, head dim 128, conv kernel 4, conv
-//! dim 6144. The incoming state and conv ring are not zero. The widths 64 and
-//! 128 are the prefill chunks, and 37 leaves a tail of five tokens in the last
-//! sub-chunk of 16. The conv digest covers the three conv outputs and the
-//! advanced conv ring. The scan digest covers the readout rows and the state.
-//! The kernels take no position, so a chunk start does not change their input.
+//! GDN. The chunked-parallel prefill runs a conv pass and a scan pass at the 2B shape: 16 key
+//! heads, 16 value heads, head dim 128, conv kernel 4, conv dim 6144. The incoming state and conv
+//! ring are not zero. The widths 64 and 128 are the prefill chunks, and 37 leaves a tail of five
+//! tokens in the last sub-chunk of 16. The conv digest covers the three conv outputs and the
+//! advanced conv ring. The scan digest covers the readout rows and the state. The kernels take no
+//! position, so a chunk start does not change their input.
 //!
-//! GEMM. The tiled kernel runs at the batch widths 64 and 128 on the three
-//! projection shapes of the 2B model. The single-wave batch kernel runs at
-//! width 7 on one shape, because it serves every width below 64.
+//! GEMM. The tiled kernel runs at the batch widths 64 and 128 on the three projection shapes of the
+//! 2B model. The single-wave batch kernel runs at width 7 on one shape, because it serves every
+//! width below 64.
 //!
-//! Each test returns `error.SkipZigTest` when no Vulkan device is reachable.
+//! Skips. Each test returns `error.SkipZigTest` when no Vulkan device is reachable.
 
 const std = @import("std");
-const z = @import("zigferencer");
+const zigferencer = @import("zigferencer");
 
 // -- fixtures ---------------------------------------------------------------
 
-fn openRunner(allocator: std.mem.Allocator) !*z.vulkan_runner.Runner {
-    return z.vulkan_runner.Runner.init(allocator) catch |e| switch (e) {
+fn openRunner(allocator: std.mem.Allocator) !*zigferencer.vulkan_runner.Runner {
+    return zigferencer.vulkan_runner.Runner.init(allocator) catch |e| switch (e) {
         error.NoVulkanDevice,
         error.InitializationFailed,
         error.IncompatibleDriver,
@@ -155,7 +153,11 @@ fn digestSlices(slices: []const []const f32) u64 {
 
 /// Run the conv pass and the scan pass on seeded inputs with a non-zero state
 /// and conv ring, and return the conv digest and the scan digest.
-fn runGdnCase(allocator: std.mem.Allocator, kp: *z.ops_vulkan.GdnChunkParallel, t: u32) ![2]u64 {
+fn runGdnCase(
+    allocator: std.mem.Allocator,
+    kp: *zigferencer.ops_vulkan.GdnChunkParallel,
+    t: u32,
+) ![2]u64 {
     const T: usize = t;
     const qkv = try allocator.alloc(f32, T * conv_dim);
     defer allocator.free(qkv);
@@ -248,7 +250,7 @@ fn runGdnDigests() !void {
     const runner = try openRunner(allocator);
     defer runner.deinit();
 
-    var kp = try z.ops_vulkan.GdnChunkParallel.init(&runner.ctx);
+    var kp = try zigferencer.ops_vulkan.GdnChunkParallel.init(&runner.ctx);
     defer kp.deinit();
 
     var got: [gdn_widths.len][2]u64 = undefined;
@@ -336,10 +338,10 @@ fn runGemmDigests() !void {
     const runner = try openRunner(allocator);
     defer runner.deinit();
 
-    var gemm = try z.ops_vulkan.LinearQ80Gemm.init(&runner.ctx);
+    var gemm = try zigferencer.ops_vulkan.LinearQ80Gemm.init(&runner.ctx);
     defer gemm.deinit();
 
-    var batch = try z.ops_vulkan.LinearQ80Batch.init(&runner.ctx);
+    var batch = try zigferencer.ops_vulkan.LinearQ80Batch.init(&runner.ctx);
     defer batch.deinit();
 
     var got: [gemm_cases.len][1]u64 = undefined;
@@ -358,6 +360,6 @@ test "prefill kernels keep their minted digests: GDN chunk conv and scan at thre
     try runGdnDigests();
 }
 
-test "prefill kernels keep their minted digests: Q8_0 GEMM at two widths and batch kernel at width 7" {
+test "prefill kernels keep their minted digests: Q8_0 GEMM at two widths, batch kernel at width 7" {
     try runGemmDigests();
 }

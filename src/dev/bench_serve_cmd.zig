@@ -7,30 +7,32 @@
 //! same stream at every B, and the rows differ only in concurrency.
 
 const std = @import("std");
+const zigferencer = @import("zigferencer");
 const Io = std.Io;
 const Allocator = std.mem.Allocator;
 const build_options = @import("build_options");
 
-const cli = @import("command.zig");
-const args = @import("args.zig");
-const flags_mod = @import("flags.zig");
-const select = @import("select.zig");
-const serve_common = @import("serve_common.zig");
-const family = @import("../engine/family.zig");
-const bpe = @import("../core/tokenizer/bpe.zig");
-const kv_budget = @import("../core/kv_budget.zig");
-const limits = @import("../core/limits.zig");
-const registry = @import("../core/registry.zig");
-const vocab_mod = @import("../core/tokenizer/vocab.zig");
-const loader = @import("../io/gguf/loader.zig");
-const parallel = @import("../runtime/parallel.zig");
-const Pool = @import("../runtime/pool.zig").Pool;
-const Sessions = @import("../runtime/session.zig").Sessions;
-const Client = @import("../serve/client.zig").Client;
-const event = @import("../serve/event.zig");
-const prefill_chunk = @import("../serve/prefill_chunk.zig");
-const protocol = @import("../serve/protocol.zig");
-const server_mod = @import("../serve/server.zig");
+const context = zigferencer.cli.context;
+const args = zigferencer.cli.args;
+const flags_mod = zigferencer.cli.flag_groups;
+const select = zigferencer.cli.select;
+const boot_facts = zigferencer.cli.boot_facts;
+const boot_lines = zigferencer.cli.boot_lines;
+const family = zigferencer.family;
+const bpe = zigferencer.bpe;
+const kv_budget = zigferencer.kv_budget;
+const limits = zigferencer.limits;
+const registry = zigferencer.registry;
+const vocab_mod = zigferencer.vocab;
+const loader = zigferencer.loader;
+const parallel = zigferencer.parallel;
+const Pool = zigferencer.pool.Pool;
+const Sessions = zigferencer.session.Sessions;
+const Client = zigferencer.serve_client.Client;
+const event = zigferencer.serve_event;
+const prefill_chunk = zigferencer.serve_prefill_chunk;
+const protocol = zigferencer.serve_protocol;
+const server_mod = zigferencer.serve_server;
 
 const log = std.log.scoped(.bench_serve);
 
@@ -109,7 +111,7 @@ const Flags = struct {
 
 /// What every row of one curve reads.
 const Curve = struct {
-    ctx: cli.Context,
+    ctx: context.Context,
     w: *Io.Writer,
     loaded: *const loader.Loaded,
     codec: *const event.Codec,
@@ -131,13 +133,13 @@ fn ServerTask(comptime ServerT: type) type {
 
 // -- api --------------------------------------------------------------------
 
-pub fn run(ctx: cli.Context) !void {
+pub fn run(ctx: context.Context) !void {
     const flags = try args.parseInto(Flags, ctx) orelse return;
 
     // The fused build benches the whole-model fused runners alone, which run
     // no CPU op, so its pool starts no workers.
     const thread_flags = flags.engine.threads.policyFlags();
-    const policy = try serve_common.resolvePolicy(ctx.io, thread_flags, !fused_build);
+    const policy = try boot_facts.resolvePolicy(ctx.io, thread_flags, !fused_build);
 
     const model = try select.model(ctx, flags.pub_name);
     const path = try registry.resolveLoadPath(ctx.arena, ctx.io, ctx.models_root, model.*);
@@ -161,9 +163,7 @@ pub fn run(ctx: cli.Context) !void {
         .eos_id = v.eos_id,
     };
 
-    var stdout_buffer: [cli.stdout_buffer_bytes]u8 = undefined;
-    var stdout_writer: Io.File.Writer = .initStreaming(.stdout(), ctx.io, &stdout_buffer);
-    const w = &stdout_writer.interface;
+    const w = &ctx.stdout.interface;
     try printIntro(w, model.pub_name, policy, &flags);
 
     if (comptime build_options.use_vulkan_ops) {
@@ -197,9 +197,9 @@ fn turnWindow(io: Io, flags: *const Flags, card: loader.ModelCard, ceiling: u32)
     const cost = kv_budget.costModel(card.kvShape(), .f32);
     const serve_default = kv_budget.defaultWindows(cost, ceiling).serve;
     const flag = flags.engine.max_seq;
-    const max_seq = serve_common.baseWindow(flag, ceiling, serve_default) catch |err| switch (err) {
+    const max_seq = boot_facts.baseWindow(flag, ceiling, serve_default) catch |err| switch (err) {
         error.WindowOutOfRange => {
-            return args.fail(io, serve_common.window_out_of_range_fmt, .{ceiling});
+            return args.fail(io, boot_lines.window_out_of_range_fmt, .{ceiling});
         },
     };
 
@@ -280,7 +280,7 @@ fn fusedCurve(comptime Family: type, c: *const Curve) !void {
     const ctx = c.ctx;
     const card = c.loaded.card;
 
-    const ctxp = try serve_common.openDevice(ctx);
+    const ctxp = try boot_facts.openDevice(ctx);
     defer ctxp.deinit();
 
     const n_slots: u32 = @max(Family.fused_min_slots, limits.max_batch);
@@ -290,7 +290,7 @@ fn fusedCurve(comptime Family: type, c: *const Curve) !void {
         .slots = n_slots,
         .batch = limits.max_batch,
     });
-    serve_common.logPlan(plan, .f32);
+    boot_lines.logPlan(plan, .f32);
 
     const fused = try Family.initFused(ctx.gpa, ctxp, c.loaded, plan, .f32);
     defer fused.deinit();

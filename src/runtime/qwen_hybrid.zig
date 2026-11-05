@@ -1,29 +1,42 @@
-//! `QwenHybridRunner` splits one Qwen3.5 forward pass across both executors: a
-//! `QwenRunner` runs the layer prefix `[0..split)` on the CPU, and a
-//! `QwenFusedRunner` runs the suffix `[split..n_layers)` plus the final norm and
-//! the lm_head on the GPU. The budget planner picks `split` so the device
-//! suffix fits the VRAM budget, which funds the middle between a model that
-//! fits VRAM and a model that runs CPU-only.
+//! `QwenHybridRunner` splits one Qwen3.5 forward pass across both executors. A `QwenRunner` runs
+//! the layer prefix `[0..split)` on the CPU. A `QwenFusedRunner` runs the suffix
+//! `[split..n_layers)`, the final norm, and the lm_head on the GPU. The budget planner picks
+//! `split` so the device suffix fits the VRAM budget.
 //!
-//! The Llama twin (`llama_hybrid.zig`) records its own GPU layer bodies. This
-//! runner instead COMPOSES the two shipped runners over two boundaries.
-//! `QwenRunner.initPrefix` builds the host prefix, and the hidden-row
-//! entry points of `QwenFusedRunner` take the crossing rows. No dispatch is
-//! recorded here, and no layer body is copied.
+//! Composition. `QwenRunner.initPrefix` builds the host prefix, and the hidden-row entry points of
+//! `QwenFusedRunner` take the crossing rows. This file records no dispatch and copies no layer
+//! body.
 //!
-//! The residual stream crosses the host-device boundary once per call: the
-//! prefix leaves its rows in its own `x`, and the suffix's hidden-row entry
-//! points read that stream in place of an embedding lookup.
+//! Crossing. The residual stream crosses the host-device boundary once per call. The prefix leaves
+//! its rows in its own `x`. The suffix reads that stream in place of an embedding lookup, so no
+//! third buffer exists. The CPU prefix runs the whole batch before the one crossing. So the GDN
+//! recurrence sees time order on both tiers.
 //!
-//! A slot's state spans both tiers, so every slot hook does too. The blob stays
-//! ONE walk in whole-model order, the prefix's regions first and the suffix's
-//! after, and the boundary offset is the prefix's own byte count. `blobSpanBytes`
-//! states that partition, and every call checks it against what the two runners
-//! report for themselves.
+//! Split bounds. The two degenerate placements are whole-model runners, and the CLI dispatches them
+//! to `QwenRunner` and `QwenFusedRunner` directly. A hybrid that accepted them holds a second
+//! construction of each. No gate reaches it, and no token hash covers it.
 //!
-//! Nothing in this file runs without a device. The tests below cover the blob
-//! framing and the backend tag, which are device-free arithmetic. The hardware
-//! gates are the equivalence tests in `tests/`.
+//! Slot state. The state of a slot spans both tiers, so every slot hook does too. Both tiers hold
+//! GDN recurrent slabs, so the session surface needs both slot hooks from this runner. Without the
+//! `has_recurrent_state` marker, a hybrid that omits `resetSlotState` still compiles, and it leaks
+//! that state across a slot reuse.
+//!
+//! Blob. One blob stays one walk in whole-model order: prefix regions first, suffix regions after.
+//! Both walks emit layers in model order. A full-attention layer emits KV rows, and a GDN layer
+//! emits its whole recurrent and conv slabs. So the concatenation is the order that a single-tier
+//! runner writes. The boundary offset is the byte count of the prefix. `blobSpanBytes` states that
+//! partition, and every call checks it against what the two runners report.
+//!
+//! Disk namespace. The CPU and GPU halves of one blob are not bit-identical. So a hybrid blob lives
+//! in its own disk namespace. The split and the KV dtype qualify the tag further.
+//!
+//! Swap stages. A swap stage holds one chunk of the device half of a slot blob, or that half when
+//! smaller. A residency plan prices two stages. A plan without residency prices zero and never
+//! swaps.
+//!
+//! Tests. Nothing in this file runs without a device. The tests below cover the blob framing and
+//! the backend tag, which are device-free arithmetic. The hardware gates are the equivalence tests
+//! in `tests/`.
 
 const std = @import("std");
 const span = @import("../core/span.zig");
@@ -61,8 +74,8 @@ comptime {
 pub const QwenHybridRunner = struct {
     gpa: Allocator,
 
-    /// The host layers `[0..split)`. The arena that owns them lives here too, so
-    /// `deinit` reclaims the prefix in one call.
+    /// The host layers `[0..split)`, which live in `prefix_arena`, so `deinit` reclaims them in one
+    /// call.
     prefix: QwenRunner,
     prefix_arena: std.heap.ArenaAllocator,
     /// The device layers `[split..n_layers)`, the final norm, and the lm_head.
@@ -72,44 +85,35 @@ pub const QwenHybridRunner = struct {
     n_layers: u32,
     hidden: u32,
     card: loader.ModelCard,
-    /// The element type every full-attention KV row is framed at, on both
-    /// tiers. One dtype crosses the boundary, so the blob keeps one row stride.
+    /// The element of every full-attention KV row on both tiers, so the blob keeps one row stride.
     kv_dtype: dtype.KvDtype,
 
     // -- session surface ----------------------------------------------------
     // The session layer in `runtime/session.zig` reads the members below from
     // every runner family, and serve reads the backend tag.
 
-    /// The suffix's compact logits rows, aliased rather than copied: the suffix
-    /// runs the lm_head and owns the buffer, and this runner adds no row.
+    /// The compact logits rows of the suffix, aliased: the suffix runs the lm_head and owns them.
     logits: []f32,
     n_slots: u32,
     max_seq: u32,
-    /// Rows one `prefillBatch` call accepts, which is the suffix's figure. The
-    /// bench and the serve chunker read this as a FIELD on every runner family,
-    /// so the hybrid states it beside `max_seq` rather than behind a call.
+    /// Rows one `prefillBatch` accepts. The bench and the serve chunker read this field on every
+    /// runner.
     prefill_batch_max: u32,
-    /// True when the plan priced both swap stages. A plan without residency
-    /// prices zero RAM for them, so this runner must then never swap.
+    /// True when the plan priced both swap stages. A plan without them means this runner never
+    /// swaps.
     swap_priced: bool,
 
-    /// This runner holds GDN recurrent slabs on both tiers, so the session
-    /// surface needs both slot hooks from it. Without the marker a hybrid that
-    /// omits `resetSlotState` still compiles, and it leaks that state across a
-    /// slot reuse.
+    /// Both tiers hold GDN slabs. See "Slot state" in the header.
     pub const has_recurrent_state = true;
 
-    /// The `run` command batches the prompt through `prefillBatch`, as serve
-    /// and bench-model do.
+    /// The `run` command batches the prompt through `prefillBatch`, as serve and bench-model do.
     pub const chunked_prefill: bool = true;
 
-    /// The literal frame of a placement tag, shared by the bound and the format
-    /// so the two stay one fact.
+    /// The literal frame of a placement tag, which the bound and the format share.
     const tag_prefix = "vulkan_hybrid_qwen:k=";
 
-    /// The one weight element the qwen family stages: `qwen_fused` refuses any
-    /// other dtype at upload. The Llama twin takes this as a parameter, because
-    /// its runner stages q8_0 or q4_0.
+    /// The one weight element the qwen family stages: `qwen_fused` refuses any other dtype at
+    /// upload.
     const quant_tag = "q8_0";
 
     /// Bytes the widest tag occupies: the literal frame, the widest u32 split,
@@ -118,11 +122,8 @@ pub const QwenHybridRunner = struct {
         std.fmt.comptimePrint("{d}", .{std.math.maxInt(u32)}).len + 1 +
         quant_tag.len + dtype.kv_tag_suffix_max;
 
-    /// The snapshot-provenance tag for a qwen hybrid placement. The CPU and the
-    /// GPU halves of one blob are not bit-identical, so a hybrid blob lives in
-    /// its own disk namespace. The split and the KV dtype qualify it further. A
-    /// caller must size its buffer at `backend_tag_buf_len`, which is the bound
-    /// that makes the format here infallible.
+    /// The snapshot-provenance tag of a qwen hybrid placement. See "Disk namespace" in the header.
+    /// `buf` must hold `backend_tag_buf_len` bytes, the bound that makes the format infallible.
     pub fn backendTag(buf: []u8, split: u32, kv_dtype: dtype.KvDtype) []const u8 {
         std.debug.assert(buf.len >= backend_tag_buf_len);
 
@@ -135,12 +136,9 @@ pub const QwenHybridRunner = struct {
 
     // -- init ---------------------------------------------------------------
 
-    /// The caller states the KV dtype. Both tiers frame their rows the same
-    /// way, so the one value reaches the prefix runner and the device suffix
-    /// from here.
-    ///
-    /// The placement's `logits` reservation must cover `n_slots` rows: the
-    /// suffix runs the lm_head, and every decode row of a tick wants logits.
+    /// Build the suffix and the prefix at the KV dtype of the caller, which both tiers share. The
+    /// `logits` reservation must cover `n_slots` rows, because every decode row of a tick wants
+    /// logits.
     pub fn init(
         gpa: Allocator,
         ctx: *const vulkan_ctx.Context,
@@ -151,26 +149,24 @@ pub const QwenHybridRunner = struct {
         policy: parallel.Policy,
         kv_dtype: dtype.KvDtype,
     ) !*QwenHybridRunner {
+        // Name the placement.
         const card = loaded.card;
         const split: u32 = plan.split;
         const n_layers: u32 = plan.n_layers;
         std.debug.assert(n_layers == card.n_layers);
-        // The two degenerate placements are whole-model runners, and the CLI
-        // dispatches them to `QwenRunner` and `QwenFusedRunner` directly. A
-        // hybrid that accepted them holds a second construction of each,
-        // reachable by no gate and covered by no token hash.
+
+        // A degenerate split belongs to a whole-model runner. See "Split bounds" in the header.
         std.debug.assert(split >= 1);
         std.debug.assert(split < n_layers);
-        // The host prefix indexes its slots by the decode width, which is the
-        // ceiling the serve helper `hybridSlots` already enforces.
+
+        // The host prefix indexes its slots by the decode width, the ceiling `hybridSlots`
+        // enforces.
         std.debug.assert(plan.n_slots >= 1);
         std.debug.assert(plan.n_slots <= limits.max_batch);
         std.debug.assert(plan.window >= 1);
 
-        // Plan-is-a-value: the planner priced this split through the per-layer
-        // cost vector, and the two runners are about to allocate against it.
-        // Both spans and their sum are checked before the first allocation, so
-        // a plan built from another vector fails here.
+        // Check the plan against the per-layer cost vector, before the first allocation. A plan
+        // built from another vector fails here.
         const kv_struct: kv_budget.KvStructure = .{
             .n_slots = plan.n_slots,
             .window = plan.window,
@@ -184,28 +180,20 @@ pub const QwenHybridRunner = struct {
             host_span + device_span == kv_budget.slotSpanBytes(kv_struct, 0, n_layers),
         );
         std.debug.assert(plan.ram.host_kv == plan.kv_host);
-        // One swap stage holds one chunk of the device half of one slot blob,
-        // or the whole half at the window when that is smaller. A residency
-        // plan prices two stages, and a plan without residency prices zero and
-        // never swaps.
+
+        // Check the swap stages. See "Swap stages" in the header.
         const stage_one = blobSpanBytes(card, kv_dtype, plan.window, split, n_layers);
         std.debug.assert(stage_one == device_span);
-        std.debug.assert(
-            plan.ram.swap_stages == 0 or plan.ram.swap_stages == 2 * kv_budget.stageBytes(
-                stage_one,
-            ),
-        );
         const swap_priced = plan.ram.swap_stages == 2 * kv_budget.stageBytes(stage_one);
+        std.debug.assert(swap_priced or plan.ram.swap_stages == 0);
         std.debug.assert(plan.ram.swap_stages <= 2 * limits.swap_stage_chunk_bytes);
         std.debug.assert(plan.ram.swap_stages * plan.n_slots <= 2 * plan.kv_vram);
 
         const self = try gpa.create(QwenHybridRunner);
         errdefer gpa.destroy(self);
 
-        // The suffix comes first: its VRAM preflight refuses an over-budget
-        // placement before the prefix spends host memory it then frees.
-        // The placement's named reservations become the suffix's plan, and the
-        // suffix asserts each one against the range it is about to upload.
+        // Build the suffix first: its VRAM preflight refuses an over-budget placement before the
+        // prefix spends host memory.
         const suffix = try QwenFusedRunner.initSuffix(gpa, ctx, loaded, .{
             .vram = .{
                 .weights = plan.weight_resident,
@@ -215,17 +203,18 @@ pub const QwenHybridRunner = struct {
             },
             .ram = .{ .blobs = plan.ram.blobs, .prefix = plan.ram.prefix },
             .n_slots = plan.n_slots,
-            // A decode row occupies a slot, and the slot count already sits
-            // under the decode ceiling, so every slot can step in one tick.
+            // A decode row occupies a slot, and the slot count sits under the decode ceiling. So
+            // every slot can step in one tick.
             .n_streams = plan.n_slots,
             .window = plan.window,
         }, split, kv_dtype);
         errdefer suffix.deinit();
 
+        // Fill the fields. `prefix` stays undefined until the init below.
         self.* = .{
             .gpa = gpa,
             .prefix = undefined,
-            .prefix_arena = std.heap.ArenaAllocator.init(gpa),
+            .prefix_arena = .init(gpa),
             .suffix = suffix,
             .split = split,
             .n_layers = n_layers,
@@ -240,8 +229,8 @@ pub const QwenHybridRunner = struct {
         };
         errdefer self.prefix_arena.deinit();
 
-        // Every row of a call crosses, so the prefix holds row scratch for the
-        // widest step the suffix accepts.
+        // Build the prefix. Every row of a call crosses, so it holds row scratch for the widest
+        // suffix step.
         self.prefix = try QwenRunner.initPrefix(
             self.prefix_arena.allocator(),
             loaded,
@@ -254,9 +243,8 @@ pub const QwenHybridRunner = struct {
             kv_dtype,
         );
 
-        // The prefix allocated what the planner priced for `[0..split)`: one
-        // slot's KV at the window plus its GDN slabs, which is the blob figure
-        // at a full window. The suffix ran the same check on its own range.
+        // The prefix allocated what the planner priced for `[0..split)`: one slot's KV at the
+        // window plus its GDN slabs. The suffix ran the same check on its own range.
         std.debug.assert(self.prefix.evictSlotBytesFor(plan.window) == host_span);
         std.debug.assert(self.prefix.maxStepRows() >= suffix.maxStepRows());
         std.debug.assert(self.prefix.n_slots == self.n_slots);
@@ -292,11 +280,9 @@ pub const QwenHybridRunner = struct {
 
     // -- step ---------------------------------------------------------------
 
-    /// Run the CPU prefix over `rows` and leave the crossing activations in the
-    /// prefix runner's own residual stream: embed, then layers `[0..split)`.
-    /// The suffix reads that stream directly, so no third buffer exists.
-    /// `embedLookup` is the naive function on every op backend, so this is the
-    /// same call `QwenRunner.stepBatch` makes.
+    /// Run the CPU prefix over `rows`: embed, then layers `[0..split)`. The crossing activations
+    /// stay in `prefix.x`. `embedLookup` is the naive function on every op backend, as in
+    /// `QwenRunner.stepBatch`.
     fn hostPrefix(self: *QwenHybridRunner, rows: []const StepRow) qwen_runner.Error!void {
         const sp = span.beginHot(.host_prefix);
         defer sp.end();
@@ -333,13 +319,10 @@ pub const QwenHybridRunner = struct {
         return self.suffix.stepHidden(self.crossing(1), pos);
     }
 
-    /// Advance a batch of rows, the sibling of `QwenRunner.stepBatch`: the same
-    /// row rules, and compact logits for the `want_logits` suffix. The CPU
-    /// prefix runs the whole batch before the one crossing, so the GDN
-    /// recurrence sees time order on both tiers.
+    /// Advance a batch of rows under the rules of `QwenRunner.stepBatch`, with compact logits for
+    /// the `want_logits` suffix. See "Crossing" in the header.
     pub fn stepBatch(self: *QwenHybridRunner, rows: []const StepRow) !void {
-        // The row rules bind the prefix drive too, so the check runs ahead of
-        // the first host layer and not inside the suffix alone.
+        // The row rules bind the prefix drive too, so the check runs ahead of the first host layer.
         _ = try step_row.validateRows(rows, self.n_slots, self.maxStepRows(), self.max_seq);
         try self.hostPrefix(rows);
         return self.suffix.stepBatchHidden(self.crossing(rows.len), rows);
@@ -369,11 +352,8 @@ pub const QwenHybridRunner = struct {
     // -- slot state ---------------------------------------------------------
     // One slot spans both tiers, so every hook below drives both runners.
 
-    /// Zero a slot's GDN recurrent state on both tiers for a fresh conversation.
-    /// The KV needs no scrub on either side, because attention reads only
-    /// rewritten positions. `Sessions.create` calls this on slot reuse, and the
-    /// session surface needs it from this runner: a hybrid that omits it
-    /// inherits the previous conversation's recurrent state.
+    /// Zero the GDN state of a slot on both tiers for a fresh conversation. `Sessions.create` calls
+    /// this on slot reuse. The KV needs no scrub, because attention reads only rewritten positions.
     pub fn resetSlotState(self: *QwenHybridRunner, slot: u32) void {
         std.debug.assert(slot < self.n_slots);
 
@@ -381,9 +361,8 @@ pub const QwenHybridRunner = struct {
         self.suffix.resetSlotState(slot);
     }
 
-    /// Fork slot state for a session clone across both tiers. One slot id spans
-    /// them, because both carry the same slot count. `Sessions.clone` calls
-    /// this.
+    /// Fork slot state for a session clone across both tiers. One slot id spans them, because both
+    /// carry the same slot count. `Sessions.clone` calls this.
     pub fn cloneSlotState(
         self: *QwenHybridRunner,
         source_slot: u32,
@@ -400,20 +379,11 @@ pub const QwenHybridRunner = struct {
     }
 
     // -- tiered kv ----------------------------------------------------------
-    // Evict a slot to a host blob, and restore it back. The serve residency
-    // layer (`serve/residency.zig`) spills idle sessions to RAM. A hybrid slot
-    // lives in two tiers, so one blob holds the host prefix layers first and
-    // the device suffix layers after. Both walks emit their layers in model
-    // order: KV rows for a full-attention layer, and the whole recurrent and
-    // conv slabs for a GDN layer. The concatenation is therefore the
-    // whole-model order a single-tier runner writes.
+    // Evict a slot to a host blob, and restore it back. See "Blob" in the header.
 
-    /// Bytes one slot's state occupies in a blob over the ABSOLUTE layer range
-    /// `[from..to)` at `n_rows` committed positions: KV rows on the
-    /// full-attention layers, and the whole recurrent slabs on the GDN ones,
-    /// which have no position axis. It is the planner's `slotSpanBytes` with the
-    /// row count in the window's place, so the boundary offset and both halves come
-    /// from ONE walk.
+    /// Bytes the state of one slot occupies in a blob over the absolute layer range `[from..to)` at
+    /// `n_rows` committed positions. It is the `slotSpanBytes` of the planner with the row count in
+    /// the place of the window.
     pub fn blobSpanBytes(
         card: loader.ModelCard,
         kv_dtype: dtype.KvDtype,
@@ -430,9 +400,8 @@ pub const QwenHybridRunner = struct {
         return blobSpanBytes(self.card, self.kv_dtype, n_rows, 0, self.n_layers);
     }
 
-    /// The blob boundary: the offset the device half starts at. It states the
-    /// partition both directions depend on, each runner's own figure against
-    /// the whole-model walk, so neither direction can drift from the other.
+    /// The blob boundary: the offset where the device half starts. It checks the figure of each
+    /// runner against the whole-model walk, so neither direction can drift from the other.
     fn seam(self: *const QwenHybridRunner, n_rows: u32, blob_len: usize) usize {
         const host: usize = @intCast(
             blobSpanBytes(self.card, self.kv_dtype, n_rows, 0, self.split),
@@ -467,8 +436,7 @@ pub const QwenHybridRunner = struct {
         });
     }
 
-    /// Restore a previously-evicted `n_rows`-row blob into `slot`, the mirror of
-    /// `evictSlot`.
+    /// Restore an evicted `n_rows`-row blob into `slot`, the mirror of `evictSlot`.
     pub fn restoreSlot(self: *QwenHybridRunner, slot: u32, n_rows: u32, blob: []const u8) !void {
         // The device half moves through a stage that the plan must have priced.
         std.debug.assert(self.swap_priced);
@@ -529,9 +497,8 @@ fn testTensors() [26]loader.TensorRef {
 
 test "qwen split: the cost vector prices six attention layers and eighteen slabs" {
     const card = testCard();
-    // The closed form of the 2B stack, which `core/kv_budget.zig` states as
-    // `qwen2bCosts`: layers 3, 7, 11, 15, 19, and 23 charge a KV row pair a
-    // token, and the other eighteen hold a fixed recurrent slab.
+    // The closed form of the 2B stack, `qwen2bCosts` in `core/kv_budget.zig`: layers 3, 7, 11, 15,
+    // 19, and 23 charge a KV row pair a token, and the other eighteen hold a fixed slab.
     const gdn_bytes: u64 = 1_122_304;
     for ([_]dtype.KvDtype{ .f32, .f16 }) |kv_dtype| {
         const row_pair: u64 = 2 * kv_dtype.rowBytes(card.n_kv_heads * card.head_dim);
@@ -549,9 +516,8 @@ test "qwen split: the cost vector prices six attention layers and eighteen slabs
             );
         }
 
-        // A uniform per-layer price charges a different number at every split,
-        // so the divisibility accident on this model cannot stand in for the
-        // vector.
+        // A uniform per-layer price charges a different number at every split, so the divisibility
+        // accident on this model cannot stand in for the vector.
         try std.testing.expectEqual(6 * row_pair, costs.total().kv_bytes_per_token);
         try std.testing.expectEqual(18 * gdn_bytes, costs.total().fixed_state_bytes_per_slot);
     }
@@ -601,9 +567,8 @@ test "qwen split: a mid split prices each tier by the layers it holds" {
     );
     // The resident weights are the suffix layers plus the head the suffix runs.
     try std.testing.expectEqual(@as(u64, 12 * 1024 + 4096 + 1024), plan.weight_resident);
-    // One swap stage is one chunk of the device half of one slot blob at the
-    // window, or the whole half when that is smaller, the figure `init`
-    // asserts against the planner's suffix span.
+    // One swap stage is one chunk of the device half of one slot blob at the window, or the whole
+    // half when that is smaller.
     try std.testing.expectEqual(
         2 * kv_budget.stageBytes(
             QwenHybridRunner.blobSpanBytes(card, kv_dtype, kv.window, plan.split, 24),
@@ -679,9 +644,8 @@ test "qwen hybrid blob: rows price the attention layers and never the slabs" {
 test "qwen hybrid blob: the seam equals the planner's prefix span" {
     const card = testCard();
     const H = QwenHybridRunner;
-    // The planner prices a slot at the window, and the blob prices it at the
-    // committed rows. At `n_rows == window` the two are one number, which is the
-    // init assert against what the prefix runner allocated.
+    // The planner prices a slot at the window, and the blob prices it at the committed rows. At
+    // `n_rows == window` the two are one number.
     for ([_]dtype.KvDtype{ .f32, .f16 }) |kv_dtype| {
         for ([_]u32{ 16, 512, 8192 }) |window| {
             const kv: kv_budget.KvStructure = .{

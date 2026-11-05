@@ -25,6 +25,34 @@
 //!   admit gates each tier by `worthwhile` (disk uses a higher bar that adds
 //!   the read-back time of the snapshot). A future hit on a kept entry must
 //!   cost less than the prefill it replaces.
+//!
+//! Disk file. `<dir>/<hexkey>.zkv` holds a fixed `DiskHeader`, then the tokens, the last logits,
+//! and the blob. `payload_fnv` guards a torn file, and `model_fp` plus the stored tokens guard
+//! hash collisions across models. A bad file is deleted and reads as a miss.
+//!
+//! Disk index. `lookupBestPrefix` needs the disk tier scannable, because its callers track no
+//! boundary lists. A row holds the key and the tokens of one file, never the blob. A row goes
+//! stale when its file is evicted or torn, and the verified load at promotion drops it, so the
+//! index heals itself. `loadDiskIndex` is bounded by `limits.serve_prefix_disk_index_max` and
+//! reports the files past the bound, because a capped index must never read as a complete one.
+//!
+//! Namespaces. `model_fp` names the namespace of every file a cache writes, and `disk_budget`
+//! bounds that namespace alone. Many models and processes can share one directory. A scan skips a
+//! foreign file silently, spends none of the bound on it, and never counts or deletes it. A file
+//! that fails to open, to read, or to stat skips both roles, so one transient IO error never
+//! makes a namespace look small enough to keep growing.
+//!
+//! Admission. `admit` copies the transient buffers of the caller. Each tier is optional, so a
+//! failure in one logs a line and the other still runs. The disk bar adds the read-back time at
+//! `disk_bw_bps`, which `persistToDisk` refines from the observed write throughput, so the gate
+//! adapts to the hardware. The GDN floor of about 50 MB makes the disk gate decline short prompts.
+//! The RAM tier can exceed its budget by one entry, when a single snapshot is larger than it.
+//!
+//! Prefix hits. `lookupLongestPrefix` and `lookupBestPrefix` return a pointer that stays valid
+//! only until the next mutating call, because an insert reallocates the RAM list. `hits` counts
+//! longest-prefix queries that an entry served, so it reads as restore demand. Exact lookups stay
+//! out of it. Every scan is linear over at most budget/snapshot_size entries, which is tens of
+//! rows.
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
@@ -37,27 +65,20 @@ const log = std.log.scoped(.cache);
 
 // -- constants --------------------------------------------------------------
 
-/// Environment variable that relocates the on-disk prompt-cache directory. It
-/// mirrors `ZIGFERENCER_MODELS_DIR` for models, and it accepts a relative path
-/// (resolved from the cwd) or an absolute one. Point it at a fast local disk,
-/// or at a big disk for a large cache: `ZIGFERENCER_CACHE_DIR=/data/zkv-cache`.
-/// Unset or empty => `.prompt_cache` under the cwd.
+/// Environment variable that relocates the cache directory. A relative path resolves from the
+/// cwd. Unset or empty means `.prompt_cache` under the cwd.
 pub const cache_dir_env = "ZIGFERENCER_CACHE_DIR";
 
 const default_cache_dir = ".prompt_cache";
 
-/// On-disk snapshot file header. Fixed extern layout. The payload
-/// (tokens ++ last_logits ++ blob) follows. `payload_fnv` guards a torn or
-/// corrupt file. `model_fp` plus the stored tokens guard hash collisions across
-/// models.
+/// Magic and version of the snapshot file. See "Disk file" in the header.
 const magic: u32 = 0x315A4B5A; // "ZKV1"
 
 const version: u32 = 1;
 
 // -- the linear-scan model --------------------------------------------------
 //
-// The model holds the RAM tier as a plain list with its own LRU clock. Each
-// held token sequence is distinct, so a best-prefix query has one answer.
+// The test model holds the RAM tier as a plain list. Each sequence is distinct.
 const model_cap = 32;
 const model_tokens_max = 6;
 
@@ -80,18 +101,10 @@ const Entry = struct {
     blob: []u8, // owned snapshot bytes (opaque to the cache)
     last_logits: []f32, // owned, logits of token n-1 (sample first output, 0 forwards)
     last_used: u64, // LRU tick
-    // Longest-prefix queries this entry served. Exact lookups (dedup probes,
-    // the boundary walk of `run`) stay out, so the count reads as restore
-    // demand. That is the datum an interior-boundary decision needs.
-    hits: u64 = 0,
+    hits: u64 = 0, // longest-prefix queries served. See "Prefix hits" in the header.
 };
 
-/// One scannable row of the disk tier: the key and the prefix tokens of an
-/// on-disk entry, never the blob. `lookupBestPrefix` needs the disk tier
-/// scannable, because its callers track no boundary lists, and the header plus
-/// the tokens are the cheap pages of a file. A row goes stale when the file is
-/// evicted or torn. The verified load at promotion time drops the row, so the
-/// index self-heals instead of trusting itself.
+/// One row of the disk index: the key and the prefix tokens of a file, never the blob.
 const DiskIndexEntry = struct {
     key: u64,
     tokens: []u32, // owned
@@ -103,11 +116,7 @@ pub const PromptCache = struct {
     used_bytes: usize,
     tick: u64,
     entries: std.ArrayList(Entry),
-    // Disk tier. Null `dir` => RAM-only (the pure unit tests). When set, a
-    // RAM miss falls through to `<dir>/<hexkey>.zkv`, and `admit` persists there
-    // too if the entry clears the (higher) disk worthwhile bar. `persistToDisk`
-    // refines `disk_bw_bps` from the observed write throughput, so the disk gate
-    // stays hardware-adaptive.
+    // Disk tier. A null `dir` means RAM-only.
     io: ?Io = null,
     dir: ?[]const u8 = null,
     disk_budget: usize = 0,
@@ -116,8 +125,7 @@ pub const PromptCache = struct {
     last_hit_from_disk: bool = false,
     last_admit_ram: bool = false, // which tiers the most recent admit() reached
     last_admit_disk: bool = false,
-    /// The scannable index of the disk tier (serve). Empty until
-    /// `loadDiskIndex`, and kept in step by persist and drop.
+    /// The disk index. Empty until `loadDiskIndex`, then kept in step by persist and drop.
     disk_index: std.ArrayList(DiskIndexEntry) = .empty,
 
     // -- init ---------------------------------------------------------------
@@ -132,11 +140,8 @@ pub const PromptCache = struct {
         };
     }
 
-    /// Enable the disk tier: make sure `dir` (cwd-relative) exists and record the
-    /// budget + model fingerprint. `dir` must outlive the cache (arena-owned).
-    /// `model_fp` names the namespace of every file this cache writes, and
-    /// `disk_budget` bounds that namespace alone. Other namespaces can share the
-    /// same directory under their own budgets.
+    /// Enable the disk tier: create `dir` (cwd-relative) and record the budget and fingerprint.
+    /// `dir` must outlive the cache. See "Namespaces" in the header.
     pub fn enableDisk(
         self: *PromptCache,
         io: Io,
@@ -176,13 +181,9 @@ pub const PromptCache = struct {
 
     // -- lookup -------------------------------------------------------------
 
-    /// Find the entry for `key` whose stored tokens equal `tokens` (collision
-    /// guard), bump its LRU tick, and return it. Check RAM first. On a RAM miss
-    /// with the disk tier enabled, load and verify the on-disk snapshot, then
-    /// PROMOTE it into RAM. The returned pointer is then stable.
-    /// `last_hit_from_disk` records which tier served the hit. Null = miss. The
-    /// RAM scan is linear over at most budget/snapshot_size entries, which is
-    /// tens of rows.
+    /// Find the entry for `key` whose stored tokens equal `tokens`, and bump its LRU tick.
+    /// A RAM miss tries the disk tier and promotes a hit. `last_hit_from_disk` records the tier.
+    /// Null means a miss.
     pub fn lookup(self: *PromptCache, key: u64, tokens: []const u32) ?*const Entry {
         self.last_hit_from_disk = false;
         for (self.entries.items) |*e| {
@@ -207,14 +208,9 @@ pub const PromptCache = struct {
         return null;
     }
 
-    /// Longest-prefix match over the candidate `boundaries`, which are the
-    /// prefix lengths saved at turn ends. Return the cached entry for the
-    /// LONGEST boundary that is <= tokens.len and whose tokens match
-    /// `tokens[0..b]`. A new request can then restore the most of its history
-    /// and prefill only the new suffix. Two passes (find best length, then
-    /// re-lookup) keep the returned pointer stable across the intermediate
-    /// lookups. An intermediate lookup can promote a disk entry and realloc
-    /// the RAM list.
+    /// Return the entry of the longest boundary that is a prefix of `tokens`. The boundaries are
+    /// the prefix lengths saved at turn ends. Two passes keep the pointer valid, because a
+    /// lookup can promote a disk entry and reallocate the RAM list.
     pub fn lookupLongestPrefix(
         self: *PromptCache,
         model_fp: u64,
@@ -234,18 +230,13 @@ pub const PromptCache = struct {
         return self.lookup(prefixKey(model_fp, tokens[0..best_n]), tokens[0..best_n]);
     }
 
-    /// Longest-prefix match that scans the cache itself. `lookupLongestPrefix`
-    /// serves a caller that tracks the boundary positions. This one serves a
-    /// caller that does not, because the stored entries already carry their
-    /// prefixes. Return the entry with the largest `n` whose stored tokens equal
-    /// `tokens[0..n]`, bump its LRU tick, and return it. Null = no candidate.
-    /// The scan covers the RAM tier plus the disk index: an on-disk prefix
-    /// longer than the RAM best is promoted through the verified load and
-    /// returned. The returned pointer is valid only until the next mutating
-    /// call, because an insert reallocates the RAM list. The scans are linear
-    /// over tens of rows, like `lookup`'s.
+    /// Return the entry with the largest `n` whose tokens equal `tokens[0..n]`, and bump its
+    /// LRU tick. The scan covers the RAM tier and the disk index, and promotes a longer disk
+    /// prefix. Null means no candidate.
     pub fn lookupBestPrefix(self: *PromptCache, tokens: []const u32) ?*const Entry {
         self.last_hit_from_disk = false;
+
+        // Find the longest RAM prefix, as the bar for the disk tier.
         var floor_n: u32 = 0;
         for (self.entries.items) |*e| {
             if (e.n == 0 or e.n > tokens.len) continue;
@@ -255,6 +246,7 @@ pub const PromptCache = struct {
             }
         }
 
+        // Promote a longer disk prefix when one loads.
         if (self.promoteBestFromDisk(tokens, floor_n)) |hit| {
             hit.hits += 1;
             self.last_hit_from_disk = true;
@@ -262,8 +254,7 @@ pub const PromptCache = struct {
             return hit;
         }
 
-        // The RAM scan reruns for the pointer, because a failed promotion can
-        // have evicted entries while it made room.
+        // Rescan RAM for a stable pointer, because a failed promotion can evict entries.
         var best: ?*Entry = null;
         for (self.entries.items) |*e| {
             if (e.n == 0 or e.n > tokens.len) continue;
@@ -284,19 +275,15 @@ pub const PromptCache = struct {
         return hit;
     }
 
-    /// One debug line per RAM entry: prefix length and hits served. Eviction
-    /// erases an entry's count, so the periodic stats tick dumps the live
-    /// distribution while it exists. Bounded by the RAM tier (tens of rows).
+    /// Log one debug line per RAM entry: prefix length and hits. Eviction erases the count.
     pub fn logEntryHits(self: *const PromptCache) void {
         for (self.entries.items) |*e| {
             log.debug("prefix entry: {d} tokens, {d} hits", .{ e.n, e.hits });
         }
     }
 
-    /// Try the index rows that beat `floor_n`, longest first. Success loads
-    /// the file, verifies it, promotes it into RAM, and returns the promoted
-    /// entry. A row whose file fails the load drops, and the next-longest
-    /// candidate gets its turn, so the loop is bounded by the index length.
+    /// Try the index rows longer than `floor_n`, longest first, and promote the first file that
+    /// loads. A failed row drops, so the loop ends within the index length.
     fn promoteBestFromDisk(self: *PromptCache, tokens: []const u32, floor_n: u32) ?*Entry {
         while (true) {
             var best_i: ?usize = null;
@@ -325,15 +312,8 @@ pub const PromptCache = struct {
 
     // -- the disk index -----------------------------------------------------
 
-    /// Build the scannable index of the disk tier: one row per
-    /// fingerprint-matching `.zkv` file, key + tokens only. Bounded at
-    /// `limits.serve_prefix_disk_index_max` rows. Own-namespace files past the
-    /// bound are counted and reported, because a capped index must never read
-    /// as a complete one. A foreign-fingerprint file belongs to another
-    /// namespace. The scan skips it silently and spends none of the bound, so a
-    /// busy neighbor in the shared directory can never crowd this namespace out
-    /// of its own index. Best-effort throughout: an unreadable file is a
-    /// missing row, and a missing row is a cache miss.
+    /// Build the disk index: one row per `.zkv` file of this namespace. Best-effort, because a
+    /// missing row is a cache miss. See "Disk index" in the header.
     pub fn loadDiskIndex(self: *PromptCache) void {
         const io = self.io orelse return;
         var dir = Io.Dir.cwd().openDir(io, self.dir.?, .{ .iterate = true }) catch return;
@@ -344,8 +324,7 @@ pub const PromptCache = struct {
         while (it.next(io) catch null) |entry| {
             if (entry.kind != .file or !std.mem.endsWith(u8, entry.name, ".zkv")) continue;
 
-            // The fingerprint check runs before the cap, so a foreign file
-            // spends none of this namespace's index capacity.
+            // Check the fingerprint before the cap, so a foreign file spends no capacity.
             const tokens = (self.readOwnTokens(io, entry.name) catch continue) orelse continue;
             if (self.disk_index.items.len >= limits.serve_prefix_disk_index_max) {
                 self.gpa.free(tokens);
@@ -368,13 +347,9 @@ pub const PromptCache = struct {
         return self.disk_index.items.len;
     }
 
-    /// Read one file's header + tokens. Return the owned prefix tokens when the
-    /// header names this namespace, and null when it does not. A null covers a
-    /// foreign fingerprint, a bad header, and a truncated file. The caller
-    /// recomputes the key from the tokens, never from the file name, so a
-    /// renamed or torn file cannot alias another prefix. No payload FNV here:
-    /// the index reads only the token pages, and the promotion's verified load
-    /// re-checks the file whole before any byte reaches a KV slot.
+    /// Return the owned prefix tokens of one file, or null for a foreign, bad, or short file.
+    /// The caller derives the key from the tokens, so a renamed file cannot alias a prefix.
+    /// The promotion load checks the payload FNV before any byte reaches a KV slot.
     fn readOwnTokens(self: *PromptCache, io: Io, name: []const u8) !?[]u32 {
         var pathbuf: [512]u8 = undefined;
         const path = try std.fmt.bufPrint(&pathbuf, "{s}/{s}", .{ self.dir.?, name });
@@ -398,8 +373,7 @@ pub const PromptCache = struct {
         return tokens;
     }
 
-    /// Take ownership of `tokens` and record the row. A twin row for the same
-    /// key is replaced, so a re-persist never duplicates.
+    /// Take ownership of `tokens` and record the row. A row for the same key is replaced.
     fn addIndexRow(self: *PromptCache, key: u64, tokens: []u32) !void {
         if (self.indexRowOf(key)) |i| {
             self.gpa.free(self.disk_index.items[i].tokens);
@@ -426,13 +400,8 @@ pub const PromptCache = struct {
 
     // -- admission ----------------------------------------------------------
 
-    /// Admit a snapshot for `tokens`, tier by tier, gated by the model-adaptive
-    /// `worthwhile` limit. RAM gates on `restore_ns`, the measured symmetric
-    /// save. Disk, when enabled, gates on a higher bar that adds the estimated
-    /// read-back of this blob at the observed disk bandwidth. This function
-    /// copies the transient buffers of the caller. Both tiers are optional, so a
-    /// failure in one logs a line and the other still runs. It returns true
-    /// when the snapshot reached at least one tier.
+    /// Admit a snapshot for `tokens` to each tier that `worthwhile` accepts.
+    /// Returns true when the snapshot reached at least one tier. See "Admission" in the header.
     pub fn admit(
         self: *PromptCache,
         key: u64,
@@ -444,21 +413,19 @@ pub const PromptCache = struct {
     ) bool {
         self.last_admit_ram = false;
         self.last_admit_disk = false;
+
+        // RAM bar: the measured restore cost.
         if (worthwhile(prefill_ns, restore_ns)) {
             self.last_admit_ram = self.admitRam(key, tokens, blob, last_logits);
         }
 
         if (self.dir != null) {
-            // Disk bar: restore plus read-back of this blob at the observed
-            // disk bandwidth. The ~50 MB GDN floor makes this gate decline
-            // short prompts, where the read-back costs more than a re-prefill.
-            // This is the per-model limit at the disk tier.
+            // Disk bar: restore plus the read-back of this blob.
             const disk_read_ns: u64 = @intFromFloat(
                 @as(f64, @floatFromInt(blob.len)) / self.disk_bw_bps * 1e9,
             );
             if (worthwhile(prefill_ns, restore_ns + disk_read_ns)) {
-                // Best-effort, and the index row lands only with the file, so
-                // an entry the RAM LRU later evicts stays findable.
+                // The index row lands only with the file, so an evicted RAM entry stays findable.
                 if (self.persistToDisk(key, tokens, blob, last_logits)) |_| {
                     self.last_admit_disk = true;
                     if (self.gpa.dupe(u32, tokens)) |dup| {
@@ -514,10 +481,7 @@ pub const PromptCache = struct {
         };
     }
 
-    /// Insert an already-owned Entry into the RAM tier, evicting LRU to stay
-    /// under budget. The RAM tier can exceed the budget by at most one entry,
-    /// when a single snapshot is larger than the budget. Takes ownership of the
-    /// entry's slices.
+    /// Insert an owned entry into the RAM tier, and evict LRU entries to stay under budget.
     fn insertEntry(self: *PromptCache, entry: Entry) !void {
         var e = entry;
         const need = entryBytes(&e);
@@ -534,7 +498,7 @@ pub const PromptCache = struct {
         self.used_bytes += need;
     }
 
-    /// Evict the least-recently-used entry. Returns false if the cache is empty.
+    /// Evict the least-recently-used entry. Returns false when the cache is empty.
     fn evictLru(self: *PromptCache) bool {
         if (self.entries.items.len == 0) return false;
 
@@ -560,17 +524,17 @@ pub const PromptCache = struct {
         return std.fmt.bufPrint(buf, "{s}/{x:0>16}.zkv", .{ self.dir.?, key });
     }
 
-    /// Load + verify the on-disk snapshot for (key, tokens). Returns an owned
-    /// Entry, or null on absent / corrupt / mismatched (a bad file is deleted).
-    /// mmap+populate reads the file. The parse validates `magic`/`version`/`model_fp`,
-    /// a payload FNV (torn-write guard), and the stored tokens (collision guard).
+    /// Load and verify the snapshot for `key` and `tokens`. Returns an owned entry, or null
+    /// for an absent, corrupt, or mismatched file. A bad file is deleted.
     fn loadFromDisk(self: *PromptCache, key: u64, tokens: []const u32) !?Entry {
+        // Map the file.
         const io = self.io orelse return null;
         var pathbuf: [512]u8 = undefined;
         const path = self.diskPath(key, &pathbuf) catch return null;
         var mapped = mmap.openReadOnly(io, path) catch return null; // not found => miss
         defer mapped.close();
 
+        // Validate the header and the length.
         const bytes = mapped.bytes();
         if (bytes.len < @sizeOf(DiskHeader)) return self.dropDisk(key);
 
@@ -585,6 +549,7 @@ pub const PromptCache = struct {
         const need = @sizeOf(DiskHeader) + tok_bytes + log_bytes + hdr.blob_len;
         if (bytes.len < need) return self.dropDisk(key);
 
+        // Check the payload FNV and the collision guard.
         var off: usize = @sizeOf(DiskHeader);
         const tok_slice = bytes[off..][0..tok_bytes];
         off += tok_bytes;
@@ -600,6 +565,7 @@ pub const PromptCache = struct {
             return null; // collision: different prompt
         }
 
+        // Copy the payload into an owned entry.
         const e_tokens = try self.gpa.dupe(u32, tokens);
         errdefer self.gpa.free(e_tokens);
 
@@ -619,8 +585,7 @@ pub const PromptCache = struct {
         };
     }
 
-    /// Delete a bad/stale disk file and report it as a miss (null). Helper so the
-    /// load path reads as `return self.dropDisk(key)`.
+    /// Delete a bad or stale disk file, and report a miss.
     fn dropDisk(self: *PromptCache, key: u64) ?Entry {
         const io = self.io orelse return null;
         self.removeIndexRow(key);
@@ -630,11 +595,8 @@ pub const PromptCache = struct {
         return null;
     }
 
-    /// Persist a snapshot to `<dir>/<hexkey>.zkv` (header + tokens + logits +
-    /// blob), evicting the oldest own-namespace files first to stay under the
-    /// disk budget of this namespace. Refines
-    /// `disk_bw_bps` from the observed write throughput (write ~ read on the same
-    /// fs), keeping the disk admission gate hardware-adaptive.
+    /// Write a snapshot file, after it evicts the oldest own files to fit the budget.
+    /// Refines `disk_bw_bps` from the write throughput, which stands in for the read speed.
     fn persistToDisk(
         self: *PromptCache,
         key: u64,
@@ -642,6 +604,7 @@ pub const PromptCache = struct {
         blob: []const u8,
         last_logits: []const f32,
     ) !void {
+        // Make room, and build the header.
         const io = self.io orelse return;
         const tok_bytes = std.mem.sliceAsBytes(tokens);
         const log_bytes = std.mem.sliceAsBytes(last_logits);
@@ -662,6 +625,7 @@ pub const PromptCache = struct {
             .payload_fnv = h.final(),
         };
 
+        // Write the file, and time it.
         var pathbuf: [512]u8 = undefined;
         const path = try self.diskPath(key, &pathbuf);
         const wbuf = try self.gpa.alloc(u8, 1 << 20);
@@ -688,9 +652,7 @@ pub const PromptCache = struct {
         }
     }
 
-    /// One scan of the cache directory, restricted to this namespace: the bytes
-    /// its files hold, the count of those files, and the name of its oldest one
-    /// by mtime.
+    /// The own-namespace share of the directory: bytes, file count, and the oldest file by mtime.
     const OwnScan = struct {
         total: u64,
         count: usize,
@@ -698,13 +660,8 @@ pub const PromptCache = struct {
         oldest_len: usize,
     };
 
-    /// Measure the own-namespace share of the shared cache directory. The file
-    /// name is a namespace-opaque hash, so only the `model_fp` in the header
-    /// tells an own file from a foreign one. A foreign file joins neither the
-    /// total nor the victim search. Null = the directory did not open. A file
-    /// that fails to open, to read, or to stat skips both roles, so one
-    /// transient IO error never makes this namespace look small enough to keep
-    /// growing, and never deletes a file of unknown provenance.
+    /// Measure the own-namespace share of the directory. Only the `model_fp` in the header tells
+    /// an own file from a foreign one. Null means the directory did not open.
     fn scanOwnNamespace(self: *const PromptCache, io: Io) ?OwnScan {
         var dir = Io.Dir.cwd().openDir(io, self.dir.?, .{ .iterate = true }) catch return null;
         defer dir.close(io);
@@ -729,9 +686,7 @@ pub const PromptCache = struct {
         return scan;
     }
 
-    /// Report whether `name` holds a snapshot of this namespace. Reads the
-    /// header alone, because the eviction scan visits every file in the
-    /// directory and the payload of a foreign file is never wanted.
+    /// Report whether `name` holds a snapshot of this namespace. It reads the header alone.
     fn ownsFile(self: *const PromptCache, io: Io, dir: *Io.Dir, name: []const u8) bool {
         const file = dir.openFile(io, name, .{}) catch return false;
         defer file.close(io);
@@ -743,18 +698,12 @@ pub const PromptCache = struct {
         return hdr.magic == magic and hdr.version == version and hdr.model_fp == self.model_fp;
     }
 
-    /// Evict the oldest own-namespace file by mtime until the bytes of this
-    /// namespace plus `need` fit `disk_budget`. The budget bounds one namespace
-    /// and not the directory, so the directory total is the sum of the budgets
-    /// of the namespaces that are active. A foreign file is never counted and
-    /// never deleted, which lets many models, backends, and processes share one
-    /// cache directory. Best-effort: a directory error stops the eviction, and
-    /// a per-file IO error skips that file.
+    /// Evict the oldest own file by mtime until this namespace plus `need` fits `disk_budget`.
+    /// Best-effort: a directory error stops the eviction. See "Namespaces" in the header.
     fn diskEvictToFit(self: *PromptCache, need: usize) void {
         const io = self.io orelse return;
         var scan = self.scanOwnNamespace(io) orelse return;
-        // Each pass deletes exactly one own file, so the own-file count of the
-        // first scan bounds the passes.
+        // Each pass deletes one own file, so the first scan count bounds the passes.
         const max_passes = scan.count;
         for (0..max_passes) |_| {
             if (scan.total + need <= self.disk_budget or scan.oldest_len == 0) return;
@@ -846,18 +795,14 @@ const CacheModel = struct {
 
 // -- api --------------------------------------------------------------------
 
-/// Apply the default policy to a raw env value (null or empty => the default).
-/// The CLI reads it once at startup and carries it on the Context, so the
-/// disk-tier path stays a plain string the cache joins keys onto.
+/// Apply the default to a raw env value. The CLI reads the variable once at startup.
 pub fn resolveCacheDir(env_value: ?[]const u8) []const u8 {
     const v = env_value orelse return default_cache_dir;
     return if (v.len == 0) default_cache_dir else v;
 }
 
-/// Weights identity: a different model must never restore the state of another.
-/// It pairs the registry name with the GGUF byte size, at low cost, and that is
-/// enough to separate the models the engine knows. A file swap that keeps both
-/// the name and the size stays undetected.
+/// Weights identity: a model must never restore the state of another. It pairs the registry
+/// name with the GGUF byte size. A file swap that keeps both stays undetected.
 pub fn modelFingerprint(pub_name: []const u8, file_size: u64) u64 {
     var h = std.hash.Fnv1a_64.init();
     h.update(pub_name);
@@ -865,9 +810,8 @@ pub fn modelFingerprint(pub_name: []const u8, file_size: u64) u64 {
     return h.final();
 }
 
-/// Key for the prefix `tokens` under model `model_fp`. FNV-1a over the model
-/// fingerprint then the token-id bytes. The lookup still guards collisions by
-/// comparing the stored tokens, so the hash only needs to be a good spread.
+/// Key for the prefix `tokens` under `model_fp`: FNV-1a over the fingerprint, then the token
+/// bytes. The lookup compares the stored tokens, so the hash only needs a good spread.
 pub fn prefixKey(model_fp: u64, tokens: []const u32) u64 {
     var h = std.hash.Fnv1a_64.init();
     h.update(std.mem.asBytes(&model_fp));
@@ -875,12 +819,8 @@ pub fn prefixKey(model_fp: u64, tokens: []const u32) u64 {
     return h.final();
 }
 
-/// Fold a backend tag into a model fingerprint. The numeric provenance of a
-/// snapshot blob is per runner family, because the equivalence gate pins greedy
-/// tokens per backend and not KV bits across backends. A disk entry must
-/// therefore never restore into the session of another family. The folded
-/// fingerprint also namespaces keys, which is what makes one shared cache
-/// directory safe.
+/// Fold a backend tag into a model fingerprint. The gate pins greedy tokens per backend and
+/// not KV bits across backends, so an entry must never restore into another family.
 pub fn backendFingerprint(model_fp: u64, backend_tag: []const u8) u64 {
     var h = std.hash.Fnv1a_64.init();
     h.update(std.mem.asBytes(&model_fp));
@@ -888,15 +828,9 @@ pub fn backendFingerprint(model_fp: u64, backend_tag: []const u8) u64 {
     return h.final();
 }
 
-/// The model-adaptive admission limit. A cache entry is only worth keeping if a
-/// future hit (restore) costs less than the miss it replaces (prefill). The
-/// caller measures both costs at run time: the prefill time, and the restore
-/// estimate of the snapshot, which is the symmetric D2H save it just timed. The
-/// limit therefore adapts to architecture with no baked-in token-count
-/// threshold. It declines a big recurrent-state model with low-cost prefill. It
-/// keeps a hybrid like Qwen3.5-9B, where restore costs milliseconds and prefill
-/// costs seconds. The 2x margin drops a marginal prefix whose win does not
-/// survive noise.
+/// The admission limit: a restore must cost under half of the prefill it replaces.
+/// The caller measures both, and the restore estimate is the timed D2H save. The 2x margin
+/// drops a marginal prefix whose win does not survive noise.
 pub fn worthwhile(prefill_ns: u64, restore_ns: u64) bool {
     return prefill_ns > restore_ns *| 2;
 }
@@ -909,10 +843,7 @@ fn testDiskPath(buf: []u8, dir: []const u8, key: u64) ![]u8 {
     return std.fmt.bufPrint(buf, "{s}/{x:0>16}.zkv", .{ dir, key });
 }
 
-/// Test helper: pin one snapshot file's mtime. Two files written back to back
-/// can carry the same mtime, and the eviction order is mtime order, so an
-/// eviction test must state the age of every file instead of waiting for the
-/// clock.
+/// Test helper: pin one snapshot file's mtime. Eviction follows mtime, and back-to-back files tie.
 fn testSetMtime(io: Io, dir: []const u8, key: u64, ns: i96) !void {
     var buf: [256]u8 = undefined;
     const path = try testDiskPath(&buf, dir, key);
@@ -1137,8 +1068,8 @@ test "PromptCache: admit, hit, collision-miss, LRU eviction" {
     );
 }
 
-/// An allocator that fails one allocation, so the allocations after it succeed. The
-/// `FailingAllocator` of std fails each allocation after its index.
+/// An allocator that fails one allocation, and then succeeds. The std `FailingAllocator`
+/// fails every allocation after its index.
 const FailOnce = struct {
     left: usize,
 
@@ -1510,7 +1441,7 @@ fn checkPromptCache(_: void, seed: u64) anyerror!void {
     }
 }
 
-test "property: the RAM tier matches a linear-scan model, and a best-prefix hit is the longest held prefix" {
+test "property: the RAM tier matches a linear-scan model, and best-prefix is the longest" {
     try prop.forAll(
         .{ .site = 0xCAC4_E001, .cases = 300 },
         {},

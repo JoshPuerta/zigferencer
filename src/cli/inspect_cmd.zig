@@ -6,7 +6,7 @@ const std = @import("std");
 const Io = std.Io;
 const Allocator = std.mem.Allocator;
 
-const cli = @import("command.zig");
+const context = @import("context.zig");
 const args = @import("args.zig");
 const style = @import("style.zig");
 const select = @import("select.zig");
@@ -56,7 +56,7 @@ const Flags = struct {
 
 // -- api --------------------------------------------------------------------
 
-pub fn run(ctx: cli.Context) !void {
+pub fn run(ctx: context.Context) !void {
     const flags = try args.parseInto(Flags, ctx) orelse return;
 
     // The raw dump skips the loader, so it can show an architecture the loader refuses.
@@ -69,9 +69,7 @@ pub fn run(ctx: cli.Context) !void {
     var loaded = try loader.loadWith(ctx.io, ctx.arena, path, .{ .prefault = false });
     defer loaded.close();
 
-    var stdout_buffer: [cli.stdout_buffer_bytes]u8 = undefined;
-    var stdout_writer: Io.File.Writer = .initStreaming(.stdout(), ctx.io, &stdout_buffer);
-    const w = &stdout_writer.interface;
+    const w = &ctx.stdout.interface;
 
     try printCard(w, model.pub_name, path, &loaded);
     try w.writeAll("\n");
@@ -148,15 +146,13 @@ fn printChatTemplate(w: *Io.Writer, template: []const u8) !void {
     }
 }
 
-fn dumpRaw(ctx: cli.Context, path: []const u8) !void {
+fn dumpRaw(ctx: context.Context, path: []const u8) !void {
     var map = try mmap.openReadOnlyLazy(ctx.io, path);
     defer map.close();
 
     const parsed = try parser.parse(ctx.arena, map.bytes());
 
-    var stdout_buffer: [cli.stdout_buffer_bytes]u8 = undefined;
-    var stdout_writer: Io.File.Writer = .initStreaming(.stdout(), ctx.io, &stdout_buffer);
-    const w = &stdout_writer.interface;
+    const w = &ctx.stdout.interface;
 
     try w.print("file:            {s}\n", .{path});
     try w.print("file size:       {d} bytes\n", .{map.bytes().len});
@@ -253,7 +249,7 @@ fn parseBlock(name: []const u8) ?BlockRef {
     if (!std.mem.startsWith(u8, name, "blk.")) return null;
 
     const rest = name["blk.".len..];
-    const dot = std.mem.indexOfScalar(u8, rest, '.') orelse return null;
+    const dot = std.mem.findScalar(u8, rest, '.') orelse return null;
     const layer = std.fmt.parseInt(u32, rest[0..dot], 10) catch return null;
     return .{ .layer = layer, .role = rest[dot + 1 ..] };
 }

@@ -1,50 +1,42 @@
 //! Fidelity gate for the Vulkan attention kernels.
 //!
-//! Each kernel must stay inside a 2e-3 relative tolerance against the CPU
-//! reference, the same tolerance the bench declares. The gate reads the
-//! maximum relative error over the whole output, so a metric artifact cannot
-//! hide a regression. The tests return `error.SkipZigTest` when no Vulkan
-//! device is reachable.
+//! Tolerance. Each kernel must stay inside a 2e-3 relative tolerance against the CPU reference, the
+//! same tolerance the bench declares. The gate reads the maximum relative error over the whole
+//! output, so a metric artifact cannot hide a regression. The tests return `error.SkipZigTest` when
+//! no Vulkan device is reachable.
 //!
-//! Decode. The SmolLM2 shape `(n_heads=9, n_kv_heads=3, head_dim=64,
-//! t_len=128)` stays pinned on the resident kernel, with a Llama-1B and a
-//! Llama-8B shape at `t_len=512`. The head geometries of the three shapes, the
-//! Qwen3.5 geometry `(8, 2, 256)`, the Phi-3-mini and Phi-2 geometries
-//! `(32, 32, 96)` and `(32, 32, 80)`, and a multi-query geometry run at the
-//! resident depths up to `limits.attn_split_len` and at five split depths past
-//! it, at both KV element types. The Phi-2 head at both KV types and the
-//! Phi-3-mini head at f16 KV are not whole 128-byte lines, so they run the
-//! tail loads of the split pass. The multi-query geometry `(16, 1, 128)` has
-//! a group wider than one split workgroup serves. One test repeats a split row
-//! to pin its bytes.
+//! Decode. The SmolLM2 shape `(n_heads=9, n_kv_heads=3, head_dim=64, t_len=128)` stays pinned on
+//! the resident kernel. A Llama-1B and a Llama-8B shape at `t_len=512` run through `Attention`,
+//! which takes the split passes for any row past `limits.attn_split_len` (256). The head geometries
+//! of the three shapes, the Qwen3.5 geometry `(8, 2, 256)`, the Phi-3-mini and Phi-2 geometries
+//! `(32, 32, 96)` and `(32, 32, 80)`, and a multi-query geometry run at the resident depths up to
+//! `limits.attn_split_len` and at five split depths past it, at both KV element types. The Phi-2
+//! head at both KV types and the Phi-3-mini head at f16 KV are not whole 128-byte lines, so they
+//! run the tail loads of the split pass. The multi-query geometry `(16, 1, 128)` has a group wider
+//! than one split workgroup serves. One test repeats a split row to pin its bytes.
 //!
-//! Split digests. The needle rows of the Qwen3.5-2B, Llama-3.1-8B,
-//! Qwen3.5-9B, and SmolLM2 geometries at three split depths and both KV types
-//! must keep the output digests that a device run minted. So a kernel change
-//! that must keep the bytes proves it on every family.
+//! Split digests. The needle rows of the Qwen3.5-2B, Llama-3.1-8B, Qwen3.5-9B, and SmolLM2
+//! geometries at three split depths and both KV types must keep the output digests that a device
+//! run minted. So a kernel change that must keep the bytes proves it on every family.
 //!
-//! Prefill. A chunk records through `attn_record.recordPrefill`, as a runner
-//! records it: one batch run for the resident prefix, then the record groups
-//! of the split rows. Four `(start_pos, b)` cases per geometry put rows inside
-//! one split, across S, and past it, against the CPU reference. The byte
-//! tests check that a prefill row gets the bytes of the decode row of its
-//! depth, that every chunk width and the minimum record budget give the same
-//! bytes, and that two runs match.
+//! Prefill. A chunk records through `attn_record.recordPrefill`, as a runner records it: one batch
+//! run for the resident prefix, then the record groups of the split rows. Four `(start_pos, b)`
+//! cases per geometry put rows inside one split, across S, and past it, against the CPU reference.
+//! The byte tests check that a prefill row gets the bytes of the decode row of its depth, that
+//! every chunk width and the minimum record budget give the same bytes, and that two runs match.
 //!
-//! Multi-row decode. Four KV streams of different content share one K region
-//! and one V region. The multi-stream kernel and the split passes must read
-//! the stream that each row names, with the q row base and the stream base
-//! set apart.
+//! Multi-row decode. Four KV streams of different content share one K region and one V region. The
+//! multi-stream kernel and the split passes must read the stream that each row names, with the q
+//! row base and the stream base set apart.
 //!
-//! The three pinned shapes keep the trig data of the bench. Every other case
-//! puts a needle in each query row. Each head gives its last causal position,
-//! and the position after it, a score near `needle_score`, far above the
-//! rest. A row that reads one position too few or too many therefore moves
-//! its output past the tolerance. V sits in [0.5, 1.5], so no output cancels
-//! toward zero, and the relative error stays well conditioned at depth.
+//! Data. The three pinned shapes keep the trig data of the bench. Every other case puts a needle in
+//! each query row. Each head gives its last causal position, and the position after it, a score
+//! near `needle_score`, far above the rest. A row that reads one position too few or too many
+//! therefore moves its output past the tolerance. V sits in [0.5, 1.5], so no output cancels toward
+//! zero, and the relative error stays well conditioned at depth.
 
 const std = @import("std");
-const z = @import("zigferencer");
+const zigferencer = @import("zigferencer");
 
 // -- fixtures ---------------------------------------------------------------
 
@@ -120,8 +112,8 @@ const decode_geometries = [_]Geometry{
     g9,
 };
 
-const split_len = z.limits.attn_split_len;
-const cpu_tile = z.limits.attn_cpu_tile;
+const split_len = zigferencer.limits.attn_split_len;
+const cpu_tile = zigferencer.limits.attn_cpu_tile;
 
 /// The resident depths: one position, and the two deepest rows of one split.
 const resident_depths = [_]u32{ 1, split_len - 1, split_len };
@@ -158,8 +150,8 @@ comptime {
 /// row. The needle then holds a large share of the softmax at every depth.
 const needle_score: f32 = 9;
 
-fn openRunner(allocator: std.mem.Allocator) !*z.vulkan_runner.Runner {
-    return z.vulkan_runner.Runner.init(allocator) catch |e| switch (e) {
+fn openRunner(allocator: std.mem.Allocator) !*zigferencer.vulkan_runner.Runner {
+    return zigferencer.vulkan_runner.Runner.init(allocator) catch |e| switch (e) {
         error.NoVulkanDevice,
         error.InitializationFailed,
         error.IncompatibleDriver,
@@ -198,7 +190,8 @@ fn Case(comptime T: type) type {
             const out_ref = try allocator.alloc(f32, q_len);
             errdefer allocator.free(out_ref);
 
-            const parts = try allocator.alloc(f32, z.attn_cpu.partialLen(s.n_heads, s.head_dim));
+            const parts_len = zigferencer.attn_cpu.partialLen(s.n_heads, s.head_dim);
+            const parts = try allocator.alloc(f32, parts_len);
             defer allocator.free(parts);
 
             // The generator matches the bench: small-magnitude trig, so the
@@ -216,7 +209,7 @@ fn Case(comptime T: type) type {
                 x.* = @floatCast(@sin(@as(f32, @floatFromInt(i)) * 0.05));
             }
 
-            z.ops.attentionRowTyped(
+            zigferencer.ops.attentionRowTyped(
                 T,
                 q,
                 s.n_heads,
@@ -272,7 +265,7 @@ fn worstRelative(ref: []const f32, got: []const f32) Worst {
 fn runAttentionCheck(
     comptime T: type,
     allocator: std.mem.Allocator,
-    attn: *z.ops_vulkan.Attention,
+    attn: *zigferencer.ops_vulkan.Attention,
     s: AtnShape,
     tol: f32,
 ) !void {
@@ -301,7 +294,18 @@ fn runAttentionCheck(
         std.debug.print(
             "{s} kv={s} t_len={d}: max_rel={e:.3} > tol={e:.3} at out[{d}] (h={d}, d={d}) " ++
                 "ref={d} gpu={d}\n",
-            .{ s.label, @typeName(T), s.t_len, worst.rel, tol, worst.idx, h, d_in_head, case.out_ref[worst.idx], out_gpu[worst.idx] },
+            .{
+                s.label,
+                @typeName(T),
+                s.t_len,
+                worst.rel,
+                tol,
+                worst.idx,
+                h,
+                d_in_head,
+                case.out_ref[worst.idx],
+                out_gpu[worst.idx],
+            },
         );
         return error.GpuAttentionExceedsTolerance;
     }
@@ -313,7 +317,7 @@ fn runAttentionCheck(
 fn runNeedleRow(
     comptime T: type,
     allocator: std.mem.Allocator,
-    attn: *z.ops_vulkan.Attention,
+    attn: *zigferencer.ops_vulkan.Attention,
     g: Geometry,
     t_len: u32,
 ) !u64 {
@@ -339,7 +343,7 @@ fn runNeedleRow(
     const got = try allocator.alloc(f32, g.rowElems());
     defer allocator.free(got);
 
-    const parts = try allocator.alloc(f32, z.attn_cpu.partialLen(g.n_heads, g.head_dim));
+    const parts = try allocator.alloc(f32, zigferencer.attn_cpu.partialLen(g.n_heads, g.head_dim));
     defer allocator.free(parts);
 
     fillKv(k, v, 1);
@@ -352,7 +356,18 @@ fn runNeedleRow(
     }
 
     fillNeedleRow(q, g, k, t_len - 1, 3);
-    z.ops.attentionRowTyped(f32, q, g.n_heads, g.head_dim, k, v, g.n_kv_heads, t_len, parts, ref);
+    zigferencer.ops.attentionRowTyped(
+        f32,
+        q,
+        g.n_heads,
+        g.head_dim,
+        k,
+        v,
+        g.n_kv_heads,
+        t_len,
+        parts,
+        ref,
+    );
     try attn.runTyped(T, q, k_typed, v_typed, g.n_heads, g.n_kv_heads, g.head_dim, t_len, got);
     try expectRows(
         ref,
@@ -369,17 +384,17 @@ fn runNeedleRow(
 /// Run every decode geometry at every resident and split depth at KV element
 /// type `T`. The needle data keeps every output far from zero, so the
 /// relative error stays well conditioned at the deepest row.
-fn runDecodeChecks(comptime T: type, kv: z.dtype.KvDtype) !void {
+fn runDecodeChecks(comptime T: type, kv: zigferencer.dtype.KvDtype) !void {
     const allocator = std.testing.allocator;
     const runner = try openRunner(allocator);
     defer runner.deinit();
 
-    var attn = try z.ops_vulkan.Attention.initKv(&runner.ctx, kv);
+    var attn = try zigferencer.ops_vulkan.Attention.initKv(&runner.ctx, kv);
     defer attn.deinit();
 
     for (decode_geometries) |geometry| {
         for (resident_depths ++ split_depths) |t_len| {
-            try std.testing.expectEqual(t_len > split_len, z.attn_split.usesSplit(t_len));
+            try std.testing.expectEqual(t_len > split_len, zigferencer.attn_split.usesSplit(t_len));
             _ = try runNeedleRow(T, allocator, &attn, geometry, t_len);
         }
     }
@@ -387,12 +402,12 @@ fn runDecodeChecks(comptime T: type, kv: z.dtype.KvDtype) !void {
 
 /// Run one split row twice through one kernel. The merge sums the splits in a
 /// fixed order, so the two outputs must match byte for byte.
-fn repeatSplitRow(comptime T: type, kv: z.dtype.KvDtype) !void {
+fn repeatSplitRow(comptime T: type, kv: zigferencer.dtype.KvDtype) !void {
     const allocator = std.testing.allocator;
     const runner = try openRunner(allocator);
     defer runner.deinit();
 
-    var attn = try z.ops_vulkan.Attention.initKv(&runner.ctx, kv);
+    var attn = try zigferencer.ops_vulkan.Attention.initKv(&runner.ctx, kv);
     defer attn.deinit();
 
     const s = qwen35.at(three_tail_depth);
@@ -441,7 +456,7 @@ const qwen9b: Geometry = .{ .label = "qwen9b", .n_heads = 16, .n_kv_heads = 4, .
 /// The head geometries of the four registry families: Qwen3.5-2B,
 /// Llama-3.1-8B, Qwen3.5-9B, and SmolLM2.
 const digest_geometries = [_]Geometry{ qwen35, llama8b, qwen9b, smollm2 };
-const digest_kv = [_]z.dtype.KvDtype{ .f32, .f16 };
+const digest_kv = [_]zigferencer.dtype.KvDtype{ .f32, .f16 };
 
 /// The first split row, a row one past eight splits, and a row three past 32
 /// splits.
@@ -453,10 +468,8 @@ comptime {
     std.debug.assert(digest_depths[2] == 8195);
 }
 
-/// The FNV-1a digest of the output bytes of each needle row, indexed as
-/// `[geometry][kv][depth]`. A device run mints them. A null entry fails the
-/// test and prints the table to paste here. A kernel change that keeps the
-/// summation order keeps every entry.
+/// The FNV-1a digest of the output bytes of each needle row, indexed as `[geometry][kv][depth]`.
+/// A device run mints them, and a null entry fails the test and prints the table to paste here.
 const split_digests: [digest_geometries.len][digest_kv.len][digest_depths.len]?u64 = .{
     .{
         .{ 0x71255138392cf8bb, 0xc904c48eb772eec5, 0x1cdfc57b25c96a62 },
@@ -480,7 +493,7 @@ const split_digests: [digest_geometries.len][digest_kv.len][digest_depths.len]?u
 /// each digest with the table. The kit of the build must sum in the
 /// `.split_ascending` order, because only that order promises fixed bytes.
 fn runSplitDigests() !void {
-    if (z.ops_vulkan.AttnKit.order != .split_ascending) return error.SkipZigTest;
+    if (zigferencer.ops_vulkan.AttnKit.order != .split_ascending) return error.SkipZigTest;
 
     const allocator = std.testing.allocator;
     const runner = try openRunner(allocator);
@@ -488,12 +501,12 @@ fn runSplitDigests() !void {
 
     var got: [digest_geometries.len][digest_kv.len][digest_depths.len]u64 = undefined;
     for (digest_kv, 0..) |kv, ki| {
-        var attn = try z.ops_vulkan.Attention.initKv(&runner.ctx, kv);
+        var attn = try zigferencer.ops_vulkan.Attention.initKv(&runner.ctx, kv);
         defer attn.deinit();
 
         for (digest_geometries, 0..) |g, gi| {
             for (digest_depths, 0..) |t_len, di| {
-                std.debug.assert(z.attn_split.usesSplit(t_len));
+                std.debug.assert(zigferencer.attn_split.usesSplit(t_len));
 
                 got[gi][ki][di] = switch (kv) {
                     .f32 => try runNeedleRow(f32, allocator, &attn, g, t_len),
@@ -553,14 +566,14 @@ fn runSplitDigests() !void {
 
 // -- record-only harness ----------------------------------------------------
 
-const Context = z.vulkan_ctx.Context;
-const HostBuffer = z.ops_vulkan.HostBuffer;
-const OneShot = z.ops_vulkan.OneShot;
+const Context = zigferencer.vulkan_ctx.Context;
+const HostBuffer = zigferencer.ops_vulkan.HostBuffer;
+const OneShot = zigferencer.ops_vulkan.OneShot;
 const CommandBuffer = @FieldType(OneShot, "cmd_buffer");
 /// The test module imports no Vulkan binding, so it reads the descriptor
 /// type from the binding helper.
 const DescriptorBufferInfo = @typeInfo(
-    @typeInfo(@TypeOf(z.ops_vulkan.updateStorageBindings)).@"fn".params[2].type.?,
+    @typeInfo(@TypeOf(zigferencer.ops_vulkan.updateStorageBindings)).@"fn".params[2].type.?,
 ).pointer.child;
 
 /// A stateless generator: value `i` of sequence `seed`, uniform in [-1, 1).
@@ -661,7 +674,10 @@ fn barrierShader(ctx: *const Context, cb: CommandBuffer) void {
         .{ .compute_shader_bit = true },
         .{},
         &.{
-            .{ .src_access_mask = .{ .shader_write_bit = true }, .dst_access_mask = .{ .shader_read_bit = true } },
+            .{
+                .src_access_mask = .{ .shader_write_bit = true },
+                .dst_access_mask = .{ .shader_read_bit = true },
+            },
         },
         null,
         null,
@@ -689,7 +705,14 @@ fn expectRows(
             std.debug.print(fmt, args);
             std.debug.print(
                 " row {d}: max_rel={e:.3} > 2e-3 at h={d} d={d}, ref={d} gpu={d}\n",
-                .{ first_row + r, worst.rel, worst.idx / g.head_dim, worst.idx % g.head_dim, ref[lo + worst.idx], got[lo + worst.idx] },
+                .{
+                    first_row + r,
+                    worst.rel,
+                    worst.idx / g.head_dim,
+                    worst.idx % g.head_dim,
+                    ref[lo + worst.idx],
+                    got[lo + worst.idx],
+                },
             );
             return error.GpuAttentionExceedsTolerance;
         }
@@ -741,7 +764,8 @@ const ChunkData = struct {
         const ref = try allocator.alloc(f32, b * g.rowElems());
         errdefer allocator.free(ref);
 
-        const parts = try allocator.alloc(f32, z.attn_cpu.partialLen(g.n_heads, g.head_dim));
+        const parts_len = zigferencer.attn_cpu.partialLen(g.n_heads, g.head_dim);
+        const parts = try allocator.alloc(f32, parts_len);
         defer allocator.free(parts);
 
         fillKv(k, v, 1);
@@ -750,7 +774,7 @@ const ChunkData = struct {
             const q_row = q[bi * g.rowElems() ..][0..g.rowElems()];
             fillNeedleRow(q_row, g, k, start_pos + row, 3 + bi);
             const t_len: usize = @as(usize, start_pos) + bi + 1;
-            z.ops.attentionRowTyped(
+            zigferencer.ops.attentionRowTyped(
                 f32,
                 q_row,
                 g.n_heads,
@@ -780,10 +804,10 @@ const ChunkData = struct {
 /// host buffers they bind. K and V hold one stream, the slot 0 of a runner.
 const PrefillRig = struct {
     ctx: *const Context,
-    single: z.ops_vulkan.Attention,
-    multi: z.ops_vulkan.AttentionMultiStream,
-    split: z.ops_vulkan.AttentionSplit,
-    batch: z.ops_vulkan.AttentionBatch,
+    single: zigferencer.ops_vulkan.Attention,
+    multi: zigferencer.ops_vulkan.AttentionMultiStream,
+    split: zigferencer.ops_vulkan.AttentionSplit,
+    batch: zigferencer.ops_vulkan.AttentionBatch,
     batch_set: OneShot,
     split_set: OneShot,
     merge_set: OneShot,
@@ -793,17 +817,17 @@ const PrefillRig = struct {
     scratch: HostBuffer,
     out: HostBuffer,
 
-    fn init(ctx: *const Context, kv: z.dtype.KvDtype) !PrefillRig {
-        var single = try z.ops_vulkan.Attention.initKv(ctx, kv);
+    fn init(ctx: *const Context, kv: zigferencer.dtype.KvDtype) !PrefillRig {
+        var single = try zigferencer.ops_vulkan.Attention.initKv(ctx, kv);
         errdefer single.deinit();
 
-        var multi = try z.ops_vulkan.AttentionMultiStream.initKv(ctx, kv);
+        var multi = try zigferencer.ops_vulkan.AttentionMultiStream.initKv(ctx, kv);
         errdefer multi.deinit();
 
-        var split = try z.ops_vulkan.AttentionSplit.initKv(ctx, kv);
+        var split = try zigferencer.ops_vulkan.AttentionSplit.initKv(ctx, kv);
         errdefer split.deinit();
 
-        var batch = try z.ops_vulkan.AttentionBatch.initKv(ctx, kv);
+        var batch = try zigferencer.ops_vulkan.AttentionBatch.initKv(ctx, kv);
         errdefer batch.deinit();
 
         const batch_set = try OneShot.init(ctx, batch.pipeline.set_layout, 4);
@@ -812,14 +836,14 @@ const PrefillRig = struct {
         const split_set = try OneShot.init(
             ctx,
             split.split.set_layout,
-            z.ops_vulkan.AttentionSplit.split_bindings,
+            zigferencer.ops_vulkan.AttentionSplit.split_bindings,
         );
         errdefer split_set.deinit(ctx);
 
         const merge_set = try OneShot.init(
             ctx,
             split.merge.set_layout,
-            z.ops_vulkan.AttentionSplit.merge_bindings,
+            zigferencer.ops_vulkan.AttentionSplit.merge_bindings,
         );
         return .{
             .ctx = ctx,
@@ -870,7 +894,7 @@ const PrefillRig = struct {
         kv_bytes: u64,
         start_pos: u32,
         first: u32,
-        plan: *const z.attn_split.AttnPlan,
+        plan: *const zigferencer.attn_split.AttnPlan,
         out: []f32,
     ) !void {
         const b = plan.resident_count + plan.split_count;
@@ -882,7 +906,7 @@ const PrefillRig = struct {
         // A row that no dispatch writes keeps the NaN sentinel and fails the
         // check, where a stale row of the run before can pass it.
         @memset(self.out.sliceTyped(u32, out.len), sentinel_bits);
-        const scratch = z.attn_split.Scratch.init(g.n_heads, g.head_dim, data.positions);
+        const scratch = zigferencer.attn_split.Scratch.init(g.n_heads, g.head_dim, data.positions);
         try self.scratch.ensure(scratch.totalBytes());
         const q_info: DescriptorBufferInfo = .{
             .buffer = self.q.buffer,
@@ -909,30 +933,30 @@ const PrefillRig = struct {
             .offset = 0,
             .range = out_bytes,
         };
-        z.ops_vulkan.AttentionSplit.assertKBinding(k_info);
-        z.ops_vulkan.AttentionSplit.assertVBinding(v_info);
-        z.ops_vulkan.updateStorageBindings(
+        zigferencer.ops_vulkan.AttentionSplit.assertKBinding(k_info);
+        zigferencer.ops_vulkan.AttentionSplit.assertVBinding(v_info);
+        zigferencer.ops_vulkan.updateStorageBindings(
             self.ctx,
             self.batch_set.desc_set,
             &.{ q_info, k_info, v_info, out_info },
         );
-        z.ops_vulkan.updateStorageBindings(
+        zigferencer.ops_vulkan.updateStorageBindings(
             self.ctx,
             self.split_set.desc_set,
             &.{ q_info, k_info, v_info, scratch_info },
         );
-        z.ops_vulkan.updateStorageBindings(
+        zigferencer.ops_vulkan.updateStorageBindings(
             self.ctx,
             self.merge_set.desc_set,
             &.{ scratch_info, out_info },
         );
-        const kit: z.ops_vulkan.AttnKit = .{
+        const kit: zigferencer.ops_vulkan.AttnKit = .{
             .single = &self.single,
             .multi = &self.multi,
             .passes = &self.split,
             .batch = &self.batch,
         };
-        const binding: z.ops_vulkan.AttnKit.Binding = .{
+        const binding: zigferencer.ops_vulkan.AttnKit.Binding = .{
             .shape = .{
                 .n_heads = g.n_heads,
                 .n_kv_heads = g.n_kv_heads,
@@ -946,7 +970,14 @@ const PrefillRig = struct {
         };
         const cb = self.batch_set.cmd_buffer;
         try begin(self.ctx, cb);
-        z.attn_record.recordPrefill(z.ops_vulkan.AttnKit, kit, cb, plan, binding, start_pos);
+        zigferencer.attn_record.recordPrefill(
+            zigferencer.ops_vulkan.AttnKit,
+            kit,
+            cb,
+            plan,
+            binding,
+            start_pos,
+        );
         try submitAndWait(self.ctx, cb);
         @memcpy(out, self.out.sliceTyped(f32, out.len));
     }
@@ -966,12 +997,12 @@ const PrefillRig = struct {
         std.debug.assert(width >= 1);
 
         const kv_bytes = try self.uploadKv(T, data);
-        const max_splits = z.attn_split.splitCount(data.positions);
+        const max_splits = zigferencer.attn_split.splitCount(data.positions);
         var first: u32 = 0;
         // Each chunk holds at least one row, so the loop runs at most b times.
         while (first < b) {
             const n = @min(width, b - first);
-            const plan = z.attn_split.planPrefill(0, start_pos + first, n, max_splits);
+            const plan = zigferencer.attn_split.planPrefill(0, start_pos + first, n, max_splits);
             try self.runChunk(
                 g,
                 data,
@@ -991,7 +1022,7 @@ const PrefillRig = struct {
 fn decodeRows(
     comptime T: type,
     allocator: std.mem.Allocator,
-    attn: *z.ops_vulkan.Attention,
+    attn: *zigferencer.ops_vulkan.Attention,
     g: Geometry,
     data: ChunkData,
     start_pos: u32,
@@ -1051,7 +1082,7 @@ fn expectSameBytes(
 
 fn PrefillHarness(comptime T: type) type {
     return struct {
-        const kv: z.dtype.KvDtype = if (T == f32) .f32 else .f16;
+        const kv: zigferencer.dtype.KvDtype = if (T == f32) .f32 else .f16;
 
         /// Prefill chunks across S against the CPU reference, at the
         /// declared tolerance.
@@ -1085,10 +1116,9 @@ fn PrefillHarness(comptime T: type) type {
             }
         }
 
-        /// (a) and (d): a prefill row gets the bytes of the decode row of the
-        /// same depth. A resident row compares the batch kernel with
-        /// `attention.comp`, and a split row compares the record groups of a
-        /// chunk with the one-row plan of a decode step.
+        /// A prefill row gets the bytes of the decode row of its depth. A resident row compares
+        /// the batch kernel with `attention.comp`, and a split row compares the record groups
+        /// of a chunk with the one-row plan of a decode step.
         fn equalsDecode(starts: []const u32, b: u32) !void {
             const allocator = std.testing.allocator;
             const runner = try openRunner(allocator);
@@ -1097,7 +1127,7 @@ fn PrefillHarness(comptime T: type) type {
             var rig: PrefillRig = try .init(&runner.ctx, kv);
             defer rig.deinit();
 
-            var attn = try z.ops_vulkan.Attention.initKv(&runner.ctx, kv);
+            var attn = try zigferencer.ops_vulkan.Attention.initKv(&runner.ctx, kv);
             defer attn.deinit();
 
             for ([_]Geometry{ smollm2, qwen35 }) |g| {
@@ -1180,14 +1210,15 @@ fn PrefillHarness(comptime T: type) type {
 
                 try rig.runChunked(T, g, data, start_pos, b, b, full);
                 // The budget of the deepest row alone holds one row per group.
-                var sites: [z.attn_split.max_plan_rows]z.attn_split.RowSite = undefined;
+                const RowSite = zigferencer.attn_split.RowSite;
+                var sites: [zigferencer.attn_split.max_plan_rows]RowSite = undefined;
                 for (sites[0..b], 0..) |*site, i| {
                     site.* = .{ .slot = 0, .t_len = start_pos + @as(u32, @intCast(i)) + 1 };
                 }
 
-                const plan = z.attn_split.planRowsBudget(
+                const plan = zigferencer.attn_split.planRowsBudget(
                     sites[0..b],
-                    z.attn_split.splitCount(start_pos + b),
+                    zigferencer.attn_split.splitCount(start_pos + b),
                 );
                 try std.testing.expectEqual(plan.split_count, plan.group_count);
                 const kv_bytes = try rig.uploadKv(T, data);
@@ -1238,7 +1269,7 @@ const stream_window: u32 = std.mem.alignForward(u32, deep_depth + 1, split_len);
 
 // One group of split rows, one row per stream, fills every scratch row.
 comptime {
-    std.debug.assert(n_streams == z.limits.attn_split_rows);
+    std.debug.assert(n_streams == zigferencer.limits.attn_split_rows);
 }
 
 /// One row of a multi-row dispatch: query row `q_row` reads stream `stream`
@@ -1267,7 +1298,7 @@ const Streams = struct {
     fn init(allocator: std.mem.Allocator, g: Geometry) !Streams {
         const stride_elems = @as(usize, stream_window) * g.kvElems();
         // The shaders index a region in 32 bits.
-        std.debug.assert(n_streams * stride_elems <= z.limits.max_kv_index_elems);
+        std.debug.assert(n_streams * stride_elems <= zigferencer.limits.max_kv_index_elems);
         const k = try allocator.alloc(f32, n_streams * stride_elems);
         errdefer allocator.free(k);
 
@@ -1300,8 +1331,8 @@ const Streams = struct {
 /// their sets, one command buffer, and the host buffers the sets bind.
 const StreamRig = struct {
     ctx: *const Context,
-    multi: z.ops_vulkan.AttentionMultiStream,
-    split: z.ops_vulkan.AttentionSplit,
+    multi: zigferencer.ops_vulkan.AttentionMultiStream,
+    split: zigferencer.ops_vulkan.AttentionSplit,
     multi_set: OneShot,
     split_set: OneShot,
     merge_set: OneShot,
@@ -1312,11 +1343,11 @@ const StreamRig = struct {
     out: HostBuffer,
     kv_bytes: u64 = 0,
 
-    fn init(ctx: *const Context, kv: z.dtype.KvDtype) !StreamRig {
-        var multi = try z.ops_vulkan.AttentionMultiStream.initKv(ctx, kv);
+    fn init(ctx: *const Context, kv: zigferencer.dtype.KvDtype) !StreamRig {
+        var multi = try zigferencer.ops_vulkan.AttentionMultiStream.initKv(ctx, kv);
         errdefer multi.deinit();
 
-        var split = try z.ops_vulkan.AttentionSplit.initKv(ctx, kv);
+        var split = try zigferencer.ops_vulkan.AttentionSplit.initKv(ctx, kv);
         errdefer split.deinit();
 
         const multi_set = try OneShot.init(ctx, multi.pipeline.set_layout, 4);
@@ -1325,14 +1356,14 @@ const StreamRig = struct {
         const split_set = try OneShot.init(
             ctx,
             split.split.set_layout,
-            z.ops_vulkan.AttentionSplit.split_bindings,
+            zigferencer.ops_vulkan.AttentionSplit.split_bindings,
         );
         errdefer split_set.deinit(ctx);
 
         const merge_set = try OneShot.init(
             ctx,
             split.merge.set_layout,
-            z.ops_vulkan.AttentionSplit.merge_bindings,
+            zigferencer.ops_vulkan.AttentionSplit.merge_bindings,
         );
         return .{
             .ctx = ctx,
@@ -1391,7 +1422,7 @@ const StreamRig = struct {
         const out_bytes: u64 = out_elems * @sizeOf(f32);
         try self.out.ensure(out_bytes);
         @memset(self.out.sliceTyped(u32, out_elems), sentinel_bits);
-        const scratch = z.attn_split.Scratch.init(g.n_heads, g.head_dim, deep_depth);
+        const scratch = zigferencer.attn_split.Scratch.init(g.n_heads, g.head_dim, deep_depth);
         const scratch_bytes = scratch.totalBytes();
         try self.scratch.ensure(scratch_bytes);
         const q_info: DescriptorBufferInfo = .{
@@ -1419,19 +1450,19 @@ const StreamRig = struct {
             .offset = 0,
             .range = out_bytes,
         };
-        z.ops_vulkan.updateStorageBindings(
+        zigferencer.ops_vulkan.updateStorageBindings(
             self.ctx,
             self.multi_set.desc_set,
             &.{ q_info, k_info, v_info, out_info },
         );
-        z.ops_vulkan.AttentionSplit.assertKBinding(k_info);
-        z.ops_vulkan.AttentionSplit.assertVBinding(v_info);
-        z.ops_vulkan.updateStorageBindings(
+        zigferencer.ops_vulkan.AttentionSplit.assertKBinding(k_info);
+        zigferencer.ops_vulkan.AttentionSplit.assertVBinding(v_info);
+        zigferencer.ops_vulkan.updateStorageBindings(
             self.ctx,
             self.split_set.desc_set,
             &.{ q_info, k_info, v_info, scratch_info },
         );
-        z.ops_vulkan.updateStorageBindings(
+        zigferencer.ops_vulkan.updateStorageBindings(
             self.ctx,
             self.merge_set.desc_set,
             &.{ scratch_info, out_info },
@@ -1474,14 +1505,14 @@ fn streamReference(
 ) !void {
     std.debug.assert(ref.len == out_rows * g.rowElems());
 
-    const parts = try allocator.alloc(f32, z.attn_cpu.partialLen(g.n_heads, g.head_dim));
+    const parts = try allocator.alloc(f32, zigferencer.attn_cpu.partialLen(g.n_heads, g.head_dim));
     defer allocator.free(parts);
 
     const kv_len = @as(usize, t_len) * g.kvElems();
     for (pairs) |p| {
         const q_row = q[p.q_row * g.rowElems() ..][0..g.rowElems()];
         const out = ref[p.out_row * g.rowElems() ..][0..g.rowElems()];
-        z.ops.attentionRowTyped(
+        zigferencer.ops.attentionRowTyped(
             f32,
             q_row,
             g.n_heads,
@@ -1572,7 +1603,7 @@ fn runStreamChecks(
         .{ .q_row = 2, .stream = 3, .out_row = 2 },
     };
     for ([_]u32{ 1, split_len }) |t_len| {
-        std.debug.assert(!z.attn_split.usesSplit(t_len));
+        std.debug.assert(!zigferencer.attn_split.usesSplit(t_len));
 
         fillStreamQueries(q, g, streams, t_len, .{ 0, 1, 2, 3 });
         try streamReference(allocator, g, streams, q, t_len, &own, ref);
@@ -1620,9 +1651,10 @@ fn runStreamChecks(
     // row 0 for a row whose q row and stream differ.
     const extra: Pair = .{ .q_row = 3, .stream = 1, .out_row = n_streams };
     const split_pairs = own ++ [_]Pair{extra};
-    const max_splits = z.attn_split.Scratch.init(g.n_heads, g.head_dim, deep_depth).max_splits;
+    const deep_scratch = zigferencer.attn_split.Scratch.init(g.n_heads, g.head_dim, deep_depth);
+    const max_splits = deep_scratch.max_splits;
     for ([_]u32{ split_len + 1, deep_depth }) |t_len| {
-        std.debug.assert(z.attn_split.usesSplit(t_len));
+        std.debug.assert(zigferencer.attn_split.usesSplit(t_len));
 
         fillStreamQueries(q, g, streams, t_len, .{ 0, 1, 2, 3 });
         try streamReference(allocator, g, streams, q, t_len, &split_pairs, ref);
@@ -1758,12 +1790,12 @@ test "attention prefill: chunks across S on three shapes within 2e-3 at both KV 
     try PrefillHarness(f16).oracle();
 }
 
-test "attention prefill: a chunk past four splits gives the same bytes on two runs at both KV types" {
+test "attention prefill: a chunk past four splits gives equal bytes on two runs at both KV types" {
     try PrefillHarness(f32).repeat();
     try PrefillHarness(f16).repeat();
 }
 
-test "attention prefill: a row past S gets the bytes of the decode row of its depth at both KV types" {
+test "attention prefill: a row past S gets the bytes of its decode row at both KV types" {
     const starts = [_]u32{ split_len - 3, 4 * split_len + 1, 2046, 8192 };
     try PrefillHarness(f32).equalsDecode(&starts, 7);
     try PrefillHarness(f16).equalsDecode(&starts, 7);
@@ -1775,12 +1807,12 @@ test "attention prefill: chunk widths 1, 2, 3, 7, and 13 give the same bytes at 
     try PrefillHarness(f16).widths(&starts, 13);
 }
 
-test "attention prefill: one row per record group gives the bytes of the full budget at both KV types" {
+test "attention prefill: one row per record group equals the full budget at both KV types" {
     try PrefillHarness(f32).minimumBudget(2046, 13);
     try PrefillHarness(f16).minimumBudget(2046, 13);
 }
 
-test "attention prefill: a resident batch row gets the bytes of the attention.comp row at both KV types" {
+test "attention prefill: a resident batch row equals the attention.comp row at both KV types" {
     const starts = [_]u32{ 0, split_len - 9 };
     try PrefillHarness(f32).equalsDecode(&starts, 9);
     try PrefillHarness(f16).equalsDecode(&starts, 9);

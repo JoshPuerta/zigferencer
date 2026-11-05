@@ -1,11 +1,9 @@
-//! The boot decisions of `run`, `serve`, and `bench-model` as one pure step.
-//! The CLI measures the host once (`Facts`), calls `early` before the model
-//! loads and `resolve` after, logs the `Resolved` value, and formats a
-//! `Refusal`. Nothing here reads a clock, a file, or a device, and nothing
-//! logs, so a table test runs every boot shape with no GPU.
+//! Role. The boot decisions of `run`, `serve`, and `bench-model` as one pure step. The CLI
+//! measures the host once (`Facts`), calls `early` before the model loads and `resolve` after,
+//! logs the `Resolved` value, and formats a `Refusal`. Nothing here reads a clock, a file, or a
+//! device, and nothing logs, so a table test runs every boot shape with no GPU.
 //!
-//! The per-kind rules. Each row is a decision a later change can unify, and
-//! each difference is on purpose:
+//! Per-kind rules. Each difference between the kinds is on purpose.
 //!
 //!   rule                      run            serve                 bench
 //!   default window budget     run budget     serve budget          run budget
@@ -17,10 +15,18 @@
 //!   thinking refusals         `on`           `on` and a budget     none (auto)
 //!   per-op vulkan refusals    f16 KV         every boot            f16 KV
 //!
-//! Every refusal that needs no model file is in `early`, so it lands before
-//! the load. The device arms (fused, hybrid) live in `device_arm.zig`. They
-//! read one VRAM figure, the live budget, which the CLI measures from one
-//! device context and passes in `Facts.device`.
+//! Refusal order. Every refusal that needs no model file is in `early`, so it lands before the
+//! load.
+//!
+//! Device arms. The fused and hybrid arms live in `device_arm.zig`. They read one VRAM figure, the
+//! live budget, which the CLI measures from one device context and passes in `Facts.device`.
+//!
+//! RAM refusals. A RAM refusal of the host arm sits in `Resolved.cpu`, so the CLI reports it where
+//! the arm starts, after the boot lines that come before it. A device arm that falls back to the
+//! host calls `cpuArm` itself.
+//!
+//! Window. A named window must lie in `1..ceiling`. Only a default window shrinks to fit the VRAM
+//! or the device buffer limits.
 
 const std = @import("std");
 const build_options = @import("build_options");
@@ -97,13 +103,11 @@ pub const Window = struct {
     base: u32,
     /// The model ceiling from `limits.contextCeiling`.
     ceiling: u32,
-    /// Null when the default applies. Only a default shrinks to fit the VRAM
-    /// or the device buffer limits.
+    /// Null when the default applies.
     flag: ?u32,
     /// The byte budget the default window reads.
     session_bytes: u64,
-    /// True when a device clamp cut the default to the buffer limits. That
-    /// clamp logs the window line, so no later line repeats it.
+    /// True when a device clamp cut the default to the buffer limits and logged the window line.
     device_clamped: bool = false,
 };
 
@@ -133,10 +137,7 @@ pub const RunHost = struct {
 pub const Resolved = struct {
     early: Early,
     window: Window,
-    /// The all-host arm, or null when the boot takes a device arm. A device
-    /// arm that falls back to the host calls `cpuArm` itself. A RAM refusal
-    /// comes here, so the CLI reports it where the arm starts, after the boot
-    /// lines that come before it.
+    /// The all-host arm, or null for a device arm. See "RAM refusals" in the header.
     cpu: ?Result(CpuArm),
     /// The device arm, when the boot opens a device and the facts state it.
     device: ?DeviceArm = null,
@@ -175,10 +176,8 @@ pub fn Result(comptime T: type) type {
 
 // -- api --------------------------------------------------------------------
 
-/// True when the boot opens a device context: a fused build that keeps at
-/// least one layer on the GPU, or a per-op vulkan build of a command that runs
-/// a model on it. The bench of a fused build always opens one, because it
-/// places a zero count to refuse it as a whole model.
+/// True when the boot opens a device context. The bench of a fused build always opens one,
+/// because it places a zero count to refuse it as a whole model.
 pub fn needsDevice(kind: Kind, flags: EngineFlags, card: loader.ModelCard) bool {
     if (comptime build_options.use_vulkan_fused_ops) {
         if (kind == .bench) return true;
@@ -206,8 +205,7 @@ pub fn early(kind: Kind, input: Input, entry: Entry) Result(Early) {
 
     const kv_dtype = flags.kv_dtype orelse entry.kv_dtype_default;
     if (comptime build_options.use_vulkan_ops) {
-        // The serve paths never start the per-op kernel context, and the
-        // per-op arm uploads the KV slab as f32 on every attention call.
+        // The serve paths never start the per-op kernel context, and the per-op arm uploads f32 KV.
         if (kind == .serve) return .{ .refused = .serve_per_op_vulkan };
         if (kv_dtype != .f32) return .{ .refused = .{ .kv_dtype_per_op_vulkan = kv_dtype } };
     }
@@ -228,6 +226,7 @@ pub fn resolve(
         .refused => |r| return .{ .refused = r },
     };
 
+    // Size the base window.
     const ceiling = limits.contextCeiling(card.context_length, entry.context_limit);
     const cost = kv_budget.costModel(card.kvShape(), e.kv_dtype);
     const session_bytes = if (kind == .serve)
@@ -246,6 +245,7 @@ pub fn resolve(
     };
     std.debug.assert(window.base <= window.ceiling);
 
+    // Pick the host arm or the device arm.
     var out: Resolved = .{ .early = e, .window = window, .cpu = null };
     if (!needsDevice(kind, input.engine, card)) {
         out.cpu = cpuArm(kind, input, card, e.kv_dtype, window, facts);
@@ -256,10 +256,8 @@ pub fn resolve(
     return .{ .ok = out };
 }
 
-/// The all-host arm at `w`: the plan and its RAM quote. Serve holds every
-/// session resident, prices the residency stages, and gives the prefix cache
-/// the named Y or the serve default. Run and bench hold one slot and price no
-/// stage.
+/// The all-host arm at `w`: the plan and its RAM quote. Serve holds every session resident and
+/// prices the residency stages. Run and bench hold one slot and price no stage.
 pub fn cpuArm(
     kind: Kind,
     input: Input,
@@ -271,6 +269,8 @@ pub fn cpuArm(
     const window = w.base;
     std.debug.assert(window >= 1);
     std.debug.assert(window <= limits.max_model_ctx);
+
+    // Plan the slots of the kind.
     const shape = input.serve;
     var plan: kv_budget.KvPlan = undefined;
     var prefix_default = false;
@@ -298,6 +298,7 @@ pub fn cpuArm(
         plan = kv_budget.pinned(1, window);
     }
 
+    // Quote the RAM, or refuse.
     const kv: kv_budget.KvStructure = .{
         .n_slots = plan.n_slots,
         .window = plan.window,
@@ -334,9 +335,8 @@ pub fn cpuArm(
     return .{ .ok = .{ .plan = plan, .prefix_default = prefix_default, .quote = quote } };
 }
 
-/// The host arm of a llama `run`. A fused build plans the one stream against
-/// the reservations of the fused runner at no VRAM, so the placement line
-/// prices what the device arm prices. A host build states no device bytes.
+/// The host arm of a llama `run`. A fused build plans against the fused runner reservations at no
+/// VRAM, so the placement line prices what the device arm prices.
 pub fn runHost(
     card: loader.ModelCard,
     model: ?ModelFacts,
@@ -361,9 +361,7 @@ pub fn runHost(
     return .{ .plan = plan, .report = device_arm.report(c, card, m, kv_dtype, plan) };
 }
 
-/// The window before any device fit: the `--max-seq` value when the flag is
-/// set, and otherwise the default window of the model. A named window must lie
-/// in `1..ceiling`.
+/// The window before any device fit: the `--max-seq` value, or else the default window.
 pub fn baseWindow(flag: ?u32, ceiling: u32, default_window: u32) error{WindowOutOfRange}!u32 {
     std.debug.assert(ceiling >= 1);
     std.debug.assert(ceiling <= limits.max_model_ctx);
@@ -456,52 +454,159 @@ const Row = struct {
     input: Input,
     /// The free RAM of the host, in MiB.
     ram_mib: u64 = 64 * 1024,
-    want: union(enum) {
-        ok: struct { window: u32, slots: u32, host_kv_mib: u64, prefix_mib: u64 },
-        refused: std.meta.Tag(Refusal),
-    },
+    want: CpuWant,
 };
 
-/// The serve shape of a default boot: four sessions, every one resident.
-const serve4: ServeShape = .{ .max_sessions = 4, .structural_slots = 4 };
+/// The models of the tables. The name of a row joins the kind, the model, and the label.
+const Model = enum {
+    smollm,
+    qwen,
 
-const rows = [_]Row{
-    .{ .name = "run-SmolLM2-default", .kind = .run, .qwen = false, .input = .{}, .want = .{ .ok = .{ .window = 8192, .slots = 1, .host_kv_mib = 360, .prefix_mib = 0 } } },
-    .{ .name = "run-SmolLM2-maxseq512", .kind = .run, .qwen = false, .input = .{ .engine = .{ .max_seq = 512 } }, .want = .{ .ok = .{ .window = 512, .slots = 1, .host_kv_mib = 22, .prefix_mib = 0 } } },
-    .{ .name = "run-SmolLM2-maxseq-huge", .kind = .run, .qwen = false, .input = .{ .engine = .{ .max_seq = 99999999 } }, .want = .{ .refused = .window_out_of_range } },
-    .{ .name = "run-SmolLM2-f16", .kind = .run, .qwen = false, .input = .{ .engine = .{ .kv_dtype = .f16 } }, .want = .{ .ok = .{ .window = 8192, .slots = 1, .host_kv_mib = 180, .prefix_mib = 0 } } },
-    .{ .name = "run-SmolLM2-chat-thinking-on", .kind = .run, .qwen = false, .input = .{ .engine = .{ .thinking = .on } }, .want = .{ .refused = .thinking_unsupported } },
-    .{ .name = "run-Qwen3.5-default", .kind = .run, .qwen = true, .input = .{}, .want = .{ .ok = .{ .window = 174592, .slots = 1, .host_kv_mib = 2065, .prefix_mib = 0 } } },
-    .{ .name = "run-Qwen3.5-maxseq-huge", .kind = .run, .qwen = true, .input = .{ .engine = .{ .max_seq = 99999999 } }, .want = .{ .refused = .window_out_of_range } },
-    .{ .name = "serve-SmolLM2-default", .kind = .serve, .qwen = false, .input = .{ .serve = serve4 }, .want = .{ .ok = .{ .window = 2816, .slots = 4, .host_kv_mib = 495, .prefix_mib = 1024 } } },
-    .{ .name = "serve-SmolLM2-kvram1", .kind = .serve, .qwen = false, .input = .{ .serve = .{ .max_sessions = 4, .structural_slots = 4, .kv_ram_bytes = 1 * mib } }, .want = .{ .ok = .{ .window = 2816, .slots = 4, .host_kv_mib = 495, .prefix_mib = 1 } } },
-    .{ .name = "serve-SmolLM2-maxseq1024", .kind = .serve, .qwen = false, .input = .{ .engine = .{ .max_seq = 1024 }, .serve = serve4 }, .want = .{ .ok = .{ .window = 1024, .slots = 4, .host_kv_mib = 180, .prefix_mib = 1024 } } },
-    .{ .name = "serve-SmolLM2-maxseq-huge", .kind = .serve, .qwen = false, .input = .{ .engine = .{ .max_seq = 99999999 }, .serve = serve4 }, .want = .{ .refused = .window_out_of_range } },
-    .{ .name = "serve-SmolLM2-thinkbudget100", .kind = .serve, .qwen = false, .input = .{ .engine = .{ .thinking_budget = 100 }, .serve = serve4 }, .want = .{ .refused = .thinking_budget_unsupported } },
-    .{ .name = "serve-Qwen3.5-default", .kind = .serve, .qwen = true, .input = .{ .serve = serve4 }, .want = .{ .ok = .{ .window = 10752, .slots = 4, .host_kv_mib = 581, .prefix_mib = 1024 } } },
-    .{ .name = "serve-Qwen3.5-sessions2", .kind = .serve, .qwen = true, .input = .{ .serve = .{ .max_sessions = 2, .structural_slots = 2 } }, .want = .{ .ok = .{ .window = 10752, .slots = 2, .host_kv_mib = 290, .prefix_mib = 1024 } } },
-    .{ .name = "bench-SmolLM2-default", .kind = .bench, .qwen = false, .input = .{}, .want = .{ .ok = .{ .window = 8192, .slots = 1, .host_kv_mib = 360, .prefix_mib = 0 } } },
-    .{ .name = "bench-Qwen3.5-default", .kind = .bench, .qwen = true, .input = .{}, .want = .{ .ok = .{ .window = 174592, .slots = 1, .host_kv_mib = 2065, .prefix_mib = 0 } } },
-    .{ .name = "bench-Qwen3.5-maxseq512", .kind = .bench, .qwen = true, .input = .{ .engine = .{ .max_seq = 512 } }, .want = .{ .ok = .{ .window = 512, .slots = 1, .host_kv_mib = 25, .prefix_mib = 0 } } },
-    .{ .name = "serve-SmolLM2-f16", .kind = .serve, .qwen = false, .input = .{ .engine = .{ .kv_dtype = .f16 }, .serve = serve4 }, .want = .{ .ok = .{ .window = 5632, .slots = 4, .host_kv_mib = 495, .prefix_mib = 1024 } } },
-    .{ .name = "serve-Qwen3.5-maxseq1024", .kind = .serve, .qwen = true, .input = .{ .engine = .{ .max_seq = 1024 }, .serve = serve4 }, .want = .{ .ok = .{ .window = 1024, .slots = 4, .host_kv_mib = 125, .prefix_mib = 1024 } } },
-    .{ .name = "serve-Qwen3.5-thinkbudget100", .kind = .serve, .qwen = true, .input = .{ .engine = .{ .thinking_budget = 100 }, .serve = serve4 }, .want = .{ .ok = .{ .window = 10752, .slots = 4, .host_kv_mib = 581, .prefix_mib = 1024 } } },
-    .{ .name = "serve-SmolLM2-sessions2", .kind = .serve, .qwen = false, .input = .{ .serve = .{ .max_sessions = 2, .structural_slots = 2 } }, .want = .{ .ok = .{ .window = 2816, .slots = 2, .host_kv_mib = 247, .prefix_mib = 1024 } } },
-    .{ .name = "run-Qwen3.5-maxseq512", .kind = .run, .qwen = true, .input = .{ .engine = .{ .max_seq = 512 } }, .want = .{ .ok = .{ .window = 512, .slots = 1, .host_kv_mib = 25, .prefix_mib = 0 } } },
-    .{ .name = "run-Qwen3.5-f16", .kind = .run, .qwen = true, .input = .{ .engine = .{ .kv_dtype = .f16 } }, .want = .{ .ok = .{ .window = 174592, .slots = 1, .host_kv_mib = 2065, .prefix_mib = 0 } } },
-    .{ .name = "run-Qwen3.5-chat-thinking-on", .kind = .run, .qwen = true, .input = .{ .engine = .{ .thinking = .on } }, .want = .{ .ok = .{ .window = 174592, .slots = 1, .host_kv_mib = 2065, .prefix_mib = 0 } } },
-    .{ .name = "bench-SmolLM2-maxseq512", .kind = .bench, .qwen = false, .input = .{ .engine = .{ .max_seq = 512 } }, .want = .{ .ok = .{ .window = 512, .slots = 1, .host_kv_mib = 22, .prefix_mib = 0 } } },
-    .{ .name = "bench-SmolLM2-f16", .kind = .bench, .qwen = false, .input = .{ .engine = .{ .kv_dtype = .f16 } }, .want = .{ .ok = .{ .window = 8192, .slots = 1, .host_kv_mib = 180, .prefix_mib = 0 } } },
-    .{ .name = "bench-Qwen3.5-f16", .kind = .bench, .qwen = true, .input = .{ .engine = .{ .kv_dtype = .f16 } }, .want = .{ .ok = .{ .window = 174592, .slots = 1, .host_kv_mib = 2065, .prefix_mib = 0 } } },
-    .{ .name = "serve-SmolLM2-kvram64", .kind = .serve, .qwen = false, .input = .{ .serve = .{ .max_sessions = 4, .structural_slots = 4, .kv_ram_bytes = 64 * mib } }, .want = .{ .ok = .{ .window = 2816, .slots = 4, .host_kv_mib = 495, .prefix_mib = 64 } } },
-    .{ .name = "serve-Qwen3.5-kvram1", .kind = .serve, .qwen = true, .input = .{ .serve = .{ .max_sessions = 4, .structural_slots = 4, .kv_ram_bytes = 1 * mib } }, .want = .{ .ok = .{ .window = 10752, .slots = 4, .host_kv_mib = 581, .prefix_mib = 1 } } },
-    .{ .name = "serve-Qwen3.5-kvram64", .kind = .serve, .qwen = true, .input = .{ .serve = .{ .max_sessions = 4, .structural_slots = 4, .kv_ram_bytes = 64 * mib } }, .want = .{ .ok = .{ .window = 10752, .slots = 4, .host_kv_mib = 581, .prefix_mib = 64 } } },
-    .{ .name = "serve-Qwen3.5-f16", .kind = .serve, .qwen = true, .input = .{ .engine = .{ .kv_dtype = .f16 }, .serve = serve4 }, .want = .{ .ok = .{ .window = 10752, .slots = 4, .host_kv_mib = 581, .prefix_mib = 1024 } } },
-    .{ .name = "serve-Qwen3.5-maxseq-huge", .kind = .serve, .qwen = true, .input = .{ .engine = .{ .max_seq = 99999999 }, .serve = serve4 }, .want = .{ .refused = .window_out_of_range } },
-    .{ .name = "serve-SmolLM2-ram-small", .kind = .serve, .qwen = false, .input = .{ .serve = serve4 }, .ram_mib = 600, .want = .{ .refused = .host_ram } },
-    .{ .name = "run-Qwen3.5-ram-small", .kind = .run, .qwen = true, .input = .{}, .ram_mib = 64, .want = .{ .refused = .host_ram } },
-    .{ .name = "serve-cpu-slots-below-sessions", .kind = .serve, .qwen = false, .input = .{ .serve = .{ .max_sessions = 4, .structural_slots = 2 } }, .want = .{ .refused = .cpu_slots } },
+    fn label(m: Model) []const u8 {
+        return switch (m) {
+            .smollm => "SmolLM2",
+            .qwen => "Qwen3.5",
+        };
+    }
 };
+
+const smollm: Model = .smollm;
+const qwen: Model = .qwen;
+
+/// The flags that rows share.
+const seq512: EngineFlags = .{ .max_seq = 512 };
+const seq1024: EngineFlags = .{ .max_seq = 1024 };
+const seq_huge: EngineFlags = .{ .max_seq = 99999999 };
+const f16kv: EngineFlags = .{ .kv_dtype = .f16 };
+const think_on: EngineFlags = .{ .thinking = .on };
+const budget: EngineFlags = .{ .thinking_budget = 100 };
+const gl0: EngineFlags = .{ .gpu_layers = .{ .count = 0 } };
+const gl6: EngineFlags = .{ .gpu_layers = .{ .count = 6 } };
+const gl31: EngineFlags = .{ .gpu_layers = .{ .count = 31 } };
+const auto: EngineFlags = .{ .gpu_layers = .auto };
+
+/// Returns `base` with each field of `over` set. A field that `base` lacks is a compile error.
+fn overlay(base: anytype, over: anytype) @TypeOf(base) {
+    var out = base;
+    inline for (std.meta.fields(@TypeOf(over))) |f| {
+        @field(out, f.name) = @field(over, f.name);
+    }
+
+    return out;
+}
+
+/// An input from a literal such as `.{ .engine = gl6 }`, which a tuple keeps as an anonymous type.
+fn asInput(comptime v: anytype) Input {
+    if (@TypeOf(v) == Input) return v;
+    return overlay(@as(Input, .{}), v);
+}
+
+/// A serve input from a base shape. The `engine` key of `over` sets the flags, and every other
+/// key sets a field of the shape.
+fn serveIn(base: ServeShape, over: anytype) Input {
+    var input: Input = .{ .serve = base };
+    inline for (std.meta.fields(@TypeOf(over))) |f| {
+        if (comptime std.mem.eql(u8, f.name, "engine")) {
+            input.engine = over.engine;
+        } else {
+            @field(input.serve, f.name) = @field(over, f.name);
+        }
+    }
+
+    return input;
+}
+
+/// The figures of a CPU row that resolves.
+const CpuWant = union(enum) {
+    ok: struct { window: u32, slots: u32, host_kv_mib: u64, prefix_mib: u64 },
+    refused: std.meta.Tag(Refusal),
+};
+
+fn ok(window: u32, slots: u32, host_kv_mib: u64, prefix_mib: u64) CpuWant {
+    return .{ .ok = .{
+        .window = window,
+        .slots = slots,
+        .host_kv_mib = host_kv_mib,
+        .prefix_mib = prefix_mib,
+    } };
+}
+
+fn rejects(tag: std.meta.Tag(Refusal)) CpuWant {
+    return .{ .refused = tag };
+}
+
+/// The serve input of a default boot: four sessions, every one resident.
+fn serve4(over: anytype) Input {
+    return serveIn(.{ .max_sessions = 4, .structural_slots = 4 }, over);
+}
+
+const serve2: Input = serve4(.{ .max_sessions = 2, .structural_slots = 2 });
+
+/// Rows of one kind and model. A case is a label, an input, a want, and optional row fields.
+fn cpuRows(comptime kind: Kind, comptime model: Model, comptime cases: anytype) [cases.len]Row {
+    var out: [cases.len]Row = undefined;
+    inline for (cases, 0..) |c, i| {
+        out[i] = .{
+            .name = @tagName(kind) ++ "-" ++ model.label() ++ "-" ++ c[0],
+            .kind = kind,
+            .qwen = model == .qwen,
+            .input = asInput(c[1]),
+            .want = c[2],
+        };
+        if (c.len == 4) out[i] = overlay(out[i], c[3]);
+    }
+
+    return out;
+}
+
+const rows =
+    cpuRows(.run, smollm, .{
+        .{ "default", .{}, ok(8192, 1, 360, 0) },
+        .{ "maxseq512", .{ .engine = seq512 }, ok(512, 1, 22, 0) },
+        .{ "maxseq-huge", .{ .engine = seq_huge }, rejects(.window_out_of_range) },
+        .{ "f16", .{ .engine = f16kv }, ok(8192, 1, 180, 0) },
+        .{ "chat-thinking-on", .{ .engine = think_on }, rejects(.thinking_unsupported) },
+    }) ++
+    cpuRows(.run, qwen, .{
+        .{ "default", .{}, ok(174592, 1, 2065, 0) },
+        .{ "maxseq-huge", .{ .engine = seq_huge }, rejects(.window_out_of_range) },
+        .{ "maxseq512", .{ .engine = seq512 }, ok(512, 1, 25, 0) },
+        .{ "f16", .{ .engine = f16kv }, ok(174592, 1, 2065, 0) },
+        .{ "chat-thinking-on", .{ .engine = think_on }, ok(174592, 1, 2065, 0) },
+        .{ "ram-small", .{}, rejects(.host_ram), .{ .ram_mib = 64 } },
+    }) ++
+    cpuRows(.serve, smollm, .{
+        .{ "default", serve4(.{}), ok(2816, 4, 495, 1024) },
+        .{ "kvram1", serve4(.{ .kv_ram_bytes = 1 * mib }), ok(2816, 4, 495, 1) },
+        .{ "maxseq1024", serve4(.{ .engine = seq1024 }), ok(1024, 4, 180, 1024) },
+        .{ "maxseq-huge", serve4(.{ .engine = seq_huge }), rejects(.window_out_of_range) },
+        .{ "thinkbudget100", serve4(.{ .engine = budget }), rejects(.thinking_budget_unsupported) },
+        .{ "f16", serve4(.{ .engine = f16kv }), ok(5632, 4, 495, 1024) },
+        .{ "sessions2", serve2, ok(2816, 2, 247, 1024) },
+        .{ "kvram64", serve4(.{ .kv_ram_bytes = 64 * mib }), ok(2816, 4, 495, 64) },
+        .{ "ram-small", serve4(.{}), rejects(.host_ram), .{ .ram_mib = 600 } },
+        .{ "cpu-slots-below-sessions", serve4(.{ .structural_slots = 2 }), rejects(.cpu_slots) },
+    }) ++
+    cpuRows(.serve, qwen, .{
+        .{ "default", serve4(.{}), ok(10752, 4, 581, 1024) },
+        .{ "sessions2", serve2, ok(10752, 2, 290, 1024) },
+        .{ "maxseq1024", serve4(.{ .engine = seq1024 }), ok(1024, 4, 125, 1024) },
+        .{ "thinkbudget100", serve4(.{ .engine = budget }), ok(10752, 4, 581, 1024) },
+        .{ "kvram1", serve4(.{ .kv_ram_bytes = 1 * mib }), ok(10752, 4, 581, 1) },
+        .{ "kvram64", serve4(.{ .kv_ram_bytes = 64 * mib }), ok(10752, 4, 581, 64) },
+        .{ "f16", serve4(.{ .engine = f16kv }), ok(10752, 4, 581, 1024) },
+        .{ "maxseq-huge", serve4(.{ .engine = seq_huge }), rejects(.window_out_of_range) },
+    }) ++
+    cpuRows(.bench, smollm, .{
+        .{ "default", .{}, ok(8192, 1, 360, 0) },
+        .{ "maxseq512", .{ .engine = seq512 }, ok(512, 1, 22, 0) },
+        .{ "f16", .{ .engine = f16kv }, ok(8192, 1, 180, 0) },
+    }) ++
+    cpuRows(.bench, qwen, .{
+        .{ "default", .{}, ok(174592, 1, 2065, 0) },
+        .{ "maxseq512", .{ .engine = seq512 }, ok(512, 1, 25, 0) },
+        .{ "f16", .{ .engine = f16kv }, ok(174592, 1, 2065, 0) },
+    });
 
 test "resolve: the CPU oracle rows resolve to their logged window, slots, and RAM" {
     if (comptime build_options.use_vulkan_ops or build_options.use_vulkan_fused_ops) {
@@ -571,8 +676,8 @@ const Case = struct {
 
 fn genCase(_: void, r: std.Random, size: u32) Case {
     const kind = r.enumValue(Kind);
-    const qwen = r.boolean();
-    const ceiling_hint: u32 = if (qwen) 262144 else 8192;
+    const is_qwen = r.boolean();
+    const ceiling_hint: u32 = if (is_qwen) 262144 else 8192;
     var input: Input = .{};
     if (r.boolean()) {
         input.engine.max_seq = r.uintAtMost(u32, ceiling_hint + 2 + size);
@@ -596,7 +701,7 @@ fn genCase(_: void, r: std.Random, size: u32) Case {
 
     return .{
         .kind = kind,
-        .qwen = qwen,
+        .qwen = is_qwen,
         .input = input,
         .ram_free = if (r.boolean()) @as(u64, r.uintAtMost(u32, 1 << 16)) * mib else null,
         .context_limit = if (r.boolean()) r.intRangeAtMost(u32, 1, ceiling_hint) else null,
@@ -733,77 +838,177 @@ const DeviceRow = struct {
     split: ?u32 = null,
     /// True when the window line names the storage-buffer range.
     clamped: bool = false,
-    want: union(enum) {
-        arm: struct {
-            tag: device_arm.ArmTag,
-            slots: u32,
-            window: u32,
-            vram_kv_mib: u64 = 0,
-            host_kv_mib: u64 = 0,
-            blobs_mib: u64 = 0,
-            prefix_mib: u64 = 0,
-            stages_mib: u64 = 0,
-        },
-        refused: std.meta.Tag(Refusal),
-    },
+    want: DeviceWant,
 };
 
-const gl6: kv_budget.GpuLayers = .{ .count = 6 };
-const serve2: ServeShape = .{ .max_sessions = 2, .structural_slots = 2, .batch = 2 };
-const serve4b: ServeShape = .{ .max_sessions = 4, .structural_slots = 4, .batch = 4 };
-
-const device_rows = [_]DeviceRow{
-    .{ .name = "run-SmolLM2-default", .kind = .run, .qwen = false, .input = .{}, .want = .{ .arm = .{ .tag = .fused, .slots = 1, .window = 8192, .vram_kv_mib = 360 } } },
-    .{ .name = "run-SmolLM2-maxseq512", .kind = .run, .qwen = false, .input = .{ .engine = .{ .max_seq = 512 } }, .want = .{ .arm = .{ .tag = .fused, .slots = 1, .window = 512, .vram_kv_mib = 22 } } },
-    .{ .name = "run-SmolLM2-f16", .kind = .run, .qwen = false, .input = .{ .engine = .{ .kv_dtype = .f16 } }, .want = .{ .arm = .{ .tag = .fused, .slots = 1, .window = 8192, .vram_kv_mib = 180 } } },
-    .{ .name = "run-SmolLM2-gl6", .kind = .run, .qwen = false, .input = .{ .engine = .{ .gpu_layers = gl6 } }, .split = 24, .want = .{ .arm = .{ .tag = .hybrid, .slots = 1, .window = 8192, .host_kv_mib = 288 } } },
-    .{ .name = "run-SmolLM2-glauto", .kind = .run, .qwen = false, .input = .{ .engine = .{ .gpu_layers = .auto } }, .split = 0, .want = .{ .arm = .{ .tag = .fused, .slots = 1, .window = 8192, .vram_kv_mib = 360 } } },
-    .{ .name = "run-SmolLM2-range1073741824", .kind = .run, .qwen = false, .input = .{}, .storage_range = 1 << 30, .want = .{ .arm = .{ .tag = .fused, .slots = 1, .window = 8192, .vram_kv_mib = 360 } } },
-    .{ .name = "serve-SmolLM2-default", .kind = .serve, .qwen = false, .input = .{ .serve = serve4b }, .want = .{ .arm = .{ .tag = .fused, .slots = 4, .window = 2816, .vram_kv_mib = 495, .prefix_mib = 1024, .stages_mib = 247 } } },
-    .{ .name = "serve-SmolLM2-sessions2", .kind = .serve, .qwen = false, .input = .{ .serve = serve2 }, .want = .{ .arm = .{ .tag = .fused, .slots = 2, .window = 2816, .vram_kv_mib = 247, .prefix_mib = 1024, .stages_mib = 247 } } },
-    .{ .name = "serve-SmolLM2-maxseq1024", .kind = .serve, .qwen = false, .input = .{ .engine = .{ .max_seq = 1024 }, .serve = serve4b }, .want = .{ .arm = .{ .tag = .fused, .slots = 4, .window = 1024, .vram_kv_mib = 180, .prefix_mib = 1024, .stages_mib = 90 } } },
-    .{ .name = "serve-SmolLM2-kvram64", .kind = .serve, .qwen = false, .input = .{ .serve = .{ .max_sessions = 4, .structural_slots = 4, .batch = 4, .kv_ram_bytes = 64 * mib } }, .want = .{ .arm = .{ .tag = .fused, .slots = 4, .window = 2816, .vram_kv_mib = 495, .prefix_mib = 64, .stages_mib = 247 } } },
-    .{ .name = "serve-SmolLM2-kvram1", .kind = .serve, .qwen = false, .input = .{ .serve = .{ .max_sessions = 4, .structural_slots = 4, .batch = 4, .kv_ram_bytes = 1 * mib } }, .want = .{ .arm = .{ .tag = .fused, .slots = 4, .window = 2816, .vram_kv_mib = 495, .prefix_mib = 1, .stages_mib = 247 } } },
-    .{ .name = "serve-SmolLM2-f16", .kind = .serve, .qwen = false, .input = .{ .engine = .{ .kv_dtype = .f16 }, .serve = serve4b }, .want = .{ .arm = .{ .tag = .fused, .slots = 4, .window = 5632, .vram_kv_mib = 495, .prefix_mib = 1024, .stages_mib = 247 } } },
-    .{ .name = "serve-SmolLM2-gl6", .kind = .serve, .qwen = false, .input = .{ .engine = .{ .gpu_layers = gl6 }, .serve = serve4b }, .split = 24, .want = .{ .arm = .{ .tag = .hybrid, .slots = 4, .window = 2816, .host_kv_mib = 396, .prefix_mib = 1024, .stages_mib = 49 } } },
-    .{ .name = "serve-SmolLM2-glauto", .kind = .serve, .qwen = false, .input = .{ .engine = .{ .gpu_layers = .auto }, .serve = serve4b }, .split = 0, .want = .{ .arm = .{ .tag = .fused, .slots = 4, .window = 2816, .vram_kv_mib = 495, .prefix_mib = 1024, .stages_mib = 247 } } },
-    .{ .name = "serve-SmolLM2-range1073741824", .kind = .serve, .qwen = false, .input = .{ .serve = serve4b }, .storage_range = 1 << 30, .want = .{ .arm = .{ .tag = .fused, .slots = 4, .window = 2816, .vram_kv_mib = 495, .prefix_mib = 1024, .stages_mib = 247 } } },
-    .{ .name = "bench-SmolLM2-default", .kind = .bench, .qwen = false, .input = .{}, .want = .{ .arm = .{ .tag = .fused, .slots = 1, .window = 8192, .vram_kv_mib = 360 } } },
-    .{ .name = "bench-SmolLM2-maxseq512", .kind = .bench, .qwen = false, .input = .{ .engine = .{ .max_seq = 512 } }, .want = .{ .arm = .{ .tag = .fused, .slots = 1, .window = 512, .vram_kv_mib = 22 } } },
-    .{ .name = "bench-SmolLM2-f16", .kind = .bench, .qwen = false, .input = .{ .engine = .{ .kv_dtype = .f16 } }, .want = .{ .arm = .{ .tag = .fused, .slots = 1, .window = 8192, .vram_kv_mib = 180 } } },
-    .{ .name = "bench-SmolLM2-gl0", .kind = .bench, .qwen = false, .input = .{ .engine = .{ .gpu_layers = .{ .count = 0 } } }, .split = 30, .want = .{ .refused = .whole_model_split } },
-    .{ .name = "bench-SmolLM2-gl6", .kind = .bench, .qwen = false, .input = .{ .engine = .{ .gpu_layers = gl6 } }, .split = 24, .want = .{ .arm = .{ .tag = .hybrid, .slots = 1, .window = 8192, .host_kv_mib = 288 } } },
-    .{ .name = "bench-SmolLM2-glauto", .kind = .bench, .qwen = false, .input = .{ .engine = .{ .gpu_layers = .auto } }, .split = 0, .want = .{ .refused = .whole_model_split } },
-    .{ .name = "run-Qwen3.5-default", .kind = .run, .qwen = true, .input = .{}, .clamped = true, .want = .{ .arm = .{ .tag = .fused, .slots = 1, .window = 131072, .vram_kv_mib = 1555 } } },
-    .{ .name = "run-Qwen3.5-maxseq512", .kind = .run, .qwen = true, .input = .{ .engine = .{ .max_seq = 512 } }, .want = .{ .arm = .{ .tag = .fused, .slots = 1, .window = 512, .vram_kv_mib = 25 } } },
-    .{ .name = "run-Qwen3.5-gl6", .kind = .run, .qwen = true, .input = .{ .engine = .{ .gpu_layers = gl6 } }, .split = 18, .clamped = true, .want = .{ .arm = .{ .tag = .hybrid, .slots = 1, .window = 131072, .host_kv_mib = 1038 } } },
-    .{ .name = "run-Qwen3.5-glauto", .kind = .run, .qwen = true, .input = .{ .engine = .{ .gpu_layers = .auto } }, .split = 0, .clamped = true, .want = .{ .arm = .{ .tag = .fused, .slots = 1, .window = 131072, .vram_kv_mib = 1555 } } },
-    .{ .name = "run-Qwen3.5-range1073741824", .kind = .run, .qwen = true, .input = .{}, .storage_range = 1 << 30, .want = .{ .arm = .{ .tag = .fused, .slots = 1, .window = 174592, .vram_kv_mib = 2065 } } },
-    .{ .name = "serve-Qwen3.5-default", .kind = .serve, .qwen = true, .input = .{ .serve = serve4b }, .want = .{ .arm = .{ .tag = .fused, .slots = 4, .window = 10752, .vram_kv_mib = 581, .prefix_mib = 1024, .stages_mib = 290 } } },
-    .{ .name = "serve-Qwen3.5-sessions2", .kind = .serve, .qwen = true, .input = .{ .serve = serve2 }, .want = .{ .arm = .{ .tag = .fused, .slots = 2, .window = 10752, .vram_kv_mib = 290, .prefix_mib = 1024, .stages_mib = 290 } } },
-    .{ .name = "serve-Qwen3.5-maxseq1024", .kind = .serve, .qwen = true, .input = .{ .engine = .{ .max_seq = 1024 }, .serve = serve4b }, .want = .{ .arm = .{ .tag = .fused, .slots = 4, .window = 1024, .vram_kv_mib = 125, .prefix_mib = 1024, .stages_mib = 62 } } },
-    .{ .name = "serve-Qwen3.5-kvram64", .kind = .serve, .qwen = true, .input = .{ .serve = .{ .max_sessions = 4, .structural_slots = 4, .batch = 4, .kv_ram_bytes = 64 * mib } }, .want = .{ .arm = .{ .tag = .fused, .slots = 4, .window = 10752, .vram_kv_mib = 581, .prefix_mib = 64, .stages_mib = 290 } } },
-    .{ .name = "serve-Qwen3.5-kvram1", .kind = .serve, .qwen = true, .input = .{ .serve = .{ .max_sessions = 4, .structural_slots = 4, .batch = 4, .kv_ram_bytes = 1 * mib } }, .want = .{ .arm = .{ .tag = .fused, .slots = 4, .window = 10752, .vram_kv_mib = 581, .prefix_mib = 1, .stages_mib = 290 } } },
-    .{ .name = "serve-Qwen3.5-gl6", .kind = .serve, .qwen = true, .input = .{ .engine = .{ .gpu_layers = gl6 }, .serve = serve4b }, .split = 18, .want = .{ .arm = .{ .tag = .hybrid, .slots = 4, .window = 10752, .host_kv_mib = 395, .prefix_mib = 1024, .stages_mib = 92 } } },
-    .{ .name = "serve-Qwen3.5-glauto", .kind = .serve, .qwen = true, .input = .{ .engine = .{ .gpu_layers = .auto }, .serve = serve4b }, .split = 0, .want = .{ .arm = .{ .tag = .fused, .slots = 4, .window = 10752, .vram_kv_mib = 581, .prefix_mib = 1024, .stages_mib = 290 } } },
-    .{ .name = "serve-Qwen3.5-range1073741824", .kind = .serve, .qwen = true, .input = .{ .serve = serve4b }, .storage_range = 1 << 30, .want = .{ .arm = .{ .tag = .fused, .slots = 4, .window = 10752, .vram_kv_mib = 581, .prefix_mib = 1024, .stages_mib = 290 } } },
-    .{ .name = "bench-Qwen3.5-default", .kind = .bench, .qwen = true, .input = .{}, .clamped = true, .want = .{ .arm = .{ .tag = .fused, .slots = 1, .window = 131072, .vram_kv_mib = 1555 } } },
-    .{ .name = "bench-Qwen3.5-maxseq512", .kind = .bench, .qwen = true, .input = .{ .engine = .{ .max_seq = 512 } }, .want = .{ .arm = .{ .tag = .fused, .slots = 1, .window = 512, .vram_kv_mib = 25 } } },
-    .{ .name = "bench-Qwen3.5-range1073741824", .kind = .bench, .qwen = true, .input = .{}, .storage_range = 1 << 30, .want = .{ .arm = .{ .tag = .fused, .slots = 1, .window = 174592, .vram_kv_mib = 2065 } } },
-    .{ .name = "bench-Qwen3.5-gl0", .kind = .bench, .qwen = true, .input = .{ .engine = .{ .gpu_layers = .{ .count = 0 } } }, .split = 24, .clamped = true, .want = .{ .refused = .whole_model_split } },
-    .{ .name = "bench-Qwen3.5-gl6", .kind = .bench, .qwen = true, .input = .{ .engine = .{ .gpu_layers = gl6 } }, .split = 18, .clamped = true, .want = .{ .arm = .{ .tag = .hybrid, .slots = 1, .window = 131072, .host_kv_mib = 1038 } } },
-    .{ .name = "run-SmolLM2-gl31", .kind = .run, .qwen = false, .input = .{ .engine = .{ .gpu_layers = .{ .count = 31 } } }, .want = .{ .refused = .gpu_layers_past_model } },
-    .{ .name = "serve-SmolLM2-gl31", .kind = .serve, .qwen = false, .input = .{ .engine = .{ .gpu_layers = .{ .count = 31 } }, .serve = serve4b }, .want = .{ .refused = .gpu_layers_past_model } },
-    .{ .name = "serve-SmolLM2-gl6-slots-pinned", .kind = .serve, .qwen = false, .input = .{ .engine = .{ .gpu_layers = gl6 }, .serve = .{ .max_sessions = 16, .structural_slots = 16, .batch = 4, .slots_req = 16 } }, .want = .{ .refused = .hybrid_slots } },
-    .{ .name = "run-Qwen3.5-gl6-vram-small", .kind = .run, .qwen = true, .input = .{ .engine = .{ .gpu_layers = gl6 } }, .vram_mib = 512, .clamped = true, .want = .{ .refused = .placement_vram } },
-    .{ .name = "serve-SmolLM2-vramslots2", .kind = .serve, .qwen = false, .input = .{ .serve = .{ .max_sessions = 4, .structural_slots = 4, .batch = 2, .slots_req = 2 } }, .want = .{ .arm = .{ .tag = .fused, .slots = 2, .window = 8192, .vram_kv_mib = 720, .blobs_mib = 1080, .prefix_mib = 1024, .stages_mib = 512 } } },
-    .{ .name = "serve-SmolLM2-vramslots2-ram-small", .kind = .serve, .qwen = false, .input = .{ .serve = .{ .max_sessions = 4, .structural_slots = 4, .batch = 2, .slots_req = 2 } }, .ram_mib = 1300, .want = .{ .refused = .blob_ram } },
-    .{ .name = "serve-SmolLM2-kvvram512", .kind = .serve, .qwen = false, .input = .{ .serve = .{ .max_sessions = 4, .structural_slots = 4, .batch = 2, .kv_vram_bytes = 512 * mib } }, .want = .{ .arm = .{ .tag = .fused, .slots = 4, .window = 2816, .vram_kv_mib = 495, .prefix_mib = 1024, .stages_mib = 247 } } },
-    .{ .name = "serve-SmolLM2-kvvram-tiny", .kind = .serve, .qwen = false, .input = .{ .serve = .{ .max_sessions = 4, .structural_slots = 4, .batch = 2, .kv_vram_bytes = 1 * mib } }, .want = .{ .refused = .kv_vram_small } },
-    .{ .name = "bench-SmolLM2-gl0-force-hybrid", .kind = .bench, .qwen = false, .input = .{ .engine = .{ .gpu_layers = .{ .count = 0 } }, .force_hybrid = true }, .split = 30, .want = .{ .arm = .{ .tag = .hybrid, .slots = 1, .window = 8192, .host_kv_mib = 360 } } },
-    .{ .name = "run-Qwen3.5-range64MiB", .kind = .run, .qwen = true, .input = .{}, .storage_range = 64 << 20, .clamp_window = 65_536, .clamped = true, .want = .{ .arm = .{ .tag = .fused, .slots = 1, .window = 65_536, .vram_kv_mib = 787 } } },
-    .{ .name = "bench-Qwen3.5-glauto", .kind = .bench, .qwen = true, .input = .{ .engine = .{ .gpu_layers = .auto } }, .split = 0, .clamped = true, .want = .{ .refused = .whole_model_split } },
+/// The figures of an arm row, in MiB.
+const ArmWant = struct {
+    tag: device_arm.ArmTag,
+    slots: u32,
+    window: u32,
+    vram_kv_mib: u64 = 0,
+    host_kv_mib: u64 = 0,
+    blobs_mib: u64 = 0,
+    prefix_mib: u64 = 0,
+    stages_mib: u64 = 0,
 };
+
+const DeviceWant = union(enum) { arm: ArmWant, refused: std.meta.Tag(Refusal) };
+
+fn refused(tag: std.meta.Tag(Refusal)) DeviceWant {
+    return .{ .refused = tag };
+}
+
+/// A fused arm of a run or bench boot: the KV lives on the device.
+fn fused(slots: u32, window: u32, vram_kv_mib: u64) DeviceWant {
+    return .{ .arm = .{
+        .tag = .fused,
+        .slots = slots,
+        .window = window,
+        .vram_kv_mib = vram_kv_mib,
+    } };
+}
+
+/// A hybrid arm of a run or bench boot: the KV lives on the host.
+fn hybrid(slots: u32, window: u32, host_kv_mib: u64) DeviceWant {
+    return .{ .arm = .{
+        .tag = .hybrid,
+        .slots = slots,
+        .window = window,
+        .host_kv_mib = host_kv_mib,
+    } };
+}
+
+/// The same arms of a serve boot, which add the prefix and the swap stages.
+fn fusedS(slots: u32, window: u32, vram_kv_mib: u64, prefix_mib: u64, stages_mib: u64) DeviceWant {
+    var w = fused(slots, window, vram_kv_mib);
+    w.arm.prefix_mib = prefix_mib;
+    w.arm.stages_mib = stages_mib;
+    return w;
+}
+
+fn hybridS(slots: u32, window: u32, host_kv_mib: u64, prefix_mib: u64, stages_mib: u64) DeviceWant {
+    var w = hybrid(slots, window, host_kv_mib);
+    w.arm.prefix_mib = prefix_mib;
+    w.arm.stages_mib = stages_mib;
+    return w;
+}
+
+/// An arm that also holds weight blobs in RAM.
+fn blobs(blobs_mib: u64, want: DeviceWant) DeviceWant {
+    var w = want;
+    w.arm.blobs_mib = blobs_mib;
+    return w;
+}
+
+/// The serve input of a device boot: four sessions, a decode width of four.
+fn gpu4(over: anytype) Input {
+    return serveIn(.{ .max_sessions = 4, .structural_slots = 4, .batch = 4 }, over);
+}
+
+const gpu2: Input = gpu4(.{ .max_sessions = 2, .structural_slots = 2, .batch = 2 });
+const pinned16: Input = gpu4(.{
+    .engine = gl6,
+    .max_sessions = 16,
+    .structural_slots = 16,
+    .slots_req = 16,
+});
+const vram_slots2: Input = gpu4(.{ .batch = 2, .slots_req = 2 });
+const kv_vram512: Input = gpu4(.{ .batch = 2, .kv_vram_bytes = 512 * mib });
+const kv_vram1: Input = gpu4(.{ .batch = 2, .kv_vram_bytes = 1 * mib });
+const auto_in: Input = .{ .engine = auto };
+const gl0_in: Input = .{ .engine = gl0 };
+const forced0: Input = .{ .engine = gl0, .force_hybrid = true };
+
+/// Row fields that name the storage range or the VRAM budget of a capture.
+const range_1gib = .{ .storage_range = 1 << 30 };
+const range_64mib = .{ .storage_range = 64 << 20, .clamp_window = 65_536, .clamped = true };
+const tight_vram = .{ .vram_mib = 512, .clamped = true };
+
+/// Rows of one kind and model. A case is a label, an input, a want, and optional row fields.
+fn deviceRows(
+    comptime kind: Kind,
+    comptime model: Model,
+    comptime cases: anytype,
+) [cases.len]DeviceRow {
+    var out: [cases.len]DeviceRow = undefined;
+    inline for (cases, 0..) |c, i| {
+        out[i] = .{
+            .name = @tagName(kind) ++ "-" ++ model.label() ++ "-" ++ c[0],
+            .kind = kind,
+            .qwen = model == .qwen,
+            .input = asInput(c[1]),
+            .want = c[2],
+        };
+        if (c.len == 4) out[i] = overlay(out[i], c[3]);
+    }
+
+    return out;
+}
+
+const device_rows =
+    deviceRows(.run, smollm, .{
+        .{ "default", .{}, fused(1, 8192, 360) },
+        .{ "maxseq512", .{ .engine = seq512 }, fused(1, 512, 22) },
+        .{ "f16", .{ .engine = f16kv }, fused(1, 8192, 180) },
+        .{ "gl6", .{ .engine = gl6 }, hybrid(1, 8192, 288), .{ .split = 24 } },
+        .{ "glauto", auto_in, fused(1, 8192, 360), .{ .split = 0 } },
+        .{ "range1073741824", .{}, fused(1, 8192, 360), range_1gib },
+        .{ "gl31", .{ .engine = gl31 }, refused(.gpu_layers_past_model) },
+    }) ++
+    deviceRows(.serve, smollm, .{
+        .{ "default", gpu4(.{}), fusedS(4, 2816, 495, 1024, 247) },
+        .{ "sessions2", gpu2, fusedS(2, 2816, 247, 1024, 247) },
+        .{ "maxseq1024", gpu4(.{ .engine = seq1024 }), fusedS(4, 1024, 180, 1024, 90) },
+        .{ "kvram64", gpu4(.{ .kv_ram_bytes = 64 * mib }), fusedS(4, 2816, 495, 64, 247) },
+        .{ "kvram1", gpu4(.{ .kv_ram_bytes = 1 * mib }), fusedS(4, 2816, 495, 1, 247) },
+        .{ "f16", gpu4(.{ .engine = f16kv }), fusedS(4, 5632, 495, 1024, 247) },
+        .{ "gl6", gpu4(.{ .engine = gl6 }), hybridS(4, 2816, 396, 1024, 49), .{ .split = 24 } },
+        .{ "glauto", gpu4(.{ .engine = auto }), fusedS(4, 2816, 495, 1024, 247), .{ .split = 0 } },
+        .{ "range1073741824", gpu4(.{}), fusedS(4, 2816, 495, 1024, 247), range_1gib },
+        .{ "gl31", gpu4(.{ .engine = gl31 }), refused(.gpu_layers_past_model) },
+        .{ "gl6-slots-pinned", pinned16, refused(.hybrid_slots) },
+        .{ "vramslots2", vram_slots2, blobs(1080, fusedS(2, 8192, 720, 1024, 512)) },
+        .{ "vramslots2-ram-small", vram_slots2, refused(.blob_ram), .{ .ram_mib = 1300 } },
+        .{ "kvvram512", kv_vram512, fusedS(4, 2816, 495, 1024, 247) },
+        .{ "kvvram-tiny", kv_vram1, refused(.kv_vram_small) },
+    }) ++
+    deviceRows(.bench, smollm, .{
+        .{ "default", .{}, fused(1, 8192, 360) },
+        .{ "maxseq512", .{ .engine = seq512 }, fused(1, 512, 22) },
+        .{ "f16", .{ .engine = f16kv }, fused(1, 8192, 180) },
+        .{ "gl0", gl0_in, refused(.whole_model_split), .{ .split = 30 } },
+        .{ "gl6", .{ .engine = gl6 }, hybrid(1, 8192, 288), .{ .split = 24 } },
+        .{ "glauto", auto_in, refused(.whole_model_split), .{ .split = 0 } },
+        .{ "gl0-force-hybrid", forced0, hybrid(1, 8192, 360), .{ .split = 30 } },
+    }) ++
+    deviceRows(.run, qwen, .{
+        .{ "default", .{}, fused(1, 131072, 1555), .{ .clamped = true } },
+        .{ "maxseq512", .{ .engine = seq512 }, fused(1, 512, 25) },
+        .{ "gl6", .{ .engine = gl6 }, hybrid(1, 131072, 1038), .{ .split = 18, .clamped = true } },
+        .{ "glauto", auto_in, fused(1, 131072, 1555), .{ .split = 0, .clamped = true } },
+        .{ "range1073741824", .{}, fused(1, 174592, 2065), range_1gib },
+        .{ "gl6-vram-small", .{ .engine = gl6 }, refused(.placement_vram), tight_vram },
+        .{ "range64MiB", .{}, fused(1, 65_536, 787), range_64mib },
+    }) ++
+    deviceRows(.serve, qwen, .{
+        .{ "default", gpu4(.{}), fusedS(4, 10752, 581, 1024, 290) },
+        .{ "sessions2", gpu2, fusedS(2, 10752, 290, 1024, 290) },
+        .{ "maxseq1024", gpu4(.{ .engine = seq1024 }), fusedS(4, 1024, 125, 1024, 62) },
+        .{ "kvram64", gpu4(.{ .kv_ram_bytes = 64 * mib }), fusedS(4, 10752, 581, 64, 290) },
+        .{ "kvram1", gpu4(.{ .kv_ram_bytes = 1 * mib }), fusedS(4, 10752, 581, 1, 290) },
+        .{ "gl6", gpu4(.{ .engine = gl6 }), hybridS(4, 10752, 395, 1024, 92), .{ .split = 18 } },
+        .{ "glauto", gpu4(.{ .engine = auto }), fusedS(4, 10752, 581, 1024, 290), .{ .split = 0 } },
+        .{ "range1073741824", gpu4(.{}), fusedS(4, 10752, 581, 1024, 290), range_1gib },
+    }) ++
+    deviceRows(.bench, qwen, .{
+        .{ "default", .{}, fused(1, 131072, 1555), .{ .clamped = true } },
+        .{ "maxseq512", .{ .engine = seq512 }, fused(1, 512, 25) },
+        .{ "range1073741824", .{}, fused(1, 174592, 2065), range_1gib },
+        .{ "gl0", gl0_in, refused(.whole_model_split), .{ .split = 24, .clamped = true } },
+        .{ "gl6", .{ .engine = gl6 }, hybrid(1, 131072, 1038), .{ .split = 18, .clamped = true } },
+        .{ "glauto", auto_in, refused(.whole_model_split), .{ .split = 0, .clamped = true } },
+    });
 
 /// The refusal of a device arm: the arm itself, or the RAM quote of the arm it took.
 fn deviceRefusal(arm: Result(device_arm.Arm)) ?Refusal {

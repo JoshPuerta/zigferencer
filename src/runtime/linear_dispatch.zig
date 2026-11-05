@@ -1,10 +1,15 @@
-//! The batched-linear interface: one function picks the kernel by the weight dtype
-//! and fans the quantized paths across rows. Both CPU runners call it, so the
-//! dtype ladder cannot drift between the two families.
+//! The batched-linear interface: one function picks the kernel by the weight dtype and fans the
+//! quantized paths across rows. Both CPU runners call it, so the dtype ladder cannot drift between
+//! the two families.
 //!
 //! Load gate. A GGUF names each dtype, so a file can name one that no kernel reads.
-//! `requireWeights` refuses such a file at runner init and names the tensor. The step
-//! functions then carry no dtype error, and the dispatch treats any other dtype as unreachable.
+//! `requireWeights` refuses such a file at runner init and names the tensor. The step functions
+//! then carry no dtype error, and the dispatch treats any other dtype as unreachable.
+//!
+//! Fan-out. The quantized paths split rows across CPU threads. The f32 path serves norms, which
+//! are tiny, so it stays serial. The Vulkan backend submits one workgroup grid for the whole
+//! matmul, because N independent submits from a row split lose against one. That backend also
+//! has no q4 or q6_k kernel.
 
 const std = @import("std");
 const builtin = @import("builtin");
@@ -17,11 +22,8 @@ const parallel = @import("parallel.zig");
 const Pool = @import("pool.zig").Pool;
 const tensor_lookup = @import("tensor_lookup.zig");
 
-/// Backend selected at build time by `-Dops-backend=naive|simd|simd_pf|vulkan|auto`.
-/// The default is `auto`, which picks the strongest eligible CPU variant. The
-/// `vulkan` backend needs `-Druntime=vulkan`. It wraps the GPU kernels behind
-/// the same op API. On any other GPU build the CPU runners ride along as CPU
-/// capability, so this interface takes the `cpu_ops` variant the build resolved.
+/// The backend that `-Dops-backend` selected. On a GPU build without the `vulkan` backend, the CPU
+/// runners take the `cpu_ops` variant the build resolved.
 const ops = if (build_options.use_vulkan_ops)
     @import("../ops_vulkan/wrap.zig")
 else if (build_options.cpu_ops_simd_pf)
@@ -123,11 +125,8 @@ pub fn requireWeights(
     return error.UnsupportedWeightDtype;
 }
 
-/// Dispatch the right batched linear kernel by weight dtype, with optional
-/// row-parallel fan-out for the quantized paths. Shared by the two CPU
-/// runners so the dtype ladder cannot drift. The f32 path is for norms
-/// (tiny tensors), which are not worth parallelizing. The kernel writes
-/// `outs` rows at stride `w.shape[1]`. `requireWeights` proves the dtype at runner init.
+/// Dispatch the batched linear kernel for the weight dtype. The kernel writes `outs` rows at
+/// stride `w.shape[1]`. `requireWeights` proves the dtype at runner init.
 pub fn linearBatchDispatch(
     pool: *Pool,
     policy: parallel.Policy,
@@ -139,25 +138,23 @@ pub fn linearBatchDispatch(
     switch (w.dtype) {
         .f32 => ops.linearF32Batch(inputs, w, outs, batch, @intCast(w.shape[1])),
         .q8_0 => if (comptime build_options.use_vulkan_ops) {
-            // GPU dispatches the whole matmul as one workgroup grid. A row
-            // split across CPU threads issues N independent submits, which
-            // strictly loses against one submit.
+            // One submit for the whole matmul. The header explains the fan-out.
             ops.linearF32Q80Batch(inputs, w, outs, batch, @intCast(w.shape[1]));
         } else {
             parallel.linearBatch(pool, policy, ops.linearF32Q80Batch, inputs, w, outs, batch);
         },
         .q4_0 => if (comptime build_options.use_vulkan_ops) {
-            unreachable; // GPU per-op backend has no q4 kernel
+            unreachable; // The Vulkan backend has no q4 kernel.
         } else {
             parallel.linearBatch(pool, policy, ops.linearF32Q40Batch, inputs, w, outs, batch);
         },
         .q4_1 => if (comptime build_options.use_vulkan_ops) {
-            unreachable; // GPU per-op backend has no q4 kernel
+            unreachable; // The Vulkan backend has no q4 kernel.
         } else {
             parallel.linearBatch(pool, policy, ops.linearF32Q41Batch, inputs, w, outs, batch);
         },
         .q6_k => if (comptime build_options.use_vulkan_ops) {
-            unreachable; // GPU per-op backend has no q6_k kernel
+            unreachable; // The Vulkan backend has no q6_k kernel.
         } else {
             parallel.linearBatch(pool, policy, ops.linearF32Q6KBatch, inputs, w, outs, batch);
         },

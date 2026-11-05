@@ -1,10 +1,9 @@
-//! The wire format between the serve layer and a client, and the document a
-//! client implementer reads. The frames are binary and little-endian
-//! throughout, and they do not depend on a transport. A ZMQ message
-//! carries one frame. The server speaks ZMTP 3.x with the NULL security
+//! The wire format between the serve layer and a client, and the document a client implementer
+//! reads. The frames are binary and little-endian throughout, and they do not depend on a
+//! transport. A ZMQ message carries one frame. The server uses ZMTP 3.x with the NULL security
 //! method, and a DEALER socket is the client.
 //!
-//! One frame = a 20-byte header + payload:
+//! Frame. One frame is a 20-byte header and a payload:
 //!
 //!     off  field        type  rule
 //!     0    magic        u32   0x4647495A ("ZIGF" read as bytes)
@@ -14,19 +13,63 @@
 //!     12   session_id   u32   0 = server scope, otherwise a live session id
 //!     16   payload_len  u32   <= max_frame_payload_bytes
 //!
-//! This module is pure. It imports no I/O and it allocates nothing. Decoded
-//! messages BORROW their text slices from the payload buffer, and the caller
-//! copies what it keeps. Every decode checks every length, and a payload must
-//! be consumed exactly. Trailing bytes are malformed. The socket is a trust
-//! boundary, and these checks are its guards. A decode never panics on input.
-//! It returns a typed error the connection layer maps to an `error` frame.
+//! Trust boundary. This module is pure: it imports no I/O and allocates nothing. Decoded
+//! messages BORROW their text slices from the payload buffer, and the caller copies what it
+//! keeps. Every decode checks every length and consumes the payload exactly, so trailing bytes
+//! are malformed. A decode never panics on input. It returns a typed error that the connection
+//! layer maps to an `error` frame.
 //!
-//! One rule every client must implement: `token.text` is RAW BYTES. One token
-//! can be a partial UTF-8 sequence. The concatenation of a turn's token texts
-//! is well-formed. Buffer the bytes until they are displayable.
+//! Token text. One rule every client must implement: `token.text` is RAW BYTES. One token can be
+//! a partial UTF-8 sequence. The concatenation of a turn's token texts is well-formed. Buffer the
+//! bytes until they are displayable.
 //!
-//! `serve/README.md` names the client method and the terminal message of every
-//! verb, and the ZMTP carrier under it.
+//! Sampling block. 36 bytes. The fields mirror `runtime/sampler.Params` plus the explicit seed:
+//!
+//!     off  field               type  rule
+//!     0    temperature         f32   finite, >= 0. 0 is greedy.
+//!     4    top_k               u32   <= limits.max_top_k. 0 is no cap.
+//!     8    top_p               f32   in (0, 1]
+//!     12   seed                u64   any
+//!     20   presence_penalty    f32   in [-2, 2]. 0 is the identity.
+//!     24   frequency_penalty   f32   in [-2, 2]. A nonzero value fails the request with
+//!                                    `forbidden`, because the server has no frequency penalty.
+//!                                    The connection lives, and the server never drops the value.
+//!     28   repetition_penalty  f32   in (0, limits.max_repetition_penalty]. 1 is the identity.
+//!     32   min_p               f32   in [0, 1]. 0 is the identity.
+//!
+//! Generate payload. `max_tokens`, the flags byte, the sampling block when bit 0 is set, a u32
+//! think budget when bit 3 is set, then the text. Bit 1 says that the request carries a think
+//! switch, and bit 2 is its value. Bit 2 is legal only with bit 1, bit 4 only with bit 0, and
+//! bits 5 to 7 are refused. A budget of 0 is unbounded, as in `hello_ack`. A switch that opens the
+//! block, or a budget, on a model with no think tags fails the request. Bit 4 restarts the
+//! sampling stream of the session at the seed of the sampling block. Without bit 4 the server
+//! ignores that seed, and the stream continues.
+//!
+//! Session verbs. `serve/README.md` names the reply and the errors of `session_keep` and
+//! `session_resume`. The two other verbs fail like this:
+//!
+//!     session_clone   Fork the session in `header.session_id`. The new session shares the whole
+//!                     context, samples with its own sampling and seed, and replies
+//!                     `session_opened` with the NEW id. Errors: `unknown_session`,
+//!                     `session_busy` (source mid-turn), `sessions_exhausted`, `internal`.
+//!     session_append  Feed kept (user, assistant) pairs into an idle session, rendered with the
+//!                     wraps of a live turn. Reply: `appended`. Errors: `unknown_session`,
+//!                     `session_busy`, `turn_too_long` (no pair fed), `cancelled`, `internal`.
+//!
+//! Resumed reply. 38 bytes of payload:
+//!
+//!     off  field             type     rule
+//!     0    token             [16]u8   the new token, not all zero
+//!     16   kv_pos            u32      the final position of the session
+//!     20   turns_done        u32      the finished turns and kept pairs
+//!     24   has_last          u8       0 or 1
+//!     25   last_request_id   u32      0 when has_last is 0
+//!     29   finish            u8       a FinishReason, 0 when has_last is 0
+//!     30   gen_tokens        u32      0 when has_last is 0
+//!     34   reasoning_tokens  u32      0 when has_last is 0
+//!
+//! Kept reply. 40 bytes: the granted time to live, then the token. See `serve/README.md` for the
+//! grant rules, the client method, and the terminal message of every verb.
 
 const std = @import("std");
 const limits = @import("../core/limits.zig");
@@ -38,10 +81,8 @@ pub const magic: u32 = 0x4647495A;
 pub const protocol_version: u16 = 3;
 pub const header_bytes: usize = 20;
 
-/// Hard cap on a frame payload. A system prompt or turn beyond 64 KiB of UTF-8
-/// is outside the serving use case. This is a boundary guard, not a growth
-/// path. This one *is* a wire-format fact, so it stays with the framing. The
-/// piece and model-name bounds are serve bounds and live in `core/limits.zig`.
+/// Hard cap on a frame payload. A system prompt or turn beyond 64 KiB of UTF-8 is outside the
+/// serving use case. The piece and model-name bounds live in `core/limits.zig`.
 pub const max_frame_payload_bytes: u32 = 64 * 1024;
 
 /// The largest system prompt that one `session_open` frame carries. The
@@ -56,26 +97,20 @@ comptime {
     std.debug.assert(clientFrameLen(open) == header_bytes + max_frame_payload_bytes);
 }
 
-/// The detail texts of a `turn_too_long` refusal. They live with the wire
-/// because a client reads the numbers back from the detail.
+/// The detail texts of a `turn_too_long` refusal. A client reads the numbers back from them.
 pub const turn_too_long_fmt = "turn of {d} tokens, {d} positions left";
 
 pub const system_too_long_fmt = "system prompt of {d} tokens, window of {d} positions";
 
-/// The largest frame the server encodes. A `token` payload is the largest:
-/// 4 bytes of token id, 1 of channel, 2 of text length, and at most
-/// `limits.max_token_text_bytes` of text. The frame is then 20 + 4 + 1 + 2 +
-/// 256 = 283 bytes. A `hello_ack` payload holds at most 101 + 64 bytes, and an
-/// `appended` payload at most 2 + 4 * `limits.max_append_pairs`. The server
-/// caps an `err` detail at 64 bytes, so an `err` payload holds at most 4 + 64.
-/// A `kept` frame is 40 bytes and a `resumed` frame is 58 bytes.
+/// The largest frame the server encodes: a `token` frame, 20 + 4 + 1 + 2 + 256 = 283 bytes.
+/// The other frames fit under it: `hello_ack` 20 + 165, `appended` 20 + 2 + 4 * max pairs,
+/// `err` 20 + 4 + 64, `kept` 40, and `resumed` 58.
 pub const max_server_frame_bytes: usize = header_bytes + 4 + 1 + 2 + limits.max_token_text_bytes;
 
 /// The bytes of a lease token on the wire.
 pub const token_bytes: usize = 16;
 
-/// The flag bits of a `generate` payload. Bit 2 is legal only with bit 1,
-/// bit 4 only with bit 0, and bits 5 to 7 are refused.
+/// The flag bits of a `generate` payload. See "Generate payload" in the header.
 const generate_flag_sampling: u8 = 1 << 0;
 
 const generate_flag_think_switch: u8 = 1 << 1;
@@ -84,12 +119,11 @@ const generate_flag_think_budget: u8 = 1 << 3;
 const generate_flag_reseed: u8 = 1 << 4;
 const generate_flags_known: u8 = 0x1F;
 
-/// The bytes of a `generate` payload outside its text: `max_tokens`, the
-/// flags, the sampling block, the budget, and the text length.
+/// The bytes of a `generate` payload outside its text: count, flags, sampling, budget, length.
 const generate_fixed_bytes_max: usize = 4 + 1 + Sampling.wire_bytes + 4 + 4;
 
-/// The longest text that one `generate` frame carries with every optional
-/// field present. A client refuses a longer text before it encodes.
+/// The longest text of one `generate` frame with every optional field present.
+/// A client refuses a longer text before it encodes.
 pub const generate_text_bytes_max: usize = max_frame_payload_bytes - generate_fixed_bytes_max;
 
 /// The pair record bytes of one `session_append` payload, after the u16 count.
@@ -102,13 +136,11 @@ comptime {
     std.debug.assert(
         header_bytes + 2 + 4 * @as(usize, limits.max_append_pairs) <= max_server_frame_bytes,
     );
-    // A pair costs at least its two length fields, so one frame cannot name
-    // more pairs than this.
+    // A pair costs at least its two length fields, so one frame cannot name more pairs.
     std.debug.assert(limits.max_append_pairs <= append_pairs_bytes_max / pair_overhead_bytes);
 }
 
-/// The detail of the refusal of a nonzero frequency penalty. The decoder
-/// accepts the value in range, and the server refuses the request.
+/// The detail of the refusal of a nonzero frequency penalty. The decoder accepts the value.
 pub const frequency_unsupported_detail = "frequency_penalty is not supported";
 
 /// The OpenAI range of the frequency penalty is the presence range, [-2, 2].
@@ -206,8 +238,8 @@ pub const Header = struct {
     payload_len: u32,
 };
 
-/// Codes 1-4 are fatal to the connection (the server replies, flushes, and
-/// closes). Codes 5-12 fail the request, and the connection lives.
+/// Codes 1-4 are fatal to the connection: the server replies, flushes, and closes.
+/// Codes 5-12 fail the request, and the connection lives.
 pub const ErrorCode = enum(u16) {
     malformed_frame = 1,
     unsupported_version = 2,
@@ -219,12 +251,9 @@ pub const ErrorCode = enum(u16) {
     turn_too_long = 8,
     connections_exhausted = 9,
     internal = 10,
-    /// The request is valid but this server refuses it. The cause is a server
-    /// policy, such as a `shutdown` that the operator did not allow, or a
-    /// request field that the model or the engine does not support.
+    /// A valid request that server policy or the model refuses, such as a barred `shutdown`.
     forbidden = 11,
-    /// A cancel stopped a `session_append` before its last pair. The rows
-    /// already fed stay in the session, so the client closes it.
+    /// A cancel stopped a `session_append` early. The fed rows stay, so the client closes it.
     cancelled = 12,
 };
 
@@ -235,24 +264,7 @@ pub const FinishReason = enum(u8) {
     cancelled = 3,
 };
 
-/// Sampling settings on the wire, 36 bytes:
-///
-///     off  field               type  rule
-///     0    temperature         f32   finite, >= 0. 0 is greedy.
-///     4    top_k               u32   <= limits.max_top_k. 0 is no cap.
-///     8    top_p               f32   in (0, 1]
-///     12   seed                u64   any
-///     20   presence_penalty    f32   in [-2, 2]. 0 is the identity.
-///     24   frequency_penalty   f32   in [-2, 2]. The server has no
-///                                    frequency penalty yet. A request
-///                                    with a nonzero value fails with
-///                                    `forbidden`, and the connection
-///                                    lives. The server never drops it.
-///     28   repetition_penalty  f32   in (0, limits.max_repetition_penalty].
-///                                    1 is the identity.
-///     32   min_p               f32   in [0, 1]. 0 is the identity.
-///
-/// The fields mirror `runtime/sampler.Params` plus the explicit seed.
+/// Sampling settings on the wire. See "Sampling block" in the header.
 pub const Sampling = struct {
     temperature: f32,
     top_k: u32,
@@ -275,17 +287,7 @@ pub const LastDone = struct {
     reasoning_tokens: u32,
 };
 
-/// The reply to a `session_resume`, 38 bytes of payload:
-///
-///     off  field             type     rule
-///     0    token             [16]u8   the new token, not all zero
-///     16   kv_pos            u32      the final position of the session
-///     20   turns_done        u32      the finished turns and kept pairs
-///     24   has_last          u8       0 or 1
-///     25   last_request_id   u32      0 when has_last is 0
-///     29   finish            u8       a FinishReason, 0 when has_last is 0
-///     30   gen_tokens        u32      0 when has_last is 0
-///     34   reasoning_tokens  u32      0 when has_last is 0
+/// The reply to a `session_resume`. See "Resumed reply" in the header.
 pub const Resumed = struct {
     token: Token,
     kv_pos: u32,
@@ -295,8 +297,8 @@ pub const Resumed = struct {
     pub const wire_bytes: usize = token_bytes + 4 + 4 + 1 + 4 + 1 + 4 + 4;
 };
 
-/// What one streamed token is. A tag keeps its text, so a client that ignores
-/// the channel prints the same bytes.
+/// What one streamed token is. A tag keeps its text, so a client that ignores the channel prints
+/// the same bytes.
 pub const Channel = enum(u8) {
     content = 0,
     reasoning = 1,
@@ -314,9 +316,8 @@ pub const ThinkMode = enum(u8) {
 /// One kept (user, assistant) pair of a `session_append`.
 pub const Pair = struct { user: []const u8, assistant: []const u8 };
 
-/// The pairs of a `session_append` frame. `bytes` holds `n` records of
-/// `u32 ulen, user, u32 alen, assistant`. The decoder checks every length
-/// before it makes this value, so `iterator` trusts them.
+/// The pairs of a `session_append` frame. `bytes` holds `n` records of `u32 ulen, user, u32 alen,
+/// assistant`. The decoder checks every length first, so `iterator` trusts them.
 pub const AppendPairs = struct {
     n: u16,
     bytes: []const u8,
@@ -372,14 +373,7 @@ pub const Appended = struct {
 pub const ClientMsg = union(enum) {
     hello,
     session_open: struct { sampling: Sampling, system_prompt: []const u8 },
-    /// `max_tokens`, the flags byte, the sampling block when bit 0 is set,
-    /// a u32 think budget when bit 3 is set, then the text. Bit 1 says that
-    /// the request carries a think switch, and bit 2 is its value. A budget
-    /// of 0 is unbounded, the `hello_ack` encoding. A switch that opens the
-    /// block or a budget on a model with no think tags fails the request.
-    /// Bit 4 restarts the sampling stream of the session at the seed of the
-    /// sampling block. Without bit 4 the server ignores that seed, and the
-    /// stream continues.
+    /// See "Generate payload" in the header.
     generate: struct {
         max_tokens: u32,
         sampling: ?Sampling,
@@ -393,29 +387,13 @@ pub const ClientMsg = union(enum) {
     stats,
     ping,
     shutdown,
-    /// Fork the session in `header.session_id`. The new session shares its
-    /// whole context (system prompt + conversation so far) but samples with
-    /// its own sampling + seed. One prefilled prefix serves many divergent
-    /// sessions.
-    /// Reply is `session_opened` whose header carries the NEW session's id.
-    /// Errors: `unknown_session`, `session_busy` (source mid-turn),
-    /// `sessions_exhausted`, `internal` (backend cannot copy slot state).
+    /// Fork the session in `header.session_id`. See "Session verbs" in the header.
     session_clone: struct { sampling: Sampling },
-    /// Feed kept (user, assistant) pairs into an idle session. The server
-    /// renders each pair with the wraps of a live turn. Reply is `appended`.
-    /// Errors: `unknown_session`, `session_busy`, `turn_too_long` (no pair
-    /// fed), `cancelled`, `internal`.
+    /// Feed kept pairs into an idle session. See "Session verbs" in the header.
     session_append: AppendPairs,
-    /// Keep the session in `header.session_id` past a drop of this
-    /// connection for at most `ttl_ms`. A `ttl_ms` of 0 drops the lease.
-    /// Reply is `kept`. Errors: `unknown_session`, `forbidden` (resumption
-    /// off and `ttl_ms` > 0), `session_busy` (a resume in flight),
-    /// `internal` (no secure random source).
+    /// Keep the session past a connection drop for `ttl_ms`. See "Session verbs" in the header.
     session_keep: struct { ttl_ms: u32 },
-    /// Attach the session of `token` to this connection. The header session
-    /// id must be 0, and any other id is malformed. Reply is `resumed`, sent when the session is
-    /// idle. Errors:
-    /// `unknown_session` (no such lease), `sessions_exhausted`, `internal`.
+    /// Attach the session of `token` to this connection. See "Session verbs" in the header.
     session_resume: struct { token: Token },
 };
 
@@ -432,9 +410,8 @@ pub const ServerMsg = union(enum) {
         think_budget: u32,
         /// The longest lease a `session_keep` gets. 0 is resumption off.
         resume_ttl_max_ms: u32,
-        /// The sampling the model card recommends for a turn inside the
-        /// think block and for a turn outside it, or greedy for a model with
-        /// no entry.
+        /// The sampling that the model card recommends inside and outside the think block.
+        /// A model with no entry gets greedy.
         recommended_think: Sampling,
         recommended_plain: Sampling,
         model_name: []const u8,
@@ -462,9 +439,7 @@ pub const ServerMsg = union(enum) {
     session_closed,
     shutdown_ack,
     appended: Appended,
-    /// The granted time to live, then the token. A grant of 0 drops the
-    /// lease and carries 16 zero bytes. A positive grant carries a token
-    /// that is not all zero. The frame is 40 bytes either way.
+    /// The granted time to live, then the token. See "Kept reply" in the header.
     kept: struct { granted_ms: u32, token: Token },
     resumed: Resumed,
 };
@@ -477,9 +452,8 @@ pub const DecodeError = error{
     PayloadMalformed,
 };
 
-/// Bounds-checked little-endian reader over a payload. A `take` past the end
-/// returns `PayloadMalformed`. `expectDone` rejects trailing bytes, so a frame
-/// parses exactly or not at all.
+/// Bounds-checked little-endian reader over a payload. A `take` past the end returns
+/// `PayloadMalformed`, and `expectDone` rejects trailing bytes.
 const Cursor = struct {
     buf: []const u8,
     i: usize = 0,
@@ -508,9 +482,8 @@ const Cursor = struct {
     }
 };
 
-/// Asserting little-endian writer. The server owns every encode buffer and
-/// sizes it with `clientFrameLen` or `serverFrameLen`, so an overflow is a
-/// programmer error and not a runtime one.
+/// Asserting little-endian writer. The caller sizes the buffer with `clientFrameLen` or
+/// `serverFrameLen`, so an overflow is a programmer error.
 const Writer = struct {
     buf: []u8,
     i: usize = 0,
@@ -546,8 +519,7 @@ pub fn decodeHeader(bytes: *const [header_bytes]u8) DecodeError!Header {
     if (payload_len > max_frame_payload_bytes) return error.FrameTooLarge;
 
     const session_id = std.mem.readInt(u32, bytes[12..16], .little);
-    // A resume names its session by the token alone, so a header id is a
-    // client fault and not a second key.
+    // A resume names its session by the token alone, so a header id is a client fault.
     if (msg_type == .session_resume and session_id != 0) return error.PayloadMalformed;
 
     return .{
@@ -562,6 +534,7 @@ pub fn decodeHeader(bytes: *const [header_bytes]u8) DecodeError!Header {
 pub fn decodeClientPayload(t: MsgType, payload: []const u8) DecodeError!ClientMsg {
     var c: Cursor = .{ .buf = payload };
     const msg: ClientMsg = switch (t) {
+        // Messages with no payload, then the fixed shapes.
         .hello => .hello,
         .cancel => .cancel,
         .session_close => .session_close,
@@ -576,11 +549,13 @@ pub fn decodeClientPayload(t: MsgType, payload: []const u8) DecodeError!ClientMs
         .session_append => .{ .session_append = try takeAppendPairs(&c) },
         .session_keep => .{ .session_keep = .{ .ttl_ms = try c.take(u32) } },
         .session_resume => blk: {
+            // A zero token names no lease.
             const token = try takeToken(&c);
             if (std.mem.allEqual(u8, &token, 0)) return error.PayloadMalformed;
             break :blk .{ .session_resume = .{ .token = token } };
         },
         .generate => blk: {
+            // Read the count and the flags, and refuse an illegal pair of bits.
             const max_tokens = try c.take(u32);
             if (max_tokens == 0) return error.PayloadMalformed;
 
@@ -594,6 +569,7 @@ pub fn decodeClientPayload(t: MsgType, payload: []const u8) DecodeError!ClientMs
             const reseed = flags & generate_flag_reseed != 0;
             if (reseed and flags & generate_flag_sampling == 0) return error.PayloadMalformed;
 
+            // Read the optional fields that the flags announce.
             const sampling: ?Sampling = if (flags & generate_flag_sampling != 0) try takeSampling(
                 &c,
             ) else null;
@@ -606,6 +582,7 @@ pub fn decodeClientPayload(t: MsgType, payload: []const u8) DecodeError!ClientMs
                 if (b > limits.max_model_ctx) return error.PayloadMalformed;
             }
 
+            // Read the text, which ends the payload.
             const text = try c.takeSlice(try c.take(u32));
             break :blk .{ .generate = .{
                 .max_tokens = max_tokens,
@@ -623,15 +600,17 @@ pub fn decodeClientPayload(t: MsgType, payload: []const u8) DecodeError!ClientMs
     return msg;
 }
 
-/// Decode a server-direction payload (the reference client and the round-trip
-/// tests). Slices borrow from `payload`.
+/// Decode a server-direction payload, for the reference client and the tests.
+/// Slices borrow from `payload`.
 pub fn decodeServerPayload(t: MsgType, payload: []const u8) DecodeError!ServerMsg {
     var c: Cursor = .{ .buf = payload };
     const msg: ServerMsg = switch (t) {
+        // Messages with no payload, then the fixed shapes.
         .pong => .pong,
         .session_closed => .session_closed,
         .shutdown_ack => .shutdown_ack,
         .hello_ack => blk: {
+            // Read the limits and the think mode.
             const ver = try c.take(u16);
             const max_seq = try c.take(u32);
             const max_sessions = try c.take(u16);
@@ -646,6 +625,7 @@ pub fn decodeServerPayload(t: MsgType, payload: []const u8) DecodeError!ServerMs
             const resume_ttl_max_ms = try c.take(u32);
             if (resume_ttl_max_ms > limits.max_resume_ttl_ms) return error.PayloadMalformed;
 
+            // Read the recommended sampling and the model name.
             const recommended_think = try takeSampling(&c);
             const recommended_plain = try takeSampling(&c);
             const name = try c.takeSlice(try c.take(u16));
@@ -706,6 +686,7 @@ pub fn decodeServerPayload(t: MsgType, payload: []const u8) DecodeError!ServerMs
         } },
         .appended => .{ .appended = try takeAppended(&c) },
         .kept => blk: {
+            // A zero grant carries a zero token, and a positive grant carries a live token.
             const granted = try c.take(u32);
             const token = try takeToken(&c);
             if (granted > limits.max_resume_ttl_ms) return error.PayloadMalformed;
@@ -721,12 +702,12 @@ pub fn decodeServerPayload(t: MsgType, payload: []const u8) DecodeError!ServerMs
     return msg;
 }
 
-/// Encode header + payload into `out`. Returns the frame's total byte length.
-/// `out` must hold the whole frame, which an assert checks. Size it with
-/// `clientFrameLen`.
+/// Encode header and payload into `out`, and return the frame length.
+/// `out` must hold the whole frame. Size it with `clientFrameLen`.
 pub fn encodeClientMsg(msg: ClientMsg, request_id: u32, session_id: u32, out: []u8) usize {
     std.debug.assert(out.len >= clientFrameLen(msg));
 
+    // Write the payload after the header slot.
     var w: Writer = .{ .buf = out[header_bytes..] };
     switch (msg) {
         .hello, .cancel, .session_close, .stats, .ping, .shutdown => {},
@@ -744,11 +725,13 @@ pub fn encodeClientMsg(msg: ClientMsg, request_id: u32, session_id: u32, out: []
             w.putSlice(m.bytes);
         },
         .generate => |m| {
+            // Assert the fields that the decoder refuses.
             std.debug.assert(m.max_tokens > 0);
 
             if (m.think_budget) |b| std.debug.assert(b <= limits.max_model_ctx);
             if (m.reseed) std.debug.assert(m.sampling != null);
 
+            // Write the count, the flags, and the optional fields in flag order.
             std.debug.assert(m.text.len <= generate_text_bytes_max);
             w.put(u32, m.max_tokens);
             w.put(
@@ -774,6 +757,7 @@ pub fn encodeClientMsg(msg: ClientMsg, request_id: u32, session_id: u32, out: []
         },
     }
 
+    // Write the header over the payload size.
     encodeHeader(.{
         .msg_type = clientMsgType(msg),
         .request_id = request_id,
@@ -786,6 +770,7 @@ pub fn encodeClientMsg(msg: ClientMsg, request_id: u32, session_id: u32, out: []
 pub fn encodeServerMsg(msg: ServerMsg, request_id: u32, session_id: u32, out: []u8) usize {
     std.debug.assert(out.len >= serverFrameLen(msg));
 
+    // Write the payload after the header slot.
     var w: Writer = .{ .buf = out[header_bytes..] };
     switch (msg) {
         .pong, .session_closed, .shutdown_ack => {},
@@ -854,6 +839,7 @@ pub fn encodeServerMsg(msg: ServerMsg, request_id: u32, session_id: u32, out: []
         .resumed => |m| putResumed(&w, m),
     }
 
+    // Write the header over the payload size.
     encodeHeader(.{
         .msg_type = serverMsgType(msg),
         .request_id = request_id,
@@ -979,9 +965,8 @@ fn takeSampling(c: *Cursor) DecodeError!Sampling {
         .repetition_penalty = try c.take(f32),
         .min_p = try c.take(f32),
     };
-    // Value guards live here, at the trust boundary, so the sampler's asserts
-    // can never fire on remote input. A NaN fails every comparison, so each
-    // guard reads as the range that it accepts.
+    // Guard the values at the trust boundary, so a sampler assert cannot fire on remote input.
+    // A NaN fails every comparison, so each guard reads as the range that it accepts.
     if (!std.math.isFinite(s.temperature) or s.temperature < 0) return error.PayloadMalformed;
     if (!std.math.isFinite(s.top_p) or s.top_p <= 0 or s.top_p > 1) return error.PayloadMalformed;
     if (s.top_k > limits.max_top_k) return error.PayloadMalformed;
@@ -1003,8 +988,8 @@ fn takeToken(c: *Cursor) DecodeError!Token {
     return (try c.takeSlice(token_bytes))[0..token_bytes].*;
 }
 
-/// The token must not be all zero, and a reply with no last request holds
-/// zeros in its four fields, so one reply has one encoding.
+/// The token must not be all zero. A reply with no last request holds zeros in its four fields,
+/// so one reply has one encoding.
 fn takeResumed(c: *Cursor) DecodeError!Resumed {
     const token = try takeToken(c);
     if (std.mem.allEqual(u8, &token, 0)) return error.PayloadMalformed;
@@ -1083,8 +1068,8 @@ fn generateFlags(sampling: bool, think_open: ?bool, budget: bool, reseed: bool) 
     return flags;
 }
 
-/// The pair count, then each record. Every length must fit the payload, and
-/// the payload must end at the last record.
+/// The pair count, then each record. Every length must fit the payload, and the payload must end
+/// at the last record.
 fn takeAppendPairs(c: *Cursor) DecodeError!AppendPairs {
     const n = try c.take(u16);
     if (n == 0 or n > limits.max_append_pairs) return error.PayloadMalformed;
@@ -1181,12 +1166,17 @@ test "round-trip: every client message" {
         },
     } }, 10, 7);
     // Every combination of the generate flags round trips.
+    const sampled: Sampling = .{
+        .temperature = 0.7,
+        .top_k = 40,
+        .top_p = 0.8,
+        .seed = 9,
+        .min_p = 1,
+        .repetition_penalty = 2,
+    };
     for ([_]?bool{ null, false, true }) |think_open| {
         for ([_]?u32{ null, 0, 512, limits.max_model_ctx }) |think_budget| {
-            for ([_]?Sampling{
-                null,
-                .{ .temperature = 0.7, .top_k = 40, .top_p = 0.8, .seed = 9, .min_p = 1, .repetition_penalty = 2 },
-            }) |sampling| {
+            for ([_]?Sampling{ null, sampled }) |sampling| {
                 try roundTripClient(.{ .generate = .{
                     .max_tokens = 5,
                     .sampling = sampling,
@@ -1386,12 +1376,14 @@ fn f32le(v: f32) [4]u8 {
 /// give the exact error. An accepted frame must encode back to its own bytes,
 /// so the decoder drops no field and reads none twice.
 fn checkGuard(c: GuardCase) !void {
+    // Encode the message.
     var buf: [512]u8 = undefined;
     var end = switch (c.msg) {
         .client => |m| encodeClientMsg(m, 1, c.session_id, &buf),
         .server => |m| encodeServerMsg(m, 1, c.session_id, &buf),
     };
 
+    // Apply the patches.
     try std.testing.expectEqual(protocol_version, std.mem.readInt(u16, buf[4..6], .little));
     for (c.patches) |patch| {
         switch (patch) {
@@ -1414,6 +1406,7 @@ fn checkGuard(c: GuardCase) !void {
         return;
     }
 
+    // Decode the payload, then check the round trip.
     const payload = buf[header_bytes..end];
     var again: [512]u8 = undefined;
     switch (c.msg) {
@@ -1438,17 +1431,115 @@ fn setAt(comptime at: usize, comptime bytes: []const u8) []const Patch {
     return &.{.{ .set = .{ .at = at, .bytes = bytes } }};
 }
 
+fn setU16(comptime at: usize, comptime v: u16) []const Patch {
+    return setAt(at, &le(u16, v));
+}
+
+fn setU32(comptime at: usize, comptime v: u32) []const Patch {
+    return setAt(at, &le(u32, v));
+}
+
+fn setByte(comptime at: usize, comptime v: u8) []const Patch {
+    return setAt(at, &.{v});
+}
+
+fn zeroFrom(comptime at: usize) []const Patch {
+    return &.{.{ .zero_from = at }};
+}
+
+fn shorten(comptime n: usize) []const Patch {
+    return &.{.{ .shorten = n }};
+}
+
+fn extend(comptime n: usize) []const Patch {
+    return &.{.{ .extend = n }};
+}
+
+fn guardAt(
+    comptime name: []const u8,
+    session_id: u32,
+    msg: GuardMsg,
+    comptime patches: []const Patch,
+    want: ?DecodeError,
+) GuardCase {
+    return .{
+        .name = name,
+        .msg = msg,
+        .session_id = session_id,
+        .patches = patches,
+        .want = want,
+    };
+}
+
+fn guard(
+    comptime name: []const u8,
+    msg: GuardMsg,
+    comptime patches: []const Patch,
+    want: ?DecodeError,
+) GuardCase {
+    return guardAt(name, 1, msg, patches, want);
+}
+
+fn headerFor(
+    comptime name: []const u8,
+    session_id: u32,
+    msg: GuardMsg,
+    comptime patches: []const Patch,
+    want: ?DecodeError,
+) GuardCase {
+    var c = guardAt(name, session_id, msg, patches, want);
+    c.header_only = true;
+    return c;
+}
+
+fn header(
+    comptime name: []const u8,
+    comptime patches: []const Patch,
+    want: ?DecodeError,
+) GuardCase {
+    return headerFor(name, 1, ping_msg, patches, want);
+}
+
+fn decodeAs(comptime name: []const u8, msg: GuardMsg, as: MsgType, want: DecodeError) GuardCase {
+    var c = guard(name, msg, &.{}, want);
+    c.decode_as = as;
+    return c;
+}
+
 const gen_x: GuardMsg = .{
     .client = .{ .generate = .{ .max_tokens = 4, .sampling = null, .text = "x" } },
 };
 const open_greedy: GuardMsg = .{
     .client = .{ .session_open = .{ .sampling = Sampling.greedy, .system_prompt = "" } },
 };
+const open_p: GuardMsg = .{
+    .client = .{ .session_open = .{ .sampling = Sampling.greedy, .system_prompt = "p" } },
+};
 const ping_msg: GuardMsg = .{ .client = .ping };
+const pong_msg: GuardMsg = .{ .server = .pong };
 const flags_at = header_bytes + 4;
+const after_flags_at = header_bytes + 5;
 const frequency_at = header_bytes + 24;
 const repetition_at = header_bytes + 28;
 const min_p_at = header_bytes + 32;
+const think_switch_open = generate_flag_think_switch | generate_flag_think_open;
+const budget_past = limits.max_model_ctx + 1;
+const ttl_past = limits.max_resume_ttl_ms + 1;
+const pairs_past = limits.max_append_pairs + 1;
+const error_code_past = @intFromEnum(ErrorCode.cancelled) + 1;
+
+fn genFlags(comptime name: []const u8, comptime flags: u8, want: ?DecodeError) GuardCase {
+    return guard(name, gen_x, setByte(flags_at, flags), want);
+}
+
+fn genWith(sampling: ?Sampling, reseed: bool) GuardMsg {
+    return .{ .client = .{ .generate = .{
+        .max_tokens = 4,
+        .sampling = sampling,
+        .text = "x",
+        .reseed = reseed,
+    } } };
+}
 
 fn samplingGuard(
     comptime name: []const u8,
@@ -1456,7 +1547,7 @@ fn samplingGuard(
     comptime v: f32,
     want: ?DecodeError,
 ) GuardCase {
-    return .{ .name = name, .msg = open_greedy, .patches = setAt(at, &f32le(v)), .want = want };
+    return guard(name, open_greedy, setAt(at, &f32le(v)), want);
 }
 
 fn penaltyOk(comptime field: []const u8, comptime v: f32) GuardCase {
@@ -1491,62 +1582,80 @@ const resumed_none: GuardMsg = .{
     .server = .{ .resumed = .{ .token = @splat(9), .kv_pos = 4, .turns_done = 1, .last = null } },
 };
 const kept_msg: GuardMsg = .{ .server = .{ .kept = .{ .granted_ms = 10, .token = @splat(4) } } };
+const lease_resume: GuardMsg = .{ .client = .{ .session_resume = .{ .token = @splat(3) } } };
+const keep_ttl_1: GuardMsg = .{ .client = .{ .session_keep = .{ .ttl_ms = 1 } } };
+const keep_ttl_5: GuardMsg = .{ .client = .{ .session_keep = .{ .ttl_ms = 5 } } };
+const token_close_tag: GuardMsg = .{
+    .server = .{ .token = .{ .token_id = 1, .channel = .close_tag, .text = "x" } },
+};
+const err_cancelled: GuardMsg = .{
+    .server = .{ .err = .{ .code = .cancelled, .detail = "x" } },
+};
+const zero_token = [_]u8{0} ** token_bytes;
+const appended_empty: []const Patch = &.{
+    .{ .set = .{ .at = rp, .bytes = &le(u16, 0) } },
+    .{ .truncate = 2 },
+};
 const rp = header_bytes;
+
+fn edgeCase(comptime name: []const u8, repetition: f32, min_p: f32) GuardCase {
+    const clone: GuardMsg = .{
+        .client = .{ .session_clone = .{ .sampling = edgeSampling(repetition, min_p) } },
+    };
+    return guardAt(name, 3, clone, &.{}, null);
+}
 
 test "guards: every refused frame returns its typed error, and every edge decodes" {
     const bad: DecodeError = error.PayloadMalformed;
+    const gen_sampled = genWith(Sampling.greedy, false);
+    const gen_reseeded = genWith(Sampling.greedy, true);
+    const gen_budget: GuardMsg = .{ .client = .{ .generate = .{
+        .max_tokens = 4,
+        .sampling = null,
+        .text = "x",
+        .think_budget = limits.max_model_ctx,
+    } } };
+    const gen_abc: GuardMsg = .{
+        .client = .{ .generate = .{ .max_tokens = 4, .sampling = null, .text = "abc" } },
+    };
     const cases = [_]GuardCase{
         // Header.
-        .{ .name = "header intact", .msg = ping_msg, .header_only = true },
-        .{ .name = "bad magic", .msg = ping_msg, .header_only = true, .patches = setAt(0, &.{0xFF}), .want = error.BadMagic },
-        .{ .name = "version 99", .msg = ping_msg, .header_only = true, .patches = setAt(4, &le(u16, 99)), .want = error.BadVersion },
-        .{ .name = "version 2", .msg = ping_msg, .header_only = true, .patches = setAt(4, &le(u16, 2)), .want = error.BadVersion },
-        .{ .name = "version 1", .msg = ping_msg, .header_only = true, .patches = setAt(4, &le(u16, 1)), .want = error.BadVersion },
-        .{ .name = "version 4", .msg = ping_msg, .header_only = true, .patches = setAt(4, &le(u16, 4)), .want = error.BadVersion },
-        .{ .name = "unknown type", .msg = ping_msg, .header_only = true, .patches = setAt(6, &le(u16, 0x7777)), .want = error.UnknownMsgType },
-        .{ .name = "frame too large", .msg = ping_msg, .header_only = true, .patches = setAt(16, &le(u32, max_frame_payload_bytes + 1)), .want = error.FrameTooLarge },
-        .{ .name = "resume with no session id", .msg = .{ .client = .{ .session_resume = .{ .token = @splat(3) } } }, .session_id = 0, .header_only = true },
-        .{ .name = "resume with a session id", .msg = .{ .client = .{ .session_resume = .{ .token = @splat(3) } } }, .session_id = 0, .header_only = true, .patches = setAt(12, &le(u32, 7)), .want = bad },
-        .{ .name = "keep keeps its session id", .msg = .{ .client = .{ .session_keep = .{ .ttl_ms = 1 } } }, .session_id = 7, .header_only = true },
+        header("header intact", &.{}, null),
+        header("bad magic", setByte(0, 0xFF), error.BadMagic),
+        header("version 99", setU16(4, 99), error.BadVersion),
+        header("version 2", setU16(4, 2), error.BadVersion),
+        header("version 1", setU16(4, 1), error.BadVersion),
+        header("version 4", setU16(4, 4), error.BadVersion),
+        header("unknown type", setU16(6, 0x7777), error.UnknownMsgType),
+        header("frame too large", setU32(16, max_frame_payload_bytes + 1), error.FrameTooLarge),
+        headerFor("resume with no session id", 0, lease_resume, &.{}, null),
+        headerFor("resume with a session id", 0, lease_resume, setU32(12, 7), bad),
+        headerFor("keep keeps its session id", 7, keep_ttl_1, &.{}, null),
         // Direction confusion.
-        .{ .name = "server type to the client decoder", .msg = .{ .client = .ping }, .decode_as = .token, .want = error.UnknownMsgType },
-        .{ .name = "client type to the server decoder", .msg = .{ .server = .pong }, .decode_as = .generate, .want = error.UnknownMsgType },
+        decodeAs("server type to the client decoder", ping_msg, .token, error.UnknownMsgType),
+        decodeAs("client type to the server decoder", pong_msg, .generate, error.UnknownMsgType),
         // Generate flags.
-        .{ .name = "think switch alone", .msg = gen_x, .patches = setAt(flags_at, &.{generate_flag_think_switch}) },
-        .{ .name = "think switch and open", .msg = gen_x, .patches = setAt(flags_at, &.{generate_flag_think_switch | generate_flag_think_open}) },
-        .{ .name = "think open alone", .msg = gen_x, .patches = setAt(flags_at, &.{generate_flag_think_open}), .want = bad },
-        .{ .name = "reseed without sampling", .msg = gen_x, .patches = setAt(flags_at, &.{generate_flag_reseed}), .want = bad },
-        .{ .name = "flag bit 5", .msg = gen_x, .patches = setAt(flags_at, &.{1 << 5}), .want = bad },
-        .{ .name = "flag bit 6", .msg = gen_x, .patches = setAt(flags_at, &.{1 << 6}), .want = bad },
-        .{ .name = "flag bit 7", .msg = gen_x, .patches = setAt(flags_at, &.{1 << 7}), .want = bad },
-        .{ .name = "sampling without reseed", .msg = .{ .client = .{ .generate = .{ .max_tokens = 4, .sampling = Sampling.greedy, .text = "x", .reseed = false } } } },
-        .{ .name = "sampling with reseed", .msg = .{ .client = .{ .generate = .{ .max_tokens = 4, .sampling = Sampling.greedy, .text = "x", .reseed = true } } } },
-        .{ .name = "think budget at the bound", .msg = .{ .client = .{ .generate = .{ .max_tokens = 4, .sampling = null, .text = "x", .think_budget = limits.max_model_ctx } } } },
-        .{
-            .name = "think budget past the bound",
-            .msg = .{
-                .client = .{
-                    .generate = .{
-                        .max_tokens = 4,
-                        .sampling = null,
-                        .text = "x",
-                        .think_budget = limits.max_model_ctx,
-                    },
-                },
-            },
-            .patches = setAt(header_bytes + 5, &le(u32, limits.max_model_ctx + 1)),
-            .want = bad,
-        },
-        .{ .name = "budget flag with no field", .msg = gen_x, .patches = setAt(flags_at, &.{generate_flag_think_budget}), .want = bad },
-        .{ .name = "text length past the payload", .msg = .{ .client = .{ .generate = .{ .max_tokens = 4, .sampling = null, .text = "abc" } } }, .patches = setAt(header_bytes + 5, &le(u32, 1000)), .want = bad },
-        .{ .name = "zero max_tokens", .msg = gen_x, .patches = setAt(header_bytes, &le(u32, 0)), .want = bad },
+        genFlags("think switch alone", generate_flag_think_switch, null),
+        genFlags("think switch and open", think_switch_open, null),
+        genFlags("think open alone", generate_flag_think_open, bad),
+        genFlags("reseed without sampling", generate_flag_reseed, bad),
+        genFlags("flag bit 5", 1 << 5, bad),
+        genFlags("flag bit 6", 1 << 6, bad),
+        genFlags("flag bit 7", 1 << 7, bad),
+        guard("sampling without reseed", gen_sampled, &.{}, null),
+        guard("sampling with reseed", gen_reseeded, &.{}, null),
+        guard("think budget at the bound", gen_budget, &.{}, null),
+        guard("think budget past the bound", gen_budget, setU32(after_flags_at, budget_past), bad),
+        genFlags("budget flag with no field", generate_flag_think_budget, bad),
+        guard("text length past the payload", gen_abc, setU32(after_flags_at, 1000), bad),
+        guard("zero max_tokens", gen_x, setU32(header_bytes, 0), bad),
         // Payload shape.
-        .{ .name = "cut session_open", .msg = open_greedy, .patches = &.{.{ .truncate = 3 }}, .want = bad },
-        .{ .name = "trailing byte", .msg = .{ .client = .{ .session_open = .{ .sampling = Sampling.greedy, .system_prompt = "p" } } }, .patches = &.{.{ .extend = 1 }}, .want = bad },
-        .{ .name = "channel past the last", .msg = .{ .server = .{ .token = .{ .token_id = 1, .channel = .close_tag, .text = "x" } } }, .patches = setAt(header_bytes + 4, &.{4}), .want = bad },
-        .{ .name = "last error code decodes", .msg = .{ .server = .{ .err = .{ .code = .cancelled, .detail = "x" } } } },
-        .{ .name = "error code 0", .msg = .{ .server = .{ .err = .{ .code = .cancelled, .detail = "x" } } }, .patches = setAt(header_bytes, &le(u16, 0)), .want = bad },
-        .{ .name = "error code past the last", .msg = .{ .server = .{ .err = .{ .code = .cancelled, .detail = "x" } } }, .patches = setAt(header_bytes, &le(u16, @intFromEnum(ErrorCode.cancelled) + 1)), .want = bad },
+        guard("cut session_open", open_greedy, &.{.{ .truncate = 3 }}, bad),
+        guard("trailing byte", open_p, extend(1), bad),
+        guard("channel past the last", token_close_tag, setByte(header_bytes + 4, 4), bad),
+        guard("last error code decodes", err_cancelled, &.{}, null),
+        guard("error code 0", err_cancelled, setU16(header_bytes, 0), bad),
+        guard("error code past the last", err_cancelled, setU16(rp, error_code_past), bad),
         // Sampling values.
         samplingGuard("negative temperature", header_bytes, -1, bad),
         samplingGuard("presence 2.01", header_bytes + 20, 2.01, bad),
@@ -1576,37 +1685,37 @@ test "guards: every refused frame returns its typed error, and every edge decode
         samplingGuard("min_p 1.01", min_p_at, 1.01, bad),
         samplingGuard("min_p NaN", min_p_at, std.math.nan(f32), bad),
         samplingGuard("min_p inf", min_p_at, std.math.inf(f32), bad),
-        .{ .name = "sampling upper edges decode", .session_id = 3, .msg = .{ .client = .{ .session_clone = .{ .sampling = edgeSampling(limits.max_repetition_penalty, 1) } } } },
-        .{ .name = "sampling lower edges decode", .session_id = 3, .msg = .{ .client = .{ .session_clone = .{ .sampling = edgeSampling(std.math.floatMin(f32), 0) } } } },
+        edgeCase("sampling upper edges decode", limits.max_repetition_penalty, 1),
+        edgeCase("sampling lower edges decode", std.math.floatMin(f32), 0),
         // Lease frames.
-        .{ .name = "resume with a zero token", .session_id = 0, .msg = .{ .client = .{ .session_resume = .{ .token = @splat(3) } } }, .patches = &.{.{ .zero_from = rp }}, .want = bad },
-        .{ .name = "cut resume", .session_id = 0, .msg = .{ .client = .{ .session_resume = .{ .token = @splat(3) } } }, .patches = &.{.{ .shorten = 1 }}, .want = bad },
-        .{ .name = "cut keep", .session_id = 2, .msg = .{ .client = .{ .session_keep = .{ .ttl_ms = 5 } } }, .patches = &.{.{ .shorten = 1 }}, .want = bad },
-        .{ .name = "kept intact", .session_id = 2, .msg = kept_msg },
-        .{ .name = "kept with a zero grant", .session_id = 2, .msg = kept_msg, .patches = setAt(rp, &le(u32, 0)), .want = bad },
-        .{ .name = "kept with a zero token", .session_id = 2, .msg = kept_msg, .patches = &.{.{ .zero_from = rp + 4 }}, .want = bad },
-        .{ .name = "kept past the ceiling", .session_id = 2, .msg = kept_msg, .patches = setAt(rp, &le(u32, limits.max_resume_ttl_ms + 1)), .want = bad },
-        .{ .name = "resumed intact", .session_id = 2, .msg = resumed_full },
-        .{ .name = "resumed has_last 2", .session_id = 2, .msg = resumed_full, .patches = setAt(rp + 24, &.{2}), .want = bad },
-        .{ .name = "resumed bad finish", .session_id = 2, .msg = resumed_full, .patches = setAt(rp + 29, &.{4}), .want = bad },
-        .{ .name = "resumed zero token", .session_id = 2, .msg = resumed_full, .patches = setAt(rp, &([_]u8{0} ** token_bytes)), .want = bad },
-        .{ .name = "resumed without last, intact", .session_id = 2, .msg = resumed_none },
-        .{ .name = "resumed without last, byte 25", .session_id = 2, .msg = resumed_none, .patches = setAt(rp + 25, &.{1}), .want = bad },
-        .{ .name = "resumed without last, byte 29", .session_id = 2, .msg = resumed_none, .patches = setAt(rp + 29, &.{1}), .want = bad },
-        .{ .name = "resumed without last, byte 30", .session_id = 2, .msg = resumed_none, .patches = setAt(rp + 30, &.{1}), .want = bad },
-        .{ .name = "resumed without last, byte 34", .session_id = 2, .msg = resumed_none, .patches = setAt(rp + 34, &.{1}), .want = bad },
-        .{ .name = "cut resumed", .session_id = 2, .msg = resumed_none, .patches = &.{.{ .shorten = 1 }}, .want = bad },
+        guardAt("resume with a zero token", 0, lease_resume, zeroFrom(rp), bad),
+        guardAt("cut resume", 0, lease_resume, shorten(1), bad),
+        guardAt("cut keep", 2, keep_ttl_5, shorten(1), bad),
+        guardAt("kept intact", 2, kept_msg, &.{}, null),
+        guardAt("kept with a zero grant", 2, kept_msg, setU32(rp, 0), bad),
+        guardAt("kept with a zero token", 2, kept_msg, zeroFrom(rp + 4), bad),
+        guardAt("kept past the ceiling", 2, kept_msg, setU32(rp, ttl_past), bad),
+        guardAt("resumed intact", 2, resumed_full, &.{}, null),
+        guardAt("resumed has_last 2", 2, resumed_full, setByte(rp + 24, 2), bad),
+        guardAt("resumed bad finish", 2, resumed_full, setByte(rp + 29, 4), bad),
+        guardAt("resumed zero token", 2, resumed_full, setAt(rp, &zero_token), bad),
+        guardAt("resumed without last, intact", 2, resumed_none, &.{}, null),
+        guardAt("resumed without last, byte 25", 2, resumed_none, setByte(rp + 25, 1), bad),
+        guardAt("resumed without last, byte 29", 2, resumed_none, setByte(rp + 29, 1), bad),
+        guardAt("resumed without last, byte 30", 2, resumed_none, setByte(rp + 30, 1), bad),
+        guardAt("resumed without last, byte 34", 2, resumed_none, setByte(rp + 34, 1), bad),
+        guardAt("cut resumed", 2, resumed_none, shorten(1), bad),
         // Append.
-        .{ .name = "append intact", .session_id = 3, .msg = append_two },
-        .{ .name = "append count 0", .session_id = 3, .msg = append_two, .patches = setAt(rp, &le(u16, 0)), .want = bad },
-        .{ .name = "append count past the bound", .session_id = 3, .msg = append_two, .patches = setAt(rp, &le(u16, limits.max_append_pairs + 1)), .want = bad },
-        .{ .name = "append count the bytes do not hold", .session_id = 3, .msg = append_two, .patches = setAt(rp, &le(u16, 3)), .want = bad },
-        .{ .name = "append user length past the payload", .session_id = 3, .msg = append_two, .patches = setAt(rp + 2, &le(u32, 1000)), .want = bad },
-        .{ .name = "append trailing byte", .session_id = 3, .msg = append_two, .patches = &.{.{ .extend = 1 }}, .want = bad },
-        .{ .name = "append cut", .session_id = 3, .msg = append_two, .patches = &.{.{ .shorten = 1 }}, .want = bad },
-        .{ .name = "appended list intact", .session_id = 3, .msg = kvPosAppended() },
-        .{ .name = "appended list decreases", .session_id = 3, .msg = kvPosAppended(), .patches = setAt(rp + 2, &le(u32, 13)), .want = bad },
-        .{ .name = "appended list empty", .session_id = 3, .msg = kvPosAppended(), .patches = &.{ .{ .set = .{ .at = rp, .bytes = &le(u16, 0) } }, .{ .truncate = 2 } }, .want = bad },
+        guardAt("append intact", 3, append_two, &.{}, null),
+        guardAt("append count 0", 3, append_two, setU16(rp, 0), bad),
+        guardAt("append count past the bound", 3, append_two, setU16(rp, pairs_past), bad),
+        guardAt("append count the bytes do not hold", 3, append_two, setU16(rp, 3), bad),
+        guardAt("append user length past the payload", 3, append_two, setU32(rp + 2, 1000), bad),
+        guardAt("append trailing byte", 3, append_two, extend(1), bad),
+        guardAt("append cut", 3, append_two, shorten(1), bad),
+        guardAt("appended list intact", 3, kvPosAppended(), &.{}, null),
+        guardAt("appended list decreases", 3, kvPosAppended(), setU32(rp + 2, 13), bad),
+        guardAt("appended list empty", 3, kvPosAppended(), appended_empty, bad),
     };
     for (cases) |c| {
         errdefer std.debug.print("guard case: {s}\n", .{c.name});
@@ -1628,7 +1737,21 @@ test "mutation: one flipped byte in each new frame decodes to a typed error or a
     const clients = [_]ClientMsg{
         .{ .session_keep = .{ .ttl_ms = 30_000 } },
         .{ .session_resume = .{ .token = token } },
-        .{ .generate = .{ .max_tokens = 8, .sampling = .{ .temperature = 0.5, .top_k = 10, .top_p = 0.9, .seed = 3, .min_p = 0.1, .repetition_penalty = 1.2 }, .text = "hi", .think_open = true, .think_budget = 64, .reseed = true } },
+        .{ .generate = .{
+            .max_tokens = 8,
+            .sampling = .{
+                .temperature = 0.5,
+                .top_k = 10,
+                .top_p = 0.9,
+                .seed = 3,
+                .min_p = 0.1,
+                .repetition_penalty = 1.2,
+            },
+            .text = "hi",
+            .think_open = true,
+            .think_budget = 64,
+            .reseed = true,
+        } },
     };
     var buf: [256]u8 = undefined;
     for (clients) |msg| {
@@ -1652,7 +1775,12 @@ test "mutation: one flipped byte in each new frame decodes to a typed error or a
 
     const servers = [_]ServerMsg{
         .{ .kept = .{ .granted_ms = 500, .token = token } },
-        .{ .resumed = .{ .token = token, .kv_pos = 9, .turns_done = 2, .last = .{ .request_id = 4, .finish = .max_tokens, .gen_tokens = 3, .reasoning_tokens = 1 } } },
+        .{ .resumed = .{ .token = token, .kv_pos = 9, .turns_done = 2, .last = .{
+            .request_id = 4,
+            .finish = .max_tokens,
+            .gen_tokens = 3,
+            .reasoning_tokens = 1,
+        } } },
     };
     for (servers) |msg| {
         const n = encodeServerMsg(msg, 1, 1, &buf);
@@ -1720,8 +1848,7 @@ test "property: random byte mutations decode to a typed error or a valid message
     );
 }
 
-/// A case of the codec properties: one seed, and a size that bounds every
-/// generated length.
+/// A case of the codec properties: one seed, and a size that bounds every generated length.
 const CodecCase = struct { seed: u64, size: u32 };
 
 fn genCodec(_: void, random: std.Random, size: u32) CodecCase {
@@ -1881,8 +2008,8 @@ fn genServerMsg(r: std.Random, size: u32, text: *[256]u8) ServerMsg {
     };
 }
 
-/// Every truncation of the payload of `msg` is a cut frame, and the guard
-/// table names `PayloadMalformed` for a cut frame.
+/// Every truncation of the payload of `msg` is a cut frame. The guard table names
+/// `PayloadMalformed` for a cut frame.
 fn expectCutsRefused(msg: GuardMsg, session_id: u32) !void {
     var buf: [512]u8 = undefined;
     const n = switch (msg) {

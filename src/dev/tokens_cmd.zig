@@ -3,16 +3,16 @@
 //! command.
 
 const std = @import("std");
-const Io = std.Io;
+const zigferencer = @import("zigferencer");
 
-const cli = @import("command.zig");
-const args = @import("args.zig");
-const select = @import("select.zig");
-const registry = @import("../core/registry.zig");
-const loader = @import("../io/gguf/loader.zig");
-const vocab_mod = @import("../core/tokenizer/vocab.zig");
-const bpe = @import("../core/tokenizer/bpe.zig");
-const chat_mod = @import("../core/chat.zig");
+const context = zigferencer.cli.context;
+const args = zigferencer.cli.args;
+const select = zigferencer.cli.select;
+const registry = zigferencer.registry;
+const loader = zigferencer.loader;
+const vocab_mod = zigferencer.vocab;
+const bpe = zigferencer.bpe;
+const chat_mod = zigferencer.chat;
 
 // -- types ------------------------------------------------------------------
 
@@ -36,7 +36,7 @@ const Flags = struct {
 
 // -- api --------------------------------------------------------------------
 
-pub fn run(ctx: cli.Context) !void {
+pub fn run(ctx: context.Context) !void {
     const flags = try args.parseInto(Flags, ctx) orelse return;
 
     const model = try select.model(ctx, flags.pub_name);
@@ -54,9 +54,7 @@ pub fn run(ctx: cli.Context) !void {
 
     const ids = try bpe.encodeAlloc(&v, ctx.arena, text, true);
 
-    var stdout_buffer: [cli.stdout_buffer_bytes]u8 = undefined;
-    var stdout_writer: Io.File.Writer = .initStreaming(.stdout(), ctx.io, &stdout_buffer);
-    const w = &stdout_writer.interface;
+    const w = &ctx.stdout.interface;
 
     try w.writeAll("[");
     for (ids, 0..) |id, i| {

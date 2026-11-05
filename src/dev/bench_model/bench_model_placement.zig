@@ -4,18 +4,19 @@
 //! never does. That forced construction is the cross-runner token gate.
 
 const std = @import("std");
+const zigferencer = @import("zigferencer");
 const build_options = @import("build_options");
 
-const args = @import("args.zig");
+const args = zigferencer.cli.args;
 const common = @import("bench_model_common.zig");
 const exec = @import("bench_model_exec.zig");
-const serve_common = @import("serve_common.zig");
-const resolve_mod = @import("../engine/resolve.zig");
-const kv_budget = @import("../core/kv_budget.zig");
-const vocab_mod = @import("../core/tokenizer/vocab.zig");
-const parallel = @import("../runtime/parallel.zig");
-const Pool = @import("../runtime/pool.zig").Pool;
-const vulkan_ctx_mod = @import("../runtime/vulkan_ctx.zig");
+const boot_lines = zigferencer.cli.boot_lines;
+const resolve_mod = zigferencer.resolve;
+const kv_budget = zigferencer.kv_budget;
+const vocab_mod = zigferencer.vocab;
+const parallel = zigferencer.parallel;
+const Pool = zigferencer.pool.Pool;
+const vulkan_ctx_mod = zigferencer.vulkan_ctx;
 
 const log = std.log.scoped(.kv);
 
@@ -122,27 +123,27 @@ fn resolveSplit(b: *const Bench, ctxp: *vulkan_ctx_mod.Context) !device_arm.Hybr
     const device = try b.boot.resolveOn(io, ctxp);
     const placed = device.placed.?;
     if (placed.clamp) |clamp| {
-        serve_common.logClamp(clamp);
+        boot_lines.logClamp(clamp);
     }
 
     if (placed.split) |split| {
         if (placed.pin == null) {
-            serve_common.logAutoSplit(split.split, b.loaded.card.n_layers);
+            boot_lines.logAutoSplit(split.split, b.loaded.card.n_layers);
         }
     }
 
     const hybrid = switch (device.arm) {
         .ok => |arm| arm.hybrid,
-        .refused => |r| return serve_common.refuse(io, name, r),
+        .refused => |r| return boot_lines.refuse(io, name, r),
     };
 
     switch (hybrid.quote) {
-        .ok => |quote| serve_common.logRamQuote(quote, false),
-        .refused => |r| return serve_common.refuse(io, name, r),
+        .ok => |quote| boot_lines.logRamQuote(quote, false),
+        .refused => |r| return boot_lines.refuse(io, name, r),
     }
 
     const plan = hybrid.plan.?;
-    serve_common.logSessionWindow(hybrid.window);
+    boot_lines.logSessionWindow(hybrid.window);
 
     var span_buffer: [kv_budget.placement_text_max]u8 = undefined;
     log.info("{s}", .{kv_budget.formatPlacement(plan, &span_buffer)});

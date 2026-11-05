@@ -1,9 +1,9 @@
 //! Command dispatch: argv to a command handler, the one entry point from `main.zig`.
-//! Each command is a `{ name, summary, handler }` row in `release` or `dev`. `zigferencer`
-//! dispatches
-//! `release`, and `zigferencer-dev` dispatches `release ++ dev`. The release binary names the dev
-//! commands only as strings, so it never analyzes a dev handler. The usage screen reads the same
-//! `summary`, so help and dispatch cannot drift.
+//! Each command is a `{ name, summary, handler }` row of a table. `zigferencer` dispatches
+//! `release`, and `zigferencer-dev` dispatches `release` plus the table of
+//! `src/dev/dev_command.zig`. The release binary names the dev commands only as strings, because
+//! its module holds no path to a dev file. The usage screen reads the same `summary`, so help and
+//! dispatch cannot drift.
 //!
 //! Help-text dialect, the same in every `--help`. `args.helpBody` generates the flag lines:
 //!   - A `summary` is an imperative fragment of 55 characters or less.
@@ -12,30 +12,23 @@
 //!   - A default reads as a trailing `[default: X]`, never as inline prose.
 //!   - One qualifier per flag line.
 //!   - A backend caveat goes in a group header (`gpu (fused-GPU build only)`), not on a line.
-//!   - A shared option keeps one name and one wording, because `flags.EngineFlags` and
-//!     `flags.ServeFlags` declare it once.
+//!   - A shared option keeps one name and one wording, because
+//!     `flag_groups.EngineFlags` and `flag_groups.ServeFlags` declare it once.
 //!   - A flag that the build cannot honor stays listed, and the command rejects it at use.
 
 const std = @import("std");
 const Io = std.Io;
-const Allocator = std.mem.Allocator;
 
-const tokens_cmd = @import("tokens_cmd.zig");
 const fetch_cmd = @import("fetch_cmd.zig");
 const list_cmd = @import("list_cmd.zig");
 const inspect_cmd = @import("inspect_cmd.zig");
 const run_cmd = @import("run_cmd.zig");
 const serve_cmd = @import("serve_cmd.zig");
 const serve_openai_cmd = @import("serve_openai_cmd.zig");
-const info_cmd = @import("info_cmd.zig");
-const bench_model_cmd = @import("bench_model_cmd.zig");
-const bench_serve_cmd = @import("bench_serve_cmd.zig");
-const bench_swap_cmd = @import("bench_swap_cmd.zig");
-const bench_decode_host_cmd = @import("bench_decode_host_cmd.zig");
-const serve_demo_cmd = @import("serve_demo_cmd.zig");
-const client_cmd = @import("client_cmd.zig");
-const gpu_selftest_cmd = @import("gpu_selftest_cmd.zig");
+const info_cmd = @import("info/info_cmd.zig");
+const client_cmd = @import("client/client_cmd.zig");
 const style = @import("style.zig");
+const context = @import("context.zig");
 const registry = @import("../core/registry.zig");
 const limits = @import("../core/limits.zig");
 const prompt_cache = @import("../runtime/prompt_cache.zig");
@@ -53,9 +46,6 @@ comptime {
 
 // -- constants --------------------------------------------------------------
 
-/// The stack buffer of one stdout writer.
-pub const stdout_buffer_bytes = 4096;
-
 /// The stack buffer of one error message on stderr.
 const error_buffer_bytes = 256;
 
@@ -63,7 +53,7 @@ const error_buffer_bytes = 256;
 const pad = " " ** 32;
 
 /// The commands of the release binary.
-const release = [_]Subcommand{
+pub const release = [_]Subcommand{
     .{ .name = "list", .summary = "List registered models (and which are on disk)", .handler = list_cmd.run },
     .{ .name = "fetch", .summary = "Download a model (registry name or HF path)", .handler = fetch_cmd.run },
     .{ .name = "inspect", .summary = "Print a downloaded GGUF's metadata", .handler = inspect_cmd.run },
@@ -74,20 +64,9 @@ const release = [_]Subcommand{
     .{ .name = "info", .summary = "Print the build, host card, and support matrix", .handler = info_cmd.run },
 };
 
-/// The developer commands. Only `zigferencer-dev` dispatches them.
-const dev = [_]Subcommand{
-    .{ .name = "bench-model", .summary = "Benchmark a model: TTFT, ITL, hash", .handler = bench_model_cmd.run },
-    .{ .name = "bench-serve", .summary = "Benchmark serve throughput vs batch size", .handler = bench_serve_cmd.run },
-    .{ .name = "bench-swap", .summary = "Benchmark tiered-KV swap cost (go/no-go)", .handler = bench_swap_cmd.run },
-    .{ .name = "bench-decode-host", .summary = "Time the host steps of one decode step", .handler = bench_decode_host_cmd.run },
-    .{ .name = "gpu-selftest", .summary = "Bit-check a GPU kernel vs its CPU reference", .handler = gpu_selftest_cmd.run },
-    .{ .name = "tokens", .summary = "Print a prompt's token ids", .handler = tokens_cmd.run },
-    .{ .name = "serve-demo", .summary = "Demo the serve connector end-to-end", .handler = serve_demo_cmd.run },
-};
-
-/// The dev command names as strings, for the hint of the release binary. A read of `dev` analyzes
-/// every dev handler, so the list repeats the names. `dispatchDev` checks the two lists.
-const dev_names = [_][]const u8{
+/// The dev command names as strings, for the hint of the release binary. This module cannot read
+/// the dev table, so the list repeats the names. `dev_command.zig` checks the two lists.
+pub const dev_names = [_][]const u8{
     "bench-model",
     "bench-serve",
     "bench-swap",
@@ -99,28 +78,10 @@ const dev_names = [_][]const u8{
 
 // -- types ------------------------------------------------------------------
 
-pub const Context = struct {
-    io: Io,
-    arena: Allocator,
-    gpa: Allocator,
-    args: []const [:0]const u8,
-    /// Resolved once from `$ZIGFERENCER_MODELS_DIR`. See core/registry.zig.
-    models_root: []const u8,
-    /// Resolved once from `$ZIGFERENCER_CACHE_DIR`. See runtime/prompt_cache.zig.
-    cache_dir: []const u8,
-    /// Replaces the storage-buffer range that the device reports. Every command that opens a
-    /// Vulkan context passes it.
-    vk_storage_range: ?u64,
-    /// True when stdout takes ANSI color. Commands build a `style.Palette` from it.
-    color: bool,
-    /// The same for stderr, which redirects apart from stdout. The pickers key their palette on it.
-    color_err: bool,
-};
-
 // The handlers hold different error sets, and one function-pointer table shares one return type.
-const Handler = *const fn (Context) anyerror!void;
+pub const Handler = *const fn (context.Context) anyerror!void;
 
-const Subcommand = struct {
+pub const Subcommand = struct {
     name: []const u8,
     summary: []const u8,
     handler: Handler,
@@ -129,23 +90,8 @@ const Subcommand = struct {
 // -- api --------------------------------------------------------------------
 
 /// Dispatch argv over the release commands.
-pub fn dispatchRelease(init: std.process.Init) !void {
-    return dispatchOver(init, &release, "zigferencer");
-}
-
-/// Dispatch argv over the release and the dev commands.
-pub fn dispatchDev(init: std.process.Init) !void {
-    comptime {
-        std.debug.assert(dev.len == dev_names.len);
-
-        for (dev, dev_names) |d, name| {
-            if (!std.mem.eql(u8, d.name, name)) {
-                @compileError("dev_names diverges from dev at '" ++ d.name ++ "'");
-            }
-        }
-    }
-
-    return dispatchOver(init, &(release ++ dev), "zigferencer-dev");
+pub fn dispatchRelease(init: std.process.Init, stdout: *std.Io.File.Writer) !void {
+    return dispatchOver(init, stdout, &release, "zigferencer");
 }
 
 /// True when `arg` asks for the top-level usage screen.
@@ -158,11 +104,10 @@ pub fn isHelpWord(arg: []const u8) bool {
     return false;
 }
 
-// -- helpers ----------------------------------------------------------------
-
 /// Resolve `args[1]` against `table` and run its handler.
-fn dispatchOver(
+pub fn dispatchOver(
     init: std.process.Init,
+    stdout: *std.Io.File.Writer,
     comptime table: []const Subcommand,
     comptime binary_name: []const u8,
 ) !void {
@@ -199,6 +144,7 @@ fn dispatchOver(
                 .arena = arena,
                 .gpa = init.gpa,
                 .args = args[2..],
+                .stdout = stdout,
                 .models_root = models_root,
                 .cache_dir = cache_dir,
                 .vk_storage_range = vk_storage_range,
@@ -220,6 +166,8 @@ fn dispatchOver(
     return error.UnknownSubcommand;
 }
 
+// -- helpers ----------------------------------------------------------------
+
 fn resolveStorageRange(init: std.process.Init) !?u64 {
     const text = init.environ_map.get(limits.storage_range_env) orelse return null;
     return limits.parseStorageRange(text) catch |err| {
@@ -237,7 +185,7 @@ fn printUsage(
     comptime table: []const Subcommand,
     comptime binary_name: []const u8,
 ) void {
-    var usage_buffer: [stdout_buffer_bytes]u8 = undefined;
+    var usage_buffer: [context.stdout_buffer_bytes]u8 = undefined;
     var usage_writer: Io.File.Writer = .initStreaming(file, io, &usage_buffer);
     const w = &usage_writer.interface;
 

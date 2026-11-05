@@ -8,11 +8,12 @@ const Io = std.Io;
 const Allocator = std.mem.Allocator;
 const build_options = @import("build_options");
 
-const cli = @import("command.zig");
+const context = @import("context.zig");
 const args = @import("args.zig");
-const flags_mod = @import("flags.zig");
+const flags_mod = @import("flag_groups.zig");
 const select = @import("select.zig");
-const serve_common = @import("serve_common.zig");
+const boot_facts = @import("boot/boot_facts.zig");
+const boot_lines = @import("boot/boot_lines.zig");
 const family = @import("../engine/family.zig");
 const resolve_mod = @import("../engine/resolve.zig");
 const bpe = @import("../core/tokenizer/bpe.zig");
@@ -111,13 +112,13 @@ const Flags = struct {
 
 /// What one boot of `run` holds once the model loaded.
 const Boot = struct {
-    ctx: cli.Context,
+    ctx: context.Context,
     flags: *const Flags,
     policy: parallel.Policy,
     model: *const registry.Model,
     loaded: *const loader.Loaded,
     resolved: *const resolve_mod.Resolved,
-    device: serve_common.DeviceBoot,
+    device: boot_facts.DeviceBoot,
 
     fn kvDtype(self: *const Boot) dtype.KvDtype {
         return self.resolved.early.kv_dtype;
@@ -142,7 +143,7 @@ const Prefilled = struct {
 
 // -- api --------------------------------------------------------------------
 
-pub fn run(ctx: cli.Context) !void {
+pub fn run(ctx: context.Context) !void {
     const flags = try args.parseInto(Flags, ctx) orelse return;
     if (flags.engine.gpu_layers != null and !fused_build) {
         return args.fail(ctx.io, "--gpu-layers requires -Dops-backend=vulkan_fused", .{});
@@ -155,19 +156,19 @@ pub fn run(ctx: cli.Context) !void {
     // workers. A pin of any layer count can run CPU layers.
     const runs_cpu_ops = !fused_build or flags.engine.gpu_layers != null;
     const thread_flags = flags.engine.threads.policyFlags();
-    const policy = try serve_common.resolvePolicy(ctx.io, thread_flags, runs_cpu_ops);
+    const policy = try boot_facts.resolvePolicy(ctx.io, thread_flags, runs_cpu_ops);
 
     const model = try select.model(ctx, flags.pub_name);
     const input: resolve_mod.Input = .{
         .engine = flags.engine,
         .prompt_cache = flags.prompt_cache,
     };
-    const entry = serve_common.entryOf(model);
+    const entry = boot_facts.entryOf(model);
 
     // Every refusal that needs no model file lands here, before the load.
     switch (resolve_mod.early(.run, input, entry)) {
         .ok => {},
-        .refused => |r| return serve_common.refuse(ctx.io, model.pub_name, r),
+        .refused => |r| return boot_lines.refuse(ctx.io, model.pub_name, r),
     }
 
     const path = try registry.resolveLoadPath(ctx.arena, ctx.io, ctx.models_root, model.*);
@@ -175,7 +176,7 @@ pub fn run(ctx: cli.Context) !void {
     defer loaded.close();
 
     // A device arm resolves again once its context states the device.
-    const resolved = try serve_common.resolveLoaded(ctx, .run, input, entry, &loaded);
+    const resolved = try boot_facts.resolveLoaded(ctx, .run, input, entry, &loaded);
 
     const boot: Boot = .{
         .ctx = ctx,
@@ -212,16 +213,13 @@ fn runFamily(comptime Family: type, b: *const Boot) !void {
     var v = try vocab_mod.buildFromParsed(ctx.arena, b.loaded.parsed);
     const prompt_ids = try promptIds(b, &v);
 
-    var stdout_buffer: [cli.stdout_buffer_bytes]u8 = undefined;
-    var stdout_writer: Io.File.Writer = .initStreaming(.stdout(), ctx.io, &stdout_buffer);
-
-    serve_common.logPrecision(b.loaded, b.kvDtype());
+    boot_lines.logPrecision(b.loaded, b.kvDtype());
 
     const turn: Turn = .{
         .boot = b,
         .pool = &pool,
         .v = &v,
-        .out = &stdout_writer.interface,
+        .out = &ctx.stdout.interface,
         .prompt_ids = prompt_ids,
     };
 
@@ -305,7 +303,7 @@ fn runHost(
     };
 
     if (comptime !Family.run_logs_every_placement) {
-        serve_common.logSessionWindow(window);
+        boot_lines.logSessionWindow(window);
     }
 
     try hostQuote(b, arm);
@@ -333,10 +331,10 @@ fn runFused(comptime Family: type, t: *const Turn) !void {
     const io = b.ctx.io;
 
     const t_init = logFusedInit(io);
-    const ctxp = try serve_common.openDevice(b.ctx);
+    const ctxp = try boot_facts.openDevice(b.ctx);
     defer ctxp.deinit();
 
-    const f = try serve_common.fusedOn(io, &b.device, ctxp);
+    const f = try boot_facts.fusedOn(io, &b.device, ctxp);
     return runFusedOn(Family, t, ctxp, f, t_init);
 }
 
@@ -352,7 +350,7 @@ fn runFusedOn(
     const ctx = b.ctx;
     const kv_dtype = b.kvDtype();
 
-    _ = try serve_common.logFused(ctx.io, b.model.pub_name, f, true, false, kv_dtype);
+    _ = try boot_lines.logFused(ctx.io, b.model.pub_name, f, true, false, kv_dtype);
     if (f.report) |report| {
         logPlacement(report);
     }
@@ -370,7 +368,7 @@ fn runFusedOn(
 /// `--gpu-layers N > 0`, or auto at a null `pin`. Open the device and resolve the
 /// split on it, then run the runner the split selects. An auto split with no GPU
 /// layer releases the device and returns `.all_host` with the host arm.
-fn runPlaced(comptime Family: type, t: *const Turn, pin: ?u32) !serve_common.Placed {
+fn runPlaced(comptime Family: type, t: *const Turn, pin: ?u32) !boot_facts.Placed {
     const b = t.boot;
     const ctx = b.ctx;
     const name = b.model.pub_name;
@@ -378,13 +376,13 @@ fn runPlaced(comptime Family: type, t: *const Turn, pin: ?u32) !serve_common.Pla
 
     try refusePastModel(ctx, pin, n_layers);
 
-    const ctxp = try serve_common.openDevice(ctx);
+    const ctxp = try boot_facts.openDevice(ctx);
     defer ctxp.deinit();
 
     const dev = try b.device.resolveOn(ctx.io, ctxp);
     const placed = dev.placed.?;
     if (placed.clamp) |c| {
-        serve_common.logClamp(c);
+        boot_lines.logClamp(c);
     }
 
     if (placed.split) |split| {
@@ -393,13 +391,13 @@ fn runPlaced(comptime Family: type, t: *const Turn, pin: ?u32) !serve_common.Pla
         }
 
         if (pin == null) {
-            serve_common.logAutoSplit(split.split, n_layers);
+            boot_lines.logAutoSplit(split.split, n_layers);
         }
     }
 
     const arm = switch (dev.arm) {
         .ok => |a| a,
-        .refused => |r| return serve_common.refuse(ctx.io, name, r),
+        .refused => |r| return boot_lines.refuse(ctx.io, name, r),
     };
 
     if (arm == .fused) {
@@ -443,8 +441,8 @@ fn runHybrid(
     const ctx = b.ctx;
 
     switch (h.quote) {
-        .ok => |q| serve_common.logRamQuote(q, false),
-        .refused => |r| return serve_common.refuse(ctx.io, b.model.pub_name, r),
+        .ok => |q| boot_lines.logRamQuote(q, false),
+        .refused => |r| return boot_lines.refuse(ctx.io, b.model.pub_name, r),
     }
 
     const placement = h.plan.?;
@@ -452,7 +450,7 @@ fn runHybrid(
         logPlacement(placement);
     }
 
-    serve_common.logSessionWindow(h.window);
+    boot_lines.logSessionWindow(h.window);
 
     log.info("initializing GPU: context + suffix weight upload to VRAM...", .{});
     const t_init = Io.Clock.Timestamp.now(ctx.io, .awake);
@@ -482,7 +480,7 @@ fn logHostPlan(b: *const Boot) kv_budget.KvPlan {
     const window = b.resolved.window;
     const host = resolve_mod.runHost(b.loaded.card, b.device.model, b.kvDtype(), window);
     logPlacement(host.report.?);
-    serve_common.logSessionWindow(window);
+    boot_lines.logSessionWindow(window);
     return host.plan;
 }
 
@@ -496,14 +494,14 @@ fn hostQuote(b: *const Boot, arm: ?resolve_mod.Result(resolve_mod.CpuArm)) !void
     const result = arm orelse
         resolve_mod.cpuArm(.run, boot.input, boot.card, b.kvDtype(), b.resolved.window, facts);
     switch (result) {
-        .ok => |a| serve_common.logRamQuote(a.quote, false),
-        .refused => |r| return serve_common.refuse(io, boot.entry.pub_name, r),
+        .ok => |a| boot_lines.logRamQuote(a.quote, false),
+        .refused => |r| return boot_lines.refuse(io, boot.entry.pub_name, r),
     }
 }
 
 /// A pin past the layer count of the model needs no device, so it refuses
 /// before the context opens.
-fn refusePastModel(ctx: cli.Context, pin: ?u32, n_layers: u32) error{UsageError}!void {
+fn refusePastModel(ctx: context.Context, pin: ?u32, n_layers: u32) error{UsageError}!void {
     const n_gpu = pin orelse return;
 
     // The zero pin took the CPU arm, so a pin here names a real GPU suffix.
@@ -531,7 +529,7 @@ fn logPlacement(placement: kv_budget.PlacementPlan) void {
 fn logBackendLegend() void {
     var buffer: [legend_text_max]u8 = undefined;
     var n: usize = 0;
-    inline for (op_requires.ops_backend_names) |name| {
+    for (op_requires.ops_backend_names) |name| {
         const marker = if (std.mem.eql(u8, name, build_options.ops_backend)) "[+]" else "";
         const segment = std.fmt.bufPrint(buffer[n..], " {s}{s}", .{ marker, name }) catch return;
         n += segment.len;
@@ -581,10 +579,13 @@ fn prefillCachedAndStream(runner: anytype, t: *const Turn) !void {
         );
         cache_key = prompt_cache_mod.prefixKey(fp, ids);
         cache = PromptCache.init(ctx.gpa, limits.prompt_cache_ram_default);
-        try cache.?.enableDisk(ctx.io, ctx.cache_dir, limits.prompt_cache_disk_default, fp);
-        log.info("prompt-cache dir: {s} (set $ZIGFERENCER_CACHE_DIR to relocate)", .{
-            ctx.cache_dir,
-        });
+        if (cache.?.enableDisk(ctx.io, ctx.cache_dir, limits.prompt_cache_disk_default, fp)) |_| {
+            log.info("prompt-cache dir: {s} (set $ZIGFERENCER_CACHE_DIR to relocate)", .{
+                ctx.cache_dir,
+            });
+        } else |err| {
+            log.warn("prompt-cache: no disk tier at {s}: {t}", .{ ctx.cache_dir, err });
+        }
     }
 
     defer if (cache) |*c| c.deinit();
@@ -605,7 +606,10 @@ fn prefillCachedAndStream(runner: anytype, t: *const Turn) !void {
         const t0 = Io.Clock.Timestamp.now(ctx.io, .awake);
         prefilled = try prefillChunks(runner, ids);
         if (cache) |*c| {
-            try admitPrompt(runner, t, c, cache_key, prefilled.last_logits, t0);
+            // The turn holds the prefill, so a failed snapshot costs only the next hit.
+            admitPrompt(runner, t, c, cache_key, prefilled.last_logits, t0) catch |err| {
+                log.warn("prompt-cache: no snapshot of this prompt: {t}", .{err});
+            };
         }
     }
 

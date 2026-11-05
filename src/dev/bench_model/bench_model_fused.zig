@@ -2,15 +2,17 @@
 //! one runner, so the weights upload once.
 
 const std = @import("std");
+const zigferencer = @import("zigferencer");
 const Io = std.Io;
 const build_options = @import("build_options");
 
 const common = @import("bench_model_common.zig");
 const exec = @import("bench_model_exec.zig");
-const serve_common = @import("serve_common.zig");
-const vocab_mod = @import("../core/tokenizer/vocab.zig");
-const sampler = @import("../runtime/sampler.zig");
-const vulkan_ctx_mod = @import("../runtime/vulkan_ctx.zig");
+const boot_facts = zigferencer.cli.boot_facts;
+const boot_lines = zigferencer.cli.boot_lines;
+const vocab_mod = zigferencer.vocab;
+const sampler = zigferencer.sampler;
+const vulkan_ctx_mod = zigferencer.vulkan_ctx;
 
 comptime {
     if (!build_options.use_vulkan_fused_ops) {
@@ -37,8 +39,8 @@ pub fn bench(comptime Family: type, b: *const Bench) !void {
     });
     defer ctxp.deinit();
 
-    const f = try serve_common.fusedOn(ctx.io, b.boot, ctxp);
-    _ = try serve_common.logFused(ctx.io, b.model.pub_name, f, true, false, kv_dtype);
+    const f = try boot_facts.fusedOn(ctx.io, b.boot, ctxp);
+    _ = try boot_lines.logFused(ctx.io, b.model.pub_name, f, true, false, kv_dtype);
 
     const runner = try Family.initFused(ctx.gpa, ctxp, b.loaded, f.plan, kv_dtype);
     defer runner.deinit();

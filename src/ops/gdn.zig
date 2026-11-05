@@ -1,22 +1,14 @@
-//! Gated DeltaNet (GDN) linear-attention CPU reference. The file holds the
-//! recurrent decode form of one Qwen3.5 or Qwen3-Next GDN layer per-token step.
-//! It is a pure datapath over caller-owned state. The runner owns the recurrent
-//! state `S` and the conv ring buffer, and this module only transforms them.
-//! GDN replaces the growing KV cache with a fixed-size d x d state matrix per
-//! head, so its cost is O(1) in sequence length. This scalar form is the
-//! correctness reference and the specification that the GPU kernel mirrors.
+//! Gated DeltaNet (GDN) linear-attention CPU reference: the per-token recurrent step of one Qwen3.5
+//! or Qwen3-Next GDN layer. It is a pure datapath over state that the runner owns (the recurrent
+//! state `S` and the conv ring buffer). A fixed d x d state per head replaces the KV cache, so the
+//! cost is O(1) in sequence length. This scalar form specifies the GPU kernel.
 //!
-//!   Hybrid layer schedule (full_attention_interval = 4). Layer i is full
-//!   softmax attention when (i+1) % 4 == 0, and GDN linear attention otherwise.
-//!   On the 2B model 18 of the 24 layers are GDN:
+//! Layer schedule. With full_attention_interval = 4, layer i is full softmax attention when
+//! (i+1) % 4 == 0, and GDN otherwise. On the 2B model 18 of the 24 layers are GDN.
 //!
-//!     layer:  0    1    2    3    4    5    6    7   ...  23
-//!     type:  GDN  GDN  GDN  ATT  GDN  GDN  GDN  ATT  ...  ATT
-//!
-//! The math comes from the recurrent path of HF `Qwen3NextGatedDeltaNet`. The
-//! tensor names are the GGUF ones. Per token and per head h the state is S[i,j],
-//! with i over the key dim and j over the value dim, and
-//! key_dim == value_dim == head_dim = 128:
+//! Recurrence. The math comes from the recurrent path of HF `Qwen3NextGatedDeltaNet`. The tensor
+//! names are the GGUF ones. Per token and per head h the state is S[i,j], with i over the key
+//! dim and j over the value dim, and key_dim == value_dim == head_dim = 128:
 //!
 //!   1. project (caller): qkv = attn_qkv.x_n  (q|k|v, each n_heads*head_dim)
 //!      z = attn_gate.x_n
@@ -39,22 +31,42 @@
 //!        o[j] = o[j]*rsqrt(mean_j(o^2)+eps)*ssm_norm[j]*silu(z[j])
 //!   7. project (caller): out = ssm_out.o  -> hidden
 //!
-//! Layout, following the llama.cpp qwen3next optimized path. qkv is contiguous
-//! as `[q(inner) | k(inner) | v(inner)]`, a flat wqkv projection split at offset
-//! key_dim and 2*key_dim, and each block `[head_dim, n_heads]` is contiguous.
-//! The readout `o` and the gate `z` are likewise contiguous per head. The conv
-//! weight `w(tap,chan)` sits at `conv_w[chan*K + tap]`, with tap 0 the oldest.
-//! The entry conv_state[t*conv_dim + c] holds the input t steps in the past,
-//! with t=0 the oldest. The model full-attention q and gate use a per-head
-//! interleaved layout instead, and the runner handles that one.
+//! Layout. This follows the llama.cpp qwen3next optimized path. qkv is contiguous as
+//! `[q(inner) | k(inner) | v(inner)]`, split at offsets key_dim and 2*key_dim, and each block
+//! `[head_dim, n_heads]` is contiguous. The readout `o` and the gate `z` are contiguous per head.
+//! The conv weight `w(tap,chan)` sits at `conv_w[chan*K + tap]`, with tap 0 the oldest. The entry
+//! conv_state[t*conv_dim + c] holds the input t steps in the past, with t=0 the oldest. The
+//! full-attention q and gate use a per-head interleaved layout, and the runner handles that one.
+//!
+//! Head mapping. When n_v_heads > n_k_heads, each VALUE head carries its own d x d state. Value
+//! head j uses key head j mod n_k, NOT the contiguous j / v_per_k, because llama.cpp repeats q and
+//! k with ggml_repeat, which TILES the key heads. The 2B is the n_v == n_k case.
+//!
+//! Scale. `stepPrologue` scales q by 1/sqrt(head_dim) once per key head, so the scale lands
+//! exactly once even when v_per_k > 1. It matches llama.cpp `ggml_scale(q, 1/sqrt(S_k))` and
+//! feeds only the readout. Dropping it inflates the output about 1.5x, because eps breaks the
+//! scale invariance of the gated RMSNorm when the state is small.
+//!
+//! Chunked form. `chunkScan` matches `recurStep` run over the T tokens in sequence, but the form
+//! is matrix ops plus one T x T strictly-lower-triangular solve. The serial t-loop collapses into
+//! the solve, and the rest is parallel matmuls. State S[i,j] has i over the key dim and j over
+//! the value dim. The per-token scalar decay d_t is in (0,1], and beta_t is in (0,1). S_in is the
+//! incoming state:
+//!
+//!   P[r] = prod_{u=0..r} d_u                       (cumulative decay, <= 1)
+//!   delta_r = beta_r (v_r - P[r]*Sin^T k_r) - sum_{s<r} beta_r (P[r]/P[s])(k_s.k_r) delta_s
+//!   o_r  = P[r]*Sin^T q_r + sum_{s<=r} (P[r]/P[s])(k_s.q_r) delta_s
+//!   S_out = P[T-1]*S_in + sum_s (P[T-1]/P[s]) k_s (x) delta_s
+//!
+//! Every decay factor is a product of d_u values in (0,1], so every ratio stays at or below 1.
+//! The scan is therefore stable across a full 128-token chunk, with no 1/A blow-up. A
+//! sub-chunked GPU port is a free choice under bounded shared memory, not a numerical need.
 
 const std = @import("std");
 
 // -- constants --------------------------------------------------------------
 
-/// Largest per-head state dimension that the stack-allocated scratch accepts.
-/// Qwen3.5 uses ssm.state_size = 128 on both the 2B and the 9B. The bound keeps
-/// the recurrence scratch, the delta vector and a state row, on the stack.
+/// Largest per-head state dimension that the stack scratch accepts. Qwen3.5 uses 128.
 const max_head_dim: usize = 128;
 
 // -- types ------------------------------------------------------------------
@@ -62,10 +74,7 @@ const max_head_dim: usize = 128;
 pub const Dims = struct {
     /// GDN key/query heads (= ssm.group_count: 16 on both 2B and 9B).
     n_k_heads: usize,
-    /// GDN value heads (= ssm.time_step_rank: 16 on the 2B, 32 on the 9B).
-    /// The heads decouple when n_v_heads > n_k_heads. Each key head then feeds
-    /// n_v/n_k value heads in the GQA style, and each VALUE head carries its own
-    /// dxd recurrent state. The 2B is the n_v == n_k special case.
+    /// GDN value heads (= ssm.time_step_rank: 16 on the 2B, 32 on the 9B). See "Head mapping".
     n_v_heads: usize,
     /// Per-head state dim d (= ssm.state_size, 128). Key and value head dims are equal.
     head_dim: usize,
@@ -98,11 +107,9 @@ pub const Dims = struct {
     }
 };
 
-/// The inputs and outputs of the value-head loop of one GDN step. The
-/// prologue writes `qkv` before this loop starts. A value-head range reads
-/// `qkv`, the per-head inputs, and the weights, and it writes only the state
-/// and the readout of its own heads. So disjoint ranges can run at the same
-/// time, and each head gets the bits of the serial step.
+/// The inputs and outputs of the value-head loop of one GDN step. A value-head range writes only
+/// the state and the readout of its own heads. So disjoint ranges can run at the same time, and
+/// each head gets the bits of the serial step.
 pub const Heads = struct {
     /// [convDim] q|k|v after `stepPrologue`: conv, SiLU, and the q and k norms.
     qkv: []const f32,
@@ -127,28 +134,9 @@ pub const Heads = struct {
 
 // -- api --------------------------------------------------------------------
 
-/// Chunk-parallel gated delta-rule scan for ONE value head. The result matches
-/// `recurStep` run over the `T` tokens in sequence, but the form is matrix ops
-/// plus one TxT strictly-lower-triangular solve. The GPU prefill kernel mirrors
-/// that form. The serial t-loop collapses into the solve, and the rest is
-/// parallel matmuls.
-///
-/// Derivation. State S[i,j] has i over the key dim and j over the value dim.
-/// The per-token scalar decay d_t is in (0,1], and beta_t is in (0,1). S_in is
-/// the incoming state:
-///   P[r] = prod_{u=0..r} d_u                       (cumulative decay, <= 1)
-///   delta_r = beta_r (v_r - P[r]*Sin^T k_r) - sum_{s<r} beta_r (P[r]/P[s])(k_s.k_r) delta_s
-///   o_r  = P[r]*Sin^T q_r + sum_{s<=r} (P[r]/P[s])(k_s.q_r) delta_s
-///   S_out = P[T-1]*S_in + sum_s (P[T-1]/P[s]) k_s (x) delta_s
-/// Every decay factor is a product of d_u values in (0,1], so every ratio stays
-/// at or below 1. The scan is therefore stable across a full 128-token chunk,
-/// with no 1/A blow-up. A sub-chunked GPU port is a free choice under bounded
-/// shared memory, not a numerical need.
-///
-/// `s` is [d*d] in and out. `q`, `k` and `v` are [T*d], the value head's
-/// per-token rows, with q already normed and scaled and k normed. `decay` and
-/// `beta` are [T]. `o` is [T*d]. The call allocates O(T^2 + T*d) scratch, so it
-/// belongs on the reference and test path, not in the hot loop.
+/// Chunk-parallel gated delta-rule scan for ONE value head. See "Chunked form" in the header.
+/// `s` is [d*d] in and out. `q`, `k` and `v` are [T*d], with q normed and scaled and k normed.
+/// `decay` and `beta` are [T]. `o` is [T*d]. The scratch is O(T*d), so keep it off the hot loop.
 pub fn chunkScan(
     gpa: std.mem.Allocator,
     d: usize,
@@ -171,7 +159,7 @@ pub fn chunkScan(
     std.debug.assert(o.len == T * d);
     if (T == 0) return;
 
-    // The cumulative decay P from the derivation.
+    // Compute the cumulative decay P.
     const P = try gpa.alloc(f32, T);
     defer gpa.free(P);
 
@@ -183,7 +171,7 @@ pub fn chunkScan(
         }
     }
 
-    // `s` still holds S_in here, because the state update comes last.
+    // Read the incoming state with every key and query. `s` still holds S_in here.
     const sin_k = try gpa.alloc(f32, T * d);
     defer gpa.free(sin_k);
 
@@ -207,7 +195,7 @@ pub fn chunkScan(
         }
     }
 
-    // delta from the derivation, solved by forward substitution.
+    // Solve for delta by forward substitution.
     const delta = try gpa.alloc(f32, T * d);
     defer gpa.free(delta);
 
@@ -233,7 +221,7 @@ pub fn chunkScan(
         }
     }
 
-    // The per-token readout o from the derivation.
+    // Compute the per-token readout.
     for (0..T) |r| {
         const qr = q[r * d ..][0..d];
         for (0..d) |j| {
@@ -255,7 +243,7 @@ pub fn chunkScan(
         }
     }
 
-    // The outgoing state S_out from the derivation.
+    // Write the outgoing state S_out.
     const plast = P[T - 1];
     for (s) |*x| {
         x.* *= plast;
@@ -275,6 +263,7 @@ pub fn chunkScan(
         }
     }
 
+    // Check that the results are finite.
     if (std.debug.runtime_safety) {
         for (o[0 .. T * d]) |x| {
             std.debug.assert(std.math.isFinite(x));
@@ -286,12 +275,9 @@ pub fn chunkScan(
     }
 }
 
-/// Full per-token GDN step. It mutates `qkv` with the conv result, plus `state`
-/// and `conv_state`. It writes the result before the output projection into
-/// `o_out`, which has length `inner`. The caller supplies the projected `qkv`,
-/// the gate `z`, the decay and beta projections `a` and `b`, and the GDN
-/// weights. The caller applies `ssm_out` to `o_out` afterwards. The step is
-/// `stepPrologue`, then `stepHeads` over every value head.
+/// Full per-token GDN step: `stepPrologue`, then `stepHeads` over every value head.
+/// It mutates `qkv`, `state`, and `conv_state`, and writes `o_out` (length `inner`).
+/// The caller applies `ssm_out` to `o_out` afterwards.
 pub fn step(
     d: Dims,
     qkv: []f32, // [convDim] projected q|k|v (mutated: conv + silu in place)
@@ -324,10 +310,8 @@ pub fn step(
     assertFinite(d, o_out);
 }
 
-/// The serial prologue of one GDN step: the conv and SiLU over every channel,
-/// then the L2 norm of q and k per key head and the scale of q. It mutates
-/// `qkv` and `conv_state`. Every value head reads its key head from the
-/// result, so the prologue must end before any value head starts.
+/// The serial prologue of one GDN step: conv and SiLU over every channel, then the L2 norm of
+/// q and k per key head and the scale of q. It must end before any value head starts.
 pub fn stepPrologue(
     d: Dims,
     qkv: []f32, // [convDim] projected q|k|v (mutated: conv + silu in place)
@@ -341,19 +325,12 @@ pub fn stepPrologue(
     std.debug.assert(qkv.len == d.convDim());
     std.debug.assert(conv_state.len == d.convStateLen());
 
-    // 1-2. conv + silu over the concatenated channels.
+    // Run the conv and SiLU over the concatenated channels.
     convStepSilu(d, conv_w, conv_state, qkv);
-    // The contiguous layout gives q and k key_dim each, over n_k heads, and v
-    // value_dim over n_v heads. The 2B has n_v == n_k, so all three match.
     const q = qkv[0..key_dim];
     const k = qkv[key_dim .. 2 * key_dim];
 
-    // 3. L2-normalize q and k per KEY head, then scale q by 1/sqrt(head_dim).
-    // The scale runs once per key head, not per value head, so it lands exactly
-    // once even when v_per_k > 1. It matches llama.cpp `ggml_scale(q,
-    // 1/sqrt(S_k))` and feeds only the readout. The gated RMSNorm is not
-    // scale-invariant when the state is small, because eps breaks it. Dropping
-    // the scale inflates the output about 1.5x.
+    // L2-normalize q and k per KEY head, then scale q. See "Scale" in the header.
     const q_scale = 1.0 / @sqrt(@as(f32, @floatFromInt(dim)));
     var kh: usize = 0;
     while (kh < d.n_k_heads) : (kh += 1) {
@@ -396,9 +373,7 @@ pub fn stepHeads(d: Dims, heads: Heads, h_lo: usize, h_hi: usize) void {
     const k = heads.qkv[key_dim .. 2 * key_dim];
     const v = heads.qkv[2 * key_dim .. 2 * key_dim + value_dim];
 
-    // 4-6. recurrence + gated-norm per VALUE head. The key head is vh % n_k.
-    // llama.cpp repeats q/k from n_k to n_v heads with ggml_repeat, which TILES
-    // the key heads. Value head j uses key head j mod n_k, NOT contiguous j/v_per_k.
+    // Run the recurrence and the gated norm per VALUE head. See "Head mapping" in the header.
     var vh: usize = h_lo;
     while (vh < h_hi) : (vh += 1) {
         const ki = vh % d.n_k_heads;
@@ -406,7 +381,7 @@ pub fn stepHeads(d: Dims, heads: Heads, h_lo: usize, h_hi: usize) void {
         const kk = k[ki * dim ..][0..dim];
         const vv = v[vh * dim ..][0..dim];
         const oh = heads.o_out[vh * dim ..][0..dim];
-        // GGUF ssm_a is already -exp(A_log), so multiply directly and do NOT re-exp.
+        // The step 4 line of the header gives the decay.
         const g = heads.ssm_a[vh] * softplus(heads.a[vh] + heads.dt_bias[vh]);
         const beta = sigmoid(heads.b[vh]);
         recurStep(heads.state[vh * dim * dim ..][0 .. dim * dim], qh, kk, vv, @exp(g), beta, oh);
@@ -455,10 +430,8 @@ fn l2normInplace(x: []f32, eps: f32) void {
     }
 }
 
-/// Causal depthwise conv1d over all `convDim` channels of `qkv`, then SiLU, in
-/// place. `conv_state` holds the last K-1 inputs per channel with t=0 oldest,
-/// and this function advances it by one step. `conv_w` is
-/// `w(tap,chan) = conv_w[chan*K+tap]`.
+/// Causal depthwise conv1d over all `convDim` channels of `qkv`, then SiLU, in place.
+/// It advances `conv_state` by one step. See "Layout" in the header.
 fn convStepSilu(d: Dims, conv_w: []const f32, conv_state: []f32, qkv: []f32) void {
     const k = d.conv_kernel;
     const cdim = d.convDim();
@@ -489,9 +462,7 @@ fn convStepSilu(d: Dims, conv_w: []const f32, conv_state: []f32, qkv: []f32) voi
 }
 
 /// One head's gated delta-rule step: decay, read, delta, write, readout.
-/// `s` is the head's dxd state (`s[i*D + j]`) and the call mutates it. `o`
-/// receives the length-D readout. `q`, `k` and `v` are the head's inputs, with
-/// q and k already L2-normed.
+/// `s` is the head's d x d state (`s[i*D + j]`), mutated. `q` and `k` arrive L2-normed.
 fn recurStep(
     s: []f32,
     q: []const f32,
@@ -508,10 +479,12 @@ fn recurStep(
     std.debug.assert(o.len == dim);
     std.debug.assert(dim <= max_head_dim);
 
+    // Decay the state.
     for (s) |*x| {
         x.* *= decay;
     }
 
+    // Read the memory with the key and form the delta.
     var delta: [max_head_dim]f32 = undefined;
     var j: usize = 0;
     while (j < dim) : (j += 1) {
@@ -524,6 +497,7 @@ fn recurStep(
         delta[j] = (v[j] - mem) * beta;
     }
 
+    // Write the rank-1 update and read out with the query.
     @memset(o, 0);
     var i: usize = 0;
     while (i < dim) : (i += 1) {
@@ -612,8 +586,7 @@ test "recurStep first token: o = (k·q)·beta·v when state starts at zero" {
 
 test "chunkScan matches sequential recurStep (state + per-token readout)" {
     const gpa = std.testing.allocator;
-    // Math is head-dim agnostic. Small d plus several T sizes (incl. T=1 and a
-    // multi-token chunk) exercise the triangular solve + state carry.
+    // Small d and several T, with T=1 and a multi-token chunk, cover the solve and the carry.
     const d: usize = 24;
     for ([_]usize{ 1, 2, 7, 33 }) |T| {
         var prng = std.Random.DefaultPrng.init(0xC0DE + T);

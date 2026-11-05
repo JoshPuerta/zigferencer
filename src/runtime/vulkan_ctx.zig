@@ -21,6 +21,24 @@
 //! 8-bit storage nor `shaderInt8`, so the quant kernels pack four quants to a
 //! `uint`. It reports the spec minimum for the storage-buffer range, so a
 //! caller can replace that one limit through `Options`.
+//!
+//! Device features. The Q8_0 kernels read f16 weight scales out of storage buffers. That needs
+//! 16-bit storage and float16 arithmetic, which are core in Vulkan 1.1 and 1.2, so a
+//! Vulkan11/12Features chain enables them. 8-bit storage and `shaderInt8` stay off, because the
+//! driver exposes neither on RDNA2. The kernels pack the quants four to a `uint` and decode them
+//! with `bitfieldExtract`, at the price of a few ALU ops. `VK_EXT_subgroup_size_control` pins a
+//! required subgroup size of 32 on every compute pipeline. The driver reports 32 to 64, and
+//! without the pin its shader compiler can choose wave64. RDNA2 issues a wave64 vector op in two
+//! passes, so the pin forces the native wave32.
+//!
+//! Memory budget. `VK_EXT_memory_budget` is optional and exposes the free device-local VRAM,
+//! which sizes the multi-stream KV window to the hardware. When a driver lacks it,
+//! `deviceLocalBudget` returns null and the runner keeps its default window.
+//!
+//! One-shot submit. The translation layer makes a native command allocator for each command
+//! buffer, and the paravirtual driver leaks part of it when the buffer is freed. So a one-shot
+//! submit never allocates. It resets `staging_cmd`, and every submit waits before it returns, so
+//! the buffer is never pending at the next reset.
 
 const std = @import("std");
 const build_options = @import("build_options");
@@ -116,30 +134,21 @@ pub const Context = struct {
     physical_device: vk.PhysicalDevice,
     physical_device_props: vk.PhysicalDeviceProperties,
     mem_props: vk.PhysicalDeviceMemoryProperties,
-    /// True when VK_EXT_memory_budget is enabled, which makes
-    /// `deviceLocalBudget` live.
+    /// True when VK_EXT_memory_budget is enabled, which makes `deviceLocalBudget` live.
     has_memory_budget: bool,
-    /// The limits every buffer check reads. The storage range is the override
-    /// when the caller stated one.
+    /// The limits every buffer check reads. The storage range is the override when set.
     buffer_limits: limits.BufferLimits,
     /// The storage range the driver reports, kept for the boot log and `info`.
     reported_storage_range: u64,
     device: vk.Device,
     queue: vk.Queue,
     queue_family: u32,
-    /// The valid bits of a timestamp on the queue family. A tick difference
-    /// is taken modulo this width, so a counter wrap stays correct.
+    /// Valid bits of a queue timestamp. A tick difference is taken modulo this width.
     timestamp_valid_bits: u32,
     command_pool: vk.CommandPool,
-    /// The one command buffer of every one-shot submit, which
-    /// `kernels.submitOnce` resets each time. The translation layer makes a
-    /// native command allocator for each command buffer, and the paravirtual
-    /// driver leaks part of it when the buffer is freed. So a one-shot submit
-    /// never allocates a buffer. Every submit waits before it returns, so the
-    /// buffer is never pending when the next submit resets it.
+    /// The one command buffer of every one-shot submit. See "One-shot submit" in the header.
     staging_cmd: vk.CommandBuffer,
-    /// The two timestamp slots of `staging_cmd`, start and end. It exists only
-    /// when the GPU timestamp level of the process is not `off`.
+    /// The start and end timestamp slots of `staging_cmd`. A null handle unless timestamps are on.
     staging_query_pool: vk.QueryPool,
     vkb: vk.BaseWrapper,
     vki: vk.InstanceWrapper,
@@ -151,6 +160,7 @@ pub const Context = struct {
             std.debug.assert(r <= limits.storage_range_max);
         }
 
+        // Create the instance.
         const vkb = vk.BaseWrapper.load(vkGetInstanceProcAddr);
         if (vkb.dispatch.vkCreateInstance == null) return error.BaseFunctionsMissing;
 
@@ -171,11 +181,12 @@ pub const Context = struct {
 
         errdefer vki.destroyInstance(instance, null);
 
+        // Pick the device and its compute queue family.
         const picked = try pickPhysicalDevice(vki, instance, allocator);
         const family = try findComputeQueueFamily(vki, picked.device, allocator);
         const queue_family = family.index;
-        // A device with no timestamp bits or no tick period cannot time a
-        // command buffer, so the level drops to off before any pool exists.
+
+        // Turn GPU timestamps off when the device cannot time a command buffer.
         if (span.gpuLevel() != .off and
             (family.timestamp_valid_bits == 0 or !(picked.props.limits.timestamp_period > 0)))
         {
@@ -186,6 +197,7 @@ pub const Context = struct {
             span.setGpuLevel(.off);
         }
 
+        // Describe the one compute queue.
         const queue_priorities = [_]f32{1.0};
         const queue_create_infos = [_]vk.DeviceQueueCreateInfo{
             .{
@@ -195,21 +207,7 @@ pub const Context = struct {
             },
         };
 
-        // The Q8_0 kernels (linear_q8_0) read f16 weight scales straight out of
-        // SSBOs through GL_EXT_shader_16bit_storage and
-        // GL_EXT_shader_explicit_arithmetic_types_float16. The matching Vulkan
-        // features are core in 1.1 and 1.2, so the Vulkan11/12Features pNext
-        // chain enables them.
-        //
-        // 8-bit storage and shaderInt8 stay off, because the driver exposes
-        // neither on RDNA2. The kernels pack the Q8_0 quants four to a `uint`
-        // and decode them with `bitfieldExtract`, at the price of a few ALU ops.
-        //
-        // VK_EXT_subgroup_size_control pins RequiredSubgroupSize=32 on every
-        // compute pipeline. The driver reports min=32 max=64. Without the pin
-        // its shader compiler can choose wave64, and RDNA2 issues a wave64
-        // vector ALU or memory op in two passes. Pinning to 32 forces wave32,
-        // the architecture's native execution width.
+        // Enable f16 storage, and pin wave32. See "Device features" in the header.
         var sgsc_features: vk.PhysicalDeviceSubgroupSizeControlFeatures = .{
             .subgroup_size_control = .true,
         };
@@ -221,10 +219,8 @@ pub const Context = struct {
             .shader_float_16 = .true,
             .p_next = @ptrCast(&v11_features),
         };
-        // VK_EXT_memory_budget (optional device extension) exposes free
-        // device-local VRAM, which sizes the multi-stream KV window to the
-        // hardware instead of a static default. It is absent on some drivers.
-        // `deviceLocalBudget` then returns null and the runner keeps its default.
+
+        // Probe the optional extensions. See "Memory budget" in the header.
         const avail_exts = vki.enumerateDeviceExtensionPropertiesAlloc(
             picked.device,
             null,
@@ -251,6 +247,7 @@ pub const Context = struct {
             .{ avail_exts.len, has_memory_budget, has_maintenance4 },
         );
 
+        // Read the buffer limits, and apply the storage-range override.
         const reported = try readBufferLimits(vki, picked.device, picked.props, has_maintenance4);
         var buffer_limits = reported;
         if (options.storage_range_override) |r| {
@@ -270,8 +267,14 @@ pub const Context = struct {
         log.debug(
             "buffer limits: storage-buffer range {d} bytes, allocation size {d} bytes, " ++
                 "offset alignment {d} bytes",
-            .{ buffer_limits.storage_range, buffer_limits.allocation_size, buffer_limits.offset_alignment },
+            .{
+                buffer_limits.storage_range,
+                buffer_limits.allocation_size,
+                buffer_limits.offset_alignment,
+            },
         );
+
+        // Create the logical device.
         var ext_names: [2][*:0]const u8 = undefined;
         var ext_count: u32 = 0;
         ext_names[ext_count] = vk.extensions.ext_subgroup_size_control.name;
@@ -295,6 +298,7 @@ pub const Context = struct {
 
         errdefer vkd.destroyDevice(device, null);
 
+        // Create the command pool, the one-shot command buffer, and the timestamp pool.
         const queue = vkd.getDeviceQueue(device, queue_family, 0);
 
         const pool_info: vk.CommandPoolCreateInfo = .{
@@ -329,6 +333,7 @@ pub const Context = struct {
             null,
         );
 
+        // Log the memory layout.
         const mem_props = vki.getPhysicalDeviceMemoryProperties(picked.device);
         for (mem_props.memory_types[0..mem_props.memory_type_count], 0..) |t, type_index| {
             const t_heap = mem_props.memory_heaps[t.heap_index];
@@ -351,6 +356,7 @@ pub const Context = struct {
 
         log.debug("init done: queue family {d}, vram {d:.0} MiB", .{ queue_family, vram_mib });
 
+        // Hand the handles to the context.
         return .{
             .instance = instance,
             .physical_device = picked.device,
@@ -387,10 +393,8 @@ pub const Context = struct {
         self.vki.destroyInstance(self.instance, null);
     }
 
-    /// Free / used bytes of the device-local (VRAM) heap, from the live
-    /// `VK_EXT_memory_budget` query. `null` when the extension is absent (the
-    /// caller then keeps its static window). Read once at runner init so the KV
-    /// window is fixed for the engine's lifetime (deterministic after startup).
+    /// Budget and usage of the device-local heap, from the live memory-budget query.
+    /// Null when the extension is absent. Read once at runner init, so the KV window stays fixed.
     pub fn deviceLocalBudget(self: *const Context) ?struct { budget: u64, usage: u64 } {
         if (!self.has_memory_budget) return null;
 
@@ -441,10 +445,8 @@ pub const Context = struct {
         };
     }
 
-    /// Device-local VRAM bytes free for new allocations right now: the live
-    /// `VK_EXT_memory_budget` (budget - usage) when present, else the static
-    /// device-local heap size. On a GPU shared with a desktop the live value is
-    /// the one that matters, because the heap size overstates what is free.
+    /// Device-local bytes free now: budget - usage when live, else the static heap size.
+    /// The heap size overstates the free bytes on a GPU that a desktop shares.
     pub fn deviceLocalAvailableBytes(self: *const Context) u64 {
         if (self.deviceLocalBudget()) |b| return b.budget -| b.usage;
         for (self.mem_props.memory_heaps[0..self.mem_props.memory_heap_count]) |heap| {
@@ -454,9 +456,8 @@ pub const Context = struct {
         return 0;
     }
 
-    /// Refuse a KV layout whose region breaks a device buffer limit, before
-    /// any allocation. The log line names the limit, the region size, and the
-    /// widest window that fits.
+    /// Refuse a KV layout whose region breaks a device buffer limit, before any allocation.
+    /// The log line names the limit, the region size, and the widest window that fits.
     pub fn guardKvLayout(
         self: *const Context,
         layout: kv_index.Layout,
@@ -465,13 +466,13 @@ pub const Context = struct {
         const verdict = kv_index.fits(layout, lim);
         if (verdict == .fits) return;
 
+        // Name the failed limit.
         const bytes = layout.regionBytes();
         const n_slots = layout.n_slots;
         const window = layout.window;
         const limit = kv_index.limitOf(verdict, lim);
         if (verdict == .misaligned) {
-            // A window that is a multiple of this unit keeps the region a whole
-            // number of alignment units.
+            // A window that is a multiple of `unit` keeps the region whole in alignment units.
             const one_position = kv_index.Layout.init(
                 n_slots,
                 1,
@@ -492,6 +493,7 @@ pub const Context = struct {
             return error.KvRegionPastDeviceLimit;
         }
 
+        // Pick the advice, from the widest window that fits.
         const fit = kv_index.maxGranuleWindow(n_slots, layout.per_step, layout.kv_dtype, lim);
         std.debug.assert(fit < window);
         var advice_buf: [kv_advice_max]u8 = undefined;
@@ -505,11 +507,21 @@ pub const Context = struct {
         else
             std.fmt.bufPrint(&advice_buf, kv_advice_fmt, .{fit}) catch unreachable;
 
+        // Log the refusal in the unit of the failed limit.
         switch (limit.unit) {
             .elements => log.err(
                 "KV region of {d} bytes for {d} slots x {d} positions holds {d} elements, " ++
                     "but the {s} is {d} {t}. {s}",
-                .{ bytes, n_slots, window, layout.regionElems(), limit.name, limit.value, limit.unit, advice },
+                .{
+                    bytes,
+                    n_slots,
+                    window,
+                    layout.regionElems(),
+                    limit.name,
+                    limit.value,
+                    limit.unit,
+                    advice,
+                },
             ),
             .bytes => log.err(
                 "KV region of {d} bytes for {d} slots x {d} positions is larger than the " ++
@@ -521,8 +533,7 @@ pub const Context = struct {
         return error.KvRegionPastDeviceLimit;
     }
 
-    /// Refuse a split attention scratch that breaks a device buffer limit,
-    /// before any allocation. The log line names the limit and both counts.
+    /// Refuse a split attention scratch that breaks a device buffer limit, before any allocation.
     pub fn guardAttnSplitScratch(
         self: *const Context,
         scratch: attn_split.Scratch,
@@ -570,6 +581,7 @@ pub fn pickPhysicalDevice(
 
     if (devices.len == 0) return error.NoVulkanDevice;
 
+    // Keep the best score. The first device wins a tie.
     var best: ?PickedDevice = null;
     for (devices) |dev| {
         const props = vki.getPhysicalDeviceProperties(dev);
@@ -590,11 +602,8 @@ pub fn pickPhysicalDevice(
     return picked;
 }
 
-/// Find a Vulkan memory type that satisfies a buffer's `type_bits` mask and
-/// has every flag in `required_flags`. Buffer creation paths use it to pair
-/// a buffer with a heap (host-visible plus coherent for staging, device-local
-/// for VRAM-resident weights). Returns null when no type qualifies, which the
-/// caller turns into `error.NoSuitableMemoryType`.
+/// Find a memory type that the `type_bits` mask allows and that has every flag in `required_flags`.
+/// Returns null when none qualifies. The caller turns that into `error.NoSuitableMemoryType`.
 pub fn findMemoryType(
     mem_props: vk.PhysicalDeviceMemoryProperties,
     type_bits: u32,
@@ -612,11 +621,8 @@ pub fn findMemoryType(
     return null;
 }
 
-/// Pick the memory type for a host-visible buffer that the CPU writes and
-/// reads. It prefers a host-visible, host-coherent, host-cached type, because
-/// an uncached host mapping makes every CPU write and read run at a small
-/// fraction of memory speed. It falls back to the first host-visible,
-/// host-coherent type, which the caller must treat as slow for CPU access.
+/// Pick the memory type for a buffer that the CPU writes and reads. A cached type wins, because
+/// an uncached mapping runs at a small fraction of memory speed. The coherent fallback is slow.
 /// Returns null when no allowed type is host-visible and coherent.
 pub fn pickHostType(mem_props: vk.PhysicalDeviceMemoryProperties, type_bits: u32) ?u32 {
     return findMemoryType(mem_props, type_bits, host_cached_flags) orelse
@@ -631,10 +637,8 @@ fn apiAtLeast13(api_version: u32) bool {
     return v.major > 1 or (v.major == 1 and v.minor >= 3);
 }
 
-/// Read the storage-buffer limits of one device. The allocation size takes the
-/// lower `maxBufferSize` where the device reports one, as the llama.cpp Vulkan
-/// backend does. A zero limit or an alignment that is not a power of two is a
-/// driver fault. It fails the open, not each buffer check after it.
+/// Read the storage-buffer limits of one device. The allocation size takes the lower
+/// `maxBufferSize` where the device reports one. A zero limit or an odd alignment fails the open.
 fn readBufferLimits(
     vki: vk.InstanceWrapper,
     dev: vk.PhysicalDevice,

@@ -1,6 +1,14 @@
-//! The batch row every runner steps, and the row rule they all hold. The file
-//! carries no weights and no state, so a runner of either family can depend on
-//! it without depending on another runner.
+//! The batch row every runner steps, and the row rule they all hold. The file carries no weights
+//! and no state, so a runner of either family can depend on it without depending on another runner.
+//!
+//! Row rule. Rows that share a slot are adjacent and ascend by exactly one position. The
+//! `want_logits` rows form a suffix of the batch, so their hidden states are contiguous. The
+//! lm_head then runs as one batched projection, and prompt rows skip it. A batch row sees exactly
+//! the inputs of its solo call.
+//!
+//! Error split. A bad slot, a broken adjacency, or a broken suffix is a programmer error (assert).
+//! A position past the window is runtime data (typed error). A row count past `rows_max` is a
+//! typed error in every build mode, because a ReleaseFast overflow writes past the row scratch.
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
@@ -14,30 +22,21 @@ pub const Error = error{
     TooManyRows,
 } || Allocator.Error;
 
-/// One row of a batched forward step. Rows sharing a slot must be adjacent
-/// and ascending by exactly one position. `want_logits` rows must form a
-/// suffix of the batch (their hidden states are contiguous, so the lm_head
-/// runs as one batched projection and prompt rows skip it entirely).
+/// One row of a batched forward step. The header states the row rule.
 pub const StepRow = struct {
     /// KV slot to read and write.
     slot: u32,
     token: u32,
     /// Position to write at. Attention spans `0..=pos`.
     pos: u32,
-    /// Compute final norm + lm_head for this row. Logits for the row at batch
-    /// index i land at `logits[i * vocab_size ..]`.
+    /// Compute the final norm and lm_head for this row. Row i lands at `logits[i * vocab_size ..]`.
     want_logits: bool,
 };
 
 // -- api --------------------------------------------------------------------
 
-/// Check the row rule that every runner shares, so they cannot drift: a
-/// batch row sees exactly the inputs of its solo call. Slot bounds, same-slot
-/// adjacency, and the `want_logits` suffix are programmer errors (asserts). An
-/// out-of-range position is runtime data (typed error). A row count past
-/// `rows_max` is a typed error in every build mode, because a ReleaseFast
-/// overflow writes past the row scratch. Returns the count of `want_logits`
-/// rows.
+/// Check the row rule that every runner shares, so they cannot drift. Returns the count of
+/// `want_logits` rows. The header splits the asserts from the typed errors.
 pub fn validateRows(
     rows: []const StepRow,
     slot_count: u32,
@@ -50,13 +49,14 @@ pub fn validateRows(
 
     var seen_logits = false;
     var n_logits: u32 = 0;
+    // Check each row against its neighbors and count the logits suffix.
     for (rows, 0..) |r, i| {
         std.debug.assert(r.slot < slot_count);
 
         if (r.pos >= max_seq) return error.PositionOutOfRange;
 
         if (i > 0 and rows[i - 1].slot == r.slot) {
-            // Consecutive ascending positions: the chunked-prefill shape.
+            // The chunked-prefill shape: consecutive ascending positions.
             std.debug.assert(rows[i - 1].pos + 1 == r.pos);
         } else if (i > 0) {
             // A slot's rows are adjacent. It must not reappear later.
@@ -76,10 +76,8 @@ pub fn validateRows(
     return n_logits;
 }
 
-/// Start of the `want_logits` suffix: rows[first..] all want logits, and
-/// no earlier row does, because the row rule makes them a suffix. lm_head runs
-/// for that suffix only. The prompt rows of a prefill chunk therefore skip the
-/// costliest matmul in the model.
+/// Start of the `want_logits` suffix. The lm_head runs for that suffix only, so the prompt rows of
+/// a prefill chunk skip the costliest matmul in the model.
 pub fn wantLogitsFirst(rows: []const StepRow) u32 {
     var first: u32 = @intCast(rows.len);
     while (first > 0 and rows[first - 1].want_logits) {
@@ -89,9 +87,8 @@ pub fn wantLogitsFirst(rows: []const StepRow) u32 {
     return first;
 }
 
-/// True when the runner that `RunnerPtr` points at declares
-/// `chunked_prefill = true`. Such a runner prefills a prompt in
-/// `prefillBatch` chunks. Every other runner keeps the per-token loop.
+/// True when the runner behind `RunnerPtr` declares `chunked_prefill = true`. Such a runner
+/// prefills in `prefillBatch` chunks, and every other runner keeps the per-token loop.
 pub fn chunkedPrefill(comptime RunnerPtr: type) bool {
     const R = @typeInfo(RunnerPtr).pointer.child;
     return @hasDecl(R, "chunked_prefill") and R.chunked_prefill;

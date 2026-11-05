@@ -1,31 +1,46 @@
-//! End-to-end serve gate over a real model and real sockets. Each test boots
-//! its own in-process server through `serve_harness.zig` and drives it through
-//! the reference client.
+//! End-to-end serve gate over a real model and real sockets. Each test boots its own in-process
+//! server through `serve_harness.zig` and drives it through the reference client.
 //!
-//! The load-bearing assertion is exact. A turn that the server runs while
-//! other sessions decode in the same batch produces the same token stream the
-//! turn produces alone. This holds on one connection and across four at once.
-//! Batched serving is sequential serving, seen from the wire. The first test
-//! also checks that context_full surfaces as a `done` and not as an error. It
-//! checks that a close in the middle of a generate leaves the server healthy
-//! and the slot reusable. It checks that the shutdown handshake is clean.
+//! Batch equality. The load-bearing assertion is exact. A turn that the server runs while other
+//! sessions decode in the same batch produces the same token stream the turn produces alone. This
+//! holds on one connection and across four at once. Batched serving is sequential serving, seen
+//! from the wire.
 //!
-//! The other tests drive every client method against a live server. They
-//! cover ping, stats, open, clone, and close. They cover cancel in prefill, in
-//! decode, on an idle session, and on an unknown one. They check the unix
-//! transport against TCP and the connection cap. They check the per-connection
-//! session share, the sweep after a hang-up, and a wire shutdown that the
-//! server refuses. Two tests read a `turn_too_long` refusal, which names the
-//! turn size and the positions left. One runs on a fresh session, and one runs
-//! after a turn fills the window. Every test returns `error.SkipZigTest` when
-//! no fixture exists.
+//! First test. It also checks that context_full surfaces as a `done` and not as an error. It checks
+//! that a close in the middle of a generate leaves the server healthy and the slot reusable. It
+//! checks that the shutdown handshake is clean.
+//!
+//! Client surface. The other tests drive every client method against a live server. They cover
+//! ping, stats, open, clone, and close. They cover cancel in prefill, in decode, on an idle
+//! session, and on an unknown one. They check the unix transport against TCP and the connection
+//! cap. They check the per-connection session share, the sweep after a hang-up, and a wire shutdown
+//! that the server refuses.
+//!
+//! Cancel in prefill. The spare-rows rule keeps prefill at one row per decode slot, so the prompt
+//! takes many ticks. With no decoder, one tick feeds `max_batch - 0 = 3` prompt rows, capped by
+//! `max_step_rows = 3`. The 41 tokens of the prompt need ceil(41 / 3) = 14 ticks before the first
+//! token. The cancel is one frame behind the generate on the same connection, and the reader
+//! submits each frame as soon as it decodes it. The engine takes up to 16 queued requests per pass,
+//! so the cancel lands while the prompt still prefills. The default rule takes the prompt in one
+//! tick.
+//!
+//! Refusals. Two tests read a `turn_too_long` refusal, which names the turn size and the positions
+//! left. One runs on a fresh session, and one runs after a turn fills the window.
+//!
+//! Kept pairs. A conversation runs live on one session, then its turns go into a fresh session as
+//! kept pairs. Each `appended` position must equal the live position, and the next turn must stream
+//! the same ids on both sessions. The server runs the real chat template with thinking off, so the
+//! kept pair renders the wraps of the live turn. A turn that stops at its budget leaves its last
+//! token pending. The pair holds that token, so its position is one past the live one.
+//!
+//! Skips. Every test returns `error.SkipZigTest` when no fixture exists.
 
 const std = @import("std");
-const z = @import("zigferencer");
-const protocol = z.serve_protocol;
-const Client = z.serve_client.Client;
-const event = z.serve_event;
-const serve_engine = z.serve_engine;
+const zigferencer = @import("zigferencer");
+const protocol = zigferencer.serve_protocol;
+const Client = zigferencer.serve_client.Client;
+const event = zigferencer.serve_event;
+const serve_engine = zigferencer.serve_engine;
 const harness = @import("serve_harness.zig");
 const Harness = harness.Harness;
 const Stream = harness.Stream;
@@ -518,15 +533,8 @@ test "cancel during prefill finishes the turn with no tokens" {
     defer client.deinit();
     defer h.stop(&client);
 
-    // The spare-rows rule keeps prefill at one row per decode slot, so the
-    // prompt takes many ticks. The default rule takes it in one tick.
-    // The cancel must land while the prompt still prefills. The generate and
-    // the cancel travel in order on one connection, and the reader submits
-    // each frame as soon as it decodes it. The engine takes up to 16 queued
-    // requests per pass. With no decoder, one tick feeds `max_batch - 0 = 3`
-    // prompt rows, capped by `max_step_rows = 3`. The 41 tokens of this prompt
-    // thus need ceil(41 / 3) = 14 ticks before the first token. The cancel is
-    // one frame behind the generate.
+    // The spare-rows rule makes the prompt take 14 ticks, so the cancel lands during prefill.
+    // See "Cancel in prefill" in the header.
     const long_prompt = "The dragon flew over the quiet hills at dawn. " ** 4;
     const sid = try openGreedy(&client);
     const gen_id = try client.generate(sid, long_prompt, turn_tokens_max, null);
@@ -739,10 +747,8 @@ test "a hang-up mid-turn sweeps only its own sessions" {
 
     try expectSameStream(reference, try oneTurn(&b, sid_b, prompts[1]));
 
-    // The sweep of A's session and this open travel on two connections, and
-    // no order joins them. Each attempt is one full round trip that reads the
-    // session table, so the loop waits on an observable state and not on a
-    // clock. The bound turns a sweep that never lands into a failure.
+    // No order joins the sweep of A's session and this open. The loop waits on the session table,
+    // and the bound turns a sweep that never lands into a failure.
     const open_attempts_max = 64;
     var sid_new: ?u32 = null;
     for (0..open_attempts_max) |_| {
@@ -810,14 +816,7 @@ test "shutdown from the wire is refused unless allowed" {
 }
 
 // -- kept pairs -------------------------------------------------------------
-//
-// A conversation runs live on one session, then its turns go into a fresh
-// session as kept pairs. Each `appended` position must equal the live
-// position, and the next turn must stream the same ids on both sessions.
-// The server runs the real chat template with thinking off, so the kept pair
-// renders the wraps of the live turn. A turn that stops at its budget leaves
-// its last token pending. The pair holds that token, so its position is one
-// past the live one.
+// See "Kept pairs" in the header.
 
 const kept_system = "You are a helpful assistant.";
 const kept_prompts = [_][]const u8{ "Name a color.", "Name an animal.", "Name a city." };

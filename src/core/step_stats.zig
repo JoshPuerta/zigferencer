@@ -1,11 +1,16 @@
-//! Lean per-run timers for the decode step. A `Stat` folds one timed host step into a
-//! sum, a max, and a count, so a run keeps its distribution summary in fixed
-//! space and the hot path allocates nothing. `DecodeHost` names the six host steps of
-//! one decode step on the host: record, submit, speculate, wait, the logits
-//! copy, and the sampler argmax. It also holds the counts of the record ring.
-//! Values only. The fused runners fill the host steps up to the copy and the ring
-//! counts, the decode loop fills the argmax, and the bench report prints the
-//! result.
+//! Lean per-run timers for the decode step. Values only.
+//!
+//! Stat. It folds one timed host step into a sum, a max, a min, and a count, so a run keeps its
+//! summary in fixed space and the hot path allocates nothing.
+//!
+//! DecodeHost. It names the six host steps of one decode step: record, submit, speculate, wait,
+//! the logits copy, and the sampler argmax. The fused runners fill the steps up to the copy and
+//! the ring counts. The decode loop fills the argmax. The bench report prints the result.
+//!
+//! Ring counts. A hit submits a buffer that the previous step recorded. A miss records on the
+//! critical path. A wasted record is a speculative record that no step submitted. The ring counts
+//! it when it discards the record, so the last speculation of a run counts in the window that
+//! discards it.
 
 const std = @import("std");
 
@@ -14,8 +19,7 @@ const std = @import("std");
 pub const Stat = struct {
     sum_ns: u64 = 0,
     max_ns: u64 = 0,
-    /// Smallest sample. It reads as maxInt while the summary is empty, so use
-    /// `minMs`.
+    /// Smallest sample. It reads as maxInt while the summary is empty, so use `minMs`.
     min_ns: u64 = std.math.maxInt(u64),
     count: u64 = 0,
 
@@ -53,11 +57,7 @@ pub const Stat = struct {
     }
 };
 
-/// The outcomes of the decode record ring. A hit submits a buffer that the
-/// previous step recorded. A miss records on the critical path. A wasted
-/// record is a speculative record that no step submitted. The ring counts it
-/// when it discards the record, so the last speculation of a run counts in
-/// the window that discards it.
+/// The outcomes of the decode record ring. See "Ring counts" in the header.
 pub const RingCounts = struct {
     hits: u64 = 0,
     misses: u64 = 0,

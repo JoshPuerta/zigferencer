@@ -1,26 +1,32 @@
-//! Snapshot gate: the first N greedy-decoded token ids from a fixed prompt
-//! against the real SmolLM2-135M-Instruct GGUFs (Q8_0 and Q4_0).
+//! Snapshot gate: the first N greedy-decoded token ids from a fixed prompt against the real
+//! SmolLM2-135M-Instruct GGUFs (Q8_0 and Q4_0).
 //!
-//! The ids must match the snapshot exactly, because the snapshot is the
-//! determinism anchor of the suite. A regression in the GGUF parser, the
-//! tokenizer, any op, the KV cache, the scheduler or the sampler surfaces
-//! here. The Q4_0 case also drives the q4_0 and q4_1 CPU dequant-and-dot
-//! kernels. That file is a mixed quant: a q4_0 body, a few q4_1 ffn_down rows,
-//! and a q8_0 tied embedding.
+//! Anchor. The ids must match the snapshot exactly, because the snapshot is the determinism anchor
+//! of the suite. A regression in the GGUF parser, the tokenizer, any op, the KV cache, the
+//! scheduler or the sampler surfaces here.
 //!
-//! A divergence is a signal to investigate before anyone regenerates the ids.
-//! A snapshot can change for a good reason, such as a new quantization. Copy
-//! the new ids into `expected` and give the reason in the commit message.
-//! The tests find the files through `test_fixtures.path`.
+//! Q4_0 file. The Q4_0 case also drives the q4_0 and q4_1 CPU dequant-and-dot kernels. That file is
+//! a mixed quant: a q4_0 body, a few q4_1 ffn_down rows, and a q8_0 tied embedding.
+//!
+//! Capture. Both snapshots come from x86_64-linux with f32 activations and naive scalar kernels,
+//! and with the BOS handling of `vocab.addBos`. The ids match the llama.cpp reference for the Q4_0
+//! file byte for byte. The Q4_0 path tracks the reference over a long greedy prefix, before f32
+//! near-tie drift flips a token.
+//!
+//! Changes. A divergence is a signal to investigate before anyone regenerates the ids. A snapshot
+//! can change for a good reason, such as a new quantization. Copy the new ids into `expected` and
+//! give the reason in the commit message.
+//!
+//! Files. The tests find the files through `test_fixtures.path`.
 
 const std = @import("std");
-const z = @import("zigferencer");
-const tp = @import("test_policy.zig");
-const loader = z.loader;
-const vocab_mod = z.vocab;
-const bpe = z.bpe;
-const LlamaRunner = z.llama_runner.LlamaRunner;
-const sampler = z.sampler;
+const zigferencer = @import("zigferencer");
+const test_policy = @import("test_policy.zig");
+const loader = zigferencer.loader;
+const vocab_mod = zigferencer.vocab;
+const bpe = zigferencer.bpe;
+const LlamaRunner = zigferencer.llama_runner.LlamaRunner;
+const sampler = zigferencer.sampler;
 
 // -- fixtures ---------------------------------------------------------------
 
@@ -29,29 +35,19 @@ const name_q4_0 = "SmolLM2-135M-Instruct-Q4_0";
 
 const prompt = "Hello";
 
-/// Greedy-decoded first 5 token ids for the prompt "Hello" against
-/// SmolLM2-135M-Instruct-Q8_0 with f32 activations and naive scalar kernels.
-/// The capture ran on x86_64-linux with the current BOS handling
-/// (`vocab.addBos`), which llama.cpp validates as reference-exact.
+/// Greedy-decoded first 5 token ids for "Hello" against SmolLM2-135M-Instruct-Q8_0.
 const expected_q8_0 = [_]u32{ 198, 198, 57, 5248, 18948 };
 
-/// Greedy-decoded first 8 token ids for the prompt "Hello" against the
-/// mixed-quant SmolLM2-135M-Instruct-Q4_0 with f32 activations and naive
-/// scalar kernels. The capture ran on x86_64-linux and matches the llama.cpp
-/// Q4_0 reference: the ids decode to the greedy continuation of the reference byte
-/// for byte. The q4 path tracks the reference over a long greedy prefix before
-/// f32 near-tie drift flips a token.
+/// Greedy-decoded first 8 token ids for "Hello" against the mixed-quant SmolLM2-135M-Instruct-Q4_0.
 const expected_q4_0 = [_]u32{ 260, 1919, 506, 746, 30, 198, 198, 57 };
 
-/// Greedy-decode `expected.len` tokens from `prompt` against the registry
-/// model `name` on a runner with the policy `cfg`, and compare them to `expected`.
-/// The token stream does not depend on the thread count or the floor, so one
-/// anchor serves every policy.
+/// Greedy-decode `expected.len` tokens from `prompt` against the registry model `name` under
+/// the policy `cfg`, and compare them to `expected`. The ids do not depend on the policy.
 fn checkSnapshot(
     comptime n: usize,
     name: []const u8,
     expected: *const [n]u32,
-    cfg: tp.Policy,
+    cfg: test_policy.Policy,
 ) !void {
     const io = std.testing.io;
 
@@ -60,20 +56,21 @@ fn checkSnapshot(
     defer arena_state.deinit();
 
     const arena = arena_state.allocator();
-    const path = try z.test_fixtures.path(arena, name);
+    const path = try zigferencer.test_fixtures.path(arena, name);
 
     var loaded = try loader.load(io, arena, path);
     defer loaded.close();
 
     var v = try vocab_mod.buildFromParsed(arena, loaded.parsed);
-    var cpu_pool: tp.Pool = undefined;
-    try tp.startPool(&cpu_pool, io, cfg);
+    var cpu_pool: test_policy.Pool = undefined;
+    try test_policy.startPool(&cpu_pool, io, cfg);
     defer cpu_pool.deinit();
 
+    const window = @min(loaded.card.context_length, zigferencer.test_fakes.test_window);
     var runner = try LlamaRunner.init(
         arena,
         &loaded,
-        z.kv_budget.pinned(1, @min(loaded.card.context_length, z.test_fakes.test_window)),
+        zigferencer.kv_budget.pinned(1, window),
         0, // max_rows: single-sequence snapshot, no wide prefill chunk
         io,
         &cpu_pool,
@@ -124,12 +121,12 @@ test "SmolLM2-Q8_0 greedy first-5 IDs snapshot" {
         expected_q8_0.len,
         name_q8_0,
         &expected_q8_0,
-        tp.Policy.forHost(std.testing.io),
+        test_policy.Policy.forHost(std.testing.io),
     );
 }
 
 test "SmolLM2-Q4_0 greedy first-8 IDs snapshot" {
-    try checkSnapshot(expected_q4_0.len, name_q4_0, &expected_q4_0, tp.policy());
+    try checkSnapshot(expected_q4_0.len, name_q4_0, &expected_q4_0, test_policy.policy());
 }
 
 test "SmolLM2-Q8_0 at kv f16: the slab halves and the blob round-trips" {
@@ -143,17 +140,17 @@ test "SmolLM2-Q8_0 at kv f16: the slab halves and the blob round-trips" {
     defer arena_state.deinit();
 
     const arena = arena_state.allocator();
-    const path = try z.test_fixtures.path(arena, name_q8_0);
+    const path = try zigferencer.test_fixtures.path(arena, name_q8_0);
 
     var loaded = try loader.load(io, arena, path);
     defer loaded.close();
 
-    const cfg = tp.policy();
-    var cpu_pool: tp.Pool = undefined;
-    try tp.startPool(&cpu_pool, io, cfg);
+    const cfg = test_policy.policy();
+    var cpu_pool: test_policy.Pool = undefined;
+    try test_policy.startPool(&cpu_pool, io, cfg);
     defer cpu_pool.deinit();
 
-    const plan = z.kv_budget.pinned(1, 64);
+    const plan = zigferencer.kv_budget.pinned(1, 64);
     var wide = try LlamaRunner.init(arena, &loaded, plan, 0, io, &cpu_pool, cfg, .f32);
     var narrow = try LlamaRunner.init(arena, &loaded, plan, 0, io, &cpu_pool, cfg, .f16);
     var restored = try LlamaRunner.init(arena, &loaded, plan, 0, io, &cpu_pool, cfg, .f16);

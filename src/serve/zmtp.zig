@@ -1,10 +1,9 @@
-//! The ZMTP 3.1 codec for a ZMQ peer of the serve layer. A ZMQ DEALER socket
-//! connects to the server, and the server answers as a ROUTER. This module
-//! encodes and decodes the greeting, the frame head, and the commands of the
-//! NULL handshake and the heartbeat. ZMTP integers are big-endian, unlike the
-//! little-endian `protocol.zig` frames that the message frames carry.
+//! The ZMTP 3.1 codec for a ZMQ peer of the serve layer. A ZMQ DEALER socket connects to the
+//! server, and the server answers as a ROUTER. This module encodes and decodes the greeting, the
+//! frame head, and the commands of the NULL handshake and the heartbeat. ZMTP integers are
+//! big-endian, unlike the little-endian `protocol.zig` frames that the message frames carry.
 //!
-//! Each peer opens with a 64-byte greeting:
+//! Greeting. Each peer opens with 64 bytes:
 //!
 //!     off  len  field      rule
 //!     0    1    signature  0xFF
@@ -16,16 +15,15 @@
 //!     32   1    as-server  0 on write, ignored on read
 //!     33   31   filler     zeros on write, ignored on read
 //!
-//! Every frame then starts with a 2-byte or 9-byte head:
+//! Frame head. Every frame then starts with a 2-byte or 9-byte head:
 //!
 //!     off  len  field  rule
 //!     0    1    flags  bit 0 MORE, bit 1 LONG, bit 2 COMMAND, bits 3-7 zero
 //!     1    1    size   when LONG is clear, a writer uses it up to 255
 //!     1    8    size   when LONG is set, big-endian
 //!
-//! The size counts the frame body and excludes the head. A command frame
-//! never sets MORE. A command body is a name length byte, a name of 1 to 255
-//! bytes, and the command data:
+//! Commands. The size counts the frame body and excludes the head. A command frame never sets
+//! MORE. A command body is a name length byte, a name of 1 to 255 bytes, and the command data:
 //!
 //!     READY  properties, each a name length byte, the name, a 4-byte
 //!            big-endian value length, and the value
@@ -33,13 +31,13 @@
 //!     PING   a 2-byte big-endian ttl and a context of up to 16 bytes
 //!     PONG   the context of the PING that it answers
 //!
-//! Property names compare without regard to letter case, and a decode skips
-//! an unknown property. A command with another name decodes to `.other`.
+//! Properties. Names compare without regard to letter case, and a decode skips an unknown
+//! property. A command with another name decodes to `.other`.
 //!
-//! This module is pure. It imports no I/O and it allocates nothing. Decoded
-//! commands borrow their slices from the body, and the caller copies what it
-//! keeps. Every decode checks every length and returns a typed error. The
-//! socket is a trust boundary, so a decode never panics on input.
+//! Trust boundary. This module is pure. It imports no I/O and it allocates nothing. Decoded
+//! commands borrow their slices from the body, and the caller copies what it keeps. Every decode
+//! checks every length and returns a typed error. The socket is a trust boundary, so a decode
+//! never panics on input.
 
 const std = @import("std");
 const protocol = @import("protocol.zig");
@@ -48,9 +46,8 @@ const protocol = @import("protocol.zig");
 
 pub const greeting_bytes: usize = 64;
 
-/// Ceiling on a READY command body. The READY of a libzmq DEALER holds 41
-/// bytes. The ceiling leaves room for more properties and bounds the property
-/// walk.
+/// Ceiling on a READY command body. The READY of a libzmq DEALER holds 41 bytes. The ceiling
+/// leaves room for more properties and bounds the property walk.
 pub const max_ready_bytes: usize = 1024;
 
 /// ZMTP 3.1 caps the PING context at 16 bytes.
@@ -59,8 +56,7 @@ pub const max_ping_context_bytes: usize = 16;
 /// A one-byte length prefixes the ERROR reason.
 pub const max_error_reason_bytes: usize = 255;
 
-/// Ceiling on a message frame body, the size of the largest `protocol.zig`
-/// frame.
+/// Ceiling on a message frame body, the size of the largest `protocol.zig` frame.
 pub const max_message_bytes: usize = protocol.header_bytes + protocol.max_frame_payload_bytes;
 
 pub const socket_type_router = "ROUTER";
@@ -99,9 +95,9 @@ const ready_fixed_bytes: usize = 1 + command_ready.len + 1 + property_socket_typ
 
 // -- types ------------------------------------------------------------------
 
-/// `decodeCommand` returns `MessageTooLarge` for a READY body above
-/// `max_ready_bytes`. The caller maps a frame size above `max_message_bytes`
-/// to `MessageTooLarge` and a false `peerAccepted` to `PeerTypeRefused`.
+/// `decodeCommand` returns `MessageTooLarge` for a READY body above `max_ready_bytes`. The caller
+/// maps a frame size above `max_message_bytes` to `MessageTooLarge`, and a false `peerAccepted` to
+/// `PeerTypeRefused`.
 pub const Error = error{
     BadSignature,
     UnsupportedVersion,
@@ -140,8 +136,8 @@ pub const Command = union(enum) {
     other,
 };
 
-/// Bounds-checked big-endian reader over a command body. A `take` past the
-/// end returns `Malformed`, so a body parses exactly or not at all.
+/// Bounds-checked big-endian reader over a command body. A `take` past the end returns
+/// `Malformed`.
 const Cursor = struct {
     buf: []const u8,
     i: usize = 0,
@@ -184,8 +180,7 @@ const Cursor = struct {
     }
 };
 
-/// Asserting big-endian writer. The caller sizes every encode buffer, so an
-/// overflow is a programmer error and not a runtime one.
+/// Asserting big-endian writer. The caller sizes the buffer, so an overflow is a programmer error.
 const Writer = struct {
     buf: []u8,
     i: usize = 0,
@@ -223,8 +218,8 @@ pub fn encodeGreeting(out: *[greeting_bytes]u8) void {
     out[security_offset..][0..security_bytes].* = security_null;
 }
 
-/// The padding, the minor version, the as-server byte, and the filler take
-/// any value, so a peer with a later 3.x minor version passes.
+/// The padding, the minor version, the as-server byte, and the filler take any value, so a peer
+/// with a later 3.x minor version passes.
 pub fn decodeGreeting(bytes: *const [greeting_bytes]u8) Error!void {
     if (bytes[0] != signature_first) return error.BadSignature;
     if (bytes[signature_last_offset] != signature_last) return error.BadSignature;
@@ -238,10 +233,9 @@ pub fn headLen(flags: u8) usize {
     return if (flags & flag_long != 0) long_head_bytes else short_head_bytes;
 }
 
-/// Decodes the head at the start of `bytes`. The caller reads
-/// `headLen(bytes[0])` bytes first, and a shorter slice returns `Malformed`.
-/// The caller also bounds `size`, because the right ceiling depends on the
-/// frame kind.
+/// Decodes the head at the start of `bytes`. The caller reads `headLen(bytes[0])` bytes first,
+/// and a shorter slice returns `Malformed`. The caller bounds `size`, because the ceiling depends
+/// on the frame kind.
 pub fn decodeFrameHead(bytes: []const u8) Error!FrameHead {
     if (bytes.len == 0) return error.Malformed;
 
@@ -262,8 +256,8 @@ pub fn decodeFrameHead(bytes: []const u8) Error!FrameHead {
     return head;
 }
 
-/// Writes the head of a frame with a body of `size` bytes and returns the
-/// head length. The head never sets MORE.
+/// Writes the head of a frame with a body of `size` bytes and returns the head length.
+/// The head never sets MORE.
 pub fn encodeFrameHead(size: u64, command: bool, out: *[long_head_bytes]u8) usize {
     std.debug.assert(size <= max_message_bytes);
 
@@ -282,9 +276,8 @@ pub fn encodeFrameHead(size: u64, command: bool, out: *[long_head_bytes]u8) usiz
     return n;
 }
 
-/// Decodes a command body, the bytes after the frame head. Slices borrow from
-/// `body`. An unknown name returns `.other`. Trailing bytes after a known
-/// command return `Malformed`.
+/// Decodes a command body, the bytes after the frame head. Slices borrow from `body`.
+/// An unknown name returns `.other`. Trailing bytes after a known command return `Malformed`.
 pub fn decodeCommand(body: []const u8) Error!Command {
     var c: Cursor = .{ .buf = body };
     const name = try c.takeSlice(try c.take(u8));
@@ -309,8 +302,8 @@ pub fn decodeCommand(body: []const u8) Error!Command {
     return command;
 }
 
-/// Writes a READY body with the Socket-Type property alone and returns its
-/// length. The body excludes the frame head.
+/// Writes a READY body with the Socket-Type property alone and returns its length.
+/// The body excludes the frame head.
 pub fn encodeReady(socket_type: []const u8, out: []u8) usize {
     const len = ready_fixed_bytes + socket_type.len;
     std.debug.assert(len <= max_ready_bytes);
@@ -346,8 +339,7 @@ pub fn encodeError(reason: []const u8, out: []u8) usize {
     return w.i;
 }
 
-/// True for a DEALER in any letter case, and for a peer that sends no
-/// Socket-Type property.
+/// True for a DEALER in any letter case, and for a peer that sends no Socket-Type property.
 pub fn peerAccepted(socket_type: []const u8) bool {
     if (socket_type.len == 0) return true;
     return std.ascii.eqlIgnoreCase(socket_type, socket_type_dealer);
@@ -361,8 +353,8 @@ fn takeReady(c: *Cursor) Error!Ready {
     var ready: Ready = .{ .socket_type = "", .has_identity = false };
     var has_socket_type = false;
     var properties: usize = 0;
-    // Each pass consumes at least `min_property_bytes`, so the body bound
-    // caps the passes at max_ready_bytes / min_property_bytes.
+    // Each pass consumes at least `min_property_bytes`, so the body bound caps the passes at
+    // max_ready_bytes / min_property_bytes.
     while (!c.done()) : (properties += 1) {
         std.debug.assert(properties <= max_ready_bytes / min_property_bytes);
 
@@ -546,6 +538,27 @@ const CommandWant = union(enum) {
 
 const CommandCase = struct { name: []const u8, body: []const u8, want: CommandWant };
 
+fn malformedCase(name: []const u8, body: []const u8) CommandCase {
+    return .{ .name = name, .body = body, .want = .{ .err = error.Malformed } };
+}
+
+fn otherCase(name: []const u8, body: []const u8) CommandCase {
+    return .{ .name = name, .body = body, .want = .other };
+}
+
+fn readyCase(
+    name: []const u8,
+    body: []const u8,
+    socket_type: []const u8,
+    identity: bool,
+) CommandCase {
+    return .{
+        .name = name,
+        .body = body,
+        .want = .{ .ready = .{ .socket_type = socket_type, .has_identity = identity } },
+    };
+}
+
 fn checkCommand(c: CommandCase) !void {
     switch (c.want) {
         .err => |err| try std.testing.expectError(err, decodeCommand(c.body)),
@@ -568,40 +581,45 @@ fn paddedReady(comptime len: usize) [len]u8 {
 }
 
 test "commands: every malformed body is refused with its error, and the edges decode" {
-    const malformed: CommandWant = .{ .err = error.Malformed };
     const body = dealer_ready_frame[short_head_bytes..];
+    const socket_type_only = body[0..socket_type_only_bytes];
     const ready_at_bound = paddedReady(max_ready_bytes);
     const ready_past_bound = paddedReady(max_ready_bytes + 1);
     const cases = [_]CommandCase{
-        .{ .name = "empty body", .body = "", .want = malformed },
-        .{ .name = "empty name", .body = "\x00", .want = malformed },
-        .{ .name = "short name", .body = "\x05READ", .want = malformed },
-        .{ .name = "ERROR with no reason length", .body = "\x05ERROR", .want = malformed },
-        .{ .name = "ERROR reason cut", .body = "\x05ERROR\x03ab", .want = malformed },
-        .{ .name = "ERROR trailing byte", .body = "\x05ERROR\x02ab!", .want = malformed },
-        .{ .name = "unknown name", .body = "\x09SUBSCRIBEtopic", .want = .other },
-        .{ .name = "name case matters", .body = "\x05ready", .want = .other },
-        .{ .name = "PING with no ttl", .body = "\x04PING", .want = malformed },
-        .{ .name = "PING with a short ttl", .body = "\x04PING\x00", .want = malformed },
-        .{ .name = "PING context past the bound", .body = "\x04PING\x00\x0a" ++ "x" ** 17, .want = malformed },
-        .{ .name = "PONG context past the bound", .body = "\x04PONG" ++ "x" ** 17, .want = malformed },
-        .{ .name = "READY cut inside a value length", .body = body[0..20], .want = malformed },
-        .{ .name = "READY value past the end", .body = body[0 .. body.len - 1] ++ [_]u8{1}, .want = malformed },
-        .{ .name = "READY empty property name", .body = "\x05READY\x00\x00\x00\x00\x00", .want = malformed },
-        .{ .name = "Socket-Type twice", .body = body[0..socket_type_only_bytes] ++ body[6..socket_type_only_bytes], .want = malformed },
-        .{ .name = "Identity twice", .body = body ++ body[socket_type_only_bytes..], .want = malformed },
-        .{ .name = "READY at the size bound", .body = &ready_at_bound, .want = .{ .ready = .{ .socket_type = "", .has_identity = false } } },
-        .{ .name = "READY past the size bound", .body = &ready_past_bound, .want = .{ .err = error.MessageTooLarge } },
-        .{ .name = "READY with only Socket-Type", .body = body[0..socket_type_only_bytes], .want = .{ .ready = .{ .socket_type = "DEALER", .has_identity = false } } },
-        .{ .name = "READY with no property", .body = "\x05READY", .want = .{ .ready = .{ .socket_type = "", .has_identity = false } } },
+        malformedCase("empty body", ""),
+        malformedCase("empty name", "\x00"),
+        malformedCase("short name", "\x05READ"),
+        malformedCase("ERROR with no reason length", "\x05ERROR"),
+        malformedCase("ERROR reason cut", "\x05ERROR\x03ab"),
+        malformedCase("ERROR trailing byte", "\x05ERROR\x02ab!"),
+        otherCase("unknown name", "\x09SUBSCRIBEtopic"),
+        otherCase("name case matters", "\x05ready"),
+        malformedCase("PING with no ttl", "\x04PING"),
+        malformedCase("PING with a short ttl", "\x04PING\x00"),
+        malformedCase("PING context past the bound", "\x04PING\x00\x0a" ++ "x" ** 17),
+        malformedCase("PONG context past the bound", "\x04PONG" ++ "x" ** 17),
+        malformedCase("READY cut inside a value length", body[0..20]),
+        malformedCase("READY value past the end", body[0 .. body.len - 1] ++ [_]u8{1}),
+        malformedCase("READY empty property name", "\x05READY\x00\x00\x00\x00\x00"),
+        malformedCase("Socket-Type twice", socket_type_only ++ body[6..socket_type_only_bytes]),
+        malformedCase("Identity twice", body ++ body[socket_type_only_bytes..]),
+        readyCase("READY at the size bound", &ready_at_bound, "", false),
         .{
-            .name = "READY skips an unknown property and ignores name case",
-            .body = "\x05READY" ++
+            .name = "READY past the size bound",
+            .body = &ready_past_bound,
+            .want = .{ .err = error.MessageTooLarge },
+        },
+        readyCase("READY with only Socket-Type", socket_type_only, "DEALER", false),
+        readyCase("READY with no property", "\x05READY", "", false),
+        readyCase(
+            "READY skips an unknown property and ignores name case",
+            "\x05READY" ++
                 "\x08Resource\x00\x00\x00\x04/zmq" ++
                 "\x0bsocket-type\x00\x00\x00\x06dealer" ++
                 "\x08IDENTITY\x00\x00\x00\x02id",
-            .want = .{ .ready = .{ .socket_type = "dealer", .has_identity = true } },
-        },
+            "dealer",
+            true,
+        ),
     };
     for (cases) |c| {
         errdefer std.debug.print("command case: {s}\n", .{c.name});
@@ -714,9 +732,8 @@ test "property: every single-byte mutation of the READY frame decodes or returns
     try std.testing.expect(refused > 0);
 }
 
-/// The decode of a frame of at most three bytes, as the head and command
-/// rules state it. No known command name fits in two bytes, so a body that
-/// holds its name decodes to `other`.
+/// The decode of a frame of at most three bytes, as the head and command rules state it.
+/// No known command name fits in two bytes, so a body that holds its name decodes to `other`.
 fn expectShortFrame(frame: []const u8) !void {
     std.debug.assert(frame.len <= 3);
 

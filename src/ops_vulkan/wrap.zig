@@ -1,20 +1,17 @@
-//! Backs the CPU op API (`linearF32Q80`, `rmsnorm`, `swiglu`, `residualAdd`)
-//! with the GPU kernels in `kernels.zig`. The inference Runner then drives the
-//! GPU through the exact op signatures it already calls on the CPU. The CPU op
-//! API has no whole-row attention op, so this module exports its own
-//! `attentionSingle` for the per-op branch of the runners. The backing is hybrid. The heavy ops run
-//! on the GPU. The small or
-//! fragmented ones stay on the CPU: the embedding lookup, the per-head RoPE, and
-//! the f32 norms. Their microsecond cost beats the fixed overhead of a dispatch.
+//! Backs the CPU op API (`linearF32Q80`, `rmsnorm`, `swiglu`, `residualAdd`) with the GPU kernels
+//! in `kernels.zig`. The inference Runner then drives the GPU through the exact op signatures it
+//! already calls on the CPU. The CPU op API has no whole-row attention op, so this module exports
+//! its own `attentionSingle` for the per-op branch of the runners.
 //!
-//! This is the simple end-to-end path. Every op call is its own submit and
-//! wait-idle, roughly 0.25 ms times hundreds of ops per Llama-8B token, which is
-//! the known floor. The fused decode path in `runtime/llama_fused.zig` records
-//! one command buffer per token and removes that floor. The simple boundary
-//! earns its place beside the fused one, because the per-op benchmarks and the
-//! GPU-against-CPU correctness checks run against it.
+//! Cost. This is the simple end-to-end path. Every op call is its own submit and wait-idle, roughly
+//! 0.25 ms times hundreds of ops per Llama-8B token, which is the known floor. The fused decode
+//! path in `runtime/llama_fused.zig` records one command buffer per token and removes that floor.
+//! The per-op benchmarks and the GPU-against-CPU correctness checks run against this simple
+//! boundary.
 //!
-//! Which side each op lands on:
+//! Placement. The backing is hybrid. The heavy ops run on the GPU. The small or fragmented ops stay
+//! on the CPU, because their microsecond cost beats the fixed overhead of a dispatch. Which side
+//! each op lands on:
 //!
 //!   embedLookup                       CPU. A pure memcpy loses to a dispatch.
 //!   ropeInplace                       CPU. One dispatch per head, 32 per layer,
@@ -22,6 +19,20 @@
 //!   linearF32                         CPU. Only the small f32 norm weights.
 //!   rmsnorm, swiglu, residualAdd,     GPU. The heavy ops that repay a dispatch.
 //!   attentionSingle, linearF32Q80
+//!
+//! Globals. These globals are deliberate, because the engine otherwise keeps none. They hold the
+//! Runner that owns the GPU context and the kernels, the VRAM weight cache, and the lazily built
+//! GdnDecode pipeline. The op signatures set the constraint. Each one takes values and returns
+//! values, with no handle to thread a `*Runner` through. A handle puts a GPU object into the
+//! signatures that every backend compiles against. A parallel GPU-only op API duplicates the
+//! signatures that the runner is built against. So the GPU lifetime stays confined here:
+//! `initBackend` creates it, `deinitBackend` tears it down, and nothing outside this file observes
+//! it. The unit of work of the fused path is a whole forward pass, owned by one explicit
+//! LlamaFusedRunner value. A per-op function has no such natural owner.
+//!
+//! Tolerance. The per-op tolerances vary: the matmul near 2e-4, rmsnorm near 1e-6, and attention
+//! near 1e-3. The declared 2e-3 is the loosest of those with a 2x cushion. It holds end to end,
+//! because no op in the chain widens the drift past its own `requires.tolerance`.
 
 const std = @import("std");
 const build_options = @import("build_options");
@@ -44,10 +55,7 @@ comptime {
 pub const requires: op_requires.OpRequires = .{
     .arch = .any,
     .runtime = .vulkan,
-    // The per-op tolerances vary: the matmul near 2e-4, rmsnorm near 1e-6, and
-    // attention near 1e-3. 2e-3 is the loosest of those with a 2x cushion. It
-    // holds end to end, because no op in the chain widens the drift past what
-    // its own `requires.tolerance` already permits.
+    // See "Tolerance" in the header.
     .tolerance = .{ .relative = 2e-3 },
 };
 
@@ -57,25 +65,7 @@ pub const InitError = vulkan_runner.Runner.InitError;
 
 // -- state ------------------------------------------------------------------
 
-//
-// These globals are deliberate. They hold the Runner that owns the GPU context
-// and the kernels, the VRAM weight cache, and the lazily built GdnDecode
-// pipeline. The deliberation is worth recording, because the engine otherwise
-// keeps no globals at all.
-//
-// The op signatures set the constraint. This module backs the CPU op signatures
-// with GPU kernels. The inference Runner then drives the GPU through the exact
-// functions it already calls on the CPU. Those signatures are
-// `linearF32Q80(input, weight, out)`, `rmsnorm(...)`, and so on. Every one takes
-// values and returns values, with no handle to thread a `*Runner` through.
-// Adding one puts a GPU object into the op signatures that every backend
-// compiles against, which is the coupling the value-at-the-boundary and
-// encapsulate-state rules forbid. A parallel GPU-only op API duplicates the same
-// signatures the runner is built against. So the GPU lifetime stays confined
-// here instead: `initBackend` creates it, `deinitBackend` tears it down, and
-// nothing outside this file observes it. The contrast is the fused path in
-// `runtime/llama_fused.zig`. Its unit of work is a whole forward pass, owned by
-// one explicit LlamaFusedRunner value. A per-op function has no such natural owner.
+// See "Globals" in the header.
 var g_runner: ?*vulkan_runner.Runner = null;
 var g_weight_cache: std.AutoHashMap(usize, kernels.Q80Weight) = undefined;
 var g_initialized: bool = false;
@@ -129,9 +119,8 @@ pub fn linearF32Q80(input: []const f32, weight: Tensor, out: []f32) void {
 
     const r = runner();
 
-    // VRAM weight cache. The key is the pointer of the slice, so a weight that
-    // is mapped once and referenced many times stages exactly once. The cache
-    // never evicts, because weights live in VRAM for the life of the program.
+    // VRAM weight cache, keyed by the slice pointer, so a weight mapped once stages exactly once.
+    // The cache never evicts, because weights live in VRAM for the life of the program.
     const key: usize = @intFromPtr(weight.data.ptr);
     const gop = g_weight_cache.getOrPut(key) catch @panic("ops_vulkan.wrap: weight cache OOM");
     if (!gop.found_existing) {
@@ -200,10 +189,9 @@ pub fn attentionSingle(
     ) catch |e| std.debug.panic("ops_vulkan.wrap: attention failed: {t}", .{e});
 }
 
-/// Run one Gated-DeltaNet decode step on the GPU, the Qwen3.5 linear-attention
-/// layer. It mirrors `gdn.step`: it mutates `state` and `conv_state` and writes
-/// `o_out`. `head_dim` must be 128. It panics on a GPU failure like the other
-/// ops here. The kernel is bit-checked against `gdn.step`.
+/// Run one Gated-DeltaNet decode step on the GPU. It mutates `state` and `conv_state` and writes
+/// `o_out`, as `gdn.step` does, and `gpu-selftest gdn` checks it against that step at its
+/// tolerance. `head_dim` must be 128. It panics on a GPU failure.
 pub fn gdnStep(
     n_k_heads: u32,
     n_v_heads: u32,

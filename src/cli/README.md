@@ -1,65 +1,88 @@
 # CLI
 
-The CLI turns one process invocation into one command, in two executables.
-`zigferencer` holds the release commands. `zigferencer-dev` holds those commands
-plus the developer ones: the benches, the kernel checks, the demo, and the tokenizer
-dump. All lasting state lives below in `runtime/` and `serve/`.
+The CLI turns one process invocation into one command. `zigferencer` holds the commands of
+this directory. `zigferencer-dev` holds those commands plus the developer commands of
+[`src/dev/`](../dev/README.md). All lasting state lives below in `runtime/` and `serve/`.
+
+A command with one file sits in this directory. A command with more than one file gets a
+directory with its name. The files that every command reads sit here too, and `boot/` holds
+the steps from the flags to a running engine.
 
 ## Files
 
+The building blocks:
+
 | File | What it holds |
 | --- | --- |
-| `command.zig` | The command tables and the `Context` every handler receives. `main.zig` enters here. |
+| `command.zig` | The release table and the dispatcher. `main.zig` enters here. |
+| `context.zig` | The `Context` every handler receives. |
 | `args.zig` | The flag parser. One struct states the flags of a command and generates its `--help`. |
-| `flags.zig` | The flag groups that several commands share: `EngineFlags` and `ServeFlags`. |
+| `flag_groups.zig` | The flag groups that several commands share: `EngineFlags` and `ServeFlags`. |
 | `select.zig` | Turns an optional model name into a registry entry, with a picker on a terminal. |
 | `style.zig` | ANSI color codes that become empty strings when color is off. |
 | `prompt.zig` | Interactive questions on stdin. Off a terminal, each one answers no. |
+
+`src/cli.zig`, one level up, lists the files of this directory that `src/dev/` can read.
+
+`boot/`, the steps from the flags to a running engine:
+
+| File | What it holds |
+| --- | --- |
+| `boot_facts.zig` | What a boot measures: the model facts, the free RAM and VRAM, the device context, and the thread policy. `run`, the servers, and the benches share it. |
+| `boot_lines.zig` | What a boot prints: the boot log lines and the message of each `resolve` refusal. `run`, the servers, and the benches share it. |
+| `serve_checks.zig` | The checks of the serve flags that need no model file. |
+| `codec_parts.zig` | The token pieces of a frontend codec and the think tags of the scheduler. |
+| `serve_boot.zig` | The engine builder of both servers. `buildAndServe` is the entry. |
+
+The commands:
+
+| File | What it holds |
+| --- | --- |
 | `list_cmd.zig` | `list`: print the registered models and where each one sits on disk. |
 | `fetch_cmd.zig` | `fetch`: download a GGUF by registry name or by path. |
 | `inspect_cmd.zig` | `inspect`: print the metadata and the tensors of a GGUF. |
-| `info_cmd.zig` | `info`: print the host, the build, and the threading defaults. |
-| `arch_matrix.zig` | The table of model architectures against backends that `info` prints. |
+| `info/info_cmd.zig` | `info`: print the host, the build, and the threading defaults. |
+| `info/arch_matrix.zig` | The table of model architectures against backends that `info` prints. |
 | `run_cmd.zig` | `run`: one prompt, from the load to the last token. |
-| `serve_common.zig` | The engine builder of both servers. It also holds the boot log lines that `run` and the benches share. |
 | `serve_cmd.zig` | `serve`: the binary protocol server. |
 | `serve_openai_cmd.zig` | `serve-openai`: the OpenAI HTTP server. |
-| `client_cmd.zig` | `client`: an interactive chat against `serve`, with reconnect and session resume. |
+
+`client/`, an interactive chat against `serve`, with reconnect and session resume:
+
+| File | What it holds |
+| --- | --- |
+| `client_cmd.zig` | `client`: the start of the chat, then one of the two loops. |
+| `client_startup.zig` | The flags, the server check, and the first session. |
+| `client_input.zig` | The stdin lines, the slash commands, and the queue of the streaming mode. |
+| `client_output.zig` | The turn summary, the compaction notes, and the shades of a reply. |
+| `client_history.zig` | The transcript with the numbers that weigh it, and one compaction cycle. |
 | `client_transcript.zig` | The bounded transcript of the chat and the pure compaction decisions. |
-| `serve_demo_cmd.zig` | `serve-demo`: start or join a server, then drive a scripted conversation. |
-| `tokens_cmd.zig` | `tokens`: print the token ids of a prompt, to compare with llama.cpp. |
-| `gpu_selftest_cmd.zig` | `gpu-selftest`: check one GPU kernel against its CPU reference. |
-| `bench_model_cmd.zig` | `bench-model`: check the flags, load the model, and pick a path. |
-| `bench_model_common.zig` | The flags and the values that the `bench_model_*` files share. |
-| `bench_model_host.zig` | The `bench-model` path of the CPU backends and the per-op Vulkan backend. |
-| `bench_model_fused.zig` | The `bench-model` path of the whole model on the GPU. |
-| `bench_model_placement.zig` | The `bench-model` path of a CPU and GPU split. |
-| `bench_model_exec.zig` | The run body that all three paths share. |
-| `bench_model_profile.zig` | `--profile-cpu-decode`: the per-op timer of the CPU runners. |
-| `bench_model_report.zig` | Print the results as a table or as JSON. |
-| `bench_serve_cmd.zig` | `bench-serve`: drive concurrent sessions over loopback and report the rate. |
-| `bench_swap_cmd.zig` | `bench-swap`: time a KV eviction and restore against a decode step. |
-| `bench_decode_host_cmd.zig` | `bench-decode-host`: split one decode step into its host steps. |
+| `client_chat.zig` | The state of the streaming control unit. |
+| `client_streaming.zig` | The streaming mode: the line, frame, and compaction transitions. |
+| `client_reconnect.zig` | The `reconnecting` state: the backoff, the attempt tasks, and the resume. |
+| `client_blocking.zig` | The `--no-stream` mode: one blocking loop with no tasks. |
 
 ## How the pieces fit
 
 An arrow means "imports". A name with a slash is the first module outside `src/cli`.
 
-Every command starts the same way:
+The layers point one way. The engine reads no CLI file. A building block reads no command.
+`boot/` reads no command. A command reads no other command. `tests/tidy_test.zig` checks the
+four rules on every build of the test suite.
 
 ```
-main.zig, dev_main.zig
+main.zig
     |
     v
-command.zig --- Context ---> <command>_cmd.run(ctx)
-                                 |
-        +---------+----------+---+------+-----------+
-        v         v          v          v           v
-    args.zig  flags.zig  select.zig  style.zig  prompt.zig
-                  |          |
-                  v          v
-         engine/flags   core/registry
-                        io/gguf/loader
+command.zig --- release table ---> <command>_cmd.run(ctx)
+                                       |
+       +---------+-------------+-------+------+-----------+
+       v         v             v              v           v
+   args.zig  flag_groups.zig  select.zig  style.zig  prompt.zig
+                  |              |
+                  v              v
+          engine/flags     core/registry
+                           io/gguf/loader
 ```
 
 The commands that read files or print facts stop early:
@@ -68,53 +91,45 @@ The commands that read files or print facts stop early:
 list_cmd ----> core/registry
 fetch_cmd ---> core/registry, io/download
 inspect_cmd -> io/gguf/loader, io/gguf/parser
-tokens_cmd --> io/gguf/loader, core/tokenizer/bpe
 info_cmd ----> arch_matrix --> core/op_requires
            +-> core/hwinfo, runtime/vulkan_ctx
 ```
 
-The commands that run a model meet in `serve_common` and `engine/`. `engine/resolve`
-makes the boot decisions, and `engine/family` holds the runner of each placement,
-for each model family. A command turns the architecture into a family once:
+The commands that run a model meet in `boot/` and `engine/`. `engine/resolve` makes the boot
+decisions, and `engine/family` holds the runner of each placement, for each model family. A
+command turns the architecture into a family once:
 
 ```
-run_cmd ----------+
-serve_cmd --------+--> serve_common --> engine/resolve --> engine/device_arm
-serve_openai_cmd -+          |
-bench_serve_cmd --+          +--------> engine/family --> runtime/llama_runner
-bench_swap_cmd ---+          |                            runtime/llama_fused
-bench_decode_host_cmd -------+                            runtime/llama_hybrid
-                             |                            runtime/qwen_runner
-                             v                            runtime/qwen_fused
-                       serve/scheduler                    runtime/qwen_hybrid
-                       serve/residency
+run_cmd ----------> boot_facts, boot_lines ----> engine/resolve --> engine/device_arm
+serve_cmd --------> serve_boot ---+              engine/family ---> runtime/llama_runner
+serve_openai_cmd -> serve_boot ---+-> serve_checks                  runtime/llama_fused
+                                  +-> codec_parts                   runtime/llama_hybrid
+                                  +-> boot_facts, boot_lines        runtime/qwen_runner
+                                  |                                 runtime/qwen_fused
+                                  v                                 runtime/qwen_hybrid
+                            serve/scheduler
+                            serve/residency
 
 run_cmd ---------> runtime/generate
 serve_cmd -------> serve/server
 serve_openai_cmd -> serve/openai/http_server
 ```
 
-`bench-model` has one file for each placement, and they share one run body:
+The client talks to a server over the wire, so it needs no runner. `client_cmd` starts the
+chat and picks a loop. The arrows inside `client/` hold no cycle:
 
 ```
-bench_model_cmd --> engine/family, engine/resolve
-    |
-    +--> bench_model_host ------> bench_model_profile --> runtime/cpu_profile
-    +--> bench_model_fused -----+
-    +--> bench_model_placement -+--> bench_model_exec --> bench_model_report
-                                         |
-                                         +--> runtime/generate
-
-bench_model_common: Options, Bench, RunResult. Every file above imports it.
-```
-
-The client talks to a server over the wire, so it needs no runner:
-
-```
-client_cmd ------> client_transcript --> serve/protocol
-           +-----> serve/client
-serve_demo_cmd --> serve/client
-gpu_selftest_cmd -> ops_vulkan/kernels, ops/naive
+client_cmd --> client_streaming --> client_reconnect --> client_chat
+           |          |                    |                 |
+           +-> client_blocking             |                 |
+           |          |                    |                 |
+           +----------+--> client_startup <+-----------------+
+                                |
+                                v
+              client_input, client_output, client_history
+                                |
+                                v
+                 client_transcript, serve/protocol, serve/client
 ```
 
 ## Rules
@@ -124,10 +139,10 @@ gpu_selftest_cmd -> ops_vulkan/kernels, ops/naive
   there. Pickers, confirms, progress bars, and flag errors go to stderr. The two
   serve commands print exactly one machine-readable `READY` line to stdout, and
   route everything else through the scoped stderr logger.
-- The command space is closed. `command.release` and `command.dev` are
-  compile-time tables, so a reader can enumerate every command. Each command
-  accepts the fixed flags of its flag struct, and an unmatched `-` or `--`
-  token raises `error.UsageError` instead of passing as a positional argument.
+- The command space is closed. `command.release` and the table of
+  `src/dev/dev_command.zig` are compile-time tables, so a reader can enumerate every
+  command. Each command accepts the fixed flags of its flag struct, and an unmatched `-`
+  or `--` token raises `error.UsageError` instead of passing as a positional argument.
 - Every interactive read degrades off a terminal. `confirm` returns false and `chooseIndex` returns null on EOF, on a read error, and on a non-interactive stdin. A piped run or an automated run never blocks. A command that needs a
   distinct message checks `prompt.stdinIsTty` first.
 - Color is presentation and resolves once. `style.Palette.init(false)` returns

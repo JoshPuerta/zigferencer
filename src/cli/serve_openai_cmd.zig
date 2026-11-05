@@ -1,14 +1,15 @@
 //! `zigferencer serve-openai <pub_name>` is the OpenAI-compatible HTTP frontend. It
-//! parses the flags and hands an `OpenAiLauncher` to `serve_common.buildAndServe`, so it
+//! parses the flags and hands an `OpenAiLauncher` to `serve_boot.buildAndServe`, so it
 //! batches requests over the scheduler of `serve` on every backend. It serves on
 //! `std.http.Server`, which adds no dependency. stdout holds only the READY line.
 
 const std = @import("std");
 
-const cli = @import("command.zig");
+const context = @import("context.zig");
 const args = @import("args.zig");
-const flags_mod = @import("flags.zig");
-const serve_common = @import("serve_common.zig");
+const flags_mod = @import("flag_groups.zig");
+const codec_parts = @import("boot/codec_parts.zig");
+const serve_boot = @import("boot/serve_boot.zig");
 const chat = @import("../core/chat.zig");
 const limits = @import("../core/limits.zig");
 const http_server = @import("../serve/openai/http_server.zig");
@@ -31,9 +32,9 @@ const OpenAiLauncher = struct {
     pub fn serve(
         self: OpenAiLauncher,
         comptime EngineT: type,
-        ctx: cli.Context,
+        ctx: context.Context,
         engine: *EngineT,
-        parts: serve_common.CodecParts,
+        parts: codec_parts.CodecParts,
         sched_cfg: scheduler_mod.Config,
     ) !void {
         // A request can resolve the thinking mode to on only for `chatml_qwen`,
@@ -82,7 +83,7 @@ const OpenAiLauncher = struct {
             cfg,
             .{ .tcp = .{ .host = self.host, .port = self.port } },
         );
-        try serve_common.printReadyTcp(ctx.io, server.boundAddress());
+        try serve_boot.printReadyTcp(&ctx.stdout.interface, server.boundAddress());
         try server.run();
         log.info("shutdown complete", .{});
     }
@@ -134,7 +135,7 @@ const Flags = struct {
 
 // -- api --------------------------------------------------------------------
 
-pub fn run(ctx: cli.Context) !void {
+pub fn run(ctx: context.Context) !void {
     const flags = try args.parseInto(Flags, ctx) orelse return;
 
     const launcher: OpenAiLauncher = .{
@@ -143,5 +144,5 @@ pub fn run(ctx: cli.Context) !void {
         .default_max_tokens = flags.max_tokens,
         .sampling_defaults = flags.sampling,
     };
-    return serve_common.buildAndServe(ctx, flags.pub_name, &flags.serve, .{}, launcher);
+    return serve_boot.buildAndServe(ctx, flags.pub_name, &flags.serve, .{}, launcher);
 }

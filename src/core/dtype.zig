@@ -1,12 +1,15 @@
-//! GGUF `ggml_type` enum plus per-type block geometry: how many bytes a tensor
-//! of N elements occupies on disk and in memory. The kernels read F32 and Q8_0
-//! directly and dequantize Q4_0 / Q6_K at load. The enum lists the other types
-//! so the parser can recognize a mixed GGUF. `blockSize` and `bytesPerBlock`
-//! panic on a type no kernel handles, because a loud failure beats a silently
-//! wrong one.
+//! GGUF `ggml_type` enum plus per-type block geometry: how many bytes a tensor of N elements
+//! occupies on disk and in memory.
 //!
-//! Quant block geometry is the unit every kernel iterates over. A row of N
-//! weights is N/32 contiguous blocks. An f16 scale `d` leads each block:
+//! Kernel coverage. The kernels read F32 and Q8_0 directly and dequantize Q4_0 and Q6_K at load.
+//! The enum lists the other types so the parser can recognize a mixed GGUF. `blockSize` and
+//! `bytesPerBlock` panic on a type no kernel handles, because a loud failure beats a silently wrong
+//! one. The k-quant sizes exist so the loader can map a mixed GGUF. Only q6_k has kernels: a CPU
+//! dequant-and-dot linear for the Q6_K logit head of a Q4_0 file, and a load-time requantize to
+//! q4_0 for the GPU path.
+//!
+//! Block geometry. It is the unit every kernel iterates over. A row of N weights is N/32
+//! contiguous blocks. An f16 scale `d` leads each block:
 //!
 //!   Q8_0   32 weights -> 34 bytes          value[i] = d * q[i]
 //!     +--------+-----------------------------------+
@@ -24,8 +27,8 @@ const std = @import("std");
 
 // -- constants --------------------------------------------------------------
 
-/// Bytes the widest `tagSuffix` occupies. A caller sizing a tag buffer adds
-/// this to its own frame, which is what makes the format infallible.
+/// Bytes the widest `tagSuffix` occupies. A tag buffer adds this to its frame, so the format cannot
+/// fail.
 pub const kv_tag_suffix_max: usize = blk: {
     var widest: usize = 0;
     for (std.enums.values(KvDtype)) |d| {
@@ -81,9 +84,8 @@ pub const KvDtype = enum {
     f32,
     f16,
 
-    /// Bytes one KV row of `per_step_elems` elements occupies. Every size site
-    /// in the economy derives from this one product, so no site multiplies by
-    /// an element width of its own.
+    /// Bytes one KV row of `per_step_elems` elements occupies. Every KV size derives from this
+    /// product.
     pub fn rowBytes(self: KvDtype, per_step_elems: u32) u64 {
         const t: GgmlType = switch (self) {
             .f32 => .f32,
@@ -93,11 +95,8 @@ pub const KvDtype = enum {
         return bytesForNumel(t, per_step_elems);
     }
 
-    /// The component a backend provenance tag folds in. It is empty at f32, so
-    /// every namespace a shipped blob already lives in stays byte identical.
-    /// Otherwise it names the dtype, so no blob can restore across the dtype it
-    /// was written at. It follows the backend-tag discipline: a name appears
-    /// only when it is not the identity.
+    /// The component a backend provenance tag folds in. Empty at f32, so shipped blob namespaces
+    /// stay byte identical. Otherwise it names the dtype, so no blob restores across dtypes.
     pub fn tagSuffix(self: KvDtype) []const u8 {
         return switch (self) {
             .f32 => "",
@@ -105,9 +104,8 @@ pub const KvDtype = enum {
         };
     }
 
-    /// The dtype token a plan line folds in. It follows the backend-tag
-    /// discipline: a name appears only when it is not the identity, so the line
-    /// every backend prints at f32 does not move one byte.
+    /// The dtype token a plan line folds in. Empty at f32, so the f32 plan line stays byte
+    /// identical.
     pub fn planToken(self: KvDtype) []const u8 {
         return switch (self) {
             .f32 => "",
@@ -172,11 +170,7 @@ pub fn bytesPerBlock(t: GgmlType) usize {
         .q5_1 => 24,
         .q8_0 => 34,
         .q8_1 => 36,
-        // k-quant superblocks (256 elems). Byte sizes only, which is enough
-        // for the loader to mmap a mixed GGUF. Of these only q6_k has kernels:
-        // a CPU dequant-and-dot linear, and a load-time requantize to q4_0 for
-        // the GPU path. The CPU linear covers the Q6_K logit head that a Q4_0
-        // ftype emits.
+        // k-quant superblocks of 256 elements. See "Kernel coverage" in the header.
         .q2_k => 84,
         .q3_k => 110,
         .q4_k => 144,

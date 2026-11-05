@@ -1,24 +1,24 @@
 //! Proof-of-life gate for the Vulkan op backend.
 //!
-//! The gate runs `vec_add` on the device, and every element must equal the CPU
-//! sum bit for bit. The comparison is exact because the shader does one scalar
-//! f32 add, with no reduction and no fused multiply-add.
+//! Exactness. The gate runs `vec_add` on the device, and every element must equal the CPU sum bit
+//! for bit. The comparison is exact because the shader does one scalar f32 add, with no reduction
+//! and no fused multiply-add.
 //!
-//! Two element counts cover the workgroup tail. 1024 is an exact multiple of
-//! the 256-wide workgroup. 1000 leaves 24 lanes that take the early-return path
-//! inside the shader and write nothing.
+//! Tail. Two element counts cover the workgroup tail. 1024 is an exact multiple of the 256-wide
+//! workgroup. 1000 leaves 24 lanes that take the early-return path inside the shader and write
+//! nothing.
 //!
-//! The test returns `error.SkipZigTest` when no Vulkan device is reachable.
-//! That covers a host with no driver, and the llvmpipe software device that
-//! `pickPhysicalDevice` rejects by design.
+//! Skips. The test returns `error.SkipZigTest` when no Vulkan device is reachable. That covers a
+//! host with no driver, and the llvmpipe software device that `pickPhysicalDevice` rejects by
+//! design.
 
 const std = @import("std");
-const z = @import("zigferencer");
+const zigferencer = @import("zigferencer");
 
 // -- fixtures ---------------------------------------------------------------
 
 fn runVecAddCheck(allocator: std.mem.Allocator, n: usize) !void {
-    const runner = z.vulkan_runner.Runner.init(allocator) catch |e| switch (e) {
+    const runner = zigferencer.vulkan_runner.Runner.init(allocator) catch |e| switch (e) {
         error.NoVulkanDevice,
         error.InitializationFailed,
         error.IncompatibleDriver,

@@ -47,7 +47,7 @@ variant. `simdBackendSupportedBy` in `build.zig` mirrors what the two SIMD
 variants declare, and the mirror and the declaration must agree.
 
 `gdn.zig` stands outside that chain. `runtime/qwen_runner.zig` is its only caller
-in the forward pass, and `cli/gpu_selftest_cmd.zig` drives it as the reference of
+in the forward pass, and `dev/gpu_selftest/gpu_selftest_gdn.zig` drives it as the reference of
 the GPU check. The runner owns the recurrent `d x d` state and the convolution
 ring buffer and passes both in. `step` is the per-token form that prefill and
 decode both run. `chunkScan` is the chunked matrix form, and it is the one op
