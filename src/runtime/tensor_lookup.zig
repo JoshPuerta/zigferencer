@@ -24,6 +24,7 @@ pub fn find(refs: []const loader.TensorRef, name: []const u8) ?*const Tensor {
     for (refs) |*r| {
         if (std.mem.eql(u8, r.name, name)) return &r.tensor;
     }
+
     return null;
 }
 
@@ -36,7 +37,12 @@ pub fn findRequired(refs: []const loader.TensorRef, name: []const u8) Error!*con
 /// `findRequired` with the name formatted into `buf` (e.g. `"blk.{d}.attn_q.weight"`).
 /// This function treats a `bufPrint` overflow as a miss: a name that cannot fit
 /// cannot exist.
-pub fn findByFmt(refs: []const loader.TensorRef, buf: []u8, comptime fmt: []const u8, args: anytype) Error!*const Tensor {
+pub fn findByFmt(
+    refs: []const loader.TensorRef,
+    buf: []u8,
+    comptime fmt: []const u8,
+    args: anytype,
+) Error!*const Tensor {
     const name = std.fmt.bufPrint(buf, fmt, args) catch return error.MissingTensor;
     return findRequired(refs, name);
 }
@@ -50,6 +56,7 @@ pub fn layerWeightBytes(refs: []const loader.TensorRef, n_layers: u32, out: []u6
     std.debug.assert(n_layers >= 1);
     std.debug.assert(n_layers <= limits.max_layers);
     std.debug.assert(out.len >= n_layers);
+
     @memset(out[0..n_layers], 0);
     for (refs) |*r| {
         const idx = blockIndex(r.name) orelse continue;
@@ -58,8 +65,10 @@ pub fn layerWeightBytes(refs: []const loader.TensorRef, n_layers: u32, out: []u6
         // writing past the vector.
         std.debug.assert(idx < n_layers);
         if (idx >= n_layers) continue;
+
         out[idx] += r.tensor.data.len;
     }
+
     return out[0..n_layers];
 }
 
@@ -70,9 +79,15 @@ pub fn layerWeightBytes(refs: []const loader.TensorRef, n_layers: u32, out: []u6
 /// nothing, the way `layerWeightBytes` charges nothing for an empty layer.
 pub fn headWeightBytes(refs: []const loader.TensorRef) u64 {
     var total: u64 = 0;
-    if (find(refs, "output_norm.weight")) |t| total += t.data.len;
+    if (find(refs, "output_norm.weight")) |t| {
+        total += t.data.len;
+    }
+
     const head = find(refs, "output.weight") orelse find(refs, "token_embd.weight");
-    if (head) |t| total += t.data.len;
+    if (head) |t| {
+        total += t.data.len;
+    }
+
     return total;
 }
 
@@ -82,6 +97,7 @@ pub fn headWeightBytes(refs: []const loader.TensorRef) u64 {
 /// tensor.
 pub fn fp32View(t: Tensor) []const f32 {
     std.debug.assert(t.dtype == .f32);
+
     return @alignCast(std.mem.bytesAsSlice(f32, t.data));
 }
 
@@ -92,6 +108,7 @@ pub fn fp32View(t: Tensor) []const f32 {
 fn blockIndex(name: []const u8) ?u32 {
     const prefix = "blk.";
     if (!std.mem.startsWith(u8, name, prefix)) return null;
+
     const rest = name[prefix.len..];
     const dot = std.mem.indexOfScalar(u8, rest, '.') orelse return null;
     return std.fmt.parseInt(u32, rest[0..dot], 10) catch null;
@@ -118,7 +135,10 @@ test "find / findRequired / findByFmt resolve and report misses" {
 
     var buf: [64]u8 = undefined;
     _ = try findByFmt(&refs, &buf, "blk.{d}.attn_q.weight", .{0});
-    try std.testing.expectError(error.MissingTensor, findByFmt(&refs, &buf, "blk.{d}.attn_q.weight", .{9}));
+    try std.testing.expectError(
+        error.MissingTensor,
+        findByFmt(&refs, &buf, "blk.{d}.attn_q.weight", .{9}),
+    );
     try std.testing.expectEqual(@as(usize, 4), fp32View(t).len);
 }
 

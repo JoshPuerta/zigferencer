@@ -99,7 +99,12 @@ pub const OutEvent = struct {
             name: [limits.max_model_name_bytes]u8,
         },
         session_opened: struct { kv_pos: u32 },
-        token: struct { token_id: u32, channel: protocol.Channel, text_len: u16, text: [limits.max_token_text_bytes]u8 },
+        token: struct {
+            token_id: u32,
+            channel: protocol.Channel,
+            text_len: u16,
+            text: [limits.max_token_text_bytes]u8,
+        },
         done: struct {
             finish_reason: protocol.FinishReason,
             turn_prompt_tokens: u32,
@@ -130,23 +135,45 @@ pub const OutEvent = struct {
         zmtp_error: struct { len: u8, reason: [64]u8 },
     };
 
-    pub fn token(request_id: u32, session_id: u32, id: u32, channel: protocol.Channel, piece: []const u8) OutEvent {
+    pub fn token(
+        request_id: u32,
+        session_id: u32,
+        id: u32,
+        channel: protocol.Channel,
+        piece: []const u8,
+    ) OutEvent {
         comptime std.debug.assert(limits.max_token_text_bytes <= std.math.maxInt(u16));
         std.debug.assert(piece.len <= limits.max_token_text_bytes);
-        var body: Body = .{ .token = .{ .token_id = id, .channel = channel, .text_len = @intCast(piece.len), .text = undefined } };
+        var body: Body = .{
+            .token = .{
+                .token_id = id,
+                .channel = channel,
+                .text_len = @intCast(piece.len),
+                .text = undefined,
+            },
+        };
         @memcpy(body.token.text[0..piece.len], piece);
         return .{ .request_id = request_id, .session_id = session_id, .body = body };
     }
 
-    pub fn fail(request_id: u32, session_id: u32, code: protocol.ErrorCode, detail: []const u8) OutEvent {
+    pub fn fail(
+        request_id: u32,
+        session_id: u32,
+        code: protocol.ErrorCode,
+        detail: []const u8,
+    ) OutEvent {
         std.debug.assert(detail.len <= 64);
-        var body: Body = .{ .err = .{ .code = code, .detail_len = @intCast(detail.len), .detail = undefined } };
+
+        var body: Body = .{
+            .err = .{ .code = code, .detail_len = @intCast(detail.len), .detail = undefined },
+        };
         @memcpy(body.err.detail[0..detail.len], detail);
         return .{ .request_id = request_id, .session_id = session_id, .body = body };
     }
 
     pub fn zmtpPong(context: []const u8) OutEvent {
         std.debug.assert(context.len <= zmtp.max_ping_context_bytes);
+
         var body: Body = .{ .zmtp_pong = .{ .len = @intCast(context.len), .context = undefined } };
         @memcpy(body.zmtp_pong.context[0..context.len], context);
         return .{ .request_id = 0, .session_id = 0, .body = body };
@@ -154,6 +181,7 @@ pub const OutEvent = struct {
 
     pub fn zmtpError(reason: []const u8) OutEvent {
         std.debug.assert(reason.len <= 64);
+
         var body: Body = .{ .zmtp_error = .{ .len = @intCast(reason.len), .reason = undefined } };
         @memcpy(body.zmtp_error.reason[0..reason.len], reason);
         return .{ .request_id = 0, .session_id = 0, .body = body };
@@ -179,7 +207,13 @@ pub const Codec = struct {
     /// `open` is the think switch that the scheduler resolved for the turn,
     /// so the tail of the wrap and the think state of the slot agree.
     /// Caller owns the returned ids (gpa).
-    pub fn turnTokens(self: *const Codec, gpa: Allocator, turn: TurnKind, text: []const u8, open: bool) ![]u32 {
+    pub fn turnTokens(
+        self: *const Codec,
+        gpa: Allocator,
+        turn: TurnKind,
+        text: []const u8,
+        open: bool,
+    ) ![]u32 {
         const kind = renderKind(self.kind, open);
         const wrapped = switch (turn) {
             .system => try chat.wrapSystemAlloc(gpa, kind, text),
@@ -187,7 +221,9 @@ pub const Codec = struct {
             .first_after_system => try chat.wrapFirstTurnAlloc(gpa, kind, text),
             .continuation => try chat.wrapContinuationAlloc(gpa, kind, text),
         };
+
         defer gpa.free(wrapped);
+
         const sequence_start = turn == .system or turn == .open_first;
         const ids = try bpe.encodeAlloc(self.vocab, gpa, wrapped, sequence_start);
         log.debug("encode: {t} turn, {d} B -> {d} tokens", .{ turn, text.len, ids.len });
@@ -198,23 +234,38 @@ pub const Codec = struct {
     /// the reply encode apart, as a live turn feeds the wrap and then samples
     /// the reply. A reply that re-encodes to its sampled ids therefore gives
     /// the ids of the live turn. Caller owns the ids (gpa).
-    pub fn pairTokens(self: *const Codec, gpa: Allocator, place: chat.PairPlace, user: []const u8, assistant: []const u8) ![]u32 {
+    pub fn pairTokens(
+        self: *const Codec,
+        gpa: Allocator,
+        place: chat.PairPlace,
+        user: []const u8,
+        assistant: []const u8,
+    ) ![]u32 {
         const wrapped = try chat.wrapPairUserAlloc(gpa, self.kind, place, user);
         defer gpa.free(wrapped);
+
         const head = try bpe.encodeAlloc(self.vocab, gpa, wrapped, place == .open_first);
         defer gpa.free(head);
+
         const reply = try bpe.encodeAlloc(self.vocab, gpa, assistant, false);
         defer gpa.free(reply);
+
         const ids = try std.mem.concat(gpa, u32, &.{ head, reply });
-        log.debug("encode: {t} pair, {d}+{d} B -> {d}+{d} tokens", .{ place, user.len, assistant.len, head.len, reply.len });
+        log.debug(
+            "encode: {t} pair, {d}+{d} B -> {d}+{d} tokens",
+            .{ place, user.len, assistant.len, head.len, reply.len },
+        );
         return ids;
     }
 
     pub fn piece(self: *const Codec, id: u32) []const u8 {
         std.debug.assert(id < self.pieces.len);
+
         return self.pieces[id];
     }
 };
+
+// -- helpers ----------------------------------------------------------------
 
 /// The kind that renders a turn with the think switch `open`. A family with
 /// no thinking mode renders one way, and the scheduler refuses an open turn
@@ -223,6 +274,7 @@ fn renderKind(kind: chat.Kind, open: bool) chat.Kind {
     const out = chat.resolveThinking(kind, if (open) .on else .off) catch kind;
     std.debug.assert(std.meta.activeTag(out) == std.meta.activeTag(kind));
     if (chat.thinkText(kind) != null) std.debug.assert(chat.thinkOpen(out) == open);
+
     return out;
 }
 
@@ -245,16 +297,21 @@ test "renderKind: the switch picks the think tail of the turn wrap" {
             try std.testing.expectEqual(open, chat.thinkOpen(kind));
             const want = try chat.wrapFirstTurnAlloc(gpa, if (open) qwen_on else qwen_off, "hi");
             defer gpa.free(want);
+
             const got = try chat.wrapFirstTurnAlloc(gpa, kind, "hi");
             defer gpa.free(got);
+
             try std.testing.expectEqualStrings(want, got);
         }
     }
+
     // The open tail differs from the closed tail, so the switch is visible.
     const open_text = try chat.wrapContinuationAlloc(gpa, renderKind(qwen_off, true), "x");
     defer gpa.free(open_text);
+
     const closed_text = try chat.wrapContinuationAlloc(gpa, renderKind(qwen_on, false), "x");
     defer gpa.free(closed_text);
+
     try std.testing.expect(!std.mem.eql(u8, open_text, closed_text));
     // A family with no thinking mode renders one way.
     try std.testing.expectEqual(chat.Kind.chatml_smollm2, renderKind(.chatml_smollm2, false));

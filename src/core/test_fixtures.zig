@@ -31,8 +31,12 @@ pub fn path(arena: Allocator, pub_name: []const u8) (Error || Allocator.Error)![
         if (err == error.FixtureMissing) {
             const local = try registry.modelFilePath(arena, registry.default_models_root, model);
             const store = try registry.modelFilePath(arena, root, model);
-            std.debug.print("test_fixtures: {s} is missing: not at {s}, not at {s}\n", .{ pub_name, local, store });
+            std.debug.print(
+                "test_fixtures: {s} is missing: not at {s}, not at {s}\n",
+                .{ pub_name, local, store },
+            );
         }
+
         return err;
     };
 }
@@ -41,8 +45,10 @@ pub fn path(arena: Allocator, pub_name: []const u8) (Error || Allocator.Error)![
 pub fn decide(found: ?[]const u8, env_set: bool) Error![]const u8 {
     if (found) |p| {
         assert(p.len > 0);
+
         return p;
     }
+
     return if (env_set) error.FixtureMissing else error.SkipZigTest;
 }
 
@@ -53,6 +59,7 @@ test "decide: a found file runs, and a missing file skips only without the store
     for ([_]bool{ false, true }) |env_set| {
         try std.testing.expectEqualStrings(p, try decide(p, env_set));
     }
+
     try std.testing.expectError(error.SkipZigTest, decide(null, false));
     try std.testing.expectError(error.FixtureMissing, decide(null, true));
 }

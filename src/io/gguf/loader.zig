@@ -22,6 +22,11 @@ const Io = std.Io;
 
 const log = std.log.scoped(.gguf);
 
+// -- constants --------------------------------------------------------------
+
+/// The tensor that holds the llama3 RoPE frequency factors.
+pub const rope_freqs_tensor = "rope_freqs.weight";
+
 // -- types ------------------------------------------------------------------
 
 pub const Error = error{
@@ -139,8 +144,9 @@ pub const LoadOptions = struct {
     quiet: bool = false,
 };
 
-/// The tensor that holds the llama3 RoPE frequency factors.
-pub const rope_freqs_tensor = "rope_freqs.weight";
+/// A value that does not fit a `u32` is a bad value, not a narrowing cast.
+/// One dimension of the model card, named by its key after the arch prefix.
+const Dim = struct { key: []const u8, value: u32 };
 
 // -- api --------------------------------------------------------------------
 
@@ -151,20 +157,29 @@ pub fn load(io: Io, arena: Allocator, path: []const u8) !Loaded {
 pub fn loadWith(io: Io, arena: Allocator, path: []const u8, opts: LoadOptions) !Loaded {
     const sp = span.begin(.model_load);
     defer sp.end();
+
     // For a multi-gigabyte model the prefault, not the metadata parse, is the
     // visible wait, so announce the load before the map.
-    if (!opts.quiet) log.info("loading {s}...", .{std.fs.path.basename(path)});
+    if (!opts.quiet) {
+        log.info("loading {s}...", .{std.fs.path.basename(path)});
+    }
+
     const t_start = Io.Clock.Timestamp.now(io, .awake);
     var map = if (opts.prefault)
         try mmap.openReadOnly(io, path)
     else
         try mmap.openReadOnlyLazy(io, path);
+
     errdefer map.close();
+
     const bytes = map.bytes();
     const t_mapped = Io.Clock.Timestamp.now(io, .awake);
 
     const parsed = parser.parse(arena, bytes) catch |err| {
-        log.err("{s}: the GGUF file is not valid: {s}", .{ std.fs.path.basename(path), @errorName(err) });
+        log.err(
+            "{s}: the GGUF file is not valid: {s}",
+            .{ std.fs.path.basename(path), @errorName(err) },
+        );
         return err;
     };
     const t_parsed = Io.Clock.Timestamp.now(io, .awake);
@@ -184,14 +199,30 @@ pub fn loadWith(io: Io, arena: Allocator, path: []const u8, opts: LoadOptions) !
     const n_heads = try lookupU32(parsed, pk(&kb, arch_str, ".attention.head_count"));
     // The head count divides the embedding width below.
     if (n_heads == 0) return error.BadKeyValue;
-    const n_kv_heads = try lookupU32Or(parsed, pk(&kb, arch_str, ".attention.head_count_kv"), n_heads);
+
+    const n_kv_heads = try lookupU32Or(
+        parsed,
+        pk(&kb, arch_str, ".attention.head_count_kv"),
+        n_heads,
+    );
     const embedding_length = try lookupU32(parsed, pk(&kb, arch_str, ".embedding_length"));
     const ffn_length = try lookupU32(parsed, pk(&kb, arch_str, ".feed_forward_length"));
     const ctx_declared = try lookupU32(parsed, pk(&kb, arch_str, ".context_length"));
-    const head_dim_explicit = try lookupU32Or(parsed, pk(&kb, arch_str, ".attention.key_length"), embedding_length / n_heads);
-    const rope_dim_count = try lookupU32Or(parsed, pk(&kb, arch_str, ".rope.dimension_count"), head_dim_explicit);
+    const head_dim_explicit = try lookupU32Or(
+        parsed,
+        pk(&kb, arch_str, ".attention.key_length"),
+        embedding_length / n_heads,
+    );
+    const rope_dim_count = try lookupU32Or(
+        parsed,
+        pk(&kb, arch_str, ".rope.dimension_count"),
+        head_dim_explicit,
+    );
     const rope_freq_base = lookupF32(parsed, pk(&kb, arch_str, ".rope.freq_base")) catch 10000.0;
-    const rms_norm_eps = try lookupF32(parsed, pk(&kb, arch_str, ".attention.layer_norm_rms_epsilon"));
+    const rms_norm_eps = try lookupF32(
+        parsed,
+        pk(&kb, arch_str, ".attention.layer_norm_rms_epsilon"),
+    );
 
     // Gated-DeltaNet params live under the SSM namespace for qwen35.
     const gdn: ?GdnParams = if (arch == .qwen35) GdnParams{
@@ -200,7 +231,10 @@ pub fn loadWith(io: Io, arena: Allocator, path: []const u8, opts: LoadOptions) !
         .group_count = try lookupU32(parsed, pk(&kb, arch_str, ".ssm.group_count")),
         .inner_size = try lookupU32(parsed, pk(&kb, arch_str, ".ssm.inner_size")),
         .time_step_rank = try lookupU32(parsed, pk(&kb, arch_str, ".ssm.time_step_rank")),
-        .full_attention_interval = try lookupU32(parsed, pk(&kb, arch_str, ".full_attention_interval")),
+        .full_attention_interval = try lookupU32(
+            parsed,
+            pk(&kb, arch_str, ".full_attention_interval"),
+        ),
     } else null;
 
     const tokens = try lookupStringArray(parsed, "tokenizer.ggml.tokens");
@@ -209,9 +243,11 @@ pub fn loadWith(io: Io, arena: Allocator, path: []const u8, opts: LoadOptions) !
     // buffer sizes that `core/limits.zig` fixes.
     if (n_layers > limits.max_layers) return error.TooManyLayers;
     if (tokens.len > limits.max_vocab) return error.VocabTooLarge;
+
     const vocab_size: u32 = @intCast(tokens.len);
     // A zero context leaves no window to plan.
     if (ctx_declared == 0) return error.BadKeyValue;
+
     const dims = [_]Dim{
         .{ .key = "block_count", .value = n_layers },
         .{ .key = "attention.head_count_kv", .value = n_kv_heads },
@@ -223,18 +259,26 @@ pub fn loadWith(io: Io, arena: Allocator, path: []const u8, opts: LoadOptions) !
         log.err("{s}: the card value {s} is 0", .{ std.fs.path.basename(path), key });
         return error.BadKeyValue;
     }
+
     // Each KV head serves a whole group of query heads.
     if (n_heads % n_kv_heads != 0) {
-        log.err("{s}: {d} attention heads do not split into groups over {d} KV heads", .{ std.fs.path.basename(path), n_heads, n_kv_heads });
+        log.err(
+            "{s}: {d} attention heads do not split into groups over {d} KV heads",
+            .{ std.fs.path.basename(path), n_heads, n_kv_heads },
+        );
         return error.BadKeyValue;
     }
+
     // A context past the engine bound is a model fact the engine cannot use
     // whole. The file loads with the bound, and the log names both numbers.
     const ctx_length = limits.contextCeiling(ctx_declared, null);
     if (ctx_length < ctx_declared) {
-        log.warn("{s}: the file declares a context of {d} positions, and the engine caps it at {d}", .{
-            std.fs.path.basename(path), ctx_declared, ctx_length,
-        });
+        log.warn(
+            "{s}: the file declares a context of {d} positions, and the engine caps it at {d}",
+            .{
+                std.fs.path.basename(path), ctx_declared, ctx_length,
+            },
+        );
     }
 
     // Scaling that the engine does not apply puts every position at the wrong
@@ -244,13 +288,19 @@ pub fn loadWith(io: Io, arena: Allocator, path: []const u8, opts: LoadOptions) !
         try lookupString(parsed, scaling_key)
     else
         null;
+
     // Only the Llama runners read the llama3 factor tensor.
     const applies_rope_freqs = arch == .llama and hasTensor(parsed, rope_freqs_tensor);
     if (!ropeScalingSupported(scaling_type, applies_rope_freqs)) {
         std.debug.assert(scaling_type != null);
-        log.err("{s}: RoPE scaling type {s} is not supported. The engine applies only the llama3 factors of a " ++ rope_freqs_tensor ++ " tensor", .{
-            std.fs.path.basename(path), scaling_type.?,
-        });
+
+        log.err(
+            "{s}: RoPE scaling type {s} is not supported. The engine applies only the " ++
+                "llama3 factors of a " ++ rope_freqs_tensor ++ " tensor",
+            .{
+                std.fs.path.basename(path), scaling_type.?,
+            },
+        );
         return error.UnsupportedRopeScaling;
     }
 
@@ -286,9 +336,12 @@ pub fn loadWith(io: Io, arena: Allocator, path: []const u8, opts: LoadOptions) !
     const refs = try bindTensors(arena, parsed, bytes, std.fs.path.basename(path), .err);
 
     const t_done = Io.Clock.Timestamp.now(io, .awake);
-    if (!opts.quiet) log.info("loaded {s}: {d} tensors, ctx {d}, {d:.0} MiB in {d:.0} ms", .{
-        arch_str, refs.len, ctx_length, mibOf(bytes.len), elapsedMs(t_start, t_done),
-    });
+    if (!opts.quiet) {
+        log.info("loaded {s}: {d} tensors, ctx {d}, {d:.0} MiB in {d:.0} ms", .{
+            arch_str, refs.len, ctx_length, mibOf(bytes.len), elapsedMs(t_start, t_done),
+        });
+    }
+
     log.debug("  timings: mmap {d:.1} ms | parse {d:.1} ms | build {d:.1} ms", .{
         elapsedMs(t_start, t_mapped), elapsedMs(t_mapped, t_parsed), elapsedMs(t_parsed, t_done),
     });
@@ -316,15 +369,20 @@ pub fn bindTensors(
     const refs = try arena.alloc(TensorRef, parsed.tensors.len);
     for (parsed.tensors, refs) |ti, *ref| {
         std.debug.assert(ti.n_dims >= 1 and ti.n_dims <= 4);
+
         // The wire model keeps every ggml type id representable, and only a
         // subset carries block geometry. Refuse the rest at the boundary.
         if (!dtype.hasBlockGeometry(ti.dtype)) {
-            refuse(refusal_level, "{s}: tensor {s} carries dtype {s} (ggml id {d}), which the engine cannot size", .{
-                file,
-                ti.name,
-                std.enums.tagName(dtype.GgmlType, ti.dtype) orelse "unknown",
-                @intFromEnum(ti.dtype),
-            });
+            refuse(
+                refusal_level,
+                "{s}: tensor {s} carries dtype {s} (ggml id {d}), which the engine cannot size",
+                .{
+                    file,
+                    ti.name,
+                    std.enums.tagName(dtype.GgmlType, ti.dtype) orelse "unknown",
+                    @intFromEnum(ti.dtype),
+                },
+            );
             return error.UnsupportedTensorDtype;
         }
 
@@ -332,58 +390,105 @@ pub fn bindTensors(
         var numel: u64 = 1;
         for (0..ti.n_dims) |i| {
             const dim = std.math.cast(u32, ti.shape[i]) orelse {
-                refuse(refusal_level, "{s}: tensor {s} has dimension {d} of {d}, which passes the 32-bit limit", .{ file, ti.name, i, ti.shape[i] });
+                refuse(
+                    refusal_level,
+                    "{s}: tensor {s} has dimension {d} of {d}, which passes the 32-bit limit",
+                    .{ file, ti.name, i, ti.shape[i] },
+                );
                 return error.BadTensorShape;
             };
             if (dim == 0) {
-                refuse(refusal_level, "{s}: tensor {s} has an empty dimension {d}", .{ file, ti.name, i });
+                refuse(
+                    refusal_level,
+                    "{s}: tensor {s} has an empty dimension {d}",
+                    .{ file, ti.name, i },
+                );
                 return error.BadTensorShape;
             }
+
             shape32[i] = dim;
             numel = std.math.mul(u64, numel, dim) catch {
-                refuse(refusal_level, "{s}: tensor {s} has an element count that passes 64 bits", .{ file, ti.name });
+                refuse(
+                    refusal_level,
+                    "{s}: tensor {s} has an element count that passes 64 bits",
+                    .{ file, ti.name },
+                );
                 return error.TensorSizeOverflow;
             };
         }
+
         const block = dtype.blockSize(ti.dtype);
         if (shape32[0] % block != 0) {
-            refuse(refusal_level, "{s}: tensor {s} has a row of {d} elements, which is not a multiple of the {d}-element block of its dtype", .{
-                file, ti.name, shape32[0], block,
-            });
+            refuse(
+                refusal_level,
+                "{s}: tensor {s} has a row of {d} elements, which is not a multiple of the " ++
+                    "{d}-element block of its dtype",
+                .{
+                    file, ti.name, shape32[0], block,
+                },
+            );
             return error.BadTensorShape;
         }
+
         // Every axis past the row counts whole rows, so a whole row is a
         // whole number of blocks and so is the tensor.
         const total_bytes = dtype.bytesForNumelChecked(ti.dtype, numel) orelse {
-            refuse(refusal_level, "{s}: tensor {s} has {d} elements, and their byte size passes 64 bits", .{ file, ti.name, numel });
+            refuse(
+                refusal_level,
+                "{s}: tensor {s} has {d} elements, and their byte size passes 64 bits",
+                .{ file, ti.name, numel },
+            );
             return error.TensorSizeOverflow;
         };
         const row_bytes = dtype.bytesForNumelChecked(ti.dtype, shape32[0]).?;
         std.debug.assert(row_bytes <= total_bytes);
 
         const start = std.math.add(u64, parsed.data_offset, ti.offset_in_data) catch {
-            refuse(refusal_level, "{s}: tensor {s} starts at data offset {d}, which passes 64 bits", .{ file, ti.name, ti.offset_in_data });
+            refuse(
+                refusal_level,
+                "{s}: tensor {s} starts at data offset {d}, which passes 64 bits",
+                .{ file, ti.name, ti.offset_in_data },
+            );
             return error.TensorSizeOverflow;
         };
         const end = std.math.add(u64, start, total_bytes) catch {
-            refuse(refusal_level, "{s}: tensor {s} ends past 64 bits ({d} bytes from byte {d})", .{ file, ti.name, total_bytes, start });
+            refuse(
+                refusal_level,
+                "{s}: tensor {s} ends past 64 bits ({d} bytes from byte {d})",
+                .{ file, ti.name, total_bytes, start },
+            );
             return error.TensorSizeOverflow;
         };
         if (end > bytes.len) {
-            refuse(refusal_level, "{s}: tensor {s} needs bytes {d} to {d}, and the file holds {d}", .{ file, ti.name, start, end, bytes.len });
+            refuse(
+                refusal_level,
+                "{s}: tensor {s} needs bytes {d} to {d}, and the file holds {d}",
+                .{ file, ti.name, start, end, bytes.len },
+            );
             return error.NotEnoughBytes;
         }
+
         const data = bytes[@intCast(start)..@intCast(end)];
         // The kernels cast an f32 view of the data with `@alignCast`. The
         // parser only proves the offset a multiple of `general.alignment`,
         // and a power of two below the element width passes that check.
         const need = elementAlign(ti.dtype);
         if (@intFromPtr(data.ptr) % need != 0) {
-            refuse(refusal_level, "{s}: tensor {s} starts at byte {d}, which breaks the {d}-byte alignment of its dtype", .{ file, ti.name, start, need });
+            refuse(
+                refusal_level,
+                "{s}: tensor {s} starts at byte {d}, which breaks the {d}-byte alignment of " ++
+                    "its dtype",
+                .{ file, ti.name, start, need },
+            );
             return error.TensorDataUnaligned;
         }
+
         const stride = std.math.cast(u32, row_bytes) orelse {
-            refuse(refusal_level, "{s}: tensor {s} has a row of {d} bytes, which passes the 32-bit stride limit", .{ file, ti.name, row_bytes });
+            refuse(
+                refusal_level,
+                "{s}: tensor {s} has a row of {d} bytes, which passes the 32-bit stride limit",
+                .{ file, ti.name, row_bytes },
+            );
             return error.TensorSizeOverflow;
         };
 
@@ -400,6 +505,7 @@ pub fn bindTensors(
         ref.tensor.assertValid();
         std.debug.assert(ref.tensor.data.len == ref.tensor.bytesRequired());
     }
+
     return refs;
 }
 
@@ -411,6 +517,7 @@ pub fn ropeScalingSupported(scaling_type: ?[]const u8, has_rope_freqs: bool) boo
     const kind = scaling_type orelse return true;
     if (std.mem.eql(u8, kind, "none")) return true;
     if (std.mem.eql(u8, kind, "llama3")) return has_rope_freqs;
+
     return false;
 }
 
@@ -433,6 +540,7 @@ fn refuse(comptime level: std.log.Level, comptime format: []const u8, args: anyt
 /// A quant block type is read byte-wise, so it needs none.
 fn elementAlign(t: dtype.GgmlType) usize {
     std.debug.assert(dtype.hasBlockGeometry(t));
+
     const need: usize = if (dtype.blockSize(t) == 1) dtype.bytesPerBlock(t) else 1;
     std.debug.assert(std.math.isPowerOfTwo(need));
     return need;
@@ -442,6 +550,7 @@ fn hasTensor(p: parser.Parsed, name: []const u8) bool {
     for (p.tensors) |ti| {
         if (std.mem.eql(u8, ti.name, name)) return true;
     }
+
     return false;
 }
 
@@ -464,6 +573,7 @@ fn lookupKv(p: parser.Parsed, key: []const u8) ?*const parser.Value {
     for (p.kvs) |*kv| {
         if (std.mem.eql(u8, kv.key, key)) return &kv.value;
     }
+
     return null;
 }
 
@@ -483,20 +593,18 @@ fn lookupStringOptional(p: parser.Parsed, key: []const u8) ?[]const u8 {
     };
 }
 
-/// A value that does not fit a `u32` is a bad value, not a narrowing cast.
-/// One dimension of the model card, named by its key after the arch prefix.
-const Dim = struct { key: []const u8, value: u32 };
-
 /// The first card dimension or GDN parameter that holds 0, or null. A zero
 /// divides or sizes a buffer downstream, so the loader refuses it here.
 fn zeroDim(dims: []const Dim, gdn: ?GdnParams) ?[]const u8 {
     for (dims) |d| {
         if (d.value == 0) return d.key;
     }
+
     const g = gdn orelse return null;
     inline for (@typeInfo(GdnParams).@"struct".fields) |f| {
         if (@field(g, f.name) == 0) return f.name;
     }
+
     return null;
 }
 
@@ -509,6 +617,7 @@ fn lookupU32(p: parser.Parsed, key: []const u8) Error!u32 {
         .i64_val => |i| std.math.cast(u32, i),
         else => return error.WrongKeyType,
     };
+
     return value orelse error.BadKeyValue;
 }
 
@@ -545,7 +654,14 @@ fn lookupStringArray(p: parser.Parsed, key: []const u8) Error![]const []const u8
 
 test "zeroDim: the first zero card dimension or GDN parameter, else null" {
     const good = [_]Dim{ .{ .key = "a", .value = 1 }, .{ .key = "b", .value = 7 } };
-    const gdn: GdnParams = .{ .conv_kernel = 4, .state_size = 128, .group_count = 16, .inner_size = 2048, .time_step_rank = 16, .full_attention_interval = 4 };
+    const gdn: GdnParams = .{
+        .conv_kernel = 4,
+        .state_size = 128,
+        .group_count = 16,
+        .inner_size = 2048,
+        .time_step_rank = 16,
+        .full_attention_interval = 4,
+    };
     const Case = struct { dims: []const Dim, gdn: ?GdnParams, want: ?[]const u8 };
     var no_interval = gdn;
     no_interval.full_attention_interval = 0;
@@ -557,7 +673,11 @@ test "zeroDim: the first zero card dimension or GDN parameter, else null" {
     };
     for (cases) |c| {
         const got = zeroDim(c.dims, c.gdn);
-        if (c.want) |w| try std.testing.expectEqualStrings(w, got.?) else try std.testing.expect(got == null);
+        if (c.want) |w| {
+            try std.testing.expectEqualStrings(w, got.?);
+        } else {
+            try std.testing.expect(got == null);
+        }
     }
 }
 
@@ -612,8 +732,10 @@ fn checkBind(c: BindCase) !void {
     };
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
+
     const got = bindTensors(arena.allocator(), parsed, file[0..c.file_len], "case.gguf", .debug);
     if (c.want) |err| return std.testing.expectError(err, got);
+
     const refs = try got;
     try std.testing.expectEqual(@as(usize, 1), refs.len);
     try std.testing.expectEqual(c.stride, refs[0].tensor.byte_stride[0]);
@@ -645,7 +767,9 @@ test "bindTensors: a descriptor binds inside the file at its row stride, or fail
         .{ .shape = &.{4}, .data_offset = 2, .want = error.TensorDataUnaligned },
         .{ .dtype = .f16, .shape = &.{4}, .offset_in_data = 1, .want = error.TensorDataUnaligned },
     };
-    for (cases) |c| try checkBind(c);
+    for (cases) |c| {
+        try checkBind(c);
+    }
 }
 
 /// A random mutation of the parser sample: byte writes in the header, the kvs,
@@ -657,12 +781,30 @@ fn checkParseBind(sample: *const parser.Sample, seed: u64) anyerror!void {
     const r = prng.random();
     var bytes: [parser.sample_capacity]u8 align(16) = undefined;
     @memcpy(bytes[0..sample.len], sample.bytes[0..sample.len]);
-    for (0..r.uintLessThan(usize, 4)) |_| bytes[r.uintLessThan(usize, sample.table_end)] = r.int(u8);
+    for (0..r.uintLessThan(usize, 4)) |_| {
+        bytes[r.uintLessThan(usize, sample.table_end)] = r.int(u8);
+    }
+
     if (r.boolean()) {
-        const edges = [_]u64{ 0, 1, 2, 3, 4, 16, 17, 1 << 31, 1 << 32, std.math.maxInt(u32), std.math.maxInt(u63), std.math.maxInt(u64), std.math.maxInt(u64) - 15 };
+        const edges = [_]u64{
+            0,
+            1,
+            2,
+            3,
+            4,
+            16,
+            17,
+            1 << 31,
+            1 << 32,
+            std.math.maxInt(u32),
+            std.math.maxInt(u63),
+            std.math.maxInt(u64),
+            std.math.maxInt(u64) - 15,
+        };
         const at = r.uintAtMost(usize, sample.table_end - 8);
         std.mem.writeInt(u64, bytes[at..][0..8], edges[r.uintLessThan(usize, edges.len)], .little);
     }
+
     const len = if (r.uintLessThan(u8, 4) == 0) r.uintAtMost(usize, sample.len) else sample.len;
     const file = bytes[0..len];
 
@@ -682,12 +824,21 @@ fn checkParseBind(sample: *const parser.Sample, seed: u64) anyerror!void {
         const at = @intFromPtr(t.data.ptr);
         try std.testing.expect(at >= lo and at + t.data.len <= lo + file.len);
         try std.testing.expectEqual(t.bytesRequired(), t.data.len);
-        try std.testing.expectEqual(t.data.len, @as(usize, t.byte_stride[0]) * (t.numel() / t.shape[0]));
+        try std.testing.expectEqual(
+            t.data.len,
+            @as(usize, t.byte_stride[0]) * (t.numel() / t.shape[0]),
+        );
         try std.testing.expectEqual(@as(usize, 0), at % elementAlign(t.dtype));
     }
 }
 
 test "property: parse then bind over a mutated sample binds inside the bytes or fails typed" {
     const sample = try parser.sampleGguf();
-    try prop.forAll(.{ .site = 0x6767_B1D0, .cases = 4000 }, &sample, u64, prop.genSeed(*const parser.Sample), checkParseBind);
+    try prop.forAll(
+        .{ .site = 0x6767_B1D0, .cases = 4000 },
+        &sample,
+        u64,
+        prop.genSeed(*const parser.Sample),
+        checkParseBind,
+    );
 }

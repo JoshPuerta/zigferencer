@@ -35,7 +35,8 @@ const log = std.log.scoped(.gpu);
 comptime {
     if (!build_options.use_vulkan) {
         @compileError("runtime/vulkan_ctx.zig was included in a non-vulkan build. " ++
-            "Either build with -Druntime=vulkan, or fix the caller to gate on build_options.use_vulkan.");
+            "Either build with -Druntime=vulkan, or fix the caller to gate on " ++
+            "build_options.use_vulkan.");
     }
 }
 
@@ -47,7 +48,33 @@ extern fn vkGetInstanceProcAddr(
     name: [*:0]const u8,
 ) callconv(vk.vulkan_call_conv) vk.PfnVoidFunction;
 
-// -- types ---------------------------------------------------------------------
+// -- constants --------------------------------------------------------------
+
+/// The advice of a KV region refusal, with the widest window that fits. A
+/// region past the storage-buffer range also names the override.
+const kv_advice_fmt = "Use --max-seq {d} or less, or fewer sessions";
+
+const kv_range_advice_fmt = "Use --max-seq {d} or less, fewer sessions, or set " ++
+    "" ++ limits.storage_range_env;
+const kv_advice_max: usize = kv_range_advice_fmt.len + std.fmt.count(
+    "{d}",
+    .{std.math.maxInt(u32)},
+);
+
+/// The flags `pickHostType` asks for first.
+pub const host_cached_flags: vk.MemoryPropertyFlags = .{
+    .host_visible_bit = true,
+    .host_coherent_bit = true,
+    .host_cached_bit = true,
+};
+
+/// The flags `pickHostType` asks for second.
+pub const host_coherent_flags: vk.MemoryPropertyFlags = .{
+    .host_visible_bit = true,
+    .host_coherent_bit = true,
+};
+
+// -- types ------------------------------------------------------------------
 
 pub const InitError = error{
     NoVulkanDevice,
@@ -77,20 +104,12 @@ pub const HeapBudget = struct {
     budget: u64,
 };
 
-/// The advice of a KV region refusal, with the widest window that fits. A
-/// region past the storage-buffer range also names the override.
-const kv_advice_fmt = "Use --max-seq {d} or less, or fewer sessions";
-const kv_range_advice_fmt = "Use --max-seq {d} or less, fewer sessions, or set " ++ limits.storage_range_env;
-const kv_advice_max: usize = kv_range_advice_fmt.len + std.fmt.count("{d}", .{std.math.maxInt(u32)});
-
 pub const PickedDevice = struct {
     device: vk.PhysicalDevice,
     props: vk.PhysicalDeviceProperties,
     /// 3 = discrete, 2 = integrated, 1 = virtual, 0 = other, -1 = cpu (rejected).
     score: i32,
 };
-
-// -- api -----------------------------------------------------------------------
 
 pub const Context = struct {
     instance: vk.Instance,
@@ -131,6 +150,7 @@ pub const Context = struct {
             std.debug.assert(r >= 1);
             std.debug.assert(r <= limits.storage_range_max);
         }
+
         const vkb = vk.BaseWrapper.load(vkGetInstanceProcAddr);
         if (vkb.dispatch.vkCreateInstance == null) return error.BaseFunctionsMissing;
 
@@ -148,6 +168,7 @@ pub const Context = struct {
 
         const vki = vk.InstanceWrapper.load(instance, vkb.dispatch.vkGetInstanceProcAddr.?);
         if (vki.dispatch.vkDestroyInstance == null) return error.InstanceFunctionsMissing;
+
         errdefer vki.destroyInstance(instance, null);
 
         const picked = try pickPhysicalDevice(vki, instance, allocator);
@@ -155,8 +176,13 @@ pub const Context = struct {
         const queue_family = family.index;
         // A device with no timestamp bits or no tick period cannot time a
         // command buffer, so the level drops to off before any pool exists.
-        if (span.gpuLevel() != .off and (family.timestamp_valid_bits == 0 or !(picked.props.limits.timestamp_period > 0))) {
-            log.warn("GPU timestamps off: the queue has {d} valid timestamp bits and a period of {d} ns", .{ family.timestamp_valid_bits, picked.props.limits.timestamp_period });
+        if (span.gpuLevel() != .off and
+            (family.timestamp_valid_bits == 0 or !(picked.props.limits.timestamp_period > 0)))
+        {
+            log.warn(
+                "GPU timestamps off: the queue has {d} valid timestamp bits and a period of {d} ns",
+                .{ family.timestamp_valid_bits, picked.props.limits.timestamp_period },
+            );
             span.setGpuLevel(.off);
         }
 
@@ -199,27 +225,53 @@ pub const Context = struct {
         // device-local VRAM, which sizes the multi-stream KV window to the
         // hardware instead of a static default. It is absent on some drivers.
         // `deviceLocalBudget` then returns null and the runner keeps its default.
-        const avail_exts = vki.enumerateDeviceExtensionPropertiesAlloc(picked.device, null, allocator) catch
+        const avail_exts = vki.enumerateDeviceExtensionPropertiesAlloc(
+            picked.device,
+            null,
+            allocator,
+        ) catch
             &[_]vk.ExtensionProperties{};
         defer allocator.free(avail_exts);
+
         var has_memory_budget = false;
         var has_maintenance4 = apiAtLeast13(picked.props.api_version);
         for (avail_exts) |*ext| {
             const name = std.mem.sliceTo(&ext.extension_name, 0);
-            if (std.mem.eql(u8, name, vk.extensions.ext_memory_budget.name)) has_memory_budget = true;
-            if (std.mem.eql(u8, name, vk.extensions.khr_maintenance_4.name)) has_maintenance4 = true;
+            if (std.mem.eql(u8, name, vk.extensions.ext_memory_budget.name)) {
+                has_memory_budget = true;
+            }
+
+            if (std.mem.eql(u8, name, vk.extensions.khr_maintenance_4.name)) {
+                has_maintenance4 = true;
+            }
         }
-        log.debug("ext: {d} available, memory_budget {}, maintenance4 {}", .{ avail_exts.len, has_memory_budget, has_maintenance4 });
+
+        log.debug(
+            "ext: {d} available, memory_budget {}, maintenance4 {}",
+            .{ avail_exts.len, has_memory_budget, has_maintenance4 },
+        );
 
         const reported = try readBufferLimits(vki, picked.device, picked.props, has_maintenance4);
         var buffer_limits = reported;
-        if (options.storage_range_override) |r| buffer_limits.storage_range = r;
+        if (options.storage_range_override) |r| {
+            buffer_limits.storage_range = r;
+        }
+
         std.debug.assert(buffer_limits.allocation_size == reported.allocation_size);
         std.debug.assert(buffer_limits.offset_alignment == reported.offset_alignment);
         if (options.storage_range_override != null) {
-            log.info("storage-buffer range {d} bytes (reported {d}, set by " ++ limits.storage_range_env ++ ")", .{ buffer_limits.storage_range, reported.storage_range });
+            log.info(
+                "storage-buffer range {d} bytes (reported {d}, set by " ++
+                    "" ++ limits.storage_range_env ++ ")",
+                .{ buffer_limits.storage_range, reported.storage_range },
+            );
         }
-        log.debug("buffer limits: storage-buffer range {d} bytes, allocation size {d} bytes, offset alignment {d} bytes", .{ buffer_limits.storage_range, buffer_limits.allocation_size, buffer_limits.offset_alignment });
+
+        log.debug(
+            "buffer limits: storage-buffer range {d} bytes, allocation size {d} bytes, " ++
+                "offset alignment {d} bytes",
+            .{ buffer_limits.storage_range, buffer_limits.allocation_size, buffer_limits.offset_alignment },
+        );
         var ext_names: [2][*:0]const u8 = undefined;
         var ext_count: u32 = 0;
         ext_names[ext_count] = vk.extensions.ext_subgroup_size_control.name;
@@ -228,6 +280,7 @@ pub const Context = struct {
             ext_names[ext_count] = vk.extensions.ext_memory_budget.name;
             ext_count += 1;
         }
+
         const device_info: vk.DeviceCreateInfo = .{
             .p_next = @ptrCast(&v12_features),
             .queue_create_info_count = 1,
@@ -239,6 +292,7 @@ pub const Context = struct {
 
         const vkd = vk.DeviceWrapper.load(device, vki.dispatch.vkGetDeviceProcAddr.?);
         if (vkd.dispatch.vkDestroyDevice == null) return error.DeviceFunctionsMissing;
+
         errdefer vkd.destroyDevice(device, null);
 
         const queue = vkd.getDeviceQueue(device, queue_family, 0);
@@ -262,10 +316,18 @@ pub const Context = struct {
 
         var staging_query_pool: vk.QueryPool = .null_handle;
         if (span.gpuLevel() != .off) {
-            const query_info: vk.QueryPoolCreateInfo = .{ .query_type = .timestamp, .query_count = 2 };
+            const query_info: vk.QueryPoolCreateInfo = .{
+                .query_type = .timestamp,
+                .query_count = 2,
+            };
             staging_query_pool = try vkd.createQueryPool(device, &query_info, null);
         }
-        errdefer if (staging_query_pool != .null_handle) vkd.destroyQueryPool(device, staging_query_pool, null);
+
+        errdefer if (staging_query_pool != .null_handle) vkd.destroyQueryPool(
+            device,
+            staging_query_pool,
+            null,
+        );
 
         const mem_props = vki.getPhysicalDeviceMemoryProperties(picked.device);
         for (mem_props.memory_types[0..mem_props.memory_type_count], 0..) |t, type_index| {
@@ -286,6 +348,7 @@ pub const Context = struct {
                 break;
             }
         }
+
         log.debug("init done: queue family {d}, vram {d:.0} MiB", .{ queue_family, vram_mib });
 
         return .{
@@ -311,10 +374,14 @@ pub const Context = struct {
 
     pub fn deinit(self: *Context) void {
         std.debug.assert(self.staging_cmd != .null_handle);
+
         const cmds = [_]vk.CommandBuffer{self.staging_cmd};
         self.vkd.freeCommandBuffers(self.device, self.command_pool, &cmds);
         self.staging_cmd = .null_handle;
-        if (self.staging_query_pool != .null_handle) self.vkd.destroyQueryPool(self.device, self.staging_query_pool, null);
+        if (self.staging_query_pool != .null_handle) {
+            self.vkd.destroyQueryPool(self.device, self.staging_query_pool, null);
+        }
+
         self.vkd.destroyCommandPool(self.device, self.command_pool, null);
         self.vkd.destroyDevice(self.device, null);
         self.vki.destroyInstance(self.instance, null);
@@ -326,6 +393,7 @@ pub const Context = struct {
     /// window is fixed for the engine's lifetime (deterministic after startup).
     pub fn deviceLocalBudget(self: *const Context) ?struct { budget: u64, usage: u64 } {
         if (!self.has_memory_budget) return null;
+
         var budget_props: vk.PhysicalDeviceMemoryBudgetPropertiesEXT = .{
             .heap_budget = undefined,
             .heap_usage = undefined,
@@ -339,9 +407,13 @@ pub const Context = struct {
         var i: u32 = 0;
         while (i < mp.memory_heap_count) : (i += 1) {
             if (mp.memory_heaps[i].flags.device_local_bit) {
-                return .{ .budget = budget_props.heap_budget[i], .usage = budget_props.heap_usage[i] };
+                return .{
+                    .budget = budget_props.heap_budget[i],
+                    .usage = budget_props.heap_usage[i],
+                };
             }
         }
+
         return null;
     }
 
@@ -349,6 +421,7 @@ pub const Context = struct {
     /// absent or the device has no such heap.
     pub fn heapBudget(self: *const Context, heap: u32) ?HeapBudget {
         if (!self.has_memory_budget) return null;
+
         var budget_props: vk.PhysicalDeviceMemoryBudgetPropertiesEXT = .{
             .heap_budget = undefined,
             .heap_usage = undefined,
@@ -361,7 +434,11 @@ pub const Context = struct {
         const count = props2.memory_properties.memory_heap_count;
         std.debug.assert(count <= vk.MAX_MEMORY_HEAPS);
         if (heap >= count) return null;
-        return .{ .usage = budget_props.heap_usage[heap], .budget = budget_props.heap_budget[heap] };
+
+        return .{
+            .usage = budget_props.heap_usage[heap],
+            .budget = budget_props.heap_budget[heap],
+        };
     }
 
     /// Device-local VRAM bytes free for new allocations right now: the live
@@ -373,16 +450,21 @@ pub const Context = struct {
         for (self.mem_props.memory_heaps[0..self.mem_props.memory_heap_count]) |heap| {
             if (heap.flags.device_local_bit) return heap.size;
         }
+
         return 0;
     }
 
     /// Refuse a KV layout whose region breaks a device buffer limit, before
     /// any allocation. The log line names the limit, the region size, and the
     /// widest window that fits.
-    pub fn guardKvLayout(self: *const Context, layout: kv_index.Layout) error{KvRegionPastDeviceLimit}!void {
+    pub fn guardKvLayout(
+        self: *const Context,
+        layout: kv_index.Layout,
+    ) error{KvRegionPastDeviceLimit}!void {
         const lim = self.buffer_limits;
         const verdict = kv_index.fits(layout, lim);
         if (verdict == .fits) return;
+
         const bytes = layout.regionBytes();
         const n_slots = layout.n_slots;
         const window = layout.window;
@@ -390,47 +472,93 @@ pub const Context = struct {
         if (verdict == .misaligned) {
             // A window that is a multiple of this unit keeps the region a whole
             // number of alignment units.
-            const one_position = kv_index.Layout.init(n_slots, 1, layout.per_step, layout.n_layers, layout.kv_dtype);
-            const unit = lim.offset_alignment / std.math.gcd(lim.offset_alignment, one_position.regionBytes());
+            const one_position = kv_index.Layout.init(
+                n_slots,
+                1,
+                layout.per_step,
+                layout.n_layers,
+                layout.kv_dtype,
+            );
+            const unit = lim.offset_alignment / std.math.gcd(
+                lim.offset_alignment,
+                one_position.regionBytes(),
+            );
             std.debug.assert(unit >= 2);
-            log.err("KV region of {d} bytes for {d} slots x {d} positions is not a multiple of the {s} of {d} {t}. Use a --max-seq value that is a multiple of {d}", .{ bytes, n_slots, window, limit.name, limit.value, limit.unit, unit });
+            log.err(
+                "KV region of {d} bytes for {d} slots x {d} positions is not a multiple of " ++
+                    "the {s} of {d} {t}. Use a --max-seq value that is a multiple of {d}",
+                .{ bytes, n_slots, window, limit.name, limit.value, limit.unit, unit },
+            );
             return error.KvRegionPastDeviceLimit;
         }
+
         const fit = kv_index.maxGranuleWindow(n_slots, layout.per_step, layout.kv_dtype, lim);
         std.debug.assert(fit < window);
         var advice_buf: [kv_advice_max]u8 = undefined;
         const range = verdict == .past_storage_range;
         const advice: []const u8 = if (fit == 0)
-            (if (range) "No window fits this many slots. Use fewer sessions, or set " ++ limits.storage_range_env else "No window fits this many slots. Use fewer sessions")
+            (if (range) "No window fits this many slots. Use fewer sessions, or set " ++
+                "" ++ limits.storage_range_env else "No window fits this many slots. Use " ++
+                "fewer sessions")
         else if (range)
             std.fmt.bufPrint(&advice_buf, kv_range_advice_fmt, .{fit}) catch unreachable
         else
             std.fmt.bufPrint(&advice_buf, kv_advice_fmt, .{fit}) catch unreachable;
+
         switch (limit.unit) {
-            .elements => log.err("KV region of {d} bytes for {d} slots x {d} positions holds {d} elements, but the {s} is {d} {t}. {s}", .{ bytes, n_slots, window, layout.regionElems(), limit.name, limit.value, limit.unit, advice }),
-            .bytes => log.err("KV region of {d} bytes for {d} slots x {d} positions is larger than the {s} of {d} {t}. {s}", .{ bytes, n_slots, window, limit.name, limit.value, limit.unit, advice }),
+            .elements => log.err(
+                "KV region of {d} bytes for {d} slots x {d} positions holds {d} elements, " ++
+                    "but the {s} is {d} {t}. {s}",
+                .{ bytes, n_slots, window, layout.regionElems(), limit.name, limit.value, limit.unit, advice },
+            ),
+            .bytes => log.err(
+                "KV region of {d} bytes for {d} slots x {d} positions is larger than the " ++
+                    "{s} of {d} {t}. {s}",
+                .{ bytes, n_slots, window, limit.name, limit.value, limit.unit, advice },
+            ),
         }
+
         return error.KvRegionPastDeviceLimit;
     }
 
     /// Refuse a split attention scratch that breaks a device buffer limit,
     /// before any allocation. The log line names the limit and both counts.
-    pub fn guardAttnSplitScratch(self: *const Context, scratch: attn_split.Scratch) error{AttentionScratchPastDeviceLimit}!void {
+    pub fn guardAttnSplitScratch(
+        self: *const Context,
+        scratch: attn_split.Scratch,
+    ) error{AttentionScratchPastDeviceLimit}!void {
         const lim = self.buffer_limits;
         const verdict = attn_split.fits(scratch, lim);
         if (verdict == .fits) return;
+
         const bytes = scratch.totalBytes();
         const limit = kv_index.limitOf(verdict, lim);
         switch (verdict) {
             // The scratch binds whole at offset 0, so the alignment never binds it.
             .fits, .misaligned => unreachable,
-            .index_past_31_bits => log.err("Split attention scratch of {d} bytes holds {d} elements, but the {s} is {d} {t}", .{ bytes, scratch.totalElems(), limit.name, limit.value, limit.unit }),
-            .past_allocation_size => log.err("Split attention scratch of {d} bytes is larger than the {s} of {d} {t}", .{ bytes, limit.name, limit.value, limit.unit }),
-            .past_storage_range => log.err("Split attention scratch of {d} bytes is larger than the {s} of {d} {t}. Set " ++ limits.storage_range_env ++ " to a range that this device reads correctly", .{ bytes, limit.name, limit.value, limit.unit }),
+            .index_past_31_bits => log.err(
+                "Split attention scratch of {d} bytes holds {d} elements, but the {s} is {d} {t}",
+                .{ bytes, scratch.totalElems(), limit.name, limit.value, limit.unit },
+            ),
+            .past_allocation_size => log.err(
+                "Split attention scratch of {d} bytes is larger than the {s} of {d} {t}",
+                .{ bytes, limit.name, limit.value, limit.unit },
+            ),
+            .past_storage_range => log.err(
+                "Split attention scratch of {d} bytes is larger than the {s} of {d} {t}. " ++
+                    "Set " ++ limits.storage_range_env ++ " to a range that this device " ++
+                    "reads correctly",
+                .{ bytes, limit.name, limit.value, limit.unit },
+            ),
         }
+
         return error.AttentionScratchPastDeviceLimit;
     }
 };
+
+const QueueFamily = struct { index: u32, timestamp_valid_bits: u32 };
+
+// -- api --------------------------------------------------------------------
 
 pub fn pickPhysicalDevice(
     vki: vk.InstanceWrapper,
@@ -439,6 +567,7 @@ pub fn pickPhysicalDevice(
 ) InitError!PickedDevice {
     const devices = try vki.enumeratePhysicalDevicesAlloc(instance, allocator);
     defer allocator.free(devices);
+
     if (devices.len == 0) return error.NoVulkanDevice;
 
     var best: ?PickedDevice = null;
@@ -446,13 +575,18 @@ pub fn pickPhysicalDevice(
         const props = vki.getPhysicalDeviceProperties(dev);
         const score = scoreDeviceType(props.device_type);
         if (score < 0) continue;
+
         if (best == null or score > best.?.score) {
             best = .{ .device = dev, .props = props, .score = score };
         }
     }
+
     const picked = best orelse return error.NoVulkanDevice;
     const name = std.mem.sliceTo(&picked.props.device_name, 0);
-    log.debug("select: {s} type {s}, score {d}, from {d} adapters", .{ name, @tagName(picked.props.device_type), picked.score, devices.len });
+    log.debug(
+        "select: {s} type {s}, score {d}, from {d} adapters",
+        .{ name, @tagName(picked.props.device_type), picked.score, devices.len },
+    );
     return picked;
 }
 
@@ -470,24 +604,13 @@ pub fn findMemoryType(
     while (i < mem_props.memory_type_count) : (i += 1) {
         const supported = (type_bits & (@as(u32, 1) << @intCast(i))) != 0;
         if (!supported) continue;
+
         const flags = mem_props.memory_types[i].property_flags;
         if (flags.contains(required_flags)) return i;
     }
+
     return null;
 }
-
-/// The flags `pickHostType` asks for first.
-pub const host_cached_flags: vk.MemoryPropertyFlags = .{
-    .host_visible_bit = true,
-    .host_coherent_bit = true,
-    .host_cached_bit = true,
-};
-
-/// The flags `pickHostType` asks for second.
-pub const host_coherent_flags: vk.MemoryPropertyFlags = .{
-    .host_visible_bit = true,
-    .host_coherent_bit = true,
-};
 
 /// Pick the memory type for a host-visible buffer that the CPU writes and
 /// reads. It prefers a host-visible, host-coherent, host-cached type, because
@@ -500,7 +623,7 @@ pub fn pickHostType(mem_props: vk.PhysicalDeviceMemoryProperties, type_bits: u32
         findMemoryType(mem_props, type_bits, host_coherent_flags);
 }
 
-// -- helpers -------------------------------------------------------------------
+// -- helpers ----------------------------------------------------------------
 
 /// True when a device reports Vulkan 1.3 or later, where `maxBufferSize` is core.
 fn apiAtLeast13(api_version: u32) bool {
@@ -530,14 +653,20 @@ fn readBufferLimits(
     };
     vki.getPhysicalDeviceProperties2(dev, &props2);
     var allocation_size: u64 = m3.max_memory_allocation_size;
-    if (has_maintenance4) allocation_size = @min(allocation_size, m4.max_buffer_size);
+    if (has_maintenance4) {
+        allocation_size = @min(allocation_size, m4.max_buffer_size);
+    }
+
     const lim: limits.BufferLimits = .{
         .storage_range = props.limits.max_storage_buffer_range,
         .allocation_size = allocation_size,
         .offset_alignment = props.limits.min_storage_buffer_offset_alignment,
     };
     if (lim.storage_range == 0 or lim.allocation_size == 0) return error.DeviceBufferLimitsInvalid;
-    if (lim.offset_alignment == 0 or !std.math.isPowerOfTwo(lim.offset_alignment)) return error.DeviceBufferLimitsInvalid;
+    if (lim.offset_alignment == 0 or !std.math.isPowerOfTwo(lim.offset_alignment)) {
+        return error.DeviceBufferLimitsInvalid;
+    }
+
     std.debug.assert(lim.storage_range <= limits.storage_range_max);
     return lim;
 }
@@ -553,8 +682,6 @@ fn scoreDeviceType(t: vk.PhysicalDeviceType) i32 {
     };
 }
 
-const QueueFamily = struct { index: u32, timestamp_valid_bits: u32 };
-
 fn findComputeQueueFamily(
     vki: vk.InstanceWrapper,
     dev: vk.PhysicalDevice,
@@ -562,17 +689,22 @@ fn findComputeQueueFamily(
 ) InitError!QueueFamily {
     const families = try vki.getPhysicalDeviceQueueFamilyPropertiesAlloc(dev, allocator);
     defer allocator.free(families);
+
     for (families, 0..) |fam, i| {
         if (fam.queue_flags.compute_bit) {
-            log.debug("queue: compute family {d} of {d}, {d} timestamp bits", .{ i, families.len, fam.timestamp_valid_bits });
+            log.debug(
+                "queue: compute family {d} of {d}, {d} timestamp bits",
+                .{ i, families.len, fam.timestamp_valid_bits },
+            );
             std.debug.assert(fam.timestamp_valid_bits <= 64);
             return .{ .index = @intCast(i), .timestamp_valid_bits = fam.timestamp_valid_bits };
         }
     }
+
     return error.NoComputeQueue;
 }
 
-// -- tests ---------------------------------------------------------------------
+// -- tests ------------------------------------------------------------------
 
 /// Build a fabricated memory table from per-type flag words. Every type sits
 /// on heap 0, which the picker never reads.
@@ -582,6 +714,7 @@ fn fakeMemProps(flag_words: []const u32) vk.PhysicalDeviceMemoryProperties {
     for (flag_words, 0..) |w, i| {
         props.memory_types[i] = .{ .property_flags = @bitCast(w), .heap_index = 0 };
     }
+
     return props;
 }
 

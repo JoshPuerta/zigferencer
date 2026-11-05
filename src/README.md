@@ -15,11 +15,11 @@ level down, and the map above this index is [docs/architecture.md](../docs/archi
 | --- | --- |
 | `main.zig` | The entry point of `zigferencer`. `main` calls `entry`, which applies `$ZIGFERENCER_LOG`, then passes control to `cli.dispatchRelease` or `cli.dispatchDev`. The file also holds the `pub const` re-exports for `tests/`, the `isUserError` exit list, and the `test {}` discovery block. |
 | `dev_main.zig` | The entry point of `zigferencer-dev`. It imports the engine as the `zigferencer` module and calls `entry` with the developer table. |
-| [`cli/`](./cli/README.md) | argv to one handler per subcommand. The imperative edge. |
+| [`cli/`](./cli/README.md) | argv to one handler per command. The imperative edge. |
 | [`core/`](./core/README.md) | The boundary values and the pure helpers: `Tensor`, quant geometry, the static bounds, the two planners, the device KV layout, the model table, the tokenizer, and the chat wraps. |
-| `engine/` | The boot decisions as pure values. `resolve.zig` takes the flags, the registry entry, the model card, and the host facts. It returns the thinking mode, the KV dtype, the window, and the all-host plan with its RAM quote, or a `Refusal`. `device_arm.zig` adds the device arms from the facts one device context states: the fused fit, the serve budget arms, and the hybrid split. `flags.zig` holds `EngineFlags`, the knobs it reads. |
+| `engine/` | The boot decisions as pure values. `resolve.zig` takes the flags, the registry entry, the model card, and the host facts. It returns the thinking mode, the KV dtype, the window, and the all-host plan with its RAM quote, or a `Refusal`. `device_arm.zig` adds the device placements from the facts one device context states: the fused fit, the serve budget placements, and the hybrid split. `flags.zig` holds `EngineFlags`, the options it reads. `family.zig` holds one row for each model family: the runner of each placement. |
 | [`io/`](./io/README.md) | The I/O shell: an HTTPS download, a read-only whole-file map, and the GGUF parser and loader. |
-| [`ops/`](./ops/README.md) | The CPU op variants. `naive` is the oracle that every other variant matches. |
+| [`ops/`](./ops/README.md) | The CPU op variants. `naive` is the reference that every other variant matches. |
 | [`ops_vulkan/`](./ops_vulkan/README.md) | The GPU op backend: one pipeline struct per shader, the upload ring, and the GLSL sources. GPU builds only. |
 | [`runtime/`](./runtime/README.md) | The control units that own state: the six runners, the KV cache, the session pool, the sampler, and the prompt cache. |
 | [`serve/`](./serve/README.md) | The serving layer: the scheduler, the transport-independent engine, the residency tier, and two transport adapters. |
@@ -48,7 +48,7 @@ level down, and the map above this index is [docs/architecture.md](../docs/archi
 ```
 
 The command set stops at the dispatcher. `cli/command.zig` owns the tables, and
-`main` names no subcommand. The re-exports and the `test {}` list point at the
+`main` names no command. The re-exports and the `test {}` list point at the
 same modules for two different reasons. A re-export lets a file under `tests/`
 write `@import("zigferencer").loader`. A `test {}` reference pulls that module's
 own tests into the test binary.

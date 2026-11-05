@@ -33,15 +33,17 @@ const log = std.log.scoped(.gpu);
 comptime {
     if (!build_options.use_vulkan) {
         @compileError("ops_vulkan/kernels.zig was included in a non-vulkan build. " ++
-            "Either build with -Druntime=vulkan, or fix the caller to gate on build_options.use_vulkan.");
+            "Either build with -Druntime=vulkan, or fix the caller to gate on " ++
+            "build_options.use_vulkan.");
     }
 }
 
-// -- types ------------------------------------------------------------------
+// -- constants --------------------------------------------------------------
 
 /// Q8_0 and Q4_0 block layout, in lockstep with `src/core/dtype.zig` and the
 /// CPU decoder in `ops/naive.zig`. The quant kernels assert a match.
 const q8_0_block_elems: usize = 32;
+
 const q8_0_block_bytes: usize = 2 + q8_0_block_elems; // f16 scale + 32 i8 quants
 const q4_0_block_elems: usize = 32;
 const q4_0_packed_bytes: usize = 16; // 32 weights at 4 bits = 16 bytes
@@ -52,6 +54,220 @@ pub const q4_0_block_bytes: usize = 2 + q4_0_packed_bytes; // f16 scale + 16 pac
 /// stays under it needs no device query. The narrowing kernels assert against
 /// it, because their grid follows an element count the caller supplies.
 const max_workgroups_x: u32 = 65535;
+
+/// SPIR-V binary for `shaders/vec_add.comp`, produced by `glslc` at build time
+/// and embedded through an anonymous import that `build.zig` declares.
+/// SPIR-V is a stream of 4-byte words and `createShaderModule` casts back to
+/// `[*]const u32`, so the declaration forces `align(@alignOf(u32))` on the
+/// embed. A bare `@embedFile` gives a `*const [N]u8` of alignment 1. Every
+/// shader embed below repeats this form.
+const vec_add_spv: [
+    @embedFile(
+        "vec_add.spv",
+    ).len
+]u8 align(@alignOf(u32)) = @embedFile("vec_add.spv").*;
+
+/// SPIR-V for `shaders/residual_add.comp`.
+const residual_add_spv: [
+    @embedFile(
+        "residual_add.spv",
+    ).len
+]u8 align(@alignOf(u32)) = @embedFile("residual_add.spv").*;
+
+/// SPIR-V for `shaders/sigmoid_gate.comp`.
+const sigmoid_gate_spv: [
+    @embedFile(
+        "sigmoid_gate.spv",
+    ).len
+]u8 align(@alignOf(u32)) = @embedFile("sigmoid_gate.spv").*;
+
+/// SPIR-V for `shaders/attention.comp`, once per KV-cache element type.
+const attention_spv: [
+    @embedFile(
+        "attention.spv",
+    ).len
+]u8 align(@alignOf(u32)) = @embedFile("attention.spv").*;
+
+const attention_f16_spv: [
+    @embedFile(
+        "attention_f16.spv",
+    ).len
+]u8 align(@alignOf(u32)) = @embedFile("attention_f16.spv").*;
+
+/// SPIR-V for `shaders/attention_split.comp`, once per KV-cache element type,
+/// and for `shaders/attention_merge.comp`, whose f32 records serve both types.
+const attention_split_spv: [
+    @embedFile(
+        "attention_split.spv",
+    ).len
+]u8 align(@alignOf(u32)) = @embedFile("attention_split.spv").*;
+
+const attention_split_f16_spv: [
+    @embedFile(
+        "attention_split_f16.spv",
+    ).len
+]u8 align(@alignOf(u32)) = @embedFile("attention_split_f16.spv").*;
+const attention_merge_spv: [
+    @embedFile(
+        "attention_merge.spv",
+    ).len
+]u8 align(@alignOf(u32)) = @embedFile("attention_merge.spv").*;
+
+/// SPIR-V for `shaders/rope.comp`.
+const rope_spv: [@embedFile("rope.spv").len]u8 align(@alignOf(u32)) = @embedFile("rope.spv").*;
+
+/// SPIR-V for `shaders/rope_multi.comp`.
+const rope_multi_spv: [
+    @embedFile(
+        "rope_multi.spv",
+    ).len
+]u8 align(@alignOf(u32)) = @embedFile("rope_multi.spv").*;
+
+/// SPIR-V for `shaders/rmsnorm.comp`.
+const rmsnorm_spv: [
+    @embedFile(
+        "rmsnorm.spv",
+    ).len
+]u8 align(@alignOf(u32)) = @embedFile("rmsnorm.spv").*;
+
+/// SPIR-V for `shaders/swiglu.comp`.
+const swiglu_spv: [
+    @embedFile(
+        "swiglu.spv",
+    ).len
+]u8 align(@alignOf(u32)) = @embedFile("swiglu.spv").*;
+
+/// SPIR-V for `shaders/linear_q8_0.comp`. See `vec_add_spv` for the alignment
+/// rule that every shader embed here follows.
+const linear_q8_0_spv: [
+    @embedFile(
+        "linear_q8_0.spv",
+    ).len
+]u8 align(@alignOf(u32)) = @embedFile("linear_q8_0.spv").*;
+
+/// SPIR-V for `shaders/linear_q8_0_reduce.comp`.
+const linear_q8_0_reduce_spv: [
+    @embedFile(
+        "linear_q8_0_reduce.spv",
+    ).len
+]u8 align(@alignOf(u32)) = @embedFile("linear_q8_0_reduce.spv").*;
+
+/// SPIR-V for `shaders/linear_q4_0_reduce.comp`.
+const linear_q4_0_reduce_spv: [
+    @embedFile(
+        "linear_q4_0_reduce.spv",
+    ).len
+]u8 align(@alignOf(u32)) = @embedFile("linear_q4_0_reduce.spv").*;
+
+/// SPIR-V for `shaders/linear_q8_0_subgroup.comp`.
+const linear_q8_0_subgroup_spv: [
+    @embedFile(
+        "linear_q8_0_subgroup.spv",
+    ).len
+]u8 align(@alignOf(u32)) = @embedFile("linear_q8_0_subgroup.spv").*;
+
+/// SPIR-V for `shaders/linear_q8_0_batch.comp`.
+const linear_q8_0_batch_spv: [
+    @embedFile(
+        "linear_q8_0_batch.spv",
+    ).len
+]u8 align(@alignOf(u32)) = @embedFile("linear_q8_0_batch.spv").*;
+
+/// SPIR-V for `shaders/linear_q8_0_gemm.comp`.
+const linear_q8_0_gemm_spv: [
+    @embedFile(
+        "linear_q8_0_gemm.spv",
+    ).len
+]u8 align(@alignOf(u32)) = @embedFile("linear_q8_0_gemm.spv").*;
+
+/// SPIR-V for `shaders/linear_q4_0_batch.comp`.
+const linear_q4_0_batch_spv: [
+    @embedFile(
+        "linear_q4_0_batch.spv",
+    ).len
+]u8 align(@alignOf(u32)) = @embedFile("linear_q4_0_batch.spv").*;
+
+/// SPIR-V for `shaders/rmsnorm_batch.comp`.
+const rmsnorm_batch_spv: [
+    @embedFile(
+        "rmsnorm_batch.spv",
+    ).len
+]u8 align(@alignOf(u32)) = @embedFile("rmsnorm_batch.spv").*;
+
+/// SPIR-V for `shaders/rope_multi_batch.comp`.
+const rope_multi_batch_spv: [
+    @embedFile(
+        "rope_multi_batch.spv",
+    ).len
+]u8 align(@alignOf(u32)) = @embedFile("rope_multi_batch.spv").*;
+
+/// SPIR-V for `shaders/attention_batch.comp`, once per KV-cache element type.
+const attention_batch_spv: [
+    @embedFile(
+        "attention_batch.spv",
+    ).len
+]u8 align(@alignOf(u32)) = @embedFile("attention_batch.spv").*;
+
+const attention_batch_f16_spv: [
+    @embedFile(
+        "attention_batch_f16.spv",
+    ).len
+]u8 align(@alignOf(u32)) = @embedFile("attention_batch_f16.spv").*;
+
+/// SPIR-V for `shaders/attention_multi_stream.comp`, once per KV-cache element
+/// type.
+const attention_multi_stream_spv: [
+    @embedFile(
+        "attention_multi_stream.spv",
+    ).len
+]u8 align(@alignOf(u32)) = @embedFile("attention_multi_stream.spv").*;
+
+const attention_multi_stream_f16_spv: [
+    @embedFile(
+        "attention_multi_stream_f16.spv",
+    ).len
+]u8 align(@alignOf(u32)) = @embedFile("attention_multi_stream_f16.spv").*;
+
+/// SPIR-V for `shaders/kv_commit_f16.comp`.
+const kv_commit_f16_spv: [
+    @embedFile(
+        "kv_commit_f16.spv",
+    ).len
+]u8 align(@alignOf(u32)) = @embedFile("kv_commit_f16.spv").*;
+
+/// SPIR-V for `shaders/gdn_decode.comp`.
+const gdn_decode_spv: [
+    @embedFile(
+        "gdn_decode.spv",
+    ).len
+]u8 align(@alignOf(u32)) = @embedFile("gdn_decode.spv").*;
+
+/// SPIR-V for the chunked-parallel GDN prefill (three dispatches).
+const gdn_chunk_conv_spv: [
+    @embedFile(
+        "gdn_chunk_conv.spv",
+    ).len
+]u8 align(@alignOf(u32)) = @embedFile("gdn_chunk_conv.spv").*;
+
+const gdn_chunk_scan_spv: [
+    @embedFile(
+        "gdn_chunk_scan.spv",
+    ).len
+]u8 align(@alignOf(u32)) = @embedFile("gdn_chunk_scan.spv").*;
+const gdn_chunk_norm_spv: [
+    @embedFile(
+        "gdn_chunk_norm.spv",
+    ).len
+]u8 align(@alignOf(u32)) = @embedFile("gdn_chunk_norm.spv").*;
+
+/// SPIR-V for `shaders/qwen_qk_norm.comp`.
+const qwen_qk_norm_spv: [
+    @embedFile(
+        "qwen_qk_norm.spv",
+    ).len
+]u8 align(@alignOf(u32)) = @embedFile("qwen_qk_norm.spv").*;
+
+// -- types ------------------------------------------------------------------
 
 /// The four objects of one compute-pipeline chain: the shader module, the
 /// descriptor set layout, the pipeline layout, and the pipeline handle. They are
@@ -80,6 +296,7 @@ pub const Pipeline = struct {
         std.debug.assert(binding_count >= 1);
         std.debug.assert(push_size >= 4);
         std.debug.assert(push_size % 4 == 0);
+
         if (@intFromPtr(spv.ptr) % 4 != 0) return error.SpirVMisaligned;
 
         const shader_info: vk.ShaderModuleCreateInfo = .{
@@ -118,19 +335,9 @@ pub const Pipeline = struct {
     }
 };
 
-// -- api --------------------------------------------------------------------
-
 /// Double-buffered host-to-device upload ring, the asynchronous counterpart to
 /// `runStagingCopies`.
 pub const StreamRing = @import("stream_ring.zig").StreamRing;
-
-/// SPIR-V binary for `shaders/vec_add.comp`, produced by `glslc` at build time
-/// and embedded through an anonymous import that `build.zig` declares.
-/// SPIR-V is a stream of 4-byte words and `createShaderModule` casts back to
-/// `[*]const u32`, so the declaration forces `align(@alignOf(u32))` on the
-/// embed. A bare `@embedFile` gives a `*const [N]u8` of alignment 1. Every
-/// shader embed below repeats this form.
-const vec_add_spv: [@embedFile("vec_add.spv").len]u8 align(@alignOf(u32)) = @embedFile("vec_add.spv").*;
 
 /// Element-wise `out[i] = a[i] + b[i]`, the proof-of-life pipeline. Three
 /// storage buffers (a, b, out) and one `u32` push constant for the element
@@ -199,6 +406,7 @@ pub const VecAdd = struct {
         out: []f32,
     ) RunError!void {
         if (a.len != b.len or a.len != out.len) return error.BuffersLengthMismatch;
+
         const n: u32 = @intCast(a.len);
         const byte_size: vk.DeviceSize = @intCast(a.len * @sizeOf(f32));
 
@@ -221,23 +429,36 @@ pub const VecAdd = struct {
         try self.ctx.vkd.beginCommandBuffer(self.oneshot.cmd_buffer, &begin);
         self.ctx.vkd.cmdBindPipeline(self.oneshot.cmd_buffer, .compute, self.pipeline.handle);
         const desc_sets = [_]vk.DescriptorSet{self.oneshot.desc_set};
-        self.ctx.vkd.cmdBindDescriptorSets(self.oneshot.cmd_buffer, .compute, self.pipeline.pipeline_layout, 0, &desc_sets, null);
-        self.ctx.vkd.cmdPushConstants(self.oneshot.cmd_buffer, self.pipeline.pipeline_layout, .{ .compute_bit = true }, 0, @sizeOf(u32), @ptrCast(&n));
+        self.ctx.vkd.cmdBindDescriptorSets(
+            self.oneshot.cmd_buffer,
+            .compute,
+            self.pipeline.pipeline_layout,
+            0,
+            &desc_sets,
+            null,
+        );
+        self.ctx.vkd.cmdPushConstants(
+            self.oneshot.cmd_buffer,
+            self.pipeline.pipeline_layout,
+            .{ .compute_bit = true },
+            0,
+            @sizeOf(u32),
+            @ptrCast(&n),
+        );
         const group_count_x: u32 = (n + 255) / 256;
         self.ctx.vkd.cmdDispatch(self.oneshot.cmd_buffer, group_count_x, 1, 1);
         try self.ctx.vkd.endCommandBuffer(self.oneshot.cmd_buffer);
 
         const cmds = [_]vk.CommandBuffer{self.oneshot.cmd_buffer};
-        const submits = [_]vk.SubmitInfo{.{ .command_buffer_count = 1, .p_command_buffers = &cmds }};
+        const submits = [_]vk.SubmitInfo{
+            .{ .command_buffer_count = 1, .p_command_buffers = &cmds },
+        };
         try self.ctx.vkd.queueSubmit(self.ctx.queue, &submits, .null_handle);
         try self.ctx.vkd.queueWaitIdle(self.ctx.queue);
 
         @memcpy(out, self.buf_out.sliceTyped(f32, out.len));
     }
 };
-
-/// SPIR-V for `shaders/residual_add.comp`.
-const residual_add_spv: [@embedFile("residual_add.spv").len]u8 align(@alignOf(u32)) = @embedFile("residual_add.spv").*;
 
 /// In-place residual add `dst[i] += x[i]`. Two storage buffers (x readonly, dst
 /// read and write) and one `u32` push constant for the length. `x` and `dst`
@@ -299,6 +520,7 @@ pub const ResidualAdd = struct {
     ) RunError!void {
         if (x.len != dst_init.len) return error.LengthMismatch;
         if (x.len != dst_final.len) return error.LengthMismatch;
+
         const n: u32 = @intCast(x.len);
         const byte_size: vk.DeviceSize = @intCast(x.len * @sizeOf(f32));
 
@@ -325,6 +547,7 @@ pub const ResidualAdd = struct {
                 .p_texel_buffer_view = undefined,
             };
         }
+
         self.ctx.vkd.updateDescriptorSets(self.ctx.device, &writes, null);
 
         try self.ctx.vkd.resetCommandBuffer(self.oneshot.cmd_buffer, .{});
@@ -332,8 +555,22 @@ pub const ResidualAdd = struct {
         try self.ctx.vkd.beginCommandBuffer(self.oneshot.cmd_buffer, &begin);
         self.ctx.vkd.cmdBindPipeline(self.oneshot.cmd_buffer, .compute, self.pipeline.handle);
         const desc_sets = [_]vk.DescriptorSet{self.oneshot.desc_set};
-        self.ctx.vkd.cmdBindDescriptorSets(self.oneshot.cmd_buffer, .compute, self.pipeline.pipeline_layout, 0, &desc_sets, null);
-        self.ctx.vkd.cmdPushConstants(self.oneshot.cmd_buffer, self.pipeline.pipeline_layout, .{ .compute_bit = true }, 0, @sizeOf(u32), @ptrCast(&n));
+        self.ctx.vkd.cmdBindDescriptorSets(
+            self.oneshot.cmd_buffer,
+            .compute,
+            self.pipeline.pipeline_layout,
+            0,
+            &desc_sets,
+            null,
+        );
+        self.ctx.vkd.cmdPushConstants(
+            self.oneshot.cmd_buffer,
+            self.pipeline.pipeline_layout,
+            .{ .compute_bit = true },
+            0,
+            @sizeOf(u32),
+            @ptrCast(&n),
+        );
         const group_count_x: u32 = (n + 255) / 256;
 
         // SSBO read-after-write hazard between dispatches: each dispatch
@@ -357,12 +594,16 @@ pub const ResidualAdd = struct {
                     null,
                 );
             }
+
             self.ctx.vkd.cmdDispatch(self.oneshot.cmd_buffer, group_count_x, 1, 1);
         }
+
         try self.ctx.vkd.endCommandBuffer(self.oneshot.cmd_buffer);
 
         const cmds = [_]vk.CommandBuffer{self.oneshot.cmd_buffer};
-        const submits = [_]vk.SubmitInfo{.{ .command_buffer_count = 1, .p_command_buffers = &cmds }};
+        const submits = [_]vk.SubmitInfo{
+            .{ .command_buffer_count = 1, .p_command_buffers = &cmds },
+        };
         try self.ctx.vkd.queueSubmit(self.ctx.queue, &submits, .null_handle);
         try self.ctx.vkd.queueWaitIdle(self.ctx.queue);
 
@@ -380,14 +621,29 @@ pub const ResidualAdd = struct {
     ) void {
         self.ctx.vkd.cmdBindPipeline(cb, .compute, self.pipeline.handle);
         const desc_sets = [_]vk.DescriptorSet{desc_set};
-        self.ctx.vkd.cmdBindDescriptorSets(cb, .compute, self.pipeline.pipeline_layout, 0, &desc_sets, null);
-        self.ctx.vkd.cmdPushConstants(cb, self.pipeline.pipeline_layout, .{ .compute_bit = true }, 0, @sizeOf(u32), @ptrCast(&n));
+        self.ctx.vkd.cmdBindDescriptorSets(
+            cb,
+            .compute,
+            self.pipeline.pipeline_layout,
+            0,
+            &desc_sets,
+            null,
+        );
+        self.ctx.vkd.cmdPushConstants(
+            cb,
+            self.pipeline.pipeline_layout,
+            .{ .compute_bit = true },
+            0,
+            @sizeOf(u32),
+            @ptrCast(&n),
+        );
         const group_count_x: u32 = (n + 255) / 256;
         self.ctx.vkd.cmdDispatch(cb, group_count_x, 1, 1);
     }
 
     pub fn run(self: *ResidualAdd, x: []const f32, dst: []f32) RunError!void {
         if (x.len != dst.len) return error.LengthMismatch;
+
         const n: u32 = @intCast(x.len);
         const byte_size: vk.DeviceSize = @intCast(x.len * @sizeOf(f32));
 
@@ -414,6 +670,7 @@ pub const ResidualAdd = struct {
                 .p_texel_buffer_view = undefined,
             };
         }
+
         self.ctx.vkd.updateDescriptorSets(self.ctx.device, &writes, null);
 
         try self.ctx.vkd.resetCommandBuffer(self.oneshot.cmd_buffer, .{});
@@ -421,23 +678,36 @@ pub const ResidualAdd = struct {
         try self.ctx.vkd.beginCommandBuffer(self.oneshot.cmd_buffer, &begin);
         self.ctx.vkd.cmdBindPipeline(self.oneshot.cmd_buffer, .compute, self.pipeline.handle);
         const desc_sets = [_]vk.DescriptorSet{self.oneshot.desc_set};
-        self.ctx.vkd.cmdBindDescriptorSets(self.oneshot.cmd_buffer, .compute, self.pipeline.pipeline_layout, 0, &desc_sets, null);
-        self.ctx.vkd.cmdPushConstants(self.oneshot.cmd_buffer, self.pipeline.pipeline_layout, .{ .compute_bit = true }, 0, @sizeOf(u32), @ptrCast(&n));
+        self.ctx.vkd.cmdBindDescriptorSets(
+            self.oneshot.cmd_buffer,
+            .compute,
+            self.pipeline.pipeline_layout,
+            0,
+            &desc_sets,
+            null,
+        );
+        self.ctx.vkd.cmdPushConstants(
+            self.oneshot.cmd_buffer,
+            self.pipeline.pipeline_layout,
+            .{ .compute_bit = true },
+            0,
+            @sizeOf(u32),
+            @ptrCast(&n),
+        );
         const group_count_x: u32 = (n + 255) / 256;
         self.ctx.vkd.cmdDispatch(self.oneshot.cmd_buffer, group_count_x, 1, 1);
         try self.ctx.vkd.endCommandBuffer(self.oneshot.cmd_buffer);
 
         const cmds = [_]vk.CommandBuffer{self.oneshot.cmd_buffer};
-        const submits = [_]vk.SubmitInfo{.{ .command_buffer_count = 1, .p_command_buffers = &cmds }};
+        const submits = [_]vk.SubmitInfo{
+            .{ .command_buffer_count = 1, .p_command_buffers = &cmds },
+        };
         try self.ctx.vkd.queueSubmit(self.ctx.queue, &submits, .null_handle);
         try self.ctx.vkd.queueWaitIdle(self.ctx.queue);
 
         @memcpy(dst, self.buf_dst.sliceTyped(f32, dst.len));
     }
 };
-
-/// SPIR-V for `shaders/sigmoid_gate.comp`.
-const sigmoid_gate_spv: [@embedFile("sigmoid_gate.spv").len]u8 align(@alignOf(u32)) = @embedFile("sigmoid_gate.spv").*;
 
 /// In-place output gate `dst[i] *= sigmoid(gate[i])` for Qwen3.5 full attention.
 /// Two storage buffers (dst read and write, gate readonly) and one `u32` push
@@ -483,11 +753,30 @@ pub const SigmoidGate = struct {
 
     /// Record one gate dispatch into a command buffer the caller owns. The
     /// caller binds the descriptor set (dst, gate).
-    pub fn recordInto(self: *SigmoidGate, cb: vk.CommandBuffer, desc_set: vk.DescriptorSet, n: u32) void {
+    pub fn recordInto(
+        self: *SigmoidGate,
+        cb: vk.CommandBuffer,
+        desc_set: vk.DescriptorSet,
+        n: u32,
+    ) void {
         self.ctx.vkd.cmdBindPipeline(cb, .compute, self.pipeline.handle);
         const sets = [_]vk.DescriptorSet{desc_set};
-        self.ctx.vkd.cmdBindDescriptorSets(cb, .compute, self.pipeline.pipeline_layout, 0, &sets, null);
-        self.ctx.vkd.cmdPushConstants(cb, self.pipeline.pipeline_layout, .{ .compute_bit = true }, 0, @sizeOf(u32), @ptrCast(&n));
+        self.ctx.vkd.cmdBindDescriptorSets(
+            cb,
+            .compute,
+            self.pipeline.pipeline_layout,
+            0,
+            &sets,
+            null,
+        );
+        self.ctx.vkd.cmdPushConstants(
+            cb,
+            self.pipeline.pipeline_layout,
+            .{ .compute_bit = true },
+            0,
+            @sizeOf(u32),
+            @ptrCast(&n),
+        );
         self.ctx.vkd.cmdDispatch(cb, (n + 255) / 256, 1, 1);
     }
 
@@ -495,6 +784,7 @@ pub const SigmoidGate = struct {
 
     pub fn run(self: *SigmoidGate, dst: []f32, gate: []const f32) RunError!void {
         if (dst.len != gate.len) return error.LengthMismatch;
+
         const n: u32 = @intCast(dst.len);
         const byte_size: vk.DeviceSize = @intCast(dst.len * @sizeOf(f32));
         try self.buf_dst.ensure(byte_size);
@@ -515,16 +805,14 @@ pub const SigmoidGate = struct {
         try self.ctx.vkd.endCommandBuffer(self.oneshot.cmd_buffer);
 
         const cmds = [_]vk.CommandBuffer{self.oneshot.cmd_buffer};
-        const submits = [_]vk.SubmitInfo{.{ .command_buffer_count = 1, .p_command_buffers = &cmds }};
+        const submits = [_]vk.SubmitInfo{
+            .{ .command_buffer_count = 1, .p_command_buffers = &cmds },
+        };
         try self.ctx.vkd.queueSubmit(self.ctx.queue, &submits, .null_handle);
         try self.ctx.vkd.queueWaitIdle(self.ctx.queue);
         @memcpy(dst, self.buf_dst.sliceTyped(f32, dst.len));
     }
 };
-
-/// SPIR-V for `shaders/attention.comp`, once per KV-cache element type.
-const attention_spv: [@embedFile("attention.spv").len]u8 align(@alignOf(u32)) = @embedFile("attention.spv").*;
-const attention_f16_spv: [@embedFile("attention_f16.spv").len]u8 align(@alignOf(u32)) = @embedFile("attention_f16.spv").*;
 
 /// Fused single-token attention: the scores, the softmax, and the V-weighted
 /// sum, one workgroup per query head. Reads q, k_cache, and v_cache, and writes
@@ -594,9 +882,14 @@ pub const Attention = struct {
                 .type = .storage_buffer,
                 .descriptor_count = AttentionSplit.split_bindings + AttentionSplit.merge_bindings,
             }};
-            const pool_info: vk.DescriptorPoolCreateInfo = .{ .max_sets = 2, .pool_size_count = 1, .p_pool_sizes = &pool_sizes };
+            const pool_info: vk.DescriptorPoolCreateInfo = .{
+                .max_sets = 2,
+                .pool_size_count = 1,
+                .p_pool_sizes = &pool_sizes,
+            };
             const pool = try ctx.vkd.createDescriptorPool(ctx.device, &pool_info, null);
             errdefer ctx.vkd.destroyDescriptorPool(ctx.device, pool, null);
+
             const split_set = try allocateOneSet(ctx, pool, passes.split.set_layout);
             const merge_set = try allocateOneSet(ctx, pool, passes.merge.set_layout);
 
@@ -633,6 +926,7 @@ pub const Attention = struct {
             .f32 => &attention_spv,
             .f16 => &attention_f16_spv,
         };
+
         const pipeline = try Pipeline.init(ctx, spv, 4, @sizeOf(PushConsts));
         errdefer pipeline.deinit(ctx);
 
@@ -658,7 +952,10 @@ pub const Attention = struct {
         self.buf_v.deinit();
         self.buf_out.deinit();
         self.buf_scratch.deinit();
-        if (self.split) |*kit| kit.deinit(self.ctx);
+        if (self.split) |*kit| {
+            kit.deinit(self.ctx);
+        }
+
         self.oneshot.deinit(self.ctx);
         self.pipeline.deinit(self.ctx);
     }
@@ -685,11 +982,31 @@ pub const Attention = struct {
         std.debug.assert(n_kv_heads >= 1);
         std.debug.assert(n_heads % n_kv_heads == 0);
         std.debug.assert(head_dim >= 1);
+
         self.ctx.vkd.cmdBindPipeline(cb, .compute, self.pipeline.handle);
         const desc_sets = [_]vk.DescriptorSet{desc_set};
-        self.ctx.vkd.cmdBindDescriptorSets(cb, .compute, self.pipeline.pipeline_layout, 0, &desc_sets, null);
-        const pc: PushConsts = .{ .n_heads = n_heads, .n_kv_heads = n_kv_heads, .head_dim = head_dim, .t_len = t_len };
-        self.ctx.vkd.cmdPushConstants(cb, self.pipeline.pipeline_layout, .{ .compute_bit = true }, 0, @sizeOf(PushConsts), @ptrCast(&pc));
+        self.ctx.vkd.cmdBindDescriptorSets(
+            cb,
+            .compute,
+            self.pipeline.pipeline_layout,
+            0,
+            &desc_sets,
+            null,
+        );
+        const pc: PushConsts = .{
+            .n_heads = n_heads,
+            .n_kv_heads = n_kv_heads,
+            .head_dim = head_dim,
+            .t_len = t_len,
+        };
+        self.ctx.vkd.cmdPushConstants(
+            cb,
+            self.pipeline.pipeline_layout,
+            .{ .compute_bit = true },
+            0,
+            @sizeOf(PushConsts),
+            @ptrCast(&pc),
+        );
         self.ctx.vkd.cmdDispatch(cb, n_heads, 1, 1);
     }
 
@@ -730,6 +1047,7 @@ pub const Attention = struct {
             f16 => .f16,
             else => @compileError("Attention.runTyped: the KV element type must be f32 or f16"),
         };
+
         std.debug.assert(self.kv == kv);
         std.debug.assert(t_len >= 1);
         std.debug.assert(t_len <= limits.max_model_ctx);
@@ -744,13 +1062,24 @@ pub const Attention = struct {
         std.debug.assert(k_cache.len >= row_elems);
         std.debug.assert(v_cache.len >= row_elems);
         const deep = attn_split.usesSplit(t_len);
-        if (deep and self.split == null) self.split = try SplitKit.init(self.ctx, self.kv);
+        if (deep and self.split == null) {
+            self.split = try SplitKit.init(self.ctx, self.kv);
+        }
+
         const q_bytes: vk.DeviceSize = @intCast(q.len * @sizeOf(f32));
         // The f16 shaders read the caches as 32-bit words, so each binding
         // covers whole words. The split pass reads K in 16-byte loads, so the
         // K binding covers whole loads. No shader reads the padding.
-        const k_bytes: vk.DeviceSize = std.mem.alignForward(vk.DeviceSize, k_cache.len * @sizeOf(T), 16);
-        const v_bytes: vk.DeviceSize = std.mem.alignForward(vk.DeviceSize, v_cache.len * @sizeOf(T), 4);
+        const k_bytes: vk.DeviceSize = std.mem.alignForward(
+            vk.DeviceSize,
+            k_cache.len * @sizeOf(T),
+            16,
+        );
+        const v_bytes: vk.DeviceSize = std.mem.alignForward(
+            vk.DeviceSize,
+            v_cache.len * @sizeOf(T),
+            4,
+        );
         const out_bytes: vk.DeviceSize = @intCast(out.len * @sizeOf(f32));
 
         try self.buf_q.ensure(q_bytes);
@@ -761,10 +1090,26 @@ pub const Attention = struct {
         @memcpy(self.buf_k.sliceTyped(T, k_cache.len), k_cache);
         @memcpy(self.buf_v.sliceTyped(T, v_cache.len), v_cache);
 
-        const q_info: vk.DescriptorBufferInfo = .{ .buffer = self.buf_q.buffer, .offset = 0, .range = q_bytes };
-        const k_info: vk.DescriptorBufferInfo = .{ .buffer = self.buf_k.buffer, .offset = 0, .range = k_bytes };
-        const v_info: vk.DescriptorBufferInfo = .{ .buffer = self.buf_v.buffer, .offset = 0, .range = v_bytes };
-        const out_info: vk.DescriptorBufferInfo = .{ .buffer = self.buf_out.buffer, .offset = 0, .range = out_bytes };
+        const q_info: vk.DescriptorBufferInfo = .{
+            .buffer = self.buf_q.buffer,
+            .offset = 0,
+            .range = q_bytes,
+        };
+        const k_info: vk.DescriptorBufferInfo = .{
+            .buffer = self.buf_k.buffer,
+            .offset = 0,
+            .range = k_bytes,
+        };
+        const v_info: vk.DescriptorBufferInfo = .{
+            .buffer = self.buf_v.buffer,
+            .offset = 0,
+            .range = v_bytes,
+        };
+        const out_info: vk.DescriptorBufferInfo = .{
+            .buffer = self.buf_out.buffer,
+            .offset = 0,
+            .range = out_bytes,
+        };
 
         // The split path writes one row of records at scratch row 0. A record
         // offset does not depend on the row count, so a one-row scratch has the
@@ -779,7 +1124,11 @@ pub const Attention = struct {
             const kit = &self.split.?;
             const scratch_bytes: vk.DeviceSize = scratch.totalBytes();
             try self.buf_scratch.ensure(scratch_bytes);
-            const scratch_info: vk.DescriptorBufferInfo = .{ .buffer = self.buf_scratch.buffer, .offset = 0, .range = scratch_bytes };
+            const scratch_info: vk.DescriptorBufferInfo = .{
+                .buffer = self.buf_scratch.buffer,
+                .offset = 0,
+                .range = scratch_bytes,
+            };
             AttentionSplit.assertKBinding(k_info);
             AttentionSplit.assertVBinding(v_info);
             const split_infos = [_]vk.DescriptorBufferInfo{ q_info, k_info, v_info, scratch_info };
@@ -797,33 +1146,59 @@ pub const Attention = struct {
         try self.ctx.vkd.beginCommandBuffer(cb, &begin);
         if (deep) {
             const kit = &self.split.?;
-            kit.passes.recordSplit(cb, kit.split_set, n_heads, n_kv_heads, head_dim, t_len, @intCast(row_elems), 0, 0, 0, scratch.max_splits);
+            kit.passes.recordSplit(
+                cb,
+                kit.split_set,
+                n_heads,
+                n_kv_heads,
+                head_dim,
+                t_len,
+                @intCast(row_elems),
+                0,
+                0,
+                0,
+                scratch.max_splits,
+            );
             // The merge reads the records that the split pass wrote.
             const records_ready = [_]vk.MemoryBarrier{.{
                 .src_access_mask = .{ .shader_write_bit = true },
                 .dst_access_mask = .{ .shader_read_bit = true },
             }};
-            self.ctx.vkd.cmdPipelineBarrier(cb, .{ .compute_shader_bit = true }, .{ .compute_shader_bit = true }, .{}, &records_ready, null, null);
-            kit.passes.recordMerge(cb, kit.merge_set, n_heads, head_dim, t_len, 0, scratch.max_splits, 0);
+            self.ctx.vkd.cmdPipelineBarrier(
+                cb,
+                .{ .compute_shader_bit = true },
+                .{ .compute_shader_bit = true },
+                .{},
+                &records_ready,
+                null,
+                null,
+            );
+            kit.passes.recordMerge(
+                cb,
+                kit.merge_set,
+                n_heads,
+                head_dim,
+                t_len,
+                0,
+                scratch.max_splits,
+                0,
+            );
         } else {
             self.recordInto(cb, self.oneshot.desc_set, n_heads, n_kv_heads, head_dim, t_len);
         }
+
         try self.ctx.vkd.endCommandBuffer(cb);
 
         const cmds = [_]vk.CommandBuffer{cb};
-        const submits = [_]vk.SubmitInfo{.{ .command_buffer_count = 1, .p_command_buffers = &cmds }};
+        const submits = [_]vk.SubmitInfo{
+            .{ .command_buffer_count = 1, .p_command_buffers = &cmds },
+        };
         try self.ctx.vkd.queueSubmit(self.ctx.queue, &submits, .null_handle);
         try self.ctx.vkd.queueWaitIdle(self.ctx.queue);
 
         @memcpy(out, self.buf_out.sliceTyped(f32, out.len));
     }
 };
-
-/// SPIR-V for `shaders/attention_split.comp`, once per KV-cache element type,
-/// and for `shaders/attention_merge.comp`, whose f32 records serve both types.
-const attention_split_spv: [@embedFile("attention_split.spv").len]u8 align(@alignOf(u32)) = @embedFile("attention_split.spv").*;
-const attention_split_f16_spv: [@embedFile("attention_split_f16.spv").len]u8 align(@alignOf(u32)) = @embedFile("attention_split_f16.spv").*;
-const attention_merge_spv: [@embedFile("attention_merge.spv").len]u8 align(@alignOf(u32)) = @embedFile("attention_merge.spv").*;
 
 /// Split-depth decode attention for a row of more than `limits.attn_split_len`
 /// positions. The split pass runs one workgroup of 64 lanes per split and per
@@ -889,9 +1264,16 @@ pub const AttentionSplit = struct {
             .f32 => &attention_split_spv,
             .f16 => &attention_split_f16_spv,
         };
+
         const split = try Pipeline.init(ctx, split_spv, split_bindings, @sizeOf(SplitPush));
         errdefer split.deinit(ctx);
-        const merge = try Pipeline.init(ctx, &attention_merge_spv, merge_bindings, @sizeOf(MergePush));
+
+        const merge = try Pipeline.init(
+            ctx,
+            &attention_merge_spv,
+            merge_bindings,
+            @sizeOf(MergePush),
+        );
 
         return .{
             .ctx = ctx,
@@ -927,6 +1309,7 @@ pub const AttentionSplit = struct {
         stride: u32,
     ) void {
         std.debug.assert(attn_split.usesSplit(t_len));
+
         const n_splits = attn_split.splitCount(t_len);
         std.debug.assert(n_splits >= 2);
         std.debug.assert(n_splits <= stride);
@@ -947,12 +1330,23 @@ pub const AttentionSplit = struct {
         std.debug.assert(@as(u64, t_len) * n_kv_heads * head_dim <= stream_stride_elems);
         // The shader forms the stream base and the q row as 32-bit products,
         // so the end of each must stay inside the 31-bit index.
-        std.debug.assert((@as(u64, kv_stream_base) + 1) * stream_stride_elems <= limits.max_kv_index_elems);
-        std.debug.assert((@as(u64, q_row_base) + 1) * n_heads * head_dim <= limits.max_kv_index_elems);
+        std.debug.assert(
+            (@as(u64, kv_stream_base) + 1) * stream_stride_elems <= limits.max_kv_index_elems,
+        );
+        std.debug.assert(
+            (@as(u64, q_row_base) + 1) * n_heads * head_dim <= limits.max_kv_index_elems,
+        );
         assertRecordsIndexable(n_heads, head_dim, scratch_row, stride);
         self.ctx.vkd.cmdBindPipeline(cb, .compute, self.split.handle);
         const desc_sets = [_]vk.DescriptorSet{set};
-        self.ctx.vkd.cmdBindDescriptorSets(cb, .compute, self.split.pipeline_layout, 0, &desc_sets, null);
+        self.ctx.vkd.cmdBindDescriptorSets(
+            cb,
+            .compute,
+            self.split.pipeline_layout,
+            0,
+            &desc_sets,
+            null,
+        );
         const pc: SplitPush = .{
             .n_heads = n_heads,
             .n_kv_heads = n_kv_heads,
@@ -964,7 +1358,14 @@ pub const AttentionSplit = struct {
             .scratch_row = scratch_row,
             .max_splits = stride,
         };
-        self.ctx.vkd.cmdPushConstants(cb, self.split.pipeline_layout, .{ .compute_bit = true }, 0, @sizeOf(SplitPush), @ptrCast(&pc));
+        self.ctx.vkd.cmdPushConstants(
+            cb,
+            self.split.pipeline_layout,
+            .{ .compute_bit = true },
+            0,
+            @sizeOf(SplitPush),
+            @ptrCast(&pc),
+        );
         // One workgroup serves up to `attn_split_queries` heads of one GQA
         // group, so each workgroup reads its K and V rows once for them.
         const groups_x = n_kv_heads * attn_split.queryGroups(n_heads / n_kv_heads);
@@ -997,10 +1398,18 @@ pub const AttentionSplit = struct {
         std.debug.assert(head_dim >= 1);
         // The shader forms the output row as a 32-bit product.
         std.debug.assert((@as(u64, out_row) + 1) * n_heads * head_dim <= limits.max_kv_index_elems);
+
         assertRecordsIndexable(n_heads, head_dim, scratch_row, stride);
         self.ctx.vkd.cmdBindPipeline(cb, .compute, self.merge.handle);
         const desc_sets = [_]vk.DescriptorSet{set};
-        self.ctx.vkd.cmdBindDescriptorSets(cb, .compute, self.merge.pipeline_layout, 0, &desc_sets, null);
+        self.ctx.vkd.cmdBindDescriptorSets(
+            cb,
+            .compute,
+            self.merge.pipeline_layout,
+            0,
+            &desc_sets,
+            null,
+        );
         const pc: MergePush = .{
             .n_heads = n_heads,
             .head_dim = head_dim,
@@ -1009,7 +1418,14 @@ pub const AttentionSplit = struct {
             .max_splits = stride,
             .out_row = out_row,
         };
-        self.ctx.vkd.cmdPushConstants(cb, self.merge.pipeline_layout, .{ .compute_bit = true }, 0, @sizeOf(MergePush), @ptrCast(&pc));
+        self.ctx.vkd.cmdPushConstants(
+            cb,
+            self.merge.pipeline_layout,
+            .{ .compute_bit = true },
+            0,
+            @sizeOf(MergePush),
+            @ptrCast(&pc),
+        );
         // Each lane of a workgroup owns one element of the head, so the
         // chunks of a head cover every element and the last chunk is partial.
         const chunks = std.math.divCeil(u32, head_dim, merge_lanes) catch unreachable;
@@ -1043,7 +1459,11 @@ pub const AttentionSplit = struct {
     /// build compiles the asserts of `recordSplit` out.
     pub fn guardHeadDim(head_dim: u32) error{AttentionHeadDimUnsupported}!void {
         if (attn_split.headDimFits(head_dim)) return;
-        log.err("The model head_dim is {d}. GPU attention takes a head_dim that is a multiple of {d} and at most {d}. Run this model on a CPU build", .{ head_dim, limits.attn_head_dim_granule, limits.attn_max_head_dim });
+        log.err(
+            "The model head_dim is {d}. GPU attention takes a head_dim that is a multiple " ++
+                "of {d} and at most {d}. Run this model on a CPU build",
+            .{ head_dim, limits.attn_head_dim_granule, limits.attn_max_head_dim },
+        );
         return error.AttentionHeadDimUnsupported;
     }
 
@@ -1052,6 +1472,7 @@ pub const AttentionSplit = struct {
     /// stay inside the 31-bit index.
     fn assertRecordsIndexable(n_heads: u32, head_dim: u32, scratch_row: u32, stride: u32) void {
         std.debug.assert(stride >= 1);
+
         const end = (@as(u64, scratch_row) + 1) * n_heads * stride * (@as(u64, head_dim) + 2);
         std.debug.assert(end <= limits.max_kv_index_elems);
     }
@@ -1059,7 +1480,7 @@ pub const AttentionSplit = struct {
 
 /// The summation-order class of an attention kit. The byte tests (the split
 /// digests, and the equality of rows across paths) hold for one class only.
-/// A kit of another class runs the oracle tests at its declared tolerance and
+/// A kit of another class runs the reference tests at its declared tolerance and
 /// the token gates.
 pub const AttnOrderClass = enum {
     /// Each split sums its positions in ascending order, and the merge
@@ -1119,6 +1540,7 @@ pub const SplitAttnKit = struct {
 
     pub fn recordResident(self: SplitAttnKit, cb: Cmd, b: Binding, r: attn_split.PlanRow) void {
         std.debug.assert(!attn_split.usesSplit(r.t_len));
+
         const s = b.shape;
         switch (b.resident) {
             .single => |set| {
@@ -1126,9 +1548,21 @@ pub const SplitAttnKit = struct {
                 // decode step, so the row reads row 0 of stream 0.
                 std.debug.assert(r.row == 0);
                 std.debug.assert(r.slot == 0);
+
                 self.single.recordInto(cb, set, s.n_heads, s.n_kv_heads, s.head_dim, r.t_len);
             },
-            .multi => |set| self.multi.recordInto(cb, set, s.n_heads, s.n_kv_heads, s.head_dim, r.t_len, s.stream_stride_elems, r.row, r.slot, 1),
+            .multi => |set| self.multi.recordInto(
+                cb,
+                set,
+                s.n_heads,
+                s.n_kv_heads,
+                s.head_dim,
+                r.t_len,
+                s.stream_stride_elems,
+                r.row,
+                r.slot,
+                1,
+            ),
             // A prefill chunk records its resident rows as one run.
             .batch => unreachable,
         }
@@ -1137,29 +1571,74 @@ pub const SplitAttnKit = struct {
     /// Record the resident prefix of a prefill chunk: query rows `[0, count)`
     /// at the positions `start_pos` through `start_pos + count - 1` of the
     /// stream that the batch set binds.
-    pub fn recordResidentRun(self: SplitAttnKit, cb: Cmd, b: Binding, start_pos: u32, count: u32) void {
+    pub fn recordResidentRun(
+        self: SplitAttnKit,
+        cb: Cmd,
+        b: Binding,
+        start_pos: u32,
+        count: u32,
+    ) void {
         std.debug.assert(count >= 1);
         std.debug.assert(start_pos + count <= limits.attn_split_len);
+
         const s = b.shape;
         const set = switch (b.resident) {
             .batch => |set| set,
             .single, .multi => unreachable,
         };
+
         self.batch.?.recordInto(cb, set, s.n_heads, s.n_kv_heads, s.head_dim, start_pos, count);
     }
 
-    pub fn recordSplit(self: SplitAttnKit, cb: Cmd, b: Binding, r: attn_split.PlanRow, scratch_row: u32, stride: u32) void {
+    pub fn recordSplit(
+        self: SplitAttnKit,
+        cb: Cmd,
+        b: Binding,
+        r: attn_split.PlanRow,
+        scratch_row: u32,
+        stride: u32,
+    ) void {
         std.debug.assert(attn_split.usesSplit(r.t_len));
+
         const s = b.shape;
         assertGroupRecords(s, scratch_row, stride);
-        self.passes.recordSplit(cb, b.split, s.n_heads, s.n_kv_heads, s.head_dim, r.t_len, s.stream_stride_elems, r.row, r.slot, scratch_row, stride);
+        self.passes.recordSplit(
+            cb,
+            b.split,
+            s.n_heads,
+            s.n_kv_heads,
+            s.head_dim,
+            r.t_len,
+            s.stream_stride_elems,
+            r.row,
+            r.slot,
+            scratch_row,
+            stride,
+        );
     }
 
-    pub fn recordMerge(self: SplitAttnKit, cb: Cmd, b: Binding, r: attn_split.PlanRow, scratch_row: u32, stride: u32) void {
+    pub fn recordMerge(
+        self: SplitAttnKit,
+        cb: Cmd,
+        b: Binding,
+        r: attn_split.PlanRow,
+        scratch_row: u32,
+        stride: u32,
+    ) void {
         std.debug.assert(attn_split.usesSplit(r.t_len));
+
         const s = b.shape;
         assertGroupRecords(s, scratch_row, stride);
-        self.passes.recordMerge(cb, b.merge, s.n_heads, s.head_dim, r.t_len, scratch_row, stride, r.row);
+        self.passes.recordMerge(
+            cb,
+            b.merge,
+            s.n_heads,
+            s.head_dim,
+            r.t_len,
+            scratch_row,
+            stride,
+            r.row,
+        );
     }
 
     /// A shader read or write waits for the shader writes before it, the
@@ -1169,7 +1648,15 @@ pub const SplitAttnKit = struct {
             .src_access_mask = .{ .shader_write_bit = true },
             .dst_access_mask = .{ .shader_read_bit = true, .shader_write_bit = true },
         }};
-        self.passes.ctx.vkd.cmdPipelineBarrier(cb, .{ .compute_shader_bit = true }, .{ .compute_shader_bit = true }, .{}, &mb, null, null);
+        self.passes.ctx.vkd.cmdPipelineBarrier(
+            cb,
+            .{ .compute_shader_bit = true },
+            .{ .compute_shader_bit = true },
+            .{},
+            &mb,
+            null,
+            null,
+        );
     }
 
     /// Group row `scratch_row` at `stride` splits per head ends inside the
@@ -1177,9 +1664,13 @@ pub const SplitAttnKit = struct {
     fn assertGroupRecords(shape: AttnShape, scratch_row: u32, stride: u32) void {
         std.debug.assert(stride >= 1);
         std.debug.assert(stride <= shape.max_splits * limits.attn_split_rows);
+
         const record_elems = @as(u64, shape.head_dim) + 2;
         const end = (@as(u64, scratch_row) + 1) * shape.n_heads * stride * record_elems;
-        const scratch_elems = @as(u64, limits.attn_split_rows) * shape.n_heads * shape.max_splits * record_elems;
+        const scratch_elems = @as(
+            u64,
+            limits.attn_split_rows,
+        ) * shape.n_heads * shape.max_splits * record_elems;
         std.debug.assert(end <= scratch_elems);
     }
 };
@@ -1189,9 +1680,6 @@ pub const SplitAttnKit = struct {
 pub const AttnKit = switch (build_options.attn_kernel) {
     .split => SplitAttnKit,
 };
-
-/// SPIR-V for `shaders/rope.comp`.
-const rope_spv: [@embedFile("rope.spv").len]u8 align(@alignOf(u32)) = @embedFile("rope.spv").*;
 
 /// In-place RoPE rotation on one head_dim vector at the given position. Two
 /// storage buffers (x read and write, the frequency factors readonly) and four
@@ -1244,11 +1732,21 @@ pub const Rope = struct {
 
     pub const RunError = ResidualAdd.RunError || error{RopeDimNotEven};
 
-    pub fn run(self: *Rope, x: []f32, pos: u32, rope_dim: usize, freq_base: f32, style: RopeStyle, freq_factors: ?[]const f32) RunError!void {
+    pub fn run(
+        self: *Rope,
+        x: []f32,
+        pos: u32,
+        rope_dim: usize,
+        freq_base: f32,
+        style: RopeStyle,
+        freq_factors: ?[]const f32,
+    ) RunError!void {
         if (rope_dim > x.len) return error.LengthMismatch;
         if (rope_dim % 2 != 0) return error.RopeDimNotEven;
+
         const half = rope_dim / 2;
         if (freq_factors) |ff| std.debug.assert(ff.len >= half);
+
         const byte_size: vk.DeviceSize = @intCast(x.len * @sizeOf(f32));
         const ff_bytes: vk.DeviceSize = @intCast(half * @sizeOf(f32));
 
@@ -1256,7 +1754,11 @@ pub const Rope = struct {
         @memcpy(self.buf_x.sliceTyped(f32, x.len), x);
         try self.buf_ff.ensure(ff_bytes);
         const ff_dst = self.buf_ff.sliceTyped(f32, half);
-        if (freq_factors) |ff| @memcpy(ff_dst, ff[0..half]) else @memset(ff_dst, 1.0);
+        if (freq_factors) |ff| {
+            @memcpy(ff_dst, ff[0..half]);
+        } else {
+            @memset(ff_dst, 1.0);
+        }
 
         const buf_infos = [_]vk.DescriptorBufferInfo{
             .{ .buffer = self.buf_x.buffer, .offset = 0, .range = byte_size },
@@ -1269,24 +1771,42 @@ pub const Rope = struct {
         try self.ctx.vkd.beginCommandBuffer(self.oneshot.cmd_buffer, &begin);
         self.ctx.vkd.cmdBindPipeline(self.oneshot.cmd_buffer, .compute, self.pipeline.handle);
         const desc_sets = [_]vk.DescriptorSet{self.oneshot.desc_set};
-        self.ctx.vkd.cmdBindDescriptorSets(self.oneshot.cmd_buffer, .compute, self.pipeline.pipeline_layout, 0, &desc_sets, null);
-        const pc: PushConsts = .{ .pos = pos, .rope_dim = @intCast(rope_dim), .freq_base = freq_base, .style_norm = @intFromBool(style == .norm) };
-        self.ctx.vkd.cmdPushConstants(self.oneshot.cmd_buffer, self.pipeline.pipeline_layout, .{ .compute_bit = true }, 0, @sizeOf(PushConsts), @ptrCast(&pc));
+        self.ctx.vkd.cmdBindDescriptorSets(
+            self.oneshot.cmd_buffer,
+            .compute,
+            self.pipeline.pipeline_layout,
+            0,
+            &desc_sets,
+            null,
+        );
+        const pc: PushConsts = .{
+            .pos = pos,
+            .rope_dim = @intCast(rope_dim),
+            .freq_base = freq_base,
+            .style_norm = @intFromBool(style == .norm),
+        };
+        self.ctx.vkd.cmdPushConstants(
+            self.oneshot.cmd_buffer,
+            self.pipeline.pipeline_layout,
+            .{ .compute_bit = true },
+            0,
+            @sizeOf(PushConsts),
+            @ptrCast(&pc),
+        );
         const group_count_x: u32 = (@as(u32, @intCast(half)) + 63) / 64;
         self.ctx.vkd.cmdDispatch(self.oneshot.cmd_buffer, group_count_x, 1, 1);
         try self.ctx.vkd.endCommandBuffer(self.oneshot.cmd_buffer);
 
         const cmds = [_]vk.CommandBuffer{self.oneshot.cmd_buffer};
-        const submits = [_]vk.SubmitInfo{.{ .command_buffer_count = 1, .p_command_buffers = &cmds }};
+        const submits = [_]vk.SubmitInfo{
+            .{ .command_buffer_count = 1, .p_command_buffers = &cmds },
+        };
         try self.ctx.vkd.queueSubmit(self.ctx.queue, &submits, .null_handle);
         try self.ctx.vkd.queueWaitIdle(self.ctx.queue);
 
         @memcpy(x, self.buf_x.sliceTyped(f32, x.len));
     }
 };
-
-/// SPIR-V for `shaders/rope_multi.comp`.
-const rope_multi_spv: [@embedFile("rope_multi.spv").len]u8 align(@alignOf(u32)) = @embedFile("rope_multi.spv").*;
 
 /// Multi-head RoPE. Same rotation as `Rope`, applied to every head of an
 /// `(n_heads, head_dim)` buffer in one dispatch. It replaces the per-head Rope
@@ -1344,17 +1864,34 @@ pub const RopeMulti = struct {
     ) void {
         self.ctx.vkd.cmdBindPipeline(cb, .compute, self.pipeline.handle);
         const desc_sets = [_]vk.DescriptorSet{desc_set};
-        self.ctx.vkd.cmdBindDescriptorSets(cb, .compute, self.pipeline.pipeline_layout, 0, &desc_sets, null);
-        const pc: PushConsts = .{ .pos = pos, .head_dim = head_dim, .rope_dim = rope_dim, .freq_base = freq_base, .style_norm = @intFromBool(style == .norm) };
-        self.ctx.vkd.cmdPushConstants(cb, self.pipeline.pipeline_layout, .{ .compute_bit = true }, 0, @sizeOf(PushConsts), @ptrCast(&pc));
+        self.ctx.vkd.cmdBindDescriptorSets(
+            cb,
+            .compute,
+            self.pipeline.pipeline_layout,
+            0,
+            &desc_sets,
+            null,
+        );
+        const pc: PushConsts = .{
+            .pos = pos,
+            .head_dim = head_dim,
+            .rope_dim = rope_dim,
+            .freq_base = freq_base,
+            .style_norm = @intFromBool(style == .norm),
+        };
+        self.ctx.vkd.cmdPushConstants(
+            cb,
+            self.pipeline.pipeline_layout,
+            .{ .compute_bit = true },
+            0,
+            @sizeOf(PushConsts),
+            @ptrCast(&pc),
+        );
         const half: u32 = rope_dim / 2;
         const group_count_x: u32 = (half + 63) / 64;
         self.ctx.vkd.cmdDispatch(cb, group_count_x, n_heads, 1);
     }
 };
-
-/// SPIR-V for `shaders/rmsnorm.comp`.
-const rmsnorm_spv: [@embedFile("rmsnorm.spv").len]u8 align(@alignOf(u32)) = @embedFile("rmsnorm.spv").*;
 
 /// RMS normalization `y[i] = x[i] * inv_rms * w[i]`, where
 /// `inv_rms = 1 / sqrt(mean(x^2) + eps)`. Three storage buffers (x, w, y) and
@@ -1419,14 +1956,29 @@ pub const Rmsnorm = struct {
     ) void {
         self.ctx.vkd.cmdBindPipeline(cb, .compute, self.pipeline.handle);
         const desc_sets = [_]vk.DescriptorSet{desc_set};
-        self.ctx.vkd.cmdBindDescriptorSets(cb, .compute, self.pipeline.pipeline_layout, 0, &desc_sets, null);
+        self.ctx.vkd.cmdBindDescriptorSets(
+            cb,
+            .compute,
+            self.pipeline.pipeline_layout,
+            0,
+            &desc_sets,
+            null,
+        );
         const pc: PushConsts = .{ .d = d, .eps = eps };
-        self.ctx.vkd.cmdPushConstants(cb, self.pipeline.pipeline_layout, .{ .compute_bit = true }, 0, @sizeOf(PushConsts), @ptrCast(&pc));
+        self.ctx.vkd.cmdPushConstants(
+            cb,
+            self.pipeline.pipeline_layout,
+            .{ .compute_bit = true },
+            0,
+            @sizeOf(PushConsts),
+            @ptrCast(&pc),
+        );
         self.ctx.vkd.cmdDispatch(cb, 1, 1, 1);
     }
 
     pub fn run(self: *Rmsnorm, x: []const f32, w: []const f32, eps: f32, y: []f32) RunError!void {
         if (x.len != w.len or x.len != y.len) return error.LengthMismatch;
+
         const d: u32 = @intCast(x.len);
         const byte_size: vk.DeviceSize = @intCast(x.len * @sizeOf(f32));
 
@@ -1449,23 +2001,36 @@ pub const Rmsnorm = struct {
         try self.ctx.vkd.beginCommandBuffer(self.oneshot.cmd_buffer, &begin);
         self.ctx.vkd.cmdBindPipeline(self.oneshot.cmd_buffer, .compute, self.pipeline.handle);
         const desc_sets = [_]vk.DescriptorSet{self.oneshot.desc_set};
-        self.ctx.vkd.cmdBindDescriptorSets(self.oneshot.cmd_buffer, .compute, self.pipeline.pipeline_layout, 0, &desc_sets, null);
+        self.ctx.vkd.cmdBindDescriptorSets(
+            self.oneshot.cmd_buffer,
+            .compute,
+            self.pipeline.pipeline_layout,
+            0,
+            &desc_sets,
+            null,
+        );
         const pc: PushConsts = .{ .d = d, .eps = eps };
-        self.ctx.vkd.cmdPushConstants(self.oneshot.cmd_buffer, self.pipeline.pipeline_layout, .{ .compute_bit = true }, 0, @sizeOf(PushConsts), @ptrCast(&pc));
+        self.ctx.vkd.cmdPushConstants(
+            self.oneshot.cmd_buffer,
+            self.pipeline.pipeline_layout,
+            .{ .compute_bit = true },
+            0,
+            @sizeOf(PushConsts),
+            @ptrCast(&pc),
+        );
         self.ctx.vkd.cmdDispatch(self.oneshot.cmd_buffer, 1, 1, 1);
         try self.ctx.vkd.endCommandBuffer(self.oneshot.cmd_buffer);
 
         const cmds = [_]vk.CommandBuffer{self.oneshot.cmd_buffer};
-        const submits = [_]vk.SubmitInfo{.{ .command_buffer_count = 1, .p_command_buffers = &cmds }};
+        const submits = [_]vk.SubmitInfo{
+            .{ .command_buffer_count = 1, .p_command_buffers = &cmds },
+        };
         try self.ctx.vkd.queueSubmit(self.ctx.queue, &submits, .null_handle);
         try self.ctx.vkd.queueWaitIdle(self.ctx.queue);
 
         @memcpy(y, self.buf_y.sliceTyped(f32, y.len));
     }
 };
-
-/// SPIR-V for `shaders/swiglu.comp`.
-const swiglu_spv: [@embedFile("swiglu.spv").len]u8 align(@alignOf(u32)) = @embedFile("swiglu.spv").*;
 
 /// SwiGLU activation `dst[i] = silu(gate[i]) * up[i]`. Three storage buffers
 /// (gate and up readonly, dst writeonly) and one `u32` push constant for the
@@ -1525,14 +2090,29 @@ pub const Swiglu = struct {
     ) void {
         self.ctx.vkd.cmdBindPipeline(cb, .compute, self.pipeline.handle);
         const desc_sets = [_]vk.DescriptorSet{desc_set};
-        self.ctx.vkd.cmdBindDescriptorSets(cb, .compute, self.pipeline.pipeline_layout, 0, &desc_sets, null);
-        self.ctx.vkd.cmdPushConstants(cb, self.pipeline.pipeline_layout, .{ .compute_bit = true }, 0, @sizeOf(u32), @ptrCast(&n));
+        self.ctx.vkd.cmdBindDescriptorSets(
+            cb,
+            .compute,
+            self.pipeline.pipeline_layout,
+            0,
+            &desc_sets,
+            null,
+        );
+        self.ctx.vkd.cmdPushConstants(
+            cb,
+            self.pipeline.pipeline_layout,
+            .{ .compute_bit = true },
+            0,
+            @sizeOf(u32),
+            @ptrCast(&n),
+        );
         const group_count_x: u32 = (n + 255) / 256;
         self.ctx.vkd.cmdDispatch(cb, group_count_x, 1, 1);
     }
 
     pub fn run(self: *Swiglu, gate: []const f32, up: []const f32, dst: []f32) RunError!void {
         if (gate.len != up.len or gate.len != dst.len) return error.LengthMismatch;
+
         const n: u32 = @intCast(gate.len);
         const byte_size: vk.DeviceSize = @intCast(gate.len * @sizeOf(f32));
 
@@ -1555,14 +2135,30 @@ pub const Swiglu = struct {
         try self.ctx.vkd.beginCommandBuffer(self.oneshot.cmd_buffer, &begin);
         self.ctx.vkd.cmdBindPipeline(self.oneshot.cmd_buffer, .compute, self.pipeline.handle);
         const desc_sets = [_]vk.DescriptorSet{self.oneshot.desc_set};
-        self.ctx.vkd.cmdBindDescriptorSets(self.oneshot.cmd_buffer, .compute, self.pipeline.pipeline_layout, 0, &desc_sets, null);
-        self.ctx.vkd.cmdPushConstants(self.oneshot.cmd_buffer, self.pipeline.pipeline_layout, .{ .compute_bit = true }, 0, @sizeOf(u32), @ptrCast(&n));
+        self.ctx.vkd.cmdBindDescriptorSets(
+            self.oneshot.cmd_buffer,
+            .compute,
+            self.pipeline.pipeline_layout,
+            0,
+            &desc_sets,
+            null,
+        );
+        self.ctx.vkd.cmdPushConstants(
+            self.oneshot.cmd_buffer,
+            self.pipeline.pipeline_layout,
+            .{ .compute_bit = true },
+            0,
+            @sizeOf(u32),
+            @ptrCast(&n),
+        );
         const group_count_x: u32 = (n + 255) / 256;
         self.ctx.vkd.cmdDispatch(self.oneshot.cmd_buffer, group_count_x, 1, 1);
         try self.ctx.vkd.endCommandBuffer(self.oneshot.cmd_buffer);
 
         const cmds = [_]vk.CommandBuffer{self.oneshot.cmd_buffer};
-        const submits = [_]vk.SubmitInfo{.{ .command_buffer_count = 1, .p_command_buffers = &cmds }};
+        const submits = [_]vk.SubmitInfo{
+            .{ .command_buffer_count = 1, .p_command_buffers = &cmds },
+        };
         try self.ctx.vkd.queueSubmit(self.ctx.queue, &submits, .null_handle);
         try self.ctx.vkd.queueWaitIdle(self.ctx.queue);
 
@@ -1631,6 +2227,7 @@ pub const Q80Weight = struct {
         out_features: usize,
     ) InitError!Q80Weight {
         if (in_features % q8_0_block_elems != 0) return error.InFeaturesNotMultipleOf32;
+
         const blocks_per_row = in_features / q8_0_block_elems;
         const row_bytes = blocks_per_row * q8_0_block_bytes;
         if (weight_bytes.len < out_features * row_bytes) return error.WeightSizeMismatch;
@@ -1640,8 +2237,10 @@ pub const Q80Weight = struct {
 
         var staging_scales: HostBuffer = .{ .ctx = ctx };
         defer staging_scales.deinit();
+
         var staging_quants: HostBuffer = .{ .ctx = ctx };
         defer staging_quants.deinit();
+
         try staging_scales.ensure(scales_bytes);
         try staging_quants.ensure(quants_bytes);
         repackQ80ToScalesQuants(
@@ -1654,8 +2253,10 @@ pub const Q80Weight = struct {
 
         var scales_db: DeviceBuffer = .{ .ctx = ctx };
         errdefer scales_db.deinit();
+
         var quants_db: DeviceBuffer = .{ .ctx = ctx };
         errdefer quants_db.deinit();
+
         try scales_db.ensure(scales_bytes);
         try quants_db.ensure(quants_bytes);
 
@@ -1689,6 +2290,7 @@ pub const Q80Weight = struct {
         out_features: usize,
     ) InitError!Q80Weight {
         if (in_features % q4_0_block_elems != 0) return error.InFeaturesNotMultipleOf32;
+
         const blocks_per_row = in_features / q4_0_block_elems;
         const row_bytes = blocks_per_row * q4_0_block_bytes;
         if (weight_bytes.len < out_features * row_bytes) return error.WeightSizeMismatch;
@@ -1698,8 +2300,10 @@ pub const Q80Weight = struct {
 
         var staging_scales: HostBuffer = .{ .ctx = ctx };
         defer staging_scales.deinit();
+
         var staging_quants: HostBuffer = .{ .ctx = ctx };
         defer staging_quants.deinit();
+
         try staging_scales.ensure(scales_bytes);
         try staging_quants.ensure(quants_bytes);
         repackQ40ToScalesQuants(
@@ -1712,8 +2316,10 @@ pub const Q80Weight = struct {
 
         var scales_db: DeviceBuffer = .{ .ctx = ctx };
         errdefer scales_db.deinit();
+
         var quants_db: DeviceBuffer = .{ .ctx = ctx };
         errdefer quants_db.deinit();
+
         try scales_db.ensure(scales_bytes);
         try quants_db.ensure(quants_bytes);
 
@@ -1751,6 +2357,7 @@ pub const Q80Weight = struct {
         out_features: usize,
     ) (InitError || VramArena.AllocError)!Q80Weight {
         if (in_features % q8_0_block_elems != 0) return error.InFeaturesNotMultipleOf32;
+
         const blocks_per_row = in_features / q8_0_block_elems;
         const row_bytes = blocks_per_row * q8_0_block_bytes;
         if (weight_bytes.len < out_features * row_bytes) return error.WeightSizeMismatch;
@@ -1760,8 +2367,10 @@ pub const Q80Weight = struct {
 
         var staging_scales: HostBuffer = .{ .ctx = ctx };
         defer staging_scales.deinit();
+
         var staging_quants: HostBuffer = .{ .ctx = ctx };
         defer staging_quants.deinit();
+
         try staging_scales.ensure(scales_bytes);
         try staging_quants.ensure(quants_bytes);
         repackQ80ToScalesQuants(
@@ -1803,6 +2412,7 @@ pub const Q80Weight = struct {
         out_features: usize,
     ) (InitError || VramArena.AllocError)!Q80Weight {
         if (in_features % q4_0_block_elems != 0) return error.InFeaturesNotMultipleOf32;
+
         const blocks_per_row = in_features / q4_0_block_elems;
         const row_bytes = blocks_per_row * q4_0_block_bytes;
         if (weight_bytes.len < out_features * row_bytes) return error.WeightSizeMismatch;
@@ -1812,8 +2422,10 @@ pub const Q80Weight = struct {
 
         var staging_scales: HostBuffer = .{ .ctx = ctx };
         defer staging_scales.deinit();
+
         var staging_quants: HostBuffer = .{ .ctx = ctx };
         defer staging_quants.deinit();
+
         try staging_scales.ensure(scales_bytes);
         try staging_quants.ensure(quants_bytes);
         repackQ40ToScalesQuants(
@@ -1852,84 +2464,6 @@ pub const Q80Weight = struct {
         }
     }
 };
-
-/// Repack a Q8_0 weight matrix from the interleaved GGUF layout into two flat
-/// arrays the shader indexes directly. The GGUF layout holds each block of 32
-/// elements as a 2-byte f16 scale plus 32 i8 quants, contiguous per row. The
-/// flat arrays hold the f16 scales by `(j, blk)` and the i8 quants by `(j, p)`.
-/// The copy keeps every bit pattern, so the GPU `float16_t` and `int8_t` loads
-/// see the bytes the CPU kernel reads through `f16BitsToF32` and
-/// `@bitCast(i8)`. The bit-exact match against the CPU kernel depends on that.
-/// Do not reorder bytes here.
-fn repackQ80ToScalesQuants(
-    weight_data: []const u8,
-    in_features: usize,
-    out_features: usize,
-    scales_out: []u8,
-    quants_out: []u8,
-) void {
-    const blocks_per_row = in_features / q8_0_block_elems;
-    const row_bytes = blocks_per_row * q8_0_block_bytes;
-    std.debug.assert(scales_out.len >= out_features * blocks_per_row * 2);
-    std.debug.assert(quants_out.len >= out_features * in_features);
-    var j: usize = 0;
-    while (j < out_features) : (j += 1) {
-        const row_off = j * row_bytes;
-        var blk: usize = 0;
-        while (blk < blocks_per_row) : (blk += 1) {
-            const blk_off = row_off + blk * q8_0_block_bytes;
-            // 2 bytes of f16 scale -> scales_out at j * blocks_per_row + blk.
-            const scales_idx = (j * blocks_per_row + blk) * 2;
-            scales_out[scales_idx + 0] = weight_data[blk_off + 0];
-            scales_out[scales_idx + 1] = weight_data[blk_off + 1];
-            // 32 bytes of i8 quants -> quants_out at j * in_features + blk * 32.
-            const quants_idx = j * in_features + blk * q8_0_block_elems;
-            @memcpy(
-                quants_out[quants_idx..][0..q8_0_block_elems],
-                weight_data[blk_off + 2 ..][0..q8_0_block_elems],
-            );
-        }
-    }
-}
-
-/// The Q4_0 sibling of `repackQ80ToScalesQuants`. A Q4_0 row holds `in/32`
-/// blocks of 18 bytes, a 2-byte f16 scale plus 16 packed bytes. It separates the
-/// scales, whose f16 layout matches Q8_0, from the 16 packed quant bytes. The
-/// packed bytes keep every bit pattern. The shader extracts the nibbles in the
-/// layout the CPU kernel uses.
-fn repackQ40ToScalesQuants(
-    weight_data: []const u8,
-    in_features: usize,
-    out_features: usize,
-    scales_out: []u8,
-    quants_out: []u8,
-) void {
-    const blocks_per_row = in_features / q4_0_block_elems;
-    const row_bytes = blocks_per_row * q4_0_block_bytes;
-    std.debug.assert(scales_out.len >= out_features * blocks_per_row * 2);
-    std.debug.assert(quants_out.len >= out_features * (in_features / 2));
-    var j: usize = 0;
-    while (j < out_features) : (j += 1) {
-        const row_off = j * row_bytes;
-        var blk: usize = 0;
-        while (blk < blocks_per_row) : (blk += 1) {
-            const blk_off = row_off + blk * q4_0_block_bytes;
-            const scales_idx = (j * blocks_per_row + blk) * 2;
-            scales_out[scales_idx + 0] = weight_data[blk_off + 0];
-            scales_out[scales_idx + 1] = weight_data[blk_off + 1];
-            // 16 packed bytes -> quants_out at j * (in/2) + blk * 16.
-            const quants_idx = j * (in_features / 2) + blk * q4_0_packed_bytes;
-            @memcpy(
-                quants_out[quants_idx..][0..q4_0_packed_bytes],
-                weight_data[blk_off + 2 ..][0..q4_0_packed_bytes],
-            );
-        }
-    }
-}
-
-/// SPIR-V for `shaders/linear_q8_0.comp`. See `vec_add_spv` for the alignment
-/// rule that every shader embed here follows.
-const linear_q8_0_spv: [@embedFile("linear_q8_0.spv").len]u8 align(@alignOf(u32)) = @embedFile("linear_q8_0.spv").*;
 
 /// Q8_0 matrix-vector product `out = input @ weight^T`, the same shape as the
 /// CPU `linearF32Q80` op. `input` is `[k]f32` and `out` is `[n]f32`. The weight
@@ -2028,15 +2562,31 @@ pub const LinearQ80 = struct {
         try self.ctx.vkd.beginCommandBuffer(self.oneshot.cmd_buffer, &begin);
         self.ctx.vkd.cmdBindPipeline(self.oneshot.cmd_buffer, .compute, self.pipeline.handle);
         const desc_sets = [_]vk.DescriptorSet{self.oneshot.desc_set};
-        self.ctx.vkd.cmdBindDescriptorSets(self.oneshot.cmd_buffer, .compute, self.pipeline.pipeline_layout, 0, &desc_sets, null);
+        self.ctx.vkd.cmdBindDescriptorSets(
+            self.oneshot.cmd_buffer,
+            .compute,
+            self.pipeline.pipeline_layout,
+            0,
+            &desc_sets,
+            null,
+        );
         const pc: PushConsts = .{ .k = weight.in_features, .n = weight.out_features };
-        self.ctx.vkd.cmdPushConstants(self.oneshot.cmd_buffer, self.pipeline.pipeline_layout, .{ .compute_bit = true }, 0, @sizeOf(PushConsts), @ptrCast(&pc));
+        self.ctx.vkd.cmdPushConstants(
+            self.oneshot.cmd_buffer,
+            self.pipeline.pipeline_layout,
+            .{ .compute_bit = true },
+            0,
+            @sizeOf(PushConsts),
+            @ptrCast(&pc),
+        );
         const group_count_x: u32 = (weight.out_features + 31) / 32;
         self.ctx.vkd.cmdDispatch(self.oneshot.cmd_buffer, group_count_x, 1, 1);
         try self.ctx.vkd.endCommandBuffer(self.oneshot.cmd_buffer);
 
         const cmds = [_]vk.CommandBuffer{self.oneshot.cmd_buffer};
-        const submits = [_]vk.SubmitInfo{.{ .command_buffer_count = 1, .p_command_buffers = &cmds }};
+        const submits = [_]vk.SubmitInfo{
+            .{ .command_buffer_count = 1, .p_command_buffers = &cmds },
+        };
         try self.ctx.vkd.queueSubmit(self.ctx.queue, &submits, .null_handle);
         try self.ctx.vkd.queueWaitIdle(self.ctx.queue);
 
@@ -2055,12 +2605,10 @@ pub const LinearQ80 = struct {
     ) RunOneShotError!void {
         var w = try Q80Weight.init(self.ctx, weight_bytes, in_features, out_features);
         defer w.deinit();
+
         try self.dispatch(&w, input, out);
     }
 };
-
-/// SPIR-V for `shaders/linear_q8_0_reduce.comp`.
-const linear_q8_0_reduce_spv: [@embedFile("linear_q8_0_reduce.spv").len]u8 align(@alignOf(u32)) = @embedFile("linear_q8_0_reduce.spv").*;
 
 /// Workgroup-cooperative Q8_0 matvec, the same shape and storage layout as
 /// `LinearQ80`. One workgroup of 32 lanes, one RDNA2 wave, computes a single
@@ -2132,9 +2680,23 @@ pub const LinearQ80Reduce = struct {
     ) void {
         self.ctx.vkd.cmdBindPipeline(cb, .compute, self.pipeline.handle);
         const desc_sets = [_]vk.DescriptorSet{desc_set};
-        self.ctx.vkd.cmdBindDescriptorSets(cb, .compute, self.pipeline.pipeline_layout, 0, &desc_sets, null);
+        self.ctx.vkd.cmdBindDescriptorSets(
+            cb,
+            .compute,
+            self.pipeline.pipeline_layout,
+            0,
+            &desc_sets,
+            null,
+        );
         const pc: PushConsts = .{ .k = k, .n = n };
-        self.ctx.vkd.cmdPushConstants(cb, self.pipeline.pipeline_layout, .{ .compute_bit = true }, 0, @sizeOf(PushConsts), @ptrCast(&pc));
+        self.ctx.vkd.cmdPushConstants(
+            cb,
+            self.pipeline.pipeline_layout,
+            .{ .compute_bit = true },
+            0,
+            @sizeOf(PushConsts),
+            @ptrCast(&pc),
+        );
         self.ctx.vkd.cmdDispatch(cb, n, 1, 1);
     }
 
@@ -2168,24 +2730,37 @@ pub const LinearQ80Reduce = struct {
         try self.ctx.vkd.beginCommandBuffer(self.oneshot.cmd_buffer, &begin);
         self.ctx.vkd.cmdBindPipeline(self.oneshot.cmd_buffer, .compute, self.pipeline.handle);
         const desc_sets = [_]vk.DescriptorSet{self.oneshot.desc_set};
-        self.ctx.vkd.cmdBindDescriptorSets(self.oneshot.cmd_buffer, .compute, self.pipeline.pipeline_layout, 0, &desc_sets, null);
+        self.ctx.vkd.cmdBindDescriptorSets(
+            self.oneshot.cmd_buffer,
+            .compute,
+            self.pipeline.pipeline_layout,
+            0,
+            &desc_sets,
+            null,
+        );
         const pc: PushConsts = .{ .k = weight.in_features, .n = weight.out_features };
-        self.ctx.vkd.cmdPushConstants(self.oneshot.cmd_buffer, self.pipeline.pipeline_layout, .{ .compute_bit = true }, 0, @sizeOf(PushConsts), @ptrCast(&pc));
+        self.ctx.vkd.cmdPushConstants(
+            self.oneshot.cmd_buffer,
+            self.pipeline.pipeline_layout,
+            .{ .compute_bit = true },
+            0,
+            @sizeOf(PushConsts),
+            @ptrCast(&pc),
+        );
         const group_count_x: u32 = weight.out_features;
         self.ctx.vkd.cmdDispatch(self.oneshot.cmd_buffer, group_count_x, 1, 1);
         try self.ctx.vkd.endCommandBuffer(self.oneshot.cmd_buffer);
 
         const cmds = [_]vk.CommandBuffer{self.oneshot.cmd_buffer};
-        const submits = [_]vk.SubmitInfo{.{ .command_buffer_count = 1, .p_command_buffers = &cmds }};
+        const submits = [_]vk.SubmitInfo{
+            .{ .command_buffer_count = 1, .p_command_buffers = &cmds },
+        };
         try self.ctx.vkd.queueSubmit(self.ctx.queue, &submits, .null_handle);
         try self.ctx.vkd.queueWaitIdle(self.ctx.queue);
 
         @memcpy(out, self.buf_out.sliceTyped(f32, out.len));
     }
 };
-
-/// SPIR-V for `shaders/linear_q4_0_reduce.comp`.
-const linear_q4_0_reduce_spv: [@embedFile("linear_q4_0_reduce.spv").len]u8 align(@alignOf(u32)) = @embedFile("linear_q4_0_reduce.spv").*;
 
 /// Q4_0 decode matvec. Same structure as `LinearQ80Reduce`: one workgroup of 32
 /// lanes per output row, reducing through LDS. The weight container is a
@@ -2247,9 +2822,23 @@ pub const LinearQ40Reduce = struct {
     ) void {
         self.ctx.vkd.cmdBindPipeline(cb, .compute, self.pipeline.handle);
         const desc_sets = [_]vk.DescriptorSet{desc_set};
-        self.ctx.vkd.cmdBindDescriptorSets(cb, .compute, self.pipeline.pipeline_layout, 0, &desc_sets, null);
+        self.ctx.vkd.cmdBindDescriptorSets(
+            cb,
+            .compute,
+            self.pipeline.pipeline_layout,
+            0,
+            &desc_sets,
+            null,
+        );
         const pc: PushConsts = .{ .k = k, .n = n };
-        self.ctx.vkd.cmdPushConstants(cb, self.pipeline.pipeline_layout, .{ .compute_bit = true }, 0, @sizeOf(PushConsts), @ptrCast(&pc));
+        self.ctx.vkd.cmdPushConstants(
+            cb,
+            self.pipeline.pipeline_layout,
+            .{ .compute_bit = true },
+            0,
+            @sizeOf(PushConsts),
+            @ptrCast(&pc),
+        );
         self.ctx.vkd.cmdDispatch(cb, n, 1, 1);
     }
 
@@ -2283,23 +2872,36 @@ pub const LinearQ40Reduce = struct {
         try self.ctx.vkd.beginCommandBuffer(self.oneshot.cmd_buffer, &begin);
         self.ctx.vkd.cmdBindPipeline(self.oneshot.cmd_buffer, .compute, self.pipeline.handle);
         const desc_sets = [_]vk.DescriptorSet{self.oneshot.desc_set};
-        self.ctx.vkd.cmdBindDescriptorSets(self.oneshot.cmd_buffer, .compute, self.pipeline.pipeline_layout, 0, &desc_sets, null);
+        self.ctx.vkd.cmdBindDescriptorSets(
+            self.oneshot.cmd_buffer,
+            .compute,
+            self.pipeline.pipeline_layout,
+            0,
+            &desc_sets,
+            null,
+        );
         const pc: PushConsts = .{ .k = weight.in_features, .n = weight.out_features };
-        self.ctx.vkd.cmdPushConstants(self.oneshot.cmd_buffer, self.pipeline.pipeline_layout, .{ .compute_bit = true }, 0, @sizeOf(PushConsts), @ptrCast(&pc));
+        self.ctx.vkd.cmdPushConstants(
+            self.oneshot.cmd_buffer,
+            self.pipeline.pipeline_layout,
+            .{ .compute_bit = true },
+            0,
+            @sizeOf(PushConsts),
+            @ptrCast(&pc),
+        );
         self.ctx.vkd.cmdDispatch(self.oneshot.cmd_buffer, weight.out_features, 1, 1);
         try self.ctx.vkd.endCommandBuffer(self.oneshot.cmd_buffer);
 
         const cmds = [_]vk.CommandBuffer{self.oneshot.cmd_buffer};
-        const submits = [_]vk.SubmitInfo{.{ .command_buffer_count = 1, .p_command_buffers = &cmds }};
+        const submits = [_]vk.SubmitInfo{
+            .{ .command_buffer_count = 1, .p_command_buffers = &cmds },
+        };
         try self.ctx.vkd.queueSubmit(self.ctx.queue, &submits, .null_handle);
         try self.ctx.vkd.queueWaitIdle(self.ctx.queue);
 
         @memcpy(out, self.buf_out.sliceTyped(f32, out.len));
     }
 };
-
-/// SPIR-V for `shaders/linear_q8_0_subgroup.comp`.
-const linear_q8_0_subgroup_spv: [@embedFile("linear_q8_0_subgroup.spv").len]u8 align(@alignOf(u32)) = @embedFile("linear_q8_0_subgroup.spv").*;
 
 /// Q8_0 matvec, the subgroup variant. Same shape as `LinearQ80Reduce`, one
 /// workgroup of 32 lanes per output row, with two changes. The workgroup stages
@@ -2387,24 +2989,37 @@ pub const LinearQ80Subgroup = struct {
         try self.ctx.vkd.beginCommandBuffer(self.oneshot.cmd_buffer, &begin);
         self.ctx.vkd.cmdBindPipeline(self.oneshot.cmd_buffer, .compute, self.pipeline.handle);
         const desc_sets = [_]vk.DescriptorSet{self.oneshot.desc_set};
-        self.ctx.vkd.cmdBindDescriptorSets(self.oneshot.cmd_buffer, .compute, self.pipeline.pipeline_layout, 0, &desc_sets, null);
+        self.ctx.vkd.cmdBindDescriptorSets(
+            self.oneshot.cmd_buffer,
+            .compute,
+            self.pipeline.pipeline_layout,
+            0,
+            &desc_sets,
+            null,
+        );
         const pc: PushConsts = .{ .k = weight.in_features, .n = weight.out_features };
-        self.ctx.vkd.cmdPushConstants(self.oneshot.cmd_buffer, self.pipeline.pipeline_layout, .{ .compute_bit = true }, 0, @sizeOf(PushConsts), @ptrCast(&pc));
+        self.ctx.vkd.cmdPushConstants(
+            self.oneshot.cmd_buffer,
+            self.pipeline.pipeline_layout,
+            .{ .compute_bit = true },
+            0,
+            @sizeOf(PushConsts),
+            @ptrCast(&pc),
+        );
         const group_count_x: u32 = weight.out_features;
         self.ctx.vkd.cmdDispatch(self.oneshot.cmd_buffer, group_count_x, 1, 1);
         try self.ctx.vkd.endCommandBuffer(self.oneshot.cmd_buffer);
 
         const cmds = [_]vk.CommandBuffer{self.oneshot.cmd_buffer};
-        const submits = [_]vk.SubmitInfo{.{ .command_buffer_count = 1, .p_command_buffers = &cmds }};
+        const submits = [_]vk.SubmitInfo{
+            .{ .command_buffer_count = 1, .p_command_buffers = &cmds },
+        };
         try self.ctx.vkd.queueSubmit(self.ctx.queue, &submits, .null_handle);
         try self.ctx.vkd.queueWaitIdle(self.ctx.queue);
 
         @memcpy(out, self.buf_out.sliceTyped(f32, out.len));
     }
 };
-
-/// SPIR-V for `shaders/linear_q8_0_batch.comp`.
-const linear_q8_0_batch_spv: [@embedFile("linear_q8_0_batch.spv").len]u8 align(@alignOf(u32)) = @embedFile("linear_q8_0_batch.spv").*;
 
 /// Batched Q8_0 matmul: a `(B, K)` input against an `(N, K)` weight into a
 /// `(B, N)` output. Each workgroup computes a 16 by 32 output tile, which
@@ -2459,9 +3074,23 @@ pub const LinearQ80Batch = struct {
     ) void {
         self.ctx.vkd.cmdBindPipeline(cb, .compute, self.pipeline.handle);
         const desc_sets = [_]vk.DescriptorSet{desc_set};
-        self.ctx.vkd.cmdBindDescriptorSets(cb, .compute, self.pipeline.pipeline_layout, 0, &desc_sets, null);
+        self.ctx.vkd.cmdBindDescriptorSets(
+            cb,
+            .compute,
+            self.pipeline.pipeline_layout,
+            0,
+            &desc_sets,
+            null,
+        );
         const pc: PushConsts = .{ .b = b, .k = k, .n = n };
-        self.ctx.vkd.cmdPushConstants(cb, self.pipeline.pipeline_layout, .{ .compute_bit = true }, 0, @sizeOf(PushConsts), @ptrCast(&pc));
+        self.ctx.vkd.cmdPushConstants(
+            cb,
+            self.pipeline.pipeline_layout,
+            .{ .compute_bit = true },
+            0,
+            @sizeOf(PushConsts),
+            @ptrCast(&pc),
+        );
         const wg_n: u32 = (n + output_tile - 1) / output_tile;
         const wg_b: u32 = (b + batch_tile - 1) / batch_tile;
         self.ctx.vkd.cmdDispatch(cb, wg_n, wg_b, 1);
@@ -2471,13 +3100,18 @@ pub const LinearQ80Batch = struct {
     /// `matmulOneShot`. `input` is `[b, in_features]` row-major and `out` is
     /// `[b, out_features]`. This is not the hot path. The runner uses
     /// `recordInto` against pre-bound device buffers.
-    pub fn runOneShot(self: *LinearQ80Batch, input: []const f32, weight_bytes: []const u8, b: usize, in_features: usize, out_features: usize, out: []f32) !void {
+    pub fn runOneShot(
+        self: *LinearQ80Batch,
+        input: []const f32,
+        weight_bytes: []const u8,
+        b: usize,
+        in_features: usize,
+        out_features: usize,
+        out: []f32,
+    ) !void {
         return matmulOneShot(self, input, weight_bytes, b, in_features, out_features, out);
     }
 };
-
-/// SPIR-V for `shaders/linear_q8_0_gemm.comp`.
-const linear_q8_0_gemm_spv: [@embedFile("linear_q8_0_gemm.spv").len]u8 align(@alignOf(u32)) = @embedFile("linear_q8_0_gemm.spv").*;
 
 /// Register-blocked, LDS-staged Q8_0 GEMM, the wide prefill matmul. It takes
 /// the same storage bindings and push constants as `LinearQ80Batch`, so the
@@ -2520,24 +3154,50 @@ pub const LinearQ80Gemm = struct {
     /// Record one tiled Q8_0 matmul. The caller binds the descriptor set
     /// (input, scales, quants, output). `b` is the batch size of this dispatch.
     /// The kernel zero-fills or skips a partial tile.
-    pub fn recordInto(self: *LinearQ80Gemm, cb: vk.CommandBuffer, desc_set: vk.DescriptorSet, b: u32, k: u32, n: u32) void {
+    pub fn recordInto(
+        self: *LinearQ80Gemm,
+        cb: vk.CommandBuffer,
+        desc_set: vk.DescriptorSet,
+        b: u32,
+        k: u32,
+        n: u32,
+    ) void {
         self.ctx.vkd.cmdBindPipeline(cb, .compute, self.pipeline.handle);
         const desc_sets = [_]vk.DescriptorSet{desc_set};
-        self.ctx.vkd.cmdBindDescriptorSets(cb, .compute, self.pipeline.pipeline_layout, 0, &desc_sets, null);
+        self.ctx.vkd.cmdBindDescriptorSets(
+            cb,
+            .compute,
+            self.pipeline.pipeline_layout,
+            0,
+            &desc_sets,
+            null,
+        );
         const pc: PushConsts = .{ .b = b, .k = k, .n = n };
-        self.ctx.vkd.cmdPushConstants(cb, self.pipeline.pipeline_layout, .{ .compute_bit = true }, 0, @sizeOf(PushConsts), @ptrCast(&pc));
+        self.ctx.vkd.cmdPushConstants(
+            cb,
+            self.pipeline.pipeline_layout,
+            .{ .compute_bit = true },
+            0,
+            @sizeOf(PushConsts),
+            @ptrCast(&pc),
+        );
         const wg_n: u32 = (n + tile_n - 1) / tile_n;
         const wg_m: u32 = (b + tile_m - 1) / tile_m;
         self.ctx.vkd.cmdDispatch(cb, wg_n, wg_m, 1);
     }
 
-    pub fn runOneShot(self: *LinearQ80Gemm, input: []const f32, weight_bytes: []const u8, b: usize, in_features: usize, out_features: usize, out: []f32) !void {
+    pub fn runOneShot(
+        self: *LinearQ80Gemm,
+        input: []const f32,
+        weight_bytes: []const u8,
+        b: usize,
+        in_features: usize,
+        out_features: usize,
+        out: []f32,
+    ) !void {
         return matmulOneShot(self, input, weight_bytes, b, in_features, out_features, out);
     }
 };
-
-/// SPIR-V for `shaders/linear_q4_0_batch.comp`.
-const linear_q4_0_batch_spv: [@embedFile("linear_q4_0_batch.spv").len]u8 align(@alignOf(u32)) = @embedFile("linear_q4_0_batch.spv").*;
 
 /// Q4_0 prefill matmul. It takes the same storage bindings and push constants
 /// as `LinearQ80Batch`, with an 8 by 32 output tile and LDS input staging. The
@@ -2586,17 +3246,28 @@ pub const LinearQ40Batch = struct {
     ) void {
         self.ctx.vkd.cmdBindPipeline(cb, .compute, self.pipeline.handle);
         const desc_sets = [_]vk.DescriptorSet{desc_set};
-        self.ctx.vkd.cmdBindDescriptorSets(cb, .compute, self.pipeline.pipeline_layout, 0, &desc_sets, null);
+        self.ctx.vkd.cmdBindDescriptorSets(
+            cb,
+            .compute,
+            self.pipeline.pipeline_layout,
+            0,
+            &desc_sets,
+            null,
+        );
         const pc: PushConsts = .{ .b = b, .k = k, .n = n };
-        self.ctx.vkd.cmdPushConstants(cb, self.pipeline.pipeline_layout, .{ .compute_bit = true }, 0, @sizeOf(PushConsts), @ptrCast(&pc));
+        self.ctx.vkd.cmdPushConstants(
+            cb,
+            self.pipeline.pipeline_layout,
+            .{ .compute_bit = true },
+            0,
+            @sizeOf(PushConsts),
+            @ptrCast(&pc),
+        );
         const wg_n: u32 = (n + output_tile - 1) / output_tile;
         const wg_b: u32 = (b + batch_tile - 1) / batch_tile;
         self.ctx.vkd.cmdDispatch(cb, wg_n, wg_b, 1);
     }
 };
-
-/// SPIR-V for `shaders/rmsnorm_batch.comp`.
-const rmsnorm_batch_spv: [@embedFile("rmsnorm_batch.spv").len]u8 align(@alignOf(u32)) = @embedFile("rmsnorm_batch.spv").*;
 
 /// Batched RMS normalization, applied independently to each of B input rows.
 /// One workgroup of 256 lanes per row shares the reduction, so the grid is b.
@@ -2638,15 +3309,26 @@ pub const RmsnormBatch = struct {
     ) void {
         self.ctx.vkd.cmdBindPipeline(cb, .compute, self.pipeline.handle);
         const desc_sets = [_]vk.DescriptorSet{desc_set};
-        self.ctx.vkd.cmdBindDescriptorSets(cb, .compute, self.pipeline.pipeline_layout, 0, &desc_sets, null);
+        self.ctx.vkd.cmdBindDescriptorSets(
+            cb,
+            .compute,
+            self.pipeline.pipeline_layout,
+            0,
+            &desc_sets,
+            null,
+        );
         const pc: PushConsts = .{ .d = d, .eps = eps };
-        self.ctx.vkd.cmdPushConstants(cb, self.pipeline.pipeline_layout, .{ .compute_bit = true }, 0, @sizeOf(PushConsts), @ptrCast(&pc));
+        self.ctx.vkd.cmdPushConstants(
+            cb,
+            self.pipeline.pipeline_layout,
+            .{ .compute_bit = true },
+            0,
+            @sizeOf(PushConsts),
+            @ptrCast(&pc),
+        );
         self.ctx.vkd.cmdDispatch(cb, b, 1, 1);
     }
 };
-
-/// SPIR-V for `shaders/rope_multi_batch.comp`.
-const rope_multi_batch_spv: [@embedFile("rope_multi_batch.spv").len]u8 align(@alignOf(u32)) = @embedFile("rope_multi_batch.spv").*;
 
 /// Batched multi-head RoPE over a `(B, n_heads, head_dim)` buffer. Row `bi`
 /// rotates at position `start_pos + bi * pos_stride`. One dispatch covers every
@@ -2708,18 +3390,37 @@ pub const RopeMultiBatch = struct {
     ) void {
         self.ctx.vkd.cmdBindPipeline(cb, .compute, self.pipeline.handle);
         const desc_sets = [_]vk.DescriptorSet{desc_set};
-        self.ctx.vkd.cmdBindDescriptorSets(cb, .compute, self.pipeline.pipeline_layout, 0, &desc_sets, null);
-        const pc: PushConsts = .{ .start_pos = start_pos, .head_dim = head_dim, .rope_dim = rope_dim, .freq_base = freq_base, .n_heads = n_heads, .pos_stride = pos_stride, .style_norm = @intFromBool(style == .norm), .row_base = row_base };
-        self.ctx.vkd.cmdPushConstants(cb, self.pipeline.pipeline_layout, .{ .compute_bit = true }, 0, @sizeOf(PushConsts), @ptrCast(&pc));
+        self.ctx.vkd.cmdBindDescriptorSets(
+            cb,
+            .compute,
+            self.pipeline.pipeline_layout,
+            0,
+            &desc_sets,
+            null,
+        );
+        const pc: PushConsts = .{
+            .start_pos = start_pos,
+            .head_dim = head_dim,
+            .rope_dim = rope_dim,
+            .freq_base = freq_base,
+            .n_heads = n_heads,
+            .pos_stride = pos_stride,
+            .style_norm = @intFromBool(style == .norm),
+            .row_base = row_base,
+        };
+        self.ctx.vkd.cmdPushConstants(
+            cb,
+            self.pipeline.pipeline_layout,
+            .{ .compute_bit = true },
+            0,
+            @sizeOf(PushConsts),
+            @ptrCast(&pc),
+        );
         const half: u32 = rope_dim / 2;
         const group_count_x: u32 = (half + 63) / 64;
         self.ctx.vkd.cmdDispatch(cb, group_count_x, n_heads, b);
     }
 };
-
-/// SPIR-V for `shaders/attention_batch.comp`, once per KV-cache element type.
-const attention_batch_spv: [@embedFile("attention_batch.spv").len]u8 align(@alignOf(u32)) = @embedFile("attention_batch.spv").*;
-const attention_batch_f16_spv: [@embedFile("attention_batch_f16.spv").len]u8 align(@alignOf(u32)) = @embedFile("attention_batch_f16.spv").*;
 
 /// Batched causal attention for the resident rows of a prefill chunk, one
 /// workgroup of 64 lanes per (head, row) pair. Query row `bi` attends to the K
@@ -2753,6 +3454,7 @@ pub const AttentionBatch = struct {
             .f32 => &attention_batch_spv,
             .f16 => &attention_batch_f16_spv,
         };
+
         const pipeline = try Pipeline.init(ctx, spv, 4, @sizeOf(PushConsts));
 
         return .{
@@ -2784,19 +3486,35 @@ pub const AttentionBatch = struct {
         // The K-dot loops read an adjacent element pair per step, on both KV
         // element types, so an odd head_dim reads past the row.
         std.debug.assert(head_dim % 2 == 0);
+
         self.ctx.vkd.cmdBindPipeline(cb, .compute, self.pipeline.handle);
         const desc_sets = [_]vk.DescriptorSet{desc_set};
-        self.ctx.vkd.cmdBindDescriptorSets(cb, .compute, self.pipeline.pipeline_layout, 0, &desc_sets, null);
-        const pc: PushConsts = .{ .n_heads = n_heads, .n_kv_heads = n_kv_heads, .head_dim = head_dim, .start_pos = start_pos, .b_count = b };
-        self.ctx.vkd.cmdPushConstants(cb, self.pipeline.pipeline_layout, .{ .compute_bit = true }, 0, @sizeOf(PushConsts), @ptrCast(&pc));
+        self.ctx.vkd.cmdBindDescriptorSets(
+            cb,
+            .compute,
+            self.pipeline.pipeline_layout,
+            0,
+            &desc_sets,
+            null,
+        );
+        const pc: PushConsts = .{
+            .n_heads = n_heads,
+            .n_kv_heads = n_kv_heads,
+            .head_dim = head_dim,
+            .start_pos = start_pos,
+            .b_count = b,
+        };
+        self.ctx.vkd.cmdPushConstants(
+            cb,
+            self.pipeline.pipeline_layout,
+            .{ .compute_bit = true },
+            0,
+            @sizeOf(PushConsts),
+            @ptrCast(&pc),
+        );
         self.ctx.vkd.cmdDispatch(cb, n_heads, b, 1);
     }
 };
-
-/// SPIR-V for `shaders/attention_multi_stream.comp`, once per KV-cache element
-/// type.
-const attention_multi_stream_spv: [@embedFile("attention_multi_stream.spv").len]u8 align(@alignOf(u32)) = @embedFile("attention_multi_stream.spv").*;
-const attention_multi_stream_f16_spv: [@embedFile("attention_multi_stream_f16.spv").len]u8 align(@alignOf(u32)) = @embedFile("attention_multi_stream_f16.spv").*;
 
 /// Multi-stream attention, one row per stream. Each row reads the K and V slice
 /// of its own stream from the K region and the V region of one layer. Every
@@ -2826,11 +3544,15 @@ pub const AttentionMultiStream = struct {
     pub const InitError = VecAdd.InitError;
 
     /// KV-dtype variant selector. See `Attention.initKv`.
-    pub fn initKv(ctx: *const vulkan_ctx.Context, kv: dtype.KvDtype) InitError!AttentionMultiStream {
+    pub fn initKv(
+        ctx: *const vulkan_ctx.Context,
+        kv: dtype.KvDtype,
+    ) InitError!AttentionMultiStream {
         const spv: []align(@alignOf(u32)) const u8 = switch (kv) {
             .f32 => &attention_multi_stream_spv,
             .f16 => &attention_multi_stream_f16_spv,
         };
+
         const pipeline = try Pipeline.init(ctx, spv, 4, @sizeOf(PushConsts));
 
         return .{
@@ -2870,10 +3592,20 @@ pub const AttentionMultiStream = struct {
         std.debug.assert(@as(u64, t_len) * n_kv_heads * head_dim <= stream_stride_elems);
         // The shader forms each stream base as a 32-bit product, so the end of
         // the last stream must stay inside the 31-bit index.
-        std.debug.assert((@as(u64, kv_stream_base) + n_rows) * stream_stride_elems <= limits.max_kv_index_elems);
+        std.debug.assert(
+            (@as(u64, kv_stream_base) + n_rows) * stream_stride_elems <= limits.max_kv_index_elems,
+        );
+
         self.ctx.vkd.cmdBindPipeline(cb, .compute, self.pipeline.handle);
         const desc_sets = [_]vk.DescriptorSet{desc_set};
-        self.ctx.vkd.cmdBindDescriptorSets(cb, .compute, self.pipeline.pipeline_layout, 0, &desc_sets, null);
+        self.ctx.vkd.cmdBindDescriptorSets(
+            cb,
+            .compute,
+            self.pipeline.pipeline_layout,
+            0,
+            &desc_sets,
+            null,
+        );
         const pc: PushConsts = .{
             .n_heads = n_heads,
             .n_kv_heads = n_kv_heads,
@@ -2883,13 +3615,17 @@ pub const AttentionMultiStream = struct {
             .q_row_base = q_row_base,
             .kv_stream_base = kv_stream_base,
         };
-        self.ctx.vkd.cmdPushConstants(cb, self.pipeline.pipeline_layout, .{ .compute_bit = true }, 0, @sizeOf(PushConsts), @ptrCast(&pc));
+        self.ctx.vkd.cmdPushConstants(
+            cb,
+            self.pipeline.pipeline_layout,
+            .{ .compute_bit = true },
+            0,
+            @sizeOf(PushConsts),
+            @ptrCast(&pc),
+        );
         self.ctx.vkd.cmdDispatch(cb, n_heads, n_rows, 1);
     }
 };
-
-/// SPIR-V for `shaders/kv_commit_f16.comp`.
-const kv_commit_f16_spv: [@embedFile("kv_commit_f16.spv").len]u8 align(@alignOf(u32)) = @embedFile("kv_commit_f16.spv").*;
 
 /// Narrow the K and V commit scratch of one layer from f32 to f16. Four storage
 /// buffers: f32 k_src, f32 v_src, f16 k_out, f16 v_out. One `u32` push constant
@@ -2944,19 +3680,31 @@ pub const KvCommitF16 = struct {
         n: u32,
     ) void {
         std.debug.assert(n >= 1);
+
         const group_count_x: u32 = (n + 63) / 64;
         std.debug.assert(group_count_x <= max_workgroups_x);
         self.ctx.vkd.cmdBindPipeline(cb, .compute, self.pipeline.handle);
         const desc_sets = [_]vk.DescriptorSet{desc_set};
-        self.ctx.vkd.cmdBindDescriptorSets(cb, .compute, self.pipeline.pipeline_layout, 0, &desc_sets, null);
+        self.ctx.vkd.cmdBindDescriptorSets(
+            cb,
+            .compute,
+            self.pipeline.pipeline_layout,
+            0,
+            &desc_sets,
+            null,
+        );
         const pc: PushConsts = .{ .n = n };
-        self.ctx.vkd.cmdPushConstants(cb, self.pipeline.pipeline_layout, .{ .compute_bit = true }, 0, @sizeOf(PushConsts), @ptrCast(&pc));
+        self.ctx.vkd.cmdPushConstants(
+            cb,
+            self.pipeline.pipeline_layout,
+            .{ .compute_bit = true },
+            0,
+            @sizeOf(PushConsts),
+            @ptrCast(&pc),
+        );
         self.ctx.vkd.cmdDispatch(cb, group_count_x, 1, 1);
     }
 };
-
-/// SPIR-V for `shaders/gdn_decode.comp`.
-const gdn_decode_spv: [@embedFile("gdn_decode.spv").len]u8 align(@alignOf(u32)) = @embedFile("gdn_decode.spv").*;
 
 /// Gated-DeltaNet decode kernel for one Qwen3.5 GDN layer, one token per call.
 /// This is the standalone bit-check form: host-visible buffers, submit and
@@ -3007,7 +3755,9 @@ pub const GdnDecode = struct {
         const oneshot = try OneShot.init(ctx, pipeline.set_layout, n_bindings);
 
         var bufs: [n_bindings]HostBuffer = undefined;
-        for (&bufs) |*b| b.* = .{ .ctx = ctx };
+        for (&bufs) |*b| {
+            b.* = .{ .ctx = ctx };
+        }
 
         return .{
             .ctx = ctx,
@@ -3018,7 +3768,10 @@ pub const GdnDecode = struct {
     }
 
     pub fn deinit(self: *GdnDecode) void {
-        for (&self.bufs) |*b| b.deinit();
+        for (&self.bufs) |*b| {
+            b.deinit();
+        }
+
         self.oneshot.deinit(self.ctx);
         self.pipeline.deinit(self.ctx);
     }
@@ -3058,7 +3811,19 @@ pub const GdnDecode = struct {
         eps: f32,
         n_tokens: u32,
     ) void {
-        self.recordRun(cb, desc_set, n_k_heads, n_v_heads, head_dim, conv_kernel, eps, n_tokens, 0, 0, 0);
+        self.recordRun(
+            cb,
+            desc_set,
+            n_k_heads,
+            n_v_heads,
+            head_dim,
+            conv_kernel,
+            eps,
+            n_tokens,
+            0,
+            0,
+            0,
+        );
     }
 
     /// Record one slot run of a mixed batch. It covers `n_tokens` rows of the
@@ -3081,7 +3846,14 @@ pub const GdnDecode = struct {
     ) void {
         self.ctx.vkd.cmdBindPipeline(cb, .compute, self.pipeline.handle);
         const sets = [_]vk.DescriptorSet{desc_set};
-        self.ctx.vkd.cmdBindDescriptorSets(cb, .compute, self.pipeline.pipeline_layout, 0, &sets, null);
+        self.ctx.vkd.cmdBindDescriptorSets(
+            cb,
+            .compute,
+            self.pipeline.pipeline_layout,
+            0,
+            &sets,
+            null,
+        );
         const push: Push = .{
             .d = head_dim,
             .k = conv_kernel,
@@ -3093,7 +3865,14 @@ pub const GdnDecode = struct {
             .state_off = state_off,
             .conv_off = conv_off,
         };
-        self.ctx.vkd.cmdPushConstants(cb, self.pipeline.pipeline_layout, .{ .compute_bit = true }, 0, @sizeOf(Push), @ptrCast(&push));
+        self.ctx.vkd.cmdPushConstants(
+            cb,
+            self.pipeline.pipeline_layout,
+            .{ .compute_bit = true },
+            0,
+            @sizeOf(Push),
+            @ptrCast(&push),
+        );
         self.ctx.vkd.cmdDispatch(cb, n_k_heads, 1, 1);
     }
 
@@ -3134,38 +3913,82 @@ pub const GdnDecode = struct {
         const value_dim: usize = @as(usize, n_v_heads) * head_dim;
         const conv_dim: usize = 2 * key_dim + value_dim;
         if (head_dim != 128 or n_v_heads % n_k_heads != 0) return error.DimMismatch;
-        if (qkv.len != conv_dim or z.len != value_dim or o_out.len != value_dim) return error.DimMismatch;
-        if (alpha.len != n_v_heads or beta_in.len != n_v_heads or ssm_a.len != n_v_heads or dt_bias.len != n_v_heads) return error.DimMismatch;
+        if (qkv.len != conv_dim or z.len != value_dim or o_out.len != value_dim) {
+            return error.DimMismatch;
+        }
+        if (alpha.len != n_v_heads or beta_in.len != n_v_heads or ssm_a.len != n_v_heads or
+            dt_bias.len != n_v_heads)
+        {
+            return error.DimMismatch;
+        }
         if (conv_w.len != @as(usize, conv_kernel) * conv_dim) return error.DimMismatch;
         if (ssm_norm.len != head_dim) return error.DimMismatch;
         if (state.len != @as(usize, n_v_heads) * head_dim * head_dim) return error.DimMismatch;
         if (conv_state.len != @as(usize, conv_kernel - 1) * conv_dim) return error.DimMismatch;
 
         // Upload all inputs (bindings 0..10). state/conv_state are in/out.
-        const inputs = [n_bindings][]const f32{ qkv, z, alpha, beta_in, conv_w, ssm_a, dt_bias, ssm_norm, state, conv_state, o_out };
+        const inputs = [n_bindings][]const f32{
+            qkv,
+            z,
+            alpha,
+            beta_in,
+            conv_w,
+            ssm_a,
+            dt_bias,
+            ssm_norm,
+            state,
+            conv_state,
+            o_out,
+        };
         var infos: [n_bindings]vk.DescriptorBufferInfo = undefined;
         for (&self.bufs, inputs, 0..) |*buf, src, i| {
             const bytes: vk.DeviceSize = @intCast(src.len * @sizeOf(f32));
             try buf.ensure(bytes);
-            if (i != 10) @memcpy(buf.sliceTyped(f32, src.len), src); // o_out is write-only
+            if (i != 10) {
+                @memcpy(buf.sliceTyped(f32, src.len), src); // o_out is write-only
+            }
+
             infos[i] = .{ .buffer = buf.buffer, .offset = 0, .range = bytes };
         }
+
         updateStorageBindings(self.ctx, self.oneshot.desc_set, &infos);
 
-        const push: Push = .{ .d = head_dim, .k = conv_kernel, .n_k = n_k_heads, .n_v = n_v_heads, .eps = eps };
+        const push: Push = .{
+            .d = head_dim,
+            .k = conv_kernel,
+            .n_k = n_k_heads,
+            .n_v = n_v_heads,
+            .eps = eps,
+        };
 
         try self.ctx.vkd.resetCommandBuffer(self.oneshot.cmd_buffer, .{});
         const begin: vk.CommandBufferBeginInfo = .{ .flags = .{ .one_time_submit_bit = true } };
         try self.ctx.vkd.beginCommandBuffer(self.oneshot.cmd_buffer, &begin);
         self.ctx.vkd.cmdBindPipeline(self.oneshot.cmd_buffer, .compute, self.pipeline.handle);
         const sets = [_]vk.DescriptorSet{self.oneshot.desc_set};
-        self.ctx.vkd.cmdBindDescriptorSets(self.oneshot.cmd_buffer, .compute, self.pipeline.pipeline_layout, 0, &sets, null);
-        self.ctx.vkd.cmdPushConstants(self.oneshot.cmd_buffer, self.pipeline.pipeline_layout, .{ .compute_bit = true }, 0, @sizeOf(Push), @ptrCast(&push));
+        self.ctx.vkd.cmdBindDescriptorSets(
+            self.oneshot.cmd_buffer,
+            .compute,
+            self.pipeline.pipeline_layout,
+            0,
+            &sets,
+            null,
+        );
+        self.ctx.vkd.cmdPushConstants(
+            self.oneshot.cmd_buffer,
+            self.pipeline.pipeline_layout,
+            .{ .compute_bit = true },
+            0,
+            @sizeOf(Push),
+            @ptrCast(&push),
+        );
         self.ctx.vkd.cmdDispatch(self.oneshot.cmd_buffer, n_k_heads, 1, 1);
         try self.ctx.vkd.endCommandBuffer(self.oneshot.cmd_buffer);
 
         const cmds = [_]vk.CommandBuffer{self.oneshot.cmd_buffer};
-        const submits = [_]vk.SubmitInfo{.{ .command_buffer_count = 1, .p_command_buffers = &cmds }};
+        const submits = [_]vk.SubmitInfo{
+            .{ .command_buffer_count = 1, .p_command_buffers = &cmds },
+        };
         try self.ctx.vkd.queueSubmit(self.ctx.queue, &submits, .null_handle);
         try self.ctx.vkd.queueWaitIdle(self.ctx.queue);
 
@@ -3206,7 +4029,9 @@ pub const GdnDecode = struct {
         const value_dim: usize = @as(usize, n_v_heads) * head_dim;
         const conv_dim: usize = 2 * key_dim + value_dim;
         if (head_dim != 128 or n_v_heads % n_k_heads != 0) return error.DimMismatch;
-        if (qkv.len != t * conv_dim or z.len != t * value_dim or o_out.len != t * value_dim) return error.DimMismatch;
+        if (qkv.len != t * conv_dim or z.len != t * value_dim or o_out.len != t * value_dim) {
+            return error.DimMismatch;
+        }
         if (alpha.len != t * n_v_heads or beta_in.len != t * n_v_heads) return error.DimMismatch;
         if (ssm_a.len != n_v_heads or dt_bias.len != n_v_heads) return error.DimMismatch;
         if (conv_w.len != @as(usize, conv_kernel) * conv_dim) return error.DimMismatch;
@@ -3214,24 +4039,51 @@ pub const GdnDecode = struct {
         if (state.len != value_dim * head_dim) return error.DimMismatch;
         if (conv_state.len != @as(usize, conv_kernel - 1) * conv_dim) return error.DimMismatch;
 
-        const inputs = [n_bindings][]const f32{ qkv, z, alpha, beta_in, conv_w, ssm_a, dt_bias, ssm_norm, state, conv_state, o_out };
+        const inputs = [n_bindings][]const f32{
+            qkv,
+            z,
+            alpha,
+            beta_in,
+            conv_w,
+            ssm_a,
+            dt_bias,
+            ssm_norm,
+            state,
+            conv_state,
+            o_out,
+        };
         var infos: [n_bindings]vk.DescriptorBufferInfo = undefined;
         for (&self.bufs, inputs, 0..) |*buf, src, i| {
             const bytes: vk.DeviceSize = @intCast(src.len * @sizeOf(f32));
             try buf.ensure(bytes);
-            if (i != 10) @memcpy(buf.sliceTyped(f32, src.len), src); // o_out is write-only
+            if (i != 10) {
+                @memcpy(buf.sliceTyped(f32, src.len), src); // o_out is write-only
+            }
+
             infos[i] = .{ .buffer = buf.buffer, .offset = 0, .range = bytes };
         }
+
         updateStorageBindings(self.ctx, self.oneshot.desc_set, &infos);
 
         try self.ctx.vkd.resetCommandBuffer(self.oneshot.cmd_buffer, .{});
         const begin: vk.CommandBufferBeginInfo = .{ .flags = .{ .one_time_submit_bit = true } };
         try self.ctx.vkd.beginCommandBuffer(self.oneshot.cmd_buffer, &begin);
-        self.recordChunk(self.oneshot.cmd_buffer, self.oneshot.desc_set, n_k_heads, n_v_heads, head_dim, conv_kernel, eps, n_tokens);
+        self.recordChunk(
+            self.oneshot.cmd_buffer,
+            self.oneshot.desc_set,
+            n_k_heads,
+            n_v_heads,
+            head_dim,
+            conv_kernel,
+            eps,
+            n_tokens,
+        );
         try self.ctx.vkd.endCommandBuffer(self.oneshot.cmd_buffer);
 
         const cmds = [_]vk.CommandBuffer{self.oneshot.cmd_buffer};
-        const submits = [_]vk.SubmitInfo{.{ .command_buffer_count = 1, .p_command_buffers = &cmds }};
+        const submits = [_]vk.SubmitInfo{
+            .{ .command_buffer_count = 1, .p_command_buffers = &cmds },
+        };
         try self.ctx.vkd.queueSubmit(self.ctx.queue, &submits, .null_handle);
         try self.ctx.vkd.queueWaitIdle(self.ctx.queue);
 
@@ -3240,11 +4092,6 @@ pub const GdnDecode = struct {
         @memcpy(o_out, self.bufs[10].sliceTyped(f32, o_out.len));
     }
 };
-
-/// SPIR-V for the chunked-parallel GDN prefill (three dispatches).
-const gdn_chunk_conv_spv: [@embedFile("gdn_chunk_conv.spv").len]u8 align(@alignOf(u32)) = @embedFile("gdn_chunk_conv.spv").*;
-const gdn_chunk_scan_spv: [@embedFile("gdn_chunk_scan.spv").len]u8 align(@alignOf(u32)) = @embedFile("gdn_chunk_scan.spv").*;
-const gdn_chunk_norm_spv: [@embedFile("gdn_chunk_norm.spv").len]u8 align(@alignOf(u32)) = @embedFile("gdn_chunk_norm.spv").*;
 
 /// Chunked-parallel GDN prefill, a replacement for the serial-over-tokens
 /// `recordChunk` of `GdnDecode`. The conv pass runs one workgroup of 128 lanes
@@ -3293,15 +4140,29 @@ pub const GdnChunkParallel = struct {
     /// `recordScan` out.
     pub fn guardHeadDim(head_dim: u32) error{GdnHeadDimUnsupported}!void {
         if (head_dim == limits.gdn_head_dim) return;
-        log.err("The model GDN state size is {d}. GPU prefill takes a state size of {d} only. Run this model on a CPU build", .{ head_dim, limits.gdn_head_dim });
+        log.err(
+            "The model GDN state size is {d}. GPU prefill takes a state size of {d} only. " ++
+                "Run this model on a CPU build",
+            .{ head_dim, limits.gdn_head_dim },
+        );
         return error.GdnHeadDimUnsupported;
     }
 
     pub fn init(ctx: *const vulkan_ctx.Context) InitError!GdnChunkParallel {
-        const pipeline_conv = try Pipeline.init(ctx, &gdn_chunk_conv_spv, conv_bindings, @sizeOf(ConvPush));
+        const pipeline_conv = try Pipeline.init(
+            ctx,
+            &gdn_chunk_conv_spv,
+            conv_bindings,
+            @sizeOf(ConvPush),
+        );
         errdefer pipeline_conv.deinit(ctx);
 
-        const pipeline_scan = try Pipeline.init(ctx, &gdn_chunk_scan_spv, scan_bindings, @sizeOf(ScanPush));
+        const pipeline_scan = try Pipeline.init(
+            ctx,
+            &gdn_chunk_scan_spv,
+            scan_bindings,
+            @sizeOf(ScanPush),
+        );
         errdefer pipeline_scan.deinit(ctx);
 
         const norm_info: vk.ShaderModuleCreateInfo = .{
@@ -3310,20 +4171,34 @@ pub const GdnChunkParallel = struct {
         };
         const norm_module = try ctx.vkd.createShaderModule(ctx.device, &norm_info, null);
         errdefer ctx.vkd.destroyShaderModule(ctx.device, norm_module, null);
-        const pipeline_norm = try createComputePipeline(ctx, norm_module, pipeline_scan.pipeline_layout);
+
+        const pipeline_norm = try createComputePipeline(
+            ctx,
+            norm_module,
+            pipeline_scan.pipeline_layout,
+        );
         errdefer ctx.vkd.destroyPipeline(ctx.device, pipeline_norm, null);
 
         // Pool for the two standalone (gate) sets.
-        const pool_sizes = [_]vk.DescriptorPoolSize{.{ .type = .storage_buffer, .descriptor_count = conv_bindings + scan_bindings }};
-        const pool_info: vk.DescriptorPoolCreateInfo = .{ .max_sets = 2, .pool_size_count = 1, .p_pool_sizes = &pool_sizes };
+        const pool_sizes = [_]vk.DescriptorPoolSize{
+            .{ .type = .storage_buffer, .descriptor_count = conv_bindings + scan_bindings },
+        };
+        const pool_info: vk.DescriptorPoolCreateInfo = .{
+            .max_sets = 2,
+            .pool_size_count = 1,
+            .p_pool_sizes = &pool_sizes,
+        };
         const desc_pool = try ctx.vkd.createDescriptorPool(ctx.device, &pool_info, null);
         errdefer ctx.vkd.destroyDescriptorPool(ctx.device, desc_pool, null);
+
         const conv_set = try allocateOneSet(ctx, desc_pool, pipeline_conv.set_layout);
         const scan_set = try allocateOneSet(ctx, desc_pool, pipeline_scan.set_layout);
         const cmd_buffer = try allocateOnePrimaryCmdBuffer(ctx);
 
         var bufs: [n_bufs]HostBuffer = undefined;
-        for (&bufs) |*b| b.* = .{ .ctx = ctx };
+        for (&bufs) |*b| {
+            b.* = .{ .ctx = ctx };
+        }
 
         return .{
             .ctx = ctx,
@@ -3340,7 +4215,10 @@ pub const GdnChunkParallel = struct {
     }
 
     pub fn deinit(self: *GdnChunkParallel) void {
-        for (&self.bufs) |*b| b.deinit();
+        for (&self.bufs) |*b| {
+            b.deinit();
+        }
+
         const cmds = [_]vk.CommandBuffer{self.cmd_buffer};
         self.ctx.vkd.freeCommandBuffers(self.ctx.device, self.ctx.command_pool, &cmds);
         self.ctx.vkd.destroyDescriptorPool(self.ctx.device, self.desc_pool, null);
@@ -3352,12 +4230,43 @@ pub const GdnChunkParallel = struct {
 
     /// Record the conv pass, one workgroup per KEY head. The caller binds `set`
     /// with 6 bindings: qkv, conv_w, conv_state (in and out), q_n, k_n, v_conv.
-    pub fn recordConv(self: *const GdnChunkParallel, cb: vk.CommandBuffer, set: vk.DescriptorSet, n_k_heads: u32, n_v_heads: u32, head_dim: u32, conv_kernel: u32, n_tokens: u32, eps: f32) void {
+    pub fn recordConv(
+        self: *const GdnChunkParallel,
+        cb: vk.CommandBuffer,
+        set: vk.DescriptorSet,
+        n_k_heads: u32,
+        n_v_heads: u32,
+        head_dim: u32,
+        conv_kernel: u32,
+        n_tokens: u32,
+        eps: f32,
+    ) void {
         self.ctx.vkd.cmdBindPipeline(cb, .compute, self.pipeline_conv.handle);
         const sets = [_]vk.DescriptorSet{set};
-        self.ctx.vkd.cmdBindDescriptorSets(cb, .compute, self.pipeline_conv.pipeline_layout, 0, &sets, null);
-        const push: ConvPush = .{ .d = head_dim, .n_k = n_k_heads, .n_v = n_v_heads, .k = conv_kernel, .n_tokens = n_tokens, .eps = eps };
-        self.ctx.vkd.cmdPushConstants(cb, self.pipeline_conv.pipeline_layout, .{ .compute_bit = true }, 0, @sizeOf(ConvPush), @ptrCast(&push));
+        self.ctx.vkd.cmdBindDescriptorSets(
+            cb,
+            .compute,
+            self.pipeline_conv.pipeline_layout,
+            0,
+            &sets,
+            null,
+        );
+        const push: ConvPush = .{
+            .d = head_dim,
+            .n_k = n_k_heads,
+            .n_v = n_v_heads,
+            .k = conv_kernel,
+            .n_tokens = n_tokens,
+            .eps = eps,
+        };
+        self.ctx.vkd.cmdPushConstants(
+            cb,
+            self.pipeline_conv.pipeline_layout,
+            .{ .compute_bit = true },
+            0,
+            @sizeOf(ConvPush),
+            @ptrCast(&push),
+        );
         self.ctx.vkd.cmdDispatch(cb, n_k_heads, 1, 1);
     }
 
@@ -3366,7 +4275,16 @@ pub const GdnChunkParallel = struct {
     /// beta_in, ssm_a, dt_bias, ssm_norm, z, state (in and out), o_out. The
     /// caller also inserts the compute-to-compute barrier between `recordConv`
     /// and `recordScan`, and the barrier after it.
-    pub fn recordScan(self: *const GdnChunkParallel, cb: vk.CommandBuffer, set: vk.DescriptorSet, n_k_heads: u32, n_v_heads: u32, head_dim: u32, n_tokens: u32, eps: f32) void {
+    pub fn recordScan(
+        self: *const GdnChunkParallel,
+        cb: vk.CommandBuffer,
+        set: vk.DescriptorSet,
+        n_k_heads: u32,
+        n_v_heads: u32,
+        head_dim: u32,
+        n_tokens: u32,
+        eps: f32,
+    ) void {
         std.debug.assert(head_dim == limits.gdn_head_dim);
         std.debug.assert(n_k_heads >= 1);
         std.debug.assert(n_v_heads % n_k_heads == 0);
@@ -3374,9 +4292,13 @@ pub const GdnChunkParallel = struct {
         // Vulkan guarantees `max_workgroups_x` on the y axis too, where the
         // norm pass puts the token.
         std.debug.assert(n_tokens <= max_workgroups_x);
+
         const groups = limits.gdnScanGroups(n_v_heads);
         std.debug.assert(groups <= max_workgroups_x);
-        std.debug.assert(limits.gdnScanLdsBytes() <= self.ctx.physical_device_props.limits.max_compute_shared_memory_size);
+        std.debug.assert(
+            limits.gdnScanLdsBytes() <=
+                self.ctx.physical_device_props.limits.max_compute_shared_memory_size,
+        );
         // The last lane of the last workgroup owns the last column of the last head.
         const last = limits.gdnScanCell(groups - 1, limits.gdn_scan_cols - 1);
         std.debug.assert(last.head == n_v_heads - 1);
@@ -3384,15 +4306,45 @@ pub const GdnChunkParallel = struct {
 
         self.ctx.vkd.cmdBindPipeline(cb, .compute, self.pipeline_scan.handle);
         const sets = [_]vk.DescriptorSet{set};
-        self.ctx.vkd.cmdBindDescriptorSets(cb, .compute, self.pipeline_scan.pipeline_layout, 0, &sets, null);
-        const push: ScanPush = .{ .d = head_dim, .n_k = n_k_heads, .n_v = n_v_heads, .n_tokens = n_tokens, .eps = eps };
-        self.ctx.vkd.cmdPushConstants(cb, self.pipeline_scan.pipeline_layout, .{ .compute_bit = true }, 0, @sizeOf(ScanPush), @ptrCast(&push));
+        self.ctx.vkd.cmdBindDescriptorSets(
+            cb,
+            .compute,
+            self.pipeline_scan.pipeline_layout,
+            0,
+            &sets,
+            null,
+        );
+        const push: ScanPush = .{
+            .d = head_dim,
+            .n_k = n_k_heads,
+            .n_v = n_v_heads,
+            .n_tokens = n_tokens,
+            .eps = eps,
+        };
+        self.ctx.vkd.cmdPushConstants(
+            cb,
+            self.pipeline_scan.pipeline_layout,
+            .{ .compute_bit = true },
+            0,
+            @sizeOf(ScanPush),
+            @ptrCast(&push),
+        );
         self.ctx.vkd.cmdDispatch(cb, groups, 1, 1);
 
         // The norm pass reads the raw readout of every column of a head, and
         // it then writes the same elements in place.
-        const mb = [_]vk.MemoryBarrier{.{ .src_access_mask = .{ .shader_write_bit = true }, .dst_access_mask = .{ .shader_read_bit = true, .shader_write_bit = true } }};
-        self.ctx.vkd.cmdPipelineBarrier(cb, .{ .compute_shader_bit = true }, .{ .compute_shader_bit = true }, .{}, &mb, null, null);
+        const mb = [_]vk.MemoryBarrier{
+            .{ .src_access_mask = .{ .shader_write_bit = true }, .dst_access_mask = .{ .shader_read_bit = true, .shader_write_bit = true } },
+        };
+        self.ctx.vkd.cmdPipelineBarrier(
+            cb,
+            .{ .compute_shader_bit = true },
+            .{ .compute_shader_bit = true },
+            .{},
+            &mb,
+            null,
+            null,
+        );
         // The norm pipeline uses the scan layout, so the set and the push
         // constants stay bound across the pipeline change.
         self.ctx.vkd.cmdBindPipeline(cb, .compute, self.pipeline_norm);
@@ -3431,7 +4383,9 @@ pub const GdnChunkParallel = struct {
         const conv_dim: usize = 2 * key_dim + value_dim;
         if (head_dim != limits.gdn_head_dim or n_v_heads % n_k_heads != 0) return error.DimMismatch;
         if (n_tokens == 0 or n_tokens > max_workgroups_x) return error.DimMismatch;
-        if (qkv.len != t * conv_dim or z.len != t * value_dim or o_out.len != t * value_dim) return error.DimMismatch;
+        if (qkv.len != t * conv_dim or z.len != t * value_dim or o_out.len != t * value_dim) {
+            return error.DimMismatch;
+        }
         if (alpha.len != t * n_v_heads or beta_in.len != t * n_v_heads) return error.DimMismatch;
         if (ssm_a.len != n_v_heads or dt_bias.len != n_v_heads) return error.DimMismatch;
         if (conv_w.len != @as(usize, conv_kernel) * conv_dim) return error.DimMismatch;
@@ -3440,32 +4394,112 @@ pub const GdnChunkParallel = struct {
         if (conv_state.len != @as(usize, conv_kernel - 1) * conv_dim) return error.DimMismatch;
 
         // Buffer sizes by index (q_n/k_n/v_conv intermediate, o_out write-only).
-        const lens = [n_bufs]usize{ qkv.len, conv_w.len, conv_state.len, t * key_dim, t * key_dim, t * value_dim, alpha.len, beta_in.len, ssm_a.len, dt_bias.len, ssm_norm.len, z.len, state.len, o_out.len };
-        const uploads = [n_bufs]?[]const f32{ qkv, conv_w, conv_state, null, null, null, alpha, beta_in, ssm_a, dt_bias, ssm_norm, z, state, null };
+        const lens = [n_bufs]usize{
+            qkv.len,
+            conv_w.len,
+            conv_state.len,
+            t * key_dim,
+            t * key_dim,
+            t * value_dim,
+            alpha.len,
+            beta_in.len,
+            ssm_a.len,
+            dt_bias.len,
+            ssm_norm.len,
+            z.len,
+            state.len,
+            o_out.len,
+        };
+        const uploads = [n_bufs]?[]const f32{
+            qkv,
+            conv_w,
+            conv_state,
+            null,
+            null,
+            null,
+            alpha,
+            beta_in,
+            ssm_a,
+            dt_bias,
+            ssm_norm,
+            z,
+            state,
+            null,
+        };
         var infos: [n_bufs]vk.DescriptorBufferInfo = undefined;
         for (&self.bufs, lens, uploads, 0..) |*buf, len, up, i| {
             const bytes: vk.DeviceSize = @intCast(len * @sizeOf(f32));
             try buf.ensure(bytes);
-            if (up) |src| @memcpy(buf.sliceTyped(f32, len), src);
+            if (up) |src| {
+                @memcpy(buf.sliceTyped(f32, len), src);
+            }
+
             infos[i] = .{ .buffer = buf.buffer, .offset = 0, .range = bytes };
         }
+
         // conv set: qkv(0), conv_w(1), conv_state(2), q_n(3), k_n(4), v_conv(5)
         updateStorageBindings(self.ctx, self.conv_set, infos[0..6]);
         // scan set: q_n(3), k_n(4), v_conv(5), alpha(6), beta(7), ssm_a(8),
         // dt_bias(9), ssm_norm(10), z(11), state(12), o_out(13)
-        const scan_infos = [scan_bindings]vk.DescriptorBufferInfo{ infos[3], infos[4], infos[5], infos[6], infos[7], infos[8], infos[9], infos[10], infos[11], infos[12], infos[13] };
+        const scan_infos = [scan_bindings]vk.DescriptorBufferInfo{
+            infos[3],
+            infos[4],
+            infos[5],
+            infos[6],
+            infos[7],
+            infos[8],
+            infos[9],
+            infos[10],
+            infos[11],
+            infos[12],
+            infos[13],
+        };
         updateStorageBindings(self.ctx, self.scan_set, &scan_infos);
 
         try self.ctx.vkd.resetCommandBuffer(self.cmd_buffer, .{});
-        try self.ctx.vkd.beginCommandBuffer(self.cmd_buffer, &.{ .flags = .{ .one_time_submit_bit = true } });
-        self.recordConv(self.cmd_buffer, self.conv_set, n_k_heads, n_v_heads, head_dim, conv_kernel, n_tokens, eps);
-        const mb = [_]vk.MemoryBarrier{.{ .src_access_mask = .{ .shader_write_bit = true }, .dst_access_mask = .{ .shader_read_bit = true } }};
-        self.ctx.vkd.cmdPipelineBarrier(self.cmd_buffer, .{ .compute_shader_bit = true }, .{ .compute_shader_bit = true }, .{}, &mb, null, null);
-        self.recordScan(self.cmd_buffer, self.scan_set, n_k_heads, n_v_heads, head_dim, n_tokens, eps);
+        try self.ctx.vkd.beginCommandBuffer(
+            self.cmd_buffer,
+            &.{ .flags = .{ .one_time_submit_bit = true } },
+        );
+        self.recordConv(
+            self.cmd_buffer,
+            self.conv_set,
+            n_k_heads,
+            n_v_heads,
+            head_dim,
+            conv_kernel,
+            n_tokens,
+            eps,
+        );
+        const mb = [_]vk.MemoryBarrier{
+            .{ .src_access_mask = .{ .shader_write_bit = true }, .dst_access_mask = .{ .shader_read_bit = true } },
+        };
+        self.ctx.vkd.cmdPipelineBarrier(
+            self.cmd_buffer,
+            .{ .compute_shader_bit = true },
+            .{ .compute_shader_bit = true },
+            .{},
+            &mb,
+            null,
+            null,
+        );
+        self.recordScan(
+            self.cmd_buffer,
+            self.scan_set,
+            n_k_heads,
+            n_v_heads,
+            head_dim,
+            n_tokens,
+            eps,
+        );
         try self.ctx.vkd.endCommandBuffer(self.cmd_buffer);
 
         const cmds = [_]vk.CommandBuffer{self.cmd_buffer};
-        try self.ctx.vkd.queueSubmit(self.ctx.queue, &[_]vk.SubmitInfo{.{ .command_buffer_count = 1, .p_command_buffers = &cmds }}, .null_handle);
+        try self.ctx.vkd.queueSubmit(
+            self.ctx.queue,
+            &[_]vk.SubmitInfo{.{ .command_buffer_count = 1, .p_command_buffers = &cmds }},
+            .null_handle,
+        );
         try self.ctx.vkd.queueWaitIdle(self.ctx.queue);
 
         @memcpy(conv_state, self.bufs[2].sliceTyped(f32, conv_state.len));
@@ -3473,9 +4507,6 @@ pub const GdnChunkParallel = struct {
         @memcpy(o_out, self.bufs[13].sliceTyped(f32, o_out.len));
     }
 };
-
-/// SPIR-V for `shaders/qwen_qk_norm.comp`.
-const qwen_qk_norm_spv: [@embedFile("qwen_qk_norm.spv").len]u8 align(@alignOf(u32)) = @embedFile("qwen_qk_norm.spv").*;
 
 /// Per-head QK norm for Qwen3.5 full attention, with an optional de-interleave
 /// of the q and gate halves. Four storage bindings: in, norm_w, out, gate_out.
@@ -3488,7 +4519,15 @@ pub const QwenQkNorm = struct {
 
     pub const InitError = Pipeline.InitError;
 
-    const Push = extern struct { head_dim: u32, in_stride: u32, gate_off: u32, write_gate: u32, eps: f32, in_off: u32 = 0, out_off: u32 = 0 };
+    const Push = extern struct {
+        head_dim: u32,
+        in_stride: u32,
+        gate_off: u32,
+        write_gate: u32,
+        eps: f32,
+        in_off: u32 = 0,
+        out_off: u32 = 0,
+    };
 
     pub fn init(ctx: *const vulkan_ctx.Context) InitError!QwenQkNorm {
         const pipeline = try Pipeline.init(ctx, &qwen_qk_norm_spv, 4, @sizeOf(Push));
@@ -3499,18 +4538,62 @@ pub const QwenQkNorm = struct {
         self.pipeline.deinit(self.ctx);
     }
 
-    pub fn recordInto(self: *const QwenQkNorm, cb: vk.CommandBuffer, desc_set: vk.DescriptorSet, n_heads: u32, head_dim: u32, in_stride: u32, gate_off: u32, write_gate: bool, eps: f32) void {
+    pub fn recordInto(
+        self: *const QwenQkNorm,
+        cb: vk.CommandBuffer,
+        desc_set: vk.DescriptorSet,
+        n_heads: u32,
+        head_dim: u32,
+        in_stride: u32,
+        gate_off: u32,
+        write_gate: bool,
+        eps: f32,
+    ) void {
         self.recordRow(cb, desc_set, n_heads, head_dim, in_stride, gate_off, write_gate, eps, 0, 0);
     }
 
     /// Record one batched row. Prefill passes the element offsets of token t as
     /// `in_off` and `out_off`. Decode passes zero for both.
-    pub fn recordRow(self: *const QwenQkNorm, cb: vk.CommandBuffer, desc_set: vk.DescriptorSet, n_heads: u32, head_dim: u32, in_stride: u32, gate_off: u32, write_gate: bool, eps: f32, in_off: u32, out_off: u32) void {
+    pub fn recordRow(
+        self: *const QwenQkNorm,
+        cb: vk.CommandBuffer,
+        desc_set: vk.DescriptorSet,
+        n_heads: u32,
+        head_dim: u32,
+        in_stride: u32,
+        gate_off: u32,
+        write_gate: bool,
+        eps: f32,
+        in_off: u32,
+        out_off: u32,
+    ) void {
         self.ctx.vkd.cmdBindPipeline(cb, .compute, self.pipeline.handle);
         const sets = [_]vk.DescriptorSet{desc_set};
-        self.ctx.vkd.cmdBindDescriptorSets(cb, .compute, self.pipeline.pipeline_layout, 0, &sets, null);
-        const push: Push = .{ .head_dim = head_dim, .in_stride = in_stride, .gate_off = gate_off, .write_gate = @intFromBool(write_gate), .eps = eps, .in_off = in_off, .out_off = out_off };
-        self.ctx.vkd.cmdPushConstants(cb, self.pipeline.pipeline_layout, .{ .compute_bit = true }, 0, @sizeOf(Push), @ptrCast(&push));
+        self.ctx.vkd.cmdBindDescriptorSets(
+            cb,
+            .compute,
+            self.pipeline.pipeline_layout,
+            0,
+            &sets,
+            null,
+        );
+        const push: Push = .{
+            .head_dim = head_dim,
+            .in_stride = in_stride,
+            .gate_off = gate_off,
+            .write_gate = @intFromBool(write_gate),
+            .eps = eps,
+            .in_off = in_off,
+            .out_off = out_off,
+        };
+        self.ctx.vkd.cmdPushConstants(
+            cb,
+            self.pipeline.pipeline_layout,
+            .{ .compute_bit = true },
+            0,
+            @sizeOf(Push),
+            @ptrCast(&push),
+        );
         self.ctx.vkd.cmdDispatch(cb, n_heads, 1, 1);
     }
 };
@@ -3531,6 +4614,7 @@ pub const HostBuffer = struct {
 
     pub fn deinit(self: *HostBuffer) void {
         if (self.capacity == 0) return;
+
         self.ctx.vkd.unmapMemory(self.ctx.device, self.memory);
         self.ctx.vkd.destroyBuffer(self.ctx.device, self.buffer, null);
         self.ctx.vkd.freeMemory(self.ctx.device, self.memory, null);
@@ -3539,6 +4623,7 @@ pub const HostBuffer = struct {
 
     pub fn ensure(self: *HostBuffer, size: vk.DeviceSize) !void {
         if (self.capacity >= size) return;
+
         self.deinit();
 
         // Host buffer flags: storage (shader-readable), transfer_src
@@ -3547,7 +4632,11 @@ pub const HostBuffer = struct {
         // three is free. The driver only differentiates at use time.
         const buf_info: vk.BufferCreateInfo = .{
             .size = size,
-            .usage = .{ .storage_buffer_bit = true, .transfer_src_bit = true, .transfer_dst_bit = true },
+            .usage = .{
+                .storage_buffer_bit = true,
+                .transfer_src_bit = true,
+                .transfer_dst_bit = true,
+            },
             .sharing_mode = .exclusive,
         };
         const buffer = try self.ctx.vkd.createBuffer(self.ctx.device, &buf_info, null);
@@ -3558,16 +4647,23 @@ pub const HostBuffer = struct {
             return error.NoSuitableMemoryType;
         const chosen = self.ctx.mem_props.memory_types[mem_type];
         const chosen_heap = self.ctx.mem_props.memory_heaps[chosen.heap_index];
-        log.debug("host buffer: {d} bytes, memory type {d} flags 0x{x} heap {d} heap flags 0x{x}", .{
-            size,
-            mem_type,
-            @as(u32, @bitCast(chosen.property_flags)),
-            chosen.heap_index,
-            @as(u32, @bitCast(chosen_heap.flags)),
-        });
+        log.debug(
+            "host buffer: {d} bytes, memory type {d} flags 0x{x} heap {d} heap flags 0x{x}",
+            .{
+                size,
+                mem_type,
+                @as(u32, @bitCast(chosen.property_flags)),
+                chosen.heap_index,
+                @as(u32, @bitCast(chosen_heap.flags)),
+            },
+        );
         // A silent fallback hides the reason CPU access to this buffer is slow.
         if (!chosen.property_flags.host_cached_bit) {
-            log.debug("host buffer: no host-cached memory type, so CPU access to this host buffer is uncached and slow", .{});
+            log.debug(
+                "host buffer: no host-cached memory type, so CPU access to this host buffer " ++
+                    "is uncached and slow",
+                .{},
+            );
         }
 
         const alloc_info: vk.MemoryAllocateInfo = .{
@@ -3588,6 +4684,7 @@ pub const HostBuffer = struct {
 
     pub fn sliceTyped(self: *HostBuffer, comptime T: type, count: usize) []T {
         std.debug.assert(count * @sizeOf(T) <= self.capacity);
+
         const raw: [*]T = @ptrCast(@alignCast(self.mapped));
         return raw[0..count];
     }
@@ -3606,6 +4703,7 @@ pub const DeviceBuffer = struct {
 
     pub fn deinit(self: *DeviceBuffer) void {
         if (self.capacity == 0) return;
+
         self.ctx.vkd.destroyBuffer(self.ctx.device, self.buffer, null);
         self.ctx.vkd.freeMemory(self.ctx.device, self.memory, null);
         self.capacity = 0;
@@ -3613,11 +4711,16 @@ pub const DeviceBuffer = struct {
 
     pub fn ensure(self: *DeviceBuffer, size: vk.DeviceSize) !void {
         if (self.capacity >= size) return;
+
         self.deinit();
 
         const buf_info: vk.BufferCreateInfo = .{
             .size = size,
-            .usage = .{ .storage_buffer_bit = true, .transfer_dst_bit = true, .transfer_src_bit = true },
+            .usage = .{
+                .storage_buffer_bit = true,
+                .transfer_dst_bit = true,
+                .transfer_src_bit = true,
+            },
             .sharing_mode = .exclusive,
         };
         const buffer = try self.ctx.vkd.createBuffer(self.ctx.device, &buf_info, null);
@@ -3625,7 +4728,11 @@ pub const DeviceBuffer = struct {
 
         const reqs = self.ctx.vkd.getBufferMemoryRequirements(self.ctx.device, buffer);
         const required: vk.MemoryPropertyFlags = .{ .device_local_bit = true };
-        const mem_type = vulkan_ctx.findMemoryType(self.ctx.mem_props, reqs.memory_type_bits, required) orelse
+        const mem_type = vulkan_ctx.findMemoryType(
+            self.ctx.mem_props,
+            reqs.memory_type_bits,
+            required,
+        ) orelse
             return error.NoSuitableMemoryType;
 
         const alloc_info: vk.MemoryAllocateInfo = .{
@@ -3687,9 +4794,11 @@ pub const KvStore = struct {
         };
         var made: u32 = 0;
         errdefer for (store.segments[0..made]) |*segment| segment.deinit();
+
         while (made < packing.n_segments) : (made += 1) {
             try store.segments[made].ensure(packing.segmentBytes(made));
         }
+
         std.debug.assert(store.deviceBytes() == layout.totalBytes());
         log.debug("kv store: {d} regions of {d} KiB in {d} allocations of up to {d} regions", .{
             packing.n_regions, packing.region_bytes >> 10, packing.n_segments, packing.per_segment,
@@ -3700,8 +4809,14 @@ pub const KvStore = struct {
     /// Free every segment. A second call frees nothing.
     pub fn deinit(self: *KvStore) void {
         std.debug.assert(self.packing.n_segments <= max_segments);
-        for (self.segments[0..self.packing.n_segments]) |*segment| segment.deinit();
-        for (self.segments) |segment| std.debug.assert(segment.capacity == 0);
+
+        for (self.segments[0..self.packing.n_segments]) |*segment| {
+            segment.deinit();
+        }
+
+        for (self.segments) |segment| {
+            std.debug.assert(segment.capacity == 0);
+        }
     }
 
     /// Bytes the segments hold together: the total of the layout.
@@ -3709,8 +4824,10 @@ pub const KvStore = struct {
         var sum: u64 = 0;
         for (self.segments[0..self.packing.n_segments], 0..) |segment, i| {
             std.debug.assert(segment.capacity == self.packing.segmentBytes(@intCast(i)));
+
             sum += segment.capacity;
         }
+
         std.debug.assert(sum == self.layout.totalBytes());
         return sum;
     }
@@ -3725,7 +4842,12 @@ pub const KvStore = struct {
     }
 
     /// The binding of the `window` rows of `slot` in region `(layer, t)`.
-    pub fn slotView(self: *const KvStore, layer: u32, t: kv_index.Tensor, slot: u32) vk.DescriptorBufferInfo {
+    pub fn slotView(
+        self: *const KvStore,
+        layer: u32,
+        t: kv_index.Tensor,
+        slot: u32,
+    ) vk.DescriptorBufferInfo {
         const base = self.regionAt(layer, t);
         const offset = base.offset + self.layout.slotByteOffset(slot);
         const range = self.layout.slotRegionBytes();
@@ -3740,7 +4862,9 @@ pub const KvStore = struct {
         const base = self.regionAt(layer, t);
         const offset = base.offset + self.layout.rowByteOffset(slot, pos);
         std.debug.assert(offset >= base.offset + self.layout.slotByteOffset(slot));
-        std.debug.assert(offset + self.layout.rowBytes() <= base.offset + self.packing.region_bytes);
+        std.debug.assert(
+            offset + self.layout.rowBytes() <= base.offset + self.packing.region_bytes,
+        );
         return .{ .buffer = base.buffer, .offset = offset };
     }
 
@@ -3762,11 +4886,18 @@ pub const KvStore = struct {
                 const from = self.rowAt(layer, t, source, 0);
                 const to = self.rowAt(layer, t, target, 0);
                 std.debug.assert(from.buffer == to.buffer);
-                out[c] = .{ .src = from.buffer, .dst = to.buffer, .src_offset = from.offset, .dst_offset = to.offset, .size = slot_rows_bytes };
+                out[c] = .{
+                    .src = from.buffer,
+                    .dst = to.buffer,
+                    .src_offset = from.offset,
+                    .dst_offset = to.offset,
+                    .size = slot_rows_bytes,
+                };
                 c += 1;
                 total += slot_rows_bytes;
             }
         }
+
         std.debug.assert(c == layout.regionCount());
         std.debug.assert(total == layout.slotBytes());
         return out[0..c];
@@ -3777,7 +4908,14 @@ pub const KvStore = struct {
     /// ascending, K rows then V rows per layer. `to_host` true reads the device, and false writes
     /// it. A save and its restore walk one order, so their packed offsets
     /// agree.
-    pub fn rowCopies(self: *const KvStore, slot: u32, n_rows: u32, stage: vk.Buffer, to_host: bool, out: []Copy) []Copy {
+    pub fn rowCopies(
+        self: *const KvStore,
+        slot: u32,
+        n_rows: u32,
+        stage: vk.Buffer,
+        to_host: bool,
+        out: []Copy,
+    ) []Copy {
         const layout = self.layout;
         std.debug.assert(n_rows >= 1);
         std.debug.assert(n_rows <= layout.window);
@@ -3790,13 +4928,26 @@ pub const KvStore = struct {
             for ([_]kv_index.Tensor{ .k, .v }) |t| {
                 const dev = self.rowAt(layer, t, slot, 0);
                 out[c] = if (to_host)
-                    .{ .src = dev.buffer, .src_offset = dev.offset, .dst = stage, .dst_offset = off, .size = rows_bytes }
+                    .{
+                        .src = dev.buffer,
+                        .src_offset = dev.offset,
+                        .dst = stage,
+                        .dst_offset = off,
+                        .size = rows_bytes,
+                    }
                 else
-                    .{ .src = stage, .src_offset = off, .dst = dev.buffer, .dst_offset = dev.offset, .size = rows_bytes };
+                    .{
+                        .src = stage,
+                        .src_offset = off,
+                        .dst = dev.buffer,
+                        .dst_offset = dev.offset,
+                        .size = rows_bytes,
+                    };
                 c += 1;
                 off += rows_bytes;
             }
         }
+
         std.debug.assert(c == layout.regionCount());
         std.debug.assert(off == layout.blobBytes(n_rows));
         return out[0..c];
@@ -3889,6 +5040,7 @@ pub const VramArena = struct {
             self.ctx.vkd.destroyBuffer(self.ctx.device, s.buffer, null);
             self.ctx.vkd.freeMemory(self.ctx.device, s.memory, null);
         }
+
         self.segments.deinit(self.gpa);
     }
 
@@ -3901,16 +5053,23 @@ pub const VramArena = struct {
         // The alloc sequence at debug scope is the VRAM map. Allocations follow
         // the deterministic weight-upload order, so a reader pairs each line
         // with the load sequence.
-        log.debug("arena alloc: {d} KiB ({d} MiB held before)", .{ size / 1024, self.totalUsed() / (1024 * 1024) });
+        log.debug(
+            "arena alloc: {d} KiB ({d} MiB held before)",
+            .{ size / 1024, self.totalUsed() / (1024 * 1024) },
+        );
         // Try the most-recent segment first. It is likeliest to have room.
         if (self.segments.items.len > 0) {
             const last = &self.segments.items[self.segments.items.len - 1];
             if (tryFit(last, size, self.align_bytes)) |view| return view;
         }
+
         // Try older segments in case the latest was just exhausted.
-        for (self.segments.items[0..if (self.segments.items.len == 0) 0 else self.segments.items.len - 1]) |*s| {
+        for (self.segments.items[0..if (self.segments.items.len ==
+            0) 0 else self.segments.items.len - 1]) |*s|
+        {
             if (tryFit(s, size, self.align_bytes)) |view| return view;
         }
+
         // Need a new segment. Size it for at least this request.
         const new_cap = @max(self.seg_capacity, size);
         try self.segments.append(self.gpa, try self.createSegment(new_cap));
@@ -3924,7 +5083,10 @@ pub const VramArena = struct {
     pub fn logSegments(self: *const VramArena, name: []const u8) void {
         const mib = 1024 * 1024;
         for (self.segments.items, 0..) |s, i| {
-            log.debug("arena {s} seg {d}: {d} of {d} MiB used", .{ name, i, s.used / mib, s.capacity / mib });
+            log.debug(
+                "arena {s} seg {d}: {d} of {d} MiB used",
+                .{ name, i, s.used / mib, s.capacity / mib },
+            );
         }
     }
 
@@ -3932,13 +5094,17 @@ pub const VramArena = struct {
     /// segments. The traces and the VRAM budget of the tiered KV cache read it.
     pub fn totalUsed(self: *const VramArena) vk.DeviceSize {
         var sum: vk.DeviceSize = 0;
-        for (self.segments.items) |s| sum += s.used;
+        for (self.segments.items) |s| {
+            sum += s.used;
+        }
+
         return sum;
     }
 
     fn tryFit(seg: *Segment, size: vk.DeviceSize, align_bytes: vk.DeviceSize) ?View {
         const aligned = alignUp(seg.used, align_bytes);
         if (aligned + size > seg.capacity) return null;
+
         seg.used = aligned + size;
         return .{ .buffer = seg.buffer, .offset = aligned, .range = size };
     }
@@ -3954,7 +5120,11 @@ pub const VramArena = struct {
 
         const reqs = self.ctx.vkd.getBufferMemoryRequirements(self.ctx.device, buffer);
         const required: vk.MemoryPropertyFlags = .{ .device_local_bit = true };
-        const mem_type = vulkan_ctx.findMemoryType(self.ctx.mem_props, reqs.memory_type_bits, required) orelse
+        const mem_type = vulkan_ctx.findMemoryType(
+            self.ctx.mem_props,
+            reqs.memory_type_bits,
+            required,
+        ) orelse
             return error.NoSuitableMemoryType;
 
         const alloc_info: vk.MemoryAllocateInfo = .{
@@ -3974,11 +5144,6 @@ pub const VramArena = struct {
         };
     }
 };
-
-fn alignUp(value: vk.DeviceSize, alignment: vk.DeviceSize) vk.DeviceSize {
-    if (alignment == 0) return value;
-    return ((value + alignment - 1) / alignment) * alignment;
-}
 
 /// The standalone-submit resources a kernel owns on top of its `Pipeline`:
 /// a single-set descriptor pool, the set, and a reusable primary command
@@ -4052,134 +5217,6 @@ pub const SubmitError = vk.DeviceWrapper.ResetCommandBufferError ||
     vk.DeviceWrapper.QueueSubmitError ||
     vk.DeviceWrapper.QueueWaitIdleError;
 
-/// One-shot submits this process started. It numbers the debug and failure
-/// lines, so a device log can tie a failure to a submit count.
-var staging_submits: std.atomic.Value(u64) = .init(0);
-
-/// True while a `submitOnce` call holds the staging buffer. It is process-wide,
-/// because every caller holds its context through a `*const` pointer.
-var staging_busy: std.atomic.Value(bool) = .init(false);
-
-/// The error of a failed wait. The buffer can still be pending after it, and a
-/// reset of a pending buffer is invalid, so every later call returns it. The
-/// busy flag guards it.
-var staging_wait_error: ?SubmitError = null;
-
-/// The number of one-shot submits this process started.
-pub fn stagingSubmitCount() u64 {
-    return staging_submits.load(.monotonic);
-}
-
-/// Submit one command buffer of work and block until the queue is idle. It
-/// resets the staging buffer of `ctx`, begins it for one submit, and calls
-/// `recorder.record(cb)`, which returns a `Recorded`. Then it ends the buffer,
-/// submits it, and waits. Once it returns, the GPU has finished the work.
-///
-/// The translation layer makes a native command allocator for each command
-/// buffer, and the paravirtual driver leaks part of it when the buffer is
-/// freed. So every one-shot submit reuses the one buffer of the context. The
-/// wait before the return keeps the buffer idle at the next entry. After a
-/// failed wait, every later call returns that error. The Vulkan host thread is
-/// single, and the busy flag asserts that no call nests in another.
-pub fn submitOnce(ctx: *const vulkan_ctx.Context, label: SubmitLabel, recorder: anytype) SubmitError!void {
-    const cmd = ctx.staging_cmd;
-    std.debug.assert(cmd != .null_handle);
-    const was_busy = staging_busy.swap(true, .acquire);
-    std.debug.assert(!was_busy);
-    defer staging_busy.store(false, .release);
-    if (staging_wait_error) |err| {
-        log.err("staging: submit refused, an earlier wait failed: {t}", .{err});
-        return err;
-    }
-    const number = staging_submits.fetchAdd(1, .monotonic) + 1;
-    var phase: SubmitPhase = .reset;
-    errdefer |err| log.err("staging: submit {d} failed in phase {t}: {t}", .{ number, phase, err });
-    var lap: [@typeInfo(SubmitPhase).@"enum".fields.len]f64 = @splat(0);
-
-    var t = core_log.now();
-    const t0 = t;
-    try ctx.vkd.resetCommandBuffer(cmd, .{});
-    lap[@intFromEnum(SubmitPhase.reset)] = core_log.msSince(t);
-
-    phase = .record;
-    t = core_log.now();
-    const begin: vk.CommandBufferBeginInfo = .{ .flags = .{ .one_time_submit_bit = true } };
-    try ctx.vkd.beginCommandBuffer(cmd, &begin);
-    // The pool exists only at a timestamp level, so the off path records no
-    // timestamp command. Both slots reset before their first write.
-    const stamps = ctx.staging_query_pool;
-    if (stamps != .null_handle) {
-        ctx.vkd.cmdResetQueryPool(cmd, stamps, 0, 2);
-        ctx.vkd.cmdWriteTimestamp(cmd, .{ .top_of_pipe_bit = true }, stamps, 0);
-    }
-    const recorded: Recorded = recorder.record(cmd);
-    if (stamps != .null_handle) ctx.vkd.cmdWriteTimestamp(cmd, .{ .bottom_of_pipe_bit = true }, stamps, 1);
-    try ctx.vkd.endCommandBuffer(cmd);
-    lap[@intFromEnum(SubmitPhase.record)] = core_log.msSince(t);
-
-    phase = .submit;
-    t = core_log.now();
-    const t_submit = t;
-    const cmds = [_]vk.CommandBuffer{cmd};
-    const submits = [_]vk.SubmitInfo{.{ .command_buffer_count = 1, .p_command_buffers = &cmds }};
-    try ctx.vkd.queueSubmit(ctx.queue, &submits, .null_handle);
-    lap[@intFromEnum(SubmitPhase.submit)] = core_log.msSince(t);
-
-    phase = .wait;
-    t = core_log.now();
-    const t_wait = t;
-    const waited = ctx.vkd.queueWaitIdle(ctx.queue);
-    if (waited) |_| {} else |err| staging_wait_error = err;
-    try waited;
-    const t_done = core_log.now();
-    lap[@intFromEnum(SubmitPhase.wait)] = msBetween(t, t_done);
-    span.record(.gpu_submit, t_submit, t_wait);
-    span.record(.gpu_wait, t_wait, t_done);
-    if (stamps != .null_handle) stagingRecord(ctx, label, t_submit, t_done);
-
-    // The words allocate and free keep the field layout that log parsers
-    // read. The reset time prints as allocate, and nothing is freed.
-    const line_fmt = "staging: submit {d} {t}: {d} copies, {d} KiB, {d:.1} ms " ++
-        "(allocate {d:.3}, record {d:.3}, submit {d:.3}, wait {d:.3}, free 0.000 ms)";
-    log.debug(line_fmt, .{ number, label, recorded.copies, recorded.bytes >> 10, core_log.msSince(t0), lap[0], lap[1], lap[2], lap[3] });
-}
-
-fn msBetween(t0: std.Io.Timestamp, t1: std.Io.Timestamp) f64 {
-    return @as(f64, @floatFromInt(t1.nanoseconds - t0.nanoseconds)) / 1e6;
-}
-
-/// Read the two stamps of the one-shot buffer after its wait and hand them to
-/// the span recorder. A failed read loses one trace record, never the submit.
-fn stagingRecord(ctx: *const vulkan_ctx.Context, label: SubmitLabel, submit: std.Io.Timestamp, wait: std.Io.Timestamp) void {
-    var ts: [2]u64 = undefined;
-    _ = ctx.vkd.getQueryPoolResults(ctx.device, ctx.staging_query_pool, 0, 2, @sizeOf(@TypeOf(ts)), &ts, @sizeOf(u64), .{ .@"64_bit" = true, .wait_bit = true }) catch |err| {
-        log.warn("staging: timestamp read failed: {t}", .{err});
-        return;
-    };
-    const gpu_label: span.GpuLabel = switch (label) {
-        inline else => |l| @field(span.GpuLabel, @tagName(l)),
-    };
-    const t = span.tickSpan(&ts, gpu_profile.tickMask(ctx.timestamp_valid_bits), null);
-    span.gpu(.{
-        .runner = .staging,
-        .label = gpu_label,
-        .gpu_start = t.start,
-        .gpu_end = t.end,
-        .period_ns = @floatCast(ctx.physical_device_props.limits.timestamp_period),
-        .host_submit_ns = span.tsNs(submit),
-        .host_wait_ns = span.tsNs(wait),
-        .backsteps = t.backsteps,
-    });
-}
-
-/// Submit one transfer that runs every copy in `copies`, for example from
-/// host-visible staging buffers to device-local destinations, through
-/// `submitOnce`. Once it returns, a compute dispatch can read the destination
-/// buffers. An empty list is a legal submit that records nothing.
-pub fn runStagingCopies(ctx: *const vulkan_ctx.Context, copies: []const Copy) SubmitError!void {
-    try submitOnce(ctx, .copy, CopyRecorder{ .ctx = ctx, .copies = copies });
-}
-
 /// Records one `cmdCopyBuffer` per copy, in list order, with no barrier.
 pub const CopyRecorder = struct {
     ctx: *const vulkan_ctx.Context,
@@ -4188,10 +5225,13 @@ pub const CopyRecorder = struct {
     pub fn record(self: CopyRecorder, cb: vk.CommandBuffer) Recorded {
         var bytes: u64 = 0;
         for (self.copies) |c| {
-            const regions = [_]vk.BufferCopy{.{ .src_offset = c.src_offset, .dst_offset = c.dst_offset, .size = c.size }};
+            const regions = [_]vk.BufferCopy{
+                .{ .src_offset = c.src_offset, .dst_offset = c.dst_offset, .size = c.size },
+            };
             self.ctx.vkd.cmdCopyBuffer(cb, c.src, c.dst, &regions);
             bytes += c.size;
         }
+
         return .{ .copies = @intCast(self.copies.len), .bytes = bytes };
     }
 };
@@ -4213,6 +5253,129 @@ pub const StageSide = union(enum) {
     to_device: []const u8,
 };
 
+// -- state ------------------------------------------------------------------
+
+/// One-shot submits this process started. It numbers the debug and failure
+/// lines, so a device log can tie a failure to a submit count.
+var staging_submits: std.atomic.Value(u64) = .init(0);
+
+/// True while a `submitOnce` call holds the staging buffer. It is process-wide,
+/// because every caller holds its context through a `*const` pointer.
+var staging_busy: std.atomic.Value(bool) = .init(false);
+
+/// The error of a failed wait. The buffer can still be pending after it, and a
+/// reset of a pending buffer is invalid, so every later call returns it. The
+/// busy flag guards it.
+var staging_wait_error: ?SubmitError = null;
+
+// -- api --------------------------------------------------------------------
+
+/// The number of one-shot submits this process started.
+pub fn stagingSubmitCount() u64 {
+    return staging_submits.load(.monotonic);
+}
+
+/// Submit one command buffer of work and block until the queue is idle. It
+/// resets the staging buffer of `ctx`, begins it for one submit, and calls
+/// `recorder.record(cb)`, which returns a `Recorded`. Then it ends the buffer,
+/// submits it, and waits. Once it returns, the GPU has finished the work.
+///
+/// The translation layer makes a native command allocator for each command
+/// buffer, and the paravirtual driver leaks part of it when the buffer is
+/// freed. So every one-shot submit reuses the one buffer of the context. The
+/// wait before the return keeps the buffer idle at the next entry. After a
+/// failed wait, every later call returns that error. The Vulkan host thread is
+/// single, and the busy flag asserts that no call nests in another.
+pub fn submitOnce(
+    ctx: *const vulkan_ctx.Context,
+    label: SubmitLabel,
+    recorder: anytype,
+) SubmitError!void {
+    const cmd = ctx.staging_cmd;
+    std.debug.assert(cmd != .null_handle);
+    const was_busy = staging_busy.swap(true, .acquire);
+    std.debug.assert(!was_busy);
+    defer staging_busy.store(false, .release);
+
+    if (staging_wait_error) |err| {
+        log.err("staging: submit refused, an earlier wait failed: {t}", .{err});
+        return err;
+    }
+
+    const number = staging_submits.fetchAdd(1, .monotonic) + 1;
+    var phase: SubmitPhase = .reset;
+    errdefer |err| log.err("staging: submit {d} failed in phase {t}: {t}", .{ number, phase, err });
+
+    var lap: [@typeInfo(SubmitPhase).@"enum".fields.len]f64 = @splat(0);
+
+    var t = core_log.now();
+    const t0 = t;
+    try ctx.vkd.resetCommandBuffer(cmd, .{});
+    lap[@intFromEnum(SubmitPhase.reset)] = core_log.msSince(t);
+
+    phase = .record;
+    t = core_log.now();
+    const begin: vk.CommandBufferBeginInfo = .{ .flags = .{ .one_time_submit_bit = true } };
+    try ctx.vkd.beginCommandBuffer(cmd, &begin);
+    // The pool exists only at a timestamp level, so the off path records no
+    // timestamp command. Both slots reset before their first write.
+    const stamps = ctx.staging_query_pool;
+    if (stamps != .null_handle) {
+        ctx.vkd.cmdResetQueryPool(cmd, stamps, 0, 2);
+        ctx.vkd.cmdWriteTimestamp(cmd, .{ .top_of_pipe_bit = true }, stamps, 0);
+    }
+
+    const recorded: Recorded = recorder.record(cmd);
+    if (stamps != .null_handle) {
+        ctx.vkd.cmdWriteTimestamp(cmd, .{ .bottom_of_pipe_bit = true }, stamps, 1);
+    }
+
+    try ctx.vkd.endCommandBuffer(cmd);
+    lap[@intFromEnum(SubmitPhase.record)] = core_log.msSince(t);
+
+    phase = .submit;
+    t = core_log.now();
+    const t_submit = t;
+    const cmds = [_]vk.CommandBuffer{cmd};
+    const submits = [_]vk.SubmitInfo{.{ .command_buffer_count = 1, .p_command_buffers = &cmds }};
+    try ctx.vkd.queueSubmit(ctx.queue, &submits, .null_handle);
+    lap[@intFromEnum(SubmitPhase.submit)] = core_log.msSince(t);
+
+    phase = .wait;
+    t = core_log.now();
+    const t_wait = t;
+    const waited = ctx.vkd.queueWaitIdle(ctx.queue);
+    if (waited) |_| {} else |err| {
+        staging_wait_error = err;
+    }
+
+    try waited;
+    const t_done = core_log.now();
+    lap[@intFromEnum(SubmitPhase.wait)] = msBetween(t, t_done);
+    span.record(.gpu_submit, t_submit, t_wait);
+    span.record(.gpu_wait, t_wait, t_done);
+    if (stamps != .null_handle) {
+        stagingRecord(ctx, label, t_submit, t_done);
+    }
+
+    // The words allocate and free keep the field layout that log parsers
+    // read. The reset time prints as allocate, and nothing is freed.
+    const line_fmt = "staging: submit {d} {t}: {d} copies, {d} KiB, {d:.1} ms " ++
+        "(allocate {d:.3}, record {d:.3}, submit {d:.3}, wait {d:.3}, free 0.000 ms)";
+    log.debug(
+        line_fmt,
+        .{ number, label, recorded.copies, recorded.bytes >> 10, core_log.msSince(t0), lap[0], lap[1], lap[2], lap[3] },
+    );
+}
+
+/// Submit one transfer that runs every copy in `copies`, for example from
+/// host-visible staging buffers to device-local destinations, through
+/// `submitOnce`. Once it returns, a compute dispatch can read the destination
+/// buffers. An empty list is a legal submit that records nothing.
+pub fn runStagingCopies(ctx: *const vulkan_ctx.Context, copies: []const Copy) SubmitError!void {
+    try submitOnce(ctx, .copy, CopyRecorder{ .ctx = ctx, .copies = copies });
+}
+
 /// Move one packed blob between the device and the host through `stage`, one
 /// chunk at a time. `full` lists the copies of the whole blob in blob order,
 /// with `stage` as the host buffer, as `KvStore.rowCopies` builds them. Evict,
@@ -4223,11 +5386,18 @@ pub const StageSide = union(enum) {
 /// clips `full` to its byte range, submits the clipped copies, and waits. A
 /// save copies the stage out after the wait, and a restore fills the stage
 /// before the submit.
-pub fn walkStage(ctx: *const vulkan_ctx.Context, full: []const Copy, stage: *const HostBuffer, side: StageSide, chunk_bytes: u64) !SwapSplit {
+pub fn walkStage(
+    ctx: *const vulkan_ctx.Context,
+    full: []const Copy,
+    stage: *const HostBuffer,
+    side: StageSide,
+    chunk_bytes: u64,
+) !SwapSplit {
     const to_host = side == .to_host;
     const total: u64 = switch (side) {
         inline else => |blob| blob.len,
     };
+
     const chunk = @min(chunk_bytes, total);
     std.debug.assert(total >= 1);
     std.debug.assert(chunk >= 1);
@@ -4235,7 +5405,9 @@ pub fn walkStage(ctx: *const vulkan_ctx.Context, full: []const Copy, stage: *con
     // The caller grew the stage to one chunk before it built `full`, so every
     // copy names the live stage buffer.
     std.debug.assert(stage.capacity >= chunk);
-    for (full) |c| std.debug.assert((if (to_host) c.dst else c.src) == stage.buffer);
+    for (full) |c| {
+        std.debug.assert((if (to_host) c.dst else c.src) == stage.buffer);
+    }
 
     var split: SwapSplit = .{ .dma_ms = 0, .memcpy_ms = 0 };
     var scratch: [KvStore.max_segments]Copy = undefined;
@@ -4264,11 +5436,10 @@ pub fn walkStage(ctx: *const vulkan_ctx.Context, full: []const Copy, stage: *con
             },
         }
     }
+
     std.debug.assert(trips == kv_budget.ChunkWalk.count(total, chunk));
     return split;
 }
-
-// -- helpers ----------------------------------------------------------------
 
 /// Create a descriptor-set layout of `binding_count` storage-buffer bindings,
 /// numbered 0 to `binding_count - 1`. Each binding holds one storage buffer
@@ -4288,11 +5459,252 @@ pub fn createStorageBufferLayout(
             .stage_flags = .{ .compute_bit = true },
         };
     }
+
     const info: vk.DescriptorSetLayoutCreateInfo = .{
         .binding_count = binding_count,
         .p_bindings = &bindings,
     };
     return ctx.vkd.createDescriptorSetLayout(ctx.device, &info, null);
+}
+
+/// Allocate one buffer that lives as long as its owner. A one-shot submit uses
+/// `submitOnce` and allocates nothing.
+pub fn allocateOnePrimaryCmdBuffer(
+    ctx: *const vulkan_ctx.Context,
+) !vk.CommandBuffer {
+    const info: vk.CommandBufferAllocateInfo = .{
+        .command_pool = ctx.command_pool,
+        .level = .primary,
+        .command_buffer_count = 1,
+    };
+    var cmd: vk.CommandBuffer = .null_handle;
+    try ctx.vkd.allocateCommandBuffers(ctx.device, &info, @ptrCast(&cmd));
+    return cmd;
+}
+
+/// Bind N storage buffers at bindings 0 through N-1. `buf_infos` must outlive
+/// the call, and it must hold at most 16 entries, the descriptor-set-layout cap.
+pub fn updateStorageBindings(
+    ctx: *const vulkan_ctx.Context,
+    set: vk.DescriptorSet,
+    buf_infos: []const vk.DescriptorBufferInfo,
+) void {
+    var writes: [16]vk.WriteDescriptorSet = undefined;
+    std.debug.assert(buf_infos.len <= writes.len);
+    for (buf_infos, 0..) |*info, i| {
+        writes[i] = .{
+            .dst_set = set,
+            .dst_binding = @intCast(i),
+            .dst_array_element = 0,
+            .descriptor_count = 1,
+            .descriptor_type = .storage_buffer,
+            .p_buffer_info = @ptrCast(info),
+            .p_image_info = undefined,
+            .p_texel_buffer_view = undefined,
+        };
+    }
+
+    ctx.vkd.updateDescriptorSets(ctx.device, writes[0..buf_infos.len], null);
+}
+
+/// The one-shot driver for the record-only `KvCommitF16`. It stages the two f32
+/// scratch inputs in host-visible memory, builds a throwaway descriptor pool and
+/// set, dispatches through `recordInto` in one `submitOnce`, and reads the two
+/// narrowed outputs back as raw f16 bits. For the rounding gate alone: the
+/// runners record this kernel into their own per-token command buffer.
+///
+/// The output is bits, not values. The bits are what the cache stores, so a bit
+/// comparison states the rounding property directly and keeps a second
+/// conversion out of the path under test.
+pub fn kvCommitF16OneShot(
+    kernel: *KvCommitF16,
+    k_src: []const f32,
+    v_src: []const f32,
+    k_out_bits: []u16,
+    v_out_bits: []u16,
+) !void {
+    // One `n` covers all four buffers. The kernel takes the same count.
+    std.debug.assert(k_src.len >= 1);
+    std.debug.assert(v_src.len == k_src.len);
+    std.debug.assert(k_out_bits.len == k_src.len);
+    std.debug.assert(v_out_bits.len == k_src.len);
+
+    const n: u32 = @intCast(k_src.len);
+    const ctx = kernel.ctx;
+
+    const src_bytes: vk.DeviceSize = @intCast(k_src.len * @sizeOf(f32));
+    const out_bytes: vk.DeviceSize = @intCast(k_src.len * @sizeOf(u16));
+
+    var buf_k_src: HostBuffer = .{ .ctx = ctx };
+    defer buf_k_src.deinit();
+
+    var buf_v_src: HostBuffer = .{ .ctx = ctx };
+    defer buf_v_src.deinit();
+
+    var buf_k_out: HostBuffer = .{ .ctx = ctx };
+    defer buf_k_out.deinit();
+
+    var buf_v_out: HostBuffer = .{ .ctx = ctx };
+    defer buf_v_out.deinit();
+
+    try buf_k_src.ensure(src_bytes);
+    try buf_v_src.ensure(src_bytes);
+    try buf_k_out.ensure(out_bytes);
+    try buf_v_out.ensure(out_bytes);
+    @memcpy(buf_k_src.sliceTyped(f32, k_src.len), k_src);
+    @memcpy(buf_v_src.sliceTyped(f32, v_src.len), v_src);
+
+    const desc_pool = try createSingleSetPool(ctx, 4);
+    defer ctx.vkd.destroyDescriptorPool(ctx.device, desc_pool, null);
+
+    const desc_set = try allocateOneSet(ctx, desc_pool, kernel.pipeline.set_layout);
+
+    const infos = [_]vk.DescriptorBufferInfo{
+        .{ .buffer = buf_k_src.buffer, .offset = 0, .range = src_bytes },
+        .{ .buffer = buf_v_src.buffer, .offset = 0, .range = src_bytes },
+        .{ .buffer = buf_k_out.buffer, .offset = 0, .range = out_bytes },
+        .{ .buffer = buf_v_out.buffer, .offset = 0, .range = out_bytes },
+    };
+    updateStorageBindings(ctx, desc_set, &infos);
+
+    const Rec = struct {
+        kernel: *KvCommitF16,
+        set: vk.DescriptorSet,
+        n: u32,
+
+        pub fn record(r: @This(), cb: vk.CommandBuffer) Recorded {
+            r.kernel.recordInto(cb, r.set, r.n);
+            return .{};
+        }
+    };
+    try submitOnce(ctx, .dispatch, Rec{ .kernel = kernel, .set = desc_set, .n = n });
+
+    @memcpy(k_out_bits, buf_k_out.sliceTyped(u16, k_out_bits.len));
+    @memcpy(v_out_bits, buf_v_out.sliceTyped(u16, v_out_bits.len));
+}
+
+// -- helpers ----------------------------------------------------------------
+
+/// Repack a Q8_0 weight matrix from the interleaved GGUF layout into two flat
+/// arrays the shader indexes directly. The GGUF layout holds each block of 32
+/// elements as a 2-byte f16 scale plus 32 i8 quants, contiguous per row. The
+/// flat arrays hold the f16 scales by `(j, blk)` and the i8 quants by `(j, p)`.
+/// The copy keeps every bit pattern, so the GPU `float16_t` and `int8_t` loads
+/// see the bytes the CPU kernel reads through `f16BitsToF32` and
+/// `@bitCast(i8)`. The bit-exact match against the CPU kernel depends on that.
+/// Do not reorder bytes here.
+fn repackQ80ToScalesQuants(
+    weight_data: []const u8,
+    in_features: usize,
+    out_features: usize,
+    scales_out: []u8,
+    quants_out: []u8,
+) void {
+    const blocks_per_row = in_features / q8_0_block_elems;
+    const row_bytes = blocks_per_row * q8_0_block_bytes;
+    std.debug.assert(scales_out.len >= out_features * blocks_per_row * 2);
+    std.debug.assert(quants_out.len >= out_features * in_features);
+    var j: usize = 0;
+    while (j < out_features) : (j += 1) {
+        const row_off = j * row_bytes;
+        var blk: usize = 0;
+        while (blk < blocks_per_row) : (blk += 1) {
+            const blk_off = row_off + blk * q8_0_block_bytes;
+            // 2 bytes of f16 scale -> scales_out at j * blocks_per_row + blk.
+            const scales_idx = (j * blocks_per_row + blk) * 2;
+            scales_out[scales_idx + 0] = weight_data[blk_off + 0];
+            scales_out[scales_idx + 1] = weight_data[blk_off + 1];
+            // 32 bytes of i8 quants -> quants_out at j * in_features + blk * 32.
+            const quants_idx = j * in_features + blk * q8_0_block_elems;
+            @memcpy(
+                quants_out[quants_idx..][0..q8_0_block_elems],
+                weight_data[blk_off + 2 ..][0..q8_0_block_elems],
+            );
+        }
+    }
+}
+
+/// The Q4_0 sibling of `repackQ80ToScalesQuants`. A Q4_0 row holds `in/32`
+/// blocks of 18 bytes, a 2-byte f16 scale plus 16 packed bytes. It separates the
+/// scales, whose f16 layout matches Q8_0, from the 16 packed quant bytes. The
+/// packed bytes keep every bit pattern. The shader extracts the nibbles in the
+/// layout the CPU kernel uses.
+fn repackQ40ToScalesQuants(
+    weight_data: []const u8,
+    in_features: usize,
+    out_features: usize,
+    scales_out: []u8,
+    quants_out: []u8,
+) void {
+    const blocks_per_row = in_features / q4_0_block_elems;
+    const row_bytes = blocks_per_row * q4_0_block_bytes;
+    std.debug.assert(scales_out.len >= out_features * blocks_per_row * 2);
+    std.debug.assert(quants_out.len >= out_features * (in_features / 2));
+    var j: usize = 0;
+    while (j < out_features) : (j += 1) {
+        const row_off = j * row_bytes;
+        var blk: usize = 0;
+        while (blk < blocks_per_row) : (blk += 1) {
+            const blk_off = row_off + blk * q4_0_block_bytes;
+            const scales_idx = (j * blocks_per_row + blk) * 2;
+            scales_out[scales_idx + 0] = weight_data[blk_off + 0];
+            scales_out[scales_idx + 1] = weight_data[blk_off + 1];
+            // 16 packed bytes -> quants_out at j * (in/2) + blk * 16.
+            const quants_idx = j * (in_features / 2) + blk * q4_0_packed_bytes;
+            @memcpy(
+                quants_out[quants_idx..][0..q4_0_packed_bytes],
+                weight_data[blk_off + 2 ..][0..q4_0_packed_bytes],
+            );
+        }
+    }
+}
+
+fn alignUp(value: vk.DeviceSize, alignment: vk.DeviceSize) vk.DeviceSize {
+    if (alignment == 0) return value;
+    return ((value + alignment - 1) / alignment) * alignment;
+}
+
+fn msBetween(t0: std.Io.Timestamp, t1: std.Io.Timestamp) f64 {
+    return @as(f64, @floatFromInt(t1.nanoseconds - t0.nanoseconds)) / 1e6;
+}
+
+/// Read the two stamps of the one-shot buffer after its wait and hand them to
+/// the span recorder. A failed read loses one trace record, never the submit.
+fn stagingRecord(
+    ctx: *const vulkan_ctx.Context,
+    label: SubmitLabel,
+    submit: std.Io.Timestamp,
+    wait: std.Io.Timestamp,
+) void {
+    var ts: [2]u64 = undefined;
+    _ = ctx.vkd.getQueryPoolResults(
+        ctx.device,
+        ctx.staging_query_pool,
+        0,
+        2,
+        @sizeOf(@TypeOf(ts)),
+        &ts,
+        @sizeOf(u64),
+        .{ .@"64_bit" = true, .wait_bit = true },
+    ) catch |err| {
+        log.warn("staging: timestamp read failed: {t}", .{err});
+        return;
+    };
+    const gpu_label: span.GpuLabel = switch (label) {
+        inline else => |l| @field(span.GpuLabel, @tagName(l)),
+    };
+
+    const t = span.tickSpan(&ts, gpu_profile.tickMask(ctx.timestamp_valid_bits), null);
+    span.gpu(.{
+        .runner = .staging,
+        .label = gpu_label,
+        .gpu_start = t.start,
+        .gpu_end = t.end,
+        .period_ns = @floatCast(ctx.physical_device_props.limits.timestamp_period),
+        .host_submit_ns = span.tsNs(submit),
+        .host_wait_ns = span.tsNs(wait),
+        .backsteps = t.backsteps,
+    });
 }
 
 fn createPipelineLayout(
@@ -4319,8 +5731,8 @@ fn createComputePipeline(
     // issuing the instruction twice. So pin every compute pipeline to wave32
     // through VK_EXT_subgroup_size_control. The SmolLM2 decode benchmark over
     // 10 runs showed 31% lower inter-token latency and a 4x lower standard
-    // deviation against the unpinned default. Precondition: every shader
-    // declares a local_size_x that is a multiple of 32.
+    // deviation against the unpinned default. Precondition: the workgroup size
+    // of every shader is a multiple of 32.
     const required_size: vk.PipelineShaderStageRequiredSubgroupSizeCreateInfo = .{
         .required_subgroup_size = 32,
     };
@@ -4375,45 +5787,6 @@ fn allocateOneSet(
     return set;
 }
 
-/// Allocate one buffer that lives as long as its owner. A one-shot submit uses
-/// `submitOnce` and allocates nothing.
-pub fn allocateOnePrimaryCmdBuffer(
-    ctx: *const vulkan_ctx.Context,
-) !vk.CommandBuffer {
-    const info: vk.CommandBufferAllocateInfo = .{
-        .command_pool = ctx.command_pool,
-        .level = .primary,
-        .command_buffer_count = 1,
-    };
-    var cmd: vk.CommandBuffer = .null_handle;
-    try ctx.vkd.allocateCommandBuffers(ctx.device, &info, @ptrCast(&cmd));
-    return cmd;
-}
-
-/// Bind N storage buffers at bindings 0 through N-1. `buf_infos` must outlive
-/// the call, and it must hold at most 16 entries, the descriptor-set-layout cap.
-pub fn updateStorageBindings(
-    ctx: *const vulkan_ctx.Context,
-    set: vk.DescriptorSet,
-    buf_infos: []const vk.DescriptorBufferInfo,
-) void {
-    var writes: [16]vk.WriteDescriptorSet = undefined;
-    std.debug.assert(buf_infos.len <= writes.len);
-    for (buf_infos, 0..) |*info, i| {
-        writes[i] = .{
-            .dst_set = set,
-            .dst_binding = @intCast(i),
-            .dst_array_element = 0,
-            .descriptor_count = 1,
-            .descriptor_type = .storage_buffer,
-            .p_buffer_info = @ptrCast(info),
-            .p_image_info = undefined,
-            .p_texel_buffer_view = undefined,
-        };
-    }
-    ctx.vkd.updateDescriptorSets(ctx.device, writes[0..buf_infos.len], null);
-}
-
 /// The shared one-shot driver for the record-only batch matmul kernels,
 /// `LinearQ80Batch` and `LinearQ80Gemm`. It stages the input and output in
 /// host-visible memory, builds a throwaway descriptor pool and set, dispatches
@@ -4431,6 +5804,7 @@ fn matmulOneShot(
 ) !void {
     std.debug.assert(input.len == b * in_features);
     std.debug.assert(out.len == b * out_features);
+
     const ctx = kernel.ctx;
     var w = try Q80Weight.init(ctx, weight_bytes, in_features, out_features);
     defer w.deinit();
@@ -4438,19 +5812,31 @@ fn matmulOneShot(
     const F = @sizeOf(f32);
     var buf_in: HostBuffer = .{ .ctx = ctx };
     defer buf_in.deinit();
+
     var buf_out: HostBuffer = .{ .ctx = ctx };
     defer buf_out.deinit();
+
     try buf_in.ensure(@intCast(input.len * F));
     try buf_out.ensure(@intCast(out.len * F));
     @memcpy(buf_in.sliceTyped(f32, input.len), input);
 
-    const pool_sizes = [_]vk.DescriptorPoolSize{.{ .type = .storage_buffer, .descriptor_count = 4 }};
-    const pool_info: vk.DescriptorPoolCreateInfo = .{ .max_sets = 1, .pool_size_count = 1, .p_pool_sizes = &pool_sizes };
+    const pool_sizes = [_]vk.DescriptorPoolSize{
+        .{ .type = .storage_buffer, .descriptor_count = 4 },
+    };
+    const pool_info: vk.DescriptorPoolCreateInfo = .{
+        .max_sets = 1,
+        .pool_size_count = 1,
+        .p_pool_sizes = &pool_sizes,
+    };
     const pool = try ctx.vkd.createDescriptorPool(ctx.device, &pool_info, null);
     defer ctx.vkd.destroyDescriptorPool(ctx.device, pool, null);
 
     const layouts = [_]vk.DescriptorSetLayout{kernel.pipeline.set_layout};
-    const ai: vk.DescriptorSetAllocateInfo = .{ .descriptor_pool = pool, .descriptor_set_count = 1, .p_set_layouts = &layouts };
+    const ai: vk.DescriptorSetAllocateInfo = .{
+        .descriptor_pool = pool,
+        .descriptor_set_count = 1,
+        .p_set_layouts = &layouts,
+    };
     var set: vk.DescriptorSet = .null_handle;
     try ctx.vkd.allocateDescriptorSets(ctx.device, &ai, @ptrCast(&set));
 
@@ -4468,82 +5854,24 @@ fn matmulOneShot(
         b: u32,
         k: u32,
         n: u32,
+
         pub fn record(r: @This(), cb: vk.CommandBuffer) Recorded {
             r.kernel.recordInto(cb, r.set, r.b, r.k, r.n);
             return .{};
         }
     };
-    try submitOnce(ctx, .dispatch, Rec{ .kernel = kernel, .set = set, .b = @intCast(b), .k = @intCast(in_features), .n = @intCast(out_features) });
+    try submitOnce(
+        ctx,
+        .dispatch,
+        Rec{
+            .kernel = kernel,
+            .set = set,
+            .b = @intCast(b),
+            .k = @intCast(in_features),
+            .n = @intCast(out_features),
+        },
+    );
     @memcpy(out, buf_out.sliceTyped(f32, out.len));
-}
-
-/// The one-shot driver for the record-only `KvCommitF16`. It stages the two f32
-/// scratch inputs in host-visible memory, builds a throwaway descriptor pool and
-/// set, dispatches through `recordInto` in one `submitOnce`, and reads the two
-/// narrowed outputs back as raw f16 bits. For the rounding gate alone: the
-/// runners record this kernel into their own per-token command buffer.
-///
-/// The output is bits, not values. The bits are what the cache stores, so a bit
-/// comparison states the rounding property directly and keeps a second
-/// conversion out of the path under test.
-pub fn kvCommitF16OneShot(
-    kernel: *KvCommitF16,
-    k_src: []const f32,
-    v_src: []const f32,
-    k_out_bits: []u16,
-    v_out_bits: []u16,
-) !void {
-    // One `n` covers all four buffers. The kernel takes the same count.
-    std.debug.assert(k_src.len >= 1);
-    std.debug.assert(v_src.len == k_src.len);
-    std.debug.assert(k_out_bits.len == k_src.len);
-    std.debug.assert(v_out_bits.len == k_src.len);
-    const n: u32 = @intCast(k_src.len);
-    const ctx = kernel.ctx;
-
-    const src_bytes: vk.DeviceSize = @intCast(k_src.len * @sizeOf(f32));
-    const out_bytes: vk.DeviceSize = @intCast(k_src.len * @sizeOf(u16));
-
-    var buf_k_src: HostBuffer = .{ .ctx = ctx };
-    defer buf_k_src.deinit();
-    var buf_v_src: HostBuffer = .{ .ctx = ctx };
-    defer buf_v_src.deinit();
-    var buf_k_out: HostBuffer = .{ .ctx = ctx };
-    defer buf_k_out.deinit();
-    var buf_v_out: HostBuffer = .{ .ctx = ctx };
-    defer buf_v_out.deinit();
-    try buf_k_src.ensure(src_bytes);
-    try buf_v_src.ensure(src_bytes);
-    try buf_k_out.ensure(out_bytes);
-    try buf_v_out.ensure(out_bytes);
-    @memcpy(buf_k_src.sliceTyped(f32, k_src.len), k_src);
-    @memcpy(buf_v_src.sliceTyped(f32, v_src.len), v_src);
-
-    const desc_pool = try createSingleSetPool(ctx, 4);
-    defer ctx.vkd.destroyDescriptorPool(ctx.device, desc_pool, null);
-    const desc_set = try allocateOneSet(ctx, desc_pool, kernel.pipeline.set_layout);
-
-    const infos = [_]vk.DescriptorBufferInfo{
-        .{ .buffer = buf_k_src.buffer, .offset = 0, .range = src_bytes },
-        .{ .buffer = buf_v_src.buffer, .offset = 0, .range = src_bytes },
-        .{ .buffer = buf_k_out.buffer, .offset = 0, .range = out_bytes },
-        .{ .buffer = buf_v_out.buffer, .offset = 0, .range = out_bytes },
-    };
-    updateStorageBindings(ctx, desc_set, &infos);
-
-    const Rec = struct {
-        kernel: *KvCommitF16,
-        set: vk.DescriptorSet,
-        n: u32,
-        pub fn record(r: @This(), cb: vk.CommandBuffer) Recorded {
-            r.kernel.recordInto(cb, r.set, r.n);
-            return .{};
-        }
-    };
-    try submitOnce(ctx, .dispatch, Rec{ .kernel = kernel, .set = desc_set, .n = n });
-
-    @memcpy(k_out_bits, buf_k_out.sliceTyped(u16, k_out_bits.len));
-    @memcpy(v_out_bits, buf_v_out.sliceTyped(u16, v_out_bits.len));
 }
 
 // -- tests ------------------------------------------------------------------
@@ -4562,13 +5890,18 @@ fn fakeKvStore(layout: kv_index.Layout, lim: limits.BufferLimits) KvStore {
         segment.buffer = @enumFromInt(i + 1);
         segment.capacity = packing.segmentBytes(@intCast(i));
     }
+
     return store;
 }
 
 test "KvStore: every row of every region lands once inside one allocation" {
     // Six regions of 192 bytes, two to an allocation of 384 bytes.
     const layout = kv_index.Layout.init(3, 4, 4, 3, .f32);
-    const lim: limits.BufferLimits = .{ .storage_range = 192, .allocation_size = 384, .offset_alignment = 16 };
+    const lim: limits.BufferLimits = .{
+        .storage_range = 192,
+        .allocation_size = 384,
+        .offset_alignment = 16,
+    };
     const store = fakeKvStore(layout, lim);
     try std.testing.expectEqual(@as(u32, 3), store.packing.n_segments);
     try std.testing.expectEqual(layout.totalBytes(), store.deviceBytes());
@@ -4588,7 +5921,10 @@ test "KvStore: every row of every region lands once inside one allocation" {
                 const slot: u32 = @intCast(s);
                 const view = store.slotView(layer, t, slot);
                 try std.testing.expectEqual(whole.buffer, view.buffer);
-                try std.testing.expectEqual(whole.offset + layout.slotByteOffset(slot), view.offset);
+                try std.testing.expectEqual(
+                    whole.offset + layout.slotByteOffset(slot),
+                    view.offset,
+                );
                 try std.testing.expectEqual(@as(u64, layout.window) * row_bytes, view.range);
                 for (0..layout.window) |p| {
                     const row = store.rowAt(layer, t, slot, @intCast(p));
@@ -4597,7 +5933,9 @@ test "KvStore: every row of every region lands once inside one allocation" {
                     try std.testing.expectEqual(view.offset + @as(u64, p) * row_bytes, row.offset);
                     const segment = @intFromEnum(row.buffer) - 1;
                     try std.testing.expect(segment < store.packing.n_segments);
-                    try std.testing.expect(row.offset + row_bytes <= store.segments[segment].capacity);
+                    try std.testing.expect(
+                        row.offset + row_bytes <= store.segments[segment].capacity,
+                    );
                     const at: usize = @intCast(row.offset / row_bytes);
                     try std.testing.expect(!seen[segment][at]);
                     seen[segment][at] = true;
@@ -4606,6 +5944,7 @@ test "KvStore: every row of every region lands once inside one allocation" {
             }
         }
     }
+
     // The rows hold as many bytes as the allocations, so no allocation byte
     // stays outside a row.
     try std.testing.expectEqual(@as(u32, 3 * rows_per_segment), count);
@@ -4617,7 +5956,11 @@ test "KvStore: two 2B sessions under the raised range start slot 1 at 128 MiB in
     // of 2 GiB. Each region holds 256 MiB, so eight regions share the first
     // allocation and four share the second.
     const layout = kv_index.Layout.init(2, 131_072, 512, 6, .f16);
-    const lim: limits.BufferLimits = .{ .storage_range = 536_870_912, .allocation_size = 2_147_483_648, .offset_alignment = 16 };
+    const lim: limits.BufferLimits = .{
+        .storage_range = 536_870_912,
+        .allocation_size = 2_147_483_648,
+        .offset_alignment = 16,
+    };
     const store = fakeKvStore(layout, lim);
     const mib: u64 = 1 << 20;
     try std.testing.expectEqual(@as(u32, 2), store.packing.n_segments);

@@ -58,7 +58,12 @@ const OpenAiServer = http_server.Server(Sessions(LlamaRunner));
 const map = z.serve_openai_map;
 
 /// A sampled row in both modes. SmolLM2 has no card, so the test supplies one.
-const card_row: z.serve_protocol.Sampling = .{ .temperature = 1.5, .top_k = 40, .top_p = 0.95, .seed = 0 };
+const card_row: z.serve_protocol.Sampling = .{
+    .temperature = 1.5,
+    .top_k = 40,
+    .top_p = 0.95,
+    .seed = 0,
+};
 const card_defaults: map.DefaultRows = .init(.model, card_row, card_row);
 
 /// An in-process server over the SmolLM2 fixture. The fields point at each
@@ -88,11 +93,13 @@ const Fixture = struct {
         fx.io = io;
         fx.arena_state = .init(fx.gpa);
         errdefer fx.arena_state.deinit();
+
         const arena = fx.arena_state.allocator();
         const fixture = try z.test_fixtures.path(arena, "SmolLM2-135M-Instruct-Q8_0");
 
         fx.loaded = try loader.load(io, arena, fixture);
         errdefer fx.loaded.close();
+
         fx.vocab = try vocab_mod.buildFromParsed(arena, fx.loaded.parsed);
 
         const pieces = try arena.alloc([]const u8, fx.vocab.tokens.len);
@@ -104,7 +111,17 @@ const Fixture = struct {
         const policy = tp.policy();
         try tp.startPool(&fx.cpu_pool, io, policy);
         errdefer fx.cpu_pool.deinit();
-        fx.runner = try LlamaRunner.init(arena, &fx.loaded, z.kv_budget.pinned(4, max_seq), 0, io, &fx.cpu_pool, policy, .f32);
+
+        fx.runner = try LlamaRunner.init(
+            arena,
+            &fx.loaded,
+            z.kv_budget.pinned(4, max_seq),
+            0,
+            io,
+            &fx.cpu_pool,
+            policy,
+            .f32,
+        );
         fx.sessions = try Sessions(LlamaRunner).init(arena, &fx.runner);
         fx.codec = .{
             .vocab = &fx.vocab,
@@ -114,7 +131,10 @@ const Fixture = struct {
             .think_ids = null,
             .model_id = "fixture",
             .max_seq = max_seq,
-            .default_max_tokens = map.resolveDefaultMaxTokens(limits.openai_default_max_tokens, max_seq),
+            .default_max_tokens = map.resolveDefaultMaxTokens(
+                limits.openai_default_max_tokens,
+                max_seq,
+            ),
             .defaults = defaults,
         };
         fx.server = OpenAiServer.init(arena, fx.gpa, io, &fx.sessions, &fx.codec, .{
@@ -130,7 +150,12 @@ const Fixture = struct {
 
         fx.run_future = try io.concurrent(runServerTask, .{&fx.server});
         errdefer fx.stopServer();
-        const uri_str = try std.fmt.bufPrint(&fx.uri_buf, "http://{f}/v1/chat/completions", .{fx.server.boundAddress()});
+
+        const uri_str = try std.fmt.bufPrint(
+            &fx.uri_buf,
+            "http://{f}/v1/chat/completions",
+            .{fx.server.boundAddress()},
+        );
         fx.uri = try std.Uri.parse(uri_str);
     }
 
@@ -144,7 +169,9 @@ const Fixture = struct {
     /// A failed assertion must not leave the test blocked on the server task.
     /// A shutdown request breaks the engine loop and closes every connection.
     fn stopServer(fx: *Fixture) void {
-        fx.server.submit(.{ .conn = 0, .request_id = 0, .session_id = 0, .body = .shutdown }) catch {};
+        fx.server.submit(
+            .{ .conn = 0, .request_id = 0, .session_id = 0, .body = .shutdown },
+        ) catch {};
         fx.run_future.await(fx.io);
     }
 };
@@ -208,8 +235,10 @@ fn runServerTask(server: *OpenAiServer) void {
 fn post(fx: *const Fixture, arena: std.mem.Allocator, body: []const u8) !Reply {
     var client: std.http.Client = .{ .allocator = fx.gpa, .io = fx.io };
     defer client.deinit();
+
     var req = try client.request(.POST, fx.uri, .{ .keep_alive = false });
     defer req.deinit();
+
     try req.sendBodyComplete(try arena.dupe(u8, body));
 
     var redirect_buf: [4096]u8 = undefined;
@@ -226,7 +255,11 @@ fn post(fx: *const Fixture, arena: std.mem.Allocator, body: []const u8) !Reply {
 /// A chat body with one user message. `extra` holds more top-level fields,
 /// each with a leading comma.
 fn chatBody(arena: std.mem.Allocator, content: []const u8, extra: []const u8) ![]const u8 {
-    return std.fmt.allocPrint(arena, "{{\"messages\":[{{\"role\":\"user\",\"content\":\"{s}\"}}]{s}}}", .{ content, extra });
+    return std.fmt.allocPrint(
+        arena,
+        "{{\"messages\":[{{\"role\":\"user\",\"content\":\"{s}\"}}]{s}}}",
+        .{ content, extra },
+    );
 }
 
 /// The body with its completion id replaced. Each request opens its own
@@ -242,6 +275,7 @@ const ContentBuf = struct {
     buf: [4096]u8 = undefined,
     len: usize = 0,
     ok: bool = false,
+
     fn slice(self: *const ContentBuf) []const u8 {
         return self.buf[0..self.len];
     }
@@ -258,14 +292,27 @@ fn fetchContent(fx: *const Fixture, prompt: []const u8, out: *ContentBuf) void {
 fn fetchContentErr(fx: *const Fixture, prompt: []const u8, out: *ContentBuf) !void {
     var arena_state = std.heap.ArenaAllocator.init(fx.gpa);
     defer arena_state.deinit();
+
     const arena = arena_state.allocator();
 
-    const reply = try post(fx, arena, try chatBody(arena, prompt, ",\"max_tokens\":24,\"stream\":false,\"temperature\":0"));
+    const reply = try post(
+        fx,
+        arena,
+        try chatBody(arena, prompt, ",\"max_tokens\":24,\"stream\":false,\"temperature\":0"),
+    );
     if (reply.status != .ok) return error.HttpStatus;
-    const parsed = try std.json.parseFromSliceLeaky(Completion, arena, reply.body, .{ .ignore_unknown_fields = true });
+
+    const parsed = try std.json.parseFromSliceLeaky(
+        Completion,
+        arena,
+        reply.body,
+        .{ .ignore_unknown_fields = true },
+    );
     if (parsed.choices.len == 0) return error.NoChoices;
+
     const content = parsed.choices[0].message.content;
     if (content.len > out.buf.len) return error.TooLong;
+
     @memcpy(out.buf[0..content.len], content);
     out.len = content.len;
     out.ok = true;
@@ -277,13 +324,21 @@ test "openai loopback: a chat completion returns a valid chat.completion object"
     var fx: Fixture = undefined;
     try fx.setUp();
     defer fx.tearDown();
+
     var arena_state = std.heap.ArenaAllocator.init(fx.gpa);
     defer arena_state.deinit();
+
     const arena = arena_state.allocator();
 
-    const reply = try post(&fx, arena, try chatBody(arena, "Hello", ",\"max_tokens\":16,\"stream\":false"));
+    const reply = try post(
+        &fx,
+        arena,
+        try chatBody(arena, "Hello", ",\"max_tokens\":16,\"stream\":false"),
+    );
     try std.testing.expectEqual(std.http.Status.ok, reply.status);
-    try std.testing.expect(std.mem.indexOf(u8, reply.body, "\"object\":\"chat.completion\"") != null);
+    try std.testing.expect(
+        std.mem.indexOf(u8, reply.body, "\"object\":\"chat.completion\"") != null,
+    );
     try std.testing.expect(std.mem.indexOf(u8, reply.body, "\"finish_reason\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, reply.body, "\"role\":\"assistant\"") != null);
     // A non-empty reply: usage reports at least one completion token.
@@ -291,13 +346,21 @@ test "openai loopback: a chat completion returns a valid chat.completion object"
 
     // One server answers for one model. A body that names another model gets a
     // 404 before any session opens, the way the OpenAI API answers it.
-    const wrong = try post(&fx, arena, "{\"model\":\"wrong\",\"messages\":[{\"role\":\"user\",\"content\":\"Hello\"}],\"max_tokens\":16,\"stream\":false}");
+    const wrong = try post(
+        &fx,
+        arena,
+        "{\"model\":\"wrong\",\"messages\":[{\"role\":\"user\",\"content\":\"Hello\"}],\"max_tokens\":16,\"stream\":false}",
+    );
     try std.testing.expectEqual(std.http.Status.not_found, wrong.status);
     try std.testing.expect(std.mem.indexOf(u8, wrong.body, "\"type\":\"model_not_found\"") != null);
 
     // The served id passes the same check, so the refusal above compares the
     // two strings and never rejects every named model.
-    const served = try post(&fx, arena, "{\"model\":\"fixture\",\"messages\":[{\"role\":\"user\",\"content\":\"Hello\"}],\"max_tokens\":4,\"stream\":false}");
+    const served = try post(
+        &fx,
+        arena,
+        "{\"model\":\"fixture\",\"messages\":[{\"role\":\"user\",\"content\":\"Hello\"}],\"max_tokens\":4,\"stream\":false}",
+    );
     try std.testing.expectEqual(std.http.Status.ok, served.status);
 
     // Two concurrent requests batch through the shared scheduler and still
@@ -326,15 +389,30 @@ test "openai loopback: a streamed reply carries the buffered text after the role
     var fx: Fixture = undefined;
     try fx.setUp();
     defer fx.tearDown();
+
     var arena_state = std.heap.ArenaAllocator.init(fx.gpa);
     defer arena_state.deinit();
+
     const arena = arena_state.allocator();
 
-    const buffered = try post(&fx, arena, try chatBody(arena, "Hello", ",\"max_tokens\":8,\"temperature\":0"));
+    const buffered = try post(
+        &fx,
+        arena,
+        try chatBody(arena, "Hello", ",\"max_tokens\":8,\"temperature\":0"),
+    );
     try std.testing.expectEqual(std.http.Status.ok, buffered.status);
-    const want = (try std.json.parseFromSliceLeaky(Completion, arena, buffered.body, .{ .ignore_unknown_fields = true })).choices[0];
+    const want = (try std.json.parseFromSliceLeaky(
+        Completion,
+        arena,
+        buffered.body,
+        .{ .ignore_unknown_fields = true },
+    )).choices[0];
 
-    const streamed = try post(&fx, arena, try chatBody(arena, "Hello", ",\"max_tokens\":8,\"stream\":true,\"temperature\":0"));
+    const streamed = try post(
+        &fx,
+        arena,
+        try chatBody(arena, "Hello", ",\"max_tokens\":8,\"stream\":true,\"temperature\":0"),
+    );
     try std.testing.expectEqual(std.http.Status.ok, streamed.status);
     try std.testing.expectEqualStrings("text/event-stream", streamed.content_type);
     const end_event = "data: [DONE]\n\n";
@@ -343,17 +421,37 @@ test "openai loopback: a streamed reply carries the buffered text after the role
     var text: std.ArrayList(u8) = .empty;
     var finish: []const u8 = "";
     var n_events: usize = 0;
-    var events = std.mem.splitSequence(u8, streamed.body[0 .. streamed.body.len - end_event.len], "\n\n");
+    var events = std.mem.splitSequence(
+        u8,
+        streamed.body[0 .. streamed.body.len - end_event.len],
+        "\n\n",
+    );
     while (events.next()) |event| {
         if (event.len == 0) continue;
+
         try std.testing.expect(std.mem.startsWith(u8, event, "data: "));
-        const chunk = try std.json.parseFromSliceLeaky(ChunkReply, arena, event["data: ".len..], .{ .ignore_unknown_fields = true });
+        const chunk = try std.json.parseFromSliceLeaky(
+            ChunkReply,
+            arena,
+            event["data: ".len..],
+            .{ .ignore_unknown_fields = true },
+        );
         const choice = chunk.choices[0];
-        if (n_events == 0) try std.testing.expectEqualStrings("assistant", choice.delta.role orelse "");
-        if (choice.delta.content) |content| try text.appendSlice(arena, content);
-        if (choice.finish_reason) |reason| finish = reason;
+        if (n_events == 0) {
+            try std.testing.expectEqualStrings("assistant", choice.delta.role orelse "");
+        }
+
+        if (choice.delta.content) |content| {
+            try text.appendSlice(arena, content);
+        }
+
+        if (choice.finish_reason) |reason| {
+            finish = reason;
+        }
+
         n_events += 1;
     }
+
     try std.testing.expectEqualStrings(want.message.content, text.items);
     try std.testing.expectEqualStrings(want.finish_reason, finish);
 }
@@ -362,43 +460,73 @@ test "openai loopback: a budget past the room fills the window and ends with len
     var fx: Fixture = undefined;
     try fx.setUp();
     defer fx.tearDown();
+
     var arena_state = std.heap.ArenaAllocator.init(fx.gpa);
     defer arena_state.deinit();
+
     const arena = arena_state.allocator();
 
-    const extra = try std.fmt.allocPrint(arena, ",\"max_tokens\":{d},\"temperature\":0", .{max_seq});
+    const extra = try std.fmt.allocPrint(
+        arena,
+        ",\"max_tokens\":{d},\"temperature\":0",
+        .{max_seq},
+    );
     const reply = try post(&fx, arena, try chatBody(arena, near_full_message, extra));
     try std.testing.expectEqual(std.http.Status.ok, reply.status);
-    const parsed = try std.json.parseFromSliceLeaky(Completion, arena, reply.body, .{ .ignore_unknown_fields = true });
+    const parsed = try std.json.parseFromSliceLeaky(
+        Completion,
+        arena,
+        reply.body,
+        .{ .ignore_unknown_fields = true },
+    );
     try std.testing.expect(parsed.usage.prompt_tokens < max_seq);
     try std.testing.expectEqualStrings("length", parsed.choices[0].finish_reason);
     // The prefill samples the first token, and each decode step commits one
     // row until the window is full. The last token never enters the window.
-    try std.testing.expectEqual(max_seq - parsed.usage.prompt_tokens + 1, parsed.usage.completion_tokens);
+    try std.testing.expectEqual(
+        max_seq - parsed.usage.prompt_tokens + 1,
+        parsed.usage.completion_tokens,
+    );
 }
 
 test "openai loopback: a request with no budget gets the whole window" {
     var fx: Fixture = undefined;
     try fx.setUp();
     defer fx.tearDown();
+
     var arena_state = std.heap.ArenaAllocator.init(fx.gpa);
     defer arena_state.deinit();
+
     const arena = arena_state.allocator();
 
     try std.testing.expectEqual(max_seq, fx.codec.default_max_tokens);
-    const reply = try post(&fx, arena, try chatBody(arena, "Count from 1 to 200. Write every number.", ",\"temperature\":0"));
+    const reply = try post(
+        &fx,
+        arena,
+        try chatBody(arena, "Count from 1 to 200. Write every number.", ",\"temperature\":0"),
+    );
     try std.testing.expectEqual(std.http.Status.ok, reply.status);
-    const parsed = try std.json.parseFromSliceLeaky(Completion, arena, reply.body, .{ .ignore_unknown_fields = true });
+    const parsed = try std.json.parseFromSliceLeaky(
+        Completion,
+        arena,
+        reply.body,
+        .{ .ignore_unknown_fields = true },
+    );
     try std.testing.expectEqualStrings("length", parsed.choices[0].finish_reason);
-    try std.testing.expectEqual(max_seq - parsed.usage.prompt_tokens + 1, parsed.usage.completion_tokens);
+    try std.testing.expectEqual(
+        max_seq - parsed.usage.prompt_tokens + 1,
+        parsed.usage.completion_tokens,
+    );
 }
 
 test "openai loopback: a buffered prompt past the window gets 400 with both numbers" {
     var fx: Fixture = undefined;
     try fx.setUp();
     defer fx.tearDown();
+
     var arena_state = std.heap.ArenaAllocator.init(fx.gpa);
     defer arena_state.deinit();
+
     const arena = arena_state.allocator();
 
     const reply = try post(&fx, arena, try chatBody(arena, long_message, ",\"max_tokens\":8"));
@@ -410,7 +538,11 @@ test "openai loopback: a buffered prompt past the window gets 400 with both numb
     try std.testing.expectEqualStrings("exceed_context_size_error", e.type);
     try std.testing.expectEqual(max_seq, e.n_ctx);
     try std.testing.expect(e.n_prompt_tokens > e.n_ctx);
-    const want = try std.fmt.allocPrint(arena, "the request of {d} tokens exceeds the context of {d} tokens", .{ e.n_prompt_tokens, e.n_ctx });
+    const want = try std.fmt.allocPrint(
+        arena,
+        "the request of {d} tokens exceeds the context of {d} tokens",
+        .{ e.n_prompt_tokens, e.n_ctx },
+    );
     try std.testing.expectEqualStrings(want, e.message);
 }
 
@@ -418,11 +550,17 @@ test "openai loopback: a streamed prompt past the window gets the same 400 and n
     var fx: Fixture = undefined;
     try fx.setUp();
     defer fx.tearDown();
+
     var arena_state = std.heap.ArenaAllocator.init(fx.gpa);
     defer arena_state.deinit();
+
     const arena = arena_state.allocator();
 
-    const streamed = try post(&fx, arena, try chatBody(arena, long_message, ",\"max_tokens\":8,\"stream\":true"));
+    const streamed = try post(
+        &fx,
+        arena,
+        try chatBody(arena, long_message, ",\"max_tokens\":8,\"stream\":true"),
+    );
     try std.testing.expectEqual(std.http.Status.bad_request, streamed.status);
     try std.testing.expectEqualStrings("application/json", streamed.content_type);
     try std.testing.expect(!std.mem.startsWith(u8, streamed.body, "data:"));
@@ -438,18 +576,26 @@ test "openai loopback: enable_thinking true on a model with no thinking mode get
     var fx: Fixture = undefined;
     try fx.setUp();
     defer fx.tearDown();
+
     var arena_state = std.heap.ArenaAllocator.init(fx.gpa);
     defer arena_state.deinit();
+
     const arena = arena_state.allocator();
 
     const on = ",\"max_tokens\":8,\"chat_template_kwargs\":{\"enable_thinking\":true}";
     const buffered = try post(&fx, arena, try chatBody(arena, "Hello", on));
     try std.testing.expectEqual(std.http.Status.bad_request, buffered.status);
     try std.testing.expectEqualStrings("application/json", buffered.content_type);
-    const e = (try std.json.parseFromSliceLeaky(PlainErrorReply, arena, buffered.body, .{})).@"error";
+    const e = (try std.json.parseFromSliceLeaky(
+        PlainErrorReply,
+        arena,
+        buffered.body,
+        .{},
+    )).@"error";
     try std.testing.expectEqualStrings("invalid_request_error", e.type);
     try std.testing.expectEqualStrings(
-        "enable_thinking true does not apply to this model, because its chat template has no thinking mode",
+        "enable_thinking true does not apply to this model, because its chat template has " ++
+            "no thinking mode",
         e.message,
     );
 
@@ -464,8 +610,10 @@ test "openai loopback: enable_thinking false and an absent switch give the plain
     var fx: Fixture = undefined;
     try fx.setUp();
     defer fx.tearDown();
+
     var arena_state = std.heap.ArenaAllocator.init(fx.gpa);
     defer arena_state.deinit();
+
     const arena = arena_state.allocator();
 
     const off = ",\"chat_template_kwargs\":{\"enable_thinking\":false}";
@@ -479,20 +627,44 @@ test "openai loopback: enable_thinking false and an absent switch give the plain
 
     const switched_off = try post(&fx, arena, try chatBody(arena, "Hello", greedy8 ++ off));
     try std.testing.expectEqual(std.http.Status.ok, switched_off.status);
-    try std.testing.expectEqualStrings(try withoutId(arena, absent.body), try withoutId(arena, switched_off.body));
+    try std.testing.expectEqualStrings(
+        try withoutId(arena, absent.body),
+        try withoutId(arena, switched_off.body),
+    );
 
-    const streamed = try post(&fx, arena, try chatBody(arena, "Hello", greedy8 ++ ",\"stream\":true"));
-    const streamed_off = try post(&fx, arena, try chatBody(arena, "Hello", greedy8 ++ ",\"stream\":true" ++ off));
+    const streamed = try post(
+        &fx,
+        arena,
+        try chatBody(arena, "Hello", greedy8 ++ ",\"stream\":true"),
+    );
+    const streamed_off = try post(
+        &fx,
+        arena,
+        try chatBody(arena, "Hello", greedy8 ++ ",\"stream\":true" ++ off),
+    );
     try std.testing.expectEqual(std.http.Status.ok, streamed.status);
     try std.testing.expect(std.mem.find(u8, streamed.body, "reasoning_content") == null);
-    try std.testing.expectEqualStrings(try withoutId(arena, streamed.body), try withoutId(arena, streamed_off.body));
+    try std.testing.expectEqualStrings(
+        try withoutId(arena, streamed.body),
+        try withoutId(arena, streamed_off.body),
+    );
 }
 
 /// The reply text of one buffered request that must succeed.
-fn replyText(fx: *const Fixture, arena: std.mem.Allocator, prompt: []const u8, extra: []const u8) ![]const u8 {
+fn replyText(
+    fx: *const Fixture,
+    arena: std.mem.Allocator,
+    prompt: []const u8,
+    extra: []const u8,
+) ![]const u8 {
     const reply = try post(fx, arena, try chatBody(arena, prompt, extra));
     try std.testing.expectEqual(std.http.Status.ok, reply.status);
-    const parsed = try std.json.parseFromSliceLeaky(Completion, arena, reply.body, .{ .ignore_unknown_fields = true });
+    const parsed = try std.json.parseFromSliceLeaky(
+        Completion,
+        arena,
+        reply.body,
+        .{ .ignore_unknown_fields = true },
+    );
     return parsed.choices[0].message.content;
 }
 
@@ -502,8 +674,10 @@ test "openai loopback: an omitted seed draws a new one, a fixed seed reproduces,
     var fx: Fixture = undefined;
     try fx.setUp();
     defer fx.tearDown();
+
     var arena_state = std.heap.ArenaAllocator.init(fx.gpa);
     defer arena_state.deinit();
+
     const arena = arena_state.allocator();
 
     // The card row samples at temperature 1.5 over 32 tokens. Two equal
@@ -527,8 +701,10 @@ test "openai loopback: the greedy defaults give one reply to equal requests with
     var fx: Fixture = undefined;
     try fx.setUpWith(.init(.greedy, card_row, card_row));
     defer fx.tearDown();
+
     var arena_state = std.heap.ArenaAllocator.init(fx.gpa);
     defer arena_state.deinit();
+
     const arena = arena_state.allocator();
 
     const a = try replyText(&fx, arena, open_prompt, ",\"max_tokens\":32");
@@ -542,8 +718,10 @@ test "openai loopback: a refused sampling or budget field gets a 400 that names 
     var fx: Fixture = undefined;
     try fx.setUp();
     defer fx.tearDown();
+
     var arena_state = std.heap.ArenaAllocator.init(fx.gpa);
     defer arena_state.deinit();
+
     const arena = arena_state.allocator();
 
     const Case = struct { extra: []const u8, message: []const u8 };
@@ -556,9 +734,22 @@ test "openai loopback: a refused sampling or budget field gets a 400 that names 
         .{ .extra = ",\"thinking_token_budget\":16", .message = "thinking_token_budget above 0 does not apply to this model, because its chat template has no thinking mode" },
     };
     for (cases) |c| {
-        const reply = try post(&fx, arena, try chatBody(arena, "Hello", try std.mem.concat(arena, u8, &.{ ",\"max_tokens\":4", c.extra })));
+        const reply = try post(
+            &fx,
+            arena,
+            try chatBody(
+                arena,
+                "Hello",
+                try std.mem.concat(arena, u8, &.{ ",\"max_tokens\":4", c.extra }),
+            ),
+        );
         try std.testing.expectEqual(std.http.Status.bad_request, reply.status);
-        const e = (try std.json.parseFromSliceLeaky(PlainErrorReply, arena, reply.body, .{})).@"error";
+        const e = (try std.json.parseFromSliceLeaky(
+            PlainErrorReply,
+            arena,
+            reply.body,
+            .{},
+        )).@"error";
         try std.testing.expectEqualStrings("invalid_request_error", e.type);
         try std.testing.expectEqualStrings(c.message, e.message);
     }
@@ -567,9 +758,16 @@ test "openai loopback: a refused sampling or budget field gets a 400 that names 
     // and budget 0 against enable_thinking true.
     const greedy = ",\"max_tokens\":8,\"temperature\":0";
     const plain = try replyText(&fx, arena, "Hello", greedy);
-    try std.testing.expectEqualStrings(plain, try replyText(&fx, arena, "Hello", greedy ++ ",\"thinking_token_budget\":0"));
-    try std.testing.expectEqualStrings(plain, try replyText(&fx, arena, "Hello", greedy ++ ",\"thinking_token_budget\":-1"));
-    const off_wins = greedy ++ ",\"thinking_token_budget\":0,\"chat_template_kwargs\":{\"enable_thinking\":true}";
+    try std.testing.expectEqualStrings(
+        plain,
+        try replyText(&fx, arena, "Hello", greedy ++ ",\"thinking_token_budget\":0"),
+    );
+    try std.testing.expectEqualStrings(
+        plain,
+        try replyText(&fx, arena, "Hello", greedy ++ ",\"thinking_token_budget\":-1"),
+    );
+    const off_wins = greedy ++
+        ",\"thinking_token_budget\":0,\"chat_template_kwargs\":{\"enable_thinking\":true}";
     try std.testing.expectEqualStrings(plain, try replyText(&fx, arena, "Hello", off_wins));
 }
 
@@ -577,15 +775,20 @@ test "openai loopback: min_p and repetition_penalty reach the sampler" {
     var fx: Fixture = undefined;
     try fx.setUp();
     defer fx.tearDown();
+
     var arena_state = std.heap.ArenaAllocator.init(fx.gpa);
     defer arena_state.deinit();
+
     const arena = arena_state.allocator();
 
     const prompt = "Count from 1 to 30. Write every number.";
     const greedy = ",\"max_tokens\":48,\"temperature\":0";
     const plain = try replyText(&fx, arena, prompt, greedy);
     // A greedy pick keeps the top id, and min_p never drops the top id.
-    try std.testing.expectEqualStrings(plain, try replyText(&fx, arena, prompt, greedy ++ ",\"min_p\":0.5"));
+    try std.testing.expectEqualStrings(
+        plain,
+        try replyText(&fx, arena, prompt, greedy ++ ",\"min_p\":0.5"),
+    );
     // The penalty divides the logits of every id in the context, so the
     // greedy count moves off its plain path.
     const penalized = try replyText(&fx, arena, prompt, greedy ++ ",\"repetition_penalty\":2");

@@ -1,6 +1,6 @@
 //! The reference client for the serve wire format. A port to another language
 //! copies this file, and the integration tests and `bench-serve` drive the
-//! server through it. The client speaks ZMTP 3.x as a DEALER, and a ZeroMQ
+//! server through it. The client speaks ZMTP 3.x as a DEALER, and a ZMQ
 //! binding in any language can replace it. Each request method is send-only
 //! or terminal-wait. A send-only method writes one frame and returns its
 //! request id. The caller then reads frames through `next` or `collectTurn`.
@@ -27,10 +27,12 @@ const limits = @import("../core/limits.zig");
 
 const log = std.log.scoped(.serve_client);
 
-// -- types ------------------------------------------------------------------
+// -- constants --------------------------------------------------------------
 
 /// The long ZMTP frame head: one flags byte and an 8-byte size.
 const zmtp_head_bytes: usize = 9;
+
+// -- types ------------------------------------------------------------------
 
 /// The hook of `collectTurn`, which needs no work per token.
 const NoTokenHook = struct {
@@ -51,7 +53,12 @@ pub const OwnedEvent = struct {
     pub const Body = union(enum) {
         hello_ack: Client.HelloInfo,
         session_opened: @FieldType(protocol.ServerMsg, "session_opened"),
-        token: struct { token_id: u32, channel: protocol.Channel, len: u16, text: [limits.max_token_text_bytes]u8 },
+        token: struct {
+            token_id: u32,
+            channel: protocol.Channel,
+            len: u16,
+            text: [limits.max_token_text_bytes]u8,
+        },
         done: @FieldType(protocol.ServerMsg, "done"),
         appended: protocol.Appended,
         kept: @FieldType(protocol.ServerMsg, "kept"),
@@ -63,31 +70,6 @@ pub const OwnedEvent = struct {
         shutdown_ack,
     };
 };
-
-pub fn toOwned(ev: Event) OwnedEvent {
-    const body: OwnedEvent.Body = switch (ev.msg) {
-        .hello_ack => |m| .{ .hello_ack = Client.helloInfoFrom(m) },
-        .session_opened => |m| .{ .session_opened = m },
-        .token => |m| blk: {
-            std.debug.assert(m.text.len <= limits.max_token_text_bytes);
-            var b: OwnedEvent.Body = .{ .token = .{ .token_id = m.token_id, .channel = m.channel, .len = @intCast(m.text.len), .text = undefined } };
-            @memcpy(b.token.text[0..m.text.len], m.text);
-            break :blk b;
-        },
-        .done => |m| .{ .done = m },
-        .err => |m| .{ .err = Client.lastErrorFrom(m) },
-        .stats_ack => |m| .{ .stats_ack = Client.statsFrom(m) },
-        .pong => .pong,
-        .session_closed => .session_closed,
-        .shutdown_ack => .shutdown_ack,
-        .appended => |m| .{ .appended = m },
-        .kept => |m| .{ .kept = m },
-        .resumed => |m| .{ .resumed = m },
-    };
-    return .{ .header = ev.header, .body = body };
-}
-
-// -- api --------------------------------------------------------------------
 
 pub const Client = struct {
     gpa: Allocator,
@@ -145,6 +127,7 @@ pub const Client = struct {
         var addr = address;
         const stream = try addr.connect(io, .{ .mode = .stream });
         errdefer stream.close(io);
+
         return fromStream(gpa, io, stream);
     }
 
@@ -152,24 +135,40 @@ pub const Client = struct {
         gpa: Allocator,
         io: Io,
         path: []const u8,
-    ) (net.UnixAddress.InitError || net.UnixAddress.ConnectError || Allocator.Error || HandshakeError)!Client {
+    ) (net.UnixAddress.InitError ||
+        net.UnixAddress.ConnectError ||
+        Allocator.Error ||
+        HandshakeError)!Client {
         const addr = try net.UnixAddress.init(path);
         const stream = try addr.connect(io);
         errdefer stream.close(io);
+
         return fromStream(gpa, io, stream);
     }
 
-    fn fromStream(gpa: Allocator, io: Io, stream: net.Stream) (Allocator.Error || HandshakeError)!Client {
+    fn fromStream(
+        gpa: Allocator,
+        io: Io,
+        stream: net.Stream,
+    ) (Allocator.Error || HandshakeError)!Client {
         const read_buf = try gpa.alloc(u8, 4096);
         errdefer gpa.free(read_buf);
+
         const write_buf = try gpa.alloc(u8, 4096);
         errdefer gpa.free(write_buf);
+
         const payload_buf = try gpa.alloc(u8, protocol.max_frame_payload_bytes);
         errdefer gpa.free(payload_buf);
-        const frame_buf = try gpa.alloc(u8, zmtp_head_bytes + protocol.header_bytes + protocol.max_frame_payload_bytes);
+
+        const frame_buf = try gpa.alloc(
+            u8,
+            zmtp_head_bytes + protocol.header_bytes + protocol.max_frame_payload_bytes,
+        );
         errdefer gpa.free(frame_buf);
+
         const pair_buf = try gpa.alloc(u8, protocol.append_pairs_bytes_max);
         errdefer gpa.free(pair_buf);
+
         var client: Client = .{
             .gpa = gpa,
             .io = io,
@@ -208,6 +207,7 @@ pub const Client = struct {
         const head = try readFrameHead(r);
         if (!head.command) return error.Malformed;
         if (head.size > zmtp.max_ready_bytes) return error.MessageTooLarge;
+
         const command_body = self.payload_buf[0..@intCast(head.size)];
         try r.readSliceAll(command_body);
         const ready = switch (try zmtp.decodeCommand(command_body)) {
@@ -218,7 +218,11 @@ pub const Client = struct {
             },
             .ping, .pong, .other => return error.Malformed,
         };
-        if (!std.ascii.eqlIgnoreCase(ready.socket_type, zmtp.socket_type_router)) return error.PeerTypeRefused;
+
+        if (!std.ascii.eqlIgnoreCase(ready.socket_type, zmtp.socket_type_router)) {
+            return error.PeerTypeRefused;
+        }
+
         log.debug("handshake: accepted server type '{s}'", .{ready.socket_type});
     }
 
@@ -263,18 +267,22 @@ pub const Client = struct {
             const head = try readFrameHead(r);
             if (head.command) {
                 if (head.size > zmtp.max_ready_bytes) return error.MessageTooLarge;
+
                 const command_body = self.payload_buf[0..@intCast(head.size)];
                 try r.readSliceAll(command_body);
                 _ = try zmtp.decodeCommand(command_body);
                 continue;
             }
+
             if (head.more or head.size < protocol.header_bytes) return error.Malformed;
             if (head.size > zmtp.max_message_bytes) return error.MessageTooLarge;
+
             var header: [protocol.header_bytes]u8 = undefined;
             try r.readSliceAll(&header);
             const h = try protocol.decodeHeader(&header);
             const payload_len: usize = @intCast(head.size - protocol.header_bytes);
             if (h.payload_len != payload_len) return error.Malformed;
+
             const payload = self.payload_buf[0..payload_len];
             try r.readSliceAll(payload);
             return .{ .header = h, .msg = try protocol.decodeServerPayload(h.msg_type, payload) };
@@ -319,6 +327,7 @@ pub const Client = struct {
         const ev = try self.next();
         if (self.recordErr(ev.msg)) return error.ServerError;
         if (ev.msg != .hello_ack) return error.UnexpectedReply;
+
         self.eos_id = ev.msg.hello_ack.eos_id;
         return helloInfoFrom(ev.msg.hello_ack);
     }
@@ -335,6 +344,7 @@ pub const Client = struct {
         const ev = try self.next();
         if (self.recordErr(ev.msg)) return error.ServerError;
         if (ev.msg != .stats_ack) return error.UnexpectedReply;
+
         return statsFrom(ev.msg.stats_ack);
     }
 
@@ -355,11 +365,19 @@ pub const Client = struct {
     }
 
     /// `openSession` with the `kv_pos` of `session_opened` too.
-    pub fn openSessionInfo(self: *Client, system_prompt: []const u8, sampling: protocol.Sampling) !Opened {
-        _ = try self.send(.{ .session_open = .{ .sampling = sampling, .system_prompt = system_prompt } }, 0);
+    pub fn openSessionInfo(
+        self: *Client,
+        system_prompt: []const u8,
+        sampling: protocol.Sampling,
+    ) !Opened {
+        _ = try self.send(
+            .{ .session_open = .{ .sampling = sampling, .system_prompt = system_prompt } },
+            0,
+        );
         const ev = try self.next();
         if (self.recordErr(ev.msg)) return error.ServerError;
         if (ev.msg != .session_opened) return error.UnexpectedReply;
+
         return .{ .id = ev.header.session_id, .kv_pos = ev.msg.session_opened.kv_pos };
     }
 
@@ -376,6 +394,7 @@ pub const Client = struct {
         const ev = try self.next();
         if (self.recordErr(ev.msg)) return error.ServerError;
         if (ev.msg != .session_opened) return error.UnexpectedReply;
+
         return .{ .id = ev.header.session_id, .kv_pos = ev.msg.session_opened.kv_pos };
     }
 
@@ -410,6 +429,7 @@ pub const Client = struct {
         if (self.recordErr(ev.msg)) return error.ServerError;
         if (ev.msg != .appended or ev.header.request_id != request_id) return error.UnexpectedReply;
         if (ev.msg.appended.n != pairs.len) return error.UnexpectedReply;
+
         return ev.msg.appended;
     }
 
@@ -419,12 +439,26 @@ pub const Client = struct {
         std.debug.assert(pairs.len >= 1);
         std.debug.assert(pairs.len <= limits.max_append_pairs);
         std.debug.assert(protocol.appendPairsBytes(pairs) <= protocol.append_pairs_bytes_max);
-        return self.send(.{ .session_append = protocol.encodeAppendPairs(pairs, self.pair_buf) }, session_id);
+
+        return self.send(
+            .{ .session_append = protocol.encodeAppendPairs(pairs, self.pair_buf) },
+            session_id,
+        );
     }
 
     /// Fire a turn. The caller then loops `next` for token/done events.
-    pub fn generate(self: *Client, session_id: u32, text: []const u8, max_tokens: u32, sampling: ?protocol.Sampling) !u32 {
-        return self.generateWith(session_id, text, .{ .max_tokens = max_tokens, .sampling = sampling });
+    pub fn generate(
+        self: *Client,
+        session_id: u32,
+        text: []const u8,
+        max_tokens: u32,
+        sampling: ?protocol.Sampling,
+    ) !u32 {
+        return self.generateWith(
+            session_id,
+            text,
+            .{ .max_tokens = max_tokens, .sampling = sampling },
+        );
     }
 
     /// The per-turn fields of a `generate`. A null field takes the session
@@ -449,9 +483,11 @@ pub const Client = struct {
     /// frame goes out.
     pub fn generateWith(self: *Client, session_id: u32, text: []const u8, opts: TurnOptions) !u32 {
         std.debug.assert(opts.max_tokens > 0);
+
         if (opts.think_budget) |b| std.debug.assert(b <= limits.max_model_ctx);
         if (opts.reseed) std.debug.assert(opts.sampling != null);
         if (text.len > protocol.generate_text_bytes_max) return error.TextTooLong;
+
         return self.send(.{ .generate = .{
             .max_tokens = opts.max_tokens,
             .sampling = opts.sampling,
@@ -476,6 +512,7 @@ pub const Client = struct {
         const ev = try self.replyTo(request_id);
         if (self.recordErr(ev.msg)) return error.ServerError;
         if (ev.msg != .kept or ev.header.session_id != session_id) return error.UnexpectedReply;
+
         return ev.msg.kept;
     }
 
@@ -493,6 +530,7 @@ pub const Client = struct {
         const ev = try self.replyTo(request_id);
         if (self.recordErr(ev.msg)) return error.ServerError;
         if (ev.msg != .resumed or ev.header.session_id == 0) return error.UnexpectedReply;
+
         return .{ .id = ev.header.session_id, .state = ev.msg.resumed };
     }
 
@@ -560,13 +598,18 @@ pub const Client = struct {
             switch (ev.msg) {
                 .token => |t| {
                     on_token.onToken(t.token_id, t.channel, t.text);
-                    if (n_tokens < ids_out.len) ids_out[n_tokens] = t.token_id;
+                    if (n_tokens < ids_out.len) {
+                        ids_out[n_tokens] = t.token_id;
+                    }
+
                     n_tokens += 1;
                     if (self.eos_id != null and t.token_id == self.eos_id.?) continue;
+
                     if (text_len == text_total and text_len + t.text.len <= text_out.len) {
                         @memcpy(text_out[text_len..][0..t.text.len], t.text);
                         text_len += t.text.len;
                     }
+
                     text_total += t.text.len;
                 },
                 .done => |d| return .{
@@ -612,6 +655,7 @@ pub const Client = struct {
             .err => |e| e,
             else => return false,
         };
+
         self.last_error = lastErrorFrom(e);
         return true;
     }
@@ -630,6 +674,7 @@ pub const Client = struct {
     fn helloInfoFrom(m: @FieldType(protocol.ServerMsg, "hello_ack")) HelloInfo {
         // The decoder refuses a longer name.
         std.debug.assert(m.model_name.len <= limits.max_model_name_bytes);
+
         var info: HelloInfo = .{
             .max_seq = m.max_seq,
             .max_sessions = m.max_sessions,
@@ -658,6 +703,40 @@ pub const Client = struct {
     }
 };
 
+// -- api --------------------------------------------------------------------
+
+pub fn toOwned(ev: Event) OwnedEvent {
+    const body: OwnedEvent.Body = switch (ev.msg) {
+        .hello_ack => |m| .{ .hello_ack = Client.helloInfoFrom(m) },
+        .session_opened => |m| .{ .session_opened = m },
+        .token => |m| blk: {
+            std.debug.assert(m.text.len <= limits.max_token_text_bytes);
+
+            var b: OwnedEvent.Body = .{
+                .token = .{
+                    .token_id = m.token_id,
+                    .channel = m.channel,
+                    .len = @intCast(m.text.len),
+                    .text = undefined,
+                },
+            };
+            @memcpy(b.token.text[0..m.text.len], m.text);
+            break :blk b;
+        },
+        .done => |m| .{ .done = m },
+        .err => |m| .{ .err = Client.lastErrorFrom(m) },
+        .stats_ack => |m| .{ .stats_ack = Client.statsFrom(m) },
+        .pong => .pong,
+        .session_closed => .session_closed,
+        .shutdown_ack => .shutdown_ack,
+        .appended => |m| .{ .appended = m },
+        .kept => |m| .{ .kept = m },
+        .resumed => |m| .{ .resumed = m },
+    };
+
+    return .{ .header = ev.header, .body = body };
+}
+
 // -- helpers ----------------------------------------------------------------
 
 /// Reads the flags byte, then the rest of the head that the flags announce,
@@ -681,7 +760,12 @@ const HookLog = struct {
     text_len: usize = 0,
     channels: [8]protocol.Channel = undefined,
 
-    pub fn onToken(self: *HookLog, token_id: u32, channel: protocol.Channel, text: []const u8) void {
+    pub fn onToken(
+        self: *HookLog,
+        token_id: u32,
+        channel: protocol.Channel,
+        text: []const u8,
+    ) void {
         self.channels[self.n] = channel;
         self.ids[self.n] = token_id;
         self.n += 1;
@@ -704,6 +788,7 @@ test "collectTurnWith: the hook sees every token frame in order, the end-of-sequ
     const gpa = std.testing.allocator;
     var frames: std.ArrayList(u8) = .empty;
     defer frames.deinit(gpa);
+
     const Sent = struct { id: u32, channel: protocol.Channel, text: []const u8 };
     const sent = [_]Sent{
         .{ .id = 5, .channel = .open_tag, .text = "<think>" },
@@ -712,7 +797,14 @@ test "collectTurnWith: the hook sees every token frame in order, the end-of-sequ
         .{ .id = 9, .channel = .content, .text = "ok" },
         .{ .id = 7, .channel = .content, .text = "<eos>" },
     };
-    for (sent) |s| try appendServerFrame(gpa, &frames, .{ .token = .{ .token_id = s.id, .channel = s.channel, .text = s.text } });
+    for (sent) |s| {
+        try appendServerFrame(
+            gpa,
+            &frames,
+            .{ .token = .{ .token_id = s.id, .channel = s.channel, .text = s.text } },
+        );
+    }
+
     try appendServerFrame(gpa, &frames, .{ .done = .{
         .finish_reason = .eos,
         .turn_prompt_tokens = 3,
@@ -727,6 +819,7 @@ test "collectTurnWith: the hook sees every token frame in order, the end-of-sequ
     // end-of-sequence id, so the test sets those three fields.
     const payload = try gpa.alloc(u8, protocol.max_frame_payload_bytes);
     defer gpa.free(payload);
+
     var client: Client = undefined;
     client.reader.interface = .fixed(frames.items);
     client.payload_buf = payload;
@@ -737,8 +830,13 @@ test "collectTurnWith: the hook sees every token frame in order, the end-of-sequ
     var text: [64]u8 = undefined;
     const turn = try client.collectTurnWith(&ids, &text, &hook);
     try std.testing.expectEqualSlices(u32, &.{ 5, 6, 8, 9, 7 }, hook.ids[0..hook.n]);
-    try std.testing.expectEqualStrings("<think>|ab|</think>|ok|<eos>|", hook.text[0..hook.text_len]);
-    for (sent, hook.channels[0..hook.n]) |s, channel| try std.testing.expectEqual(s.channel, channel);
+    try std.testing.expectEqualStrings(
+        "<think>|ab|</think>|ok|<eos>|",
+        hook.text[0..hook.text_len],
+    );
+    for (sent, hook.channels[0..hook.n]) |s, channel| {
+        try std.testing.expectEqual(s.channel, channel);
+    }
 
     // The hook changes nothing in the turn that `collectTurn` returns.
     try std.testing.expectEqual(@as(usize, 5), turn.n_tokens);
@@ -753,6 +851,7 @@ test "generateWith: a text past the frame bound is refused before any frame goes
     const gpa = std.testing.allocator;
     const text = try gpa.alloc(u8, protocol.generate_text_bytes_max + 1);
     defer gpa.free(text);
+
     @memset(text, 'a');
     // The refusal reads no field of the client, so an unset client shows
     // that no write ran.

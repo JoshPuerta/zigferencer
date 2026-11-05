@@ -84,10 +84,16 @@ fn cpuRunner(
     );
 }
 
-fn soloStream(arena: std.mem.Allocator, io: std.Io, loaded: *const loader.Loaded, ids: []const u32) !Stream {
+fn soloStream(
+    arena: std.mem.Allocator,
+    io: std.Io,
+    loaded: *const loader.Loaded,
+    ids: []const u32,
+) !Stream {
     var cpu_pool: tp.Pool = undefined;
     try tp.startPool(&cpu_pool, io, default_policy);
     defer cpu_pool.deinit();
+
     var runner = try cpuRunner(arena, io, &cpu_pool, loaded, 1, .f32, default_policy);
     var pool = try Sessions(QwenRunner).init(arena, &runner);
     const sid = try pool.create(0, .{});
@@ -100,6 +106,7 @@ fn soloStream(arena: std.mem.Allocator, io: std.Io, loaded: *const loader.Loaded
         s.tokens[k] = out[0];
         s.logits_hash[k] = hashLogitsRow(&runner, 0);
     }
+
     return s;
 }
 
@@ -113,9 +120,11 @@ fn greedyProbe(
     out: []u32,
 ) !void {
     std.debug.assert(out.len >= 1);
+
     var cpu_pool: tp.Pool = undefined;
     try tp.startPool(&cpu_pool, io, default_policy);
     defer cpu_pool.deinit();
+
     var runner = try cpuRunner(arena, io, &cpu_pool, loaded, 1, kv_dtype, default_policy);
     var pool = try Sessions(QwenRunner).init(arena, &runner);
     const sid = try pool.create(0, .{});
@@ -134,22 +143,29 @@ test "qwen time-sliced sessions are bit-identical to solo runs, and slot reuse s
     const gpa = std.testing.allocator;
     var arena_state = std.heap.ArenaAllocator.init(gpa);
     defer arena_state.deinit();
+
     const arena = arena_state.allocator();
     const fixture = try z.test_fixtures.path(arena, "Qwen3.5-2B-Q8_0");
 
     var loaded = try loader.load(io, arena, fixture);
     defer loaded.close();
+
     var v = try vocab_mod.buildFromParsed(arena, loaded.parsed);
     var prompt_ids: [prompts.len][]const u32 = undefined;
-    for (prompts, 0..) |p, i| prompt_ids[i] = try bpe.encodeAlloc(&v, arena, p, true);
+    for (prompts, 0..) |p, i| {
+        prompt_ids[i] = try bpe.encodeAlloc(&v, arena, p, true);
+    }
 
     var reference: [prompts.len]Stream = undefined;
-    for (prompt_ids, 0..) |ids, p| reference[p] = try soloStream(arena, io, &loaded, ids);
+    for (prompt_ids, 0..) |ids, p| {
+        reference[p] = try soloStream(arena, io, &loaded, ids);
+    }
 
     // -- B: interleaved on one 2-slot runner --------------------------------
     var cpu_pool: tp.Pool = undefined;
     try tp.startPool(&cpu_pool, io, default_policy);
     defer cpu_pool.deinit();
+
     var runner = try cpuRunner(arena, io, &cpu_pool, &loaded, prompts.len, .f32, default_policy);
     var pool = try Sessions(QwenRunner).init(arena, &runner);
     var sids: [prompts.len]u32 = undefined;
@@ -161,6 +177,7 @@ test "qwen time-sliced sessions are bit-identical to solo runs, and slot reuse s
         // logits[0].
         try std.testing.expectEqual(reference[p].logits_hash[0], hashLogitsRow(&runner, 0));
     }
+
     for (1..n_tokens) |k| {
         var out: [prompts.len]u32 = undefined;
         try pool.decodeBatch(&sids, &out);
@@ -171,7 +188,10 @@ test "qwen time-sliced sessions are bit-identical to solo runs, and slot reuse s
     }
 
     // -- C: chunk-fed prefill on fresh sessions -----------------------------
-    for (0..prompts.len) |p| pool.destroy(sids[p]);
+    for (0..prompts.len) |p| {
+        pool.destroy(sids[p]);
+    }
+
     for (prompt_ids, 0..) |ids, p| {
         sids[p] = try pool.create(0, .{});
         var fed: usize = 0;
@@ -182,12 +202,16 @@ test "qwen time-sliced sessions are bit-identical to solo runs, and slot reuse s
             first = try pool.feed(sids[p], ids[fed..][0..n], fed + n == ids.len);
             fed += n;
         }
+
         try std.testing.expectEqual(reference[p].tokens[0], first.?);
     }
+
     for (1..n_tokens) |k| {
         var out: [prompts.len]u32 = undefined;
         try pool.decodeBatch(&sids, &out);
-        for (0..prompts.len) |p| try std.testing.expectEqual(reference[p].tokens[k], out[p]);
+        for (0..prompts.len) |p| {
+            try std.testing.expectEqual(reference[p].tokens[k], out[p]);
+        }
     }
 
     // -- D: slot reuse must not inherit the previous session's GDN state ----
@@ -201,15 +225,19 @@ test "qwen time-sliced sessions are bit-identical to solo runs, and slot reuse s
         try pool.decodeBatch(&.{reused}, &out);
         again.tokens[k] = out[0];
     }
+
     try std.testing.expectEqualSlices(u32, &reference[0].tokens, &again.tokens);
 
     // -- E: continuous batching ---------------------------------------------
-    // Prompt 1 re-prefills through `advance` chunks that ride the decode ticks
+    // Prompt 1 re-prefills through `advance` chunks that share the decode ticks
     // of prompt 0. Both streams must stay exactly the solo streams.
     pool.destroy(reused);
     pool.destroy(sids[1]);
     const front = try pool.create(0, .{});
-    try std.testing.expectEqual(reference[0].tokens[0], (try pool.feed(front, prompt_ids[0], true)).?);
+    try std.testing.expectEqual(
+        reference[0].tokens[0],
+        (try pool.feed(front, prompt_ids[0], true)).?,
+    );
 
     const late = try pool.create(0, .{});
     var k: usize = 1;
@@ -231,6 +259,7 @@ test "qwen time-sliced sessions are bit-identical to solo runs, and slot reuse s
         try std.testing.expectEqual(reference[0].logits_hash[k], hashLogitsRow(&runner, base));
         k += 1;
     }
+
     try std.testing.expectEqual(reference[1].tokens[0], first_late.?);
     try std.testing.expectEqual(reference[1].logits_hash[0], hashLogitsRow(&runner, 0));
 
@@ -252,12 +281,16 @@ test "qwen time-sliced sessions are bit-identical to solo runs, and slot reuse s
     pool.destroy(front);
     pool.destroy(late);
     const source = try pool.create(0, .{});
-    try std.testing.expectEqual(reference[0].tokens[0], (try pool.feed(source, prompt_ids[0], true)).?);
+    try std.testing.expectEqual(
+        reference[0].tokens[0],
+        (try pool.feed(source, prompt_ids[0], true)).?,
+    );
     for (1..4) |k2| {
         var out: [1]u32 = undefined;
         try pool.decodeBatch(&.{source}, &out);
         try std.testing.expectEqual(reference[0].tokens[k2], out[0]);
     }
+
     const target = try pool.clone(source, 0, .{});
     for (4..n_tokens) |k2| {
         var out: [2]u32 = undefined;
@@ -277,7 +310,16 @@ test "qwen time-sliced sessions are bit-identical to solo runs, and slot reuse s
         var par_cpu_pool: tp.Pool = undefined;
         try tp.startPool(&par_cpu_pool, io, forced);
         defer par_cpu_pool.deinit();
-        var par_runner = try cpuRunner(arena, io, &par_cpu_pool, &loaded, prompts.len, .f32, forced);
+
+        var par_runner = try cpuRunner(
+            arena,
+            io,
+            &par_cpu_pool,
+            &loaded,
+            prompts.len,
+            .f32,
+            forced,
+        );
         var par_pool = try Sessions(QwenRunner).init(arena, &par_runner);
         var par_sids: [prompts.len]u32 = undefined;
         for (prompt_ids, 0..) |ids, p| {
@@ -288,12 +330,16 @@ test "qwen time-sliced sessions are bit-identical to solo runs, and slot reuse s
             // at logits[0].
             try std.testing.expectEqual(reference[p].logits_hash[0], hashLogitsRow(&par_runner, 0));
         }
+
         for (1..n_tokens) |k2| {
             var out: [prompts.len]u32 = undefined;
             try par_pool.decodeBatch(&par_sids, &out);
             for (0..prompts.len) |p| {
                 try std.testing.expectEqual(reference[p].tokens[k2], out[p]);
-                try std.testing.expectEqual(reference[p].logits_hash[k2], hashLogitsRow(&par_runner, p));
+                try std.testing.expectEqual(
+                    reference[p].logits_hash[k2],
+                    hashLogitsRow(&par_runner, p),
+                );
             }
         }
     }
@@ -309,11 +355,13 @@ test "qwen prefix restore: a warm-restored prefix continues bit-exactly" {
     const gpa = std.testing.allocator;
     var arena_state = std.heap.ArenaAllocator.init(gpa);
     defer arena_state.deinit();
+
     const arena = arena_state.allocator();
     const fixture = try z.test_fixtures.path(arena, "Qwen3.5-2B-Q8_0");
 
     var loaded = try loader.load(io, arena, fixture);
     defer loaded.close();
+
     var v = try vocab_mod.buildFromParsed(arena, loaded.parsed);
     const ids = try bpe.encodeAlloc(&v, arena, prompts[0], true);
     std.debug.assert(ids.len >= 2); // the split needs a prefix row and a suffix row
@@ -322,6 +370,7 @@ test "qwen prefix restore: a warm-restored prefix continues bit-exactly" {
     var cpu_pool: tp.Pool = undefined;
     try tp.startPool(&cpu_pool, io, default_policy);
     defer cpu_pool.deinit();
+
     var runner = try cpuRunner(arena, io, &cpu_pool, &loaded, 2, .f32, default_policy);
     var pool = try Sessions(QwenRunner).init(arena, &runner);
 
@@ -360,17 +409,20 @@ test "qwen kv f16: the kv slab halves and the blob round-trips" {
     const gpa = std.testing.allocator;
     var arena_state = std.heap.ArenaAllocator.init(gpa);
     defer arena_state.deinit();
+
     const arena = arena_state.allocator();
     const fixture = try z.test_fixtures.path(arena, "Qwen3.5-2B-Q8_0");
 
     var loaded = try loader.load(io, arena, fixture);
     defer loaded.close();
+
     var v = try vocab_mod.buildFromParsed(arena, loaded.parsed);
     const ids = try bpe.encodeAlloc(&v, arena, prompts[0], true);
 
     var cpu_pool: tp.Pool = undefined;
     try tp.startPool(&cpu_pool, io, default_policy);
     defer cpu_pool.deinit();
+
     var wide = try cpuRunner(arena, io, &cpu_pool, &loaded, 1, .f32, default_policy);
     var narrow = try cpuRunner(arena, io, &cpu_pool, &loaded, 1, .f16, default_policy);
 
@@ -410,11 +462,13 @@ test "qwen kv f16: greedy divergence against f32 stays coherent" {
     const gpa = std.testing.allocator;
     var arena_state = std.heap.ArenaAllocator.init(gpa);
     defer arena_state.deinit();
+
     const arena = arena_state.allocator();
     const fixture = try z.test_fixtures.path(arena, "Qwen3.5-2B-Q8_0");
 
     var loaded = try loader.load(io, arena, fixture);
     defer loaded.close();
+
     var v = try vocab_mod.buildFromParsed(arena, loaded.parsed);
     const ids = try bpe.encodeAlloc(&v, arena, prompts[0], true);
 
@@ -431,6 +485,7 @@ test "qwen kv f16: greedy divergence against f32 stays coherent" {
             break;
         }
     }
+
     // A narrower cache can diverge later, because an argmax tie flips on the
     // last bit. Token 0 reads only the prefill rows this pair just wrote, so a
     // disagreement there means the commit or the attention read the wrong

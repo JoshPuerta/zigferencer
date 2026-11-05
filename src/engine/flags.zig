@@ -1,4 +1,4 @@
-//! The knobs of one engine boot as a plain value. `resolve` reads them, so they
+//! The options of one engine boot as a plain value. `resolve` reads them, so they
 //! live outside the CLI. The CLI attaches the help text in `cli/flags.zig`.
 
 const dtype = @import("../core/dtype.zig");
@@ -16,11 +16,15 @@ pub const ThreadFlags = struct {
     spin_us: ?u64 = null,
 
     pub fn policyFlags(self: ThreadFlags) parallel.Flags {
-        return .{ .threads = self.threads, .min_parallel_flops = self.min_parallel_flops, .spin_us = self.spin_us };
+        return .{
+            .threads = self.threads,
+            .min_parallel_flops = self.min_parallel_flops,
+            .spin_us = self.spin_us,
+        };
     }
 };
 
-/// The knobs of one engine boot.
+/// The options of one engine boot.
 pub const EngineFlags = struct {
     /// Null takes the default of the model (`registry.Model.kv_dtype_default`).
     kv_dtype: ?dtype.KvDtype = null,

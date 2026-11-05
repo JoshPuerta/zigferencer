@@ -34,7 +34,13 @@ pub const RawCodec = struct {
     /// Tokenize a turn's text. No chat-wrap, because the map did it, and the
     /// map also rendered the think tail, so `open` changes nothing here.
     /// `sequence_start` (BOS, per the vocab) opens the prefill turn.
-    pub fn turnTokens(self: *const RawCodec, gpa: Allocator, turn: event.TurnKind, text: []const u8, open: bool) ![]u32 {
+    pub fn turnTokens(
+        self: *const RawCodec,
+        gpa: Allocator,
+        turn: event.TurnKind,
+        text: []const u8,
+        open: bool,
+    ) ![]u32 {
         _ = open;
         const sequence_start = turn == .system or turn == .open_first;
         return bpe.encodeAlloc(self.vocab, gpa, text, sequence_start);
@@ -42,7 +48,13 @@ pub const RawCodec = struct {
 
     /// The connector renders whole conversations through the map, so it has
     /// no pair render, and the scheduler refuses an append with this error.
-    pub fn pairTokens(self: *const RawCodec, gpa: Allocator, place: chat.PairPlace, user: []const u8, assistant: []const u8) error{AppendUnsupported}![]u32 {
+    pub fn pairTokens(
+        self: *const RawCodec,
+        gpa: Allocator,
+        place: chat.PairPlace,
+        user: []const u8,
+        assistant: []const u8,
+    ) error{AppendUnsupported}![]u32 {
         _ = self;
         _ = gpa;
         _ = place;
@@ -53,6 +65,7 @@ pub const RawCodec = struct {
 
     pub fn piece(self: *const RawCodec, id: u32) []const u8 {
         std.debug.assert(id < self.pieces.len);
+
         return self.pieces[id];
     }
 };

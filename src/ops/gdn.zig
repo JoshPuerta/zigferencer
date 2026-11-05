@@ -50,12 +50,14 @@
 
 const std = @import("std");
 
-// -- types ------------------------------------------------------------------
+// -- constants --------------------------------------------------------------
 
 /// Largest per-head state dimension that the stack-allocated scratch accepts.
 /// Qwen3.5 uses ssm.state_size = 128 on both the 2B and the 9B. The bound keeps
 /// the recurrence scratch, the delta vector and a state row, on the stack.
 const max_head_dim: usize = 128;
+
+// -- types ------------------------------------------------------------------
 
 pub const Dims = struct {
     /// GDN key/query heads (= ssm.group_count: 16 on both 2B and 9B).
@@ -74,22 +76,53 @@ pub const Dims = struct {
     pub fn keyDim(self: Dims) usize {
         return self.n_k_heads * self.head_dim;
     }
+
     /// v / z / readout width: n_v_heads x d (= ssm.inner_size).
     pub fn valueDim(self: Dims) usize {
         return self.n_v_heads * self.head_dim;
     }
+
     /// Conv channels: [q(key_dim) | k(key_dim) | v(value_dim)].
     pub fn convDim(self: Dims) usize {
         return 2 * self.keyDim() + self.valueDim();
     }
+
     /// Recurrent state: one dxd matrix per VALUE head.
     pub fn stateLen(self: Dims) usize {
         return self.n_v_heads * self.head_dim * self.head_dim;
     }
+
     /// Floats of conv ring buffer: (K-1) x convDim.
     pub fn convStateLen(self: Dims) usize {
         return (self.conv_kernel - 1) * self.convDim();
     }
+};
+
+/// The inputs and outputs of the value-head loop of one GDN step. The
+/// prologue writes `qkv` before this loop starts. A value-head range reads
+/// `qkv`, the per-head inputs, and the weights, and it writes only the state
+/// and the readout of its own heads. So disjoint ranges can run at the same
+/// time, and each head gets the bits of the serial step.
+pub const Heads = struct {
+    /// [convDim] q|k|v after `stepPrologue`: conv, SiLU, and the q and k norms.
+    qkv: []const f32,
+    /// [inner] gate projection.
+    z: []const f32,
+    /// [n_v_heads] decay projection (ssm_alpha * x_n).
+    a: []const f32,
+    /// [n_v_heads] beta projection (ssm_beta * x_n).
+    b: []const f32,
+    /// [n_v_heads] A_log.
+    ssm_a: []const f32,
+    /// [n_v_heads] ssm_dt.bias.
+    dt_bias: []const f32,
+    /// [head_dim] gated-rmsnorm weight.
+    ssm_norm: []const f32,
+    rms_eps: f32,
+    /// [stateLen] recurrent state. Head `vh` owns `[vh*d*d, (vh+1)*d*d)`.
+    state: []f32,
+    /// [inner] output before ssm_out. Head `vh` owns `[vh*d, (vh+1)*d)`.
+    o_out: []f32,
 };
 
 // -- api --------------------------------------------------------------------
@@ -141,6 +174,7 @@ pub fn chunkScan(
     // The cumulative decay P from the derivation.
     const P = try gpa.alloc(f32, T);
     defer gpa.free(P);
+
     {
         var acc: f32 = 1;
         for (0..T) |r| {
@@ -152,8 +186,10 @@ pub fn chunkScan(
     // `s` still holds S_in here, because the state update comes last.
     const sin_k = try gpa.alloc(f32, T * d);
     defer gpa.free(sin_k);
+
     const sin_q = try gpa.alloc(f32, T * d);
     defer gpa.free(sin_q);
+
     for (0..T) |r| {
         const kr = k[r * d ..][0..d];
         const qr = q[r * d ..][0..d];
@@ -165,6 +201,7 @@ pub fn chunkScan(
                 sk += sij * kr[i];
                 sq += sij * qr[i];
             }
+
             sin_k[r * d + j] = sk;
             sin_q[r * d + j] = sq;
         }
@@ -173,37 +210,57 @@ pub fn chunkScan(
     // delta from the derivation, solved by forward substitution.
     const delta = try gpa.alloc(f32, T * d);
     defer gpa.free(delta);
+
     for (0..T) |r| {
         const kr = k[r * d ..][0..d];
         const vr = v[r * d ..][0..d];
-        for (0..d) |j| delta[r * d + j] = beta[r] * (vr[j] - P[r] * sin_k[r * d + j]);
+        for (0..d) |j| {
+            delta[r * d + j] = beta[r] * (vr[j] - P[r] * sin_k[r * d + j]);
+        }
+
         var sidx: usize = 0;
         while (sidx < r) : (sidx += 1) {
             const ks = k[sidx * d ..][0..d];
             var kk: f32 = 0;
-            for (0..d) |i| kk += ks[i] * kr[i];
+            for (0..d) |i| {
+                kk += ks[i] * kr[i];
+            }
+
             const coef = beta[r] * (P[r] / P[sidx]) * kk;
-            for (0..d) |j| delta[r * d + j] -= coef * delta[sidx * d + j];
+            for (0..d) |j| {
+                delta[r * d + j] -= coef * delta[sidx * d + j];
+            }
         }
     }
 
     // The per-token readout o from the derivation.
     for (0..T) |r| {
         const qr = q[r * d ..][0..d];
-        for (0..d) |j| o[r * d + j] = P[r] * sin_q[r * d + j];
+        for (0..d) |j| {
+            o[r * d + j] = P[r] * sin_q[r * d + j];
+        }
+
         var sidx: usize = 0;
         while (sidx <= r) : (sidx += 1) {
             const ks = k[sidx * d ..][0..d];
             var kq: f32 = 0;
-            for (0..d) |i| kq += ks[i] * qr[i];
+            for (0..d) |i| {
+                kq += ks[i] * qr[i];
+            }
+
             const coef = (P[r] / P[sidx]) * kq;
-            for (0..d) |j| o[r * d + j] += coef * delta[sidx * d + j];
+            for (0..d) |j| {
+                o[r * d + j] += coef * delta[sidx * d + j];
+            }
         }
     }
 
     // The outgoing state S_out from the derivation.
     const plast = P[T - 1];
-    for (s) |*x| x.* *= plast;
+    for (s) |*x| {
+        x.* *= plast;
+    }
+
     var sidx: usize = 0;
     while (sidx < T) : (sidx += 1) {
         const ks = k[sidx * d ..][0..d];
@@ -212,41 +269,22 @@ pub fn chunkScan(
         for (0..d) |i| {
             const ci = coef * ks[i];
             const row = s[i * d ..][0..d];
-            for (0..d) |j| row[j] += ci * ds[j];
+            for (0..d) |j| {
+                row[j] += ci * ds[j];
+            }
         }
     }
+
     if (std.debug.runtime_safety) {
-        for (o[0 .. T * d]) |x| std.debug.assert(std.math.isFinite(x));
-        for (s) |x| std.debug.assert(std.math.isFinite(x));
+        for (o[0 .. T * d]) |x| {
+            std.debug.assert(std.math.isFinite(x));
+        }
+
+        for (s) |x| {
+            std.debug.assert(std.math.isFinite(x));
+        }
     }
 }
-
-/// The inputs and outputs of the value-head loop of one GDN step. The
-/// prologue writes `qkv` before this loop starts. A value-head range reads
-/// `qkv`, the per-head inputs, and the weights, and it writes only the state
-/// and the readout of its own heads. So disjoint ranges can run at the same
-/// time, and each head gets the bits of the serial step.
-pub const Heads = struct {
-    /// [convDim] q|k|v after `stepPrologue`: conv, SiLU, and the q and k norms.
-    qkv: []const f32,
-    /// [inner] gate projection.
-    z: []const f32,
-    /// [n_v_heads] decay projection (ssm_alpha * x_n).
-    a: []const f32,
-    /// [n_v_heads] beta projection (ssm_beta * x_n).
-    b: []const f32,
-    /// [n_v_heads] A_log.
-    ssm_a: []const f32,
-    /// [n_v_heads] ssm_dt.bias.
-    dt_bias: []const f32,
-    /// [head_dim] gated-rmsnorm weight.
-    ssm_norm: []const f32,
-    rms_eps: f32,
-    /// [stateLen] recurrent state. Head `vh` owns `[vh*d*d, (vh+1)*d*d)`.
-    state: []f32,
-    /// [inner] output before ssm_out. Head `vh` owns `[vh*d, (vh+1)*d)`.
-    o_out: []f32,
-};
 
 /// Full per-token GDN step. It mutates `qkv` with the conv result, plus `state`
 /// and `conv_state`. It writes the result before the output projection into
@@ -323,10 +361,15 @@ pub fn stepPrologue(
         const kk = k[kh * dim ..][0..dim];
         l2normInplace(qh, rms_eps);
         l2normInplace(kk, rms_eps);
-        for (qh) |*x| x.* *= q_scale;
+        for (qh) |*x| {
+            x.* *= q_scale;
+        }
     }
+
     if (std.debug.runtime_safety) {
-        for (qkv[0 .. 2 * key_dim]) |x| std.debug.assert(std.math.isFinite(x));
+        for (qkv[0 .. 2 * key_dim]) |x| {
+            std.debug.assert(std.math.isFinite(x));
+        }
     }
 }
 
@@ -375,8 +418,11 @@ pub fn stepHeads(d: Dims, heads: Heads, h_lo: usize, h_hi: usize) void {
 /// caller that splits the value heads runs it after every range ends.
 pub fn assertFinite(d: Dims, o_out: []const f32) void {
     std.debug.assert(o_out.len == d.valueDim());
+
     if (std.debug.runtime_safety) {
-        for (o_out) |x| std.debug.assert(std.math.isFinite(x));
+        for (o_out) |x| {
+            std.debug.assert(std.math.isFinite(x));
+        }
     }
 }
 
@@ -399,9 +445,14 @@ fn softplus(x: f32) f32 {
 /// L2-normalize `x` in place: x /= sqrt(sum(x^2) + eps).
 fn l2normInplace(x: []f32, eps: f32) void {
     var ss: f32 = 0;
-    for (x) |v| ss += v * v;
+    for (x) |v| {
+        ss += v * v;
+    }
+
     const inv = 1.0 / @sqrt(ss + eps);
-    for (x) |*v| v.* *= inv;
+    for (x) |*v| {
+        v.* *= inv;
+    }
 }
 
 /// Causal depthwise conv1d over all `convDim` channels of `qkv`, then SiLU, in
@@ -419,12 +470,18 @@ fn convStepSilu(d: Dims, conv_w: []const f32, conv_state: []f32, qkv: []f32) voi
     while (c < cdim) : (c += 1) {
         var acc: f32 = 0;
         var t: usize = 0;
-        while (t < k - 1) : (t += 1) acc += conv_w[c * k + t] * conv_state[t * cdim + c];
+        while (t < k - 1) : (t += 1) {
+            acc += conv_w[c * k + t] * conv_state[t * cdim + c];
+        }
+
         acc += conv_w[c * k + (k - 1)] * qkv[c];
 
         // Advance the ring: drop the oldest entry, append the current input.
         t = 0;
-        while (t < k - 2) : (t += 1) conv_state[t * cdim + c] = conv_state[(t + 1) * cdim + c];
+        while (t < k - 2) : (t += 1) {
+            conv_state[t * cdim + c] = conv_state[(t + 1) * cdim + c];
+        }
+
         conv_state[(k - 2) * cdim + c] = qkv[c];
 
         qkv[c] = silu(acc);
@@ -435,7 +492,15 @@ fn convStepSilu(d: Dims, conv_w: []const f32, conv_state: []f32, qkv: []f32) voi
 /// `s` is the head's dxd state (`s[i*D + j]`) and the call mutates it. `o`
 /// receives the length-D readout. `q`, `k` and `v` are the head's inputs, with
 /// q and k already L2-normed.
-fn recurStep(s: []f32, q: []const f32, k: []const f32, v: []const f32, decay: f32, beta: f32, o: []f32) void {
+fn recurStep(
+    s: []f32,
+    q: []const f32,
+    k: []const f32,
+    v: []const f32,
+    decay: f32,
+    beta: f32,
+    o: []f32,
+) void {
     const dim = q.len;
     std.debug.assert(s.len == dim * dim);
     std.debug.assert(k.len == dim);
@@ -443,14 +508,19 @@ fn recurStep(s: []f32, q: []const f32, k: []const f32, v: []const f32, decay: f3
     std.debug.assert(o.len == dim);
     std.debug.assert(dim <= max_head_dim);
 
-    for (s) |*x| x.* *= decay;
+    for (s) |*x| {
+        x.* *= decay;
+    }
 
     var delta: [max_head_dim]f32 = undefined;
     var j: usize = 0;
     while (j < dim) : (j += 1) {
         var mem: f32 = 0;
         var i: usize = 0;
-        while (i < dim) : (i += 1) mem += s[i * dim + j] * k[i];
+        while (i < dim) : (i += 1) {
+            mem += s[i * dim + j] * k[i];
+        }
+
         delta[j] = (v[j] - mem) * beta;
     }
 
@@ -475,10 +545,15 @@ fn gatedRmsNormInplace(o: []f32, weight: []const f32, gate: []const f32, eps: f3
     std.debug.assert(weight.len == dim);
     std.debug.assert(gate.len == dim);
     var ss: f32 = 0;
-    for (o) |v| ss += v * v;
+    for (o) |v| {
+        ss += v * v;
+    }
+
     const inv = 1.0 / @sqrt(ss / @as(f32, @floatFromInt(dim)) + eps);
     var j: usize = 0;
-    while (j < dim) : (j += 1) o[j] = o[j] * inv * weight[j] * silu(gate[j]);
+    while (j < dim) : (j += 1) {
+        o[j] = o[j] * inv * weight[j] * silu(gate[j]);
+    }
 }
 
 // -- tests ------------------------------------------------------------------
@@ -526,8 +601,13 @@ test "recurStep first token: o = (k·q)·beta·v when state starts at zero" {
     recurStep(&s, &q, &k, &v, 1.0, beta, &o);
 
     var kq: f32 = 0;
-    for (q, k) |qi, ki| kq += qi * ki;
-    for (v, o) |vj, oj| try std.testing.expectApproxEqAbs(kq * beta * vj, oj, 1e-5);
+    for (q, k) |qi, ki| {
+        kq += qi * ki;
+    }
+
+    for (v, o) |vj, oj| {
+        try std.testing.expectApproxEqAbs(kq * beta * vj, oj, 1e-5);
+    }
 }
 
 test "chunkScan matches sequential recurStep (state + per-token readout)" {
@@ -541,43 +621,82 @@ test "chunkScan matches sequential recurStep (state + per-token readout)" {
 
         const q = try gpa.alloc(f32, T * d);
         defer gpa.free(q);
+
         const k = try gpa.alloc(f32, T * d);
         defer gpa.free(k);
+
         const v = try gpa.alloc(f32, T * d);
         defer gpa.free(v);
+
         const decay = try gpa.alloc(f32, T);
         defer gpa.free(decay);
+
         const beta = try gpa.alloc(f32, T);
         defer gpa.free(beta);
-        for (q) |*x| x.* = (r.float(f32) - 0.5);
-        for (k) |*x| x.* = (r.float(f32) - 0.5);
-        for (v) |*x| x.* = (r.float(f32) - 0.5) * 2.0;
+
+        for (q) |*x| {
+            x.* = (r.float(f32) - 0.5);
+        }
+
+        for (k) |*x| {
+            x.* = (r.float(f32) - 0.5);
+        }
+
+        for (v) |*x| {
+            x.* = (r.float(f32) - 0.5) * 2.0;
+        }
+
         // decay in (0,1) via exp(g) with g<0. beta in (0,1) via sigmoid.
-        for (decay) |*x| x.* = @exp(-(r.float(f32) * 0.5)); // ~[0.6, 1.0]
-        for (beta) |*x| x.* = sigmoid((r.float(f32) - 0.5) * 4.0);
+        for (decay) |*x| {
+            x.* = @exp(-(r.float(f32) * 0.5)); // ~[0.6, 1.0]
+        }
+
+        for (beta) |*x| {
+            x.* = sigmoid((r.float(f32) - 0.5) * 4.0);
+        }
 
         const s0 = try gpa.alloc(f32, d * d);
         defer gpa.free(s0);
-        for (s0) |*x| x.* = (r.float(f32) - 0.5) * 0.2;
+
+        for (s0) |*x| {
+            x.* = (r.float(f32) - 0.5) * 0.2;
+        }
 
         // Sequential reference: recurStep over the T tokens.
         const s_seq = try gpa.dupe(f32, s0);
         defer gpa.free(s_seq);
+
         const o_seq = try gpa.alloc(f32, T * d);
         defer gpa.free(o_seq);
+
         for (0..T) |t| {
-            recurStep(s_seq, q[t * d ..][0..d], k[t * d ..][0..d], v[t * d ..][0..d], decay[t], beta[t], o_seq[t * d ..][0..d]);
+            recurStep(
+                s_seq,
+                q[t * d ..][0..d],
+                k[t * d ..][0..d],
+                v[t * d ..][0..d],
+                decay[t],
+                beta[t],
+                o_seq[t * d ..][0..d],
+            );
         }
 
         // Chunked.
         const s_chunk = try gpa.dupe(f32, s0);
         defer gpa.free(s_chunk);
+
         const o_chunk = try gpa.alloc(f32, T * d);
         defer gpa.free(o_chunk);
+
         try chunkScan(gpa, d, T, s_chunk, q, k, v, decay, beta, o_chunk);
 
-        for (o_seq, o_chunk) |a, b| try std.testing.expectApproxEqAbs(a, b, 1e-4);
-        for (s_seq, s_chunk) |a, b| try std.testing.expectApproxEqAbs(a, b, 1e-4);
+        for (o_seq, o_chunk) |a, b| {
+            try std.testing.expectApproxEqAbs(a, b, 1e-4);
+        }
+
+        for (s_seq, s_chunk) |a, b| {
+            try std.testing.expectApproxEqAbs(a, b, 1e-4);
+        }
     }
 }
 
@@ -585,7 +704,10 @@ test "l2normInplace yields unit norm" {
     var x = [_]f32{ 3, 4, 0, 0 };
     l2normInplace(&x, 0);
     var ss: f32 = 0;
-    for (x) |v| ss += v * v;
+    for (x) |v| {
+        ss += v * v;
+    }
+
     try std.testing.expectApproxEqAbs(@as(f32, 1.0), ss, 1e-5);
     try std.testing.expectApproxEqAbs(@as(f32, 0.6), x[0], 1e-5);
     try std.testing.expectApproxEqAbs(@as(f32, 0.8), x[1], 1e-5);
@@ -607,9 +729,16 @@ test "step: the prologue, then every value head alone in reverse order, gives th
             const cd = d.convDim();
             const vd = d.valueDim();
             const nv = d.n_v_heads;
-            const buf = try gpa.alloc(f32, 2 * cd + vd + 2 * nv + d.conv_kernel * cd + 2 * nv + d.head_dim);
+            const buf = try gpa.alloc(
+                f32,
+                2 * cd + vd + 2 * nv + d.conv_kernel * cd + 2 * nv + d.head_dim,
+            );
             defer gpa.free(buf);
-            for (buf) |*x| x.* = r.float(f32) * 2.0 - 1.0;
+
+            for (buf) |*x| {
+                x.* = r.float(f32) * 2.0 - 1.0;
+            }
+
             var at: usize = 0;
             const qkv_in = buf[at..][0..cd];
             at += cd;
@@ -627,33 +756,65 @@ test "step: the prologue, then every value head alone in reverse order, gives th
             at += nv;
             const ssm_norm = buf[at..][0..d.head_dim];
             // GGUF ssm_a is -exp(A_log), so it is negative.
-            for (ssm_a) |*x| x.* = -@abs(x.*) - 0.1;
+            for (ssm_a) |*x| {
+                x.* = -@abs(x.*) - 0.1;
+            }
 
             const state_ref = try gpa.alloc(f32, d.stateLen());
             defer gpa.free(state_ref);
-            for (state_ref) |*x| x.* = (r.float(f32) - 0.5) * 0.2;
+
+            for (state_ref) |*x| {
+                x.* = (r.float(f32) - 0.5) * 0.2;
+            }
+
             const state_split = try gpa.dupe(f32, state_ref);
             defer gpa.free(state_split);
+
             const conv_ref = try gpa.alloc(f32, d.convStateLen());
             defer gpa.free(conv_ref);
-            for (conv_ref) |*x| x.* = r.float(f32) - 0.5;
+
+            for (conv_ref) |*x| {
+                x.* = r.float(f32) - 0.5;
+            }
+
             const conv_split = try gpa.dupe(f32, conv_ref);
             defer gpa.free(conv_split);
+
             const qkv_ref = try gpa.alloc(f32, cd);
             defer gpa.free(qkv_ref);
+
             const qkv_split = try gpa.alloc(f32, cd);
             defer gpa.free(qkv_split);
+
             const o_ref = try gpa.alloc(f32, vd);
             defer gpa.free(o_ref);
+
             const o_split = try gpa.alloc(f32, vd);
             defer gpa.free(o_split);
 
             // Several tokens carry the state, so a head that reads a stale key
             // or writes a neighbor moves the later tokens.
             for (0..tokens) |t| {
-                for (qkv_ref, qkv_in) |*x, y| x.* = y + @as(f32, @floatFromInt(t)) * 0.25;
+                for (qkv_ref, qkv_in) |*x, y| {
+                    x.* = y + @as(f32, @floatFromInt(t)) * 0.25;
+                }
+
                 @memcpy(qkv_split, qkv_ref);
-                step(d, qkv_ref, z, a, b, conv_w, ssm_a, dt_bias, ssm_norm, 1e-6, state_ref, conv_ref, o_ref);
+                step(
+                    d,
+                    qkv_ref,
+                    z,
+                    a,
+                    b,
+                    conv_w,
+                    ssm_a,
+                    dt_bias,
+                    ssm_norm,
+                    1e-6,
+                    state_ref,
+                    conv_ref,
+                    o_ref,
+                );
 
                 @memset(o_split, std.math.nan(f32));
                 stepPrologue(d, qkv_split, conv_w, conv_split, 1e-6);
@@ -670,13 +831,32 @@ test "step: the prologue, then every value head alone in reverse order, gives th
                     .o_out = o_split,
                 };
                 var vh: usize = nv;
-                while (vh > 0) : (vh -= 1) stepHeads(d, heads, vh - 1, vh);
+                while (vh > 0) : (vh -= 1) {
+                    stepHeads(d, heads, vh - 1, vh);
+                }
+
                 assertFinite(d, o_split);
 
-                try std.testing.expectEqualSlices(u8, std.mem.sliceAsBytes(qkv_ref), std.mem.sliceAsBytes(qkv_split));
-                try std.testing.expectEqualSlices(u8, std.mem.sliceAsBytes(o_ref), std.mem.sliceAsBytes(o_split));
-                try std.testing.expectEqualSlices(u8, std.mem.sliceAsBytes(state_ref), std.mem.sliceAsBytes(state_split));
-                try std.testing.expectEqualSlices(u8, std.mem.sliceAsBytes(conv_ref), std.mem.sliceAsBytes(conv_split));
+                try std.testing.expectEqualSlices(
+                    u8,
+                    std.mem.sliceAsBytes(qkv_ref),
+                    std.mem.sliceAsBytes(qkv_split),
+                );
+                try std.testing.expectEqualSlices(
+                    u8,
+                    std.mem.sliceAsBytes(o_ref),
+                    std.mem.sliceAsBytes(o_split),
+                );
+                try std.testing.expectEqualSlices(
+                    u8,
+                    std.mem.sliceAsBytes(state_ref),
+                    std.mem.sliceAsBytes(state_split),
+                );
+                try std.testing.expectEqualSlices(
+                    u8,
+                    std.mem.sliceAsBytes(conv_ref),
+                    std.mem.sliceAsBytes(conv_split),
+                );
             }
         }
     }

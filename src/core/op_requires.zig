@@ -12,6 +12,13 @@ const std = @import("std");
 const builtin = @import("builtin");
 const hwinfo = @import("hwinfo.zig");
 
+// -- constants --------------------------------------------------------------
+
+/// Every selectable `-Dops-backend` value, in display order. The one list that
+/// the UI surfaces enumerating backends read from (the run command's legend,
+/// the support matrix of `info`). `build.zig` resolves the same names at build time.
+pub const ops_backend_names = [_][]const u8{ "naive", "simd", "simd_pf", "vulkan", "vulkan_fused" };
+
 // -- types ------------------------------------------------------------------
 
 /// Target CPU architecture family (`.any` = runs anywhere). Only the
@@ -78,11 +85,6 @@ pub const OpRequires = struct {
 
 // -- api --------------------------------------------------------------------
 
-/// Every selectable `-Dops-backend` value, in display order. The one list that
-/// the UI surfaces enumerating backends read from (the run command's legend,
-/// the support matrix of `info`). `build.zig` resolves the same names at build time.
-pub const ops_backend_names = [_][]const u8{ "naive", "simd", "simd_pf", "vulkan", "vulkan_fused" };
-
 /// Combine an observed max relative error and a hash-match bit against the
 /// variant's declared tolerance. Returns true only when the variant honors
 /// that tolerance. The bench prints both numbers either way, so a hash-equal
@@ -108,9 +110,11 @@ pub fn isMetBy(req: OpRequires, cpu: std.Target.Cpu) bool {
         .any => true,
         .x86_64 => cpu.arch == .x86_64,
     };
+
     if (!arch_ok) return false;
     if (!simdLevelMetBy(req.min_simd, cpu)) return false;
     if (req.needs_fma and !fmaAvailableBy(cpu)) return false;
+
     return true;
 }
 
@@ -121,9 +125,11 @@ pub fn isMetByHost(req: OpRequires, card: hwinfo.HwCard) bool {
         .any => true,
         .x86_64 => std.mem.eql(u8, card.arch, "x86_64"),
     };
+
     if (!arch_ok) return false;
     if (!simdLevelMetByHost(req.min_simd, card.simd)) return false;
     if (req.needs_fma and !card.simd.fma) return false;
+
     return true;
 }
 
@@ -164,7 +170,9 @@ test "avx2 requirement is filtered by arch" {
     // The test cannot assume the host has AVX2, only that the check agrees
     // with the same check inlined.
     const host_arch_ok = builtin.cpu.arch == .x86_64;
-    if (!host_arch_ok) try std.testing.expect(!isMetBy(req, builtin.cpu));
+    if (!host_arch_ok) {
+        try std.testing.expect(!isMetBy(req, builtin.cpu));
+    }
 }
 
 test "runtime default is cpu and matches host=cpu" {

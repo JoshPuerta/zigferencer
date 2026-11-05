@@ -7,7 +7,7 @@
 //! Width 8 matches the 256-bit AVX2 ymm register, and Zig lowers it to a NEON
 //! 4+4 pair. A vector reduction sums in a different order than a scalar loop, so
 //! the output differs bit for bit from naive but stays inside the declared
-//! tolerance. naive stays the oracle.
+//! tolerance. naive stays the reference.
 
 const std = @import("std");
 const attention_simd = @import("attention_simd.zig");
@@ -16,13 +16,9 @@ const op_requires = @import("../core/op_requires.zig");
 const Tensor = @import("../core/tensor.zig").Tensor;
 const f16BitsToF32 = naive.f16BitsToF32;
 
-// -- types ------------------------------------------------------------------
+// -- constants --------------------------------------------------------------
 
 const vec_lanes = 8;
-const Vec = @Vector(vec_lanes, f32);
-const VecI8 = @Vector(vec_lanes, i8);
-
-// -- api --------------------------------------------------------------------
 
 /// AVX2 and FMA on x86_64. The build system rejects `-Dops-backend=simd` when
 /// the target does not meet these.
@@ -34,15 +30,25 @@ pub const requires: op_requires.OpRequires = .{
     .needs_fma = true,
 };
 
-pub const dequantQ80 = naive.dequantQ80;
-pub const embedLookup = naive.embedLookup;
 pub const rmsnorm = naive.rmsnorm;
 pub const swiglu = naive.swiglu;
+
+// -- types ------------------------------------------------------------------
+
+const Vec = @Vector(vec_lanes, f32);
+const VecI8 = @Vector(vec_lanes, i8);
+
+// -- api --------------------------------------------------------------------
+
+pub const dequantQ80 = naive.dequantQ80;
+pub const embedLookup = naive.embedLookup;
+
 pub const residualAdd = naive.residualAdd;
 pub const ropeInplace = naive.ropeInplace;
 pub const attentionPartTyped = attention_simd.plain.attentionPartTyped;
 pub const attentionMerge = attention_simd.plain.attentionMerge;
 pub const attentionRowTyped = attention_simd.plain.attentionRowTyped;
+
 // The q4 CPU path exists for completeness, so it reuses the naive scalar
 // dequant-and-dot. The runner still parallelizes it across rows.
 pub const linearF32Q40 = naive.linearF32Q40;
@@ -55,6 +61,7 @@ pub const linearF32Q6KBatch = naive.linearF32Q6KBatch;
 pub fn linearF32(input: []const f32, weight: Tensor, out: []f32) void {
     std.debug.assert(weight.dtype == .f32);
     std.debug.assert(weight.n_dims == 2);
+
     const in_features: usize = @intCast(weight.shape[0]);
     const out_features: usize = @intCast(weight.shape[1]);
     std.debug.assert(input.len == in_features);
@@ -72,18 +79,26 @@ pub fn linearF32(input: []const f32, weight: Tensor, out: []f32) void {
             const b: Vec = row[k..][0..vec_lanes].*;
             acc += a * b;
         }
+
         var sum: f32 = @reduce(.Add, acc);
-        while (k < in_features) : (k += 1) sum += input[k] * row[k];
+        while (k < in_features) : (k += 1) {
+            sum += input[k] * row[k];
+        }
+
         out[j] = sum;
     }
+
     if (std.debug.runtime_safety) {
-        for (out[0..out_features]) |x| std.debug.assert(std.math.isFinite(x));
+        for (out[0..out_features]) |x| {
+            std.debug.assert(std.math.isFinite(x));
+        }
     }
 }
 
 pub fn linearF32Q80(input: []const f32, weight: Tensor, out: []f32) void {
     std.debug.assert(weight.dtype == .q8_0);
     std.debug.assert(weight.n_dims == 2);
+
     const in_features: usize = @intCast(weight.shape[0]);
     const out_features: usize = @intCast(weight.shape[1]);
     std.debug.assert(input.len == in_features);
@@ -115,21 +130,37 @@ pub fn linearF32Q80(input: []const f32, weight: Tensor, out: []f32) void {
                 acc += w_v * in_v;
             }
         }
+
         out[j] = @reduce(.Add, acc);
     }
+
     if (std.debug.runtime_safety) {
-        for (out[0..out_features]) |x| std.debug.assert(std.math.isFinite(x));
+        for (out[0..out_features]) |x| {
+            std.debug.assert(std.math.isFinite(x));
+        }
     }
 }
 
 /// Batch by rows over this variant's own kernels. The result is bit-identical
 /// to one B=1 call per row. No weight-reuse win exists here, because the
 /// batched microkernel lives in `simd_pf`, which is the auto default.
-pub fn linearF32Batch(inputs: []const f32, weight: Tensor, outs: []f32, batch: usize, out_stride: usize) void {
+pub fn linearF32Batch(
+    inputs: []const f32,
+    weight: Tensor,
+    outs: []f32,
+    batch: usize,
+    out_stride: usize,
+) void {
     naive.linearBatchPerRow(linearF32, inputs, weight, outs, batch, out_stride);
 }
 
-pub fn linearF32Q80Batch(inputs: []const f32, weight: Tensor, outs: []f32, batch: usize, out_stride: usize) void {
+pub fn linearF32Q80Batch(
+    inputs: []const f32,
+    weight: Tensor,
+    outs: []f32,
+    batch: usize,
+    out_stride: usize,
+) void {
     naive.linearBatchPerRow(linearF32Q80, inputs, weight, outs, batch, out_stride);
 }
 
@@ -144,14 +175,20 @@ test "simd linearF32Q80Batch is bit-identical to per-row simd linearF32Q80" {
 
     const inputs = try gpa.alloc(f32, batch * in_features);
     defer gpa.free(inputs);
+
     const w_data = try gpa.alignedAlloc(u8, .@"32", out_features * row_bytes);
     defer gpa.free(w_data);
+
     const outs = try gpa.alloc(f32, batch * out_features);
     defer gpa.free(outs);
+
     const out_single = try gpa.alloc(f32, out_features);
     defer gpa.free(out_single);
 
-    for (inputs, 0..) |*x, i| x.* = @sin(@as(f32, @floatFromInt(i)) * 0.04);
+    for (inputs, 0..) |*x, i| {
+        x.* = @sin(@as(f32, @floatFromInt(i)) * 0.04);
+    }
+
     for (0..out_features) |row| {
         const off = row * row_bytes;
         var blk: usize = 0;
@@ -165,6 +202,7 @@ test "simd linearF32Q80Batch is bit-identical to per-row simd linearF32Q80" {
             }
         }
     }
+
     const w: Tensor = .{
         .dtype = .q8_0,
         .n_dims = 2,
@@ -189,16 +227,24 @@ test "simd linearF32 matches naive within tolerance" {
 
     const input = try gpa.alignedAlloc(f32, .of(f32), in_features);
     defer gpa.free(input);
+
     const w_data = try gpa.alignedAlloc(u8, .@"32", in_features * out_features * @sizeOf(f32));
     defer gpa.free(w_data);
+
     const out_naive = try gpa.alloc(f32, out_features);
     defer gpa.free(out_naive);
+
     const out_simd = try gpa.alloc(f32, out_features);
     defer gpa.free(out_simd);
 
-    for (input, 0..) |*x, i| x.* = @sin(@as(f32, @floatFromInt(i)) * 0.01);
+    for (input, 0..) |*x, i| {
+        x.* = @sin(@as(f32, @floatFromInt(i)) * 0.01);
+    }
+
     const w_f32: []f32 = @alignCast(std.mem.bytesAsSlice(f32, w_data));
-    for (w_f32, 0..) |*x, i| x.* = @cos(@as(f32, @floatFromInt(i)) * 0.003);
+    for (w_f32, 0..) |*x, i| {
+        x.* = @cos(@as(f32, @floatFromInt(i)) * 0.003);
+    }
 
     const w: Tensor = .{
         .dtype = .f32,
@@ -214,7 +260,9 @@ test "simd linearF32 matches naive within tolerance" {
     // An f32 dot product over hundreds of elements accumulates rounding on the
     // order of N*eps. SIMD reduces in a different tree than scalar, so 1e-3
     // relative is the right tolerance, not 1e-7.
-    for (out_naive, out_simd) |n, s| try std.testing.expectApproxEqRel(n, s, 1e-3);
+    for (out_naive, out_simd) |n, s| {
+        try std.testing.expectApproxEqRel(n, s, 1e-3);
+    }
 }
 
 test "simd linearF32Q80 matches naive within tolerance" {
@@ -225,14 +273,20 @@ test "simd linearF32Q80 matches naive within tolerance" {
 
     const input = try gpa.alignedAlloc(f32, .of(f32), in_features);
     defer gpa.free(input);
+
     const w_data = try gpa.alignedAlloc(u8, .@"32", out_features * row_bytes);
     defer gpa.free(w_data);
+
     const out_naive = try gpa.alloc(f32, out_features);
     defer gpa.free(out_naive);
+
     const out_simd = try gpa.alloc(f32, out_features);
     defer gpa.free(out_simd);
 
-    for (input, 0..) |*x, i| x.* = @sin(@as(f32, @floatFromInt(i)) * 0.01);
+    for (input, 0..) |*x, i| {
+        x.* = @sin(@as(f32, @floatFromInt(i)) * 0.01);
+    }
+
     for (0..out_features) |row| {
         const off = row * row_bytes;
         var blk: usize = 0;
@@ -247,6 +301,7 @@ test "simd linearF32Q80 matches naive within tolerance" {
             }
         }
     }
+
     const w: Tensor = .{
         .dtype = .q8_0,
         .n_dims = 2,
@@ -261,5 +316,7 @@ test "simd linearF32Q80 matches naive within tolerance" {
     // An f32 dot product over hundreds of elements accumulates rounding on the
     // order of N*eps. SIMD reduces in a different tree than scalar, so 1e-3
     // relative is the right tolerance, not 1e-7.
-    for (out_naive, out_simd) |n, s| try std.testing.expectApproxEqRel(n, s, 1e-3);
+    for (out_naive, out_simd) |n, s| {
+        try std.testing.expectApproxEqRel(n, s, 1e-3);
+    }
 }

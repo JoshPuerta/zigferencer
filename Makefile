@@ -3,116 +3,62 @@
 # The build system of record is `zig build` (see build.zig). Every target here is a
 # thin alias for a command you can run by hand, and `make help` lists them grouped.
 #
-# Every target uses one symbolic status line (shared with `zigferencer info`) through
-# tools/menu.sh. Two habits make the targets teachable:
+# Every target uses one symbolic status line (shared with `zigferencer info`):
 #
 #   * Every external command is echoed before it runs, shell-quoted behind a [$]
 #     marker, so you can copy the exact `zig build` / `zigferencer` invocation.
-#   * Every selectable knob resolves by one rule. Set it to skip the prompt, or leave
+#   * Every selectable variable resolves by one rule. Set it to skip the prompt, or leave
 #     it unset to be asked:
 #       1. `make build BACKEND=naive`, `make run MODEL=..`  -> used as-is, no prompt
 #       2. unset, on a terminal                             -> prompted, Enter = default
 #       3. unset, piped or CI (no TTY)                      -> the default, silently
 #
-# Which targets prompt: a target that builds or runs for a chosen backend (build,
-# release, debug, debug-test, run, run-all, chat, serve, demo, bench-model,
-# bench-serve, bench-threads-sweep) asks for the op backend. bench-swap and bench-decode-host
-# always build the fused-GPU binary, so they ask for none. The run-style targets also ask for
-# the prompt, the token count, and the threads. bench-openai and demo-openai build
-# the CPU default and ask for the model here: they spawn the server through a script
-# that captures its output, so the binary's own picker cannot appear. A target that
-# never runs a kernel (list, fetch, inspect, info) reuses whatever binary is
-# already built, so a GPU build survives them. list/fetch/inspect build the CPU
-# default only when no binary exists. The prompts and the [$] echo drop to plain
-# text when stderr is not a terminal or $NO_COLOR is set.
-#
 # Zig 0.16.0 is required. `ZIG` is `zig` on PATH. Override it with
 # `make <target> ZIG=/path/to/zig`.
 #
-# Knobs. Each resolves by the rule above.
+# Variables. Each resolves by the rule above.
+#   MODEL       registry name
+#   PROMPT      prompt text
+#   N           tokens
+#   RUNS        bench repetitions
+#   BACKEND     op kernel
+#   THREADS     pool threads
+#   SESSIONS    serve sessions
+#   TURNS       demo follow-ups
+#   PORT        serve tcp port
 #
-#   MODEL       registry name        Enter = first on disk (the picker lists them)
-#   PROMPT      prompt text          Enter = "Hello"
-#   N           tokens               Enter = 32 (run, chat, bench-model) / 48 (demo,
-#               bench-serve) / 64 (bench-openai) / 128 (bench-ttft-sweep decode)
-#   RUNS        bench repetitions    Enter = 3 (bench-model) / 20 (bench-openai) /
-#               5 (bench-model-all)
-#   BACKEND     op kernel            Enter = auto (strongest CPU). auto|naive|simd|
-#               simd_pf|vulkan|vulkan_fused. The vulkan ones need glslc +
-#               libvulkan-dev, and they select the GPU runtime.
-#               list/fetch/inspect/info ignore it.
-#   THREADS     pool threads         Enter = auto, min(physical cores, 8). For
-#               bench-threads-sweep it is the sweep list ("1 2 4 8")
-#   SESSIONS    serve sessions       Enter = 4, `make serve` only (cap 8 on a CPU
-#               build, 128 on the fused-GPU build with VRAM_SLOTS or KV_VRAM).
-#               demo/demo-openai pass it through when set
-#   TURNS       demo follow-ups      Enter = 2 (`make demo` only)
-#   PORT        serve tcp port       Enter = 0 = ephemeral (see the READY line)
-#
-# Pass-through knobs (never prompted, appended only when set):
-#   PREFILL     serve prefill chunk  unset = full row width. 0 = spare decode rows. N = N tokens
-#   VRAM_SLOTS  serve VRAM KV slots  fused-GPU only. Below SESSIONS it swaps idle KV to RAM
-#   KV_VRAM     serve VRAM KV budget MiB, fused-GPU only. It buys the slots, so it
-#               excludes VRAM_SLOTS
+# Pass-through variables (never prompted, appended only when set):
+#   PREFILL     serve prefill chunk
+#   VRAM_SLOTS  serve VRAM KV slots
+#   KV_VRAM     serve VRAM KV budget MiB, fused-GPU only.
 #   KV_RAM      serve RAM KV budget  MiB for evicted KV blobs. Any backend
-#   KV_DTYPE    KV element type      f32 or f16 (run, chat, serve, demo,
-#               bench-model, gate-llama-hybrid). f16 halves every KV price
+#   KV_DTYPE    KV element type      f32 or f16
 #   PREFIX_DISK serve prefix-cache disk budget MiB. Entries survive restarts
 #   RESUME_TTL  serve lease ceiling  ms a kept session outlives a drop, cap 3600000.
-#               unset = 0 = resumption off
-#   PROMPT_TOKENS bench prompt length  bench-model only. Synthesizes that many
-#               prompt tokens in place of PROMPT
-#   MAX_SEQ     bench window         bench-serve and bench-model. KV positions per
-#               session (default: the session byte budget, capped by the model
-#               ceiling). N must fit in it
-#   POS         swap KV depth        bench-swap only (default 256)
-#   STREAMS     swap KV slots        bench-swap only, 2..8 (default 2)
-#   REPS, MODE  decode-host probe    bench-decode-host only. POS defaults to 2000,
-#               REPS to 200, MODE to all (m3, m4, m5, gap, or all)
-#   GPU_LAYERS  pinned GPU layers    fused-GPU build only (run, chat, bench-model).
-#               Counts from the top. 0 = the CPU runner, all = the fused runner,
-#               a mid split = the hybrid runner (CPU prefix + GPU suffix). A pin
-#               the VRAM budget cannot fund is refused with the shortfall
+#   PROMPT_TOKENS bench prompt length  bench-model only.
+#   MAX_SEQ     bench window
+#   POS         swap KV depth        bench-swap only
+#   STREAMS     swap KV slots        bench-swap only
+#   REPS, MODE  decode-host probe    bench-decode-host only.
+#   GPU_LAYERS  pinned GPU layers    fused-GPU build only
 #   LAYERS      model layer count    gate-llama-hybrid only (default 30 = SmolLM2)
-#   TEST        test binary          debug-test only (default unit). unit or the stem
-#               of a tests/*_test.zig file
-#   FILTER      test name part       debug-test only. Compiles only the tests whose
-#               name contains it
+#   TEST        test binary          debug-test only (default unit)
+#   FILTER      test name part       debug-test only
 #   MODELS      sweep model list     bench-ttft-sweep only (space-separated names)
 #   OUT         sweep output path    bench-threads-sweep only (default bench_threads.jsonl)
+#   ONLY        one model            gate-deep only
+#   GPU         add per-op vulkan    bench-model-all only (set to 1)
+#   SETTLE, RETRIES  run spacing     bench-ttft-sweep only
+#   ZF_READY_TIMEOUT_S  ready wait   the OpenAI scripts only
 #   FLOPS       fan-out floor        bench-model, bench-serve, bench-threads-sweep.
-#               Ops below F FLOPs stay serial (default: the binary floor)
 #
-# Toggles (set to 1): CACHE (--prompt-cache, qwen35 fused-GPU), DRY (fetch preview),
-#   FORCE (overwrite / skip the gpu-flush confirm), FORCE_HYBRID (bench-model with
-#   GPU_LAYERS: construct the llama hybrid even at a degenerate split, which is how the
-#   cross-runner equality gate compares like against like), IGNORE_EOS (bench-model:
-#   decode the full token count every run), BUDGET (bench-swap: size the window from
-#   the live VRAM budget).
-# Diagnostics (no rebuild): LOG -> $ZIGFERENCER_LOG, the runtime trace level. With LOG
-#   unset, milestones and the serve session lifecycle (admit / stop / complete) print
-#   at the default info level. LOG=debug (everything), LOG=gguf,runner (only those
-#   scopes), LOG=runner=debug. `make info` shows the live value. Scopes: serve
-#   serve_openai serve_demo run runner kv gpu gguf fetch parallel cache bench_swap
-#   bench_serve, plus the hot scopes layer dispatch token (compiled only with TRACE=1
-#   or OPT=Debug). Full flow without the hot flood:
-#   LOG=debug,dispatch=off,layer=off,token=off. Simplest trace tour:
-#   `make run OPT=Debug LOG=debug N=8`.
-# Build vars (make-expanded, not prompted). OPT: Enter = ReleaseFast.
-#   OPT=ReleaseSafe keeps assertions on, and it is slightly slower. TRACE=1 compiles
-#   the hot traces (layer / dispatch / token) into a release build. A Debug build has
-#   them by default. TARGET / CPU / KERNEL drive the simd-* inspection targets only.
-#   TEST_THREADS sets the pool threads of the runner tests (`make test`, default 4).
-#   ATTN names the GPU attention kit of a Vulkan build (`-Dattn-kernel`, default split).
-#   ARGS, FLAVOR, CALLS, CELL, and PROFILE_DIR belong to `make profile` (see the
-#   Profiling group). They are never prompted.
-#   The run/serve binary is always built for the host.
+# For more information, run `zigferencer --help`, then `zigferencer run --help`.
 #
 # Environment (read by the binary. make passes the environment through, so
-# `ZIGFERENCER_MODELS_DIR=/data/models make run ..` works with no knob):
+# `ZIGFERENCER_MODELS_DIR=/data/models make run ..` works with no variable):
 #   ZIGFERENCER_MODELS_DIR  model storage root      default: models/
 #   ZIGFERENCER_CACHE_DIR   prompt-cache directory  default: .prompt_cache
-#   ZIGFERENCER_LOG         runtime trace grammar   the LOG knob writes this one
+#   ZIGFERENCER_LOG         runtime trace grammar   the LOG variable writes this one
 
 ZIG     ?= zig
 OPT     ?= ReleaseFast
@@ -142,6 +88,10 @@ POS     ?=
 STREAMS ?=
 BUDGET  ?=
 LAYERS  ?=
+REPS    ?=
+MODE    ?=
+OUT     ?=
+MODELS  ?=
 TEST    ?= unit
 FILTER  ?=
 CACHE   ?=
@@ -163,12 +113,12 @@ DEV_BIN := zig-out/bin/zigferencer-dev
 PROBE   := zig-out/zigferencer-simd-probe.s
 PROBE_FLAGS  := -Doptimize=$(OPT) $(if $(TARGET),-Dtarget=$(TARGET)) $(if $(CPU),-Dcpu=$(CPU))
 
-# Knobs cross into the recipes as environment variables (not make-expanded text), so
+# Variables cross into the recipes as environment variables (not make-expanded text), so
 # a prompt value with spaces or an apostrophe survives intact. The recipes read them
 # as $$MODEL, $$PROMPT, ... and tools/menu.sh resolves each per the rule at the top.
 # OPT / TEST_THREADS / TARGET / CPU / KERNEL are build-time make variables instead. They expand as
 # $(OPT) and they shape `zig build`. They are not prompted and not exported.
-export MODEL PROMPT N RUNS BACKEND THREADS FLOPS SESSIONS PREFILL TURNS PORT VRAM_SLOTS KV_VRAM KV_RAM KV_DTYPE PREFIX_DISK RESUME_TTL GPU_LAYERS FORCE_HYBRID PROMPT_TOKENS IGNORE_EOS MAX_SEQ POS STREAMS BUDGET LAYERS TEST FILTER CACHE DRY FORCE LOG TRACE ATTN ZIG OUT MODELS ARGS FLAVOR CALLS CELL PROFILE_DIR
+export MODEL PROMPT N RUNS REPS MODE BACKEND THREADS FLOPS SESSIONS PREFILL TURNS PORT VRAM_SLOTS KV_VRAM KV_RAM KV_DTYPE PREFIX_DISK RESUME_TTL GPU_LAYERS FORCE_HYBRID PROMPT_TOKENS IGNORE_EOS MAX_SEQ POS STREAMS BUDGET LAYERS TEST FILTER CACHE DRY FORCE LOG TRACE ATTN ZIG OUT MODELS ARGS FLAVOR CALLS CELL PROFILE_DIR
 
 # Recipes are bash, one shell per target (so a recipe can source the helper, prompt,
 # then build + run as one flow), and fail on the first error.
@@ -177,7 +127,7 @@ SHELL := bash
 .ONESHELL:
 
 .DEFAULT_GOAL := help
-.PHONY: help build release test fmt check check-targets clean debug debug-test bench bench-gpu bench-attn bench-model \
+.PHONY: help build release test fmt check check-targets clean debug debug-test debug-build bench bench-gpu bench-attn bench-model \
         bench-serve bench-swap bench-decode-host bench-model-all bench-ttft-sweep bench-threads-sweep \
         gate-llama-hybrid gate-deep simd-report simd-list simd-asm profile run run-all chat serve demo \
         demo-openai bench-openai info list fetch inspect gpu gpu-selftest \
@@ -191,9 +141,10 @@ help: ## Show this help (targets grouped by section)
 		/^##@/ {printf "\n%s%s%s\n", b, substr($$0, 5), r; next} \
 		/^[a-zA-Z][a-zA-Z_-]*:.*## / {printf "  %s%-19s%s %s\n", cy, $$1, r, $$2}' \
 		$(MAKEFILE_LIST)
-	printf '\nKnobs: MODEL PROMPT N RUNS BACKEND THREADS FLOPS SESSIONS PREFILL TURNS PORT VRAM_SLOTS KV_VRAM KV_RAM KV_DTYPE PREFIX_DISK RESUME_TTL GPU_LAYERS PROMPT_TOKENS MAX_SEQ POS STREAMS REPS MODE LAYERS MODELS OUT TEST FILTER  Profile: ARGS FLAVOR CALLS CELL PROFILE_DIR  Toggles: CACHE DRY FORCE FORCE_HYBRID IGNORE_EOS BUDGET  Trace: LOG TRACE  Build: OPT TEST_THREADS ATTN (simd-*: TARGET CPU KERNEL)\n'
+	printf '\nVariables: MODEL PROMPT N RUNS BACKEND THREADS FLOPS SESSIONS PREFILL TURNS PORT VRAM_SLOTS KV_VRAM KV_RAM KV_DTYPE PREFIX_DISK RESUME_TTL GPU_LAYERS PROMPT_TOKENS MAX_SEQ POS STREAMS REPS MODE LAYERS MODELS OUT TEST FILTER  Profile: ARGS FLAVOR CALLS CELL PROFILE_DIR  Set to 1: CACHE DRY FORCE FORCE_HYBRID IGNORE_EOS BUDGET  Trace: LOG TRACE  Build: OPT TEST_THREADS ATTN (simd-*: TARGET CPU KERNEL)\n'
+	printf 'Script variables: ONLY (gate-deep) GPU (bench-model-all) SETTLE RETRIES (bench-ttft-sweep) ZF_READY_TIMEOUT_S (OpenAI scripts)\n'
 	printf 'Env (pass through make): ZIGFERENCER_MODELS_DIR (models/) ZIGFERENCER_CACHE_DIR (.prompt_cache) ZIGFERENCER_LOG (via LOG)\n'
-	printf 'Set a knob to skip its prompt. Unset -> prompted (Enter = default).\n'
+	printf 'Set a variable to skip its prompt. Unset -> prompted (Enter = default).\n'
 	printf 'Symbols: %s[+]%s ok  %s[-]%s no  %s[*]%s note  %s[>]%s prompt  %s[?]%s confirm  %s[$$]%s command run  %s[!]%s error\n' \
 		"$$cy" "$$r" "$$cy" "$$r" "$$cy" "$$r" "$$cy" "$$r" "$$cy" "$$r" "$$cy" "$$r" "$$cy" "$$r"
 
@@ -261,6 +212,24 @@ debug-test: ## One Debug test binary with LLVM -> zig-out/test/<TEST>: make debu
 	ok "test binary ready ($$backend): zig-out/test/$$TEST"
 	say "example, from the repository root: lldb zig-out/test/$$TEST -o run"
 
+# `zig build` compiles build.zig with the default code generator. Only a direct
+# compile selects LLVM, and gdb and lldb need LLVM for lines and locals.
+debug-build: ## LLVM build runner to debug build.zig -> zig-out/debug/build-runner
+	@source tools/menu.sh
+	run_cmd $(ZIG) build --fetch=all
+	run_cmd $(ZIG) build -l >/dev/null
+	env=$$($(ZIG) env)
+	field() { sed -n "s/^ *\.$$1 = \"\(.*\)\",$$/\1/p" <<<"$$env"; }
+	lib=$$(field lib_dir)
+	deps=$$(ls -t .zig-cache/o/*/dependencies.zig | sed -n 1p)
+	vulkan=$$(sed -n 's/^ *\.{ "vulkan", "\(.*\)" },$$/\1/p' "$$deps")
+	mkdir -p zig-out/debug
+	run_cmd $(ZIG) build-exe -fllvm -ODebug -femit-bin=zig-out/debug/build-runner \
+	  --dep @build --dep @dependencies -Mroot=$$lib/compiler/build_runner.zig -M@build=build.zig \
+	  --dep $$vulkan -M@dependencies=$$deps -M$$vulkan=zig-pkg/$$vulkan/build.zig
+	ok "build runner ready: zig-out/debug/build-runner"
+	say "example: lldb zig-out/debug/build-runner -o \"breakpoint set --name build.resolveOpsBackend\" -o \"run $$(field zig_exe) $$lib $$PWD .zig-cache $$(field global_cache_dir) -l\""
+
 ##@ Benchmarks
 bench: ## Op micro-benchmarks, CPU kernels (per-kernel GFLOP/s)
 	@source tools/menu.sh
@@ -270,7 +239,7 @@ bench-gpu: ## Op micro-benchmarks incl. GPU kernels (needs glslc + libvulkan-dev
 	@source tools/menu.sh
 	run_cmd $(ZIG) build bench -Doptimize=$(OPT) -Druntime=vulkan $${ATTN:+-Dattn-kernel=$$ATTN}
 
-bench-attn: ## GPU attention kit grid only (shape x depth x rows, ms and GB/s): make bench-attn [ATTN=name]
+bench-attn: ## GPU attention kernel set grid only (shape x depth x rows, ms and GB/s): make bench-attn [ATTN=name]
 	@source tools/menu.sh
 	run_cmd $(ZIG) build bench -Doptimize=$(OPT) -Druntime=vulkan $${ATTN:+-Dattn-kernel=$$ATTN} -- attn-kit
 
@@ -300,9 +269,9 @@ bench-swap: ## Tiered-KV swap cost vs a decode tick (fused-GPU build): make benc
 	[ -n "$$BUDGET" ] && cmd+=(--budget)
 	run_cmd "$${cmd[@]}"
 
-# Splits one decode step into its host legs. The probe records, submits, and
+# Splits one decode step into its host steps. The probe records, submits, and
 # waits on the fused-GPU command buffer, so the target builds that binary.
-bench-decode-host: ## Host legs of one decode step (fused-GPU build): make bench-decode-host [MODEL=..] [POS=..] [REPS=..] [MODE=m3|m4|m5|gap|all]
+bench-decode-host: ## Host steps of one decode step (fused-GPU build): make bench-decode-host [MODEL=..] [POS=..] [REPS=..] [MODE=m3|m4|m5|gap|all]
 	@source tools/menu.sh
 	zig_build $(ZIG) $(OPT) vulkan_fused
 	cmd=($(DEV_BIN) bench-decode-host)
@@ -347,7 +316,7 @@ bench-openai: ## Benchmark the OpenAI endpoint (tok/s, latency, TTFT): make benc
 
 # The cross-backend determinism gate: greedy decoding is deterministic, so the
 # three CPU backends must emit the identical token stream. Exits non-zero on a
-# hash divergence (a kernel disagrees with the naive oracle).
+# hash divergence (a kernel disagrees with the naive reference).
 bench-model-all: ## Cross-backend token-hash gate (naive/simd/simd_pf, GPU=1 adds per-op vulkan): make bench-model-all [MODEL=..] [PROMPT=".."] [N=..] [RUNS=..] [GPU=1]
 	@source tools/menu.sh
 	run_cmd tools/bench_model_all.sh "$${MODEL:-SmolLM2-135M-Instruct-Q8_0}" "$${PROMPT:-Hello}" "$${N:-32}" "$${RUNS:-5}"
@@ -372,8 +341,7 @@ gate-deep: ## Deep token-hash gate against the recorded hashes (cpu, fused): mak
 
 # Long back-to-back GPU prefills. A translation-layer driver can drop the device
 # under repeated large submits, so the script spaces and retries the runs.
-# The script builds nothing. Run `make gpu` first, so it finds the fused
-# developer binary.
+# The script builds the fused GPU binaries itself.
 bench-ttft-sweep: ## GPU TTFT/ITL vs prefill length (fused-GPU build): make bench-ttft-sweep [N=decode] [MODELS=".."]
 	@source tools/menu.sh
 	run_cmd tools/bench_ttft_sweep.sh $${N:+"$$N"}

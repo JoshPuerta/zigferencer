@@ -44,7 +44,7 @@
 const std = @import("std");
 const protocol = @import("protocol.zig");
 
-// -- types ------------------------------------------------------------------
+// -- constants --------------------------------------------------------------
 
 pub const greeting_bytes: usize = 64;
 
@@ -65,6 +65,39 @@ pub const max_message_bytes: usize = protocol.header_bytes + protocol.max_frame_
 
 pub const socket_type_router = "ROUTER";
 pub const socket_type_dealer = "DEALER";
+
+const signature_first: u8 = 0xFF;
+const signature_last: u8 = 0x7F;
+const signature_last_offset: usize = 9;
+const major_offset: usize = 10;
+const minor_offset: usize = 11;
+const security_offset: usize = 12;
+const security_bytes: usize = 20;
+const version_major: u8 = 3;
+const version_minor: u8 = 1;
+const security_null: [security_bytes]u8 = "NULL".* ++ [_]u8{0} ** (security_bytes - 4);
+
+const flag_more: u8 = 0x01;
+const flag_long: u8 = 0x02;
+const flag_command: u8 = 0x04;
+const flags_reserved: u8 = 0xF8;
+const short_head_bytes: usize = 2;
+const long_head_bytes: usize = 9;
+const short_size_max: u64 = std.math.maxInt(u8);
+
+const command_ready = "READY";
+const command_error = "ERROR";
+const command_ping = "PING";
+const command_pong = "PONG";
+const property_socket_type = "Socket-Type";
+const property_identity = "Identity";
+
+/// A name length byte, a name of one byte, and a 4-byte value length.
+const min_property_bytes: usize = 1 + 1 + 4;
+
+const ready_fixed_bytes: usize = 1 + command_ready.len + 1 + property_socket_type.len + 4;
+
+// -- types ------------------------------------------------------------------
 
 /// `decodeCommand` returns `MessageTooLarge` for a READY body above
 /// `max_ready_bytes`. The caller maps a frame size above `max_message_bytes`
@@ -107,36 +140,6 @@ pub const Command = union(enum) {
     other,
 };
 
-const signature_first: u8 = 0xFF;
-const signature_last: u8 = 0x7F;
-const signature_last_offset: usize = 9;
-const major_offset: usize = 10;
-const minor_offset: usize = 11;
-const security_offset: usize = 12;
-const security_bytes: usize = 20;
-const version_major: u8 = 3;
-const version_minor: u8 = 1;
-const security_null: [security_bytes]u8 = "NULL".* ++ [_]u8{0} ** (security_bytes - 4);
-
-const flag_more: u8 = 0x01;
-const flag_long: u8 = 0x02;
-const flag_command: u8 = 0x04;
-const flags_reserved: u8 = 0xF8;
-const short_head_bytes: usize = 2;
-const long_head_bytes: usize = 9;
-const short_size_max: u64 = std.math.maxInt(u8);
-
-const command_ready = "READY";
-const command_error = "ERROR";
-const command_ping = "PING";
-const command_pong = "PONG";
-const property_socket_type = "Socket-Type";
-const property_identity = "Identity";
-
-/// A name length byte, a name of one byte, and a 4-byte value length.
-const min_property_bytes: usize = 1 + 1 + 4;
-const ready_fixed_bytes: usize = 1 + command_ready.len + 1 + property_socket_type.len + 4;
-
 /// Bounds-checked big-endian reader over a command body. A `take` past the
 /// end returns `Malformed`, so a body parses exactly or not at all.
 const Cursor = struct {
@@ -145,29 +148,38 @@ const Cursor = struct {
 
     fn take(c: *Cursor, comptime T: type) Error!T {
         std.debug.assert(c.i <= c.buf.len);
+
         const n = @sizeOf(T);
         if (c.buf.len - c.i < n) return error.Malformed;
+
         defer c.i += n;
+
         return std.mem.readInt(T, c.buf[c.i..][0..n], .big);
     }
 
     fn takeSlice(c: *Cursor, len: u64) Error![]const u8 {
         std.debug.assert(c.i <= c.buf.len);
+
         const remaining: u64 = c.buf.len - c.i;
         if (len > remaining) return error.Malformed;
+
         const n: usize = @intCast(len);
         defer c.i += n;
+
         return c.buf[c.i..][0..n];
     }
 
     fn takeRest(c: *Cursor) []const u8 {
         std.debug.assert(c.i <= c.buf.len);
+
         defer c.i = c.buf.len;
+
         return c.buf[c.i..];
     }
 
     fn done(c: *const Cursor) bool {
         std.debug.assert(c.i <= c.buf.len);
+
         return c.i == c.buf.len;
     }
 };
@@ -187,12 +199,14 @@ const Writer = struct {
 
     fn putSlice(w: *Writer, bytes: []const u8) void {
         std.debug.assert(w.buf.len - w.i >= bytes.len);
+
         @memcpy(w.buf[w.i..][0..bytes.len], bytes);
         w.i += bytes.len;
     }
 
     fn putShort(w: *Writer, bytes: []const u8) void {
         std.debug.assert(bytes.len <= std.math.maxInt(u8));
+
         w.put(u8, @intCast(bytes.len));
         w.putSlice(bytes);
     }
@@ -215,6 +229,7 @@ pub fn decodeGreeting(bytes: *const [greeting_bytes]u8) Error!void {
     if (bytes[0] != signature_first) return error.BadSignature;
     if (bytes[signature_last_offset] != signature_last) return error.BadSignature;
     if (bytes[major_offset] != version_major) return error.UnsupportedVersion;
+
     const security = bytes[security_offset..][0..security_bytes];
     if (!std.mem.eql(u8, security, &security_null)) return error.MechanismUnsupported;
 }
@@ -229,10 +244,13 @@ pub fn headLen(flags: u8) usize {
 /// frame kind.
 pub fn decodeFrameHead(bytes: []const u8) Error!FrameHead {
     if (bytes.len == 0) return error.Malformed;
+
     const flags = bytes[0];
     if (flags & flags_reserved != 0) return error.Malformed;
+
     const n = headLen(flags);
     if (bytes.len < n) return error.Malformed;
+
     const head: FrameHead = .{
         .more = flags & flag_more != 0,
         .long = flags & flag_long != 0,
@@ -240,6 +258,7 @@ pub fn decodeFrameHead(bytes: []const u8) Error!FrameHead {
         .size = if (n == long_head_bytes) std.mem.readInt(u64, bytes[1..9], .big) else bytes[1],
     };
     if (head.command and head.more) return error.Malformed;
+
     return head;
 }
 
@@ -247,6 +266,7 @@ pub fn decodeFrameHead(bytes: []const u8) Error!FrameHead {
 /// head length. The head never sets MORE.
 pub fn encodeFrameHead(size: u64, command: bool, out: *[long_head_bytes]u8) usize {
     std.debug.assert(size <= max_message_bytes);
+
     const kind: u8 = if (command) flag_command else 0;
     const n: usize = if (size <= short_size_max) blk: {
         out[0] = kind;
@@ -257,6 +277,7 @@ pub fn encodeFrameHead(size: u64, command: bool, out: *[long_head_bytes]u8) usiz
         std.mem.writeInt(u64, out[1..9], size, .big);
         break :blk long_head_bytes;
     };
+
     std.debug.assert(headLen(out[0]) == n);
     return n;
 }
@@ -268,10 +289,12 @@ pub fn decodeCommand(body: []const u8) Error!Command {
     var c: Cursor = .{ .buf = body };
     const name = try c.takeSlice(try c.take(u8));
     if (name.len == 0) return error.Malformed;
+
     if (std.mem.eql(u8, name, command_ready)) {
         if (body.len > max_ready_bytes) return error.MessageTooLarge;
         return .{ .ready = try takeReady(&c) };
     }
+
     const command: Command = if (std.mem.eql(u8, name, command_ping))
         .{ .ping = .{ .ttl = try c.take(u16), .context = try takeContext(&c) } }
     else if (std.mem.eql(u8, name, command_pong))
@@ -280,7 +303,9 @@ pub fn decodeCommand(body: []const u8) Error!Command {
         .{ .err = try c.takeSlice(try c.take(u8)) }
     else
         return .other;
+
     if (!c.done()) return error.Malformed;
+
     return command;
 }
 
@@ -302,6 +327,7 @@ pub fn encodeReady(socket_type: []const u8, out: []u8) usize {
 /// Writes a PONG body that echoes `context` and returns its length.
 pub fn encodePong(context: []const u8, out: *[32]u8) usize {
     std.debug.assert(context.len <= max_ping_context_bytes);
+
     var w: Writer = .{ .buf = out };
     w.putShort(command_pong);
     w.putSlice(context);
@@ -313,6 +339,7 @@ pub fn encodePong(context: []const u8, out: *[32]u8) usize {
 pub fn encodeError(reason: []const u8, out: []u8) usize {
     std.debug.assert(reason.len <= max_error_reason_bytes);
     std.debug.assert(out.len >= 1 + command_error.len + 1 + reason.len);
+
     var w: Writer = .{ .buf = out };
     w.putShort(command_error);
     w.putShort(reason);
@@ -330,6 +357,7 @@ pub fn peerAccepted(socket_type: []const u8) bool {
 
 fn takeReady(c: *Cursor) Error!Ready {
     std.debug.assert(c.buf.len <= max_ready_bytes);
+
     var ready: Ready = .{ .socket_type = "", .has_identity = false };
     var has_socket_type = false;
     var properties: usize = 0;
@@ -337,8 +365,10 @@ fn takeReady(c: *Cursor) Error!Ready {
     // caps the passes at max_ready_bytes / min_property_bytes.
     while (!c.done()) : (properties += 1) {
         std.debug.assert(properties <= max_ready_bytes / min_property_bytes);
+
         const name = try c.takeSlice(try c.take(u8));
         if (name.len == 0) return error.Malformed;
+
         const value = try c.takeSlice(try c.take(u32));
         // A repeated property has no single meaning, so the decode refuses it.
         if (std.ascii.eqlIgnoreCase(name, property_socket_type)) {
@@ -350,6 +380,7 @@ fn takeReady(c: *Cursor) Error!Ready {
             ready.has_identity = true;
         }
     }
+
     return ready;
 }
 
@@ -385,7 +416,9 @@ fn borrowsFrom(frame: []const u8, command: Command) bool {
         .pong, .err => |s| s,
         .other => return true,
     };
+
     if (slice.len == 0) return true;
+
     const lo = @intFromPtr(frame.ptr);
     const at = @intFromPtr(slice.ptr);
     return at >= lo and at + slice.len <= lo + frame.len;
@@ -471,6 +504,7 @@ test "frame head guards: reserved bits, command with MORE, short buffer" {
         const head = [_]u8{ @as(u8, 1) << shift, 0 };
         try std.testing.expectError(error.Malformed, decodeFrameHead(&head));
     }
+
     const command_more = [_]u8{ flag_command | flag_more, 0 };
     try std.testing.expectError(error.Malformed, decodeFrameHead(&command_more));
     try std.testing.expectError(error.Malformed, decodeFrameHead(&[_]u8{}));
@@ -528,7 +562,9 @@ fn checkCommand(c: CommandCase) !void {
 /// A READY body of exactly `len` bytes whose single property carries the padding.
 fn paddedReady(comptime len: usize) [len]u8 {
     const fixed = "\x05READY" ++ "\x01X";
-    return (fixed ++ std.mem.toBytes(std.mem.nativeToBig(u32, len - fixed.len - 4)) ++ ("v" ** (len - fixed.len - 4))).*;
+    return (fixed ++ std.mem.toBytes(
+        std.mem.nativeToBig(u32, len - fixed.len - 4),
+    ) ++ ("v" ** (len - fixed.len - 4))).*;
 }
 
 test "commands: every malformed body is refused with its error, and the edges decode" {
@@ -569,6 +605,7 @@ test "commands: every malformed body is refused with its error, and the edges de
     };
     for (cases) |c| {
         errdefer std.debug.print("command case: {s}\n", .{c.name});
+
         try checkCommand(c);
     }
 }
@@ -671,6 +708,7 @@ test "property: every single-byte mutation of the READY frame decodes or returns
             }
         }
     }
+
     try std.testing.expectEqual(@as(u32, dealer_ready_frame.len * 256), decoded + refused);
     try std.testing.expect(decoded > 0);
     try std.testing.expect(refused > 0);
@@ -681,6 +719,7 @@ test "property: every single-byte mutation of the READY frame decodes or returns
 /// holds its name decodes to `other`.
 fn expectShortFrame(frame: []const u8) !void {
     std.debug.assert(frame.len <= 3);
+
     const head_ok = frame.len > 0 and frame[0] & flags_reserved == 0 and
         frame.len >= (if (frame[0] & 0x02 != 0) @as(usize, 9) else 2) and
         !(frame[0] & flag_command != 0 and frame[0] & flag_more != 0);
@@ -694,6 +733,7 @@ fn expectShortFrame(frame: []const u8) !void {
         try std.testing.expect(!head_ok);
         try std.testing.expectEqual(error.Malformed, err);
     }
+
     const name_fits = frame.len > 0 and frame[0] > 0 and 1 + @as(usize, frame[0]) <= frame.len;
     if (decodeCommand(frame)) |command| {
         try std.testing.expect(name_fits);
@@ -724,7 +764,10 @@ test "exhaustive: every frame of at most three bytes decodes as the head and com
 test "round trip: an ERROR frame of every reason length crosses the short and long head boundary" {
     const body_max = 1 + command_error.len + 1 + max_error_reason_bytes;
     var reason: [max_error_reason_bytes]u8 = undefined;
-    for (&reason, 0..) |*b, i| b.* = @intCast(i);
+    for (&reason, 0..) |*b, i| {
+        b.* = @intCast(i);
+    }
+
     var longs: u32 = 0;
     for (0..max_error_reason_bytes + 1) |len| {
         var frame: [long_head_bytes + body_max]u8 = undefined;
@@ -746,6 +789,10 @@ test "round trip: an ERROR frame of every reason length crosses the short and lo
         // A frame cut by one byte cuts the reason, so its length no longer fits.
         try std.testing.expectError(error.Malformed, decodeFrame(frame[0 .. n - 1]));
     }
+
     // Bodies of 256 to 262 bytes take the long head.
-    try std.testing.expectEqual(@as(u32, 1 + command_error.len + 1 + max_error_reason_bytes - short_size_max), longs);
+    try std.testing.expectEqual(
+        @as(u32, 1 + command_error.len + 1 + max_error_reason_bytes - short_size_max),
+        longs,
+    );
 }

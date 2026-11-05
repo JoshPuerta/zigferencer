@@ -24,7 +24,7 @@ const limits = @import("limits.zig");
 
 const assert = std.debug.assert;
 
-// -- types ------------------------------------------------------------------
+// -- constants --------------------------------------------------------------
 
 /// Bytes one scratch element occupies. The records are f32 at every KV dtype.
 const elem_bytes: u64 = @sizeOf(f32);
@@ -36,6 +36,12 @@ comptime {
     // `splitCount` adds `S - 1` to a row length inside 32 bits.
     assert(@as(u64, limits.max_model_ctx) + limits.attn_split_len - 1 <= std.math.maxInt(u32));
 }
+
+/// Rows one plan holds: the widest step a runner records, one serve prefill
+/// chunk.
+pub const max_plan_rows: u32 = limits.max_prefill_chunk;
+
+// -- types ------------------------------------------------------------------
 
 /// The partial records of the split attention: `rows * max_splits` records
 /// per query head. A record holds `head_dim` value sums, then the maximum
@@ -57,6 +63,7 @@ pub const Scratch = struct {
         assert(head_dim >= 1);
         assert(ceiling >= 1);
         assert(ceiling <= limits.max_model_ctx);
+
         const scratch: Scratch = .{
             .rows = limits.attn_split_rows,
             .n_heads = n_heads,
@@ -82,6 +89,7 @@ pub const Scratch = struct {
         assert(head < self.n_heads);
         assert(split < self.max_splits);
         assert(e < self.recordElems());
+
         const index = ((@as(u64, row) * self.n_heads + head) * self.max_splits + split) *
             self.recordElems() + e;
         assert(index < self.totalElems());
@@ -112,6 +120,7 @@ pub const Scratch = struct {
         assert(self.head_dim <= std.math.maxInt(u32) - 2);
         assert(self.max_splits >= 1);
         assert(self.max_splits <= max_splits_bound);
+
         // The engine sets no bound on the head count or the head width. So the
         // byte total is checked in 128 bits, and every 64-bit product stays
         // exact.
@@ -120,10 +129,6 @@ pub const Scratch = struct {
         assert(widest <= std.math.maxInt(u64));
     }
 };
-
-/// Rows one plan holds: the widest step a runner records, one serve prefill
-/// chunk.
-pub const max_plan_rows: u32 = limits.max_prefill_chunk;
 
 /// The input of the planner for one row of a step: the KV stream the row
 /// reads and the positions it attends to.
@@ -173,16 +178,19 @@ pub const AttnPlan = struct {
 
     pub fn residentRows(self: *const AttnPlan) []const PlanRow {
         assert(self.resident_count <= max_plan_rows);
+
         return self.resident[0..self.resident_count];
     }
 
     pub fn splitRows(self: *const AttnPlan) []const PlanRow {
         assert(self.split_count <= max_plan_rows);
+
         return self.split[0..self.split_count];
     }
 
     pub fn recordGroups(self: *const AttnPlan) []const PlanGroup {
         assert(self.group_count <= max_plan_rows);
+
         return self.groups[0..self.group_count];
     }
 
@@ -191,6 +199,7 @@ pub const AttnPlan = struct {
         assert(g.len >= 1);
         assert(g.first + g.len <= self.split_count);
         assert(@as(u64, g.len) * g.stride <= self.budget);
+
         return self.split[g.first..][0..g.len];
     }
 
@@ -203,23 +212,33 @@ pub const AttnPlan = struct {
         assert(self.budget >= 1);
         assert(self.resident_count + self.split_count <= max_plan_rows);
         assert(self.group_count <= self.split_count);
-        for (self.residentRows()) |r| assert(!usesSplit(r.t_len));
-        for (self.splitRows()) |r| assert(usesSplit(r.t_len));
+
+        for (self.residentRows()) |r| {
+            assert(!usesSplit(r.t_len));
+        }
+
+        for (self.splitRows()) |r| {
+            assert(usesSplit(r.t_len));
+        }
+
         var next: u32 = 0;
         for (self.recordGroups()) |g| {
             assert(g.first == next);
             assert(g.len >= 1);
             assert(@as(u64, g.len) * g.stride <= self.budget);
+
             var widest: u32 = 0;
             for (self.split[g.first..][0..g.len]) |r| {
                 const count = splitCount(r.t_len);
                 assert(count <= g.stride);
                 widest = @max(widest, count);
             }
+
             // The stride is the largest count of the group, not more.
             assert(widest == g.stride);
             next += g.len;
         }
+
         assert(next == self.split_count);
     }
 };
@@ -230,6 +249,7 @@ pub const AttnPlan = struct {
 pub fn splitCount(t_len: u32) u32 {
     assert(t_len >= 1);
     assert(t_len <= limits.max_model_ctx);
+
     const count = (t_len + limits.attn_split_len - 1) / limits.attn_split_len;
     assert(count >= 1);
     // The last split starts inside the row, so no split is empty.
@@ -254,6 +274,7 @@ pub fn headDimFits(head_dim: u32) bool {
 /// attn_split_queries, group))` of the group.
 pub fn queryGroups(group: u32) u32 {
     assert(group >= 1);
+
     const count = (group + limits.attn_split_queries - 1) / limits.attn_split_queries;
     assert(count >= 1);
     // The last workgroup holds at least one head, and the workgroups cover the group.
@@ -286,6 +307,7 @@ pub fn fits(s: Scratch, lim: limits.BufferLimits) limits.BufferVerdict {
         assert(bytes <= lim.allocation_size);
         assert(bytes <= lim.storage_range);
     }
+
     return verdict;
 }
 
@@ -297,6 +319,7 @@ pub fn fits(s: Scratch, lim: limits.BufferLimits) limits.BufferVerdict {
 pub fn planRows(sites: []const RowSite, max_splits: u32) AttnPlan {
     assert(max_splits >= 1);
     assert(max_splits <= max_splits_bound);
+
     return planRowsBudget(sites, limits.attn_split_rows * max_splits);
 }
 
@@ -307,6 +330,7 @@ pub fn planRowsBudget(sites: []const RowSite, budget: u32) AttnPlan {
     assert(sites.len >= 1);
     assert(sites.len <= max_plan_rows);
     assert(budget >= 1);
+
     var plan: AttnPlan = .{
         .budget = budget,
         .resident_count = 0,
@@ -326,21 +350,31 @@ pub fn planRowsBudget(sites: []const RowSite, budget: u32) AttnPlan {
             plan.resident_count += 1;
             continue;
         }
+
         counts[plan.split_count] = splitCount(site.t_len);
         // A row that the scratch cannot hold alone has no group.
         assert(counts[plan.split_count] <= budget);
         plan.split[plan.split_count] = row;
         plan.split_count += 1;
     }
+
     if (plan.split_count > 0) {
         var spans: [max_plan_rows]BudgetGroup = undefined;
         for (budgetGroups(budget, counts[0..plan.split_count], &spans)) |span| {
             var widest: u32 = 0;
-            for (counts[span.lo..span.hi]) |c| widest = @max(widest, c);
-            plan.groups[plan.group_count] = .{ .first = span.lo, .len = span.hi - span.lo, .stride = widest };
+            for (counts[span.lo..span.hi]) |c| {
+                widest = @max(widest, c);
+            }
+
+            plan.groups[plan.group_count] = .{
+                .first = span.lo,
+                .len = span.hi - span.lo,
+                .stride = widest,
+            };
             plan.group_count += 1;
         }
     }
+
     assert(plan.resident_count + plan.split_count == sites.len);
     plan.assertValid();
     return plan;
@@ -362,11 +396,18 @@ pub fn planPrefill(slot: u32, start_pos: u32, b: u32, max_splits: u32) AttnPlan 
     assert(b >= 1);
     assert(b <= max_plan_rows);
     assert(@as(u64, start_pos) + b <= limits.max_model_ctx);
+
     var sites: [max_plan_rows]RowSite = undefined;
-    for (sites[0..b], 0..) |*site, i| site.* = .{ .slot = slot, .t_len = start_pos + @as(u32, @intCast(i)) + 1 };
+    for (sites[0..b], 0..) |*site, i| {
+        site.* = .{ .slot = slot, .t_len = start_pos + @as(u32, @intCast(i)) + 1 };
+    }
+
     const plan = planRows(sites[0..b], max_splits);
     assert(plan.resident_count == prefillResident(start_pos, b));
-    for (plan.residentRows(), 0..) |r, i| assert(r.row == i);
+    for (plan.residentRows(), 0..) |r, i| {
+        assert(r.row == i);
+    }
+
     return plan;
 }
 
@@ -377,8 +418,11 @@ pub fn prefillResident(start_pos: u32, b: u32) u32 {
     const count = if (start_pos < split_len) @min(b, split_len - start_pos) else 0;
     assert(count <= b);
     if (count > 0) assert(@as(u64, start_pos) + count <= split_len);
+
     return count;
 }
+
+// -- helpers ----------------------------------------------------------------
 
 /// The row count of the greedy record group that starts at `lo`. The group
 /// takes each next row while its row count times its largest count stays
@@ -387,15 +431,18 @@ fn groupLen(budget: u32, counts: []const u32, lo: u32) u32 {
     assert(counts.len <= std.math.maxInt(u32));
     assert(lo < counts.len);
     assert(counts[lo] <= budget);
+
     var rows: u32 = 1;
     var widest: u32 = counts[lo];
     while (lo + rows < counts.len) {
         const next_widest = @max(widest, counts[lo + rows]);
         const cost = (@as(u64, rows) + 1) * @as(u64, next_widest);
         if (cost > budget) break;
+
         widest = next_widest;
         rows += 1;
     }
+
     assert(rows >= 1);
     assert(lo + rows <= counts.len);
     assert(@as(u64, rows) * widest <= budget);
@@ -409,6 +456,7 @@ fn budgetGroups(budget: u32, counts: []const u32, out: []BudgetGroup) []BudgetGr
     assert(counts.len >= 1);
     assert(counts.len <= std.math.maxInt(u32));
     assert(out.len >= counts.len);
+
     var filled: usize = 0;
     var lo: u32 = 0;
     // Each group holds at least one row, so the loop runs at most `counts.len` times.
@@ -419,6 +467,7 @@ fn budgetGroups(budget: u32, counts: []const u32, out: []BudgetGroup) []BudgetGr
         filled += 1;
         lo += rows;
     }
+
     assert(filled >= 1);
     assert(filled <= counts.len);
     assert(out[filled - 1].hi == counts.len);
@@ -466,12 +515,17 @@ test "usesSplit: the resident kernel runs up to S positions and the split path p
 }
 
 test "headDimFits: the common head widths fit, and a head past the bound or off the granule does not" {
-    for ([_]u32{ 64, 80, 96, 112, 128, 256 }) |hd| try testing.expect(headDimFits(hd));
+    for ([_]u32{ 64, 80, 96, 112, 128, 256 }) |hd| {
+        try testing.expect(headDimFits(hd));
+    }
+
     try testing.expect(headDimFits(limits.attn_head_dim_granule));
     try testing.expect(headDimFits(limits.attn_max_head_dim));
     try testing.expect(!headDimFits(0));
     try testing.expect(!headDimFits(limits.attn_max_head_dim + limits.attn_head_dim_granule));
-    for ([_]u32{ 1, 4, 60, 100, 250 }) |hd| try testing.expect(!headDimFits(hd));
+    for ([_]u32{ 1, 4, 60, 100, 250 }) |hd| {
+        try testing.expect(!headDimFits(hd));
+    }
 }
 
 test "queryGroups: every head of a group lands in one workgroup slot, and every slot holds a head" {
@@ -499,7 +553,10 @@ test "queryGroups: every head of a group lands in one workgroup slot, and every 
                 seen[h] = true;
             }
         }
-        for (seen[0 .. n_kv * group]) |s| try testing.expect(s);
+
+        for (seen[0 .. n_kv * group]) |s| {
+            try testing.expect(s);
+        }
     }
 }
 
@@ -513,9 +570,15 @@ test "splitCount: the splits of every row up to four splits cover it, and none i
         try testing.expectEqual(count - 1, (t_len - 1) / S);
         // Every split below the count starts inside the row.
         var j: u32 = 0;
-        while (j < count) : (j += 1) try testing.expect(j * S < t_len);
+        while (j < count) : (j += 1) {
+            try testing.expect(j * S < t_len);
+        }
+
         // A longer row never needs fewer splits.
-        if (t_len >= 2) try testing.expect(splitCount(t_len - 1) <= count);
+        if (t_len >= 2) {
+            try testing.expect(splitCount(t_len - 1) <= count);
+        }
+
         try testing.expectEqual(count >= 2, usesSplit(t_len));
     }
 }
@@ -543,7 +606,12 @@ test "offset: every coordinate of a small box gets its own element below the scr
                         for (0..n_heads) |h| {
                             for (0..max_splits) |j| {
                                 for (0..record) |e| {
-                                    const at = scratch.offset(@intCast(r), @intCast(h), @intCast(j), @intCast(e));
+                                    const at = scratch.offset(
+                                        @intCast(r),
+                                        @intCast(h),
+                                        @intCast(j),
+                                        @intCast(e),
+                                    );
                                     try testing.expect(at < scratch.totalElems());
                                     try testing.expect(!seen[@intCast(at)]);
                                     seen[@intCast(at)] = true;
@@ -552,11 +620,15 @@ test "offset: every coordinate of a small box gets its own element below the scr
                             }
                         }
                     }
+
                     // The box and the scratch have one size, so the offset
                     // covers every element, and the last coordinate lands on
                     // the last element.
                     try testing.expectEqual(scratch.totalElems(), count);
-                    try testing.expectEqual(scratch.totalElems() - 1, scratch.offset(rows - 1, n_heads - 1, max_splits - 1, record - 1));
+                    try testing.expectEqual(
+                        scratch.totalElems() - 1,
+                        scratch.offset(rows - 1, n_heads - 1, max_splits - 1, record - 1),
+                    );
                     try testing.expectEqual(scratch.totalElems() * 4, scratch.totalBytes());
                 }
             }
@@ -631,10 +703,12 @@ test "fits: every registry model at its declared context fits the spec-minimum l
         var matches: u32 = 0;
         for (pinned) |row| {
             if (!std.mem.eql(u8, row.pub_name, m.pub_name)) continue;
+
             matches += 1;
             const scratch = Scratch.init(row.n_heads, row.head_dim, row.context_length);
             try testing.expectEqual(limits.BufferVerdict.fits, fits(scratch, spec_min_limits));
         }
+
         try testing.expectEqual(@as(u32, 1), matches);
     }
 }
@@ -645,14 +719,24 @@ test "planDecode: a row of one split runs resident, and a longer row runs one gr
         try testing.expectEqual(@as(u32, 1), plan.resident_count);
         try testing.expectEqual(@as(u32, 0), plan.split_count);
         try testing.expectEqual(@as(u32, 0), plan.group_count);
-        try testing.expectEqual(PlanRow{ .row = 0, .slot = 0, .t_len = t_len }, plan.residentRows()[0]);
+        try testing.expectEqual(
+            PlanRow{ .row = 0, .slot = 0, .t_len = t_len },
+            plan.residentRows()[0],
+        );
     }
+
     for ([_]u32{ S + 1, 32_704, limits.max_model_ctx }) |t_len| {
         const plan = planDecode(t_len);
         try testing.expectEqual(@as(u32, 0), plan.resident_count);
         try testing.expectEqual(@as(u32, 1), plan.group_count);
-        try testing.expectEqual(PlanGroup{ .first = 0, .len = 1, .stride = splitCount(t_len) }, plan.recordGroups()[0]);
-        try testing.expectEqual(PlanRow{ .row = 0, .slot = 0, .t_len = t_len }, plan.rowsOf(plan.recordGroups()[0])[0]);
+        try testing.expectEqual(
+            PlanGroup{ .first = 0, .len = 1, .stride = splitCount(t_len) },
+            plan.recordGroups()[0],
+        );
+        try testing.expectEqual(
+            PlanRow{ .row = 0, .slot = 0, .t_len = t_len },
+            plan.rowsOf(plan.recordGroups()[0])[0],
+        );
     }
 }
 
@@ -665,10 +749,13 @@ fn checkPlanRows(_: void, c: prop.Trial) anyerror!void {
     // Half the trials mix depths around S, and the rest put every row
     // past it, so groups of one row and groups of many rows both occur.
     const low: u32 = if (trial % 2 == 0) 1 else S + 1;
-    for (sites[0..n]) |*site| site.* = .{
-        .slot = random.intRangeLessThan(u32, 0, 8),
-        .t_len = random.intRangeAtMost(u32, low, 3 * S),
-    };
+    for (sites[0..n]) |*site| {
+        site.* = .{
+            .slot = random.intRangeLessThan(u32, 0, 8),
+            .t_len = random.intRangeAtMost(u32, low, 3 * S),
+        };
+    }
+
     const max_splits = random.intRangeAtMost(u32, splitCount(3 * S), 12);
     const plan = planRows(sites[0..n], max_splits);
     try testing.expectEqual(limits.attn_split_rows * max_splits, plan.budget);
@@ -677,34 +764,52 @@ fn checkPlanRows(_: void, c: prop.Trial) anyerror!void {
     var seen = [_]bool{false} ** max_plan_rows;
     for ([_][]const PlanRow{ plan.residentRows(), plan.splitRows() }) |list| {
         for (list, 0..) |r, k| {
-            if (k > 0) try testing.expect(list[k - 1].row < r.row);
+            if (k > 0) {
+                try testing.expect(list[k - 1].row < r.row);
+            }
+
             try testing.expect(!seen[r.row]);
             seen[r.row] = true;
             try testing.expectEqual(sites[r.row].slot, r.slot);
             try testing.expectEqual(sites[r.row].t_len, r.t_len);
         }
     }
-    for (seen[0..n]) |landed| try testing.expect(landed);
+
+    for (seen[0..n]) |landed| {
+        try testing.expect(landed);
+    }
+
     // The groups cover the split rows in order. Each group fits the
     // budget at its stride, and the next row breaks the budget.
     var next: u32 = 0;
     for (plan.recordGroups()) |g| {
         try testing.expectEqual(next, g.first);
         var widest: u32 = 0;
-        for (plan.rowsOf(g)) |r| widest = @max(widest, splitCount(r.t_len));
+        for (plan.rowsOf(g)) |r| {
+            widest = @max(widest, splitCount(r.t_len));
+        }
+
         try testing.expectEqual(widest, g.stride);
         try testing.expect(g.len * g.stride <= plan.budget);
         if (g.first + g.len < plan.split_count) {
             const after = splitCount(plan.splitRows()[g.first + g.len].t_len);
             try testing.expect((g.len + 1) * @max(widest, after) > plan.budget);
         }
+
         next += g.len;
     }
+
     try testing.expectEqual(plan.split_count, next);
 }
 
 test "planRows: every row lands once, in step order, and the split rows fill maximal groups within the budget" {
-    try prop.forAll(.{ .site = 0x0031_a7a5, .cases = 400, .max_size = 399 }, {}, prop.Trial, prop.genTrial(void), checkPlanRows);
+    try prop.forAll(
+        .{ .site = 0x0031_a7a5, .cases = 400, .max_size = 399 },
+        {},
+        prop.Trial,
+        prop.genTrial(void),
+        checkPlanRows,
+    );
 }
 
 test "planRows: the four registry anchors group a prefill chunk of 128 rows" {
@@ -751,7 +856,11 @@ test "planPrefill: the resident rows of a chunk are the prefix that stays within
             try testing.expectEqual(@as(u32, 2), r.slot);
             try testing.expect(c.start_pos + r.row + 1 <= S);
         }
-        for (plan.splitRows()) |r| try testing.expect(r.row >= c.resident);
+
+        for (plan.splitRows()) |r| {
+            try testing.expect(r.row >= c.resident);
+        }
+
         // The resident run of the chunk ends at S or before it.
         try testing.expect(c.start_pos + c.resident <= S or c.resident == 0);
     }
@@ -761,7 +870,10 @@ test "planPrefill: the resident rows of a chunk are the prefix that stays within
 /// of one group.
 fn spanCost(counts: []const u32, lo: u32, hi: u32) u64 {
     var widest: u64 = 0;
-    for (counts[lo..hi]) |c| widest = @max(widest, c);
+    for (counts[lo..hi]) |c| {
+        widest = @max(widest, c);
+    }
+
     return @as(u64, hi - lo) * widest;
 }
 
@@ -769,19 +881,31 @@ fn spanCost(counts: []const u32, lo: u32, hi: u32) u64 {
 /// and stride.
 fn expectAnchor(s: u32, ctx: u32, sizes: []const u32, stride: u32) !void {
     var counts: [128]u32 = undefined;
-    for (&counts, 0..) |*c, i| c.* = splitCount(s + @as(u32, @intCast(i)) + 1);
+    for (&counts, 0..) |*c, i| {
+        c.* = splitCount(s + @as(u32, @intCast(i)) + 1);
+    }
+
     const budget = 4 * splitCount(ctx);
     var out: [128]BudgetGroup = undefined;
     const groups = budgetGroups(budget, &counts, &out);
     try testing.expectEqual(sizes.len, groups.len);
-    for (groups, sizes) |g, want| try testing.expectEqual(want, g.hi - g.lo);
+    for (groups, sizes) |g, want| {
+        try testing.expectEqual(want, g.hi - g.lo);
+    }
+
     // The stride of the chunk is its largest count, and every group has it.
     var max: u32 = 0;
-    for (counts) |c| max = @max(max, c);
+    for (counts) |c| {
+        max = @max(max, c);
+    }
+
     try testing.expectEqual(stride, max);
     for (groups) |g| {
         var group_max: u32 = 0;
-        for (counts[g.lo..g.hi]) |c| group_max = @max(group_max, c);
+        for (counts[g.lo..g.hi]) |c| {
+            group_max = @max(group_max, c);
+        }
+
         try testing.expectEqual(stride, group_max);
     }
 }
@@ -811,6 +935,7 @@ fn checkBudgetGroups(_: void, seed: u64) anyerror!void {
         c.* = random.intRangeAtMost(u32, 1, 64);
         max = @max(max, c.*);
     }
+
     // Every single row fits the budget, so the precondition holds.
     const budget = random.intRangeAtMost(u32, max, 4 * max);
     const groups = budgetGroups(budget, counts[0..n], &out);
@@ -820,14 +945,24 @@ fn checkBudgetGroups(_: void, seed: u64) anyerror!void {
         try testing.expect(g.lo < g.hi);
         try testing.expect(spanCost(counts[0..n], g.lo, g.hi) <= budget);
         // The group is maximal, so the next row exceeds the budget.
-        if (g.hi < n) try testing.expect(spanCost(counts[0..n], g.lo, g.hi + 1) > budget);
+        if (g.hi < n) {
+            try testing.expect(spanCost(counts[0..n], g.lo, g.hi + 1) > budget);
+        }
+
         next = g.hi;
     }
+
     try testing.expectEqual(n, next);
 }
 
 test "budgetGroups: random counts partition the rows in order within the budget" {
-    try prop.forAll(.{ .site = 0x0031_a7a6, .cases = 500 }, {}, u64, prop.genSeed(void), checkBudgetGroups);
+    try prop.forAll(
+        .{ .site = 0x0031_a7a6, .cases = 500 },
+        {},
+        u64,
+        prop.genSeed(void),
+        checkBudgetGroups,
+    );
 }
 
 test "budgetGroups: the minimum budget gives one row per group when counts are equal" {

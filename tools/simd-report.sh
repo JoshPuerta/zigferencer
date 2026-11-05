@@ -26,8 +26,8 @@
 # A regression is therefore visible during kernel work. A backend that must reach
 # 256-bit or NEON and reports `scalar` did not vectorize. A kernel below the
 # target ceiling in the header is headroom, not a bug. `naive` is the scalar
-# oracle by design, and the f32 kernels emit a separate multiply and add rather
-# than a fused fma or fmla, which keeps them bit-identical with that oracle. The
+# reference by design, and the f32 kernels emit a separate multiply and add rather
+# than a fused fma or fmla, which keeps them bit-identical with that reference. The
 # cross-backend token-hash gate rests on that equality. The attention part
 # kernels of simd and simd_pf fuse, and a test holds them to a measured
 # tolerance against naive instead.

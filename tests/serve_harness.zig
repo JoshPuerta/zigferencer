@@ -31,12 +31,14 @@ const server_mod = z.serve_server;
 const prefill_chunk = z.serve_prefill_chunk;
 const Client = z.serve_client.Client;
 
-// -- types ------------------------------------------------------------------
+// -- constants --------------------------------------------------------------
 
 pub const max_seq: u32 = 64;
 pub const turn_tokens_max: u32 = 12;
 
 pub const prompts = [_][]const u8{ "The dragon flew over", "Tell me a story about" };
+
+// -- types ------------------------------------------------------------------
 
 pub const Endpoint = enum { tcp, unix };
 
@@ -66,8 +68,6 @@ pub const Stream = struct {
     n: usize = 0,
     reason: protocol.FinishReason = .eos,
 };
-
-// -- api --------------------------------------------------------------------
 
 /// One in-process server over the SmolLM2 fixture.
 pub const Harness = HarnessFor(LlamaRunner);
@@ -116,15 +116,22 @@ pub fn HarnessFor(comptime Runner: type) type {
 
             const arena_state = try gpa.create(std.heap.ArenaAllocator);
             errdefer gpa.destroy(arena_state);
+
             arena_state.* = .init(gpa);
             errdefer arena_state.deinit();
+
             const arena = arena_state.allocator();
-            const fixture_name = if (Runner == QwenRunner) "Qwen3.5-2B-Q8_0" else "SmolLM2-135M-Instruct-Q8_0";
+            const fixture_name = if (Runner == QwenRunner)
+                "Qwen3.5-2B-Q8_0"
+            else
+                "SmolLM2-135M-Instruct-Q8_0";
+
             const fixture = try z.test_fixtures.path(arena, fixture_name);
 
             const loaded = try arena.create(loader.Loaded);
             loaded.* = try loader.load(io, arena, fixture);
             errdefer loaded.close();
+
             const vocab = try arena.create(vocab_mod.Vocab);
             vocab.* = try vocab_mod.buildFromParsed(arena, loaded.parsed);
 
@@ -133,34 +140,59 @@ pub fn HarnessFor(comptime Runner: type) type {
                 piece.* = try bpe.decodeAlloc(vocab, arena, &[_]u32{@intCast(id)});
                 try std.testing.expect(piece.len <= limits.max_token_text_bytes);
             }
+
             const codec = try arena.create(event.Codec);
-            codec.* = .{ .vocab = vocab, .kind = opts.kind, .pieces = pieces, .eos_id = vocab.eos_id };
+            codec.* = .{
+                .vocab = vocab,
+                .kind = opts.kind,
+                .pieces = pieces,
+                .eos_id = vocab.eos_id,
+            };
 
             const policy = tp.policy();
             const cpu_pool = try arena.create(tp.Pool);
             try tp.startPool(cpu_pool, io, policy);
             errdefer cpu_pool.deinit();
+
             const runner = try arena.create(Runner);
-            runner.* = try Runner.init(arena, loaded, z.kv_budget.pinned(opts.max_sessions, opts.window), prefill_chunk.stepRows(opts.prefill, opts.max_sessions, opts.max_batch), io, cpu_pool, policy, .f32);
+            runner.* = try Runner.init(
+                arena,
+                loaded,
+                z.kv_budget.pinned(opts.max_sessions, opts.window),
+                prefill_chunk.stepRows(opts.prefill, opts.max_sessions, opts.max_batch),
+                io,
+                cpu_pool,
+                policy,
+                .f32,
+            );
             const engine = try arena.create(Sessions(Runner));
             engine.* = try Sessions(Runner).init(arena, runner);
 
             var tmp: ?std.testing.TmpDir = null;
             errdefer if (tmp) |*t| t.cleanup();
+
             var path_buf: [Io.net.UnixAddress.max_len]u8 = undefined;
             var path_len: usize = 0;
             const transport: server_mod.Transport = switch (endpoint) {
                 .tcp => .{ .tcp = .{} },
                 .unix => blk: {
                     tmp = std.testing.tmpDir(.{});
-                    const path = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}/serve.sock", .{&tmp.?.sub_path});
+                    const path = try std.fmt.bufPrint(
+                        &path_buf,
+                        ".zig-cache/tmp/{s}/serve.sock",
+                        .{&tmp.?.sub_path},
+                    );
                     path_len = path.len;
                     break :blk .{ .unix = path };
                 },
             };
 
             // The launcher's own builder, so the harness boots the think config the server boots.
-            const think = z.serve_common.schedulerThink(try z.serve_common.thinkTagsOf(arena, vocab, opts.kind), opts.kind, 0);
+            const think = z.serve_common.schedulerThink(
+                try z.serve_common.thinkTagsOf(arena, vocab, opts.kind),
+                opts.kind,
+                0,
+            );
 
             const server = try arena.create(ServeServer);
             server.* = try ServeServer.init(arena, gpa, io, engine, codec, .{
@@ -238,19 +270,25 @@ pub fn HarnessFor(comptime Runner: type) type {
             self.loaded.close();
             self.arena_state.deinit();
             self.gpa.destroy(self.arena_state);
-            if (self.tmp) |*t| t.cleanup();
+            if (self.tmp) |*t| {
+                t.cleanup();
+            }
+
             self.* = undefined;
         }
 
         fn stopOverFallback(self: *Self) void {
             var fallback = self.connect() catch return self.submitOwnerShutdown();
             defer fallback.deinit();
+
             fallback.shutdown() catch self.submitOwnerShutdown();
         }
 
         fn submitOwnerShutdown(self: *Self) void {
             // A closed request queue means the engine loop already tears down.
-            self.server.submit(.{ .conn = 0, .request_id = 0, .session_id = 0, .body = .shutdown }) catch {};
+            self.server.submit(
+                .{ .conn = 0, .request_id = 0, .session_id = 0, .body = .shutdown },
+            ) catch {};
         }
 
         fn awaitRun(self: *Self) void {
@@ -263,6 +301,8 @@ pub fn HarnessFor(comptime Runner: type) type {
         }
     };
 }
+
+// -- api --------------------------------------------------------------------
 
 /// One whole turn on an otherwise-quiet connection.
 pub fn oneTurn(client: *Client, sid: u32, prompt: []const u8) !Stream {

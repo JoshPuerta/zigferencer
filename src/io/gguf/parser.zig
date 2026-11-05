@@ -23,12 +23,14 @@ const prop = @import("../../core/prop.zig");
 
 const log = std.log.scoped(.gguf);
 
-// -- types ------------------------------------------------------------------
+// -- constants --------------------------------------------------------------
 
 pub const magic: [4]u8 = .{ 'G', 'G', 'U', 'F' };
 const default_alignment: u64 = 32;
 const max_tensor_name_len: usize = 64;
 const supported_version: u32 = 3;
+
+// -- types ------------------------------------------------------------------
 
 pub const Error = error{
     BadMagic,
@@ -136,6 +138,7 @@ const Reader = struct {
 
     fn ensure(r: *const Reader, n: usize) Error!void {
         std.debug.assert(r.pos <= r.bytes.len);
+
         if (n > r.bytes.len - r.pos) return error.Truncated;
     }
 
@@ -150,6 +153,7 @@ const Reader = struct {
     /// billion-element array and force a multi-gigabyte `alloc`.
     fn boundCount(r: *const Reader, count: u64, min_each: usize) Error!void {
         std.debug.assert(min_each >= 1);
+
         if (count > r.remaining() / min_each) return error.CountExceedsFile;
     }
 
@@ -200,10 +204,12 @@ pub fn parse(arena: Allocator, bytes: []const u8) Error!Parsed {
 
     try r.ensure(4 + 4 + 8 + 8);
     if (!std.mem.eql(u8, bytes[0..4], &magic)) return error.BadMagic;
+
     r.pos = 4;
 
     const version = try r.read(u32);
     if (version != supported_version) return error.UnsupportedVersion;
+
     const tensor_count = try r.read(u64);
     const kv_count = try r.read(u64);
     log.debug("header: v{d}, {d} tensors, {d} kv", .{ version, tensor_count, kv_count });
@@ -215,24 +221,31 @@ pub fn parse(arena: Allocator, bytes: []const u8) Error!Parsed {
         kv.value = try readValue(&r, arena);
     }
 
-    try r.boundCount(tensor_count, 32); // floor per tensor: name len + n_dims + 1 dim + dtype + offset
+    try r.boundCount(
+        tensor_count,
+        32,
+    ); // floor per tensor: name len + n_dims + 1 dim + dtype + offset
     const tensors = try arena.alloc(TensorInfo, @intCast(tensor_count));
     var last_offset: u64 = 0;
     for (tensors) |*ti| {
         const name = try r.readString();
         if (name.len > max_tensor_name_len) return error.NameTooLong;
+
         ti.name = name;
         const n_dims_u32 = try r.read(u32);
         if (n_dims_u32 == 0 or n_dims_u32 > 4) return error.BadTensorDims;
+
         ti.n_dims = @intCast(n_dims_u32);
         ti.shape = .{ 1, 1, 1, 1 };
         var i: usize = 0;
         while (i < ti.n_dims) : (i += 1) {
             ti.shape[i] = try r.read(u64);
         }
+
         ti.dtype = @enumFromInt(try r.read(u32));
         ti.offset_in_data = try r.read(u64);
         if (ti.offset_in_data < last_offset) return error.TensorOffsetsUnordered;
+
         last_offset = ti.offset_in_data;
     }
 
@@ -247,12 +260,18 @@ pub fn parse(arena: Allocator, bytes: []const u8) Error!Parsed {
             break;
         }
     }
+
     // The llama.cpp reader refuses the same two forms. A power of two keeps
     // every aligned offset aligned for each smaller power of two.
     if (alignment == 0 or !std.math.isPowerOfTwo(alignment)) return error.BadAlignment;
+
     for (tensors) |ti| {
         if (ti.offset_in_data % alignment != 0) {
-            log.debug("tensor {s} starts at data offset {d}, which is not a multiple of the alignment {d}", .{ ti.name, ti.offset_in_data, alignment });
+            log.debug(
+                "tensor {s} starts at data offset {d}, which is not a multiple of the " ++
+                    "alignment {d}",
+                .{ ti.name, ti.offset_in_data, alignment },
+            );
             return error.TensorOffsetUnaligned;
         }
     }
@@ -297,62 +316,98 @@ fn readArray(r: *Reader, arena: Allocator) Error!Array {
     return switch (elem_type) {
         .u8 => blk: {
             const buf = try arena.alloc(u8, n);
-            for (buf) |*x| x.* = try r.read(u8);
+            for (buf) |*x| {
+                x.* = try r.read(u8);
+            }
+
             break :blk .{ .u8s = buf };
         },
         .i8 => blk: {
             const buf = try arena.alloc(i8, n);
-            for (buf) |*x| x.* = try r.read(i8);
+            for (buf) |*x| {
+                x.* = try r.read(i8);
+            }
+
             break :blk .{ .i8s = buf };
         },
         .u16 => blk: {
             const buf = try arena.alloc(u16, n);
-            for (buf) |*x| x.* = try r.read(u16);
+            for (buf) |*x| {
+                x.* = try r.read(u16);
+            }
+
             break :blk .{ .u16s = buf };
         },
         .i16 => blk: {
             const buf = try arena.alloc(i16, n);
-            for (buf) |*x| x.* = try r.read(i16);
+            for (buf) |*x| {
+                x.* = try r.read(i16);
+            }
+
             break :blk .{ .i16s = buf };
         },
         .u32 => blk: {
             const buf = try arena.alloc(u32, n);
-            for (buf) |*x| x.* = try r.read(u32);
+            for (buf) |*x| {
+                x.* = try r.read(u32);
+            }
+
             break :blk .{ .u32s = buf };
         },
         .i32 => blk: {
             const buf = try arena.alloc(i32, n);
-            for (buf) |*x| x.* = try r.read(i32);
+            for (buf) |*x| {
+                x.* = try r.read(i32);
+            }
+
             break :blk .{ .i32s = buf };
         },
         .f32 => blk: {
             const buf = try arena.alloc(f32, n);
-            for (buf) |*x| x.* = try r.read(f32);
+            for (buf) |*x| {
+                x.* = try r.read(f32);
+            }
+
             break :blk .{ .f32s = buf };
         },
         .bool => blk: {
             const buf = try arena.alloc(bool, n);
-            for (buf) |*x| x.* = try r.readBool();
+            for (buf) |*x| {
+                x.* = try r.readBool();
+            }
+
             break :blk .{ .bools = buf };
         },
         .string => blk: {
             const buf = try arena.alloc([]const u8, n);
-            for (buf) |*x| x.* = try r.readString();
+            for (buf) |*x| {
+                x.* = try r.readString();
+            }
+
             break :blk .{ .strings = buf };
         },
         .u64 => blk: {
             const buf = try arena.alloc(u64, n);
-            for (buf) |*x| x.* = try r.read(u64);
+            for (buf) |*x| {
+                x.* = try r.read(u64);
+            }
+
             break :blk .{ .u64s = buf };
         },
         .i64 => blk: {
             const buf = try arena.alloc(i64, n);
-            for (buf) |*x| x.* = try r.read(i64);
+            for (buf) |*x| {
+                x.* = try r.read(i64);
+            }
+
             break :blk .{ .i64s = buf };
         },
         .f64 => blk: {
             const buf = try arena.alloc(f64, n);
-            for (buf) |*x| x.* = try r.read(f64);
+            for (buf) |*x| {
+                x.* = try r.read(f64);
+            }
+
             break :blk .{ .f64s = buf };
         },
         .array => return error.NestedArray,
@@ -408,8 +463,10 @@ test "hardening: unordered tensor offsets are a typed error, not a panic" {
     const al = std.testing.allocator;
     var arena = std.heap.ArenaAllocator.init(al);
     defer arena.deinit();
+
     var list: std.ArrayList(u8) = .empty;
     defer list.deinit(al);
+
     try list.appendSlice(al, "GGUF");
     try tInt(al, &list, u32, supported_version);
     try tInt(al, &list, u64, 2); // tensor_count
@@ -422,6 +479,7 @@ test "hardening: unordered tensor offsets are a typed error, not a panic" {
         try tInt(al, &list, u32, 0); // dtype (ggml F32)
         try tInt(al, &list, u64, @as(u64, t[1])); // offset
     }
+
     try std.testing.expectError(error.TensorOffsetsUnordered, parse(arena.allocator(), list.items));
 }
 
@@ -466,6 +524,7 @@ pub fn sampleGguf() !Sample {
         try tInt(al, &list, u64, item.len);
         list.appendSliceAssumeCapacity(item);
     }
+
     inline for (.{ .{ "t0", 0 }, .{ "t1", 16 } }) |t| {
         try tInt(al, &list, u64, t[0].len);
         list.appendSliceAssumeCapacity(t[0]);
@@ -475,6 +534,7 @@ pub fn sampleGguf() !Sample {
         try tInt(al, &list, u32, @intFromEnum(dtype.GgmlType.f32));
         try tInt(al, &list, u64, t[1]);
     }
+
     const table_end = list.items.len;
     list.appendNTimesAssumeCapacity(0, (16 - table_end % 16) % 16);
     list.appendNTimesAssumeCapacity(0x5A, 32);
@@ -487,6 +547,7 @@ pub fn sampleGguf() !Sample {
 
 fn inside(buf: []const u8, slice: []const u8) bool {
     if (slice.len == 0) return true;
+
     const lo = @intFromPtr(buf.ptr);
     const at = @intFromPtr(slice.ptr);
     return at >= lo and at + slice.len <= lo + buf.len;
@@ -510,10 +571,13 @@ fn expectParseInside(bytes: []const u8) !void {
         try std.testing.expect(inside(bytes, kv.key));
         switch (kv.value) {
             .string => |s| try std.testing.expect(inside(bytes, s)),
-            .array => |a| if (a == .strings) for (a.strings) |s| try std.testing.expect(inside(bytes, s)),
+            .array => |a| if (a == .strings) for (a.strings) |s| try std.testing.expect(
+                inside(bytes, s),
+            ),
             else => {},
         }
     }
+
     var last: u64 = 0;
     for (p.tensors) |t| {
         try std.testing.expect(inside(bytes, t.name));
@@ -530,6 +594,7 @@ test "exhaustive: every single-byte change of the header, the kvs, and the tenso
     const original = sample.bytes[0..sample.len];
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
+
     const p = try parse(arena.allocator(), original);
     try std.testing.expectEqual(@as(usize, 2), p.tensors.len);
     try std.testing.expectEqual(@as(u64, 16), p.alignment);
@@ -552,24 +617,45 @@ fn checkGgufMutation(sample: *const Sample, seed: u64) anyerror!void {
     const r = prng.random();
     var bytes: [sample_capacity]u8 = undefined;
     @memcpy(bytes[0..sample.len], sample.bytes[0..sample.len]);
-    for (0..1 + r.uintLessThan(usize, 8)) |_| bytes[r.uintLessThan(usize, sample.len)] = r.int(u8);
+    for (0..1 + r.uintLessThan(usize, 8)) |_| {
+        bytes[r.uintLessThan(usize, sample.len)] = r.int(u8);
+    }
+
     if (r.boolean()) {
-        const edges = [_]u64{ 0, 1, 0x7F, 0xFF, 1 << 32, std.math.maxInt(u32), std.math.maxInt(u63), std.math.maxInt(u64), std.math.maxInt(u64) - 7 };
+        const edges = [_]u64{
+            0,
+            1,
+            0x7F,
+            0xFF,
+            1 << 32,
+            std.math.maxInt(u32),
+            std.math.maxInt(u63),
+            std.math.maxInt(u64),
+            std.math.maxInt(u64) - 7,
+        };
         const at = r.uintAtMost(usize, sample.table_end - 8);
         std.mem.writeInt(u64, bytes[at..][0..8], edges[r.uintLessThan(usize, edges.len)], .little);
     }
+
     const len = if (r.boolean()) sample.len else r.uintAtMost(usize, sample.len);
     try expectParseInside(bytes[0..len]);
 }
 
 test "property: random multi-byte mutations and cuts parse inside the buffer or fail typed" {
     const sample = try sampleGguf();
-    try prop.forAll(.{ .site = 0x6767_7566, .cases = 4000 }, &sample, u64, prop.genSeed(*const Sample), checkGgufMutation);
+    try prop.forAll(
+        .{ .site = 0x6767_7566, .cases = 4000 },
+        &sample,
+        u64,
+        prop.genSeed(*const Sample),
+        checkGgufMutation,
+    );
 }
 
 test "hardening: a key length of maxInt(u64) is a typed error, not an overflow" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
+
     var bytes: [37]u8 = @splat(0);
     @memcpy(bytes[0..4], "GGUF");
     std.mem.writeInt(u32, bytes[4..8], supported_version, .little);
@@ -581,6 +667,7 @@ test "hardening: a key length of maxInt(u64) is a typed error, not an overflow" 
 test "hardening: an alignment near maxInt(u64) is a typed error, not an overflow" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
+
     var list: std.ArrayList(u8) = .empty;
     const a = arena.allocator();
     try list.appendSlice(a, "GGUF");
@@ -593,7 +680,10 @@ test "hardening: an alignment near maxInt(u64) is a typed error, not an overflow
     for ([_]u64{ std.math.maxInt(u64), std.math.maxInt(u64) - 7, 1 << 63 }) |align_value| {
         list.items.len = 4 + 4 + 8 + 8 + 8 + "general.alignment".len + 4;
         try tInt(a, &list, u64, align_value);
-        const want: Error = if (std.math.isPowerOfTwo(align_value)) error.Truncated else error.BadAlignment;
+        const want: Error = if (std.math.isPowerOfTwo(
+            align_value,
+        )) error.Truncated else error.BadAlignment;
+
         try std.testing.expectError(want, parse(a, list.items));
     }
 }
@@ -622,6 +712,7 @@ test "alignment: the parse takes a power of two and offsets on it, and refuses t
     };
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
+
     for (cases) |c| {
         const s = try sampleWith(c.alignment, c.t1_offset);
         const got = parse(arena.allocator(), s.bytes[0..s.len]);

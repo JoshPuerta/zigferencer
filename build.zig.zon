@@ -8,19 +8,19 @@
     // Auto-generated package id (Zig writes it on first build). Do not hand-edit.
     .fingerprint = 0x8d219c7ebb4de560,
 
-    // Hard floor on the toolchain. The code uses the 0.16 `std.Io` and build
-    // APIs. An older or a newer Zig does not compile it. A raise is deliberate.
+    // Hard floor on the toolchain.
     .minimum_zig_version = "0.16.0",
 
     .dependencies = .{
         // vulkan-zig generates the Vulkan bindings (`vk.zig`) from the registry
-        // XML at build time. `-Druntime=vulkan` ALONE materializes it, because
-        // build.zig calls `b.dependency("vulkan", ...)` inside `wireVulkan`. A
-        // default CPU build therefore never fetches or compiles it. The pin is
-        // an exact commit, which keeps the generated API fixed.
+        // XML at build time. The dependency is lazy, so `zig build` fetches it
+        // only when `wireVulkan` asks for it under `-Druntime=vulkan`. A default
+        // CPU build needs no network. The pin is an exact commit, which keeps
+        // the generated API fixed.
         .vulkan = .{
             .url = "git+https://github.com/Snektron/vulkan-zig?ref=master#b496a6a561ffbbeb530b0f9ed4e059f88c0723a5",
             .hash = "vulkan-0.0.0-r7Ytx7N9AwD7IZt5_XNHtkJ4G9qY0pCH-cpcOsbL8wzD",
+            .lazy = true,
         },
     },
 

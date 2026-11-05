@@ -74,7 +74,7 @@ comptime {
     }
 }
 
-// -- types ---------------------------------------------------------------------
+// -- types ------------------------------------------------------------------
 
 /// All the per-layer and final weight tensor handles that the fused runner
 /// needs at init time. The field names mirror `runtime.LlamaRunner`, so a caller
@@ -101,8 +101,6 @@ pub const WeightHandles = struct {
 /// model uses one, because the per-layer matmuls are uniform. It selects the
 /// matmul kernel and the weight-upload path.
 pub const WeightQuant = enum { q8_0, q4_0 };
-
-// -- api -----------------------------------------------------------------------
 
 pub const LlamaFusedRunner = struct {
     gpa: Allocator,
@@ -296,17 +294,17 @@ pub const LlamaFusedRunner = struct {
     /// stays valid only while no set changes, so no set changes after init.
     sets_fixed: bool = false,
 
-    // Host-to-device staging for the KV restore leg. The first restore
+    // Host-to-device staging for the KV restore path. The first restore
     // allocates it, so a run that never restores pays nothing.
     kv_swap_stage: kernels.HostBuffer,
 
-    /// Separate staging for the device-to-host leg. Both stages use host-cached
+    /// Separate staging for the device-to-host copy. Both stages use host-cached
     /// memory when the driver offers it. Two stages and not one, because an
     /// eviction readback must not wait for an upload that still uses
     /// `kv_swap_stage`.
     kv_readback_stage: kernels.HostBuffer,
 
-    /// Telemetry only: the leg split of the last evict or restore, so a bench
+    /// Telemetry only: the DMA and copy split of the last evict or restore, so a bench
     /// aggregates the DMA and the mapped-staging memcpy without parsing logs.
     last_swap_split: kernels.SwapSplit,
 
@@ -321,7 +319,7 @@ pub const LlamaFusedRunner = struct {
     /// commands raise it to `phases` for one submit.
     prof: gpu_profile.GpuProfile,
 
-    /// Host time of the single-row decode legs, summed since the last reset.
+    /// Host time of the single-row decode host steps, summed since the last reset.
     /// `generate.decode` clears it before a run and reads it after.
     host: step_stats.DecodeHost = .{},
 
@@ -372,8 +370,14 @@ pub const LlamaFusedRunner = struct {
         loaded: *const loader.Loaded,
     ) (Allocator.Error || error{MissingTensor})!FoundWeights {
         const c = loaded.card;
-        const embed = findTensor(loaded.tensors, "token_embd.weight") orelse return error.MissingTensor;
-        const output_norm = findTensor(loaded.tensors, "output_norm.weight") orelse return error.MissingTensor;
+        const embed = findTensor(
+            loaded.tensors,
+            "token_embd.weight",
+        ) orelse return error.MissingTensor;
+        const output_norm = findTensor(
+            loaded.tensors,
+            "output_norm.weight",
+        ) orelse return error.MissingTensor;
         const output = findTensor(loaded.tensors, "output.weight") orelse embed;
 
         // One allocation carved into the nine per-layer arrays: a partial
@@ -382,6 +386,7 @@ pub const LlamaFusedRunner = struct {
         const n: usize = c.n_layers;
         const backing = try gpa.alloc(*const Tensor, per_layer_arrays * n);
         errdefer gpa.free(backing);
+
         const attn_norm_w = backing[0 * n ..][0..n];
         const attn_q_w = backing[1 * n ..][0..n];
         const attn_k_w = backing[2 * n ..][0..n];
@@ -395,16 +400,42 @@ pub const LlamaFusedRunner = struct {
         var name_buf: [64]u8 = undefined;
         var i: u32 = 0;
         while (i < c.n_layers) : (i += 1) {
-            attn_norm_w[i] = try findByFmt(loaded.tensors, &name_buf, "blk.{d}.attn_norm.weight", .{i});
+            attn_norm_w[i] = try findByFmt(
+                loaded.tensors,
+                &name_buf,
+                "blk.{d}.attn_norm.weight",
+                .{i},
+            );
             attn_q_w[i] = try findByFmt(loaded.tensors, &name_buf, "blk.{d}.attn_q.weight", .{i});
             attn_k_w[i] = try findByFmt(loaded.tensors, &name_buf, "blk.{d}.attn_k.weight", .{i});
             attn_v_w[i] = try findByFmt(loaded.tensors, &name_buf, "blk.{d}.attn_v.weight", .{i});
-            attn_o_w[i] = try findByFmt(loaded.tensors, &name_buf, "blk.{d}.attn_output.weight", .{i});
-            ffn_norm_w[i] = try findByFmt(loaded.tensors, &name_buf, "blk.{d}.ffn_norm.weight", .{i});
-            ffn_gate_w[i] = try findByFmt(loaded.tensors, &name_buf, "blk.{d}.ffn_gate.weight", .{i});
+            attn_o_w[i] = try findByFmt(
+                loaded.tensors,
+                &name_buf,
+                "blk.{d}.attn_output.weight",
+                .{i},
+            );
+            ffn_norm_w[i] = try findByFmt(
+                loaded.tensors,
+                &name_buf,
+                "blk.{d}.ffn_norm.weight",
+                .{i},
+            );
+            ffn_gate_w[i] = try findByFmt(
+                loaded.tensors,
+                &name_buf,
+                "blk.{d}.ffn_gate.weight",
+                .{i},
+            );
             ffn_up_w[i] = try findByFmt(loaded.tensors, &name_buf, "blk.{d}.ffn_up.weight", .{i});
-            ffn_down_w[i] = try findByFmt(loaded.tensors, &name_buf, "blk.{d}.ffn_down.weight", .{i});
+            ffn_down_w[i] = try findByFmt(
+                loaded.tensors,
+                &name_buf,
+                "blk.{d}.ffn_down.weight",
+                .{i},
+            );
         }
+
         return .{
             .handles = .{
                 .attn_norm_w = attn_norm_w,
@@ -433,6 +464,7 @@ pub const LlamaFusedRunner = struct {
     /// runner exists.
     pub fn kvCostModel(card: loader.ModelCard, kv_dtype: dtype.KvDtype) kv_budget.KvCostModel {
         std.debug.assert(card.gdn == null);
+
         return kv_budget.costModel(card.kvShape(), kv_dtype);
     }
 
@@ -457,6 +489,7 @@ pub const LlamaFusedRunner = struct {
         const f32_bytes: u64 = @as(u64, prefill_rows_max) * per_row * @sizeOf(f32) +
             attnSplitScratch(card).totalBytes();
         if (kv_dtype == .f32) return f32_bytes;
+
         return f32_bytes + @as(u64, prefill_rows_max) * 2 * kv_dtype.rowBytes(@intCast(per_step));
     }
 
@@ -473,11 +506,15 @@ pub const LlamaFusedRunner = struct {
     /// counted, unless it doubles as the tied lm_head, which is uploaded.
     pub fn weightsVramBytes(weights: WeightHandles, n_layers: u32) u64 {
         var total: u64 = weights.output_norm.data.len + weights.output.data.len;
-        for (0..n_layers) |li| total +=
-            weights.attn_norm_w[li].data.len + weights.ffn_norm_w[li].data.len +
-            weights.attn_q_w[li].data.len + weights.attn_k_w[li].data.len +
-            weights.attn_v_w[li].data.len + weights.attn_o_w[li].data.len +
-            weights.ffn_gate_w[li].data.len + weights.ffn_up_w[li].data.len + weights.ffn_down_w[li].data.len;
+        for (0..n_layers) |li| {
+            total +=
+                weights.attn_norm_w[li].data.len + weights.ffn_norm_w[li].data.len +
+                weights.attn_q_w[li].data.len + weights.attn_k_w[li].data.len +
+                weights.attn_v_w[li].data.len + weights.attn_o_w[li].data.len +
+                weights.ffn_gate_w[li].data.len + weights.ffn_up_w[li].data.len +
+                weights.ffn_down_w[li].data.len;
+        }
+
         return total;
     }
 
@@ -488,6 +525,7 @@ pub const LlamaFusedRunner = struct {
     ) (Allocator.Error || error{MissingTensor})!u64 {
         const found = try handlesFromLoaded(gpa, loaded);
         defer found.deinit(gpa);
+
         return weightsVramBytes(found.handles, loaded.card.n_layers);
     }
 
@@ -516,6 +554,7 @@ pub const LlamaFusedRunner = struct {
     ) (Allocator.Error || error{MissingTensor})!kv_budget.Caps {
         std.debug.assert(ceiling >= 1);
         std.debug.assert(ceiling <= loaded.card.context_length);
+
         const windows = kv_budget.defaultWindows(kvCostModel(loaded.card, kv_dtype), ceiling);
         return .{
             .vram_free = vram_free,
@@ -542,6 +581,7 @@ pub const LlamaFusedRunner = struct {
     ) (InitError || error{MissingTensor})!*LlamaFusedRunner {
         const found = try handlesFromLoaded(gpa, loaded);
         defer found.deinit(gpa);
+
         return init(gpa, ctx, loaded.card, found.handles, plan, kv_dtype);
     }
 
@@ -587,7 +627,13 @@ pub const LlamaFusedRunner = struct {
         // Every layer holds one K region and one V region, and the plan priced
         // exactly those bytes. The device limits bind one region, so the guard
         // refuses before the first allocation.
-        const kv_layout = kv_index.Layout.init(n_slots, max_seq, per_step_elems, n_layers, kv_dtype);
+        const kv_layout = kv_index.Layout.init(
+            n_slots,
+            max_seq,
+            per_step_elems,
+            n_layers,
+            kv_dtype,
+        );
         std.debug.assert(kv_layout.totalBytes() == plan.vram.kv);
         try ctx.guardKvLayout(kv_layout);
         try kernels.AttentionSplit.guardHeadDim(head_dim);
@@ -619,7 +665,11 @@ pub const LlamaFusedRunner = struct {
             std.debug.assert(plan.vram.scratch == scratch_bytes);
             const planned: u64 = weights_bytes + kv_total + logits_bytes + scratch_bytes;
             const available: u64 = ctx.deviceLocalAvailableBytes();
-            log.debug("vram preflight: planned {d} MiB (weights {d}, kv {d}, scratch {d}), available {d} MiB", .{ planned / mib, weights_bytes / mib, kv_total / mib, scratch_bytes / mib, available / mib });
+            log.debug(
+                "vram preflight: planned {d} MiB (weights {d}, kv {d}, scratch {d}), " ++
+                    "available {d} MiB",
+                .{ planned / mib, weights_bytes / mib, kv_total / mib, scratch_bytes / mib, available / mib },
+            );
             if (!limits.vramPlanFits(planned, available)) {
                 // The fit reads the same live budget and the same reservations
                 // as the check above.
@@ -634,7 +684,13 @@ pub const LlamaFusedRunner = struct {
                     .kv = kv_total,
                     .n_slots = n_slots,
                     .window = max_seq,
-                    .fit = kv_budget.largestFittingWindow(available, reserved, cost, n_slots, max_seq),
+                    .fit = kv_budget.largestFittingWindow(
+                        available,
+                        reserved,
+                        cost,
+                        n_slots,
+                        max_seq,
+                    ),
                 })});
                 return error.VramBudgetExceeded;
             }
@@ -759,6 +815,7 @@ pub const LlamaFusedRunner = struct {
                 @memset(ff_dst, 1.0);
             }
         }
+
         try self.buf_k_scratch.ensure(bm * @as(vk.DeviceSize, per_step_elems) * f32_size);
         try self.buf_v_scratch.ensure(bm * @as(vk.DeviceSize, per_step_elems) * f32_size);
         // The narrowed commit scratch: the same row count at the storage
@@ -769,9 +826,11 @@ pub const LlamaFusedRunner = struct {
             try self.buf_k_scratch_kv.ensure(kv_scratch);
             try self.buf_v_scratch_kv.ensure(kv_scratch);
         }
+
         try self.buf_attn_out.ensure(bm * @as(vk.DeviceSize, n_heads * head_dim) * f32_size);
         try self.buf_attn_split.ensure(attn_scratch.totalBytes());
         errdefer self.buf_attn_split.deinit();
+
         try self.buf_ffn_gate.ensure(bm * @as(vk.DeviceSize, ffn_dim) * f32_size);
         try self.buf_ffn_up.ensure(bm * @as(vk.DeviceSize, ffn_dim) * f32_size);
         try self.buf_ffn_down.ensure(bm * @as(vk.DeviceSize, hidden_dim) * f32_size);
@@ -779,7 +838,9 @@ pub const LlamaFusedRunner = struct {
         // the first row, a batched tick the first n_logits rows,
         // and prefill is also single-row because sampling reads only
         // the last token.
-        try self.buf_logits.ensure(@as(vk.DeviceSize, self.logit_rows_max) * @as(vk.DeviceSize, vocab_size) * f32_size);
+        try self.buf_logits.ensure(
+            @as(vk.DeviceSize, self.logit_rows_max) * @as(vk.DeviceSize, vocab_size) * f32_size,
+        );
 
         // KV cache, one region per layer and tensor. The commit copies move
         // scratch rows of `kvRowBytes()` into rows of the layout.
@@ -792,7 +853,9 @@ pub const LlamaFusedRunner = struct {
         // stage_out sized for logit_rows_max rows so batched
         // readback fits.
         try self.stage_in.ensure(bm * @as(vk.DeviceSize, hidden_dim) * f32_size);
-        try self.stage_out.ensure(@as(vk.DeviceSize, self.logit_rows_max) * @as(vk.DeviceSize, vocab_size) * f32_size);
+        try self.stage_out.ensure(
+            @as(vk.DeviceSize, self.logit_rows_max) * @as(vk.DeviceSize, vocab_size) * f32_size,
+        );
         self.logits_heap = try gpa.alloc(f32, vocab_size);
 
         self.k_linear = try kernels.LinearQ80Reduce.init(ctx);
@@ -812,14 +875,21 @@ pub const LlamaFusedRunner = struct {
         self.k_attention_multi = try kernels.AttentionMultiStream.initKv(ctx, kv_dtype);
         self.k_attention_split = try kernels.AttentionSplit.initKv(ctx, kv_dtype);
         errdefer self.k_attention_split.deinit();
-        if (kv_dtype != .f32) self.k_kv_commit = try kernels.KvCommitF16.init(ctx);
+
+        if (kv_dtype != .f32) {
+            self.k_kv_commit = try kernels.KvCommitF16.init(ctx);
+        }
 
         // The 1 GB quants segment holds the largest single weight on Llama-8B
         // Q8_0, the lm_head quants at ~525 MB. The whole model then takes ~9
         // segments instead of 448 separate allocations.
-        const arena_usage: vk.BufferUsageFlags = .{ .storage_buffer_bit = true, .transfer_dst_bit = true };
+        const arena_usage: vk.BufferUsageFlags = .{
+            .storage_buffer_bit = true,
+            .transfer_dst_bit = true,
+        };
         self.arena_small = try kernels.VramArena.init(ctx, gpa, arena_usage, 256 * 1024 * 1024);
         errdefer self.arena_small.deinit();
+
         self.arena_quants = try kernels.VramArena.init(ctx, gpa, arena_usage, 1024 * 1024 * 1024);
         errdefer self.arena_quants.deinit();
 
@@ -837,22 +907,80 @@ pub const LlamaFusedRunner = struct {
 
         var layer: u32 = 0;
         while (layer < n_layers) : (layer += 1) {
-            self.attn_norm_w[layer] = try uploadFp32NormInArena(ctx, weights.attn_norm_w[layer].*, &self.arena_small);
-            self.ffn_norm_w[layer] = try uploadFp32NormInArena(ctx, weights.ffn_norm_w[layer].*, &self.arena_small);
-            // Attention matmuls keep N-outer (no transposed copy) to fit
-            // Llama-8B in 16 GB. FFN matmuls get the transposed copy.
-            // They are the largest (4096*14336) and benefit most from
-            // the coalesced weight read pattern.
-            self.attn_q_w[layer] = try makeMatmulW(ctx, &self.arena_small, &self.arena_quants, self.quant, weights.attn_q_w[layer].*);
-            self.attn_k_w[layer] = try makeMatmulW(ctx, &self.arena_small, &self.arena_quants, self.quant, weights.attn_k_w[layer].*);
-            self.attn_v_w[layer] = try makeMatmulW(ctx, &self.arena_small, &self.arena_quants, self.quant, weights.attn_v_w[layer].*);
-            self.attn_o_w[layer] = try makeMatmulW(ctx, &self.arena_small, &self.arena_quants, self.quant, weights.attn_o_w[layer].*);
-            self.ffn_gate_w[layer] = try makeMatmulW(ctx, &self.arena_small, &self.arena_quants, self.quant, weights.ffn_gate_w[layer].*);
-            self.ffn_up_w[layer] = try makeMatmulW(ctx, &self.arena_small, &self.arena_quants, self.quant, weights.ffn_up_w[layer].*);
-            self.ffn_down_w[layer] = try makeMatmulW(ctx, &self.arena_small, &self.arena_quants, self.quant, weights.ffn_down_w[layer].*);
+            self.attn_norm_w[layer] = try uploadFp32NormInArena(
+                ctx,
+                weights.attn_norm_w[layer].*,
+                &self.arena_small,
+            );
+            self.ffn_norm_w[layer] = try uploadFp32NormInArena(
+                ctx,
+                weights.ffn_norm_w[layer].*,
+                &self.arena_small,
+            );
+            self.attn_q_w[layer] = try makeMatmulW(
+                ctx,
+                &self.arena_small,
+                &self.arena_quants,
+                self.quant,
+                weights.attn_q_w[layer].*,
+            );
+            self.attn_k_w[layer] = try makeMatmulW(
+                ctx,
+                &self.arena_small,
+                &self.arena_quants,
+                self.quant,
+                weights.attn_k_w[layer].*,
+            );
+            self.attn_v_w[layer] = try makeMatmulW(
+                ctx,
+                &self.arena_small,
+                &self.arena_quants,
+                self.quant,
+                weights.attn_v_w[layer].*,
+            );
+            self.attn_o_w[layer] = try makeMatmulW(
+                ctx,
+                &self.arena_small,
+                &self.arena_quants,
+                self.quant,
+                weights.attn_o_w[layer].*,
+            );
+            self.ffn_gate_w[layer] = try makeMatmulW(
+                ctx,
+                &self.arena_small,
+                &self.arena_quants,
+                self.quant,
+                weights.ffn_gate_w[layer].*,
+            );
+            self.ffn_up_w[layer] = try makeMatmulW(
+                ctx,
+                &self.arena_small,
+                &self.arena_quants,
+                self.quant,
+                weights.ffn_up_w[layer].*,
+            );
+            self.ffn_down_w[layer] = try makeMatmulW(
+                ctx,
+                &self.arena_small,
+                &self.arena_quants,
+                self.quant,
+                weights.ffn_down_w[layer].*,
+            );
         }
-        self.output_norm_w = try uploadFp32NormInArena(ctx, weights.output_norm.*, &self.arena_small);
-        self.output_w = try makeOutputW(ctx, gpa, &self.arena_small, &self.arena_quants, self.quant, weights.output.*);
+
+        self.output_norm_w = try uploadFp32NormInArena(
+            ctx,
+            weights.output_norm.*,
+            &self.arena_small,
+        );
+        self.output_w = try makeOutputW(
+            ctx,
+            gpa,
+            &self.arena_small,
+            &self.arena_quants,
+            self.quant,
+            weights.output.*,
+        );
 
         // Descriptor pool. Total descriptor slots conservatively sized:
         //   matmul: n_layers*7 + 1 sets, 4 storage_buffer per set
@@ -868,8 +996,10 @@ pub const LlamaFusedRunner = struct {
         const kv_commit_sets: u32 = if (kv_dtype == .f32) 0 else 1;
         const split_bindings = kernels.AttentionSplit.split_bindings;
         const merge_bindings = kernels.AttentionSplit.merge_bindings;
-        const total_sets: u32 = (n_layers * 7 + 1) + (n_layers * 2 + 1) + n_layers + n_layers + n_layers + 1 + 2 + 1 + 2 + kv_commit_sets;
-        const total_storage: u32 = (n_layers * 7 + 1) * 4 + (n_layers * 2 + 1) * 3 + n_layers * 4 + n_layers * 4 +
+        const total_sets: u32 = (n_layers * 7 + 1) + (n_layers * 2 + 1) + n_layers + n_layers +
+            n_layers + 1 + 2 + 1 + 2 + kv_commit_sets;
+        const total_storage: u32 = (n_layers * 7 + 1) * 4 + (n_layers * 2 + 1) * 3 + n_layers * 4 +
+            n_layers * 4 +
             n_layers * split_bindings + merge_bindings + 2 * 2 + 3 + 2 * 2 + kv_commit_sets * 4;
         const pool_sizes = [_]vk.DescriptorPoolSize{
             .{ .type = .storage_buffer, .descriptor_count = total_storage },
@@ -898,18 +1028,31 @@ pub const LlamaFusedRunner = struct {
         try self.allocateAndBindDescriptorSets();
 
         self.cmd_buffer = try kernels.allocateOnePrimaryCmdBuffer(ctx);
-        errdefer ctx.vkd.freeCommandBuffers(ctx.device, ctx.command_pool, &[_]vk.CommandBuffer{self.cmd_buffer});
+        errdefer ctx.vkd.freeCommandBuffers(
+            ctx.device,
+            ctx.command_pool,
+            &[_]vk.CommandBuffer{self.cmd_buffer},
+        );
+
         self.decode = try decode_ring.DecodeRing.init(ctx, .llama_fused);
         errdefer self.decode.deinit();
+
         self.sets_fixed = true;
 
         self.prof = try gpu_profile.GpuProfile.init(ctx, span.gpuLevel(), span.gpuLevel());
         errdefer self.prof.deinit();
 
         const mib: f64 = 1024.0 * 1024.0;
-        const weights_mib: f64 = @as(f64, @floatFromInt(self.arena_quants.totalUsed() + self.arena_small.totalUsed())) / mib;
+        const weights_mib: f64 = @as(
+            f64,
+            @floatFromInt(self.arena_quants.totalUsed() + self.arena_small.totalUsed()),
+        ) / mib;
         const kv_mib: f64 = @as(f64, @floatFromInt(self.kv.deviceBytes())) / mib;
-        log.debug("init llama fused: {d} layers, {d} slots x {d} streams, max_seq {d}, quant {t}, weights {d:.0} MiB, kv {d:.0} MiB", .{ n_layers, self.n_slots, self.n_streams_max, max_seq, self.quant, weights_mib, kv_mib });
+        log.debug(
+            "init llama fused: {d} layers, {d} slots x {d} streams, max_seq {d}, quant {t}, " ++
+                "weights {d:.0} MiB, kv {d:.0} MiB",
+            .{ n_layers, self.n_slots, self.n_streams_max, max_seq, self.quant, weights_mib, kv_mib },
+        );
         self.arena_small.logSegments("small");
         self.arena_quants.logSegments("quants");
 
@@ -918,7 +1061,13 @@ pub const LlamaFusedRunner = struct {
 
     pub fn deinit(self: *LlamaFusedRunner) void {
         const ctx = self.ctx;
-        const freed_mib: f64 = @as(f64, @floatFromInt(self.arena_quants.totalUsed() + self.arena_small.totalUsed() + self.kv.layout.totalBytes())) / (1024.0 * 1024.0);
+        const freed_mib: f64 = @as(
+            f64,
+            @floatFromInt(
+                self.arena_quants.totalUsed() + self.arena_small.totalUsed() +
+                    self.kv.layout.totalBytes(),
+            ),
+        ) / (1024.0 * 1024.0);
         log.debug("deinit: freeing {d:.0} MiB weights+kv", .{freed_mib});
         self.prof.deinit();
         self.decode.deinit();
@@ -954,6 +1103,7 @@ pub const LlamaFusedRunner = struct {
             self.attn_k_w[layer].deinit();
             self.attn_q_w[layer].deinit();
         }
+
         self.gpa.free(self.ffn_down_w);
         self.gpa.free(self.ffn_up_w);
         self.gpa.free(self.ffn_gate_w);
@@ -967,7 +1117,10 @@ pub const LlamaFusedRunner = struct {
         self.arena_quants.deinit();
         self.arena_small.deinit();
 
-        if (self.k_kv_commit) |*k| k.deinit();
+        if (self.k_kv_commit) |*k| {
+            k.deinit();
+        }
+
         self.k_attention_split.deinit();
         self.k_attention_multi.deinit();
         self.k_attention_batch.deinit();
@@ -1022,7 +1175,10 @@ pub const LlamaFusedRunner = struct {
     /// `recordKvCommit` just wrote. Either way one row is `kvRowBytes()`, so
     /// every offset and every region size in the copy lists holds unchanged.
     fn kvCommitSrc(self: *const LlamaFusedRunner) struct { k: vk.Buffer, v: vk.Buffer } {
-        if (self.kv_dtype == .f32) return .{ .k = self.buf_k_scratch.buffer, .v = self.buf_v_scratch.buffer };
+        if (self.kv_dtype == .f32) {
+            return .{ .k = self.buf_k_scratch.buffer, .v = self.buf_v_scratch.buffer };
+        }
+
         return .{ .k = self.buf_k_scratch_kv.buffer, .v = self.buf_v_scratch_kv.buffer };
     }
 
@@ -1035,10 +1191,15 @@ pub const LlamaFusedRunner = struct {
     fn recordKvCommit(self: *LlamaFusedRunner, cb: vk.CommandBuffer, rows: u32) void {
         std.debug.assert(rows >= 1);
         std.debug.assert(rows <= self.prefill_batch_max);
+
         if (self.k_kv_commit) |*k| {
-            if (comptime core_log.hot) log_dispatch.debug("  kv commit ({t}): rows {d}", .{ self.kv_dtype, rows });
+            if (comptime core_log.hot) {
+                log_dispatch.debug("  kv commit ({t}): rows {d}", .{ self.kv_dtype, rows });
+            }
+
             k.recordInto(cb, self.set_kv_commit, rows * self.per_step_elems);
         }
+
         barrierShaderToTransfer(self.ctx.vkd, cb);
     }
 
@@ -1052,13 +1213,22 @@ pub const LlamaFusedRunner = struct {
     /// `Sessions.clone` calls this. The presence of this method is what makes
     /// `Sessions(LlamaFusedRunner).can_clone` true, so a swallowed failure
     /// corrupts the fork in silence. It panics instead.
-    pub fn cloneSlotState(self: *LlamaFusedRunner, source_slot: u32, target_slot: u32, pos: u32) void {
+    pub fn cloneSlotState(
+        self: *LlamaFusedRunner,
+        source_slot: u32,
+        target_slot: u32,
+        pos: u32,
+    ) void {
         std.debug.assert(source_slot < self.n_slots);
         std.debug.assert(target_slot < self.n_slots);
         std.debug.assert(source_slot != target_slot);
         std.debug.assert(pos <= self.max_seq);
+
         const stride = self.kv.layout.slotBytes();
-        log_kv.debug("clone slot {d} -> {d}, pos {d}, {d:.0} MiB", .{ source_slot, target_slot, pos, @as(f64, @floatFromInt(stride)) / (1024.0 * 1024.0) });
+        log_kv.debug(
+            "clone slot {d} -> {d}, pos {d}, {d:.0} MiB",
+            .{ source_slot, target_slot, pos, @as(f64, @floatFromInt(stride)) / (1024.0 * 1024.0) },
+        );
         var scratch: [kernels.KvStore.max_segments]kernels.Copy = undefined;
         const copies = self.kv.cloneCopies(source_slot, target_slot, &scratch);
         self.invalidateDecode();
@@ -1084,7 +1254,13 @@ pub const LlamaFusedRunner = struct {
     /// positions into `out`, in the blob order of `KvStore.rowCopies`.
     /// `to_host` true = save (D2H into the readback stage), false = restore
     /// (H2D out of the swap stage).
-    fn slotCopies(self: *LlamaFusedRunner, slot: u32, n_rows: u32, to_host: bool, out: []kernels.Copy) []kernels.Copy {
+    fn slotCopies(
+        self: *LlamaFusedRunner,
+        slot: u32,
+        n_rows: u32,
+        to_host: bool,
+        out: []kernels.Copy,
+    ) []kernels.Copy {
         const stage = if (to_host) self.kv_readback_stage.buffer else self.kv_swap_stage.buffer;
         const copies = self.kv.rowCopies(slot, n_rows, stage, to_host, out);
         std.debug.assert(copies.len == 2 * @as(usize, self.n_layers));
@@ -1097,17 +1273,31 @@ pub const LlamaFusedRunner = struct {
         std.debug.assert(slot < self.n_slots);
         std.debug.assert(n_rows >= 1); // a blob must hold rows to restore from
         std.debug.assert(n_rows <= self.max_seq);
+
         const bytes: usize = @intCast(self.evictSlotBytesFor(n_rows));
         std.debug.assert(out.len == bytes);
         const t0 = core_log.now();
         try self.kv_readback_stage.ensure(@min(self.swap_chunk_bytes, bytes));
-        kv_budget.assertStageCap(self.kv_readback_stage.capacity, self.swap_chunk_bytes, self.evictSlotBytesFor(self.max_seq));
+        kv_budget.assertStageCap(
+            self.kv_readback_stage.capacity,
+            self.swap_chunk_bytes,
+            self.evictSlotBytesFor(self.max_seq),
+        );
         var scratch: [kernels.KvStore.max_segments]kernels.Copy = undefined;
         const copies = self.slotCopies(slot, n_rows, true, &scratch);
         self.invalidateDecode();
-        const split = try kernels.walkStage(self.ctx, copies, &self.kv_readback_stage, .{ .to_host = out }, self.swap_chunk_bytes);
+        const split = try kernels.walkStage(
+            self.ctx,
+            copies,
+            &self.kv_readback_stage,
+            .{ .to_host = out },
+            self.swap_chunk_bytes,
+        );
         self.last_swap_split = split;
-        log_kv.debug("evict slot {d}: {d} rows, {d:.0} MiB, {d:.0} ms ({d:.1} dma + {d:.1} memcpy)", .{ slot, n_rows, @as(f64, @floatFromInt(bytes)) / (1024.0 * 1024.0), core_log.msSince(t0), split.dma_ms, split.memcpy_ms });
+        log_kv.debug(
+            "evict slot {d}: {d} rows, {d:.0} MiB, {d:.0} ms ({d:.1} dma + {d:.1} memcpy)",
+            .{ slot, n_rows, @as(f64, @floatFromInt(bytes)) / (1024.0 * 1024.0), core_log.msSince(t0), split.dma_ms, split.memcpy_ms },
+        );
     }
 
     /// Restore a previously-evicted `n_rows`-row blob into slot `slot` (H2D).
@@ -1115,17 +1305,31 @@ pub const LlamaFusedRunner = struct {
         std.debug.assert(slot < self.n_slots);
         std.debug.assert(n_rows >= 1); // a blob must hold rows to restore from
         std.debug.assert(n_rows <= self.max_seq);
+
         const bytes: usize = @intCast(self.evictSlotBytesFor(n_rows));
         std.debug.assert(blob.len == bytes);
         const t0 = core_log.now();
         try self.kv_swap_stage.ensure(@min(self.swap_chunk_bytes, bytes));
-        kv_budget.assertStageCap(self.kv_swap_stage.capacity, self.swap_chunk_bytes, self.evictSlotBytesFor(self.max_seq));
+        kv_budget.assertStageCap(
+            self.kv_swap_stage.capacity,
+            self.swap_chunk_bytes,
+            self.evictSlotBytesFor(self.max_seq),
+        );
         var scratch: [kernels.KvStore.max_segments]kernels.Copy = undefined;
         const copies = self.slotCopies(slot, n_rows, false, &scratch);
         self.invalidateDecode();
-        const split = try kernels.walkStage(self.ctx, copies, &self.kv_swap_stage, .{ .to_device = blob }, self.swap_chunk_bytes);
+        const split = try kernels.walkStage(
+            self.ctx,
+            copies,
+            &self.kv_swap_stage,
+            .{ .to_device = blob },
+            self.swap_chunk_bytes,
+        );
         self.last_swap_split = split;
-        log_kv.debug("restore slot {d}: {d} rows, {d:.0} MiB, {d:.0} ms ({d:.1} dma + {d:.1} memcpy)", .{ slot, n_rows, @as(f64, @floatFromInt(bytes)) / (1024.0 * 1024.0), core_log.msSince(t0), split.dma_ms, split.memcpy_ms });
+        log_kv.debug(
+            "restore slot {d}: {d} rows, {d:.0} MiB, {d:.0} ms ({d:.1} dma + {d:.1} memcpy)",
+            .{ slot, n_rows, @as(f64, @floatFromInt(bytes)) / (1024.0 * 1024.0), core_log.msSince(t0), split.dma_ms, split.memcpy_ms },
+        );
     }
 
     // -- decode step --------------------------------------------------------
@@ -1139,6 +1343,7 @@ pub const LlamaFusedRunner = struct {
         // The public single-row entry point still checks its own precondition,
         // as the batched `validateRows` and the CPU runner do.
         if (pos >= self.max_seq) return error.PositionOutOfRange;
+
         log.debug("step: token {d} at pos {d}", .{ token_id, pos });
         // 1. Embed lookup on CPU into the host-mapped stage_in buffer.
         const x_host = self.stage_in.sliceTyped(f32, self.hidden_dim);
@@ -1163,7 +1368,12 @@ pub const LlamaFusedRunner = struct {
     const DecodeRec = struct {
         runner: *LlamaFusedRunner,
 
-        pub fn recordDecode(self: DecodeRec, cb: vk.CommandBuffer, prof: *gpu_profile.GpuProfile, key: gpu_profile.DecodeKey) !void {
+        pub fn recordDecode(
+            self: DecodeRec,
+            cb: vk.CommandBuffer,
+            prof: *gpu_profile.GpuProfile,
+            key: gpu_profile.DecodeKey,
+        ) !void {
             return self.runner.recordDecodeStepOpts(cb, prof, key.pos, key.opts);
         }
     };
@@ -1175,8 +1385,18 @@ pub const LlamaFusedRunner = struct {
 
     /// Record a single-row (decode-shape) matmul with the kernel matching
     /// this model's weight quant. Same call shape as LinearQ80Reduce.recordInto.
-    fn recordDecodeMatmul(self: *LlamaFusedRunner, cb: vk.CommandBuffer, set: vk.DescriptorSet, k: u32, n: u32, op: []const u8) void {
-        if (comptime core_log.hot) log_dispatch.debug("  matmul {s} reduce ({t}): k {d} n {d}", .{ op, self.quant, k, n });
+    fn recordDecodeMatmul(
+        self: *LlamaFusedRunner,
+        cb: vk.CommandBuffer,
+        set: vk.DescriptorSet,
+        k: u32,
+        n: u32,
+        op: []const u8,
+    ) void {
+        if (comptime core_log.hot) {
+            log_dispatch.debug("  matmul {s} reduce ({t}): k {d} n {d}", .{ op, self.quant, k, n });
+        }
+
         switch (self.quant) {
             .q8_0 => self.k_linear.recordInto(cb, set, k, n),
             .q4_0 => self.k_linear_q4.recordInto(cb, set, k, n),
@@ -1189,9 +1409,23 @@ pub const LlamaFusedRunner = struct {
     /// row, which turns a memory-bound B=1 serve tick into a compute-bound one.
     /// That trap made the qwen GPU engine ~8x slow at B=1. So B=1 takes the
     /// Reduce kernel, the same path single-stream decode takes.
-    fn recordBatchMatmul(self: *LlamaFusedRunner, cb: vk.CommandBuffer, set: vk.DescriptorSet, b: u32, k: u32, n: u32, op: []const u8) void {
+    fn recordBatchMatmul(
+        self: *LlamaFusedRunner,
+        cb: vk.CommandBuffer,
+        set: vk.DescriptorSet,
+        b: u32,
+        k: u32,
+        n: u32,
+        op: []const u8,
+    ) void {
         if (b == 1) return self.recordDecodeMatmul(cb, set, k, n, op);
-        if (comptime core_log.hot) log_dispatch.debug("  matmul {s} batch ({t}): b {d} k {d} n {d}", .{ op, self.quant, b, k, n });
+        if (comptime core_log.hot) {
+            log_dispatch.debug(
+                "  matmul {s} batch ({t}): b {d} k {d} n {d}",
+                .{ op, self.quant, b, k, n },
+            );
+        }
+
         switch (self.quant) {
             .q8_0 => self.k_linear_batch.recordInto(cb, set, b, k, n),
             .q4_0 => self.k_linear_batch_q4.recordInto(cb, set, b, k, n),
@@ -1200,7 +1434,12 @@ pub const LlamaFusedRunner = struct {
 
     /// The attention kit over the attention pipelines of the runner.
     fn attnKit(self: *LlamaFusedRunner) kernels.AttnKit {
-        return .{ .single = &self.k_attention, .multi = &self.k_attention_multi, .passes = &self.k_attention_split, .batch = &self.k_attention_batch };
+        return .{
+            .single = &self.k_attention,
+            .multi = &self.k_attention_multi,
+            .passes = &self.k_attention_split,
+            .batch = &self.k_attention_batch,
+        };
     }
 
     fn attnShape(self: *const LlamaFusedRunner, stream_stride_elems: u32) kernels.AttnShape {
@@ -1213,10 +1452,18 @@ pub const LlamaFusedRunner = struct {
         };
     }
 
-    fn recordDecodeStepOpts(self: *LlamaFusedRunner, cb: vk.CommandBuffer, prof: *gpu_profile.GpuProfile, pos: u32, opts: gpu_profile.RecordOpts) !void {
+    fn recordDecodeStepOpts(
+        self: *LlamaFusedRunner,
+        cb: vk.CommandBuffer,
+        prof: *gpu_profile.GpuProfile,
+        pos: u32,
+        opts: gpu_profile.RecordOpts,
+    ) !void {
         const vkd = self.ctx.vkd;
         try vkd.resetCommandBuffer(cb, .{});
-        const begin: vk.CommandBufferBeginInfo = .{ .flags = .{ .one_time_submit_bit = opts.one_time } };
+        const begin: vk.CommandBufferBeginInfo = .{
+            .flags = .{ .one_time_submit_bit = opts.one_time },
+        };
         try vkd.beginCommandBuffer(cb, &begin);
 
         prof.begin(cb);
@@ -1233,23 +1480,67 @@ pub const LlamaFusedRunner = struct {
         const attn_shape = self.attnShape(self.kv.layout.streamStrideElems());
         var layer: u32 = 0;
         while (layer < self.n_layers) : (layer += 1) {
-            if (comptime core_log.hot) log_dispatch.debug("record layer {d}", .{layer});
+            if (comptime core_log.hot) {
+                log_dispatch.debug("record layer {d}", .{layer});
+            }
+
             // -- attention block --------------------------------------------
             // x -> x_norm via rmsnorm
-            self.k_rmsnorm.recordInto(cb, self.set_rmsnorm_attn[layer], self.hidden_dim, self.rms_norm_eps);
+            self.k_rmsnorm.recordInto(
+                cb,
+                self.set_rmsnorm_attn[layer],
+                self.hidden_dim,
+                self.rms_norm_eps,
+            );
             barrierShader(vkd, cb);
             prof.mark(cb, .norm);
 
             // x_norm @ Q/K/V -> q, k_scratch, v_scratch
-            self.recordDecodeMatmul(cb, self.set_q[layer], self.hidden_dim, self.n_heads * self.head_dim, "q");
-            self.recordDecodeMatmul(cb, self.set_k[layer], self.hidden_dim, self.per_step_elems, "k");
-            self.recordDecodeMatmul(cb, self.set_v[layer], self.hidden_dim, self.per_step_elems, "v");
+            self.recordDecodeMatmul(
+                cb,
+                self.set_q[layer],
+                self.hidden_dim,
+                self.n_heads * self.head_dim,
+                "q",
+            );
+            self.recordDecodeMatmul(
+                cb,
+                self.set_k[layer],
+                self.hidden_dim,
+                self.per_step_elems,
+                "k",
+            );
+            self.recordDecodeMatmul(
+                cb,
+                self.set_v[layer],
+                self.hidden_dim,
+                self.per_step_elems,
+                "v",
+            );
             barrierShader(vkd, cb);
             prof.mark(cb, .matmul_attn_in);
 
             // Multi-head RoPE on q and k_scratch.
-            self.k_rope_multi.recordInto(cb, self.set_rope_q, pos, self.n_heads, self.head_dim, self.rope_dim, self.rope_freq_base, .norm);
-            self.k_rope_multi.recordInto(cb, self.set_rope_k, pos, self.n_kv_heads, self.head_dim, self.rope_dim, self.rope_freq_base, .norm);
+            self.k_rope_multi.recordInto(
+                cb,
+                self.set_rope_q,
+                pos,
+                self.n_heads,
+                self.head_dim,
+                self.rope_dim,
+                self.rope_freq_base,
+                .norm,
+            );
+            self.k_rope_multi.recordInto(
+                cb,
+                self.set_rope_k,
+                pos,
+                self.n_kv_heads,
+                self.head_dim,
+                self.rope_dim,
+                self.rope_freq_base,
+                .norm,
+            );
             barrierShader(vkd, cb);
             prof.mark(cb, .rope);
 
@@ -1279,7 +1570,13 @@ pub const LlamaFusedRunner = struct {
             prof.mark(cb, .attn);
 
             // O projection: attn_out @ o_w -> x_norm (reused).
-            self.recordDecodeMatmul(cb, self.set_o[layer], self.n_heads * self.head_dim, self.hidden_dim, "o");
+            self.recordDecodeMatmul(
+                cb,
+                self.set_o[layer],
+                self.n_heads * self.head_dim,
+                self.hidden_dim,
+                "o",
+            );
             barrierShader(vkd, cb);
             prof.mark(cb, .matmul_out);
 
@@ -1289,11 +1586,22 @@ pub const LlamaFusedRunner = struct {
             prof.mark(cb, .elementwise);
 
             // -- ffn block --------------------------------------------------
-            self.k_rmsnorm.recordInto(cb, self.set_rmsnorm_ffn[layer], self.hidden_dim, self.rms_norm_eps);
+            self.k_rmsnorm.recordInto(
+                cb,
+                self.set_rmsnorm_ffn[layer],
+                self.hidden_dim,
+                self.rms_norm_eps,
+            );
             barrierShader(vkd, cb);
             prof.mark(cb, .norm);
 
-            self.recordDecodeMatmul(cb, self.set_gate[layer], self.hidden_dim, self.ffn_dim, "gate");
+            self.recordDecodeMatmul(
+                cb,
+                self.set_gate[layer],
+                self.hidden_dim,
+                self.ffn_dim,
+                "gate",
+            );
             self.recordDecodeMatmul(cb, self.set_up[layer], self.hidden_dim, self.ffn_dim, "up");
             barrierShader(vkd, cb);
             prof.mark(cb, .matmul_ffn_up);
@@ -1304,7 +1612,13 @@ pub const LlamaFusedRunner = struct {
             prof.mark(cb, .elementwise);
 
             // Down projection: ffn_gate @ down_w -> ffn_down.
-            self.recordDecodeMatmul(cb, self.set_down[layer], self.ffn_dim, self.hidden_dim, "down");
+            self.recordDecodeMatmul(
+                cb,
+                self.set_down[layer],
+                self.ffn_dim,
+                self.hidden_dim,
+                "down",
+            );
             barrierShader(vkd, cb);
             prof.mark(cb, .matmul_ffn_down);
 
@@ -1340,6 +1654,7 @@ pub const LlamaFusedRunner = struct {
     pub fn probeRecord(self: *LlamaFusedRunner, pos: u32) !void {
         std.debug.assert(self.prof.level == span.gpuLevel());
         std.debug.assert(pos < self.max_seq);
+
         try self.recordDecodeStepOpts(self.cmd_buffer, &self.prof, pos, .{});
         self.probe_recorded = false;
     }
@@ -1350,6 +1665,7 @@ pub const LlamaFusedRunner = struct {
     pub fn probeRecordReusable(self: *LlamaFusedRunner, pos: u32) !void {
         std.debug.assert(self.prof.level == span.gpuLevel());
         std.debug.assert(pos < self.max_seq);
+
         try self.recordDecodeStepOpts(self.cmd_buffer, &self.prof, pos, .{ .one_time = false });
         self.probe_recorded = true;
     }
@@ -1358,9 +1674,12 @@ pub const LlamaFusedRunner = struct {
     /// the way a normal step does.
     pub fn probeSubmitWait(self: *LlamaFusedRunner) !void {
         std.debug.assert(self.probe_recorded);
+
         self.invalidateDecode();
         const cmds = [_]vk.CommandBuffer{self.cmd_buffer};
-        const submits = [_]vk.SubmitInfo{.{ .command_buffer_count = 1, .p_command_buffers = &cmds }};
+        const submits = [_]vk.SubmitInfo{
+            .{ .command_buffer_count = 1, .p_command_buffers = &cmds },
+        };
         try self.ctx.vkd.queueSubmit(self.ctx.queue, &submits, .null_handle);
         try self.ctx.vkd.queueWaitIdle(self.ctx.queue);
     }
@@ -1413,21 +1732,37 @@ pub const LlamaFusedRunner = struct {
         // n_logits can be 0. An opening (system-prompt) prefill chunk, or a
         // mid-prompt chunk with no decode rows, wants no logits. The record
         // path then skips the lm_head tail and the readback stays empty.
-        const n_logits = try step_row.validateRows(rows, self.n_slots, self.prefill_batch_max, self.max_seq);
+        const n_logits = try step_row.validateRows(
+            rows,
+            self.n_slots,
+            self.prefill_batch_max,
+            self.max_seq,
+        );
         std.debug.assert(n_logits <= self.logit_rows_max);
         const n: u32 = @intCast(rows.len);
-        log.debug("step_batch: {d} rows, slot {d} pos {d}..{d}", .{ n, rows[0].slot, rows[0].pos, rows[n - 1].pos });
+        log.debug(
+            "step_batch: {d} rows, slot {d} pos {d}..{d}",
+            .{ n, rows[0].slot, rows[0].pos, rows[n - 1].pos },
+        );
 
         // Embed lookup: one row per batch index, CPU-side into stage_in.
         const x_host = self.stage_in.sliceTyped(f32, @as(usize, n) * self.hidden_dim);
         for (rows, 0..) |r, i| {
             const dst_off = @as(usize, i) * self.hidden_dim;
-            naive.embedLookup(self.embed.*, r.token, self.hidden_dim, x_host[dst_off..][0..self.hidden_dim]);
+            naive.embedLookup(
+                self.embed.*,
+                r.token,
+                self.hidden_dim,
+                x_host[dst_off..][0..self.hidden_dim],
+            );
         }
 
         const live = (comptime core_log.hot) and core_log.enabled(.dispatch, .debug);
         var t_record: std.Io.Timestamp = undefined;
-        if (live) t_record = core_log.now();
+        if (live) {
+            t_record = core_log.now();
+        }
+
         try self.recordStepBatch(rows);
         var record_ms: f64 = 0;
         var t_submit: std.Io.Timestamp = undefined;
@@ -1435,8 +1770,14 @@ pub const LlamaFusedRunner = struct {
             record_ms = core_log.msSince(t_record);
             t_submit = core_log.now();
         }
+
         try self.submitWait(.decode_batch);
-        if (live) log_dispatch.debug("step_batch {d} rows: record {d:.1} ms, submit+wait {d:.1} ms", .{ n, record_ms, core_log.msSince(t_submit) });
+        if (live) {
+            log_dispatch.debug(
+                "step_batch {d} rows: record {d:.1} ms, submit+wait {d:.1} ms",
+                .{ n, record_ms, core_log.msSince(t_submit) },
+            );
+        }
 
         // Stream-copy stage_out into ordinary heap memory, for the same reason
         // the decode and prefill paths do. The GPU computed and read back only
@@ -1450,7 +1791,9 @@ pub const LlamaFusedRunner = struct {
     /// recorder runs, so the off path reads no clock.
     fn submitWait(self: *LlamaFusedRunner, label: span.GpuLabel) !void {
         const cmds = [_]vk.CommandBuffer{self.cmd_buffer};
-        const submits = [_]vk.SubmitInfo{.{ .command_buffer_count = 1, .p_command_buffers = &cmds }};
+        const submits = [_]vk.SubmitInfo{
+            .{ .command_buffer_count = 1, .p_command_buffers = &cmds },
+        };
         self.invalidateDecode();
         const timed = self.prof.level != .off or span.enabled();
         const t0: std.Io.Timestamp = if (timed) core_log.now() else undefined;
@@ -1458,6 +1801,7 @@ pub const LlamaFusedRunner = struct {
         const t1: std.Io.Timestamp = if (timed) core_log.now() else undefined;
         try self.ctx.vkd.queueWaitIdle(self.ctx.queue);
         if (!timed) return;
+
         const t2 = core_log.now();
         span.record(.gpu_submit, t0, t1);
         span.record(.gpu_wait, t1, t2);
@@ -1491,17 +1835,47 @@ pub const LlamaFusedRunner = struct {
 
         var layer: u32 = 0;
         while (layer < self.n_layers) : (layer += 1) {
-            if (comptime core_log.hot) log_dispatch.debug("record layer {d}", .{layer});
+            if (comptime core_log.hot) {
+                log_dispatch.debug("record layer {d}", .{layer});
+            }
+
             // attn pre-norm: per-stream rmsnorm
-            self.k_rmsnorm_batch.recordInto(cb, self.set_rmsnorm_attn[layer], n, self.hidden_dim, self.rms_norm_eps);
+            self.k_rmsnorm_batch.recordInto(
+                cb,
+                self.set_rmsnorm_attn[layer],
+                n,
+                self.hidden_dim,
+                self.rms_norm_eps,
+            );
             barrierShader(vkd, cb);
             self.prof.mark(cb, .norm);
 
             // Q/K/V matmuls: B = n streams, output goes to per-row
             // slots in buf_q / buf_k_scratch / buf_v_scratch.
-            self.recordBatchMatmul(cb, self.set_q[layer], n, self.hidden_dim, self.n_heads * self.head_dim, "q");
-            self.recordBatchMatmul(cb, self.set_k[layer], n, self.hidden_dim, self.per_step_elems, "k");
-            self.recordBatchMatmul(cb, self.set_v[layer], n, self.hidden_dim, self.per_step_elems, "v");
+            self.recordBatchMatmul(
+                cb,
+                self.set_q[layer],
+                n,
+                self.hidden_dim,
+                self.n_heads * self.head_dim,
+                "q",
+            );
+            self.recordBatchMatmul(
+                cb,
+                self.set_k[layer],
+                n,
+                self.hidden_dim,
+                self.per_step_elems,
+                "k",
+            );
+            self.recordBatchMatmul(
+                cb,
+                self.set_v[layer],
+                n,
+                self.hidden_dim,
+                self.per_step_elems,
+                "v",
+            );
             barrierShader(vkd, cb);
             self.prof.mark(cb, .matmul_attn_in);
 
@@ -1509,9 +1883,34 @@ pub const LlamaFusedRunner = struct {
             // OWN position (row_base aims the dispatch, pos_stride 0).
             for (rows, 0..) |r, i| {
                 const row: u32 = @intCast(i);
-                self.k_rope_multi_batch.recordInto(cb, self.set_rope_q, r.pos, self.n_heads, self.head_dim, self.rope_dim, self.rope_freq_base, 1, 0, row, .norm);
-                self.k_rope_multi_batch.recordInto(cb, self.set_rope_k, r.pos, self.n_kv_heads, self.head_dim, self.rope_dim, self.rope_freq_base, 1, 0, row, .norm);
+                self.k_rope_multi_batch.recordInto(
+                    cb,
+                    self.set_rope_q,
+                    r.pos,
+                    self.n_heads,
+                    self.head_dim,
+                    self.rope_dim,
+                    self.rope_freq_base,
+                    1,
+                    0,
+                    row,
+                    .norm,
+                );
+                self.k_rope_multi_batch.recordInto(
+                    cb,
+                    self.set_rope_k,
+                    r.pos,
+                    self.n_kv_heads,
+                    self.head_dim,
+                    self.rope_dim,
+                    self.rope_freq_base,
+                    1,
+                    0,
+                    row,
+                    .norm,
+                );
             }
+
             barrierShader(vkd, cb);
             self.prof.mark(cb, .rope);
 
@@ -1525,8 +1924,14 @@ pub const LlamaFusedRunner = struct {
             const src = self.kvCommitSrc();
             const k_dst = self.kv.region(layer, .k).buffer;
             const v_dst = self.kv.region(layer, .v).buffer;
-            var k_regions_buf: [limits.max_batch + limits.max_prefill_chunk]vk.BufferCopy = undefined;
-            var v_regions_buf: [limits.max_batch + limits.max_prefill_chunk]vk.BufferCopy = undefined;
+            var k_regions_buf: [
+                limits.max_batch +
+                    limits.max_prefill_chunk
+            ]vk.BufferCopy = undefined;
+            var v_regions_buf: [
+                limits.max_batch +
+                    limits.max_prefill_chunk
+            ]vk.BufferCopy = undefined;
             const k_regions = k_regions_buf[0..n];
             const v_regions = v_regions_buf[0..n];
             for (rows, 0..) |r, i| {
@@ -1545,6 +1950,7 @@ pub const LlamaFusedRunner = struct {
                     .size = kv_row_bytes,
                 };
             }
+
             vkd.cmdCopyBuffer(cb, src.k, k_dst, k_regions);
             vkd.cmdCopyBuffer(cb, src.v, v_dst, v_regions);
             barrierTransferToShader(vkd, cb);
@@ -1563,24 +1969,51 @@ pub const LlamaFusedRunner = struct {
             barrierShader(vkd, cb);
             self.prof.mark(cb, .attn);
 
-            self.recordBatchMatmul(cb, self.set_o[layer], n, self.n_heads * self.head_dim, self.hidden_dim, "o");
+            self.recordBatchMatmul(
+                cb,
+                self.set_o[layer],
+                n,
+                self.n_heads * self.head_dim,
+                self.hidden_dim,
+                "o",
+            );
             barrierShader(vkd, cb);
             self.prof.mark(cb, .matmul_out);
             self.k_residual.recordInto(cb, self.set_residual_attn, n * self.hidden_dim);
             barrierShader(vkd, cb);
             self.prof.mark(cb, .elementwise);
 
-            self.k_rmsnorm_batch.recordInto(cb, self.set_rmsnorm_ffn[layer], n, self.hidden_dim, self.rms_norm_eps);
+            self.k_rmsnorm_batch.recordInto(
+                cb,
+                self.set_rmsnorm_ffn[layer],
+                n,
+                self.hidden_dim,
+                self.rms_norm_eps,
+            );
             barrierShader(vkd, cb);
             self.prof.mark(cb, .norm);
-            self.recordBatchMatmul(cb, self.set_gate[layer], n, self.hidden_dim, self.ffn_dim, "gate");
+            self.recordBatchMatmul(
+                cb,
+                self.set_gate[layer],
+                n,
+                self.hidden_dim,
+                self.ffn_dim,
+                "gate",
+            );
             self.recordBatchMatmul(cb, self.set_up[layer], n, self.hidden_dim, self.ffn_dim, "up");
             barrierShader(vkd, cb);
             self.prof.mark(cb, .matmul_ffn_up);
             self.k_swiglu.recordInto(cb, self.set_swiglu, n * self.ffn_dim);
             barrierShader(vkd, cb);
             self.prof.mark(cb, .elementwise);
-            self.recordBatchMatmul(cb, self.set_down[layer], n, self.ffn_dim, self.hidden_dim, "down");
+            self.recordBatchMatmul(
+                cb,
+                self.set_down[layer],
+                n,
+                self.ffn_dim,
+                self.hidden_dim,
+                "down",
+            );
             barrierShader(vkd, cb);
             self.prof.mark(cb, .matmul_ffn_down);
             self.k_residual.recordInto(cb, self.set_residual_ffn, n * self.hidden_dim);
@@ -1603,7 +2036,13 @@ pub const LlamaFusedRunner = struct {
         // want_logits SUFFIX only. The suffix is compacted to buf_x_norm[0..] so
         // the offset-0 lm_head descriptor sees it. Logits then land compactly at
         // buf_logits[0..n_logits], the layout Sessions.advance reads.
-        self.k_rmsnorm_batch.recordInto(cb, self.set_rmsnorm_final, n, self.hidden_dim, self.rms_norm_eps);
+        self.k_rmsnorm_batch.recordInto(
+            cb,
+            self.set_rmsnorm_final,
+            n,
+            self.hidden_dim,
+            self.rms_norm_eps,
+        );
 
         const n_logits: u32 = n - first;
         if (first > 0) {
@@ -1613,20 +2052,46 @@ pub const LlamaFusedRunner = struct {
             // first < n_logits.
             barrierShaderToTransfer(vkd, cb);
             const suffix_bytes: vk.DeviceSize = @as(vk.DeviceSize, n_logits) * hidden_row_bytes;
-            copyDeviceToDevice(vkd, cb, self.buf_x_norm.buffer, @as(vk.DeviceSize, first) * hidden_row_bytes, self.buf_x.buffer, 0, suffix_bytes);
+            copyDeviceToDevice(
+                vkd,
+                cb,
+                self.buf_x_norm.buffer,
+                @as(vk.DeviceSize, first) * hidden_row_bytes,
+                self.buf_x.buffer,
+                0,
+                suffix_bytes,
+            );
             barrierTransferToTransfer(vkd, cb);
-            copyDeviceToDevice(vkd, cb, self.buf_x.buffer, 0, self.buf_x_norm.buffer, 0, suffix_bytes);
+            copyDeviceToDevice(
+                vkd,
+                cb,
+                self.buf_x.buffer,
+                0,
+                self.buf_x_norm.buffer,
+                0,
+                suffix_bytes,
+            );
             barrierTransferToShader(vkd, cb);
         } else {
             barrierShader(vkd, cb);
         }
 
         // Batched lm_head: B = n_logits want-logits rows. Output is (n_logits, vocab).
-        self.recordBatchMatmul(cb, self.set_lm_head, n_logits, self.hidden_dim, self.vocab_size, "lmhead");
+        self.recordBatchMatmul(
+            cb,
+            self.set_lm_head,
+            n_logits,
+            self.hidden_dim,
+            self.vocab_size,
+            "lmhead",
+        );
         barrierShaderToTransfer(vkd, cb);
         self.prof.mark(cb, .lmhead);
 
-        const logits_bytes: vk.DeviceSize = @as(vk.DeviceSize, n_logits) * @as(vk.DeviceSize, self.vocab_size) * f32_size;
+        const logits_bytes: vk.DeviceSize = @as(vk.DeviceSize, n_logits) * @as(
+            vk.DeviceSize,
+            self.vocab_size,
+        ) * f32_size;
         copyDeviceToHost(vkd, cb, self.buf_logits.buffer, self.stage_out.buffer, logits_bytes);
         self.prof.mark(cb, .copy);
         self.prof.end(cb);
@@ -1648,6 +2113,7 @@ pub const LlamaFusedRunner = struct {
     pub fn prefillBatch(self: *LlamaFusedRunner, tokens: []const u32, start_pos: u32) ![]f32 {
         std.debug.assert(tokens.len > 0);
         std.debug.assert(tokens.len <= self.prefill_batch_max);
+
         const b: u32 = @intCast(tokens.len);
         log.debug("prefill: {d} tokens at start_pos {d}", .{ b, start_pos });
 
@@ -1657,13 +2123,21 @@ pub const LlamaFusedRunner = struct {
         var i: u32 = 0;
         while (i < b) : (i += 1) {
             const dst_off = @as(usize, i) * self.hidden_dim;
-            naive.embedLookup(self.embed.*, tokens[i], self.hidden_dim, x_host[dst_off..][0..self.hidden_dim]);
+            naive.embedLookup(
+                self.embed.*,
+                tokens[i],
+                self.hidden_dim,
+                x_host[dst_off..][0..self.hidden_dim],
+            );
         }
 
         // 2. Record + submit the batched forward pass.
         const live = (comptime core_log.hot) and core_log.enabled(.dispatch, .debug);
         var t_record: std.Io.Timestamp = undefined;
-        if (live) t_record = core_log.now();
+        if (live) {
+            t_record = core_log.now();
+        }
+
         try self.recordPrefillStep(b, start_pos);
         var record_ms: f64 = 0;
         var t_submit: std.Io.Timestamp = undefined;
@@ -1671,8 +2145,14 @@ pub const LlamaFusedRunner = struct {
             record_ms = core_log.msSince(t_record);
             t_submit = core_log.now();
         }
+
         try self.submitWait(.prefill_chunk);
-        if (live) log_dispatch.debug("prefill b={d}: record {d:.1} ms, submit+wait {d:.1} ms", .{ b, record_ms, core_log.msSince(t_submit) });
+        if (live) {
+            log_dispatch.debug(
+                "prefill b={d}: record {d:.1} ms, submit+wait {d:.1} ms",
+                .{ b, record_ms, core_log.msSince(t_submit) },
+            );
+        }
 
         // 3. Copy logits into ordinary heap memory, for the same reason the
         //    decode step does.
@@ -1707,23 +2187,76 @@ pub const LlamaFusedRunner = struct {
 
         var layer: u32 = 0;
         while (layer < self.n_layers) : (layer += 1) {
-            if (comptime core_log.hot) log_dispatch.debug("record layer {d}", .{layer});
+            if (comptime core_log.hot) {
+                log_dispatch.debug("record layer {d}", .{layer});
+            }
+
             // attn pre-norm: batched
-            self.k_rmsnorm_batch.recordInto(cb, self.set_rmsnorm_attn[layer], b, self.hidden_dim, self.rms_norm_eps);
+            self.k_rmsnorm_batch.recordInto(
+                cb,
+                self.set_rmsnorm_attn[layer],
+                b,
+                self.hidden_dim,
+                self.rms_norm_eps,
+            );
             barrierShader(vkd, cb);
             self.prof.mark(cb, .norm);
 
             // Q/K/V projections: batched matmul, (B, hidden) -> (B, *)
-            // Attention matmuls use the N-outer layout (no transposed copy).
-            self.recordBatchMatmul(cb, self.set_q[layer], b, self.hidden_dim, self.n_heads * self.head_dim, "q");
-            self.recordBatchMatmul(cb, self.set_k[layer], b, self.hidden_dim, self.per_step_elems, "k");
-            self.recordBatchMatmul(cb, self.set_v[layer], b, self.hidden_dim, self.per_step_elems, "v");
+            self.recordBatchMatmul(
+                cb,
+                self.set_q[layer],
+                b,
+                self.hidden_dim,
+                self.n_heads * self.head_dim,
+                "q",
+            );
+            self.recordBatchMatmul(
+                cb,
+                self.set_k[layer],
+                b,
+                self.hidden_dim,
+                self.per_step_elems,
+                "k",
+            );
+            self.recordBatchMatmul(
+                cb,
+                self.set_v[layer],
+                b,
+                self.hidden_dim,
+                self.per_step_elems,
+                "v",
+            );
             barrierShader(vkd, cb);
             self.prof.mark(cb, .matmul_attn_in);
 
             // Multi-head RoPE: per-row position = start_pos + row_idx.
-            self.k_rope_multi_batch.recordInto(cb, self.set_rope_q, start_pos, self.n_heads, self.head_dim, self.rope_dim, self.rope_freq_base, b, 1, 0, .norm);
-            self.k_rope_multi_batch.recordInto(cb, self.set_rope_k, start_pos, self.n_kv_heads, self.head_dim, self.rope_dim, self.rope_freq_base, b, 1, 0, .norm);
+            self.k_rope_multi_batch.recordInto(
+                cb,
+                self.set_rope_q,
+                start_pos,
+                self.n_heads,
+                self.head_dim,
+                self.rope_dim,
+                self.rope_freq_base,
+                b,
+                1,
+                0,
+                .norm,
+            );
+            self.k_rope_multi_batch.recordInto(
+                cb,
+                self.set_rope_k,
+                start_pos,
+                self.n_kv_heads,
+                self.head_dim,
+                self.rope_dim,
+                self.rope_freq_base,
+                b,
+                1,
+                0,
+                .norm,
+            );
             barrierShader(vkd, cb);
             self.prof.mark(cb, .rope);
 
@@ -1756,7 +2289,14 @@ pub const LlamaFusedRunner = struct {
             self.prof.mark(cb, .attn);
 
             // O projection (N-outer layout).
-            self.recordBatchMatmul(cb, self.set_o[layer], b, self.n_heads * self.head_dim, self.hidden_dim, "o");
+            self.recordBatchMatmul(
+                cb,
+                self.set_o[layer],
+                b,
+                self.n_heads * self.head_dim,
+                self.hidden_dim,
+                "o",
+            );
             barrierShader(vkd, cb);
             self.prof.mark(cb, .matmul_out);
 
@@ -1766,11 +2306,24 @@ pub const LlamaFusedRunner = struct {
             self.prof.mark(cb, .elementwise);
 
             // FFN pre-norm.
-            self.k_rmsnorm_batch.recordInto(cb, self.set_rmsnorm_ffn[layer], b, self.hidden_dim, self.rms_norm_eps);
+            self.k_rmsnorm_batch.recordInto(
+                cb,
+                self.set_rmsnorm_ffn[layer],
+                b,
+                self.hidden_dim,
+                self.rms_norm_eps,
+            );
             barrierShader(vkd, cb);
             self.prof.mark(cb, .norm);
 
-            self.recordBatchMatmul(cb, self.set_gate[layer], b, self.hidden_dim, self.ffn_dim, "gate");
+            self.recordBatchMatmul(
+                cb,
+                self.set_gate[layer],
+                b,
+                self.hidden_dim,
+                self.ffn_dim,
+                "gate",
+            );
             self.recordBatchMatmul(cb, self.set_up[layer], b, self.hidden_dim, self.ffn_dim, "up");
             barrierShader(vkd, cb);
             self.prof.mark(cb, .matmul_ffn_up);
@@ -1781,7 +2334,14 @@ pub const LlamaFusedRunner = struct {
             self.prof.mark(cb, .elementwise);
 
             // Down projection.
-            self.recordBatchMatmul(cb, self.set_down[layer], b, self.ffn_dim, self.hidden_dim, "down");
+            self.recordBatchMatmul(
+                cb,
+                self.set_down[layer],
+                b,
+                self.ffn_dim,
+                self.hidden_dim,
+                "down",
+            );
             barrierShader(vkd, cb);
             self.prof.mark(cb, .matmul_ffn_down);
 
@@ -1792,7 +2352,13 @@ pub const LlamaFusedRunner = struct {
         }
 
         // Final norm.
-        self.k_rmsnorm_batch.recordInto(cb, self.set_rmsnorm_final, b, self.hidden_dim, self.rms_norm_eps);
+        self.k_rmsnorm_batch.recordInto(
+            cb,
+            self.set_rmsnorm_final,
+            b,
+            self.hidden_dim,
+            self.rms_norm_eps,
+        );
         barrierShader(vkd, cb);
         self.prof.mark(cb, .norm);
 
@@ -1804,7 +2370,15 @@ pub const LlamaFusedRunner = struct {
         // does not overlap [0..hidden_row_bytes).
         if (b > 1) {
             const src_off: vk.DeviceSize = @as(vk.DeviceSize, b - 1) * hidden_row_bytes;
-            copyDeviceToDevice(vkd, cb, self.buf_x_norm.buffer, src_off, self.buf_x_norm.buffer, 0, hidden_row_bytes);
+            copyDeviceToDevice(
+                vkd,
+                cb,
+                self.buf_x_norm.buffer,
+                src_off,
+                self.buf_x_norm.buffer,
+                0,
+                hidden_row_bytes,
+            );
             barrierTransferToShader(vkd, cb);
         }
 
@@ -1827,40 +2401,73 @@ pub const LlamaFusedRunner = struct {
     /// breakdown. It is the diagnostic behind `--profile-prefill`. It mutates
     /// the KV like a real prefill, so the caller must treat the runner as dirty
     /// afterwards.
-    pub fn profilePrefill(self: *LlamaFusedRunner, io: std.Io, tokens: []const u32, start_pos: u32, tag: []const u8) !void {
+    pub fn profilePrefill(
+        self: *LlamaFusedRunner,
+        io: std.Io,
+        tokens: []const u32,
+        start_pos: u32,
+        tag: []const u8,
+    ) !void {
         std.debug.assert(tokens.len > 0 and tokens.len <= self.prefill_batch_max);
+
         const level = self.prof.level;
         // The pool grows on the first probe, so level off creates none. No
         // submit of this buffer is pending here.
         try self.prof.reserve(.phases);
         self.prof.setLevel(.phases);
         defer self.prof.setLevel(level);
+
         const b: u32 = @intCast(tokens.len);
 
         const x_host = self.stage_in.sliceTyped(f32, @as(usize, b) * self.hidden_dim);
         var i: u32 = 0;
         while (i < b) : (i += 1) {
             const dst_off = @as(usize, i) * self.hidden_dim;
-            naive.embedLookup(self.embed.*, tokens[i], self.hidden_dim, x_host[dst_off..][0..self.hidden_dim]);
+            naive.embedLookup(
+                self.embed.*,
+                tokens[i],
+                self.hidden_dim,
+                x_host[dst_off..][0..self.hidden_dim],
+            );
         }
+
         const t0 = std.Io.Clock.Timestamp.now(io, .awake);
         try self.recordPrefillStep(b, start_pos);
         const t_rec = std.Io.Clock.Timestamp.now(io, .awake);
         const cmds = [_]vk.CommandBuffer{self.cmd_buffer};
-        const submits = [_]vk.SubmitInfo{.{ .command_buffer_count = 1, .p_command_buffers = &cmds }};
+        const submits = [_]vk.SubmitInfo{
+            .{ .command_buffer_count = 1, .p_command_buffers = &cmds },
+        };
         self.invalidateDecode();
         try self.ctx.vkd.queueSubmit(self.ctx.queue, &submits, .null_handle);
         try self.ctx.vkd.queueWaitIdle(self.ctx.queue);
         const t_wait = std.Io.Clock.Timestamp.now(io, .awake);
 
-        const r = (try self.prof.collectInto(.llama_fused, .prefill_chunk, t_rec.raw, t_wait.raw)).?;
-        try r.report(io, "[llama prefill {s}] b={d}", .{ tag, b }, time.msBetween(t0, t_rec), time.msBetween(t_rec, t_wait));
+        const r = (try self.prof.collectInto(
+            .llama_fused,
+            .prefill_chunk,
+            t_rec.raw,
+            t_wait.raw,
+        )).?;
+        try r.report(
+            io,
+            "[llama prefill {s}] b={d}",
+            .{ tag, b },
+            time.msBetween(t0, t_rec),
+            time.msBetween(t_rec, t_wait),
+        );
     }
 
     /// Run ONE decode step with GPU timestamps and print a per-`Phase`
     /// breakdown, the decode twin of `profilePrefill`. It mutates the KV like a
     /// real step, so the runner is dirty afterwards.
-    pub fn profileStep(self: *LlamaFusedRunner, io: std.Io, token_id: u32, pos: u32, tag: []const u8) !void {
+    pub fn profileStep(
+        self: *LlamaFusedRunner,
+        io: std.Io,
+        token_id: u32,
+        pos: u32,
+        tag: []const u8,
+    ) !void {
         self.invalidateDecode();
         const level = self.prof.level;
         // The pool grows on the first probe, so level off creates none. No
@@ -1868,26 +2475,36 @@ pub const LlamaFusedRunner = struct {
         try self.prof.reserve(.phases);
         self.prof.setLevel(.phases);
         defer self.prof.setLevel(level);
+
         const x_host = self.stage_in.sliceTyped(f32, self.hidden_dim);
         naive.embedLookup(self.embed.*, token_id, self.hidden_dim, x_host);
         const t0 = std.Io.Clock.Timestamp.now(io, .awake);
         try self.recordDecodeStepOpts(self.cmd_buffer, &self.prof, pos, .{});
         const t_rec = std.Io.Clock.Timestamp.now(io, .awake);
         const cmds = [_]vk.CommandBuffer{self.cmd_buffer};
-        const submits = [_]vk.SubmitInfo{.{ .command_buffer_count = 1, .p_command_buffers = &cmds }};
+        const submits = [_]vk.SubmitInfo{
+            .{ .command_buffer_count = 1, .p_command_buffers = &cmds },
+        };
         try self.ctx.vkd.queueSubmit(self.ctx.queue, &submits, .null_handle);
         try self.ctx.vkd.queueWaitIdle(self.ctx.queue);
         const t_wait = std.Io.Clock.Timestamp.now(io, .awake);
         @memcpy(self.logits_heap, self.stage_out.sliceTyped(f32, self.vocab_size));
 
         const r = (try self.prof.collectInto(.llama_fused, .decode, t_rec.raw, t_wait.raw)).?;
-        try r.report(io, "[llama decode {s}] pos={d}", .{ tag, pos }, time.msBetween(t0, t_rec), time.msBetween(t_rec, t_wait));
+        try r.report(
+            io,
+            "[llama decode {s}] pos={d}",
+            .{ tag, pos },
+            time.msBetween(t0, t_rec),
+            time.msBetween(t_rec, t_wait),
+        );
     }
 
     // -- descriptor sets ----------------------------------------------------
 
     fn allocateAndBindDescriptorSets(self: *LlamaFusedRunner) !void {
         std.debug.assert(!self.sets_fixed);
+
         const ctx = self.ctx;
         const layouts = struct {
             rmsnorm: vk.DescriptorSetLayout,
@@ -1907,7 +2524,11 @@ pub const LlamaFusedRunner = struct {
 
         // Helper that allocates one descriptor set from self.desc_pool.
         const allocOne = struct {
-            fn f(ctx2: *const vulkan_ctx.Context, pool: vk.DescriptorPool, layout: vk.DescriptorSetLayout) !vk.DescriptorSet {
+            fn f(
+                ctx2: *const vulkan_ctx.Context,
+                pool: vk.DescriptorPool,
+                layout: vk.DescriptorSetLayout,
+            ) !vk.DescriptorSet {
                 const layouts_arr = [_]vk.DescriptorSetLayout{layout};
                 const alloc_info: vk.DescriptorSetAllocateInfo = .{
                     .descriptor_pool = pool,
@@ -1927,13 +2548,22 @@ pub const LlamaFusedRunner = struct {
         // per-layer because they are not batched.
         const bm: vk.DeviceSize = @intCast(self.prefill_batch_max);
         const hidden_bytes: vk.DeviceSize = bm * @as(vk.DeviceSize, self.hidden_dim) * @sizeOf(f32);
-        const qkv_q_bytes: vk.DeviceSize = bm * @as(vk.DeviceSize, self.n_heads * self.head_dim) * @sizeOf(f32);
-        const kv_scratch_bytes: vk.DeviceSize = bm * @as(vk.DeviceSize, self.per_step_elems) * @sizeOf(f32);
+        const qkv_q_bytes: vk.DeviceSize = bm * @as(
+            vk.DeviceSize,
+            self.n_heads * self.head_dim,
+        ) * @sizeOf(f32);
+        const kv_scratch_bytes: vk.DeviceSize = bm * @as(
+            vk.DeviceSize,
+            self.per_step_elems,
+        ) * @sizeOf(f32);
         const ffn_bytes: vk.DeviceSize = bm * @as(vk.DeviceSize, self.ffn_dim) * @sizeOf(f32);
         // The logits descriptor range covers logit_rows_max rows, the full
         // batched output of a composed tick. Single-row decode and prefill read
         // only the first row.
-        const logits_bytes: vk.DeviceSize = @as(vk.DeviceSize, self.logit_rows_max) * @as(vk.DeviceSize, self.vocab_size) * @sizeOf(f32);
+        const logits_bytes: vk.DeviceSize = @as(
+            vk.DeviceSize,
+            self.logit_rows_max,
+        ) * @as(vk.DeviceSize, self.vocab_size) * @sizeOf(f32);
         // Every attention binding below starts at a region base, which the
         // store packs at whole regions. A storage-buffer descriptor offset
         // must be a multiple of the device offset alignment, so a region must
@@ -1949,40 +2579,111 @@ pub const LlamaFusedRunner = struct {
         while (layer < self.n_layers) : (layer += 1) {
             // rmsnorm attn-pre: (x, attn_norm_w[L], x_norm)
             self.set_rmsnorm_attn[layer] = try allocOne(ctx, self.desc_pool, layouts.rmsnorm);
-            bindRmsnorm(ctx, self.set_rmsnorm_attn[layer], self.buf_x.buffer, self.attn_norm_w[layer], self.buf_x_norm.buffer, hidden_bytes);
+            bindRmsnorm(
+                ctx,
+                self.set_rmsnorm_attn[layer],
+                self.buf_x.buffer,
+                self.attn_norm_w[layer],
+                self.buf_x_norm.buffer,
+                hidden_bytes,
+            );
 
             // rmsnorm ffn-pre: (x, ffn_norm_w[L], x_norm)
             self.set_rmsnorm_ffn[layer] = try allocOne(ctx, self.desc_pool, layouts.rmsnorm);
-            bindRmsnorm(ctx, self.set_rmsnorm_ffn[layer], self.buf_x.buffer, self.ffn_norm_w[layer], self.buf_x_norm.buffer, hidden_bytes);
+            bindRmsnorm(
+                ctx,
+                self.set_rmsnorm_ffn[layer],
+                self.buf_x.buffer,
+                self.ffn_norm_w[layer],
+                self.buf_x_norm.buffer,
+                hidden_bytes,
+            );
 
             // matmul Q: (x_norm, q_w.scales, q_w.quants, q)
             self.set_q[layer] = try allocOne(ctx, self.desc_pool, layouts.matmul);
-            bindMatmul(ctx, self.set_q[layer], self.buf_x_norm.buffer, hidden_bytes, &self.attn_q_w[layer], self.buf_q.buffer, qkv_q_bytes);
+            bindMatmul(
+                ctx,
+                self.set_q[layer],
+                self.buf_x_norm.buffer,
+                hidden_bytes,
+                &self.attn_q_w[layer],
+                self.buf_q.buffer,
+                qkv_q_bytes,
+            );
 
             // matmul K: (x_norm, k_w, k_scratch)
             self.set_k[layer] = try allocOne(ctx, self.desc_pool, layouts.matmul);
-            bindMatmul(ctx, self.set_k[layer], self.buf_x_norm.buffer, hidden_bytes, &self.attn_k_w[layer], self.buf_k_scratch.buffer, kv_scratch_bytes);
+            bindMatmul(
+                ctx,
+                self.set_k[layer],
+                self.buf_x_norm.buffer,
+                hidden_bytes,
+                &self.attn_k_w[layer],
+                self.buf_k_scratch.buffer,
+                kv_scratch_bytes,
+            );
 
             // matmul V: (x_norm, v_w, v_scratch)
             self.set_v[layer] = try allocOne(ctx, self.desc_pool, layouts.matmul);
-            bindMatmul(ctx, self.set_v[layer], self.buf_x_norm.buffer, hidden_bytes, &self.attn_v_w[layer], self.buf_v_scratch.buffer, kv_scratch_bytes);
+            bindMatmul(
+                ctx,
+                self.set_v[layer],
+                self.buf_x_norm.buffer,
+                hidden_bytes,
+                &self.attn_v_w[layer],
+                self.buf_v_scratch.buffer,
+                kv_scratch_bytes,
+            );
 
             // matmul O: (attn_out, o_w, x_norm). It writes back to x_norm,
             // which the residual then consumes.
             self.set_o[layer] = try allocOne(ctx, self.desc_pool, layouts.matmul);
-            bindMatmul(ctx, self.set_o[layer], self.buf_attn_out.buffer, qkv_q_bytes, &self.attn_o_w[layer], self.buf_x_norm.buffer, hidden_bytes);
+            bindMatmul(
+                ctx,
+                self.set_o[layer],
+                self.buf_attn_out.buffer,
+                qkv_q_bytes,
+                &self.attn_o_w[layer],
+                self.buf_x_norm.buffer,
+                hidden_bytes,
+            );
 
             // matmul gate: (x_norm, gate_w, ffn_gate)
             self.set_gate[layer] = try allocOne(ctx, self.desc_pool, layouts.matmul);
-            bindMatmul(ctx, self.set_gate[layer], self.buf_x_norm.buffer, hidden_bytes, &self.ffn_gate_w[layer], self.buf_ffn_gate.buffer, ffn_bytes);
+            bindMatmul(
+                ctx,
+                self.set_gate[layer],
+                self.buf_x_norm.buffer,
+                hidden_bytes,
+                &self.ffn_gate_w[layer],
+                self.buf_ffn_gate.buffer,
+                ffn_bytes,
+            );
 
             // matmul up: (x_norm, up_w, ffn_up)
             self.set_up[layer] = try allocOne(ctx, self.desc_pool, layouts.matmul);
-            bindMatmul(ctx, self.set_up[layer], self.buf_x_norm.buffer, hidden_bytes, &self.ffn_up_w[layer], self.buf_ffn_up.buffer, ffn_bytes);
+            bindMatmul(
+                ctx,
+                self.set_up[layer],
+                self.buf_x_norm.buffer,
+                hidden_bytes,
+                &self.ffn_up_w[layer],
+                self.buf_ffn_up.buffer,
+                ffn_bytes,
+            );
 
-            // matmul down: (ffn_gate, down_w, ffn_down). swiglu wrote silu(gate)*up back into ffn_gate.
+            // matmul down: (ffn_gate, down_w, ffn_down). swiglu wrote silu(gate)*up back into
+            // ffn_gate.
             self.set_down[layer] = try allocOne(ctx, self.desc_pool, layouts.matmul);
-            bindMatmul(ctx, self.set_down[layer], self.buf_ffn_gate.buffer, ffn_bytes, &self.ffn_down_w[layer], self.buf_ffn_down.buffer, hidden_bytes);
+            bindMatmul(
+                ctx,
+                self.set_down[layer],
+                self.buf_ffn_gate.buffer,
+                ffn_bytes,
+                &self.ffn_down_w[layer],
+                self.buf_ffn_down.buffer,
+                hidden_bytes,
+            );
 
             // attention: (q, slot 0 of k_cache[L], slot 0 of v_cache[L],
             // attn_out)
@@ -2001,7 +2702,11 @@ pub const LlamaFusedRunner = struct {
             // Multi-slot attention descriptor: binds the whole K region and
             // the whole V region of this layer. The shader strides by slot
             // (`stream_stride_elems`).
-            self.set_attention_multi[layer] = try allocOne(ctx, self.desc_pool, self.k_attention_multi.pipeline.set_layout);
+            self.set_attention_multi[layer] = try allocOne(
+                ctx,
+                self.desc_pool,
+                self.k_attention_multi.pipeline.set_layout,
+            );
             bindAttention(
                 ctx,
                 self.set_attention_multi[layer],
@@ -2015,7 +2720,11 @@ pub const LlamaFusedRunner = struct {
 
             // Split attention: (q, the whole K region, the whole V region,
             // the records).
-            self.set_attention_split[layer] = try allocOne(ctx, self.desc_pool, self.k_attention_split.split.set_layout);
+            self.set_attention_split[layer] = try allocOne(
+                ctx,
+                self.desc_pool,
+                self.k_attention_split.split.set_layout,
+            );
             kernels.AttentionSplit.assertKBinding(self.kv.region(layer, .k));
             kernels.AttentionSplit.assertVBinding(self.kv.region(layer, .v));
             bindAttention(
@@ -2031,7 +2740,11 @@ pub const LlamaFusedRunner = struct {
         }
 
         // Split merge: (the records, attn_out).
-        self.set_attention_merge = try allocOne(ctx, self.desc_pool, self.k_attention_split.merge.set_layout);
+        self.set_attention_merge = try allocOne(
+            ctx,
+            self.desc_pool,
+            self.k_attention_split.merge.set_layout,
+        );
         kernels.updateStorageBindings(ctx, self.set_attention_merge, &.{
             .{ .buffer = self.buf_attn_split.buffer, .offset = 0, .range = split_bytes },
             .{ .buffer = self.buf_attn_out.buffer, .offset = 0, .range = qkv_q_bytes },
@@ -2039,11 +2752,26 @@ pub const LlamaFusedRunner = struct {
 
         // Final rmsnorm: (x, output_norm_w, x_norm)
         self.set_rmsnorm_final = try allocOne(ctx, self.desc_pool, layouts.rmsnorm);
-        bindRmsnorm(ctx, self.set_rmsnorm_final, self.buf_x.buffer, self.output_norm_w, self.buf_x_norm.buffer, hidden_bytes);
+        bindRmsnorm(
+            ctx,
+            self.set_rmsnorm_final,
+            self.buf_x.buffer,
+            self.output_norm_w,
+            self.buf_x_norm.buffer,
+            hidden_bytes,
+        );
 
         // lm_head: (x_norm, output_w, logits)
         self.set_lm_head = try allocOne(ctx, self.desc_pool, layouts.matmul);
-        bindMatmul(ctx, self.set_lm_head, self.buf_x_norm.buffer, hidden_bytes, &self.output_w, self.buf_logits.buffer, logits_bytes);
+        bindMatmul(
+            ctx,
+            self.set_lm_head,
+            self.buf_x_norm.buffer,
+            hidden_bytes,
+            &self.output_w,
+            self.buf_logits.buffer,
+            logits_bytes,
+        );
 
         // swiglu: (ffn_gate, ffn_up, ffn_gate). dst = ffn_gate (in-place).
         self.set_swiglu = try allocOne(ctx, self.desc_pool, layouts.swiglu);
@@ -2098,7 +2826,7 @@ pub const LlamaFusedRunner = struct {
     }
 };
 
-// -- helpers -------------------------------------------------------------------
+// -- helpers ----------------------------------------------------------------
 
 /// Suballocate space in `arena` for the norm weight, stage the upload
 /// through a transient HostBuffer, and return a view into the arena
@@ -2109,10 +2837,12 @@ fn uploadFp32NormInArena(
     arena: *kernels.VramArena,
 ) !vk.DescriptorBufferInfo {
     if (t.dtype != .f32) return error.UnsupportedWeightDtype;
+
     const bytes: vk.DeviceSize = @intCast(t.data.len);
 
     var staging: kernels.HostBuffer = .{ .ctx = ctx };
     defer staging.deinit();
+
     try staging.ensure(bytes);
     @memcpy(staging.sliceTyped(u8, @intCast(bytes)), t.data);
 
@@ -2134,9 +2864,17 @@ fn makeQ80InArenas(
     t: Tensor,
 ) !kernels.Q80Weight {
     if (t.dtype != .q8_0) return error.UnsupportedWeightDtype;
+
     const in_features: usize = @intCast(t.shape[0]);
     const out_features: usize = @intCast(t.shape[1]);
-    return try kernels.Q80Weight.initInArenas(ctx, scales_arena, quants_arena, t.data, in_features, out_features);
+    return try kernels.Q80Weight.initInArenas(
+        ctx,
+        scales_arena,
+        quants_arena,
+        t.data,
+        in_features,
+        out_features,
+    );
 }
 
 fn makeQ40InArenas(
@@ -2146,9 +2884,17 @@ fn makeQ40InArenas(
     t: Tensor,
 ) !kernels.Q80Weight {
     if (t.dtype != .q4_0) return error.UnsupportedWeightDtype;
+
     const in_features: usize = @intCast(t.shape[0]);
     const out_features: usize = @intCast(t.shape[1]);
-    return try kernels.Q80Weight.initInArenasQ40(ctx, scales_arena, quants_arena, t.data, in_features, out_features);
+    return try kernels.Q80Weight.initInArenasQ40(
+        ctx,
+        scales_arena,
+        quants_arena,
+        t.data,
+        in_features,
+        out_features,
+    );
 }
 
 /// Upload the output/lm_head weight. QuantFactory's "Q4_0" Llama-3.1-8B keeps
@@ -2168,9 +2914,11 @@ fn makeOutputW(
     t: Tensor,
 ) !kernels.Q80Weight {
     if (t.dtype != .q6_k) return makeMatmulW(ctx, scales_arena, quants_arena, quant, t);
+
     std.debug.assert(quant == .q4_0); // only the Q4 model ships a Q6_K head here
     const q40_bytes = try convertQ6KtoQ40(gpa, t);
     defer gpa.free(q40_bytes);
+
     const in_features: usize = @intCast(t.shape[0]);
     const row_bytes: u32 = @intCast((in_features / 32) * kernels.q4_0_block_bytes);
     const t40: Tensor = .{
@@ -2189,11 +2937,13 @@ fn makeOutputW(
 /// multi-GB f32 staging copy of the whole lm_head. Caller owns the result.
 fn convertQ6KtoQ40(gpa: Allocator, t: Tensor) ![]u8 {
     std.debug.assert(t.dtype == .q6_k);
+
     const numel: usize = @as(usize, @intCast(t.shape[0])) * @as(usize, @intCast(t.shape[1]));
     std.debug.assert(numel % 256 == 0);
     const n_super = numel / 256;
     const out = try gpa.alloc(u8, (numel / 32) * kernels.q4_0_block_bytes);
     errdefer gpa.free(out);
+
     var scratch: [256]f32 = undefined;
     var s: usize = 0;
     while (s < n_super) : (s += 1) {
@@ -2201,6 +2951,7 @@ fn convertQ6KtoQ40(gpa: Allocator, t: Tensor) ![]u8 {
         // 256 elements = 8 Q4_0 blocks = 8 * 18 = 144 bytes.
         naive.quantizeQ40(&scratch, out[s * 144 ..][0..144]);
     }
+
     return out;
 }
 
@@ -2264,6 +3015,7 @@ fn bindAttention(
     out_bytes: vk.DeviceSize,
 ) void {
     std.debug.assert(k.range == v.range);
+
     const infos = [_]vk.DescriptorBufferInfo{
         .{ .buffer = q, .offset = 0, .range = q_bytes },
         k,
@@ -2274,7 +3026,6 @@ fn bindAttention(
 }
 
 // -- command recording ---------------------------------------------------------
-
 fn copyHostToDevice(
     vkd: vk.DeviceWrapper,
     cb: vk.CommandBuffer,
@@ -2295,7 +3046,9 @@ fn copyDeviceToDevice(
     dst_off: vk.DeviceSize,
     size: vk.DeviceSize,
 ) void {
-    const regions = [_]vk.BufferCopy{.{ .src_offset = src_off, .dst_offset = dst_off, .size = size }};
+    const regions = [_]vk.BufferCopy{
+        .{ .src_offset = src_off, .dst_offset = dst_off, .size = size },
+    };
     vkd.cmdCopyBuffer(cb, src, dst, &regions);
 }
 
@@ -2383,9 +3136,9 @@ fn barrierShaderToTransfer(vkd: vk.DeviceWrapper, cb: vk.CommandBuffer) void {
     );
 }
 
-// -- tests ---------------------------------------------------------------------
-// The cost-model anchors below need no Vulkan device.
+// -- tests ------------------------------------------------------------------
 
+// The cost-model anchors below need no Vulkan device.
 /// A Llama-3.1-8B-shaped card: 32 layers stepping 8 KV heads x 128 head_dim.
 fn testCard() loader.ModelCard {
     return .{
@@ -2420,6 +3173,7 @@ test "llama kv cost: the vector is n_layers equal entries and sums to the model"
             // No Llama layer holds recurrent state.
             try std.testing.expectEqual(@as(u32, 0), entry.fixed_bytes_per_slot);
         }
+
         const whole = vector.total();
         try std.testing.expectEqual(LlamaFusedRunner.kvCostModel(card, kv_dtype), whole);
         try std.testing.expectEqual(@as(u64, card.n_layers) * per_layer, whole.kv_bytes_per_token);
@@ -2442,11 +3196,21 @@ test "llama scratch: the split attention records follow the declared context" {
     const records_shallow = LlamaFusedRunner.attnSplitScratch(shallow).totalBytes();
     // The records are the only context term, and they are f32 at every dtype.
     for ([_]dtype.KvDtype{ .f32, .f16 }) |kv_dtype| {
-        const gained = LlamaFusedRunner.scratchVramBytes(deep, kv_dtype) - LlamaFusedRunner.scratchVramBytes(shallow, kv_dtype);
+        const gained = LlamaFusedRunner.scratchVramBytes(
+            deep,
+            kv_dtype,
+        ) - LlamaFusedRunner.scratchVramBytes(
+            shallow,
+            kv_dtype,
+        );
         try std.testing.expectEqual(records_deep - records_shallow, gained);
     }
+
     // The anchors: 4 rows x 32 heads x 512 splits x 130 elements of 4 bytes,
     // on top of 256 activation rows of 51200 f32 elements.
     try std.testing.expectEqual(@as(u64, 34_078_720), records_deep);
-    try std.testing.expectEqual(@as(u64, 52_428_800 + 34_078_720), LlamaFusedRunner.scratchVramBytes(deep, .f32));
+    try std.testing.expectEqual(
+        @as(u64, 52_428_800 + 34_078_720),
+        LlamaFusedRunner.scratchVramBytes(deep, .f32),
+    );
 }

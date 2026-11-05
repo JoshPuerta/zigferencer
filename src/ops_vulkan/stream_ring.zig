@@ -27,11 +27,12 @@ const kernels = @import("kernels.zig");
 comptime {
     if (!build_options.use_vulkan) {
         @compileError("ops_vulkan/stream_ring.zig was included in a non-vulkan build. " ++
-            "Either build with -Druntime=vulkan, or fix the caller to gate on build_options.use_vulkan.");
+            "Either build with -Druntime=vulkan, or fix the caller to gate on " ++
+            "build_options.use_vulkan.");
     }
 }
 
-// -- api --------------------------------------------------------------------
+// -- types ------------------------------------------------------------------
 
 pub const StreamRing = struct {
     ctx: *const vulkan_ctx.Context,
@@ -72,7 +73,10 @@ pub const StreamRing = struct {
     /// `segment_capacity` is the largest upload one slot can carry. The ring
     /// allocates `depth` segments of that size up front and never grows, so
     /// pick the capacity from the consumer's largest expected chunk.
-    pub fn init(ctx: *const vulkan_ctx.Context, segment_capacity: vk.DeviceSize) InitError!StreamRing {
+    pub fn init(
+        ctx: *const vulkan_ctx.Context,
+        segment_capacity: vk.DeviceSize,
+    ) InitError!StreamRing {
         std.debug.assert(segment_capacity > 0);
 
         // Each slot starts at a descriptor-bindable offset, so a consumer can
@@ -99,6 +103,7 @@ pub const StreamRing = struct {
         var fences: [depth]vk.Fence = @splat(.null_handle);
         var created: usize = 0;
         errdefer for (fences[0..created]) |f| ctx.vkd.destroyFence(ctx.device, f, null);
+
         // Unsignaled at birth. The invariant the ring keeps is that a fence is
         // signaled or pending exactly when its slot is `in_flight`.
         const fence_info: vk.FenceCreateInfo = .{};
@@ -111,10 +116,12 @@ pub const StreamRing = struct {
         // So the ring never calls it twice.
         var host: kernels.HostBuffer = .{ .ctx = ctx };
         errdefer host.deinit();
+
         try host.ensure(total);
 
         var device_buf: kernels.DeviceBuffer = .{ .ctx = ctx };
         errdefer device_buf.deinit();
+
         try device_buf.ensure(total);
 
         std.debug.assert(stride >= segment_capacity);
@@ -139,16 +146,25 @@ pub const StreamRing = struct {
     /// the condition and does not block.
     pub fn acquire(self: *StreamRing) ?Acquired {
         std.debug.assert(self.segment_capacity > 0);
+
         for (self.states, 0..) |s, i| {
             if (s != .free) continue;
+
             const slot: Slot = @intCast(i);
             self.transition(slot, .acquire);
             const base: usize = @intCast(@as(vk.DeviceSize, slot) * self.stride);
-            const bytes = self.host.mapped[base .. base + @as(usize, @intCast(self.segment_capacity))];
+            const bytes = self.host.mapped[base .. base + @as(
+                usize,
+                @intCast(self.segment_capacity),
+            )];
             std.debug.assert(bytes.len == self.segment_capacity);
             return .{ .slot = slot, .bytes = bytes };
         }
-        for (self.states) |s| std.debug.assert(s != .free);
+
+        for (self.states) |s| {
+            std.debug.assert(s != .free);
+        }
+
         return null;
     }
 
@@ -170,11 +186,13 @@ pub const StreamRing = struct {
         const begin: vk.CommandBufferBeginInfo = .{ .flags = .{ .one_time_submit_bit = true } };
         try self.ctx.vkd.beginCommandBuffer(cmd, &begin);
 
-        const regions = [_]vk.BufferCopy{.{ .src_offset = offset, .dst_offset = offset, .size = len }};
+        const regions = [_]vk.BufferCopy{
+            .{ .src_offset = offset, .dst_offset = offset, .size = len },
+        };
         self.ctx.vkd.cmdCopyBuffer(cmd, self.host.buffer, self.device_buf.buffer, &regions);
 
         // This barrier replaces the `queueWaitIdle` the rest of the engine
-        // leans on. The transfer-read leg covers a consumer that stages the
+        // leans on. The transfer-read part covers a consumer that stages the
         // segment back host-ward instead of dispatching on it.
         const mb = [_]vk.MemoryBarrier{.{
             .src_access_mask = .{ .transfer_write_bit = true },
@@ -192,7 +210,9 @@ pub const StreamRing = struct {
         try self.ctx.vkd.endCommandBuffer(cmd);
 
         const cmds = [_]vk.CommandBuffer{cmd};
-        const submits = [_]vk.SubmitInfo{.{ .command_buffer_count = 1, .p_command_buffers = &cmds }};
+        const submits = [_]vk.SubmitInfo{
+            .{ .command_buffer_count = 1, .p_command_buffers = &cmds },
+        };
         try self.ctx.vkd.queueSubmit(self.ctx.queue, &submits, self.fences[slot]);
 
         // Only a queue that took the work leaves a fence pending. An error
@@ -211,7 +231,12 @@ pub const StreamRing = struct {
         std.debug.assert(self.states[slot] == .in_flight);
 
         const waited = [_]vk.Fence{self.fences[slot]};
-        const result = try self.ctx.vkd.waitForFences(self.ctx.device, &waited, .true, std.math.maxInt(u64));
+        const result = try self.ctx.vkd.waitForFences(
+            self.ctx.device,
+            &waited,
+            .true,
+            std.math.maxInt(u64),
+        );
         // An infinite timeout cannot report `timeout`, so any result but
         // success means the wrapper or the driver broke the Vulkan rule.
         std.debug.assert(result == .success);
@@ -233,6 +258,7 @@ pub const StreamRing = struct {
         std.debug.assert(slot < depth);
         std.debug.assert(self.states[slot] == .ready);
         std.debug.assert(self.lens[slot] > 0);
+
         return .{
             .buffer = self.device_buf.buffer,
             .offset = @as(vk.DeviceSize, slot) * self.stride,
@@ -246,6 +272,7 @@ pub const StreamRing = struct {
         std.debug.assert(self.segment_capacity > 0);
         std.debug.assert(slot < depth);
         std.debug.assert(self.states[slot] == .ready);
+
         self.transition(slot, .release);
         self.lens[slot] = 0;
         std.debug.assert(self.states[slot] == .free);
@@ -254,8 +281,11 @@ pub const StreamRing = struct {
     pub fn inFlightCount(self: *const StreamRing) u32 {
         var n: u32 = 0;
         for (self.states) |s| {
-            if (s == .in_flight) n += 1;
+            if (s == .in_flight) {
+                n += 1;
+            }
         }
+
         std.debug.assert(n <= depth);
         return n;
     }
@@ -269,7 +299,12 @@ pub const StreamRing = struct {
         drain: for (self.states, 0..) |s, i| {
             if (s != .in_flight) continue;
             const waited = [_]vk.Fence{self.fences[i]};
-            _ = self.ctx.vkd.waitForFences(self.ctx.device, &waited, .true, std.math.maxInt(u64)) catch {
+            _ = self.ctx.vkd.waitForFences(
+                self.ctx.device,
+                &waited,
+                .true,
+                std.math.maxInt(u64),
+            ) catch {
                 // A lost device fails every later fence wait too. One
                 // queue-wide drain is the last chance to let outstanding work
                 // settle before the handles go.
@@ -277,13 +312,20 @@ pub const StreamRing = struct {
                 break :drain;
             };
         }
+
         var slot: Slot = 0;
         while (slot < depth) : (slot += 1) {
-            if (self.states[slot] == .in_flight) self.transition(slot, .wait);
+            if (self.states[slot] == .in_flight) {
+                self.transition(slot, .wait);
+            }
         }
+
         std.debug.assert(self.inFlightCount() == 0);
 
-        for (self.fences) |f| self.ctx.vkd.destroyFence(self.ctx.device, f, null);
+        for (self.fences) |f| {
+            self.ctx.vkd.destroyFence(self.ctx.device, f, null);
+        }
+
         // Destroying the pool frees the command buffers allocated from it.
         self.ctx.vkd.destroyCommandPool(self.ctx.device, self.command_pool, null);
         self.device_buf.deinit();
@@ -296,6 +338,7 @@ pub const StreamRing = struct {
     /// condition.
     fn transition(self: *StreamRing, slot: Slot, op: ring_fsm.OpTag) void {
         std.debug.assert(slot < depth);
+
         const from = self.states[slot];
         const to = ring_fsm.next(from, op);
         std.debug.assert(to != null);

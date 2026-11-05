@@ -68,8 +68,6 @@ pub const Session = struct {
     state: State,
 };
 
-// -- api --------------------------------------------------------------------
-
 /// Fixed pool of sessions over `RunnerT`'s KV slots. Session id == slot index.
 /// `RunnerT` provides `stepBatch(rows)`, `logits` (rows at vocab stride),
 /// `n_slots`, and `max_seq`. The type is duck-typed, so the CPU runners, the
@@ -130,14 +128,18 @@ pub fn Sessions(comptime RunnerT: type) type {
             std.debug.assert(runner.n_slots >= 1);
             std.debug.assert(logitRows(runner) >= 1);
             std.debug.assert(runner.logits.len % logitRows(runner) == 0);
+
             const table = try arena.alloc(Session, runner.n_slots);
-            for (table) |*s| s.* = .{
-                .pos = 0,
-                .token_pending = 0,
-                .rng = std.Random.DefaultPrng.init(0),
-                .params = .{},
-                .state = .free,
-            };
+            for (table) |*s| {
+                s.* = .{
+                    .pos = 0,
+                    .token_pending = 0,
+                    .rng = std.Random.DefaultPrng.init(0),
+                    .params = .{},
+                    .state = .free,
+                };
+            }
+
             const vocab = runner.logits.len / logitRows(runner);
             return .{
                 .runner = runner,
@@ -153,14 +155,17 @@ pub fn Sessions(comptime RunnerT: type) type {
         pub fn create(self: *Self, seed: u64, params: sampler.Params) error{NoFreeSession}!u32 {
             std.debug.assert(params.temperature >= 0);
             std.debug.assert(params.top_p > 0);
+
             for (self.table, 0..) |*s, id| {
                 if (s.state != .free) continue;
+
                 // KV needs no scrub on reuse (rewrite-before-read), but a
                 // runner with NON-positional recurrent state (qwen's GDN
                 // scan) must zero it for a fresh conversation.
                 if (comptime @hasDecl(RunnerT, "resetSlotState")) {
                     self.runner.resetSlotState(@intCast(id));
                 }
+
                 s.* = .{
                     .pos = 0,
                     .token_pending = 0,
@@ -168,9 +173,13 @@ pub fn Sessions(comptime RunnerT: type) type {
                     .params = params,
                     .state = .feeding,
                 };
-                log.debug("engine create: id {d}, slot {d}, max_seq {d}", .{ id, id, self.runner.max_seq });
+                log.debug(
+                    "engine create: id {d}, slot {d}, max_seq {d}",
+                    .{ id, id, self.runner.max_seq },
+                );
                 return @intCast(id);
             }
+
             return error.NoFreeSession;
         }
 
@@ -180,14 +189,21 @@ pub fn Sessions(comptime RunnerT: type) type {
         /// The clone gets its
         /// OWN seed and sampling: one prefilled context, divergent sessions.
         /// The source is untouched and both sessions decode on independently.
-        pub fn clone(self: *Self, source_id: u32, seed: u64, params: sampler.Params) error{NoFreeSession}!u32 {
+        pub fn clone(
+            self: *Self,
+            source_id: u32,
+            seed: u64,
+            params: sampler.Params,
+        ) error{NoFreeSession}!u32 {
             std.debug.assert(source_id < self.table.len);
+
             const source = &self.table[source_id];
             std.debug.assert(source.state != .free);
             std.debug.assert(params.temperature >= 0);
             std.debug.assert(params.top_p > 0);
             for (self.table, 0..) |*s, id| {
                 if (s.state != .free) continue;
+
                 std.debug.assert(id != source_id);
                 self.runner.cloneSlotState(source_id, @intCast(id), source.pos);
                 s.* = .{
@@ -200,6 +216,7 @@ pub fn Sessions(comptime RunnerT: type) type {
                 log.debug("engine clone: {d} -> {d}, pos {d}", .{ source_id, id, source.pos });
                 return @intCast(id);
             }
+
             return error.NoFreeSession;
         }
 
@@ -208,6 +225,7 @@ pub fn Sessions(comptime RunnerT: type) type {
         /// it before it holds a session.
         pub fn snapshotBytesFor(self: *const Self, n_rows: u32) u64 {
             if (comptime !can_snapshot) @compileError("runner cannot snapshot slot state");
+
             std.debug.assert(n_rows >= 1);
             std.debug.assert(n_rows <= self.runner.max_seq);
             return self.runner.evictSlotBytesFor(n_rows);
@@ -223,6 +241,7 @@ pub fn Sessions(comptime RunnerT: type) type {
         /// caller-owned.
         pub fn restorePrefix(self: *Self, id: u32, n_rows: u32, blob: []const u8) !void {
             if (comptime !can_snapshot) @compileError("runner cannot snapshot slot state");
+
             std.debug.assert(id < self.table.len);
             const s = &self.table[id];
             std.debug.assert(s.state == .feeding);
@@ -240,8 +259,15 @@ pub fn Sessions(comptime RunnerT: type) type {
         /// pending, so a full-prompt cache hit costs zero forward rows. The
         /// sample runs here, inside the engine, so the sampling path stays
         /// single. Returns the sampled token.
-        pub fn restoreReady(self: *Self, id: u32, n_rows: u32, blob: []const u8, logits: []const f32) !u32 {
+        pub fn restoreReady(
+            self: *Self,
+            id: u32,
+            n_rows: u32,
+            blob: []const u8,
+            logits: []const f32,
+        ) !u32 {
             if (comptime !can_snapshot) @compileError("runner cannot snapshot slot state");
+
             std.debug.assert(logits.len == self.vocab);
             try self.restorePrefix(id, n_rows, blob);
             const s = &self.table[id];
@@ -249,7 +275,10 @@ pub fn Sessions(comptime RunnerT: type) type {
             std.debug.assert(s.pos == n_rows);
             s.token_pending = sampler.sample(logits, s.params, s.rng.random(), self.sample_scratch);
             s.state = .ready;
-            log.debug("engine restore ready: id {d}, {d} rows, first {d}", .{ id, n_rows, s.token_pending });
+            log.debug(
+                "engine restore ready: id {d}, {d} rows, first {d}",
+                .{ id, n_rows, s.token_pending },
+            );
             return s.token_pending;
         }
 
@@ -261,6 +290,7 @@ pub fn Sessions(comptime RunnerT: type) type {
             std.debug.assert(self.last_final != null);
             std.debug.assert(self.last_final.? == id);
             std.debug.assert(out.len == self.vocab);
+
             @memcpy(out, self.runner.logits[0..self.vocab]);
         }
 
@@ -270,13 +300,17 @@ pub fn Sessions(comptime RunnerT: type) type {
         /// session that goes on decoding.
         pub fn snapshotPrefix(self: *Self, id: u32, n_rows: u32, out: []u8) !void {
             if (comptime !can_snapshot) @compileError("runner cannot snapshot slot state");
+
             std.debug.assert(id < self.table.len);
             const s = &self.table[id];
             std.debug.assert(s.state != .free);
             std.debug.assert(n_rows <= s.pos); // uncommitted rows hold no state to cache
             std.debug.assert(out.len == @as(usize, @intCast(self.snapshotBytesFor(n_rows))));
             try self.runner.evictSlot(id, n_rows, out);
-            log.debug("engine snapshot prefix: id {d}, slot {d}, {d} of {d} rows", .{ id, id, n_rows, s.pos });
+            log.debug(
+                "engine snapshot prefix: id {d}, slot {d}, {d} of {d} rows",
+                .{ id, id, n_rows, s.pos },
+            );
         }
 
         /// Release a slot. No KV scrub: attention reads only positions
@@ -284,6 +318,7 @@ pub fn Sessions(comptime RunnerT: type) type {
         pub fn destroy(self: *Self, id: u32) void {
             std.debug.assert(id < self.table.len);
             std.debug.assert(self.table[id].state != .free);
+
             log.debug("engine destroy: id {d}, pos {d}", .{ id, self.table[id].pos });
             self.table[id].state = .free;
             self.table[id].pos = 0;
@@ -294,6 +329,7 @@ pub fn Sessions(comptime RunnerT: type) type {
         pub fn capacityRemaining(self: *const Self, id: u32) u32 {
             std.debug.assert(id < self.table.len);
             std.debug.assert(self.table[id].state != .free);
+
             return self.runner.max_seq - self.table[id].pos;
         }
 
@@ -301,6 +337,7 @@ pub fn Sessions(comptime RunnerT: type) type {
         pub fn posOf(self: *const Self, id: u32) u32 {
             std.debug.assert(id < self.table.len);
             std.debug.assert(self.table[id].state != .free);
+
             return self.table[id].pos;
         }
 
@@ -309,6 +346,7 @@ pub fn Sessions(comptime RunnerT: type) type {
         /// forces the close of a think block this way.
         pub fn overridePending(self: *Self, id: u32, token: u32) void {
             std.debug.assert(id < self.table.len);
+
             const s = &self.table[id];
             std.debug.assert(s.state == .ready);
             std.debug.assert(token < self.vocab);
@@ -321,6 +359,7 @@ pub fn Sessions(comptime RunnerT: type) type {
         pub fn reseed(self: *Self, id: u32, seed: u64) void {
             std.debug.assert(id < self.table.len);
             std.debug.assert(self.table[id].state != .free);
+
             self.table[id].rng = std.Random.DefaultPrng.init(seed);
         }
 
@@ -332,6 +371,7 @@ pub fn Sessions(comptime RunnerT: type) type {
             std.debug.assert(self.table[id].state != .free);
             std.debug.assert(params.temperature >= 0);
             std.debug.assert(params.top_p > 0);
+
             self.table[id].params = params;
             log.debug("params: engine {d} temp {d:.2} top_k {d} top_p {d:.2}", .{
                 id, params.temperature, params.top_k, params.top_p,
@@ -348,6 +388,7 @@ pub fn Sessions(comptime RunnerT: type) type {
         pub fn feed(self: *Self, id: u32, tokens: []const u32, final: bool) !?u32 {
             std.debug.assert(id < self.table.len);
             std.debug.assert(tokens.len > 0);
+
             const s = &self.table[id];
             std.debug.assert(s.state != .free);
             if (@as(usize, s.pos) + tokens.len > self.runner.max_seq) return error.ContextFull;
@@ -365,9 +406,11 @@ pub fn Sessions(comptime RunnerT: type) type {
                 }, &.{}, &.{});
                 done += chunk;
             }
+
             std.debug.assert(done == tokens.len);
             if (final) std.debug.assert(first != null);
             if (!final) std.debug.assert(first == null);
+
             log.debug("engine feed: id {d}, +{d} tokens, pos {d}", .{ id, tokens.len, s.pos });
             return first;
         }
@@ -379,6 +422,7 @@ pub fn Sessions(comptime RunnerT: type) type {
         /// `error.ContextFull` every session is unmodified.
         pub fn decodeBatch(self: *Self, ids: []const u32, tokens_out: []u32) !void {
             std.debug.assert(ids.len >= 1);
+
             _ = try self.advance(null, ids, tokens_out);
         }
 
@@ -393,7 +437,12 @@ pub fn Sessions(comptime RunnerT: type) type {
         /// `tokens_out` in `ids` order. `advance` validates capacity for the
         /// chunk and ALL ids before it steps any row. On `error.ContextFull`
         /// every session is unmodified.
-        pub fn advance(self: *Self, feed_chunk: ?FeedChunk, ids: []const u32, tokens_out: []u32) !?u32 {
+        pub fn advance(
+            self: *Self,
+            feed_chunk: ?FeedChunk,
+            ids: []const u32,
+            tokens_out: []u32,
+        ) !?u32 {
             const n_feed: usize = if (feed_chunk) |fc| fc.tokens.len else 0;
             std.debug.assert(n_feed + ids.len >= 1);
             std.debug.assert(n_feed + ids.len <= self.rows.len);
@@ -402,13 +451,22 @@ pub fn Sessions(comptime RunnerT: type) type {
                 std.debug.assert(fc.id < self.table.len);
                 std.debug.assert(fc.tokens.len >= 1);
                 std.debug.assert(self.table[fc.id].state != .free);
-                if (@as(usize, self.table[fc.id].pos) + fc.tokens.len > self.runner.max_seq) return error.ContextFull;
+
+                if (@as(usize, self.table[fc.id].pos) + fc.tokens.len > self.runner.max_seq) {
+                    return error.ContextFull;
+                }
             }
+
             for (ids, 0..) |id, i| {
                 std.debug.assert(id < self.table.len);
                 std.debug.assert(self.table[id].state == .ready);
+
                 if (feed_chunk) |fc| std.debug.assert(fc.id != id);
-                for (ids[0..i]) |prev| std.debug.assert(prev != id);
+
+                for (ids[0..i]) |prev| {
+                    std.debug.assert(prev != id);
+                }
+
                 if (self.table[id].pos >= self.runner.max_seq) return error.ContextFull;
             }
 
@@ -424,6 +482,7 @@ pub fn Sessions(comptime RunnerT: type) type {
                     };
                 }
             }
+
             for (ids, 0..) |id, i| {
                 self.rows[n_feed + i] = .{
                     .slot = id,
@@ -432,6 +491,7 @@ pub fn Sessions(comptime RunnerT: type) type {
                     .want_logits = true,
                 };
             }
+
             try self.runner.stepBatch(self.rows[0 .. n_feed + ids.len]);
             self.last_final = if (feed_chunk) |fc| (if (fc.final) fc.id else null) else null;
 
@@ -449,20 +509,42 @@ pub fn Sessions(comptime RunnerT: type) type {
                 s.pos += @intCast(fc.tokens.len);
                 if (fc.final) {
                     const logits = self.runner.logits[0..vocab];
-                    s.token_pending = sampler.sample(logits, s.params, s.rng.random(), self.sample_scratch);
+                    s.token_pending = sampler.sample(
+                        logits,
+                        s.params,
+                        s.rng.random(),
+                        self.sample_scratch,
+                    );
                     s.state = .ready;
                     first = s.token_pending;
-                    if (comptime core_log.hot) log_token.debug("sample: slot {d} pos {d} -> {d}", .{ fc.id, s.pos, s.token_pending });
+                    if (comptime core_log.hot) {
+                        log_token.debug(
+                            "sample: slot {d} pos {d} -> {d}",
+                            .{ fc.id, s.pos, s.token_pending },
+                        );
+                    }
                 }
             }
+
             for (ids, 0..) |id, i| {
                 const s = &self.table[id];
                 s.pos += 1;
                 const logits = self.runner.logits[(base + i) * vocab ..][0..vocab];
-                s.token_pending = sampler.sample(logits, s.params, s.rng.random(), self.sample_scratch);
+                s.token_pending = sampler.sample(
+                    logits,
+                    s.params,
+                    s.rng.random(),
+                    self.sample_scratch,
+                );
                 tokens_out[i] = s.token_pending;
-                if (comptime core_log.hot) log_token.debug("sample: slot {d} pos {d} -> {d}", .{ id, s.pos, s.token_pending });
+                if (comptime core_log.hot) {
+                    log_token.debug(
+                        "sample: slot {d} pos {d} -> {d}",
+                        .{ id, s.pos, s.token_pending },
+                    );
+                }
             }
+
             return first;
         }
     };
@@ -479,56 +561,93 @@ pub fn Sessions(comptime RunnerT: type) type {
 // test looks. `Sessions` checks the rows it reads when a pool type is built.
 // The test below instantiates the whole surface against every runner this
 // build holds. `README.md` states the same table in prose.
-
 /// One field of the surface: the name and the exact type a consumer reads.
 fn requireField(comptime T: type, comptime name: []const u8, comptime Want: type) void {
-    if (!@hasField(T, name))
+    if (!@hasField(T, name)) {
         @compileError("runner surface: " ++ @typeName(T) ++ " has no field '" ++ name ++ "'");
-    if (@FieldType(T, name) != Want)
+    }
+    if (@FieldType(T, name) != Want) {
         @compileError("runner surface: " ++ @typeName(T) ++ "." ++ name ++ " is " ++
             @typeName(@FieldType(T, name)) ++ ", the surface states " ++ @typeName(Want));
+    }
 }
 
 /// One method of the surface.
-fn requireFn(comptime T: type, comptime name: []const u8, comptime params: []const type, comptime Payload: type) void {
-    if (!@hasDecl(T, name))
+fn requireFn(
+    comptime T: type,
+    comptime name: []const u8,
+    comptime params: []const type,
+    comptime Payload: type,
+) void {
+    if (!@hasDecl(T, name)) {
         @compileError("runner surface: " ++ @typeName(T) ++ " has no declaration '" ++ name ++ "'");
+    }
+
     checkFn(T, name, params, Payload);
 }
 
 /// A method `Sessions` gates on `@hasDecl`. Absence is legal, and a wrong shape
 /// is not: the gate reads the name alone, so it cannot catch a drifted argument.
-fn optionalFn(comptime T: type, comptime name: []const u8, comptime params: []const type, comptime Payload: type) void {
-    if (@hasDecl(T, name)) checkFn(T, name, params, Payload);
+fn optionalFn(
+    comptime T: type,
+    comptime name: []const u8,
+    comptime params: []const type,
+    comptime Payload: type,
+) void {
+    if (@hasDecl(T, name)) {
+        checkFn(T, name, params, Payload);
+    }
 }
 
 /// The receiver, the arguments after it, and the value the method yields. An
 /// error union counts as its payload, because each runner family declares its
 /// own error set.
-fn checkFn(comptime T: type, comptime name: []const u8, comptime params: []const type, comptime Payload: type) void {
+fn checkFn(
+    comptime T: type,
+    comptime name: []const u8,
+    comptime params: []const type,
+    comptime Payload: type,
+) void {
     const where = "runner surface: " ++ @typeName(T) ++ "." ++ name ++ " ";
     const info = @typeInfo(@TypeOf(@field(T, name)));
     if (info != .@"fn") @compileError(where ++ "is not a function");
+
     const f = info.@"fn";
-    if (f.params.len != params.len + 1)
+    if (f.params.len != params.len + 1) {
         @compileError(where ++ "takes " ++ std.fmt.comptimePrint("{d}", .{f.params.len}) ++
             " arguments, the surface states " ++ std.fmt.comptimePrint("{d}", .{params.len + 1}));
+    }
+
     const receiver = f.params[0].type orelse @compileError(where ++ "has a generic receiver");
-    if (receiver != *T and receiver != *const T)
-        @compileError(where ++ "takes " ++ @typeName(receiver) ++ ", not a pointer to its own runner");
+    if (receiver != *T and receiver != *const T) {
+        @compileError(
+            where ++ "takes " ++ @typeName(receiver) ++ ", not a pointer to its own runner",
+        );
+    }
+
     inline for (params, 0..) |Want, i| {
         const got = f.params[i + 1].type orelse @compileError(where ++ "has a generic argument");
-        if (got != Want)
-            @compileError(where ++ "argument " ++ std.fmt.comptimePrint("{d}", .{i + 1}) ++ " is " ++
-                @typeName(got) ++ ", the surface states " ++ @typeName(Want));
+        if (got != Want) {
+            @compileError(
+                where ++ "argument " ++ std.fmt.comptimePrint("{d}", .{i + 1}) ++ " is " ++
+                    @typeName(got) ++ ", the surface states " ++ @typeName(Want),
+            );
+        }
     }
+
     const ret = f.return_type orelse @compileError(where ++ "has a generic return type");
     const payload = switch (@typeInfo(ret)) {
         .error_union => |eu| eu.payload,
         else => ret,
     };
-    if (payload != Payload)
-        @compileError(where ++ "yields " ++ @typeName(payload) ++ ", the surface states " ++ @typeName(Payload));
+
+    if (payload != Payload) {
+        @compileError(
+            where ++ "yields " ++ @typeName(
+                payload,
+            ) ++ ", the surface states " ++ @typeName(Payload),
+        );
+    }
 }
 
 /// The slot hooks a runner with non-positional state must carry. `Sessions`
@@ -539,14 +658,17 @@ fn checkFn(comptime T: type, comptime name: []const u8, comptime params: []const
 /// check then needs them by name.
 fn requireRecurrentHooks(comptime T: type) void {
     if (!@hasDecl(T, "has_recurrent_state")) return;
-    if (@TypeOf(T.has_recurrent_state) != bool)
+    if (@TypeOf(T.has_recurrent_state) != bool) {
         @compileError("runner surface: " ++ @typeName(T) ++ ".has_recurrent_state is " ++
             @typeName(@TypeOf(T.has_recurrent_state)) ++ ", the surface states bool");
+    }
     if (!T.has_recurrent_state) return;
+
     inline for ([_][]const u8{ "resetSlotState", "cloneSlotState" }) |hook| {
-        if (!@hasDecl(T, hook))
+        if (!@hasDecl(T, hook)) {
             @compileError("runner surface: " ++ @typeName(T) ++ " declares has_recurrent_state, " ++
                 "so it must declare '" ++ hook ++ "'");
+        }
     }
 }
 
@@ -554,9 +676,10 @@ fn requireRecurrentHooks(comptime T: type) void {
 /// this the `requireRecurrentHooks` check passes vacuously on a runner that
 /// dropped the marker along with a hook.
 fn requireRecurrentState(comptime T: type) void {
-    if (!@hasDecl(T, "has_recurrent_state") or !T.has_recurrent_state)
+    if (!@hasDecl(T, "has_recurrent_state") or !T.has_recurrent_state) {
         @compileError("runner surface: " ++ @typeName(T) ++ " holds recurrent state, " ++
             "so it must declare 'pub const has_recurrent_state = true'");
+    }
 }
 
 /// The surface `Sessions` itself reads. `Sessions(RunnerT)` checks it when the
@@ -575,7 +698,9 @@ fn requireSessionsSurface(comptime T: type) void {
     optionalFn(T, "resetSlotState", &.{u32}, void);
     optionalFn(T, "cloneSlotState", &.{ u32, u32, u32 }, void);
     requireRecurrentHooks(T);
-    if (@hasDecl(T, "evictSlot")) requireSwapSurface(T);
+    if (@hasDecl(T, "evictSlot")) {
+        requireSwapSurface(T);
+    }
 }
 
 /// The step surface every shipped runner carries: the pool surface plus the
@@ -599,20 +724,28 @@ fn requireSwapSurface(comptime T: type) void {
 /// check states only that the constructor reads one. Every family names that
 /// constructor `init`.
 fn requirePlanValue(comptime T: type, comptime Plan: type) void {
-    if (!@hasDecl(T, "init"))
+    if (!@hasDecl(T, "init")) {
         @compileError("runner surface: " ++ @typeName(T) ++ " has no declaration 'init'");
+    }
+
     const info = @typeInfo(@TypeOf(@field(T, "init")));
-    if (info != .@"fn")
+    if (info != .@"fn") {
         @compileError("runner surface: " ++ @typeName(T) ++ ".init is not a function");
+    }
+
     comptime var reads_plan = false;
     inline for (info.@"fn".params) |p| {
         if (p.type) |ty| {
-            if (ty == Plan) reads_plan = true;
+            if (ty == Plan) {
+                reads_plan = true;
+            }
         }
     }
-    if (!reads_plan)
+
+    if (!reads_plan) {
         @compileError("runner surface: " ++ @typeName(T) ++ ".init takes no " ++ @typeName(Plan) ++
             ", so its shape is not a value the caller planned");
+    }
 }
 
 // -- tests ------------------------------------------------------------------
@@ -622,7 +755,6 @@ fn requirePlanValue(comptime T: type, comptime Plan: type) void {
 // logits of row i = (rows[i].token + 1) % vocab. Greedy params then give fully
 // predictable streams, and the recorded rows pin the chunking, the slot, and
 // the position bookkeeping.
-
 const test_fakes = @import("test_fakes.zig");
 const test_vocab = test_fakes.vocab;
 
@@ -662,14 +794,17 @@ const FakeRunner = struct {
         self.calls += 1;
         for (rows) |r| {
             std.debug.assert(self.rows_log_len < self.rows_log.len);
+
             self.rows_log[self.rows_log_len] = r;
             self.rows_log_len += 1;
         }
+
         test_fakes.writeCannedLogits(self.logits, rows);
     }
 
     pub fn cloneSlotState(self: *FakeRunner, source_slot: u32, target_slot: u32, pos: u32) void {
         std.debug.assert(self.clones_log_len < self.clones_log.len);
+
         self.clones_log[self.clones_log_len] = .{ source_slot, target_slot, pos };
         self.clones_log_len += 1;
     }
@@ -707,7 +842,10 @@ const SnapFakeRunner = struct {
     }
 
     pub fn stepBatch(self: *SnapFakeRunner, rows: []const StepRow) !void {
-        for (rows) |r| self.markers[r.slot] = r.token;
+        for (rows) |r| {
+            self.markers[r.slot] = r.token;
+        }
+
         test_fakes.writeCannedLogits(self.logits, rows);
     }
 
@@ -719,6 +857,7 @@ const SnapFakeRunner = struct {
     pub fn evictSlot(self: *SnapFakeRunner, slot: u32, n_rows: u32, out: []u8) !void {
         std.debug.assert(n_rows >= 1);
         std.debug.assert(out.len == n_rows * @sizeOf(u32));
+
         std.mem.writeInt(u32, out[0..4], self.markers[slot], .little);
         self.evicts += 1;
     }
@@ -726,6 +865,7 @@ const SnapFakeRunner = struct {
     pub fn restoreSlot(self: *SnapFakeRunner, slot: u32, n_rows: u32, blob: []const u8) !void {
         std.debug.assert(n_rows >= 1);
         std.debug.assert(blob.len == n_rows * @sizeOf(u32));
+
         self.markers[slot] = std.mem.readInt(u32, blob[0..4], .little);
         self.restores += 1;
     }
@@ -744,14 +884,17 @@ test "runner surface: the session seam holds for every runner in this build" {
         @import("llama_fused.zig")
     else
         struct {};
+
     const qwen_fused = if (build_options.use_vulkan_fused_ops)
         @import("qwen_fused.zig")
     else
         struct {};
+
     const llama_hybrid = if (build_options.use_vulkan_fused_ops)
         @import("llama_hybrid.zig")
     else
         struct {};
+
     const qwen_hybrid = if (build_options.use_vulkan_fused_ops)
         @import("qwen_hybrid.zig")
     else
@@ -764,12 +907,17 @@ test "runner surface: the session seam holds for every runner in this build" {
             requireSwapSurface(T);
             requirePlanValue(T, kv_budget.KvPlan);
         }
+
         // The qwen family holds the GDN recurrent slabs, so every one of its
         // runners carries the marker and both hooks. The llama family holds no
         // non-positional state, so it carries neither.
         requireRecurrentState(qwen_runner.QwenRunner);
-        if (@hasDecl(llama_runner.LlamaRunner, "has_recurrent_state"))
-            @compileError("runner surface: the LlamaRunner holds no recurrent state, so it states no marker");
+        if (@hasDecl(llama_runner.LlamaRunner, "has_recurrent_state")) {
+            @compileError(
+                "runner surface: the LlamaRunner holds no recurrent state, so it states no marker",
+            );
+        }
+
         if (build_options.use_vulkan_fused_ops) {
             const gpu = .{ llama_fused.LlamaFusedRunner, qwen_fused.QwenFusedRunner };
             for (gpu) |T| {
@@ -777,18 +925,28 @@ test "runner surface: the session seam holds for every runner in this build" {
                 requireSwapSurface(T);
                 requirePlanValue(T, kv_budget.KvPlan);
             }
+
             const hybrids = .{ llama_hybrid.LlamaHybridRunner, qwen_hybrid.QwenHybridRunner };
             for (hybrids) |T| {
                 requireStepSurface(T);
                 requireSwapSurface(T);
                 requirePlanValue(T, kv_budget.PlacementPlan);
             }
+
             requireRecurrentState(qwen_fused.QwenFusedRunner);
             requireRecurrentState(qwen_hybrid.QwenHybridRunner);
-            if (@hasDecl(llama_fused.LlamaFusedRunner, "has_recurrent_state"))
-                @compileError("runner surface: the llama LlamaFusedRunner holds no recurrent state, so it states no marker");
-            if (@hasDecl(llama_hybrid.LlamaHybridRunner, "has_recurrent_state"))
-                @compileError("runner surface: the llama LlamaHybridRunner holds no recurrent state, so it states no marker");
+            if (@hasDecl(llama_fused.LlamaFusedRunner, "has_recurrent_state")) {
+                @compileError(
+                    "runner surface: the llama LlamaFusedRunner holds no recurrent state, " ++
+                        "so it states no marker",
+                );
+            }
+            if (@hasDecl(llama_hybrid.LlamaHybridRunner, "has_recurrent_state")) {
+                @compileError(
+                    "runner surface: the llama LlamaHybridRunner holds no recurrent state, " ++
+                        "so it states no marker",
+                );
+            }
         }
     }
 }
@@ -797,6 +955,7 @@ test "create/destroy lifecycle and pool exhaustion" {
     const gpa = std.testing.allocator;
     var arena_state = std.heap.ArenaAllocator.init(gpa);
     defer arena_state.deinit();
+
     var fake = try FakeRunner.initFake(gpa, 2, 16);
     defer fake.deinitFake(gpa);
 
@@ -814,6 +973,7 @@ test "feed chunks at n_slots rows, positions ascend, logits only on the last row
     const gpa = std.testing.allocator;
     var arena_state = std.heap.ArenaAllocator.init(gpa);
     defer arena_state.deinit();
+
     var fake = try FakeRunner.initFake(gpa, 2, 16);
     defer fake.deinitFake(gpa);
 
@@ -829,6 +989,7 @@ test "feed chunks at n_slots rows, positions ascend, logits only on the last row
         try std.testing.expectEqual(@as(u32, @intCast(i)), r.pos);
         try std.testing.expectEqual(i == 4, r.want_logits);
     }
+
     // Last fed token 0 -> fake argmax 1: the sampled first response token.
     try std.testing.expectEqual(@as(u32, 1), first.?);
     try std.testing.expectEqual(@as(u32, 5), pool.table[id].pos);
@@ -839,6 +1000,7 @@ test "decodeBatch steps pending tokens and walks the fake's token chain" {
     const gpa = std.testing.allocator;
     var arena_state = std.heap.ArenaAllocator.init(gpa);
     defer arena_state.deinit();
+
     var fake = try FakeRunner.initFake(gpa, 3, 16);
     defer fake.deinitFake(gpa);
 
@@ -871,6 +1033,7 @@ test "ContextFull is atomic: no step happens, state is unchanged" {
     const gpa = std.testing.allocator;
     var arena_state = std.heap.ArenaAllocator.init(gpa);
     defer arena_state.deinit();
+
     var fake = try FakeRunner.initFake(gpa, 2, 4);
     defer fake.deinitFake(gpa);
 
@@ -893,6 +1056,7 @@ test "clone forks a session: state copied, continuation identical, source untouc
     const gpa = std.testing.allocator;
     var arena_state = std.heap.ArenaAllocator.init(gpa);
     defer arena_state.deinit();
+
     var fake = try FakeRunner.initFake(gpa, 3, 16);
     defer fake.deinitFake(gpa);
 
@@ -928,6 +1092,7 @@ test "advance: a prefill chunk and decode rows share one forward call" {
     const gpa = std.testing.allocator;
     var arena_state = std.heap.ArenaAllocator.init(gpa);
     defer arena_state.deinit();
+
     var fake = try FakeRunner.initFake(gpa, 4, 16);
     defer fake.deinitFake(gpa);
 
@@ -941,7 +1106,11 @@ test "advance: a prefill chunk and decode rows share one forward call" {
     // One call: c's two-token chunk (non-final) shares a's and b's decode step.
     const calls_before = fake.calls;
     var out: [2]u32 = undefined;
-    const none = try pool.advance(.{ .id = c, .tokens = &.{ 1, 2 }, .final = false }, &.{ a, b }, &out);
+    const none = try pool.advance(
+        .{ .id = c, .tokens = &.{ 1, 2 }, .final = false },
+        &.{ a, b },
+        &out,
+    );
     try std.testing.expectEqual(@as(usize, 1), fake.calls - calls_before);
     try std.testing.expectEqual(@as(?u32, null), none);
     try std.testing.expectEqual(@as(u32, 4), out[0]); // a: pending 3 -> 4
@@ -971,7 +1140,10 @@ test "advance: a prefill chunk and decode rows share one forward call" {
     // chunk's session nor the decode rows move. Drive c to pos 14 of 16
     // first, so a 3-token chunk no longer fits.
     var one: [1]u32 = undefined;
-    for (0..11) |_| try pool.decodeBatch(&.{c}, &one);
+    for (0..11) |_| {
+        try pool.decodeBatch(&.{c}, &one);
+    }
+
     try std.testing.expectEqual(@as(u32, 14), pool.table[c].pos);
     const calls_full = fake.calls;
     const a_pos = pool.table[a].pos;
@@ -988,6 +1160,7 @@ test "pending-token turn boundary: budget stop prepends, EOS stop drops" {
     const gpa = std.testing.allocator;
     var arena_state = std.heap.ArenaAllocator.init(gpa);
     defer arena_state.deinit();
+
     var fake = try FakeRunner.initFake(gpa, 2, 32);
     defer fake.deinitFake(gpa);
 
@@ -1017,6 +1190,7 @@ test "restorePrefix seeds a fresh session, and its suffix walks the cold chain" 
     const gpa = std.testing.allocator;
     var arena_state = std.heap.ArenaAllocator.init(gpa);
     defer arena_state.deinit();
+
     var fake = try SnapFakeRunner.initFake(gpa, 2, 16);
     defer fake.deinitFake(gpa);
 
@@ -1053,6 +1227,7 @@ test "restoreReady seeds a ready session that continues the cold chain with zero
     const gpa = std.testing.allocator;
     var arena_state = std.heap.ArenaAllocator.init(gpa);
     defer arena_state.deinit();
+
     var fake = try SnapFakeRunner.initFake(gpa, 2, 16);
     defer fake.deinitFake(gpa);
 
@@ -1089,6 +1264,7 @@ test "snapshotPrefix copies rows out and leaves the session running" {
     const gpa = std.testing.allocator;
     var arena_state = std.heap.ArenaAllocator.init(gpa);
     defer arena_state.deinit();
+
     var fake = try SnapFakeRunner.initFake(gpa, 2, 16);
     defer fake.deinitFake(gpa);
 

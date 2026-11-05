@@ -43,9 +43,36 @@ const assert = std.debug.assert;
 const lanes = exp_simd.lanes;
 const Vec = exp_simd.Vec;
 
+// -- constants --------------------------------------------------------------
+
+/// Weights per block sum of the full-vocab draw. The CDF walk skips whole
+/// blocks by their sums, so it reads about `V / 64` sums and at most 64
+/// weights.
+const weight_block = 64;
+
+/// The weight bits that one level of the radix select reads. A weight lies in
+/// [0, 1], so its bits lie below 2^30, and three levels read every bit.
+const radix_bits = 10;
+
+const radix_buckets = 1 << radix_bits;
+const radix_levels = 3;
+
+/// The histogram copies of one radix level. Four copies break the add chains
+/// of a bucket that many neighbor ids share.
+const radix_ways = 4;
+
+/// The most ids the cut sorts. A boundary bucket with more ids takes the next
+/// radix level, so the sort never grows with the vocab.
+const cut_candidates_max = 1024;
+
+comptime {
+    assert(weight_block % lanes == 0);
+    assert(@as(u32, @bitCast(@as(f32, 1))) < 1 << (radix_bits * radix_levels));
+}
+
 // -- types ------------------------------------------------------------------
 
-/// Per-session sampling knobs. The zero value is greedy decoding, so the
+/// Per-session sampling settings. The zero value is greedy decoding, so the
 /// default keeps every determinism gate.
 pub const Params = struct {
     /// 0 = greedy (argmax, no RNG draw). Higher flattens.
@@ -96,7 +123,7 @@ pub const PenaltySets = struct {
     context: []const u64 = &.{},
 };
 
-/// The penalty knobs of one request. The zero value is neutral. A new penalty
+/// The penalty settings of one request. The zero value is neutral. A new penalty
 /// adds a field with its neutral value as the default.
 pub const Penalties = struct {
     /// Subtracted from the logit of every id in `PenaltySets.seen`.
@@ -105,29 +132,6 @@ pub const Penalties = struct {
     /// `PenaltySets.context`.
     repetition: f32 = 1,
 };
-
-/// Weights per block sum of the full-vocab draw. The CDF walk skips whole
-/// blocks by their sums, so it reads about `V / 64` sums and at most 64
-/// weights.
-const weight_block = 64;
-
-/// The weight bits that one level of the radix select reads. A weight lies in
-/// [0, 1], so its bits lie below 2^30, and three levels read every bit.
-const radix_bits = 10;
-const radix_buckets = 1 << radix_bits;
-const radix_levels = 3;
-/// The histogram copies of one radix level. Four copies break the add chains
-/// of a bucket that many neighbor ids share.
-const radix_ways = 4;
-
-/// The most ids the cut sorts. A boundary bucket with more ids takes the next
-/// radix level, so the sort never grows with the vocab.
-const cut_candidates_max = 1024;
-
-comptime {
-    assert(weight_block % lanes == 0);
-    assert(@as(u32, @bitCast(@as(f32, 1))) < 1 << (radix_bits * radix_levels));
-}
 
 const Candidate = struct {
     v: f32,
@@ -154,6 +158,9 @@ const PoolCut = struct {
     total: f32,
 };
 
+const Keys = @Vector(lanes, u32);
+const Wide = @Vector(lanes / 2, f64);
+
 // -- api --------------------------------------------------------------------
 
 /// The words of an id set over `vocab` ids.
@@ -165,17 +172,21 @@ pub fn setWords(vocab: usize) usize {
 pub fn markId(set: []u64, vocab: usize, id: u32) void {
     assert(set.len == setWords(vocab));
     assert(id < vocab);
+
     set[id / 64] |= @as(u64, 1) << @intCast(id % 64);
 }
 
 /// Mark every id of `ids` in an id set over `vocab` ids.
 pub fn markIds(set: []u64, vocab: usize, ids: []const u32) void {
-    for (ids) |id| markId(set, vocab, id);
+    for (ids) |id| {
+        markId(set, vocab, id);
+    }
 }
 
 /// Whether an id set holds `id`.
 pub fn isMarked(set: []const u64, id: u32) bool {
     assert(id / 64 < set.len);
+
     return set[id / 64] & (@as(u64, 1) << @intCast(id % 64)) != 0;
 }
 
@@ -196,6 +207,7 @@ pub fn greedy(logits: []const f32) u32 {
 pub fn sample(logits: []const f32, params: Params, random: std.Random, scratch: []f32) u32 {
     const sp = span.begin(.sample);
     defer sp.end();
+
     assert(logits.len > 0);
     assert(params.temperature >= 0);
     assert(params.top_p > 0);
@@ -208,6 +220,7 @@ pub fn sample(logits: []const f32, params: Params, random: std.Random, scratch: 
     assert(params.repetition_penalty <= limits.max_repetition_penalty);
     if (params.presence.len > 0) assert(params.presence.len == setWords(logits.len));
     if (params.context.len > 0) assert(params.context.len == setWords(logits.len));
+
     assert(scratch.len == scratchLen(logits.len));
 
     const row: []const f32 = if (params.penalized()) fixed: {
@@ -215,6 +228,7 @@ pub fn sample(logits: []const f32, params: Params, random: std.Random, scratch: 
         penalize(logits, target, params.penaltySets(), params.penalties());
         break :fixed target;
     } else logits;
+
     const id = pick(row, params, random, scratch);
     assert(id < logits.len);
     return id;
@@ -231,6 +245,7 @@ pub fn sample(logits: []const f32, params: Params, random: std.Random, scratch: 
 pub fn penalize(source: []const f32, target: []f32, sets: PenaltySets, knobs: Penalties) void {
     assert(source.len == target.len);
     assert(source.len > 0);
+
     const words = setWords(source.len);
     assert(sets.seen.len == 0 or sets.seen.len == words);
     assert(sets.context.len == 0 or sets.context.len == words);
@@ -264,6 +279,7 @@ fn validBits(w: usize, vocab: usize) u64 {
     const first = w * 64;
     assert(first < vocab);
     if (vocab - first >= 64) return std.math.maxInt(u64);
+
     return (@as(u64, 1) << @intCast(vocab - first)) - 1;
 }
 
@@ -272,25 +288,36 @@ fn validBits(w: usize, vocab: usize) u64 {
 /// per-element view, so a presence stream keeps its bits.
 fn penalizeOne(l: f32, in_context: bool, in_seen: bool, knobs: Penalties) f32 {
     var v = l;
-    if (in_context) v = if (v > 0) v / knobs.repetition else v * knobs.repetition;
-    if (in_seen) v -= knobs.presence;
+    if (in_context) {
+        v = if (v > 0) v / knobs.repetition else v * knobs.repetition;
+    }
+
+    if (in_seen) {
+        v -= knobs.presence;
+    }
+
     const max = std.math.floatMax(f32);
     // `@min` returns the other operand for a NaN, so the clamp alone sends a
     // NaN to `floatMax`, the top of the row.
     if (std.math.isNan(v)) return -max;
+
     return std.math.clamp(v, -max, max);
 }
 
 fn pick(row: []const f32, params: Params, random: std.Random, scratch: []f32) u32 {
     if (params.temperature == 0) return argmax(row);
     if (params.top_k > 0) return samplePool(row, params, random);
-    if (params.top_p == 1 and params.min_p == 0) return sampleFullVocab(row, params.temperature, random, scratch);
+    if (params.top_p == 1 and params.min_p == 0) {
+        return sampleFullVocab(row, params.temperature, random, scratch);
+    }
+
     return sampleFullCut(row, params, random, scratch);
 }
 
 /// The first index of the highest value. The loop runs `row.len` times.
 fn argmax(row: []const f32) u32 {
     assert(row.len > 0);
+
     var best: usize = 0;
     var best_v: f32 = row[0];
     var i: usize = 1;
@@ -301,6 +328,7 @@ fn argmax(row: []const f32) u32 {
             best = i;
         }
     }
+
     return @intCast(best);
 }
 
@@ -309,6 +337,7 @@ fn argmax(row: []const f32) u32 {
 /// `scratch`, because the weight pass reads each element before it writes it.
 fn sampleFullVocab(row: []const f32, temperature: f32, random: std.Random, scratch: []f32) u32 {
     assert(temperature > 0);
+
     const n = row.len;
     const weights = scratch[0..n];
     const sums = scratch[n..][0..blockCount(n)];
@@ -331,6 +360,7 @@ fn fullCutWeights(row: []const f32, params: Params, scratch: []f32) f32 {
     assert(params.temperature > 0);
     assert(params.top_k == 0);
     assert(params.top_p < 1 or params.min_p > 0);
+
     const n = row.len;
     const weights = scratch[0..n];
     const sums = scratch[n..][0..blockCount(n)];
@@ -347,6 +377,7 @@ fn fullCutWeights(row: []const f32, params: Params, scratch: []f32) f32 {
         selectCut(weights, floor, floor_mass, params.top_p)
     else
         .{ .weight = floor, .ties = std.math.maxInt(u32) };
+
     const total = applyCut(weights, sums, cut);
     return total;
 }
@@ -356,6 +387,7 @@ fn fullCutWeights(row: []const f32, params: Params, scratch: []f32) f32 {
 fn drawWeights(weights: []const f32, sums: []const f32, total: f32, random: std.Random) u32 {
     // The term at the maximum is exactly 1, and every cut keeps it.
     assert(total >= 1);
+
     const r = random.float(f32) * total;
     var acc: f32 = 0;
     for (sums, 0..) |sum, b| {
@@ -364,6 +396,7 @@ fn drawWeights(weights: []const f32, sums: []const f32, total: f32, random: std.
         if (acc + sum > r) return drawInBlock(weights, b, acc, r);
         acc += sum;
     }
+
     // f32 rounding can leave the sum of the block sums at or below `r`. The
     // draw then takes the last id with a positive weight.
     var b = sums.len;
@@ -371,6 +404,7 @@ fn drawWeights(weights: []const f32, sums: []const f32, total: f32, random: std.
         b -= 1;
         if (sums[b] > 0) return lastPositive(weights, b);
     }
+
     unreachable;
 }
 
@@ -380,6 +414,7 @@ fn drawWeights(weights: []const f32, sums: []const f32, total: f32, random: std.
 fn fullVocabWeights(row: []const f32, temperature: f32, weights: []f32, sums: []f32) f32 {
     assert(weights.len == row.len);
     assert(sums.len == blockCount(row.len));
+
     const m = rowMax(row);
     const m_v: Vec = @splat(m);
     const t_v: Vec = @splat(temperature);
@@ -394,6 +429,7 @@ fn fullVocabWeights(row: []const f32, temperature: f32, weights: []f32, sums: []
             weights[i..][0..lanes].* = w;
             acc += w;
         }
+
         if (i < end) {
             // A pad of -inf gives a weight of 0, so the short tail adds nothing.
             var pad: [lanes]f32 = @splat(-std.math.inf(f32));
@@ -402,9 +438,11 @@ fn fullVocabWeights(row: []const f32, temperature: f32, weights: []f32, sums: []
             @memcpy(weights[i..end], w[0 .. end - i]);
             acc += w;
         }
+
         sum.* = @reduce(.Add, acc);
         total += sum.*;
     }
+
     assert(std.math.isFinite(total));
     return total;
 }
@@ -412,11 +450,18 @@ fn fullVocabWeights(row: []const f32, temperature: f32, weights: []f32, sums: []
 /// The largest value of a finite row.
 fn rowMax(row: []const f32) f32 {
     assert(row.len > 0);
+
     var m_v: Vec = @splat(-std.math.inf(f32));
     var i: usize = 0;
-    while (i + lanes <= row.len) : (i += lanes) m_v = @max(m_v, @as(Vec, row[i..][0..lanes].*));
+    while (i + lanes <= row.len) : (i += lanes) {
+        m_v = @max(m_v, @as(Vec, row[i..][0..lanes].*));
+    }
+
     var m = @reduce(.Max, m_v);
-    while (i < row.len) : (i += 1) m = @max(m, row[i]);
+    while (i < row.len) : (i += 1) {
+        m = @max(m, row[i]);
+    }
+
     assert(std.math.isFinite(m));
     return m;
 }
@@ -444,6 +489,7 @@ fn selectCut(weights: []const f32, floor: f32, floor_mass: f32, top_p: f32) Cut 
     assert(floor_mass >= 1);
     assert(top_p > 0);
     assert(top_p < 1);
+
     const n: f64 = @floatFromInt(weights.len);
     const skip: f32 = @floatCast((1 - @as(f64, top_p)) * floor_mass / (2 * n));
     const scan_key = @max(@as(u32, @bitCast(floor)), @as(u32, @bitCast(skip)) + 1);
@@ -454,22 +500,35 @@ fn selectCut(weights: []const f32, floor: f32, floor_mass: f32, top_p: f32) Cut 
     var target: f64 = 0;
     for (0..radix_levels) |level| {
         const shift: u5 = @intCast(radix_bits * (radix_levels - 1 - level));
-        const total = radixLevel(weights, floor, scan_key, shift, prefix, &mass, &count, level == 0);
+        const total = radixLevel(
+            weights,
+            floor,
+            scan_key,
+            shift,
+            prefix,
+            &mass,
+            &count,
+            level == 0,
+        );
         if (level == 0) {
             // The largest weight is 1, and the floor is at most 1.
             assert(total >= 1);
+
             target = top_p * total;
         }
+
         const bucket = boundaryBucket(&mass, &count, &above, target);
         prefix = prefix << radix_bits | bucket;
-        if (level + 1 == radix_levels) return tieCut(@bitCast(prefix), count[bucket], above, target);
-        if (count[bucket] <= cut_candidates_max) return sortedCut(weights, scan_key, prefix, shift, above, target);
+        if (level + 1 == radix_levels) {
+            return tieCut(@bitCast(prefix), count[bucket], above, target);
+        }
+        if (count[bucket] <= cut_candidates_max) {
+            return sortedCut(weights, scan_key, prefix, shift, above, target);
+        }
     }
+
     unreachable;
 }
-
-const Keys = @Vector(lanes, u32);
-const Wide = @Vector(lanes / 2, f64);
 
 /// One radix level: the mass and the count of each field value at `shift`,
 /// over the weights at or above `scan_key` whose higher bits equal `prefix`.
@@ -509,9 +568,11 @@ fn radixLevel(
             lo += @as(Wide, @floatCast(@shuffle(f32, e, undefined, [4]i32{ 0, 1, 2, 3 })));
             hi += @as(Wide, @floatCast(@shuffle(f32, e, undefined, [4]i32{ 4, 5, 6, 7 })));
         }
+
         const keys: Keys = @bitCast(w);
         const hot = @select(bool, w >= scan_v, keys >> up == prefix_v, none);
         if (!@reduce(.Or, hot)) continue;
+
         // A lane outside the level adds 0 to a valid bucket, so the adds need
         // no branch per lane.
         const add = @select(f32, hot, w, zero);
@@ -522,16 +583,22 @@ fn radixLevel(
             count_ways[l % radix_ways][d[l]] += one[l];
         }
     }
+
     var total: f64 = @reduce(.Add, lo) + @reduce(.Add, hi);
     while (i < weights.len) : (i += 1) {
         const w = weights[i];
-        if (with_total and w >= floor) total += w;
+        if (with_total and w >= floor) {
+            total += w;
+        }
+
         const key: u32 = @bitCast(w);
         if (key < scan_key or key >> shift >> radix_bits != prefix) continue;
+
         const d = (key >> shift) & (radix_buckets - 1);
         mass_ways[0][d] += w;
         count_ways[0][d] += 1;
     }
+
     for (mass, count, 0..) |*m, *c, d| {
         m.* = 0;
         c.* = 0;
@@ -540,6 +607,7 @@ fn radixLevel(
             c.* += count_ways[way][d];
         }
     }
+
     return total;
 }
 
@@ -547,16 +615,23 @@ fn radixLevel(
 /// mass of every higher bucket moves into `above.*`. f64 rounding can leave
 /// the walk short of the target, and the lowest nonempty bucket then takes
 /// the cut, so every id of the level survives.
-fn boundaryBucket(mass: *const [radix_buckets]f64, count: *const [radix_buckets]u32, above: *f64, target: f64) u32 {
+fn boundaryBucket(
+    mass: *const [radix_buckets]f64,
+    count: *const [radix_buckets]u32,
+    above: *f64,
+    target: f64,
+) u32 {
     var lowest: ?u32 = null;
     var d: u32 = radix_buckets;
     while (d > 0) {
         d -= 1;
         if (count[d] == 0) continue;
         if (above.* + mass[d] >= target) return d;
+
         above.* += mass[d];
         lowest = d;
     }
+
     const last = lowest.?;
     above.* -= mass[last];
     return last;
@@ -564,7 +639,14 @@ fn boundaryBucket(mass: *const [radix_buckets]f64, count: *const [radix_buckets]
 
 /// The cut inside a boundary bucket of at most `cut_candidates_max` ids: sort
 /// the bucket, then walk it from the mass above it.
-fn sortedCut(weights: []const f32, scan_key: u32, prefix: u32, shift: u5, above: f64, target: f64) Cut {
+fn sortedCut(
+    weights: []const f32,
+    scan_key: u32,
+    prefix: u32,
+    shift: u5,
+    above: f64,
+    target: f64,
+) Cut {
     var cand: [cut_candidates_max]Candidate = undefined;
     var n: usize = 0;
     const scan_v: Vec = @splat(@as(f32, @bitCast(scan_key)));
@@ -577,21 +659,26 @@ fn sortedCut(weights: []const f32, scan_key: u32, prefix: u32, shift: u5, above:
         const keys: Keys = @bitCast(w);
         const hot = @select(bool, w >= scan_v, keys >> sh == prefix_v, none);
         if (!@reduce(.Or, hot)) continue;
+
         inline for (0..lanes) |l| {
             if (hot[l]) {
                 assert(n < cand.len);
+
                 cand[n] = .{ .v = w[l], .i = @intCast(i + l) };
                 n += 1;
             }
         }
     }
+
     while (i < weights.len) : (i += 1) {
         const key: u32 = @bitCast(weights[i]);
         if (key < scan_key or key >> shift != prefix) continue;
+
         assert(n < cand.len);
         cand[n] = .{ .v = weights[i], .i = @intCast(i) };
         n += 1;
     }
+
     assert(n >= 1);
     std.mem.sort(Candidate, cand[0..n], {}, Candidate.moreLikely);
     var j: usize = 0;
@@ -600,11 +687,15 @@ fn sortedCut(weights: []const f32, scan_key: u32, prefix: u32, shift: u5, above:
         j += 1;
         acc += cand[j].v;
     }
+
     const weight = cand[j].v;
     var ties: u32 = 0;
     for (cand[0 .. j + 1]) |c| {
-        if (c.v == weight) ties += 1;
+        if (c.v == weight) {
+            ties += 1;
+        }
     }
+
     assert(ties >= 1);
     return .{ .weight = weight, .ties = ties };
 }
@@ -614,12 +705,14 @@ fn sortedCut(weights: []const f32, scan_key: u32, prefix: u32, shift: u5, above:
 fn tieCut(weight: f32, n: u32, above: f64, target: f64) Cut {
     assert(n >= 1);
     assert(weight > 0);
+
     var ties: u32 = 1;
     var acc = above + weight;
     while (acc < target and ties < n) {
         ties += 1;
         acc += weight;
     }
+
     return .{ .weight = weight, .ties = ties };
 }
 
@@ -631,6 +724,7 @@ fn applyCut(weights: []f32, sums: []f32, cut: Cut) f32 {
     assert(sums.len == blockCount(weights.len));
     assert(cut.weight > 0);
     assert(cut.ties >= 1);
+
     const t_v: Vec = @splat(cut.weight);
     const zero: Vec = @splat(0);
     var tied: usize = 0;
@@ -646,30 +740,51 @@ fn applyCut(weights: []f32, sums: []f32, cut: Cut) f32 {
             acc += kept;
             tied += std.simd.countTrues(w == t_v);
         }
+
         var s = @reduce(.Add, acc);
         while (i < end) : (i += 1) {
-            if (weights[i] == cut.weight) tied += 1;
-            if (weights[i] < cut.weight) weights[i] = 0;
+            if (weights[i] == cut.weight) {
+                tied += 1;
+            }
+
+            if (weights[i] < cut.weight) {
+                weights[i] = 0;
+            }
+
             s += weights[i];
         }
+
         sum.* = s;
     }
+
     if (tied > cut.ties) {
         var kept_ties: u32 = 0;
         for (weights) |*w| {
             if (w.* != cut.weight) continue;
-            if (kept_ties < cut.ties) kept_ties += 1 else w.* = 0;
+            if (kept_ties < cut.ties) {
+                kept_ties += 1;
+            } else {
+                w.* = 0;
+            }
         }
+
         assert(kept_ties == cut.ties);
         for (sums, 0..) |*sum, b| {
             const start = b * weight_block;
             var s: f32 = 0;
-            for (weights[start..@min(start + weight_block, weights.len)]) |w| s += w;
+            for (weights[start..@min(start + weight_block, weights.len)]) |w| {
+                s += w;
+            }
+
             sum.* = s;
         }
     }
+
     var total: f32 = 0;
-    for (sums) |s| total += s;
+    for (sums) |s| {
+        total += s;
+    }
+
     assert(std.math.isFinite(total));
     return total;
 }
@@ -684,6 +799,7 @@ fn drawInBlock(weights: []const f32, b: usize, acc_start: f32, r: f32) u32 {
         acc += w;
         if (acc > r) return @intCast(i);
     }
+
     // f32 rounding can leave the weights of the block short of its vector sum.
     return lastPositive(weights, b);
 }
@@ -696,6 +812,7 @@ fn lastPositive(weights: []const f32, b: usize) u32 {
         i -= 1;
         if (weights[i] > 0) return @intCast(i);
     }
+
     unreachable;
 }
 
@@ -715,6 +832,7 @@ noinline fn samplePool(row: []const f32, params: Params, random: std.Random) u32
         acc += p;
         if (acc > r) return pool[j].i;
     }
+
     return pool[cut.n - 1].i;
 }
 
@@ -731,6 +849,7 @@ fn poolWeights(
 ) usize {
     assert(top_k >= 1);
     assert(temperature > 0);
+
     const k = @min(top_k, row.len);
     assert(k <= limits.max_top_k);
     var n: usize = 0;
@@ -739,16 +858,22 @@ fn poolWeights(
         if (n < k) {
             pool[n] = c;
             n += 1;
-            if (n == k) buildMinHeap(pool[0..k]);
+            if (n == k) {
+                buildMinHeap(pool[0..k]);
+            }
         } else if (c.v > pool[0].v) {
             pool[0] = c;
             siftDown(pool[0..k], 0);
         }
     }
+
     assert(n == k);
     std.mem.sort(Candidate, pool[0..k], {}, Candidate.moreLikely);
     const m = pool[0].v;
-    for (pool[0..k], 0..) |c, j| probs[j] = @exp((c.v - m) / temperature);
+    for (pool[0..k], 0..) |c, j| {
+        probs[j] = @exp((c.v - m) / temperature);
+    }
+
     assert(probs[0] == 1);
     return k;
 }
@@ -760,13 +885,20 @@ fn poolWeights(
 fn poolCut(probs: []const f32, min_p: f32, top_p: f32) PoolCut {
     assert(probs.len >= 1);
     assert(probs[0] == 1);
+
     var n = probs.len;
     if (min_p > 0) {
         n = 1;
-        while (n < probs.len and probs[n] >= min_p) n += 1;
+        while (n < probs.len and probs[n] >= min_p) {
+            n += 1;
+        }
     }
+
     var total: f32 = 0;
-    for (probs[0..n]) |p| total += p;
+    for (probs[0..n]) |p| {
+        total += p;
+    }
+
     assert(total > 0);
     if (top_p < 1) {
         var acc: f32 = 0;
@@ -777,14 +909,17 @@ fn poolCut(probs: []const f32, min_p: f32, top_p: f32) PoolCut {
                 break;
             }
         }
+
         total = acc;
     }
+
     assert(n >= 1);
     return .{ .n = n, .total = total };
 }
 
 fn buildMinHeap(items: []Candidate) void {
     assert(items.len >= 1);
+
     var i = items.len / 2;
     while (i > 0) {
         i -= 1;
@@ -794,14 +929,22 @@ fn buildMinHeap(items: []Candidate) void {
 
 fn siftDown(items: []Candidate, start: usize) void {
     assert(start < items.len);
+
     var i = start;
     while (true) {
         const l = 2 * i + 1;
         const rgt = 2 * i + 2;
         var smallest = i;
-        if (l < items.len and items[l].v < items[smallest].v) smallest = l;
-        if (rgt < items.len and items[rgt].v < items[smallest].v) smallest = rgt;
+        if (l < items.len and items[l].v < items[smallest].v) {
+            smallest = l;
+        }
+
+        if (rgt < items.len and items[rgt].v < items[smallest].v) {
+            smallest = rgt;
+        }
+
         if (smallest == i) return;
+
         std.mem.swap(Candidate, &items[i], &items[smallest]);
         i = smallest;
     }
@@ -857,7 +1000,12 @@ test "tiny top_p collapses to the most likely token" {
     for (0..32) |_| {
         const id = sample(&x, .{ .temperature = 1.0, .top_p = 0.01 }, prng.random(), &scratch);
         try std.testing.expectEqual(@as(u32, 0), id);
-        const pooled = sample(&x, .{ .temperature = 1.0, .top_k = 4, .top_p = 0.01 }, prng.random(), &scratch);
+        const pooled = sample(
+            &x,
+            .{ .temperature = 1.0, .top_k = 4, .top_p = 0.01 },
+            prng.random(),
+            &scratch,
+        );
         try std.testing.expectEqual(@as(u32, 0), pooled);
     }
 }
@@ -868,8 +1016,11 @@ test "full-vocab temperature sampling overwhelmingly picks a dominant logit" {
     var prng = std.Random.DefaultPrng.init(2026);
     var hits: u32 = 0;
     for (0..100) |_| {
-        if (sample(&x, .{ .temperature = 1.0 }, prng.random(), &scratch) == 1) hits += 1;
+        if (sample(&x, .{ .temperature = 1.0 }, prng.random(), &scratch) == 1) {
+            hits += 1;
+        }
     }
+
     try std.testing.expect(hits >= 95);
 }
 
@@ -887,11 +1038,20 @@ test "presence penalty: greedy moves off a present id and leaves the logits" {
     const set = testSet(x.len, &.{1});
     var prng = std.Random.DefaultPrng.init(1);
     // 5 - 1 = 4 < 4.5, so the argmax moves to id 2. A smaller penalty keeps 1.
-    try std.testing.expectEqual(@as(u32, 2), sample(&x, .{ .presence_penalty = 1, .presence = &set }, prng.random(), &scratch));
-    try std.testing.expectEqual(@as(u32, 1), sample(&x, .{ .presence_penalty = 0.25, .presence = &set }, prng.random(), &scratch));
+    try std.testing.expectEqual(
+        @as(u32, 2),
+        sample(&x, .{ .presence_penalty = 1, .presence = &set }, prng.random(), &scratch),
+    );
+    try std.testing.expectEqual(
+        @as(u32, 1),
+        sample(&x, .{ .presence_penalty = 0.25, .presence = &set }, prng.random(), &scratch),
+    );
     // A negative penalty favors a present id: 4.5 + 2 passes 5.
     const low = testSet(x.len, &.{2});
-    try std.testing.expectEqual(@as(u32, 2), sample(&x, .{ .presence_penalty = -2, .presence = &low }, prng.random(), &scratch));
+    try std.testing.expectEqual(
+        @as(u32, 2),
+        sample(&x, .{ .presence_penalty = -2, .presence = &low }, prng.random(), &scratch),
+    );
     try std.testing.expectEqualSlices(f32, &before, &x);
 }
 
@@ -903,16 +1063,29 @@ test "presence penalty: the pool and the full vocab never draw a heavily penaliz
     for (0..64) |_| {
         // 10 - 2 = 8 is still a candidate in a pool of two. At a low
         // temperature the mass sits on id 1.
-        const pooled = sample(&x, .{ .temperature = 0.05, .top_k = 2, .presence_penalty = 2, .presence = &set }, prng.random(), &scratch);
+        const pooled = sample(
+            &x,
+            .{ .temperature = 0.05, .top_k = 2, .presence_penalty = 2, .presence = &set },
+            prng.random(),
+            &scratch,
+        );
         try std.testing.expectEqual(@as(u32, 1), pooled);
-        const full = sample(&x, .{ .temperature = 0.05, .presence_penalty = 2, .presence = &set }, prng.random(), &scratch);
+        const full = sample(
+            &x,
+            .{ .temperature = 0.05, .presence_penalty = 2, .presence = &set },
+            prng.random(),
+            &scratch,
+        );
         try std.testing.expectEqual(@as(u32, 1), full);
     }
 }
 
 test "neutral penalties equal the plain path draw for draw" {
     var x: [100]f32 = undefined;
-    for (&x, 0..) |*v, i| v.* = @cos(@as(f32, @floatFromInt(i)) * 0.7) * 3;
+    for (&x, 0..) |*v, i| {
+        v.* = @cos(@as(f32, @floatFromInt(i)) * 0.7) * 3;
+    }
+
     var scratch: TestScratch(x.len) = undefined;
     const set = testSet(x.len, &.{ 0, 5, 17, 99 });
     const shapes = [_]Params{
@@ -946,13 +1119,17 @@ const prop_vocab = 1000 + 3;
 const prop_rounds = 64;
 
 fn fillRow(r: std.Random, row: []f32) void {
-    for (row) |*v| v.* = r.floatNorm(f32) * 4;
+    for (row) |*v| {
+        v.* = r.floatNorm(f32) * 4;
+    }
 }
 
 fn fillSet(r: std.Random, set: []u64, vocab: usize) void {
     @memset(set, 0);
     const n = r.uintLessThan(usize, vocab / 4);
-    for (0..n) |_| markId(set, vocab, r.uintLessThan(u32, @intCast(vocab)));
+    for (0..n) |_| {
+        markId(set, vocab, r.uintLessThan(u32, @intCast(vocab)));
+    }
 }
 
 /// Every path of the chain, with and without each penalty.
@@ -980,8 +1157,8 @@ fn checkGreedyInvariance(_: void, seed: u64) anyerror!void {
     var scratch: TestScratch(prop_vocab) = undefined;
     fillRow(r, &row);
     fillSet(r, &set, prop_vocab);
-    // Neutral in every form: no penalty, a neutral knob over a full set,
-    // a penalty over an empty set, and cut knobs at temperature zero.
+    // Neutral in every form: no penalty, a neutral setting over a full set,
+    // a penalty over an empty set, and cut settings at temperature zero.
     const neutral = [_]Params{
         .{},
         .{ .presence = &set, .context = &set },
@@ -994,12 +1171,20 @@ fn checkGreedyInvariance(_: void, seed: u64) anyerror!void {
         const before = rng.s;
         try std.testing.expectEqual(greedy(&row), sample(&row, p, rng.random(), &scratch));
         try std.testing.expectEqual(before, rng.s);
-        for (scratch) |v| try std.testing.expect(std.math.isNan(v));
+        for (scratch) |v| {
+            try std.testing.expect(std.math.isNan(v));
+        }
     }
 }
 
 test "greedy invariance: a neutral request is greedy, draws nothing, and writes no scratch" {
-    try prop.forAll(.{ .site = 0x7001, .cases = prop_rounds }, {}, u64, prop.genSeed(void), checkGreedyInvariance);
+    try prop.forAll(
+        .{ .site = 0x7001, .cases = prop_rounds },
+        {},
+        u64,
+        prop.genSeed(void),
+        checkGreedyInvariance,
+    );
 }
 
 fn checkSeedReproducibility(_: void, case_seed: u64) anyerror!void {
@@ -1021,14 +1206,23 @@ fn checkSeedReproducibility(_: void, case_seed: u64) anyerror!void {
             const ia = sample(&row, p, a.random(), &scratch);
             const ib = sample(&row, p, b.random(), &scratch);
             try std.testing.expectEqual(ia, ib);
-            if (p.temperature > 0) _ = twin.random().float(f32);
+            if (p.temperature > 0) {
+                _ = twin.random().float(f32);
+            }
+
             try std.testing.expectEqual(twin.s, a.s);
         }
     }
 }
 
 test "seed reproducibility: one seed gives one stream and one draw per token on every path" {
-    try prop.forAll(.{ .site = 0x7002, .cases = prop_rounds }, {}, u64, prop.genSeed(void), checkSeedReproducibility);
+    try prop.forAll(
+        .{ .site = 0x7002, .cases = prop_rounds },
+        {},
+        u64,
+        prop.genSeed(void),
+        checkSeedReproducibility,
+    );
 }
 
 /// The logit of id `i` as the per-element penalty view read it: the oracle of
@@ -1051,12 +1245,18 @@ fn checkFixupEquivalence(_: void, c: prop.Trial) anyerror!void {
     // Every fourth round holds -inf logits, marked and unmarked. A marked
     // -inf becomes -floatMax, and an unmarked one stays.
     const with_inf = round % 4 == 3;
-    if (with_inf) for (0..16) |_| {
-        row[r.uintLessThan(usize, prop_vocab)] = -std.math.inf(f32);
-    };
+    if (with_inf) {
+        for (0..16) |_| {
+            row[r.uintLessThan(usize, prop_vocab)] = -std.math.inf(f32);
+        }
+    }
+
     const penalty = (r.float(f32) - 0.5) * 8;
     penalize(&row, &target, .{ .seen = &set }, .{ .presence = penalty });
-    for (&viewed, 0..) |*v, i| v.* = viewAt(&row, &set, penalty, i);
+    for (&viewed, 0..) |*v, i| {
+        v.* = viewAt(&row, &set, penalty, i);
+    }
+
     for (viewed, target, 0..) |v, t, i| {
         if (std.math.isNegativeInf(v) and isMarked(&set, @intCast(i))) {
             try std.testing.expectEqual(-std.math.floatMax(f32), t);
@@ -1087,7 +1287,13 @@ fn checkFixupEquivalence(_: void, c: prop.Trial) anyerror!void {
 }
 
 test "fix-up equivalence: the scratch row equals the per-element view bit for bit" {
-    try prop.forAll(.{ .site = 0x7006, .cases = prop_rounds, .max_size = prop_rounds - 1 }, {}, prop.Trial, prop.genTrial(void), checkFixupEquivalence);
+    try prop.forAll(
+        .{ .site = 0x7006, .cases = prop_rounds, .max_size = prop_rounds - 1 },
+        {},
+        prop.Trial,
+        prop.genTrial(void),
+        checkFixupEquivalence,
+    );
 }
 
 test "penalize clamps a result past the f32 range and sends a marked NaN or -inf to the floor" {
@@ -1121,7 +1327,12 @@ test "penalize reads no padding bit past the vocab" {
     const x = [_]f32{ 1, 2, 3 };
     const set = [_]u64{std.math.maxInt(u64)};
     var y: [x.len + 1]f32 = @splat(7);
-    penalize(&x, y[0..x.len], .{ .seen = &set, .context = &set }, .{ .presence = 1, .repetition = 2 });
+    penalize(
+        &x,
+        y[0..x.len],
+        .{ .seen = &set, .context = &set },
+        .{ .presence = 1, .repetition = 2 },
+    );
     try std.testing.expectEqualSlices(f32, &.{ -0.5, 0, 0.5, 7 }, &y);
 }
 
@@ -1151,7 +1362,7 @@ fn checkPenaltyMarked(_: void, seed: u64) anyerror!void {
     const sets: PenaltySets = .{ .seen = &seen, .context = &context };
     const ap = r.float(f32) * limits.max_presence_penalty;
     const rep = 1 + r.float(f32) * (limits.max_repetition_penalty - 1);
-    // A second knob set at or past the first in both knobs.
+    // A second set of settings at or past the first in both settings.
     const ap2 = ap + r.float(f32) * (limits.max_presence_penalty - ap);
     const rep2 = rep + r.float(f32) * (limits.max_repetition_penalty - rep);
     penalize(&row, &low, sets, .{ .presence = ap, .repetition = rep });
@@ -1159,7 +1370,10 @@ fn checkPenaltyMarked(_: void, seed: u64) anyerror!void {
     for (row, low, high, 0..) |l, a, b, i| {
         try std.testing.expect(std.math.isFinite(a));
         try std.testing.expect(std.math.isFinite(b));
-        const marked = (ap != 0 and isMarked(&seen, @intCast(i))) or (rep != 1 and isMarked(&context, @intCast(i)));
+        const marked = (ap != 0 and isMarked(&seen, @intCast(i))) or (rep != 1 and isMarked(
+            &context,
+            @intCast(i),
+        ));
         if (marked) {
             try std.testing.expect(a <= l);
             try std.testing.expect(b <= a);
@@ -1170,7 +1384,13 @@ fn checkPenaltyMarked(_: void, seed: u64) anyerror!void {
 }
 
 test "penalty monotonicity: no marked logit rises, no other logit moves, results stay finite" {
-    try prop.forAll(.{ .site = 0x7003, .cases = prop_rounds }, {}, u64, prop.genSeed(void), checkPenaltyMarked);
+    try prop.forAll(
+        .{ .site = 0x7003, .cases = prop_rounds },
+        {},
+        u64,
+        prop.genSeed(void),
+        checkPenaltyMarked,
+    );
 }
 
 fn checkPenaltyProbability(_: void, seed: u64) anyerror!void {
@@ -1185,7 +1405,10 @@ fn checkPenaltyProbability(_: void, seed: u64) anyerror!void {
     for ([_]f32{ 1, 1.1, 1.5, 2 }) |rep| {
         penalize(&row, &y, .{ .context = &set }, .{ .repetition = rep });
         var total: f64 = 0;
-        for (y) |v| total += @exp(@as(f64, v));
+        for (y) |v| {
+            total += @exp(@as(f64, v));
+        }
+
         const p = @exp(@as(f64, y[id])) / total;
         try std.testing.expect(p <= last);
         last = p;
@@ -1193,7 +1416,13 @@ fn checkPenaltyProbability(_: void, seed: u64) anyerror!void {
 }
 
 test "penalty monotonicity: the probability of a lone marked id never rises with the factor" {
-    try prop.forAll(.{ .site = 0x7013, .cases = prop_rounds }, {}, u64, prop.genSeed(void), checkPenaltyProbability);
+    try prop.forAll(
+        .{ .site = 0x7013, .cases = prop_rounds },
+        {},
+        u64,
+        prop.genSeed(void),
+        checkPenaltyProbability,
+    );
 }
 
 /// A random source that repeats one byte. 0x00 makes `float(f32)` return 0,
@@ -1218,8 +1447,14 @@ test "the draw at the edges of u: 0 takes the first positive weight, near 1 the 
     // Ids 0..4 and the last 3 ids fall under the exp cut at T 1. The rest tie,
     // so `u * total` rounds to the total on the full-vocab path.
     var row: [prop_vocab]f32 = @splat(0);
-    for (row[0..5]) |*v| v.* = -200;
-    for (row[prop_vocab - 3 ..]) |*v| v.* = -200;
+    for (row[0..5]) |*v| {
+        v.* = -200;
+    }
+
+    for (row[prop_vocab - 3 ..]) |*v| {
+        v.* = -200;
+    }
+
     var scratch: TestScratch(prop_vocab) = undefined;
     const shapes = [_]Params{
         .{ .temperature = 1 },
@@ -1231,6 +1466,7 @@ test "the draw at the edges of u: 0 takes the first positive weight, near 1 the 
         const last: u32 = if (p.top_p < 1) cutLast(prop_vocab - 8, p.top_p) + 5 else prop_vocab - 4;
         try std.testing.expectEqual(last, sample(&row, p, one.random(), &scratch));
     }
+
     // The pool walks its own CDF, and the edges hold there too.
     const pool: Params = .{ .temperature = 1, .top_k = 50 };
     try std.testing.expectEqual(@as(u32, 5), sample(&row, pool, zero.random(), &scratch));
@@ -1266,9 +1502,11 @@ fn checkFullVocabWeights(_: void, c: prop.Trial) anyerror!void {
         } else {
             try std.testing.expect(exp_simd.expUlpErr(x, w) <= exp_simd.exp_ulp_tol);
         }
+
         max_w = @max(max_w, w);
         total_ref += @exp(@as(f64, x));
     }
+
     try std.testing.expectEqual(@as(f32, 1), max_w);
     // The f32 sum of about a thousand weights stays within a few ulps.
     try std.testing.expectApproxEqRel(total_ref, @as(f64, total), 1e-5);
@@ -1276,13 +1514,22 @@ fn checkFullVocabWeights(_: void, c: prop.Trial) anyerror!void {
         const start = b * weight_block;
         const end = @min(start + weight_block, prop_vocab);
         var block_ref: f64 = 0;
-        for (weights[start..end]) |w| block_ref += w;
+        for (weights[start..end]) |w| {
+            block_ref += w;
+        }
+
         try std.testing.expectApproxEqRel(block_ref, @as(f64, s), 1e-5);
     }
 }
 
 test "full-vocab weights match the f64 exponential within the exp bound" {
-    try prop.forAll(.{ .site = 0x70E0, .cases = prop_rounds, .max_size = prop_rounds - 1 }, {}, prop.Trial, prop.genTrial(void), checkFullVocabWeights);
+    try prop.forAll(
+        .{ .site = 0x70E0, .cases = prop_rounds, .max_size = prop_rounds - 1 },
+        {},
+        prop.Trial,
+        prop.genTrial(void),
+        checkFullVocabWeights,
+    );
 }
 
 test "full-vocab draw: every id has a positive weight and the frequencies follow the weights" {
@@ -1291,7 +1538,10 @@ test "full-vocab draw: every id has a positive weight and the frequencies follow
     // Ten ids carry the mass at T 1, and the rest fall under the cut.
     var row: [prop_vocab]f32 = @splat(-200);
     const hot = [_]u32{ 0, 7, 63, 64, 65, 300, 511, 512, 1000, 1002 };
-    for (hot, 0..) |id, j| row[id] = @as(f32, @floatFromInt(j)) * 0.25;
+    for (hot, 0..) |id, j| {
+        row[id] = @as(f32, @floatFromInt(j)) * 0.25;
+    }
+
     var scratch: TestScratch(prop_vocab) = undefined;
     var counts: [hot.len]u32 = @splat(0);
     const draws = 20_000;
@@ -1300,8 +1550,12 @@ test "full-vocab draw: every id has a positive weight and the frequencies follow
         const j = std.mem.indexOfScalar(u32, &hot, id) orelse return error.TestUnexpectedResult;
         counts[j] += 1;
     }
+
     var mass: f64 = 0;
-    for (0..hot.len) |j| mass += @exp(@as(f64, @floatFromInt(j)) * 0.25);
+    for (0..hot.len) |j| {
+        mass += @exp(@as(f64, @floatFromInt(j)) * 0.25);
+    }
+
     for (counts, 0..) |c, j| {
         const want = @exp(@as(f64, @floatFromInt(j)) * 0.25) / mass * draws;
         // Five standard deviations of a binomial count.
@@ -1354,8 +1608,18 @@ test "min_p golden rows: three of four ids survive, and the order of the cuts ke
 
 /// The weights the full-vocab cut leaves in the scratch: a zero weight is a
 /// dropped id.
-fn fullCutKept(row: []const f32, temperature: f32, min_p: f32, top_p: f32, scratch: []f32) []const f32 {
-    const total = fullCutWeights(row, .{ .temperature = temperature, .min_p = min_p, .top_p = top_p }, scratch);
+fn fullCutKept(
+    row: []const f32,
+    temperature: f32,
+    min_p: f32,
+    top_p: f32,
+    scratch: []f32,
+) []const f32 {
+    const total = fullCutWeights(
+        row,
+        .{ .temperature = temperature, .min_p = min_p, .top_p = top_p },
+        scratch,
+    );
     std.debug.assert(total >= 1);
     return scratch[0..row.len];
 }
@@ -1374,17 +1638,34 @@ fn checkMinPPool(_: void, seed: u64) anyerror!void {
     for ([_]*const TestPool{ &full, &top }) |p| {
         try std.testing.expect(p.cut.n >= 1);
         // The pool is in rank order, so the survivors are a ranked prefix.
-        for (1..p.k) |j| try std.testing.expect(!Candidate.moreLikely({}, p.pool[j], p.pool[j - 1]));
-        for (p.probs[0..p.cut.n]) |w| try std.testing.expect(w >= m * p.probs[0]);
-        for (p.probs[p.cut.n..p.k]) |w| try std.testing.expect(w < m * p.probs[0]);
+        for (1..p.k) |j| {
+            try std.testing.expect(!Candidate.moreLikely({}, p.pool[j], p.pool[j - 1]));
+        }
+
+        for (p.probs[0..p.cut.n]) |w| {
+            try std.testing.expect(w >= m * p.probs[0]);
+        }
+
+        for (p.probs[p.cut.n..p.k]) |w| {
+            try std.testing.expect(w < m * p.probs[0]);
+        }
     }
+
     // min_p then top_k equals top_k then min_p: the same ranked prefix.
     try std.testing.expectEqual(@min(k, full.cut.n), top.cut.n);
-    for (top.pool[0..top.cut.n], full.pool[0..top.cut.n]) |a, b| try std.testing.expectEqual(a.i, b.i);
+    for (top.pool[0..top.cut.n], full.pool[0..top.cut.n]) |a, b| {
+        try std.testing.expectEqual(a.i, b.i);
+    }
 }
 
 test "min_p bound on the pool: survivors reach the floor, dropped members do not, and top_k commutes" {
-    try prop.forAll(.{ .site = 0x7004, .cases = prop_rounds * 4 }, {}, u64, prop.genSeed(void), checkMinPPool);
+    try prop.forAll(
+        .{ .site = 0x7004, .cases = prop_rounds * 4 },
+        {},
+        u64,
+        prop.genSeed(void),
+        checkMinPPool,
+    );
 }
 
 fn checkMinPFull(_: void, seed: u64) anyerror!void {
@@ -1408,6 +1689,7 @@ fn checkMinPFull(_: void, seed: u64) anyerror!void {
             try std.testing.expect(w < m);
         }
     }
+
     try std.testing.expect(n >= 1);
     var rng = std.Random.DefaultPrng.init(r.int(u64));
     for (0..16) |_| {
@@ -1417,20 +1699,39 @@ fn checkMinPFull(_: void, seed: u64) anyerror!void {
 }
 
 test "min_p bound on the full vocab: survivors reach the floor and dropped ids do not" {
-    try prop.forAll(.{ .site = 0x7014, .cases = prop_rounds }, {}, u64, prop.genSeed(void), checkMinPFull);
+    try prop.forAll(
+        .{ .site = 0x7014, .cases = prop_rounds },
+        {},
+        u64,
+        prop.genSeed(void),
+        checkMinPFull,
+    );
 }
 
 /// The oracle of the exact cut: sort the eligible ids by weight, ties by id,
 /// and walk the f64 mass to `top_p` of the total. Marks the kept ids.
-fn refCut(gpa: std.mem.Allocator, weights: []const f32, min_p: f32, top_p: f32, kept: []bool) !void {
+fn refCut(
+    gpa: std.mem.Allocator,
+    weights: []const f32,
+    min_p: f32,
+    top_p: f32,
+    kept: []bool,
+) !void {
     var ids: std.ArrayList(Candidate) = .empty;
     defer ids.deinit(gpa);
+
     for (weights, 0..) |w, i| {
-        if (w > 0 and w >= min_p) try ids.append(gpa, .{ .v = w, .i = @intCast(i) });
+        if (w > 0 and w >= min_p) {
+            try ids.append(gpa, .{ .v = w, .i = @intCast(i) });
+        }
     }
+
     std.mem.sort(Candidate, ids.items, {}, Candidate.moreLikely);
     var total: f64 = 0;
-    for (ids.items) |c| total += c.v;
+    for (ids.items) |c| {
+        total += c.v;
+    }
+
     @memset(kept, false);
     var acc: f64 = 0;
     for (ids.items) |c| {
@@ -1450,31 +1751,46 @@ fn checkExactTopP(_: void, c: prop.Trial) anyerror!void {
     const vocab = 6000 + 5;
     const row = try gpa.alloc(f32, vocab);
     defer gpa.free(row);
+
     const scratch = try gpa.alloc(f32, scratchLen(vocab));
     defer gpa.free(scratch);
+
     const weights = try gpa.alloc(f32, vocab);
     defer gpa.free(weights);
+
     const want = try gpa.alloc(bool, vocab);
     defer gpa.free(want);
+
     switch (round % 3) {
         0 => fillRow(r, row),
         1 => {
             @memset(row, 0);
-            for (0..vocab / 8) |_| row[r.uintLessThan(usize, vocab)] = -r.float(f32) * 4;
+            for (0..vocab / 8) |_| {
+                row[r.uintLessThan(usize, vocab)] = -r.float(f32) * 4;
+            }
         },
         else => for (row) |*v| {
             v.* = r.float(f32) * 0.01;
         },
     }
+
     const t = 0.5 + r.float(f32);
     const top_p = 0.05 + r.float(f32) * 0.9;
     const min_p: f32 = if (round % 2 == 0) 0 else r.float(f32) * 0.5;
     _ = fullVocabWeights(row, t, weights, scratch[vocab..]);
     try refCut(gpa, weights, min_p, top_p, want);
     const kept = fullCutKept(row, t, min_p, top_p, scratch);
-    for (want, kept) |w, k| try std.testing.expectEqual(w, k > 0);
+    for (want, kept) |w, k| {
+        try std.testing.expectEqual(w, k > 0);
+    }
 }
 
 test "exact top_p over the full vocab equals a sorted f64 walk" {
-    try prop.forAll(.{ .site = 0x7015, .cases = prop_rounds, .max_size = prop_rounds - 1 }, {}, prop.Trial, prop.genTrial(void), checkExactTopP);
+    try prop.forAll(
+        .{ .site = 0x7015, .cases = prop_rounds, .max_size = prop_rounds - 1 },
+        {},
+        prop.Trial,
+        prop.genTrial(void),
+        checkExactTopP,
+    );
 }

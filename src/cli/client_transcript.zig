@@ -1,22 +1,11 @@
 //! The transcript of a client chat and the pure decisions that compact it.
-//! The client cannot tokenize. It weighs each turn in positions, the measured
-//! `kv_pos` delta of the live turn. When a turn does not fit the window, the
-//! client closes the session and opens a new one with the exact original
-//! system prompt. It then appends the newest turns that fit as kept pairs.
-//! `plan` keeps the longest suffix of turns that fits beside the
-//! system rows and a reserve. Each `appended` reply gives the exact cost of
-//! each kept pair, which replaces the estimate.
+//! The client cannot tokenize, so it weighs each turn in positions and keeps
+//! the newest turns that fit beside the system rows and a reserve. The module
+//! is pure: no I/O and no allocation.
 //!
 //! A live delta errs high when the turn thought, because a kept pair drops
-//! its reasoning. It errs low only when the reply re-encodes to more ids than
-//! the model sampled. A refused append frame then teaches the client a cost
-//! that is at least the real one, so each restart keeps fewer pairs.
-//!
-//! The transcript holds text under a fixed byte bound and reports each cut.
-//! The bound equals the pair bytes of one `session_append` frame, so one held
-//! turn always fits one frame. After a drop and a resume, `reconcile` tells
-//! the client what the server did with the turn in flight. The module is
-//! pure: no I/O and no allocation.
+//! its reasoning. A refused append frame teaches a cost of at least the real
+//! one, so each restart keeps fewer pairs.
 
 const std = @import("std");
 const protocol = @import("../serve/protocol.zig");
@@ -24,33 +13,39 @@ const limits = @import("../core/limits.zig");
 
 const assert = std.debug.assert;
 
-// -- types ------------------------------------------------------------------
+// -- constants --------------------------------------------------------------
 
-/// The pair bytes that the held turns can fill. It equals the pair record
-/// bytes of one `session_append` frame, so one held turn fits one frame.
+/// The pair bytes that the held turns can fill, so one held turn fits one
+/// `session_append` frame.
 pub const pair_bytes_max: u32 = protocol.append_pairs_bytes_max;
 
 const pair_overhead_bytes: u32 = protocol.pair_overhead_bytes;
 
-/// The largest prompt of one turn. It equals the stdin line bound of the
-/// client, which reads each prompt as one line.
+/// The largest prompt of one turn, the stdin line bound of the client.
 pub const prompt_bytes_max: u32 = 4096;
 
 /// A prompt holds at least one byte, and a reply can be empty.
 const min_pair_bytes: u32 = pair_overhead_bytes + 1;
 
-/// The held pair bytes bound the turn count.
 const turns_max: u32 = pair_bytes_max / min_pair_bytes;
 
-/// The held text fits the byte bound. The extra room holds a pending prompt,
-/// because `begin` never evicts.
+/// The extra room holds a pending prompt, because `begin` never evicts.
 const text_bytes_cap: u32 = pair_bytes_max + prompt_bytes_max;
+
+/// The divisors of the bounds of `reserveFor`.
+pub const reserve_floor_divisor: u32 = 8;
+pub const reserve_ceiling_divisor: u32 = 2;
+
+const turn_pieces = splitFormat(protocol.turn_too_long_fmt);
+const system_pieces = splitFormat(protocol.system_too_long_fmt);
 
 comptime {
     assert(prompt_bytes_max < pair_bytes_max);
     assert(turns_max >= 1);
     assert(@as(u64, turns_max) * min_pair_bytes <= pair_bytes_max);
 }
+
+// -- types ------------------------------------------------------------------
 
 /// One held turn. Its prompt and its reply sit back to back at `start`.
 const Turn = struct {
@@ -119,8 +114,8 @@ pub const Retry = union(enum) {
     retry: u32,
 };
 
-/// The record of a chat, in fixed storage. The caller allocates it once and
-/// calls `init` in place, because it holds about 180 KiB.
+/// The record of a chat in fixed storage of about 180 KiB. The caller calls
+/// `init` in place.
 pub const Transcript = struct {
     /// The pair bytes of the held turns.
     held_bytes: u32,
@@ -146,9 +141,10 @@ pub const Transcript = struct {
     }
 
     /// The positions of turn `i`, oldest first: the live `kv_pos` delta, or
-    /// the exact cost of its pair once an append measured it.
+    /// the exact cost once an append measured it.
     pub fn cost(t: *const Transcript, i: u32) u32 {
         assert(i < t.n);
+
         return t.turns[i].cost;
     }
 
@@ -156,17 +152,20 @@ pub const Transcript = struct {
     pub fn setCost(t: *Transcript, i: u32, c: u32) void {
         assert(i < t.n);
         assert(t.pending == null);
+
         t.turns[i].cost = c;
     }
 
     pub fn prompt(t: *const Transcript, i: u32) []const u8 {
         assert(i < t.n);
+
         const turn = t.turns[i];
         return t.text[turn.start..][0..turn.prompt_len];
     }
 
     pub fn reply(t: *const Transcript, i: u32) []const u8 {
         assert(i < t.n);
+
         const turn = t.turns[i];
         return t.text[turn.start + turn.prompt_len ..][0..turn.reply_len];
     }
@@ -182,6 +181,7 @@ pub const Transcript = struct {
         assert(t.pending == null);
         assert(prompt_text.len >= 1);
         assert(prompt_text.len <= prompt_bytes_max);
+
         const at = t.heldTextLen();
         @memcpy(t.text[at..][0..prompt_text.len], prompt_text);
         t.pending = .{
@@ -193,20 +193,22 @@ pub const Transcript = struct {
         t.assertHeld();
     }
 
-    /// Add reply text to the pending turn. The oldest held turns leave only
-    /// when the pending turn needs their room. Past the budget of an empty
+    /// Add reply text to the pending turn. Past the budget of an empty
     /// history, the turn stops growing and ends as a barrier.
     pub fn appendReply(t: *Transcript, bytes: []const u8) void {
         const p = &t.pending.?;
         if (p.overflow) return;
+
         const size = @as(u64, pair_overhead_bytes) + p.prompt_len + p.reply_len + bytes.len;
         if (size > pair_bytes_max) {
             p.overflow = true;
             return;
         }
+
         const k = t.evictionCount(size);
         t.evictOldest(k);
         p.evicted += k;
+
         const at = t.heldTextLen() + p.prompt_len + p.reply_len;
         @memcpy(t.text[at..][0..bytes.len], bytes);
         p.reply_len += @intCast(bytes.len);
@@ -221,10 +223,8 @@ pub const Transcript = struct {
     }
 
     /// Commit the pending turn with its measured cost. The reply loses its
-    /// leading newlines, the rule of the model template for the text after a
-    /// think block. The rest of the reply stays byte for byte, so a kept pair
-    /// re-encodes to the ids the model sampled. The oldest turns leave while
-    /// the total is over the budget.
+    /// leading newlines, as the model template does after a think block. The
+    /// rest stays byte for byte, so a kept pair re-encodes to the sampled ids.
     pub fn finish(t: *Transcript, turn_cost: u32) Recorded {
         t.longest_cost = @max(t.longest_cost, turn_cost);
         const p = &t.pending.?;
@@ -236,6 +236,7 @@ pub const Transcript = struct {
         const offset = raw.len - kept.len;
         std.mem.copyForwards(u8, t.text[reply_at..][0..kept.len], raw[offset..][0..kept.len]);
         p.reply_len = @intCast(kept.len);
+
         const size = @as(u64, pair_overhead_bytes) + p.prompt_len + p.reply_len;
         if (size > pair_bytes_max) return t.barrier();
 
@@ -244,10 +245,11 @@ pub const Transcript = struct {
         const k = t.evictionCount(size);
         t.evictOldest(k);
         p.evicted += k;
-        // Each held turn takes at least `min_pair_bytes`, and the total fits
-        // the byte bound, so the count stays in bounds.
+
+        // Each held turn takes at least `min_pair_bytes`, so the count fits.
         assert(t.n < turns_max);
         const done = p.*;
+
         t.turns[t.n] = .{
             .start = t.heldTextLen(),
             .prompt_len = done.prompt_len,
@@ -262,7 +264,7 @@ pub const Transcript = struct {
     }
 
     /// Drop the pending turn. The result counts the held turns that its reply
-    /// already pushed out, so the caller can report them.
+    /// already pushed out.
     pub fn abandon(t: *Transcript) u32 {
         const p = t.pending.?;
         t.pending = null;
@@ -272,6 +274,7 @@ pub const Transcript = struct {
 
     pub fn clear(t: *Transcript) void {
         assert(t.pending == null);
+
         t.n = 0;
         t.held_bytes = 0;
         t.longest_cost = 0;
@@ -281,6 +284,7 @@ pub const Transcript = struct {
     pub fn dropOldest(t: *Transcript, k: u32) void {
         assert(t.pending == null);
         assert(k <= t.n);
+
         const before = t.n;
         t.evictOldest(k);
         t.assertHeld();
@@ -302,12 +306,15 @@ pub const Transcript = struct {
     /// beside the rest. The loop runs at most `n` times.
     fn evictionCount(t: *const Transcript, extra: u64) u32 {
         assert(extra <= pair_bytes_max);
+
         var total: u64 = t.held_bytes;
         var k: u32 = 0;
         while (total + extra > pair_bytes_max) : (k += 1) {
             assert(k < t.n);
+
             total -= t.turns[k].pairBytes();
         }
+
         assert(total + extra <= pair_bytes_max);
         return k;
     }
@@ -316,16 +323,25 @@ pub const Transcript = struct {
     /// pending text too, to the front.
     fn evictOldest(t: *Transcript, k: u32) void {
         assert(k <= t.n);
+
         if (k == 0) return;
+
         const held_end = t.heldTextLen();
         const shift = if (k < t.n) t.turns[k].start else held_end;
         const used = held_end + t.pendingTextLen();
         std.mem.copyForwards(u8, t.text[0 .. used - shift], t.text[shift..used]);
+
         var dropped: u32 = 0;
-        for (t.turns[0..k]) |turn| dropped += turn.pairBytes();
+        for (t.turns[0..k]) |turn| {
+            dropped += turn.pairBytes();
+        }
+
         std.mem.copyForwards(Turn, t.turns[0 .. t.n - k], t.turns[k..t.n]);
         t.n -= k;
-        for (t.turns[0..t.n]) |*turn| turn.start -= shift;
+        for (t.turns[0..t.n]) |*turn| {
+            turn.start -= shift;
+        }
+
         t.held_bytes -= dropped;
     }
 
@@ -345,77 +361,21 @@ pub const Transcript = struct {
     fn assertHeld(t: *const Transcript) void {
         assert(t.n <= turns_max);
         assert(t.held_bytes <= pair_bytes_max);
+
         var total: u64 = 0;
         var end: u32 = 0;
         for (t.turns[0..t.n]) |turn| {
             assert(turn.start == end);
             assert(turn.prompt_len >= 1);
+
             end += turn.prompt_len + turn.reply_len;
             total += turn.pairBytes();
         }
+
         assert(total == t.held_bytes);
         assert(end + t.pendingTextLen() <= text_bytes_cap);
     }
 };
-
-// -- api --------------------------------------------------------------------
-
-/// The newest turns that fit `cap`, counted by a walk from the newest turn
-/// that stops at the first overflow. No weight is negative, so a longer suffix
-/// never sums to less, and the walk finds the longest suffix that fits. The
-/// loop runs at most `weights_newest_first.len` times.
-fn keepCount(cap: u64, weights_newest_first: []const u32) u32 {
-    assert(weights_newest_first.len <= turns_max);
-    var acc: u64 = 0;
-    for (weights_newest_first, 0..) |w, i| {
-        if (acc + w > cap) {
-            assert(acc <= cap);
-            return @intCast(i);
-        }
-        acc += w;
-    }
-    assert(acc <= cap);
-    return @intCast(weights_newest_first.len);
-}
-
-/// The compaction of the held turns for `budget`. The kept pairs follow the
-/// system rows of the original system prompt.
-pub fn plan(t: *const Transcript, budget: Budget) Plan {
-    var weights: [turns_max]u32 = undefined;
-    for (0..t.n) |j| weights[j] = t.cost(@intCast(t.n - 1 - j));
-    const p = planOver(weights[0..t.n], budget);
-    assert(p.kept + p.dropped == t.n);
-    return p;
-}
-
-/// The end of the `session_append` frame that starts at turn `from`: the
-/// most turns up to `to` that fit `limits.max_append_pairs` pairs and
-/// `pair_bytes_max` bytes. One held turn always fits, so the frame holds
-/// at least one pair. The loop runs at most `limits.max_append_pairs` times.
-pub fn frameEnd(t: *const Transcript, from: u32, to: u32) u32 {
-    assert(from < to);
-    assert(to <= t.n);
-    var bytes: u64 = 0;
-    var end = from;
-    while (end < to and end - from < limits.max_append_pairs) : (end += 1) {
-        const b = t.turns[end].pairBytes();
-        if (bytes + b > pair_bytes_max) break;
-        bytes += b;
-    }
-    assert(end > from);
-    assert(end - from <= limits.max_append_pairs);
-    return end;
-}
-
-/// The cost of a finished live turn as a kept pair. A budget or cancel stop
-/// after one token or more leaves the last token pending. That token is not
-/// in the `kv_pos` delta, but the pair holds it, so the cost counts one more.
-/// The next live turn counts the carried token too. The estimate therefore
-/// errs high by at most one per turn and never low.
-pub fn liveCost(delta: u32, finish: protocol.FinishReason, gen_tokens: u32) u32 {
-    const carried = gen_tokens > 0 and (finish == .max_tokens or finish == .cancelled);
-    return delta + @intFromBool(carried);
-}
 
 /// The turn in flight at a drop, as the client saw it.
 pub const InFlight = struct {
@@ -426,14 +386,6 @@ pub const InFlight = struct {
     /// `gen_tokens` counts it too.
     received: u32,
 };
-
-/// Whether a token frame of a turn counts in its `gen_tokens`. The server
-/// sends the open tag of a turn that opens in the think block as an echo
-/// before the prefill. The echo is the only frame on the open tag channel,
-/// and it counts as no generated token.
-pub fn countsAsGenerated(channel: protocol.Channel) bool {
-    return channel != .open_tag;
-}
 
 /// What the server did with the turn in flight at a drop.
 pub const Reconciled = union(enum) {
@@ -449,51 +401,6 @@ pub const Reconciled = union(enum) {
     inconsistent,
 };
 
-/// Classify the turn in flight at a drop from the `resumed` summary. The
-/// server answers a resume only when the session is idle, so the summary
-/// is final. The summary comes from the network, so a contradiction is
-/// data, not a broken invariant.
-pub fn reconcile(turn: InFlight, turns_done: u32, last: ?protocol.LastDone) Reconciled {
-    assert(turn.request_id >= 1);
-    const done = last orelse return if (turn.received == 0) .never_ran else .inconsistent;
-    if (turns_done == 0) return .inconsistent;
-    // Request ids only grow on one chat, so a later id names a request
-    // that the client never sent.
-    if (done.request_id > turn.request_id) return .inconsistent;
-    if (done.request_id < turn.request_id) return if (turn.received == 0) .never_ran else .inconsistent;
-    if (turn.received > done.gen_tokens) return .inconsistent;
-    const k = done.gen_tokens - turn.received;
-    if (k == 0) return .complete;
-    return .{ .cut = k };
-}
-
-/// Record the exact cost of each pair of an `appended` reply. `base` is the
-/// session position before the frame, and `positions` the position after
-/// each pair of turns `from..`. Returns the position after the frame.
-pub fn learnAppended(t: *Transcript, from: u32, base: u32, positions: []const u32) u32 {
-    assert(positions.len >= 1);
-    assert(from + positions.len <= t.n);
-    var prev = base;
-    for (positions, 0..) |pos, j| {
-        assert(pos >= prev);
-        t.setCost(from + @as(u32, @intCast(j)), pos - prev);
-        prev = pos;
-    }
-    return prev;
-}
-
-/// Learn from a refused frame of turns `from..to` that the server counted as
-/// `tokens`. The refusal names the sum only, so an excess over the estimates
-/// joins the oldest pair of the frame. The costs then sum to at least the real
-/// cost, and the next plan keeps fewer pairs.
-pub fn learnRefusal(t: *Transcript, from: u32, to: u32, tokens: u32) void {
-    assert(from < to);
-    assert(to <= t.n);
-    var sum: u64 = 0;
-    for (from..to) |j| sum += t.cost(@intCast(j));
-    if (tokens > sum) t.setCost(from, t.cost(from) + @as(u32, @intCast(tokens - sum)));
-}
-
 /// The answer to a refused append frame.
 pub const Refit = union(enum) {
     /// The learned costs keep fewer pairs. The dropped turns already left.
@@ -503,15 +410,126 @@ pub const Refit = union(enum) {
     stuck,
 };
 
+// -- api --------------------------------------------------------------------
+
+/// The compaction of the held turns for `budget`.
+pub fn plan(t: *const Transcript, budget: Budget) Plan {
+    var weights: [turns_max]u32 = undefined;
+    for (0..t.n) |j| {
+        weights[j] = t.cost(@intCast(t.n - 1 - j));
+    }
+
+    const p = planOver(weights[0..t.n], budget);
+    assert(p.kept + p.dropped == t.n);
+    return p;
+}
+
+/// The end of the `session_append` frame that starts at turn `from`: the
+/// most turns up to `to` that fit `limits.max_append_pairs` pairs and
+/// `pair_bytes_max` bytes. The loop runs at most `limits.max_append_pairs`
+/// times.
+pub fn frameEnd(t: *const Transcript, from: u32, to: u32) u32 {
+    assert(from < to);
+    assert(to <= t.n);
+
+    var bytes: u64 = 0;
+    var end = from;
+    while (end < to and end - from < limits.max_append_pairs) : (end += 1) {
+        const b = t.turns[end].pairBytes();
+        if (bytes + b > pair_bytes_max) break;
+        bytes += b;
+    }
+
+    assert(end > from);
+    assert(end - from <= limits.max_append_pairs);
+    return end;
+}
+
+/// The cost of a finished live turn as a kept pair. A budget or cancel stop
+/// leaves the last token pending, outside the `kv_pos` delta. The pair holds
+/// it, so the cost counts one more and errs high by at most one per turn.
+pub fn liveCost(delta: u32, finish: protocol.FinishReason, gen_tokens: u32) u32 {
+    const carried = gen_tokens > 0 and (finish == .max_tokens or finish == .cancelled);
+    return delta + @intFromBool(carried);
+}
+
+/// Whether a token frame counts in `gen_tokens`. The echo of the open tag of
+/// a think-open turn is the only frame on that channel, and it counts as none.
+pub fn countsAsGenerated(channel: protocol.Channel) bool {
+    return channel != .open_tag;
+}
+
+/// Classify the turn in flight at a drop from the `resumed` summary. The
+/// server answers a resume only when the session is idle, so the summary is
+/// final. It comes from the network, so a contradiction is data.
+pub fn reconcile(turn: InFlight, turns_done: u32, last: ?protocol.LastDone) Reconciled {
+    assert(turn.request_id >= 1);
+
+    const done = last orelse return if (turn.received == 0) .never_ran else .inconsistent;
+    if (turns_done == 0) return .inconsistent;
+    // Request ids only grow on one chat, so a later id names a request
+    // that the client never sent.
+    if (done.request_id > turn.request_id) return .inconsistent;
+    if (done.request_id < turn.request_id) {
+        return if (turn.received == 0) .never_ran else .inconsistent;
+    }
+    if (turn.received > done.gen_tokens) return .inconsistent;
+
+    const k = done.gen_tokens - turn.received;
+    if (k == 0) return .complete;
+
+    return .{ .cut = k };
+}
+
+/// Record the exact cost of each pair of an `appended` reply. `base` is the
+/// position before the frame. Returns the position after it.
+pub fn learnAppended(t: *Transcript, from: u32, base: u32, positions: []const u32) u32 {
+    assert(positions.len >= 1);
+    assert(from + positions.len <= t.n);
+
+    var prev = base;
+    for (positions, 0..) |pos, j| {
+        assert(pos >= prev);
+
+        t.setCost(from + @as(u32, @intCast(j)), pos - prev);
+        prev = pos;
+    }
+
+    return prev;
+}
+
 /// Learn from a refused frame of turns `from..to` that the server counted as
-/// `tokens`, and plan again. A refusal at or under the estimates teaches
-/// nothing, and a plan that keeps as many pairs as `kept_before` gives
-/// `stuck`. The server sends the refusal, so this is data, not a broken
-/// invariant.
-pub fn refit(t: *Transcript, budget: Budget, from: u32, to: u32, tokens: u32, kept_before: u32) Refit {
+/// `tokens`. The refusal names the sum only, so an excess over the estimates
+/// joins the oldest pair of the frame.
+pub fn learnRefusal(t: *Transcript, from: u32, to: u32, tokens: u32) void {
+    assert(from < to);
+    assert(to <= t.n);
+
+    var sum: u64 = 0;
+    for (from..to) |j| {
+        sum += t.cost(@intCast(j));
+    }
+
+    if (tokens > sum) {
+        t.setCost(from, t.cost(from) + @as(u32, @intCast(tokens - sum)));
+    }
+}
+
+/// Learn from a refusal, as `learnRefusal` does, and plan again. A plan that
+/// keeps as many pairs as `kept_before` gives `stuck`. The refusal comes from
+/// the server, so this is data, not a broken invariant.
+pub fn refit(
+    t: *Transcript,
+    budget: Budget,
+    from: u32,
+    to: u32,
+    tokens: u32,
+    kept_before: u32,
+) Refit {
     learnRefusal(t, from, to, tokens);
     const p = plan(t, budget);
     if (p.kept >= kept_before) return .stuck;
+
     t.dropOldest(p.dropped);
     assert(t.count() == p.kept);
     return .{ .plan = p };
@@ -520,67 +538,90 @@ pub fn refit(t: *Transcript, budget: Budget, from: u32, to: u32, tokens: u32, ke
 /// Read the numbers back from the detail of a `turn_too_long` refusal. Any
 /// text other than the two protocol formats gives null.
 pub fn parseTooLong(detail: []const u8) ?TooLong {
-    if (parseFields(turn_pieces, detail)) |f| return .{ .kind = .turn, .tokens = f[0], .room = f[1] };
-    if (parseFields(system_pieces, detail)) |f| return .{ .kind = .system, .tokens = f[0], .room = f[1] };
+    if (parseFields(turn_pieces, detail)) |f| {
+        return .{ .kind = .turn, .tokens = f[0], .room = f[1] };
+    }
+    if (parseFields(system_pieces, detail)) |f| {
+        return .{ .kind = .system, .tokens = f[0], .room = f[1] };
+    }
+
     return null;
 }
 
 /// The answer to a refused turn of `q` positions. A compaction that keeps no
 /// turn costs exactly `system_rows`, so a prompt that does not fit beside them
-/// alone gets a refusal. Else the reserve leaves room for the prompt: the
-/// kept turns fit beside it, or no turn stays and the system rows leave room.
+/// gets a refusal.
 pub fn retryPlan(system_rows: u32, window: u32, reserve: u32, q: u32) Retry {
     assert(window > 0);
     assert(reserve < window);
+
     if (@as(u64, system_rows) + q > window) return .refuse;
+
     const headroom = window -| system_rows;
     const r = @min(q +| reserve, headroom);
-    // A reserve equal to the window means no system rows and a prompt of the
-    // whole window. The plan then keeps no turn.
+    // A reserve equal to the window keeps no turn.
     assert(r <= window);
     return .{ .retry = r };
 }
 
-/// The reserve of a compaction when the user names none. The reserve must
-/// hold the next turn, and the longest turn so far is the measured turn size
-/// of this conversation. The floor gives room before any turn exists. The
-/// ceiling keeps at least half the window for history. A turn cut at the
-/// window counts the positions it used, so the reserve grows with each cut
-/// until answers fit, up to the ceiling.
+/// The reserve of a compaction when the user names none: the longest turn so
+/// far, clamped between a floor and a ceiling. The ceiling keeps at least
+/// half the window for history.
 pub fn reserveFor(window: u32, longest_cost: u32) u32 {
     assert(window > 0);
+
     const floor = window / reserve_floor_divisor;
     const ceiling = window / reserve_ceiling_divisor;
     assert(floor <= ceiling);
+
     const r = std.math.clamp(longest_cost, floor, ceiling);
     assert(r >= floor);
     assert(r < window);
     return r;
 }
 
-/// The divisors of the bounds of `reserveFor`. The client help text names
-/// them.
-pub const reserve_floor_divisor: u32 = 8;
-pub const reserve_ceiling_divisor: u32 = 2;
-
 // -- helpers ----------------------------------------------------------------
+
+/// The count of newest turns that fit `cap`. The walk stops at the first
+/// overflow, which finds the longest suffix because no weight is negative.
+/// The loop runs at most `weights_newest_first.len` times.
+fn keepCount(cap: u64, weights_newest_first: []const u32) u32 {
+    assert(weights_newest_first.len <= turns_max);
+
+    var acc: u64 = 0;
+    for (weights_newest_first, 0..) |w, i| {
+        if (acc + w > cap) {
+            assert(acc <= cap);
+
+            return @intCast(i);
+        }
+
+        acc += w;
+    }
+
+    assert(acc <= cap);
+    return @intCast(weights_newest_first.len);
+}
 
 /// `plan` over a weight list, newest first.
 fn planOver(weights_newest_first: []const u32, budget: Budget) Plan {
     assert(budget.window > 0);
     assert(budget.reserve <= budget.window);
+
     const cap = (@as(u64, budget.window) - budget.reserve) -| budget.system_rows;
     const kept = keepCount(cap, weights_newest_first);
+
     var estimate: u64 = budget.system_rows;
-    for (weights_newest_first[0..kept]) |w| estimate += w;
+    for (weights_newest_first[0..kept]) |w| {
+        estimate += w;
+    }
+
     if (kept > 0) assert(estimate + budget.reserve <= budget.window);
+
     const n: u32 = @intCast(weights_newest_first.len);
     assert(kept <= n);
     return .{ .kept = kept, .dropped = n - kept, .estimate = @intCast(estimate) };
 }
-
-const turn_pieces = splitFormat(protocol.turn_too_long_fmt);
-const system_pieces = splitFormat(protocol.system_too_long_fmt);
 
 /// The literal text around the two `{d}` fields of a format.
 fn splitFormat(comptime fmt: []const u8) [3][]const u8 {
@@ -592,6 +633,7 @@ fn splitFormat(comptime fmt: []const u8) [3][]const u8 {
             pieces[i] = rest[0..at];
             rest = rest[at + 3 ..];
         }
+
         assert(std.mem.findScalar(u8, rest, '{') == null);
         pieces[2] = rest;
         return pieces;
@@ -606,14 +648,22 @@ fn parseFields(pieces: [3][]const u8, detail: []const u8) ?[2]u32 {
     var rest = detail;
     for (0..2) |i| {
         if (!std.mem.startsWith(u8, rest, pieces[i])) return null;
+
         rest = rest[pieces[i].len..];
+
         var digits: usize = 0;
-        while (digits < rest.len and std.ascii.isDigit(rest[digits])) digits += 1;
+        while (digits < rest.len and std.ascii.isDigit(rest[digits])) {
+            digits += 1;
+        }
+
         if (digits == 0) return null;
+
         fields[i] = std.fmt.parseInt(u32, rest[0..digits], 10) catch return null;
         rest = rest[digits..];
     }
+
     if (!std.mem.eql(u8, rest, pieces[2])) return null;
+
     return fields;
 }
 
@@ -627,24 +677,38 @@ fn newTranscript() !*Transcript {
     return t;
 }
 
-fn record(t: *Transcript, prompt_text: []const u8, reply_text: []const u8, turn_cost: u32) Recorded {
+fn record(
+    t: *Transcript,
+    prompt_text: []const u8,
+    reply_text: []const u8,
+    turn_cost: u32,
+) Recorded {
     t.begin(prompt_text);
     // A turn with no reply text reaches `finish` with no `appendReply`, as in
     // the client, so `finish` does its own eviction.
-    if (reply_text.len > 0) t.appendReply(reply_text);
+    if (reply_text.len > 0) {
+        t.appendReply(reply_text);
+    }
+
     return t.finish(turn_cost);
 }
 
 /// A transcript of one-byte turns with the measured deltas `ds`.
 fn weighed(ds: []const u32) !*Transcript {
     const t = try newTranscript();
-    for (ds) |d| _ = record(t, "q", "", d);
+    for (ds) |d| {
+        _ = record(t, "q", "", d);
+    }
+
     return t;
 }
 
 /// The costs of the turns that `plan` keeps, oldest first.
 fn keptCosts(t: *const Transcript, p: Plan, out: []u32) []const u32 {
-    for (0..p.kept) |j| out[j] = t.cost(p.dropped + @as(u32, @intCast(j)));
+    for (0..p.kept) |j| {
+        out[j] = t.cost(p.dropped + @as(u32, @intCast(j)));
+    }
+
     return out[0..p.kept];
 }
 
@@ -653,6 +717,7 @@ fn keptCosts(t: *const Transcript, p: Plan, out: []u32) []const u32 {
 test "anchor A' keeps the three newest turns" {
     const t = try weighed(&.{ 12, 9, 20, 7, 11 });
     defer testing.allocator.destroy(t);
+
     const p = plan(t, .{ .window = 64, .reserve = 8, .system_rows = 10 });
     var buf: [8]u32 = undefined;
     try testing.expectEqualSlices(u32, &.{ 20, 7, 11 }, keptCosts(t, p, &buf));
@@ -662,6 +727,7 @@ test "anchor A' keeps the three newest turns" {
 test "anchor B' keeps an exact fit" {
     const t = try weighed(&.{ 8, 38 });
     defer testing.allocator.destroy(t);
+
     const p = plan(t, .{ .window = 64, .reserve = 8, .system_rows = 10 });
     var buf: [8]u32 = undefined;
     try testing.expectEqualSlices(u32, &.{ 8, 38 }, keptCosts(t, p, &buf));
@@ -671,6 +737,7 @@ test "anchor B' keeps an exact fit" {
 test "anchor C' keeps nothing when the newest turn alone is too large" {
     const t = try weighed(&.{ 5, 50 });
     defer testing.allocator.destroy(t);
+
     const p = plan(t, .{ .window = 64, .reserve = 8, .system_rows = 10 });
     try testing.expectEqual(Plan{ .kept = 0, .dropped = 2, .estimate = 10 }, p);
 }
@@ -678,6 +745,7 @@ test "anchor C' keeps nothing when the newest turn alone is too large" {
 test "anchor D' keeps three turns at the scale of a long chat" {
     const t = try weighed(&.{ 700, 300, 900, 500 });
     defer testing.allocator.destroy(t);
+
     const p = plan(t, .{ .window = 2048, .reserve = 256, .system_rows = 40 });
     var buf: [8]u32 = undefined;
     try testing.expectEqualSlices(u32, &.{ 300, 900, 500 }, keptCosts(t, p, &buf));
@@ -686,6 +754,7 @@ test "anchor D' keeps three turns at the scale of a long chat" {
 test "anchor E' leaves room for the refused prompt" {
     const t = try weighed(&.{ 12, 9, 20, 7, 11 });
     defer testing.allocator.destroy(t);
+
     const q = 30;
     const r = retryPlan(10, 64, 8, q).retry;
     try testing.expectEqual(@as(u32, @min(38, 64 - 10)), r);
@@ -702,25 +771,39 @@ test "keepCount matches the longest fitting suffix on random weights" {
     for (0..500) |_| {
         var oldest_first: [12]u32 = undefined;
         const len = r.uintAtMost(usize, oldest_first.len);
-        for (oldest_first[0..len]) |*w| w.* = r.uintAtMost(u32, 40);
+        for (oldest_first[0..len]) |*w| {
+            w.* = r.uintAtMost(u32, 40);
+        }
+
         const cap = r.uintAtMost(u64, 120);
         const turns = oldest_first[0..len];
         var newest_first: [12]u32 = undefined;
-        for (turns, 0..) |w, j| newest_first[len - 1 - j] = w;
+        for (turns, 0..) |w, j| {
+            newest_first[len - 1 - j] = w;
+        }
 
         // The oracle: the first start index whose suffix sum fits the cap.
         var first: usize = 0;
         while (first < len) : (first += 1) {
             var sum: u64 = 0;
-            for (turns[first..]) |w| sum += w;
+            for (turns[first..]) |w| {
+                sum += w;
+            }
+
             if (sum <= cap) break;
         }
+
         const kept = keepCount(cap, newest_first[0..len]);
         try testing.expectEqual(len - first, kept);
         var sum: u64 = 0;
-        for (turns[len - kept ..]) |w| sum += w;
+        for (turns[len - kept ..]) |w| {
+            sum += w;
+        }
+
         try testing.expect(sum <= cap);
-        if (kept < len) try testing.expect(sum + turns[len - kept - 1] > cap);
+        if (kept < len) {
+            try testing.expect(sum + turns[len - kept - 1] > cap);
+        }
     }
 }
 
@@ -734,10 +817,19 @@ test "a refused frame teaches a cost that drops at least one kept pair" {
         const len = rand.intRangeAtMost(u32, 1, 10);
         const t = try newTranscript();
         defer testing.allocator.destroy(t);
-        for (0..len) |_| _ = record(t, "q", "", rand.uintAtMost(u32, 30));
-        const budget: Budget = .{ .window = 128, .reserve = rand.uintAtMost(u32, 40), .system_rows = rand.uintAtMost(u32, 30) };
+
+        for (0..len) |_| {
+            _ = record(t, "q", "", rand.uintAtMost(u32, 30));
+        }
+
+        const budget: Budget = .{
+            .window = 128,
+            .reserve = rand.uintAtMost(u32, 40),
+            .system_rows = rand.uintAtMost(u32, 30),
+        };
         const before = plan(t, budget);
         if (before.kept == 0) continue;
+
         // The server counts the kept pairs as one frame and finds them too
         // large. The real sum is past the room after the system rows.
         const room = budget.window - budget.system_rows;
@@ -752,7 +844,11 @@ test "a refused frame teaches a cost that drops at least one kept pair" {
 test "frameEnd splits the kept pairs by count and by bytes" {
     const t = try newTranscript();
     defer testing.allocator.destroy(t);
-    for (0..limits.max_append_pairs + 5) |_| _ = record(t, "q", "r", 1);
+
+    for (0..limits.max_append_pairs + 5) |_| {
+        _ = record(t, "q", "r", 1);
+    }
+
     try testing.expectEqual(@as(u32, limits.max_append_pairs), frameEnd(t, 0, t.count()));
     try testing.expectEqual(t.count(), frameEnd(t, limits.max_append_pairs, t.count()));
     try testing.expectEqual(@as(u32, 3), frameEnd(t, 1, 3));
@@ -760,9 +856,13 @@ test "frameEnd splits the kept pairs by count and by bytes" {
     // Two turns of about 40 KiB each take one frame each.
     const big = try newTranscript();
     defer testing.allocator.destroy(big);
+
     const reply_text = "x" ** (40 * 1024);
     _ = record(big, "a", reply_text, 1);
-    try testing.expectEqual(Recorded{ .evicted = 1, .barrier = false }, record(big, "b", reply_text, 1));
+    try testing.expectEqual(
+        Recorded{ .evicted = 1, .barrier = false },
+        record(big, "b", reply_text, 1),
+    );
     try testing.expectEqual(@as(u32, 1), big.count());
     try testing.expectEqual(@as(u32, 1), frameEnd(big, 0, 1));
     const pairs = [_]protocol.Pair{big.pair(0)};
@@ -773,6 +873,7 @@ test "refit: a refusal past the estimates drops a pair, and one at or under them
     const budget: Budget = .{ .window = 64, .reserve = 8, .system_rows = 10 };
     const t = try weighed(&.{ 10, 10, 10 });
     defer testing.allocator.destroy(t);
+
     const p = plan(t, budget);
     try testing.expectEqual(@as(u32, 3), p.kept);
     // The server counts 30 tokens, the sum of the estimates. Nothing new is
@@ -797,6 +898,7 @@ test "liveCost counts the pending token of a budget or cancel stop" {
 test "learnAppended stores the exact cost of each pair" {
     const t = try weighed(&.{ 30, 30, 30 });
     defer testing.allocator.destroy(t);
+
     try testing.expectEqual(@as(u32, 61), learnAppended(t, 1, 40, &.{ 52, 61 }));
     try testing.expectEqual(@as(u32, 30), t.cost(0));
     try testing.expectEqual(@as(u32, 12), t.cost(1));
@@ -820,11 +922,24 @@ const third_reply: u32 = pair_bytes_max / 3 - pair_overhead_bytes - 1;
 test "the record evicts the oldest turns and counts them" {
     const t = try newTranscript();
     defer testing.allocator.destroy(t);
+
     const reply_text = filler[0..third_reply];
-    try testing.expectEqual(Recorded{ .evicted = 0, .barrier = false }, record(t, "a", reply_text, 1));
-    try testing.expectEqual(Recorded{ .evicted = 0, .barrier = false }, record(t, "b", reply_text, 2));
-    try testing.expectEqual(Recorded{ .evicted = 0, .barrier = false }, record(t, "c", reply_text, 3));
-    try testing.expectEqual(Recorded{ .evicted = 1, .barrier = false }, record(t, "d", reply_text, 4));
+    try testing.expectEqual(
+        Recorded{ .evicted = 0, .barrier = false },
+        record(t, "a", reply_text, 1),
+    );
+    try testing.expectEqual(
+        Recorded{ .evicted = 0, .barrier = false },
+        record(t, "b", reply_text, 2),
+    );
+    try testing.expectEqual(
+        Recorded{ .evicted = 0, .barrier = false },
+        record(t, "c", reply_text, 3),
+    );
+    try testing.expectEqual(
+        Recorded{ .evicted = 1, .barrier = false },
+        record(t, "d", reply_text, 4),
+    );
     try testing.expectEqual(@as(u32, 3), t.count());
     try testing.expectEqualStrings("b", t.prompt(0));
     try testing.expectEqual(@as(u32, 2), t.cost(0));
@@ -844,6 +959,7 @@ test "the record evicts the oldest turns and counts them" {
 test "a turn past the byte budget is a barrier that drops every held turn" {
     const t = try newTranscript();
     defer testing.allocator.destroy(t);
+
     _ = record(t, "a", "0123456789", 1);
     _ = record(t, "b", "0123456789", 2);
 
@@ -858,6 +974,7 @@ test "a turn past the byte budget is a barrier that drops every held turn" {
 test "a reply that the caller cut is a barrier" {
     const t = try newTranscript();
     defer testing.allocator.destroy(t);
+
     _ = record(t, "a", "0123456789", 1);
     _ = record(t, "b", "0123456789", 2);
     t.begin("c");
@@ -879,6 +996,7 @@ test "reserveFor clamps the longest turn between an eighth and half the window" 
 test "longest_cost keeps the largest turn until clear" {
     const t = try newTranscript();
     defer testing.allocator.destroy(t);
+
     _ = record(t, "a", "0123456789", 12);
     _ = record(t, "b", "0123456789", 30);
     _ = record(t, "c", "0123456789", 7);
@@ -902,6 +1020,7 @@ test "longest_cost keeps the largest turn until clear" {
 test "begin then abandon keeps every held turn" {
     const t = try newTranscript();
     defer testing.allocator.destroy(t);
+
     _ = record(t, "a", filler[0..third_reply], 1);
     _ = record(t, "b", filler[0..third_reply], 2);
     _ = record(t, "c", filler[0..third_reply], 3);
@@ -920,12 +1039,16 @@ test "begin then abandon keeps every held turn" {
 test "finish drops only the leading newlines of the reply" {
     const t = try newTranscript();
     defer testing.allocator.destroy(t);
+
     _ = record(t, "a", "\n\n hello world \r\n", 7);
     _ = record(t, "b", "\n", 8);
     _ = record(t, "c", "ok", 9);
     try testing.expectEqualStrings(" hello world \r\n", t.reply(0));
     try testing.expectEqualStrings("", t.reply(1));
-    try testing.expectEqual(protocol.Pair{ .user = t.prompt(2), .assistant = t.reply(2) }, t.pair(2));
+    try testing.expectEqual(
+        protocol.Pair{ .user = t.prompt(2), .assistant = t.reply(2) },
+        t.pair(2),
+    );
     t.dropOldest(2);
     try testing.expectEqual(@as(u32, 1), t.count());
     try testing.expectEqualStrings("c", t.prompt(0));
@@ -936,8 +1059,12 @@ test "finish drops only the leading newlines of the reply" {
 test "the record holds turns_max turns of the smallest size" {
     const t = try newTranscript();
     defer testing.allocator.destroy(t);
+
     var evicted: u32 = 0;
-    for (0..turns_max + 5) |_| evicted += record(t, "q", "", 1).evicted;
+    for (0..turns_max + 5) |_| {
+        evicted += record(t, "q", "", 1).evicted;
+    }
+
     const fit: u32 = pair_bytes_max / min_pair_bytes;
     try testing.expectEqual(fit, t.count());
     try testing.expectEqual(turns_max + 5 - fit, evicted);
@@ -949,9 +1076,15 @@ test "parseTooLong reads back both refusal formats" {
     for (values) |a| {
         for (values) |b| {
             const turn = try std.fmt.bufPrint(&buf, protocol.turn_too_long_fmt, .{ a, b });
-            try testing.expectEqual(TooLong{ .kind = .turn, .tokens = a, .room = b }, parseTooLong(turn).?);
+            try testing.expectEqual(
+                TooLong{ .kind = .turn, .tokens = a, .room = b },
+                parseTooLong(turn).?,
+            );
             const sys = try std.fmt.bufPrint(&buf, protocol.system_too_long_fmt, .{ a, b });
-            try testing.expectEqual(TooLong{ .kind = .system, .tokens = a, .room = b }, parseTooLong(sys).?);
+            try testing.expectEqual(
+                TooLong{ .kind = .system, .tokens = a, .room = b },
+                parseTooLong(sys).?,
+            );
         }
     }
 }
@@ -970,7 +1103,9 @@ test "parseTooLong rejects foreign, truncated, and overflowing details" {
         "turn of -1 tokens, 3 positions left",
         "system prompt of 12 tokens, window of 64",
     };
-    for (bad) |detail| try testing.expectEqual(@as(?TooLong, null), parseTooLong(detail));
+    for (bad) |detail| {
+        try testing.expectEqual(@as(?TooLong, null), parseTooLong(detail));
+    }
 }
 
 test "retryPlan refuses only when the system rows alone leave no room" {
@@ -988,7 +1123,11 @@ test "retryPlan refuses only when the system rows alone leave no room" {
 test "plan keeps the newest turns that fit beside the system rows and reserve" {
     const t = try newTranscript();
     defer testing.allocator.destroy(t);
-    try testing.expectEqual(Plan{ .kept = 0, .dropped = 0, .estimate = 20 }, plan(t, .{ .window = 64, .reserve = 8, .system_rows = 20 }));
+
+    try testing.expectEqual(
+        Plan{ .kept = 0, .dropped = 0, .estimate = 20 },
+        plan(t, .{ .window = 64, .reserve = 8, .system_rows = 20 }),
+    );
     _ = record(t, "a", "x", 18);
     _ = record(t, "b", "x", 10);
     _ = record(t, "c", "x", 10);
@@ -1010,7 +1149,10 @@ test "retryPlan leaves room for the prompt on random budgets" {
     for (0..500) |_| {
         var weights: [12]u32 = undefined;
         const len = rand.uintAtMost(usize, weights.len);
-        for (weights[0..len]) |*w| w.* = rand.uintAtMost(u32, 40);
+        for (weights[0..len]) |*w| {
+            w.* = rand.uintAtMost(u32, 40);
+        }
+
         const window = rand.intRangeAtMost(u32, 1, 200);
         const system_rows = rand.uintAtMost(u32, 100);
         const reserve = rand.uintLessThan(u32, window);
@@ -1018,7 +1160,10 @@ test "retryPlan leaves room for the prompt on random budgets" {
         switch (retryPlan(system_rows, window, reserve, q)) {
             .refuse => try testing.expect(system_rows + q > window),
             .retry => |r| {
-                const p = planOver(weights[0..len], .{ .window = window, .reserve = r, .system_rows = system_rows });
+                const p = planOver(
+                    weights[0..len],
+                    .{ .window = window, .reserve = r, .system_rows = system_rows },
+                );
                 try testing.expectEqual(len, p.kept + p.dropped);
                 try testing.expect(p.estimate + q <= window);
             },
@@ -1027,7 +1172,12 @@ test "retryPlan leaves room for the prompt on random budgets" {
 }
 
 fn lastDone(request_id: u32, finish: protocol.FinishReason, gen_tokens: u32) protocol.LastDone {
-    return .{ .request_id = request_id, .finish = finish, .gen_tokens = gen_tokens, .reasoning_tokens = 0 };
+    return .{
+        .request_id = request_id,
+        .finish = finish,
+        .gen_tokens = gen_tokens,
+        .reasoning_tokens = 0,
+    };
 }
 
 test "reconcile: every generated token reached the client" {
@@ -1037,28 +1187,52 @@ test "reconcile: every generated token reached the client" {
 
 test "reconcile: a turn that ended exactly at the drop is complete" {
     // The last token frame arrived and the `done` did not.
-    try testing.expectEqual(Reconciled.complete, reconcile(.{ .request_id = 4, .received = 7 }, 2, lastDone(4, .max_tokens, 7)));
+    try testing.expectEqual(
+        Reconciled.complete,
+        reconcile(.{ .request_id = 4, .received = 7 }, 2, lastDone(4, .max_tokens, 7)),
+    );
 }
 
 test "reconcile: a drop with no token in the gap cuts by zero, so the turn is complete" {
     // The drop cancelled the turn right after the last frame that the client got.
-    try testing.expectEqual(Reconciled.complete, reconcile(.{ .request_id = 5, .received = 30 }, 1, lastDone(5, .cancelled, 30)));
+    try testing.expectEqual(
+        Reconciled.complete,
+        reconcile(.{ .request_id = 5, .received = 30 }, 1, lastDone(5, .cancelled, 30)),
+    );
     // A drop in the turn prefill: the server ran the turn and generated nothing.
-    try testing.expectEqual(Reconciled.complete, reconcile(.{ .request_id = 5, .received = 0 }, 1, lastDone(5, .cancelled, 0)));
+    try testing.expectEqual(
+        Reconciled.complete,
+        reconcile(.{ .request_id = 5, .received = 0 }, 1, lastDone(5, .cancelled, 0)),
+    );
 }
 
 test "reconcile: the server generated k tokens that the client never got" {
-    try testing.expectEqual(Reconciled{ .cut = 3 }, reconcile(.{ .request_id = 9, .received = 17 }, 4, lastDone(9, .cancelled, 20)));
-    try testing.expectEqual(Reconciled{ .cut = 20 }, reconcile(.{ .request_id = 9, .received = 0 }, 4, lastDone(9, .cancelled, 20)));
+    try testing.expectEqual(
+        Reconciled{ .cut = 3 },
+        reconcile(.{ .request_id = 9, .received = 17 }, 4, lastDone(9, .cancelled, 20)),
+    );
+    try testing.expectEqual(
+        Reconciled{ .cut = 20 },
+        reconcile(.{ .request_id = 9, .received = 0 }, 4, lastDone(9, .cancelled, 20)),
+    );
 }
 
 test "reconcile: a turn the server never ran goes out again" {
     // has_last is 0: no turn of the session finished.
-    try testing.expectEqual(Reconciled.never_ran, reconcile(.{ .request_id = 3, .received = 0 }, 0, null));
+    try testing.expectEqual(
+        Reconciled.never_ran,
+        reconcile(.{ .request_id = 3, .received = 0 }, 0, null),
+    );
     // Kept pairs count in turns_done and leave has_last at 0.
-    try testing.expectEqual(Reconciled.never_ran, reconcile(.{ .request_id = 3, .received = 0 }, 5, null));
+    try testing.expectEqual(
+        Reconciled.never_ran,
+        reconcile(.{ .request_id = 3, .received = 0 }, 5, null),
+    );
     // The last finished request is an older turn.
-    try testing.expectEqual(Reconciled.never_ran, reconcile(.{ .request_id = 8, .received = 0 }, 2, lastDone(6, .eos, 40)));
+    try testing.expectEqual(
+        Reconciled.never_ran,
+        reconcile(.{ .request_id = 8, .received = 0 }, 2, lastDone(6, .eos, 40)),
+    );
 }
 
 test "reconcile: a summary that contradicts the client frames is inconsistent" {
@@ -1074,41 +1248,65 @@ test "reconcile: a summary that contradicts the client frames is inconsistent" {
         // A last turn with zero finished turns.
         .{ .turn = .{ .request_id = 8, .received = 4 }, .turns_done = 0, .last = lastDone(8, .eos, 4) },
     };
-    for (cases) |case| try testing.expectEqual(Reconciled.inconsistent, reconcile(case.turn, case.turns_done, case.last));
+    for (cases) |case| {
+        try testing.expectEqual(
+            Reconciled.inconsistent,
+            reconcile(case.turn, case.turns_done, case.last),
+        );
+    }
 }
 
 test "reconcile: on the same request the cut plus the received frames equals gen_tokens" {
-    for (0..40) |g| for (0..g + 1) |r| {
-        const gen: u32 = @intCast(g);
-        const got: u32 = @intCast(r);
-        switch (reconcile(.{ .request_id = 1, .received = got }, 1, lastDone(1, .cancelled, gen))) {
-            .complete => try testing.expectEqual(gen, got),
-            .cut => |k| {
-                try testing.expect(k > 0);
-                try testing.expectEqual(gen, got + k);
-            },
-            .never_ran, .inconsistent => return error.TestUnexpectedResult,
+    for (0..40) |g| {
+        for (0..g + 1) |r| {
+            const gen: u32 = @intCast(g);
+            const got: u32 = @intCast(r);
+            switch (reconcile(
+                .{ .request_id = 1, .received = got },
+                1,
+                lastDone(1, .cancelled, gen),
+            )) {
+                .complete => try testing.expectEqual(gen, got),
+                .cut => |k| {
+                    try testing.expect(k > 0);
+                    try testing.expectEqual(gen, got + k);
+                },
+                .never_ran, .inconsistent => return error.TestUnexpectedResult,
+            }
         }
-    };
+    }
 }
 
 /// The `received` count of the first `n` frames, the count the client keeps.
 fn receivedOf(frames: []const protocol.Channel, n: usize) u32 {
     var got: u32 = 0;
-    for (frames[0..n]) |ch| got += @intFromBool(countsAsGenerated(ch));
+    for (frames[0..n]) |ch| {
+        got += @intFromBool(countsAsGenerated(ch));
+    }
+
     return got;
 }
 
 test "reconcile: a think-open turn counts no echo, so the verdicts match the server count" {
     // The frames of a think-open turn: the echo, two think tokens, the
     // close, the answer, and the end token. The server counts five.
-    const frames = [_]protocol.Channel{ .open_tag, .reasoning, .reasoning, .close_tag, .content, .content };
+    const frames = [_]protocol.Channel{
+        .open_tag,
+        .reasoning,
+        .reasoning,
+        .close_tag,
+        .content,
+        .content,
+    };
     const gen: u32 = frames.len - 1;
     const turn = InFlight{ .request_id = 4, .received = receivedOf(&frames, frames.len) };
     try testing.expectEqual(Reconciled.complete, reconcile(turn, 1, lastDone(4, .eos, gen)));
     // The drop lost the end token.
     const cut = InFlight{ .request_id = 4, .received = receivedOf(&frames, frames.len - 1) };
-    try testing.expectEqual(Reconciled{ .cut = 1 }, reconcile(cut, 1, lastDone(4, .cancelled, gen)));
+    try testing.expectEqual(
+        Reconciled{ .cut = 1 },
+        reconcile(cut, 1, lastDone(4, .cancelled, gen)),
+    );
     // The drop came after the echo, during the prefill.
     const echoed = InFlight{ .request_id = 4, .received = receivedOf(&frames, 1) };
     try testing.expectEqual(Reconciled.complete, reconcile(echoed, 1, lastDone(4, .cancelled, 0)));

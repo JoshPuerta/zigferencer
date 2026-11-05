@@ -40,26 +40,11 @@ const span = @import("../core/span.zig");
 const assert = std.debug.assert;
 const cache_line = std.atomic.cache_line;
 
-// -- types ------------------------------------------------------------------
-
-pub const InitError = std.Thread.SpawnError;
-
-/// One dispatch with its types erased. Only the participants of the current
-/// epoch read it.
-const Job = struct {
-    unit_fn: *const fn (ctx: *const anyopaque, unit: u32) void,
-    ctx: *const anyopaque,
-    n_units: u32,
-};
-
-/// One atomic word on a cache line of its own. The struct alignment rounds
-/// its size up to the line, so no other field shares the line.
-const Line = struct {
-    value: std.atomic.Value(u32) align(cache_line),
-};
+// -- constants --------------------------------------------------------------
 
 /// The epoch word packs a 24-bit sequence over an 8-bit participant count.
 const seq_bits: u5 = 24;
+
 const parts_bits: u5 = 8;
 const seq_mask: u32 = (1 << seq_bits) - 1;
 const parts_mask: u32 = (1 << parts_bits) - 1;
@@ -79,6 +64,24 @@ const ctl_stop: u32 = std.math.maxInt(u32);
 /// Pause iterations between two clock reads of the spin wait. A clock read
 /// costs more than one pause, so the wait reads it rarely.
 const spin_check: u32 = 64;
+
+// -- types ------------------------------------------------------------------
+
+pub const InitError = std.Thread.SpawnError;
+
+/// One dispatch with its types erased. Only the participants of the current
+/// epoch read it.
+const Job = struct {
+    unit_fn: *const fn (ctx: *const anyopaque, unit: u32) void,
+    ctx: *const anyopaque,
+    n_units: u32,
+};
+
+/// One atomic word on a cache line of its own. The struct alignment rounds
+/// its size up to the line, so no other field shares the line.
+const Line = struct {
+    value: std.atomic.Value(u32) align(cache_line),
+};
 
 /// The pool state. Each shared counter sits on a cache line of its own, so a
 /// claim does not slow the spin of a waiting worker.
@@ -106,6 +109,7 @@ pub const Pool = struct {
     pub fn init(self: *Pool, io: std.Io, n_threads: u32, spin_ns: u64) InitError!void {
         assert(n_threads >= 1);
         assert(n_threads <= limits.max_threads);
+
         self.* = .{
             .ctl = .{ .value = .init(ctl_idle) },
             .claim = .{ .value = .init(0) },
@@ -120,13 +124,20 @@ pub const Pool = struct {
             .workers = undefined,
         };
         if (builtin.single_threaded) return;
+
         var spawned: u32 = 0;
         errdefer self.stopWorkers(spawned);
+
         while (spawned < n_threads - 1) : (spawned += 1) {
             // Each worker starts from the idle word, not from a load of its
             // own. A load at thread start can miss a dispatch that ran first.
-            self.workers[spawned] = try std.Thread.spawn(.{}, workerMain, .{ self, spawned + 1, ctl_idle });
+            self.workers[spawned] = try std.Thread.spawn(
+                .{},
+                workerMain,
+                .{ self, spawned + 1, ctl_idle },
+            );
         }
+
         assert(spawned == n_threads - 1);
     }
 
@@ -134,7 +145,11 @@ pub const Pool = struct {
     pub fn deinit(self: *Pool) void {
         assert(!self.busy.load(.monotonic));
         assert(self.pending.value.load(.monotonic) == 0);
-        if (!builtin.single_threaded) self.stopWorkers(self.n_threads - 1);
+
+        if (!builtin.single_threaded) {
+            self.stopWorkers(self.n_threads - 1);
+        }
+
         self.* = undefined;
     }
 
@@ -142,6 +157,7 @@ pub const Pool = struct {
     pub fn threads(self: *const Pool) u32 {
         assert(self.n_threads >= 1);
         assert(self.n_threads <= limits.max_threads);
+
         return self.n_threads;
     }
 
@@ -162,6 +178,7 @@ pub const Pool = struct {
         assert(parts <= n_units);
         // The claim counter ends at `n_units + parts`, and it must not wrap.
         assert(n_units <= std.math.maxInt(u32) - limits.max_threads);
+
         const Erased = struct {
             fn call(erased: *const anyopaque, unit: u32) void {
                 unit_fn(@ptrCast(@alignCast(erased)), unit);
@@ -169,13 +186,19 @@ pub const Pool = struct {
         };
         self.enter();
         defer self.leave();
+
         const sp = span.beginHot(.pool_run);
         defer sp.end();
+
         if (builtin.single_threaded or parts == 1) {
             var unit: u32 = 0;
-            while (unit < n_units) : (unit += 1) unit_fn(ctx, unit);
+            while (unit < n_units) : (unit += 1) {
+                unit_fn(ctx, unit);
+            }
+
             return;
         }
+
         assert(self.pending.value.load(.monotonic) == 0);
         self.job = .{ .unit_fn = Erased.call, .ctx = ctx, .n_units = n_units };
         self.claim.value.store(parts, .monotonic);
@@ -187,10 +210,14 @@ pub const Pool = struct {
         if (self.sleepers.value.load(.seq_cst) > 0) {
             self.io.futexWake(u32, &self.ctl.value.raw, std.math.maxInt(u32));
         }
+
         runShare(&self.job, &self.claim.value, 0);
         // The wait ends when the last of `parts - 1` workers finishes its
         // claims. Each worker makes at most `n_units - parts` claims plus one.
-        while (self.pending.value.load(.acquire) != 0) std.Thread.yield() catch {};
+        while (self.pending.value.load(.acquire) != 0) {
+            std.Thread.yield() catch {};
+        }
+
         // Each participant made one failed claim, so the counter holds every
         // unit plus one claim per participant.
         assert(self.claim.value.load(.monotonic) == n_units + parts);
@@ -214,9 +241,13 @@ pub const Pool = struct {
     /// workers.
     fn stopWorkers(self: *Pool, count: u32) void {
         assert(count < limits.max_threads);
+
         self.ctl.value.store(ctl_stop, .seq_cst);
         self.io.futexWake(u32, &self.ctl.value.raw, std.math.maxInt(u32));
-        for (self.workers[0..count]) |worker| worker.join();
+        for (self.workers[0..count]) |worker| {
+            worker.join();
+        }
+
         assert(self.ctl.value.load(.monotonic) == ctl_stop);
     }
 
@@ -224,6 +255,7 @@ pub const Pool = struct {
     fn workerMain(self: *Pool, w: u32, seen_first: u32) void {
         assert(w >= 1);
         assert(w < self.n_threads);
+
         var name_buf: [16]u8 = undefined;
         span.nameThread(std.fmt.bufPrint(&name_buf, "zf-pool-{d}", .{w}) catch unreachable);
         var seen = seen_first;
@@ -235,6 +267,7 @@ pub const Pool = struct {
             seen = word;
             if (word == ctl_stop) return;
             if (w >= unpackParts(word)) continue;
+
             runShare(&self.job, &self.claim.value, w);
             _ = self.pending.value.fetchSub(1, .release);
         }
@@ -250,11 +283,13 @@ pub const Pool = struct {
             while (true) {
                 const word = self.ctl.value.load(.acquire);
                 if (word != seen) return word;
+
                 std.atomic.spinLoopHint();
                 spins +%= 1;
                 if (spins % spin_check == 0 and nowNs(self.io) - start >= self.spin_ns) break;
             }
         }
+
         // The sleep loop runs once per wake-up. A spurious wake-up with no
         // new word goes back to sleep.
         while (true) {
@@ -262,6 +297,7 @@ pub const Pool = struct {
             if (self.ctl.value.load(.seq_cst) == seen) {
                 self.io.futexWaitUncancelable(u32, &self.ctl.value.raw, seen);
             }
+
             _ = self.sleepers.value.fetchSub(1, .monotonic);
             const word = self.ctl.value.load(.acquire);
             if (word != seen) return word;
@@ -269,10 +305,13 @@ pub const Pool = struct {
     }
 };
 
+// -- helpers ----------------------------------------------------------------
+
 /// Pack a sequence and a participant count into one epoch word.
 fn pack(seq: u32, parts: u32) u32 {
     assert(seq <= seq_mask);
     assert(parts <= parts_mask);
+
     const word = seq << parts_bits | parts;
     assert(unpackSeq(word) == seq);
     assert(unpackParts(word) == parts);
@@ -300,8 +339,6 @@ comptime {
     assert(@sizeOf(Line) == cache_line);
 }
 
-// -- helpers ----------------------------------------------------------------
-
 /// Run the first unit of a participant, then claim units until the counter
 /// passes the unit count. The loop ends after at most `n_units` claims.
 fn runShare(job: *const Job, claim: *std.atomic.Value(u32), first: u32) void {
@@ -309,6 +346,7 @@ fn runShare(job: *const Job, claim: *std.atomic.Value(u32), first: u32) void {
     assert(first < n_units);
     const sp = span.beginHot(.run_share);
     defer sp.end();
+
     job.unit_fn(job.ctx, first);
     while (true) {
         const unit = claim.fetchAdd(1, .monotonic);
@@ -334,7 +372,9 @@ const Counts = struct {
     }
 
     fn reset(self: Counts) void {
-        for (self.runs) |*r| r.store(0, .monotonic);
+        for (self.runs) |*r| {
+            r.store(0, .monotonic);
+        }
     }
 };
 
@@ -348,7 +388,9 @@ fn expectRuns(counts: Counts, n_units: u32, want: u32) !void {
 /// Wait until every worker of the pool is inside its sleep loop. The wait is
 /// bounded: with `spin_ns = 0` every idle worker goes to sleep at once.
 fn awaitAllAsleep(pool: *Pool) void {
-    while (pool.sleepers.value.load(.seq_cst) != pool.n_threads - 1) std.Thread.yield() catch {};
+    while (pool.sleepers.value.load(.seq_cst) != pool.n_threads - 1) {
+        std.Thread.yield() catch {};
+    }
 }
 
 test "pool: pack and unpack, the anchors of the epoch word" {
@@ -365,6 +407,7 @@ test "pool: pack and unpack, the anchors of the epoch word" {
         try testing.expectEqual(a.seq, unpackSeq(a.word));
         try testing.expectEqual(a.parts, unpackParts(a.word));
     }
+
     try testing.expectEqual(ctl_stop, pack(seq_mask, 255));
     try testing.expectEqual(ctl_idle, pack(0, 0));
 }
@@ -379,6 +422,7 @@ fn checkPoolShape(_: void, c: prop.Trial) anyerror!void {
     var pool: Pool = undefined;
     try pool.init(testing.io, n_threads, spin_ns);
     defer pool.deinit();
+
     for (0..20) |_| {
         const n_units = random.intRangeAtMost(u32, 1, runs.len);
         const parts = random.intRangeAtMost(u32, 1, @min(n_threads, n_units));
@@ -389,7 +433,13 @@ fn checkPoolShape(_: void, c: prop.Trial) anyerror!void {
 }
 
 test "pool: every unit runs exactly once over seeded shapes, up to 48 threads" {
-    try prop.forAll(.{ .site = 0x9001_f0c5, .cases = 24, .max_size = 23 }, {}, prop.Trial, prop.genTrial(void), checkPoolShape);
+    try prop.forAll(
+        .{ .site = 0x9001_f0c5, .cases = 24, .max_size = 23 },
+        {},
+        prop.Trial,
+        prop.genTrial(void),
+        checkPoolShape,
+    );
 }
 
 test "pool: 100 init and deinit cycles" {
@@ -401,6 +451,7 @@ test "pool: 100 init and deinit cycles" {
         var pool: Pool = undefined;
         try pool.init(testing.io, n_threads, spin_ns);
         defer pool.deinit();
+
         try testing.expectEqual(n_threads, pool.threads());
         // Every other cycle ends with no dispatch, so deinit also meets
         // workers that never left their first wait.
@@ -414,11 +465,13 @@ test "pool: 100 init and deinit cycles" {
 
 test "pool: dispatch and deinit while every worker sleeps" {
     if (builtin.single_threaded) return error.SkipZigTest;
+
     var runs: [32]std.atomic.Value(u32) = undefined;
     const counts: Counts = .{ .runs = &runs };
     var pool: Pool = undefined;
     try pool.init(testing.io, 8, 0);
     defer pool.deinit();
+
     awaitAllAsleep(&pool);
     counts.reset();
     pool.run(Counts, &counts, Counts.unit, runs.len, 8);
@@ -432,6 +485,7 @@ test "pool: one participant runs inline and stores no shared word" {
     var pool: Pool = undefined;
     try pool.init(testing.io, 4, 0);
     defer pool.deinit();
+
     counts.reset();
     pool.run(Counts, &counts, Counts.unit, runs.len, 1);
     try expectRuns(counts, runs.len, 1);
@@ -448,8 +502,12 @@ test "pool: 10000 back-to-back dispatches of tiny units, spinning and sleeping" 
         var pool: Pool = undefined;
         try pool.init(testing.io, 4, spin_ns);
         defer pool.deinit();
+
         counts.reset();
-        for (0..10_000) |_| pool.run(Counts, &counts, Counts.unit, runs.len, 4);
+        for (0..10_000) |_| {
+            pool.run(Counts, &counts, Counts.unit, runs.len, 4);
+        }
+
         try expectRuns(counts, runs.len, 10_000);
         if (!builtin.single_threaded) {
             // The sequence advances once per dispatch.

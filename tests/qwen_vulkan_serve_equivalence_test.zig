@@ -36,10 +36,20 @@ const Stream = struct { tokens: [n_tokens]u32 };
 
 /// Build the plan for the fused runner: `n_slots` slots, the narrower test
 /// window past one slot, and no device budget.
-fn fusedPlan(loaded: *const loader.Loaded, n_slots: u32, kv_dtype: z.dtype.KvDtype) !z.kv_budget.KvPlan {
+fn fusedPlan(
+    loaded: *const loader.Loaded,
+    n_slots: u32,
+    kv_dtype: z.dtype.KvDtype,
+) !z.kv_budget.KvPlan {
     const window = if (n_slots <= 1) z.test_fakes.test_window else z.test_fakes.test_serve_window;
     return z.kv_budget.kvPlan(
-        qwen_fused.QwenFusedRunner.kvCaps(loaded, limits.contextCeiling(loaded.card.context_length, null), 0, n_slots, kv_dtype),
+        qwen_fused.QwenFusedRunner.kvCaps(
+            loaded,
+            limits.contextCeiling(loaded.card.context_length, null),
+            0,
+            n_slots,
+            kv_dtype,
+        ),
         qwen_fused.QwenFusedRunner.kvCostModel(loaded.card, kv_dtype),
         .{
             .window = @min(loaded.card.context_length, window),
@@ -54,14 +64,18 @@ fn batchedDecodeGate(kv_dtype: z.dtype.KvDtype) !void {
     const gpa = std.testing.allocator;
     var arena_state = std.heap.ArenaAllocator.init(gpa);
     defer arena_state.deinit();
+
     const arena = arena_state.allocator();
     const fixture = try z.test_fixtures.path(arena, "Qwen3.5-2B-Q8_0");
 
     var loaded = try loader.load(io, arena, fixture);
     defer loaded.close();
+
     var v = try vocab_mod.buildFromParsed(arena, loaded.parsed);
     var prompt_ids: [prompts.len][]const u32 = undefined;
-    for (prompts, 0..) |p, i| prompt_ids[i] = try bpe.encodeAlloc(&v, arena, p, true);
+    for (prompts, 0..) |p, i| {
+        prompt_ids[i] = try bpe.encodeAlloc(&v, arena, p, true);
+    }
 
     // -- cpu reference: each prompt alone on the batched CPU runner ---------
     var reference: [prompts.len]Stream = undefined;
@@ -69,7 +83,17 @@ fn batchedDecodeGate(kv_dtype: z.dtype.KvDtype) !void {
         var cpu_pool: tp.Pool = undefined;
         try tp.startPool(&cpu_pool, io, tp.policy());
         defer cpu_pool.deinit();
-        var runner = try QwenRunner.init(arena, &loaded, z.kv_budget.pinned(1, z.test_fakes.test_window), 0, io, &cpu_pool, tp.policy(), kv_dtype);
+
+        var runner = try QwenRunner.init(
+            arena,
+            &loaded,
+            z.kv_budget.pinned(1, z.test_fakes.test_window),
+            0,
+            io,
+            &cpu_pool,
+            tp.policy(),
+            kv_dtype,
+        );
         var pool = try Sessions(QwenRunner).init(arena, &runner);
         const sid = try pool.create(0, .{});
         reference[p].tokens[0] = (try pool.feed(sid, ids, true)).?;
@@ -84,9 +108,17 @@ fn batchedDecodeGate(kv_dtype: z.dtype.KvDtype) !void {
     const ctxp = try arena.create(vulkan_ctx.Context);
     ctxp.* = vulkan_ctx.Context.init(arena, .{}) catch return error.SkipZigTest;
     defer ctxp.deinit();
-    const fused = qwen_fused.QwenFusedRunner.init(gpa, ctxp, &loaded, try fusedPlan(&loaded, 3, kv_dtype), kv_dtype) catch
+
+    const fused = qwen_fused.QwenFusedRunner.init(
+        gpa,
+        ctxp,
+        &loaded,
+        try fusedPlan(&loaded, 3, kv_dtype),
+        kv_dtype,
+    ) catch
         return error.SkipZigTest;
     defer fused.deinit();
+
     var pool = try Sessions(qwen_fused.QwenFusedRunner).init(arena, fused);
 
     var sids: [prompts.len]u32 = undefined;
@@ -95,6 +127,7 @@ fn batchedDecodeGate(kv_dtype: z.dtype.KvDtype) !void {
         const first = (try pool.feed(sids[p], ids, true)).?;
         try std.testing.expectEqual(reference[p].tokens[0], first);
     }
+
     // Every tick round-trips slot 1 through a RAM blob with a deliberate
     // corruption in between. The round evicts the slot, overwrites it with the
     // state of slot 0, and restores the blob. An evict or a restore that
@@ -110,7 +143,9 @@ fn batchedDecodeGate(kv_dtype: z.dtype.KvDtype) !void {
         try fused.restoreSlot(1, rows, blob); // must fully undo it
         var out: [prompts.len]u32 = undefined;
         try pool.decodeBatch(&sids, &out);
-        for (0..prompts.len) |p| try std.testing.expectEqual(reference[p].tokens[k], out[p]);
+        for (0..prompts.len) |p| {
+            try std.testing.expectEqual(reference[p].tokens[k], out[p]);
+        }
     }
 
     // -- clone: the fork and its source continue identically ----------------
@@ -143,22 +178,36 @@ test "qwen GPU residency over-subscription: 2 logical sessions, 1 VRAM slot, str
     const gpa = std.testing.allocator;
     var arena_state = std.heap.ArenaAllocator.init(gpa);
     defer arena_state.deinit();
+
     const arena = arena_state.allocator();
     const fixture = try z.test_fixtures.path(arena, "Qwen3.5-2B-Q8_0");
 
     var loaded = try loader.load(io, arena, fixture);
     defer loaded.close();
+
     var v = try vocab_mod.buildFromParsed(arena, loaded.parsed);
     var prompt_ids: [prompts.len][]const u32 = undefined;
-    for (prompts, 0..) |p, i| prompt_ids[i] = try bpe.encodeAlloc(&v, arena, p, true);
+    for (prompts, 0..) |p, i| {
+        prompt_ids[i] = try bpe.encodeAlloc(&v, arena, p, true);
+    }
 
-    // CPU reference: each prompt alone, the in-repo oracle.
+    // CPU reference: each prompt alone.
     var reference: [prompts.len]Stream = undefined;
     for (prompt_ids, 0..) |ids, p| {
         var cpu_pool: tp.Pool = undefined;
         try tp.startPool(&cpu_pool, io, tp.policy());
         defer cpu_pool.deinit();
-        var runner = try QwenRunner.init(arena, &loaded, z.kv_budget.pinned(1, z.test_fakes.test_window), 0, io, &cpu_pool, tp.policy(), .f32);
+
+        var runner = try QwenRunner.init(
+            arena,
+            &loaded,
+            z.kv_budget.pinned(1, z.test_fakes.test_window),
+            0,
+            io,
+            &cpu_pool,
+            tp.policy(),
+            .f32,
+        );
         var pool = try Sessions(QwenRunner).init(arena, &runner);
         const sid = try pool.create(0, .{});
         reference[p].tokens[0] = (try pool.feed(sid, ids, true)).?;
@@ -178,11 +227,21 @@ test "qwen GPU residency over-subscription: 2 logical sessions, 1 VRAM slot, str
     const ctxp = try arena.create(vulkan_ctx.Context);
     ctxp.* = vulkan_ctx.Context.init(arena, .{}) catch return error.SkipZigTest;
     defer ctxp.deinit();
-    const fused = qwen_fused.QwenFusedRunner.init(gpa, ctxp, &loaded, try fusedPlan(&loaded, 1, .f32), .f32) catch
+
+    const fused = qwen_fused.QwenFusedRunner.init(
+        gpa,
+        ctxp,
+        &loaded,
+        try fusedPlan(&loaded, 1, .f32),
+        .f32,
+    ) catch
         return error.SkipZigTest;
     defer fused.deinit();
+
     var sessions = try Sessions(qwen_fused.QwenFusedRunner).init(arena, fused);
-    var res = try Residency(Sessions(qwen_fused.QwenFusedRunner)).init(arena, gpa, &sessions, 2, null);
+    var res = try Residency(
+        Sessions(qwen_fused.QwenFusedRunner),
+    ).init(arena, gpa, &sessions, 2, null);
     defer res.deinit();
 
     var sids: [prompts.len]u32 = undefined;
@@ -191,6 +250,7 @@ test "qwen GPU residency over-subscription: 2 logical sessions, 1 VRAM slot, str
         const first = (try res.feed(sids[p], ids, true)).?; // the second feed evicts the first
         try std.testing.expectEqual(reference[p].tokens[0], first);
     }
+
     for (1..n_tokens) |k| {
         for (0..prompts.len) |p| {
             var out: [1]u32 = undefined;
@@ -198,6 +258,7 @@ test "qwen GPU residency over-subscription: 2 logical sessions, 1 VRAM slot, str
             try std.testing.expectEqual(reference[p].tokens[k], out[0]);
         }
     }
+
     res.destroy(sids[0]);
     res.destroy(sids[1]);
 }
@@ -223,11 +284,13 @@ test "qwen GPU prefix restore: a warm-restored prefix continues bit-exactly" {
     const gpa = std.testing.allocator;
     var arena_state = std.heap.ArenaAllocator.init(gpa);
     defer arena_state.deinit();
+
     const arena = arena_state.allocator();
     const fixture = try z.test_fixtures.path(arena, "Qwen3.5-2B-Q8_0");
 
     var loaded = try loader.load(io, arena, fixture);
     defer loaded.close();
+
     var v = try vocab_mod.buildFromParsed(arena, loaded.parsed);
     const ids = try bpe.encodeAlloc(&v, arena, prompts[0], true);
     std.debug.assert(ids.len >= 2); // the split needs a prefix row and a suffix row
@@ -236,9 +299,17 @@ test "qwen GPU prefix restore: a warm-restored prefix continues bit-exactly" {
     const ctxp = try arena.create(vulkan_ctx.Context);
     ctxp.* = vulkan_ctx.Context.init(arena, .{}) catch return error.SkipZigTest;
     defer ctxp.deinit();
-    const fused = qwen_fused.QwenFusedRunner.init(gpa, ctxp, &loaded, try fusedPlan(&loaded, 2, .f32), .f32) catch
+
+    const fused = qwen_fused.QwenFusedRunner.init(
+        gpa,
+        ctxp,
+        &loaded,
+        try fusedPlan(&loaded, 2, .f32),
+        .f32,
+    ) catch
         return error.SkipZigTest;
     defer fused.deinit();
+
     var pool = try Sessions(qwen_fused.QwenFusedRunner).init(arena, fused);
 
     // Cold: feed the prefix without asking for logits, snapshot those rows,

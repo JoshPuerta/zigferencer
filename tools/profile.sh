@@ -385,7 +385,7 @@ main() {
         report) cmd_report "$@" ;;
         calls) cmd_calls "$@" ;;
         offcpu) cmd_offcpu "$@" ;;
-        *) die "unknown subcommand '$sub'" ;;
+        *) die "unknown command '$sub'" ;;
     esac
 }
 

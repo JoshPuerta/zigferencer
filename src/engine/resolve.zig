@@ -135,7 +135,7 @@ pub const Resolved = struct {
     window: Window,
     /// The all-host arm, or null when the boot takes a device arm. A device
     /// arm that falls back to the host calls `cpuArm` itself. A RAM refusal
-    /// rides here, so the CLI reports it where the arm starts, after the boot
+    /// comes here, so the CLI reports it where the arm starts, after the boot
     /// lines that come before it.
     cpu: ?Result(CpuArm),
     /// The device arm, when the boot opens a device and the facts state it.
@@ -160,7 +160,13 @@ pub const Refusal = union(enum) {
     /// is the auto pin.
     whole_model_split: ?u32,
     kv_vram_ceiling: struct { window: u32, ceiling: u32 },
-    kv_vram_small: struct { x_bytes: u64, rows: u64, per_slot: u64, window: u32, clamp: ?device_arm.Clamp },
+    kv_vram_small: struct {
+        x_bytes: u64,
+        rows: u64,
+        per_slot: u64,
+        window: u32,
+        clamp: ?device_arm.Clamp,
+    },
 };
 
 pub fn Result(comptime T: type) type {
@@ -179,9 +185,11 @@ pub fn needsDevice(kind: Kind, flags: EngineFlags, card: loader.ModelCard) bool 
         const zero = if (flags.gpu_layers) |g| g.isZeroCount() else false;
         return !zero;
     }
+
     if (comptime build_options.use_vulkan_ops) {
         return kind != .serve and card.arch != .qwen35;
     }
+
     return false;
 }
 
@@ -192,8 +200,10 @@ pub fn early(kind: Kind, input: Input, entry: Entry) Result(Early) {
     const thinking: chat.ThinkingFlag = if (kind == .bench) .auto else flags.thinking;
     const chat_kind = chat.resolveThinking(entry.chat_template_kind, thinking) catch
         return .{ .refused = .thinking_unsupported };
-    if (kind == .serve and flags.thinking_budget > 0 and chat_kind != .chatml_qwen)
+    if (kind == .serve and flags.thinking_budget > 0 and chat_kind != .chatml_qwen) {
         return .{ .refused = .thinking_budget_unsupported };
+    }
+
     const kv_dtype = flags.kv_dtype orelse entry.kv_dtype_default;
     if (comptime build_options.use_vulkan_ops) {
         // The serve paths never start the per-op kernel context, and the
@@ -201,22 +211,39 @@ pub fn early(kind: Kind, input: Input, entry: Entry) Result(Early) {
         if (kind == .serve) return .{ .refused = .serve_per_op_vulkan };
         if (kv_dtype != .f32) return .{ .refused = .{ .kv_dtype_per_op_vulkan = kv_dtype } };
     }
+
     return .{ .ok = .{ .chat_kind = chat_kind, .kv_dtype = kv_dtype } };
 }
 
 /// The whole boot after the load. `card` is the parsed model card.
-pub fn resolve(kind: Kind, input: Input, entry: Entry, card: loader.ModelCard, facts: Facts) Result(Resolved) {
+pub fn resolve(
+    kind: Kind,
+    input: Input,
+    entry: Entry,
+    card: loader.ModelCard,
+    facts: Facts,
+) Result(Resolved) {
     const e = switch (early(kind, input, entry)) {
         .ok => |v| v,
         .refused => |r| return .{ .refused = r },
     };
+
     const ceiling = limits.contextCeiling(card.context_length, entry.context_limit);
     const cost = kv_budget.costModel(card.kvShape(), e.kv_dtype);
-    const session_bytes = if (kind == .serve) limits.serve_session_kv_bytes else limits.run_session_kv_bytes;
+    const session_bytes = if (kind == .serve)
+        limits.serve_session_kv_bytes
+    else
+        limits.run_session_kv_bytes;
+
     const default_window = kv_budget.defaultWindow(cost, ceiling, session_bytes);
     const base = baseWindow(input.engine.max_seq, ceiling, default_window) catch
         return .{ .refused = .{ .window_out_of_range = ceiling } };
-    const window: Window = .{ .base = base, .ceiling = ceiling, .flag = input.engine.max_seq, .session_bytes = session_bytes };
+    const window: Window = .{
+        .base = base,
+        .ceiling = ceiling,
+        .flag = input.engine.max_seq,
+        .session_bytes = session_bytes,
+    };
     std.debug.assert(window.base <= window.ceiling);
 
     var out: Resolved = .{ .early = e, .window = window, .cpu = null };
@@ -225,6 +252,7 @@ pub fn resolve(kind: Kind, input: Input, entry: Entry, card: loader.ModelCard, f
     } else if (facts.device != null) {
         out.device = device_arm.arm(kind, input, card, e.kv_dtype, window, facts);
     }
+
     return .{ .ok = out };
 }
 
@@ -232,7 +260,14 @@ pub fn resolve(kind: Kind, input: Input, entry: Entry, card: loader.ModelCard, f
 /// session resident, prices the residency stages, and gives the prefix cache
 /// the named Y or the serve default. Run and bench hold one slot and price no
 /// stage.
-pub fn cpuArm(kind: Kind, input: Input, card: loader.ModelCard, kv_dtype: dtype.KvDtype, w: Window, facts: Facts) Result(CpuArm) {
+pub fn cpuArm(
+    kind: Kind,
+    input: Input,
+    card: loader.ModelCard,
+    kv_dtype: dtype.KvDtype,
+    w: Window,
+    facts: Facts,
+) Result(CpuArm) {
     const window = w.base;
     std.debug.assert(window >= 1);
     std.debug.assert(window <= limits.max_model_ctx);
@@ -242,8 +277,17 @@ pub fn cpuArm(kind: Kind, input: Input, card: loader.ModelCard, kv_dtype: dtype.
     var n_logical: u32 = 1;
     const residency = kind == .serve;
     if (kind == .serve) {
-        if (shape.structural_slots < shape.max_sessions)
-            return .{ .refused = .{ .cpu_slots = .{ .slots = shape.structural_slots, .sessions = shape.max_sessions } } };
+        if (shape.structural_slots < shape.max_sessions) {
+            return .{
+                .refused = .{
+                    .cpu_slots = .{
+                        .slots = shape.structural_slots,
+                        .sessions = shape.max_sessions,
+                    },
+                },
+            };
+        }
+
         plan = kv_budget.pinned(shape.structural_slots, window);
         plan.ram.prefix = shape.kv_ram_bytes orelse limits.serve_prefix_ram_default;
         prefix_default = shape.kv_ram_bytes == null;
@@ -253,6 +297,7 @@ pub fn cpuArm(kind: Kind, input: Input, card: loader.ModelCard, kv_dtype: dtype.
     } else {
         plan = kv_budget.pinned(1, window);
     }
+
     const kv: kv_budget.KvStructure = .{
         .n_slots = plan.n_slots,
         .window = plan.window,
@@ -260,9 +305,30 @@ pub fn cpuArm(kind: Kind, input: Input, card: loader.ModelCard, kv_dtype: dtype.
     };
     const host: kv_budget.HostRequest = .{ .ram_split = plan.ram, .residency = residency };
     const named = kind == .serve and shape.kv_ram_bytes != null;
-    const quote = kv_budget.quoteRam(kv, card.n_layers, host, n_logical, named, facts.ram_free) catch |err| switch (err) {
-        error.HostRamBudgetTooSmall => return .{ .refused = .{ .host_ram = kv_budget.ramRefusal(kv, card.n_layers, host, facts.ram_free.?) } },
-        error.BlobRamBudgetTooSmall => return .{ .refused = .{ .blob_ram = kv_budget.blobRefusal(kv, card.n_layers, host, n_logical, facts.ram_free.?) } },
+    const quote = kv_budget.quoteRam(
+        kv,
+        card.n_layers,
+        host,
+        n_logical,
+        named,
+        facts.ram_free,
+    ) catch |err| switch (err) {
+        error.HostRamBudgetTooSmall => return .{
+            .refused = .{
+                .host_ram = kv_budget.ramRefusal(kv, card.n_layers, host, facts.ram_free.?),
+            },
+        },
+        error.BlobRamBudgetTooSmall => return .{
+            .refused = .{
+                .blob_ram = kv_budget.blobRefusal(
+                    kv,
+                    card.n_layers,
+                    host,
+                    n_logical,
+                    facts.ram_free.?,
+                ),
+            },
+        },
     };
     std.debug.assert(plan.window == window);
     return .{ .ok = .{ .plan = plan, .prefix_default = prefix_default, .quote = quote } };
@@ -271,15 +337,26 @@ pub fn cpuArm(kind: Kind, input: Input, card: loader.ModelCard, kv_dtype: dtype.
 /// The host arm of a llama `run`. A fused build plans the one stream against
 /// the reservations of the fused runner at no VRAM, so the placement line
 /// prices what the device arm prices. A host build states no device bytes.
-pub fn runHost(card: loader.ModelCard, model: ?ModelFacts, kv_dtype: dtype.KvDtype, w: Window) RunHost {
+pub fn runHost(
+    card: loader.ModelCard,
+    model: ?ModelFacts,
+    kv_dtype: dtype.KvDtype,
+    w: Window,
+) RunHost {
     std.debug.assert(card.gdn == null);
     std.debug.assert(w.base <= w.ceiling);
+
     const m = model orelse return .{ .plan = kv_budget.pinned(1, w.base), .report = null };
     const c = device_arm.caps(card, m, 0, w.ceiling, 1, kv_dtype);
     const plan = if (comptime build_options.use_vulkan_fused_ops)
-        kv_budget.kvPlan(c, kv_budget.costModel(card.kvShape(), kv_dtype), .{ .window = w.base, .batch = 1 }) catch unreachable
+        kv_budget.kvPlan(
+            c,
+            kv_budget.costModel(card.kvShape(), kv_dtype),
+            .{ .window = w.base, .batch = 1 },
+        ) catch unreachable
     else
         kv_budget.pinned(1, w.base);
+
     std.debug.assert(plan.window == w.base);
     return .{ .plan = plan, .report = device_arm.report(c, card, m, kv_dtype, plan) };
 }
@@ -292,8 +369,10 @@ pub fn baseWindow(flag: ?u32, ceiling: u32, default_window: u32) error{WindowOut
     std.debug.assert(ceiling <= limits.max_model_ctx);
     std.debug.assert(default_window >= 1);
     std.debug.assert(default_window <= ceiling);
+
     const w = flag orelse return default_window;
     if (w == 0 or w > ceiling) return error.WindowOutOfRange;
+
     std.debug.assert(w >= 1);
     std.debug.assert(w <= ceiling);
     return w;
@@ -355,8 +434,18 @@ fn qwenCard() loader.ModelCard {
     };
 }
 
-const smollm2_entry: Entry = .{ .pub_name = "SmolLM2-135M-Instruct-Q8_0", .chat_template_kind = .chatml_smollm2, .kv_dtype_default = .f32, .context_limit = null };
-const qwen_entry: Entry = .{ .pub_name = "Qwen3.5-2B-Q8_0", .chat_template_kind = .{ .chatml_qwen = .off }, .kv_dtype_default = .f16, .context_limit = null };
+const smollm2_entry: Entry = .{
+    .pub_name = "SmolLM2-135M-Instruct-Q8_0",
+    .chat_template_kind = .chatml_smollm2,
+    .kv_dtype_default = .f32,
+    .context_limit = null,
+};
+const qwen_entry: Entry = .{
+    .pub_name = "Qwen3.5-2B-Q8_0",
+    .chat_template_kind = .{ .chatml_qwen = .off },
+    .kv_dtype_default = .f16,
+    .context_limit = null,
+};
 
 /// One row of the CPU boot-log oracle: the command and its flags, and the
 /// figures its log lines state.
@@ -415,16 +504,21 @@ const rows = [_]Row{
 };
 
 test "resolve: the CPU oracle rows resolve to their logged window, slots, and RAM" {
-    if (comptime build_options.use_vulkan_ops or build_options.use_vulkan_fused_ops) return error.SkipZigTest;
+    if (comptime build_options.use_vulkan_ops or build_options.use_vulkan_fused_ops) {
+        return error.SkipZigTest;
+    }
+
     for (rows) |row| {
         const facts: Facts = .{ .ram_free = row.ram_mib * mib };
         const card = if (row.qwen) qwenCard() else smollm2Card();
         const entry = if (row.qwen) qwen_entry else smollm2_entry;
         const got = resolve(row.kind, row.input, entry, card, facts);
         errdefer std.debug.print("row {s}\n", .{row.name});
+
         switch (row.want) {
             .refused => |tag| {
-                // A window or flag refusal stops the boot. A RAM or slot refusal rides on the host arm.
+                // A window or flag refusal stops the boot. A RAM or slot refusal goes with the host
+                // arm.
                 const refusal = switch (got) {
                     .refused => |r| r,
                     .ok => |r| switch (r.cpu.?) {
@@ -432,6 +526,7 @@ test "resolve: the CPU oracle rows resolve to their logged window, slots, and RA
                         .ok => return error.TestUnexpectedResult,
                     },
                 };
+
                 try std.testing.expectEqual(tag, std.meta.activeTag(refusal));
             },
             .ok => |w| {
@@ -439,6 +534,7 @@ test "resolve: the CPU oracle rows resolve to their logged window, slots, and RA
                     .ok => |v| v,
                     .refused => return error.TestUnexpectedResult,
                 };
+
                 const arm = r.cpu.?.ok;
                 try std.testing.expectEqual(w.window, arm.plan.window);
                 try std.testing.expectEqual(w.slots, arm.plan.n_slots);
@@ -450,11 +546,19 @@ test "resolve: the CPU oracle rows resolve to their logged window, slots, and RA
 }
 
 test "resolve: a RAM figure below the host KV refuses with the host tag" {
-    if (comptime build_options.use_vulkan_ops or build_options.use_vulkan_fused_ops) return error.SkipZigTest;
+    if (comptime build_options.use_vulkan_ops or build_options.use_vulkan_fused_ops) {
+        return error.SkipZigTest;
+    }
+
     const got = resolve(.run, .{}, qwen_entry, qwenCard(), .{ .ram_free = 64 * mib });
-    try std.testing.expectEqual(std.meta.Tag(Refusal).host_ram, std.meta.activeTag(got.ok.cpu.?.refused));
+    try std.testing.expectEqual(
+        std.meta.Tag(Refusal).host_ram,
+        std.meta.activeTag(got.ok.cpu.?.refused),
+    );
     // An absent figure checks nothing, so the same boot resolves.
-    try std.testing.expect(resolve(.run, .{}, qwen_entry, qwenCard(), .{ .ram_free = null }) == .ok);
+    try std.testing.expect(
+        resolve(.run, .{}, qwen_entry, qwenCard(), .{ .ram_free = null }) == .ok,
+    );
 }
 
 const Case = struct {
@@ -470,16 +574,26 @@ fn genCase(_: void, r: std.Random, size: u32) Case {
     const qwen = r.boolean();
     const ceiling_hint: u32 = if (qwen) 262144 else 8192;
     var input: Input = .{};
-    if (r.boolean()) input.engine.max_seq = r.uintAtMost(u32, ceiling_hint + 2 + size);
-    if (r.boolean()) input.engine.kv_dtype = r.enumValue(dtype.KvDtype);
+    if (r.boolean()) {
+        input.engine.max_seq = r.uintAtMost(u32, ceiling_hint + 2 + size);
+    }
+
+    if (r.boolean()) {
+        input.engine.kv_dtype = r.enumValue(dtype.KvDtype);
+    }
+
     if (kind == .serve) {
         const sessions = r.intRangeAtMost(u16, 1, 8);
         input.serve = .{
             .max_sessions = sessions,
             .structural_slots = r.intRangeAtMost(u16, 1, sessions),
-            .kv_ram_bytes = if (r.boolean()) (@as(u64, r.uintAtMost(u32, 4096)) + 1) * mib else null,
+            .kv_ram_bytes = if (r.boolean()) (@as(
+                u64,
+                r.uintAtMost(u32, 4096),
+            ) + 1) * mib else null,
         };
     }
+
     return .{
         .kind = kind,
         .qwen = qwen,
@@ -500,19 +614,29 @@ fn checkCase(_: void, c: Case) anyerror!void {
             // The generated flags break no other rule, so the only legal refusal is a
             // named window of zero or past the ceiling.
             const ceiling = limits.contextCeiling(card.context_length, c.context_limit);
-            try std.testing.expectEqual(std.meta.Tag(Refusal).window_out_of_range, std.meta.activeTag(refusal));
+            try std.testing.expectEqual(
+                std.meta.Tag(Refusal).window_out_of_range,
+                std.meta.activeTag(refusal),
+            );
             try std.testing.expectEqual(ceiling, refusal.window_out_of_range);
             const w = c.input.engine.max_seq orelse return error.TestUnexpectedResult;
             try std.testing.expect(w == 0 or w > ceiling);
             return;
         },
     };
+
     // A window never passes the ceiling, and a named window is the window.
     try std.testing.expect(r.window.base >= 1);
     try std.testing.expect(r.window.base <= r.window.ceiling);
     try std.testing.expect(r.window.ceiling <= card.context_length);
-    if (c.context_limit) |l| try std.testing.expect(r.window.ceiling <= l);
-    if (c.input.engine.max_seq) |w| try std.testing.expectEqual(w, r.window.base);
+    if (c.context_limit) |l| {
+        try std.testing.expect(r.window.ceiling <= l);
+    }
+
+    if (c.input.engine.max_seq) |w| {
+        try std.testing.expectEqual(w, r.window.base);
+    }
+
     const arm = switch (r.cpu orelse return) {
         .ok => |a| a,
         .refused => |refusal| {
@@ -522,17 +646,25 @@ fn checkCase(_: void, c: Case) anyerror!void {
                 .cpu_slots => |s| try std.testing.expect(s.slots < s.sessions),
                 else => return error.TestUnexpectedResult,
             }
+
             return;
         },
     };
+
     // A plan never spends more host RAM than the facts it was given.
-    if (c.ram_free) |free| try std.testing.expect(arm.quote.ram.spend() <= free);
+    if (c.ram_free) |free| {
+        try std.testing.expect(arm.quote.ram.spend() <= free);
+    }
+
     try std.testing.expect(arm.plan.n_slots >= 1);
     try std.testing.expectEqual(r.window.base, arm.plan.window);
 }
 
 test "resolve: no window past the ceiling, no plan past the RAM it was given" {
-    if (comptime build_options.use_vulkan_ops or build_options.use_vulkan_fused_ops) return error.SkipZigTest;
+    if (comptime build_options.use_vulkan_ops or build_options.use_vulkan_fused_ops) {
+        return error.SkipZigTest;
+    }
+
     try prop.forAll(.{ .site = 0x7265736f6c766521 }, {}, Case, genCase, checkCase);
 }
 
@@ -542,7 +674,10 @@ test "resolve: no window past the ceiling, no plan past the RAM it was given" {
 /// head. The ledger lines of the device rows state 50 MiB for six layers.
 fn smollm2Model() ModelFacts {
     var m: ModelFacts = .{ .n_layers = 30, .layer_weights = @splat(0), .head_weights = 30_083_328 };
-    for (m.layer_weights[0..30]) |*w| w.* = 3_764_736;
+    for (m.layer_weights[0..30]) |*w| {
+        w.* = 3_764_736;
+    }
+
     m.weights = 143_025_408;
     m.scratch = .initFill(64 * mib);
     m.logits_row = 49_152 * 4;
@@ -553,8 +688,15 @@ fn smollm2Model() ModelFacts {
 /// and lighter, and the head is tied. The ledger lines state 860 MiB for six
 /// layers.
 fn qwenModel() ModelFacts {
-    var m: ModelFacts = .{ .n_layers = 24, .layer_weights = @splat(0), .head_weights = 540_352_512 };
-    for (m.layer_weights[0..24], 0..) |*w, i| w.* = if (i % 4 == 3) 55_724_032 else 62_575_232;
+    var m: ModelFacts = .{
+        .n_layers = 24,
+        .layer_weights = @splat(0),
+        .head_weights = 540_352_512,
+    };
+    for (m.layer_weights[0..24], 0..) |*w, i| {
+        w.* = if (i % 4 == 3) 55_724_032 else 62_575_232;
+    }
+
     m.weights = 2_001_050_880;
     m.scratch = .initFill(256 * mib);
     m.logits_row = 248_320 * 4;
@@ -566,7 +708,11 @@ fn qwenModel() ModelFacts {
 /// that funds every row stands for the live budget.
 const capture_device: DeviceFacts = .{
     .vram = 12 << 30,
-    .buffer_limits = .{ .storage_range = 128 << 20, .allocation_size = 2 << 30, .offset_alignment = 16 },
+    .buffer_limits = .{
+        .storage_range = 128 << 20,
+        .allocation_size = 2 << 30,
+        .offset_alignment = 16,
+    },
 };
 
 /// One row of the device boot-log oracle: the command, its flags, the storage
@@ -665,6 +811,7 @@ fn deviceRefusal(arm: Result(device_arm.Arm)) ?Refusal {
         .refused => |r| return r,
         .ok => |a| a,
     };
+
     return switch (a) {
         .fused => |f| if (f.quote == .refused) f.quote.refused else null,
         .hybrid => |h| if (h.quote == .refused) h.quote.refused else null,
@@ -673,11 +820,31 @@ fn deviceRefusal(arm: Result(device_arm.Arm)) ?Refusal {
 }
 
 /// The window, slots, VRAM KV, and RAM quote of the arm a device row takes.
-fn deviceShape(a: device_arm.Arm) struct { slots: u32, window: u32, vram_kv: u64, ram: kv_budget.PlacementPlan.Ram } {
+fn deviceShape(a: device_arm.Arm) struct {
+    slots: u32,
+    window: u32,
+    vram_kv: u64,
+    ram: kv_budget.PlacementPlan.Ram,
+} {
     return switch (a) {
-        .fused => |f| .{ .slots = f.plan.n_slots, .window = f.plan.window, .vram_kv = f.plan.vram.kv, .ram = f.quote.ok.ram },
-        .hybrid => |h| .{ .slots = h.plan.?.n_slots, .window = h.plan.?.window, .vram_kv = 0, .ram = h.quote.ok.ram },
-        .cpu => |c| .{ .slots = c.ok.plan.n_slots, .window = c.ok.plan.window, .vram_kv = 0, .ram = c.ok.quote.ram },
+        .fused => |f| .{
+            .slots = f.plan.n_slots,
+            .window = f.plan.window,
+            .vram_kv = f.plan.vram.kv,
+            .ram = f.quote.ok.ram,
+        },
+        .hybrid => |h| .{
+            .slots = h.plan.?.n_slots,
+            .window = h.plan.?.window,
+            .vram_kv = 0,
+            .ram = h.quote.ok.ram,
+        },
+        .cpu => |c| .{
+            .slots = c.ok.plan.n_slots,
+            .window = c.ok.plan.window,
+            .vram_kv = 0,
+            .ram = c.ok.quote.ram,
+        },
     };
 }
 
@@ -689,20 +856,41 @@ test "resolve: the device oracle rows resolve to their logged split, window, slo
         var device = capture_device;
         device.buffer_limits.storage_range = row.storage_range;
         device.vram = row.vram_mib * mib;
-        const facts: Facts = .{ .ram_free = row.ram_mib * mib, .model = if (row.qwen) qwenModel() else smollm2Model(), .device = device };
+        const facts: Facts = .{
+            .ram_free = row.ram_mib * mib,
+            .model = if (row.qwen) qwenModel() else smollm2Model(),
+            .device = device,
+        };
         // A host build resolves no device arm, so the row takes the window of
         // the boot and calls the device arm itself.
         const pre = early(row.kind, row.input, entry).ok;
-        const base = switch (resolve(row.kind, row.input, entry, card, .{ .ram_free = facts.ram_free })) {
+        const base = switch (resolve(
+            row.kind,
+            row.input,
+            entry,
+            card,
+            .{ .ram_free = facts.ram_free },
+        )) {
             .ok => |r| r.window,
             .refused => return error.TestUnexpectedResult,
         };
+
         const dev = device_arm.arm(row.kind, row.input, card, pre.kv_dtype, base, facts);
         errdefer std.debug.print("row {s}\n", .{row.name});
-        if (row.split) |want| try std.testing.expectEqual(want, dev.placed.?.split.?.split);
-        if (row.split == null and row.want != .refused) try std.testing.expect(dev.placed == null);
+
+        if (row.split) |want| {
+            try std.testing.expectEqual(want, dev.placed.?.split.?.split);
+        }
+
+        if (row.split == null and row.want != .refused) {
+            try std.testing.expect(dev.placed == null);
+        }
+
         switch (row.want) {
-            .refused => |tag| try std.testing.expectEqual(tag, std.meta.activeTag(deviceRefusal(dev.arm) orelse return error.TestUnexpectedResult)),
+            .refused => |tag| try std.testing.expectEqual(
+                tag,
+                std.meta.activeTag(deviceRefusal(dev.arm) orelse return error.TestUnexpectedResult),
+            ),
             .arm => |w| {
                 const a = dev.arm.ok;
                 try std.testing.expectEqual(w.tag, std.meta.activeTag(a));
@@ -715,10 +903,16 @@ test "resolve: the device oracle rows resolve to their logged split, window, slo
                 try std.testing.expectEqual(w.prefix_mib, got.ram.prefix / mib);
                 try std.testing.expectEqual(w.stages_mib, got.ram.swap_stages / mib);
                 // The run of a llama model states the all-device placement.
-                if (a == .fused and row.kind == .run and !row.qwen) try std.testing.expectEqual(@as(u32, 0), a.fused.report.?.split);
+                if (a == .fused and row.kind == .run and !row.qwen) {
+                    try std.testing.expectEqual(@as(u32, 0), a.fused.report.?.split);
+                }
             },
         }
-        const clamp = if (dev.placed) |p| p.clamp else if (dev.arm == .ok and dev.arm.ok == .fused) dev.arm.ok.fused.clamp else null;
+
+        const clamp = if (dev.placed) |p|
+            p.clamp
+        else if (dev.arm == .ok and dev.arm.ok == .fused) dev.arm.ok.fused.clamp else null;
+
         try std.testing.expectEqual(row.clamped, clamp != null);
         if (clamp) |c| {
             // The logged line: 178782208 bytes at 174592 positions, past the

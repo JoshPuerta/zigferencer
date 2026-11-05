@@ -5,7 +5,6 @@ zig-out/
 zig-pkg/
 
 # Downloaded models, and machine-local links into an external store.
-# Never tracked. `zigferencer fetch` gets them.
 models/
 
 # Editor / OS / tooling-local

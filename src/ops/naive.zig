@@ -4,7 +4,7 @@
 //! re-exports the remaining ops from here. It overrides the linear kernels, and
 //! the SIMD variants also override the attention part kernel and the serial row.
 //!
-//! This file is the correctness oracle. Every other variant must match its
+//! This file is the correctness reference. Every other variant must match its
 //! output inside a stated tolerance, and the variant tests plus the
 //! cross-backend bench check that. No fusion, no shortcuts. Each op asserts its
 //! shape preconditions and, under runtime safety, a finiteness postcondition.
@@ -17,10 +17,16 @@ const limits = @import("../core/limits.zig");
 const op_requires = @import("../core/op_requires.zig");
 const Tensor = @import("../core/tensor.zig").Tensor;
 
-// -- types ------------------------------------------------------------------
+// -- constants --------------------------------------------------------------
 
 const max_head_dim: usize = limits.attn_max_head_dim;
 const max_group: usize = limits.attn_max_group;
+
+/// The naive variant runs anywhere. It is the correctness reference every other
+/// variant validates against.
+pub const requires: op_requires.OpRequires = .{ .arch = .any };
+
+// -- types ------------------------------------------------------------------
 
 /// Which lanes form a RoPE rotation pair. The angle for pair i is the same
 /// either way. Only the memory layout differs. The layout must match how the
@@ -37,16 +43,13 @@ pub const RopeStyle = enum {
 
 // -- api --------------------------------------------------------------------
 
-/// The naive variant runs anywhere. It is the correctness oracle every other
-/// variant validates against.
-pub const requires: op_requires.OpRequires = .{ .arch = .any };
-
 /// Linear layer: `out = input @ W.T` with `W` in `[out, in]` row-major (the
 /// PyTorch layout that GGUF stores). GGUF's `weight.shape = [in, out]` is the
 /// reversed shape.
 pub fn linearF32(input: []const f32, weight: Tensor, out: []f32) void {
     std.debug.assert(weight.dtype == .f32);
     std.debug.assert(weight.n_dims == 2);
+
     const in_features: usize = @intCast(weight.shape[0]);
     const out_features: usize = @intCast(weight.shape[1]);
     std.debug.assert(input.len == in_features);
@@ -60,10 +63,14 @@ pub fn linearF32(input: []const f32, weight: Tensor, out: []f32) void {
         while (k < in_features) : (k += 1) {
             sum += input[k] * w[j * in_features + k];
         }
+
         out[j] = sum;
     }
+
     if (std.debug.runtime_safety) {
-        for (out[0..out_features]) |x| std.debug.assert(std.math.isFinite(x));
+        for (out[0..out_features]) |x| {
+            std.debug.assert(std.math.isFinite(x));
+        }
     }
 }
 
@@ -72,6 +79,7 @@ pub fn linearF32(input: []const f32, weight: Tensor, out: []f32) void {
 pub fn linearF32Q80(input: []const f32, weight: Tensor, out: []f32) void {
     std.debug.assert(weight.dtype == .q8_0);
     std.debug.assert(weight.n_dims == 2);
+
     const in_features: usize = @intCast(weight.shape[0]);
     const out_features: usize = @intCast(weight.shape[1]);
     std.debug.assert(input.len == in_features);
@@ -93,10 +101,14 @@ pub fn linearF32Q80(input: []const f32, weight: Tensor, out: []f32) void {
                 sum += input[blk * 32 + i] * scale * @as(f32, @floatFromInt(v));
             }
         }
+
         out[j] = sum;
     }
+
     if (std.debug.runtime_safety) {
-        for (out[0..out_features]) |x| std.debug.assert(std.math.isFinite(x));
+        for (out[0..out_features]) |x| {
+            std.debug.assert(std.math.isFinite(x));
+        }
     }
 }
 
@@ -108,10 +120,17 @@ pub fn linearF32Q80(input: []const f32, weight: Tensor, out: []f32) void {
 /// inputs. For one (row, output) pair the reduction order is exactly the
 /// `linearF32` order, so each row's result is bit-identical to a B=1 call. The
 /// engine batch tests pin that equivalence.
-pub fn linearF32Batch(inputs: []const f32, weight: Tensor, outs: []f32, batch: usize, out_stride: usize) void {
+pub fn linearF32Batch(
+    inputs: []const f32,
+    weight: Tensor,
+    outs: []f32,
+    batch: usize,
+    out_stride: usize,
+) void {
     std.debug.assert(weight.dtype == .f32);
     std.debug.assert(weight.n_dims == 2);
     std.debug.assert(batch > 0);
+
     const in_features: usize = @intCast(weight.shape[0]);
     const out_features: usize = @intCast(weight.shape[1]);
     std.debug.assert(inputs.len == batch * in_features);
@@ -129,13 +148,17 @@ pub fn linearF32Batch(inputs: []const f32, weight: Tensor, outs: []f32, batch: u
             while (k < in_features) : (k += 1) {
                 sum += input[k] * w[j * in_features + k];
             }
+
             outs[b * out_stride + j] = sum;
         }
     }
+
     if (std.debug.runtime_safety) {
         var b: usize = 0;
         while (b < batch) : (b += 1) {
-            for (outs[b * out_stride ..][0..out_features]) |x| std.debug.assert(std.math.isFinite(x));
+            for (outs[b * out_stride ..][0..out_features]) |x| {
+                std.debug.assert(std.math.isFinite(x));
+            }
         }
     }
 }
@@ -145,10 +168,17 @@ pub fn linearF32Batch(inputs: []const f32, weight: Tensor, outs: []f32, batch: u
 /// `outs[b*out_stride ..][0..out]`, the same rule as `linearF32Batch`. For one
 /// (row, output) pair the block walk and accumulation order are exactly the
 /// `linearF32Q80` ones.
-pub fn linearF32Q80Batch(inputs: []const f32, weight: Tensor, outs: []f32, batch: usize, out_stride: usize) void {
+pub fn linearF32Q80Batch(
+    inputs: []const f32,
+    weight: Tensor,
+    outs: []f32,
+    batch: usize,
+    out_stride: usize,
+) void {
     std.debug.assert(weight.dtype == .q8_0);
     std.debug.assert(weight.n_dims == 2);
     std.debug.assert(batch > 0);
+
     const in_features: usize = @intCast(weight.shape[0]);
     const out_features: usize = @intCast(weight.shape[1]);
     std.debug.assert(inputs.len == batch * in_features);
@@ -167,20 +197,26 @@ pub fn linearF32Q80Batch(inputs: []const f32, weight: Tensor, outs: []f32, batch
             var blk: usize = 0;
             while (blk < in_features / 32) : (blk += 1) {
                 const blk_off = row_off + blk * 34;
-                const scale = f16BitsToF32(std.mem.readInt(u16, weight.data[blk_off..][0..2], .little));
+                const scale = f16BitsToF32(
+                    std.mem.readInt(u16, weight.data[blk_off..][0..2], .little),
+                );
                 var i: usize = 0;
                 while (i < 32) : (i += 1) {
                     const v: i8 = @bitCast(weight.data[blk_off + 2 + i]);
                     sum += input[blk * 32 + i] * scale * @as(f32, @floatFromInt(v));
                 }
             }
+
             outs[b * out_stride + j] = sum;
         }
     }
+
     if (std.debug.runtime_safety) {
         var b: usize = 0;
         while (b < batch) : (b += 1) {
-            for (outs[b * out_stride ..][0..out_features]) |x| std.debug.assert(std.math.isFinite(x));
+            for (outs[b * out_stride ..][0..out_features]) |x| {
+                std.debug.assert(std.math.isFinite(x));
+            }
         }
     }
 }
@@ -200,6 +236,7 @@ pub fn linearBatchPerRow(
 ) void {
     std.debug.assert(weight.n_dims == 2);
     std.debug.assert(batch > 0);
+
     const in_features: usize = @intCast(weight.shape[0]);
     const out_features: usize = @intCast(weight.shape[1]);
     std.debug.assert(inputs.len == batch * in_features);
@@ -208,7 +245,11 @@ pub fn linearBatchPerRow(
 
     var b: usize = 0;
     while (b < batch) : (b += 1) {
-        kernel(inputs[b * in_features ..][0..in_features], weight, outs[b * out_stride ..][0..out_features]);
+        kernel(
+            inputs[b * in_features ..][0..in_features],
+            weight,
+            outs[b * out_stride ..][0..out_features],
+        );
     }
 }
 
@@ -220,6 +261,7 @@ pub fn linearBatchPerRow(
 pub fn linearF32Q40(input: []const f32, weight: Tensor, out: []f32) void {
     std.debug.assert(weight.dtype == .q4_0);
     std.debug.assert(weight.n_dims == 2);
+
     const in_features: usize = @intCast(weight.shape[0]);
     const out_features: usize = @intCast(weight.shape[1]);
     std.debug.assert(input.len == in_features);
@@ -244,10 +286,14 @@ pub fn linearF32Q40(input: []const f32, weight: Tensor, out: []f32) void {
                 sum += input[blk * 32 + 16 + i] * scale * @as(f32, @floatFromInt(hi));
             }
         }
+
         out[j] = sum;
     }
+
     if (std.debug.runtime_safety) {
-        for (out[0..out_features]) |x| std.debug.assert(std.math.isFinite(x));
+        for (out[0..out_features]) |x| {
+            std.debug.assert(std.math.isFinite(x));
+        }
     }
 }
 
@@ -255,8 +301,15 @@ pub fn linearF32Q40(input: []const f32, weight: Tensor, out: []f32) void {
 /// bit-identical to the B=1 `linearF32Q40` result, with no cross-batch weight
 /// reuse. The q4 CPU path exists for completeness, not throughput. Row
 /// parallelism comes from the runner `parallel.linearBatch`.
-pub fn linearF32Q40Batch(inputs: []const f32, weight: Tensor, outs: []f32, batch: usize, out_stride: usize) void {
+pub fn linearF32Q40Batch(
+    inputs: []const f32,
+    weight: Tensor,
+    outs: []f32,
+    batch: usize,
+    out_stride: usize,
+) void {
     std.debug.assert(weight.dtype == .q4_0);
+
     linearBatchPerRow(linearF32Q40, inputs, weight, outs, batch, out_stride);
 }
 
@@ -267,6 +320,7 @@ pub fn linearF32Q40Batch(inputs: []const f32, weight: Tensor, outs: []f32, batch
 pub fn linearF32Q41(input: []const f32, weight: Tensor, out: []f32) void {
     std.debug.assert(weight.dtype == .q4_1);
     std.debug.assert(weight.n_dims == 2);
+
     const in_features: usize = @intCast(weight.shape[0]);
     const out_features: usize = @intCast(weight.shape[1]);
     std.debug.assert(input.len == in_features);
@@ -282,7 +336,9 @@ pub fn linearF32Q41(input: []const f32, weight: Tensor, out: []f32) void {
         while (blk < in_features / 32) : (blk += 1) {
             const blk_off = row_off + blk * 20;
             const d = f16BitsToF32(std.mem.readInt(u16, weight.data[blk_off..][0..2], .little));
-            const m = f16BitsToF32(std.mem.readInt(u16, weight.data[blk_off + 2 ..][0..2], .little));
+            const m = f16BitsToF32(
+                std.mem.readInt(u16, weight.data[blk_off + 2 ..][0..2], .little),
+            );
             var i: usize = 0;
             while (i < 16) : (i += 1) {
                 const byte = weight.data[blk_off + 4 + i];
@@ -292,16 +348,27 @@ pub fn linearF32Q41(input: []const f32, weight: Tensor, out: []f32) void {
                 sum += input[blk * 32 + 16 + i] * (hi * d + m);
             }
         }
+
         out[j] = sum;
     }
+
     if (std.debug.runtime_safety) {
-        for (out[0..out_features]) |x| std.debug.assert(std.math.isFinite(x));
+        for (out[0..out_features]) |x| {
+            std.debug.assert(std.math.isFinite(x));
+        }
     }
 }
 
 /// Batched Q4_1 linear via the per-row fallback (see `linearF32Q40Batch`).
-pub fn linearF32Q41Batch(inputs: []const f32, weight: Tensor, outs: []f32, batch: usize, out_stride: usize) void {
+pub fn linearF32Q41Batch(
+    inputs: []const f32,
+    weight: Tensor,
+    outs: []f32,
+    batch: usize,
+    out_stride: usize,
+) void {
     std.debug.assert(weight.dtype == .q4_1);
+
     linearBatchPerRow(linearF32Q41, inputs, weight, outs, batch, out_stride);
 }
 
@@ -313,6 +380,7 @@ pub fn linearF32Q41Batch(inputs: []const f32, weight: Tensor, outs: []f32, batch
 pub fn linearF32Q6K(input: []const f32, weight: Tensor, out: []f32) void {
     std.debug.assert(weight.dtype == .q6_k);
     std.debug.assert(weight.n_dims == 2);
+
     const in_features: usize = @intCast(weight.shape[0]);
     const out_features: usize = @intCast(weight.shape[1]);
     std.debug.assert(input.len == in_features);
@@ -329,24 +397,38 @@ pub fn linearF32Q6K(input: []const f32, weight: Tensor, out: []f32) void {
         while (sb < n_super) : (sb += 1) {
             var tmp: [256]f32 = undefined;
             dequantQ6K(weight.data[row_off + sb * 210 ..][0..210], &tmp);
-            for (0..256) |i| sum += input[sb * 256 + i] * tmp[i];
+            for (0..256) |i| {
+                sum += input[sb * 256 + i] * tmp[i];
+            }
         }
+
         out[j] = sum;
     }
+
     if (std.debug.runtime_safety) {
-        for (out[0..out_features]) |x| std.debug.assert(std.math.isFinite(x));
+        for (out[0..out_features]) |x| {
+            std.debug.assert(std.math.isFinite(x));
+        }
     }
 }
 
 /// Batched Q6_K linear via the per-row fallback (see `linearF32Q40Batch`).
-pub fn linearF32Q6KBatch(inputs: []const f32, weight: Tensor, outs: []f32, batch: usize, out_stride: usize) void {
+pub fn linearF32Q6KBatch(
+    inputs: []const f32,
+    weight: Tensor,
+    outs: []f32,
+    batch: usize,
+    out_stride: usize,
+) void {
     std.debug.assert(weight.dtype == .q6_k);
+
     linearBatchPerRow(linearF32Q6K, inputs, weight, outs, batch, out_stride);
 }
 
 /// Dequantize a Q8_0 buffer (`src.len % 34 == 0`) into f32 (`dst.len == (src.len/34)*32`).
 pub fn dequantQ80(src: []const u8, dst: []f32) void {
     std.debug.assert(src.len % 34 == 0);
+
     const n_blocks = src.len / 34;
     std.debug.assert(dst.len == n_blocks * 32);
     var b: usize = 0;
@@ -360,8 +442,11 @@ pub fn dequantQ80(src: []const u8, dst: []f32) void {
             dst[b * 32 + i] = scale * @as(f32, @floatFromInt(v));
         }
     }
+
     if (std.debug.runtime_safety) {
-        for (dst) |v| std.debug.assert(std.math.isFinite(v));
+        for (dst) |v| {
+            std.debug.assert(std.math.isFinite(v));
+        }
     }
 }
 
@@ -376,6 +461,7 @@ pub fn f16BitsToF32(bits: u16) f32 {
 /// nibble. Each dequantizes as `(nibble - 8) * scale`.
 pub fn dequantQ40(src: []const u8, dst: []f32) void {
     std.debug.assert(src.len % 18 == 0);
+
     const n_blocks = src.len / 18;
     std.debug.assert(dst.len == n_blocks * 32);
     var b: usize = 0;
@@ -391,8 +477,11 @@ pub fn dequantQ40(src: []const u8, dst: []f32) void {
             dst[b * 32 + 16 + i] = scale * @as(f32, @floatFromInt(hi));
         }
     }
+
     if (std.debug.runtime_safety) {
-        for (dst) |v| std.debug.assert(std.math.isFinite(v));
+        for (dst) |v| {
+            std.debug.assert(std.math.isFinite(v));
+        }
     }
 }
 
@@ -402,6 +491,7 @@ pub fn dequantQ40(src: []const u8, dst: []f32) void {
 /// nibble. Each dequantizes as `nibble*d + m`.
 pub fn dequantQ41(src: []const u8, dst: []f32) void {
     std.debug.assert(src.len % 20 == 0);
+
     const n_blocks = src.len / 20;
     std.debug.assert(dst.len == n_blocks * 32);
     var b: usize = 0;
@@ -416,8 +506,11 @@ pub fn dequantQ41(src: []const u8, dst: []f32) void {
             dst[b * 32 + 16 + i] = @as(f32, @floatFromInt(byte >> 4)) * d + m;
         }
     }
+
     if (std.debug.runtime_safety) {
-        for (dst) |v| std.debug.assert(std.math.isFinite(v));
+        for (dst) |v| {
+            std.debug.assert(std.math.isFinite(v));
+        }
     }
 }
 
@@ -428,6 +521,7 @@ pub fn dequantQ41(src: []const u8, dst: []f32) void {
 /// the lm_head, keeping the GPU path uniformly Q4_0.
 pub fn quantizeQ40(src: []const f32, dst: []u8) void {
     std.debug.assert(src.len % 32 == 0);
+
     const n_blocks = src.len / 32;
     std.debug.assert(dst.len == n_blocks * 18);
     var b: usize = 0;
@@ -443,6 +537,7 @@ pub fn quantizeQ40(src: []const f32, dst: []u8) void {
                 maxv = v;
             }
         }
+
         const d: f32 = maxv / -8.0;
         const id: f32 = if (d != 0) 1.0 / d else 0.0;
         const off = b * 18;
@@ -467,6 +562,7 @@ pub fn quantizeQ40(src: []const f32, dst: []u8) void {
 /// ggml `dequantize_row_q6_K`.
 pub fn dequantQ6K(src: []const u8, dst: []f32) void {
     std.debug.assert(src.len % 210 == 0);
+
     const n_super = src.len / 210;
     std.debug.assert(dst.len == n_super * 256);
     var sb: usize = 0;
@@ -505,8 +601,11 @@ pub fn dequantQ6K(src: []const u8, dst: []f32) void {
             }
         }
     }
+
     if (std.debug.runtime_safety) {
-        for (dst) |v| std.debug.assert(std.math.isFinite(v));
+        for (dst) |v| {
+            std.debug.assert(std.math.isFinite(v));
+        }
     }
 }
 
@@ -530,26 +629,32 @@ pub fn embedLookup(weight: Tensor, token_id: u32, dim: usize, dst: []f32) void {
         },
         .q8_0 => {
             std.debug.assert(dim % 32 == 0);
+
             const row_bytes = (dim / 32) * 34;
             const row_start = @as(usize, token_id) * row_bytes;
             dequantQ80(weight.data[row_start..][0..row_bytes], dst[0..dim]);
         },
         .q4_0 => {
             std.debug.assert(dim % 32 == 0);
+
             const row_bytes = (dim / 32) * 18;
             const row_start = @as(usize, token_id) * row_bytes;
             dequantQ40(weight.data[row_start..][0..row_bytes], dst[0..dim]);
         },
         .q4_1 => {
             std.debug.assert(dim % 32 == 0);
+
             const row_bytes = (dim / 32) * 20;
             const row_start = @as(usize, token_id) * row_bytes;
             dequantQ41(weight.data[row_start..][0..row_bytes], dst[0..dim]);
         },
         else => @panic("embedLookup: unsupported weight dtype"),
     }
+
     if (std.debug.runtime_safety) {
-        for (dst[0..dim]) |v| std.debug.assert(std.math.isFinite(v));
+        for (dst[0..dim]) |v| {
+            std.debug.assert(std.math.isFinite(v));
+        }
     }
 }
 
@@ -557,12 +662,21 @@ pub fn embedLookup(weight: Tensor, token_id: u32, dim: usize, dst: []f32) void {
 pub fn rmsnorm(x: []const f32, w: []const f32, eps: f32, dst: []f32) void {
     std.debug.assert(x.len == w.len);
     std.debug.assert(dst.len >= x.len);
+
     var sum_sq: f32 = 0.0;
-    for (x) |v| sum_sq += v * v;
+    for (x) |v| {
+        sum_sq += v * v;
+    }
+
     const inv_rms = 1.0 / @sqrt(sum_sq / @as(f32, @floatFromInt(x.len)) + eps);
-    for (x, w, dst[0..x.len]) |v, wv, *d| d.* = v * inv_rms * wv;
+    for (x, w, dst[0..x.len]) |v, wv, *d| {
+        d.* = v * inv_rms * wv;
+    }
+
     if (std.debug.runtime_safety) {
-        for (dst[0..x.len]) |v| std.debug.assert(std.math.isFinite(v));
+        for (dst[0..x.len]) |v| {
+            std.debug.assert(std.math.isFinite(v));
+        }
     }
 }
 
@@ -570,21 +684,31 @@ pub fn rmsnorm(x: []const f32, w: []const f32, eps: f32, dst: []f32) void {
 pub fn swiglu(gate: []const f32, up: []const f32, dst: []f32) void {
     std.debug.assert(gate.len == up.len);
     std.debug.assert(dst.len >= gate.len);
+
     for (gate, up, dst[0..gate.len]) |g, u, *d| {
         const e = std.math.exp(-g);
         d.* = (g / (1.0 + e)) * u;
     }
+
     if (std.debug.runtime_safety) {
-        for (dst[0..gate.len]) |v| std.debug.assert(std.math.isFinite(v));
+        for (dst[0..gate.len]) |v| {
+            std.debug.assert(std.math.isFinite(v));
+        }
     }
 }
 
 /// dst[i] += x[i]
 pub fn residualAdd(x: []const f32, dst: []f32) void {
     std.debug.assert(x.len <= dst.len);
-    for (x, dst[0..x.len]) |v, *d| d.* += v;
+
+    for (x, dst[0..x.len]) |v, *d| {
+        d.* += v;
+    }
+
     if (std.debug.runtime_safety) {
-        for (dst[0..x.len]) |v| std.debug.assert(std.math.isFinite(v));
+        for (dst[0..x.len]) |v| {
+            std.debug.assert(std.math.isFinite(v));
+        }
     }
 }
 
@@ -595,10 +719,19 @@ pub fn residualAdd(x: []const f32, dst: []f32) void {
 /// tensor (Llama-3.1 long-context scaling): pair i rotates by `pos *
 /// base^(-2i/D) / freq_factors[i]`, matching ggml's rope (`theta / ff`).
 /// Null = classic RoPE.
-pub fn ropeInplace(x: []f32, pos: u32, rope_dim: usize, freq_base: f32, style: RopeStyle, freq_factors: ?[]const f32) void {
+pub fn ropeInplace(
+    x: []f32,
+    pos: u32,
+    rope_dim: usize,
+    freq_base: f32,
+    style: RopeStyle,
+    freq_factors: ?[]const f32,
+) void {
     std.debug.assert(rope_dim <= x.len);
     std.debug.assert(rope_dim % 2 == 0);
+
     if (freq_factors) |ff| std.debug.assert(ff.len >= rope_dim / 2);
+
     const half = rope_dim / 2;
     const inv_dim_f: f32 = 1.0 / @as(f32, @floatFromInt(rope_dim));
     const pos_f: f32 = @floatFromInt(pos);
@@ -617,8 +750,11 @@ pub fn ropeInplace(x: []f32, pos: u32, rope_dim: usize, freq_base: f32, style: R
         x[ia] = a * cos_v - b * sin_v;
         x[ib] = a * sin_v + b * cos_v;
     }
+
     if (std.debug.runtime_safety) {
-        for (x[0..rope_dim]) |v| std.debug.assert(std.math.isFinite(v));
+        for (x[0..rope_dim]) |v| {
+            std.debug.assert(std.math.isFinite(v));
+        }
     }
 }
 
@@ -708,6 +844,7 @@ pub fn attentionPartTyped(
                             widenRow(E, k_cache[k_off + d0 ..][0..dn], row[0..dn]);
                             break :blk row[0..dn];
                         };
+
                         var h = blk_lo;
                         while (h < blk_hi) : (h += 1) {
                             const q_off = h * head_dim + d0;
@@ -715,12 +852,18 @@ pub fn attentionPartTyped(
                             // summand sequence is the whole-row one.
                             var s: f32 = s_acc[h - blk_lo];
                             var d: usize = 0;
-                            while (d < dn) : (d += 1) s += q[q_off + d] * k_row[d];
+                            while (d < dn) : (d += 1) {
+                                s += q[q_off + d] * k_row[d];
+                            }
+
                             s_acc[h - blk_lo] = s;
                         }
                     }
+
                     var h = blk_lo;
-                    while (h < blk_hi) : (h += 1) scores[h - blk_lo][t - tile_lo] = s_acc[h - blk_lo] * scale;
+                    while (h < blk_hi) : (h += 1) {
+                        scores[h - blk_lo][t - tile_lo] = s_acc[h - blk_lo] * scale;
+                    }
                 }
 
                 var h = blk_lo;
@@ -729,27 +872,38 @@ pub fn attentionPartTyped(
                     const e_row = scores[g][0..tile_n];
                     const acc = recs[(h - h_lo) * rec_stride ..][0..head_dim];
                     if (std.debug.runtime_safety) {
-                        for (e_row) |s| std.debug.assert(std.math.isFinite(s));
+                        for (e_row) |s| {
+                            std.debug.assert(std.math.isFinite(s));
+                        }
                     }
+
                     var m_tile = e_row[0];
                     for (e_row[1..]) |s| {
-                        if (s > m_tile) m_tile = s;
+                        if (s > m_tile) {
+                            m_tile = s;
+                        }
                     }
+
                     if (tile_lo == t_lo) {
                         m_run[g] = m_tile;
                         l_run[g] = 0;
                         @memset(acc, 0);
                     } else if (m_tile > m_run[g]) {
                         const c = std.math.exp(m_run[g] - m_tile);
-                        for (acc) |*x| x.* *= c;
+                        for (acc) |*x| {
+                            x.* *= c;
+                        }
+
                         l_run[g] *= c;
                         m_run[g] = m_tile;
                     }
+
                     var l = l_run[g];
                     for (e_row) |*s| {
                         s.* = std.math.exp(s.* - m_run[g]);
                         l += s.*;
                     }
+
                     // The term at the maximum adds exp(0) = 1, and no term
                     // is negative.
                     std.debug.assert(l >= 1);
@@ -768,12 +922,15 @@ pub fn attentionPartTyped(
                             widenRow(E, v_cache[v_off + d0 ..][0..dn], row[0..dn]);
                             break :blk row[0..dn];
                         };
+
                         h = blk_lo;
                         while (h < blk_hi) : (h += 1) {
                             const w = scores[h - blk_lo][t - tile_lo];
                             const acc_off = (h - h_lo) * rec_stride + d0;
                             var d: usize = 0;
-                            while (d < dn) : (d += 1) recs[acc_off + d] += w * v_row[d];
+                            while (d < dn) : (d += 1) {
+                                recs[acc_off + d] += w * v_row[d];
+                            }
                         }
                     }
                 }
@@ -787,10 +944,13 @@ pub fn attentionPartTyped(
             }
         }
     }
+
     if (std.debug.runtime_safety) {
         var h = h_lo;
         while (h < h_hi) : (h += 1) {
-            for (recs[(h - h_lo) * rec_stride ..][0..rec_len]) |x| std.debug.assert(std.math.isFinite(x));
+            for (recs[(h - h_lo) * rec_stride ..][0..rec_len]) |x| {
+                std.debug.assert(std.math.isFinite(x));
+            }
         }
     }
 }
@@ -809,6 +969,7 @@ pub fn attentionMerge(
 ) void {
     std.debug.assert(n_parts >= 1);
     std.debug.assert(n_parts <= limits.attn_cpu_parts);
+
     const n_heads32: u32 = @intCast(n_heads);
     const head_dim32: u32 = @intCast(head_dim);
     std.debug.assert(parts_buf.len >= attn_cpu.partialLen(n_heads32, head_dim32));
@@ -818,28 +979,41 @@ pub fn attentionMerge(
     var w: [limits.attn_cpu_parts]f32 = undefined;
     var h: u32 = 0;
     while (h < n_heads32) : (h += 1) {
-        for (offs[0..n_parts], 0..) |*off, p| off.* = attn_cpu.recordOffset(n_heads32, head_dim32, h, @intCast(p));
+        for (offs[0..n_parts], 0..) |*off, p| {
+            off.* = attn_cpu.recordOffset(n_heads32, head_dim32, h, @intCast(p));
+        }
+
         var big_m = parts_buf[offs[0] + head_dim];
         for (offs[1..n_parts]) |off| {
-            if (parts_buf[off + head_dim] > big_m) big_m = parts_buf[off + head_dim];
+            if (parts_buf[off + head_dim] > big_m) {
+                big_m = parts_buf[off + head_dim];
+            }
         }
+
         var big_l: f32 = 0;
         for (offs[0..n_parts], w[0..n_parts]) |off, *w_p| {
             w_p.* = std.math.exp(parts_buf[off + head_dim] - big_m);
             big_l += parts_buf[off + head_dim + 1] * w_p.*;
         }
+
         // The part at the maximum adds its own sum, at least 1, at weight 1.
         std.debug.assert(big_l >= 1);
         const inv_l = 1.0 / big_l;
         const out_h = out[@as(usize, h) * head_dim ..][0..head_dim];
         for (out_h, 0..) |*o, d| {
             var acc: f32 = 0;
-            for (offs[0..n_parts], w[0..n_parts]) |off, w_p| acc += parts_buf[off + d] * w_p;
+            for (offs[0..n_parts], w[0..n_parts]) |off, w_p| {
+                acc += parts_buf[off + d] * w_p;
+            }
+
             o.* = acc * inv_l;
         }
     }
+
     if (std.debug.runtime_safety) {
-        for (out[0 .. n_heads * head_dim]) |x| std.debug.assert(std.math.isFinite(x));
+        for (out[0 .. n_heads * head_dim]) |x| {
+            std.debug.assert(std.math.isFinite(x));
+        }
     }
 }
 
@@ -860,7 +1034,19 @@ pub fn attentionRowTyped(
     parts_buf: []f32,
     out: []f32,
 ) void {
-    attentionRowWith(@This(), E, q, n_heads, head_dim, k_cache, v_cache, n_kv_heads, t_len, parts_buf, out);
+    attentionRowWith(
+        @This(),
+        E,
+        q,
+        n_heads,
+        head_dim,
+        k_cache,
+        v_cache,
+        n_kv_heads,
+        t_len,
+        parts_buf,
+        out,
+    );
 }
 
 /// The serial attention row over the part kernel of `Kernels`, a namespace
@@ -881,6 +1067,7 @@ pub fn attentionRowWith(
 ) void {
     std.debug.assert(t_len >= 1);
     std.debug.assert(t_len <= limits.max_model_ctx);
+
     const n_heads32: u32 = @intCast(n_heads);
     const head_dim32: u32 = @intCast(head_dim);
     const t_len32: u32 = @intCast(t_len);
@@ -897,8 +1084,23 @@ pub fn attentionRowWith(
         // head 0, where the merge reads it.
         std.debug.assert(attn_cpu.recordOffset(n_heads32, head_dim32, n_heads32 - 1, p) ==
             rec_lo + (n_heads - 1) * rec_stride);
-        Kernels.attentionPartTyped(E, q, 0, n_heads, n_heads, head_dim, k_cache, v_cache, n_kv_heads, part.t_lo, part.t_hi, parts_buf[rec_lo..], rec_stride);
+        Kernels.attentionPartTyped(
+            E,
+            q,
+            0,
+            n_heads,
+            n_heads,
+            head_dim,
+            k_cache,
+            v_cache,
+            n_kv_heads,
+            part.t_lo,
+            part.t_hi,
+            parts_buf[rec_lo..],
+            rec_stride,
+        );
     }
+
     attentionMerge(parts_buf, n_parts, n_heads, head_dim, out);
 }
 
@@ -920,7 +1122,10 @@ noinline fn widenRow(comptime E: type, noalias src: []const E, noalias dst: []f3
         const w: @Vector(W, f32) = @floatCast(v);
         dst[i..][0..W].* = w;
     }
-    while (i < src.len) : (i += 1) dst[i] = @floatCast(src[i]);
+
+    while (i < src.len) : (i += 1) {
+        dst[i] = @floatCast(src[i]);
+    }
 }
 
 // -- tests ------------------------------------------------------------------
@@ -949,22 +1154,32 @@ test "dequant Q8_0 single block, scale 1.0" {
     var src: [34]u8 = undefined;
     std.mem.writeInt(u16, src[0..2], 0x3c00, .little);
     var i: usize = 0;
-    while (i < 32) : (i += 1) src[2 + i] = @intCast(i);
+    while (i < 32) : (i += 1) {
+        src[2 + i] = @intCast(i);
+    }
+
     var dst: [32]f32 = undefined;
     dequantQ80(&src, &dst);
-    for (0..32) |k| try std.testing.expectEqual(@as(f32, @floatFromInt(k)), dst[k]);
+    for (0..32) |k| {
+        try std.testing.expectEqual(@as(f32, @floatFromInt(k)), dst[k]);
+    }
 }
 
 test "Q4_0 round-trip: integer ramp in [-8,7] is exact" {
     // maxabs = 8 (the -8) -> d = -8/-8 = 1.0, so every integer in [-8,7]
     // lands on a nibble boundary and round-trips exactly.
     var src: [32]f32 = undefined;
-    for (0..32) |i| src[i] = @as(f32, @floatFromInt(@as(i32, @intCast(i % 16)) - 8));
+    for (0..32) |i| {
+        src[i] = @as(f32, @floatFromInt(@as(i32, @intCast(i % 16)) - 8));
+    }
+
     var packed_bytes: [18]u8 = undefined;
     quantizeQ40(&src, &packed_bytes);
     var dst: [32]f32 = undefined;
     dequantQ40(&packed_bytes, &dst);
-    for (0..32) |k| try std.testing.expectEqual(src[k], dst[k]);
+    for (0..32) |k| {
+        try std.testing.expectEqual(src[k], dst[k]);
+    }
 }
 
 test "Q4_1 dequant: nibble*d + m, low/high nibble split" {
@@ -990,6 +1205,7 @@ test "linearF32Q41 matches dequantize-then-dot" {
 
     const w_data = try gpa.alignedAlloc(u8, .@"32", out_features * row_bytes);
     defer gpa.free(w_data);
+
     for (0..out_features) |j| {
         for (0..in_features / 32) |blk| {
             const off = j * row_bytes + blk * 20;
@@ -1002,6 +1218,7 @@ test "linearF32Q41 matches dequantize-then-dot" {
             }
         }
     }
+
     const w: Tensor = .{
         .dtype = .q4_1,
         .n_dims = 2,
@@ -1012,7 +1229,10 @@ test "linearF32Q41 matches dequantize-then-dot" {
 
     const input = try gpa.alloc(f32, in_features);
     defer gpa.free(input);
-    for (input, 0..) |*x, i| x.* = @sin(@as(f32, @floatFromInt(i)) * 0.1);
+
+    for (input, 0..) |*x, i| {
+        x.* = @sin(@as(f32, @floatFromInt(i)) * 0.1);
+    }
 
     var got: [out_features]f32 = undefined;
     linearF32Q41(input, w, &got);
@@ -1021,7 +1241,10 @@ test "linearF32Q41 matches dequantize-then-dot" {
     for (0..out_features) |j| {
         dequantQ41(w_data[j * row_bytes ..][0..row_bytes], &row_f32);
         var sum: f32 = 0;
-        for (0..in_features) |i| sum += input[i] * row_f32[i];
+        for (0..in_features) |i| {
+            sum += input[i] * row_f32[i];
+        }
+
         try std.testing.expectApproxEqAbs(sum, got[j], 1e-5);
     }
 }
@@ -1031,7 +1254,10 @@ test "Q6_K dequant: bit assembly, -32 bias, and per-group scale" {
     // ql/qh bytes, so a handful of decoded values is predictable by hand.
     var src = [_]u8{0} ** 210;
     std.mem.writeInt(u16, src[208..210], 0x3c00, .little); // d = 1.0
-    for (192..208) |i| src[i] = 1; // scales all 1...
+    for (192..208) |i| {
+        src[i] = 1; // scales all 1...
+    }
+
     src[192] = 2; //              ...except scales[0] = 2
     src[0] = 0x05; // ql[0]: low nibble 5
     src[128] = 0x03; // qh[0]: low 2 bits = 3 -> high bits of element 0
@@ -1056,11 +1282,16 @@ test "linearF32Q6K matches dequantize-then-dot" {
 
     const w_data = try gpa.alignedAlloc(u8, .@"32", out_features * row_bytes);
     defer gpa.free(w_data);
+
     for (0..out_features) |j| {
         const off = j * row_bytes;
-        for (0..210) |b| w_data[off + b] = @intCast((b * 7 + j * 13) % 251);
+        for (0..210) |b| {
+            w_data[off + b] = @intCast((b * 7 + j * 13) % 251);
+        }
+
         std.mem.writeInt(u16, w_data[off + 208 ..][0..2], 0x3000, .little); // d = 0.125
     }
+
     const w: Tensor = .{
         .dtype = .q6_k,
         .n_dims = 2,
@@ -1071,7 +1302,10 @@ test "linearF32Q6K matches dequantize-then-dot" {
 
     const input = try gpa.alloc(f32, in_features);
     defer gpa.free(input);
-    for (input, 0..) |*x, i| x.* = @sin(@as(f32, @floatFromInt(i)) * 0.03);
+
+    for (input, 0..) |*x, i| {
+        x.* = @sin(@as(f32, @floatFromInt(i)) * 0.03);
+    }
 
     var got: [out_features]f32 = undefined;
     linearF32Q6K(input, w, &got);
@@ -1080,7 +1314,10 @@ test "linearF32Q6K matches dequantize-then-dot" {
     for (0..out_features) |j| {
         dequantQ6K(w_data[j * row_bytes ..][0..row_bytes], &row_f32);
         var sum: f32 = 0;
-        for (0..in_features) |i| sum += input[i] * row_f32[i];
+        for (0..in_features) |i| {
+            sum += input[i] * row_f32[i];
+        }
+
         try std.testing.expectApproxEqAbs(sum, got[j], 1e-4);
     }
 }
@@ -1109,9 +1346,14 @@ test "rope pos=0 is identity" {
     var x = [_]f32{ 1, 2, 3, 4 };
     const orig = x;
     ropeInplace(&x, 0, 4, 10000.0, .neox, null);
-    for (x, orig) |a, b| try std.testing.expectApproxEqAbs(b, a, 1e-6);
+    for (x, orig) |a, b| {
+        try std.testing.expectApproxEqAbs(b, a, 1e-6);
+    }
+
     ropeInplace(&x, 0, 4, 10000.0, .norm, null);
-    for (x, orig) |a, b| try std.testing.expectApproxEqAbs(b, a, 1e-6);
+    for (x, orig) |a, b| {
+        try std.testing.expectApproxEqAbs(b, a, 1e-6);
+    }
 }
 
 test "rope styles rotate the documented pairs" {
@@ -1150,16 +1392,25 @@ test "linearF32Batch is bit-identical to per-row linearF32 (strided outs)" {
 
     const inputs = try gpa.alloc(f32, batch * in_features);
     defer gpa.free(inputs);
+
     const w_data = try gpa.alignedAlloc(u8, .@"32", in_features * out_features * @sizeOf(f32));
     defer gpa.free(w_data);
+
     const outs_batch = try gpa.alloc(f32, (batch - 1) * out_stride + out_features);
     defer gpa.free(outs_batch);
+
     const out_single = try gpa.alloc(f32, out_features);
     defer gpa.free(out_single);
 
-    for (inputs, 0..) |*x, i| x.* = @sin(@as(f32, @floatFromInt(i)) * 0.05);
+    for (inputs, 0..) |*x, i| {
+        x.* = @sin(@as(f32, @floatFromInt(i)) * 0.05);
+    }
+
     const w_f32: []f32 = @alignCast(std.mem.bytesAsSlice(f32, w_data));
-    for (w_f32, 0..) |*x, i| x.* = @cos(@as(f32, @floatFromInt(i)) * 0.003);
+    for (w_f32, 0..) |*x, i| {
+        x.* = @cos(@as(f32, @floatFromInt(i)) * 0.003);
+    }
+
     const w: Tensor = .{
         .dtype = .f32,
         .n_dims = 2,
@@ -1187,14 +1438,20 @@ test "linearF32Q80Batch is bit-identical to per-row linearF32Q80 (strided outs)"
 
     const inputs = try gpa.alloc(f32, batch * in_features);
     defer gpa.free(inputs);
+
     const w_data = try gpa.alignedAlloc(u8, .@"32", out_features * row_bytes);
     defer gpa.free(w_data);
+
     const outs_batch = try gpa.alloc(f32, (batch - 1) * out_stride + out_features);
     defer gpa.free(outs_batch);
+
     const out_single = try gpa.alloc(f32, out_features);
     defer gpa.free(out_single);
 
-    for (inputs, 0..) |*x, i| x.* = @sin(@as(f32, @floatFromInt(i)) * 0.05);
+    for (inputs, 0..) |*x, i| {
+        x.* = @sin(@as(f32, @floatFromInt(i)) * 0.05);
+    }
+
     fillTestQ80(w_data, in_features, out_features);
     const w: Tensor = .{
         .dtype = .q8_0,
@@ -1222,14 +1479,20 @@ test "linearBatchPerRow over linearF32Q80 is bit-identical to per-row calls" {
 
     const inputs = try gpa.alloc(f32, batch * in_features);
     defer gpa.free(inputs);
+
     const w_data = try gpa.alignedAlloc(u8, .@"32", out_features * row_bytes);
     defer gpa.free(w_data);
+
     const outs = try gpa.alloc(f32, batch * out_features);
     defer gpa.free(outs);
+
     const out_single = try gpa.alloc(f32, out_features);
     defer gpa.free(out_single);
 
-    for (inputs, 0..) |*x, i| x.* = @cos(@as(f32, @floatFromInt(i)) * 0.02);
+    for (inputs, 0..) |*x, i| {
+        x.* = @cos(@as(f32, @floatFromInt(i)) * 0.02);
+    }
+
     fillTestQ80(w_data, in_features, out_features);
     const w: Tensor = .{
         .dtype = .q8_0,
@@ -1260,16 +1523,29 @@ test "attention at f16 tracks the f32 reference and repeats bitwise" {
     var q: [n_heads * head_dim]f32 = undefined;
     var k32: [kv_len]f32 = undefined;
     var v32: [kv_len]f32 = undefined;
-    for (&q) |*x| x.* = r.float(f32) * 2.0 - 1.0;
-    for (&k32) |*x| x.* = r.float(f32) * 2.0 - 1.0;
-    for (&v32) |*x| x.* = r.float(f32) * 2.0 - 1.0;
+    for (&q) |*x| {
+        x.* = r.float(f32) * 2.0 - 1.0;
+    }
+
+    for (&k32) |*x| {
+        x.* = r.float(f32) * 2.0 - 1.0;
+    }
+
+    for (&v32) |*x| {
+        x.* = r.float(f32) * 2.0 - 1.0;
+    }
 
     // The f16 run reads the same values at storage precision, so the measured
     // gap is the element type alone.
     var k16: [kv_len]f16 = undefined;
     var v16: [kv_len]f16 = undefined;
-    for (k32, 0..) |x, i| k16[i] = @floatCast(x);
-    for (v32, 0..) |x, i| v16[i] = @floatCast(x);
+    for (k32, 0..) |x, i| {
+        k16[i] = @floatCast(x);
+    }
+
+    for (v32, 0..) |x, i| {
+        v16[i] = @floatCast(x);
+    }
 
     var parts: [attn_cpu.partialLen(n_heads, head_dim)]f32 = undefined;
     var out32: [n_heads * head_dim]f32 = undefined;
@@ -1277,13 +1553,25 @@ test "attention at f16 tracks the f32 reference and repeats bitwise" {
     var out16_repeat: [n_heads * head_dim]f32 = undefined;
     attentionRowTyped(f32, &q, n_heads, head_dim, &k32, &v32, n_kv_heads, t_len, &parts, &out32);
     attentionRowTyped(f16, &q, n_heads, head_dim, &k16, &v16, n_kv_heads, t_len, &parts, &out16);
-    attentionRowTyped(f16, &q, n_heads, head_dim, &k16, &v16, n_kv_heads, t_len, &parts, &out16_repeat);
+    attentionRowTyped(
+        f16,
+        &q,
+        n_heads,
+        head_dim,
+        &k16,
+        &v16,
+        n_kv_heads,
+        t_len,
+        &parts,
+        &out16_repeat,
+    );
 
     var rel_max: f32 = 0;
     for (out32, out16) |a, b| {
         const denom = @max(@abs(a), 1.0e-2); // the outputs are averages of unit-scale values
         rel_max = @max(rel_max, @abs(a - b) / denom);
     }
+
     // The bound states what f16 storage claims. This fixture measures 7.4e-4,
     // so a regression has to move the error by more than an order of magnitude
     // before it trips.
@@ -1322,7 +1610,18 @@ fn expectPartMatchesSingleHeads(
     h_lo: usize,
     h_hi: usize,
 ) !void {
-    try attention_ref.expectPartMatchesSingleHeads(@This(), E, r, shape, leads, sink_t, t_lo, t_hi, h_lo, h_hi);
+    try attention_ref.expectPartMatchesSingleHeads(
+        @This(),
+        E,
+        r,
+        shape,
+        leads,
+        sink_t,
+        t_lo,
+        t_hi,
+        h_lo,
+        h_hi,
+    );
 }
 
 test "attention row: the part row tracks the f64 reference across tile and part edges" {
@@ -1334,10 +1633,34 @@ test "attention row: the part row tracks the f64 reference across tile and part 
     // Debug. The widest head spans 3 tiles in 3 parts, so it crosses two tile
     // edges and two part edges.
     inline for (.{ f32, f16 }) |E| {
-        for (depths) |t_len| try expectRowNearF64(E, r, .{ .n_heads = 2, .n_kv_heads = 1, .head_dim = 8 }, t_len, &.{}, true);
+        for (depths) |t_len| {
+            try expectRowNearF64(
+                E,
+                r,
+                .{ .n_heads = 2, .n_kv_heads = 1, .head_dim = 8 },
+                t_len,
+                &.{},
+                true,
+            );
+        }
+
         // The widest registered head, and a group of 3 with an odd head count.
-        try expectRowNearF64(E, r, .{ .n_heads = 8, .n_kv_heads = 2, .head_dim = 256 }, 2 * T + 1, &.{}, true);
-        try expectRowNearF64(E, r, .{ .n_heads = 3, .n_kv_heads = 1, .head_dim = 8 }, 16 * T + 1, &.{}, true);
+        try expectRowNearF64(
+            E,
+            r,
+            .{ .n_heads = 8, .n_kv_heads = 2, .head_dim = 256 },
+            2 * T + 1,
+            &.{},
+            true,
+        );
+        try expectRowNearF64(
+            E,
+            r,
+            .{ .n_heads = 3, .n_kv_heads = 1, .head_dim = 8 },
+            16 * T + 1,
+            &.{},
+            true,
+        );
     }
 }
 
@@ -1348,8 +1671,22 @@ test "attention row: a tail head width and a head wider than the stack row track
     var prng = std.Random.DefaultPrng.init(0xA770_0008);
     const r = prng.random();
     inline for (.{ f32, f16 }) |E| {
-        try expectRowNearF64(E, r, .{ .n_heads = 3, .n_kv_heads = 1, .head_dim = 20 }, cpu_tile + 5, &.{}, true);
-        try expectRowNearF64(E, r, .{ .n_heads = 1, .n_kv_heads = 1, .head_dim = 300 }, cpu_tile + 5, &.{}, true);
+        try expectRowNearF64(
+            E,
+            r,
+            .{ .n_heads = 3, .n_kv_heads = 1, .head_dim = 20 },
+            cpu_tile + 5,
+            &.{},
+            true,
+        );
+        try expectRowNearF64(
+            E,
+            r,
+            .{ .n_heads = 1, .n_kv_heads = 1, .head_dim = 300 },
+            cpu_tile + 5,
+            &.{},
+            true,
+        );
     }
 }
 
@@ -1431,27 +1768,44 @@ test "attention row: a repeated row and a row over a garbage partial buffer give
         for ([_]usize{ 3 * T + 1, 16 * T + 1 }) |t_len| {
             const q = try gpa.alloc(f32, nh * hd);
             defer gpa.free(q);
+
             const k = try gpa.alloc(E, t_len * shape.n_kv_heads * hd);
             defer gpa.free(k);
+
             const v = try gpa.alloc(E, t_len * shape.n_kv_heads * hd);
             defer gpa.free(v);
+
             const parts_len = attn_cpu.partialLen(@intCast(nh), @intCast(hd));
             const parts = try gpa.alloc(f32, parts_len);
             defer gpa.free(parts);
+
             const out_first = try gpa.alloc(f32, nh * hd);
             defer gpa.free(out_first);
+
             const out_again = try gpa.alloc(f32, nh * hd);
             defer gpa.free(out_again);
+
             fillAttention(E, r, shape, t_len, &.{}, 0, q, k, v);
 
             @memset(parts, 0);
             attentionRowTyped(E, q, nh, hd, k, v, shape.n_kv_heads, t_len, parts, out_first);
             attentionRowTyped(E, q, nh, hd, k, v, shape.n_kv_heads, t_len, parts, out_again);
-            try std.testing.expectEqualSlices(u8, std.mem.sliceAsBytes(out_first), std.mem.sliceAsBytes(out_again));
+            try std.testing.expectEqualSlices(
+                u8,
+                std.mem.sliceAsBytes(out_first),
+                std.mem.sliceAsBytes(out_again),
+            );
 
-            for (parts) |*x| x.* = r.float(f32) * 200.0 - 100.0;
+            for (parts) |*x| {
+                x.* = r.float(f32) * 200.0 - 100.0;
+            }
+
             attentionRowTyped(E, q, nh, hd, k, v, shape.n_kv_heads, t_len, parts, out_again);
-            try std.testing.expectEqualSlices(u8, std.mem.sliceAsBytes(out_first), std.mem.sliceAsBytes(out_again));
+            try std.testing.expectEqualSlices(
+                u8,
+                std.mem.sliceAsBytes(out_first),
+                std.mem.sliceAsBytes(out_again),
+            );
         }
     }
 }
@@ -1471,7 +1825,12 @@ test "attention merge: one part divides the value sums by the exponential sum" {
     attentionRowTyped(f16, &q, nh, hd, &k, &v, shape.n_kv_heads, t_len, &parts, &out);
     try std.testing.expectEqual(@as(u32, 1), attn_cpu.partCount(t_len));
     for (0..nh) |h| {
-        const rec = parts[attn_cpu.recordOffset(nh, hd, @intCast(h), 0)..][0..attn_cpu.recordElems(hd)];
+        const rec = parts[attn_cpu.recordOffset(
+            nh,
+            hd,
+            @intCast(h),
+            0,
+        )..][0..attn_cpu.recordElems(hd)];
         const inv_l = 1.0 / rec[hd + 1];
         for (rec[0..hd], out[h * hd ..][0..hd]) |a, o| {
             try std.testing.expectEqual(@as(u32, @bitCast(a * inv_l)), @as(u32, @bitCast(o)));

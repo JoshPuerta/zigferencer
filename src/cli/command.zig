@@ -1,26 +1,20 @@
-//! Subcommand dispatch: argv to a sub-handler call, the one entry point from
-//! `main.zig`. Each subcommand is a `{ name, summary, handler }` row in one of
-//! two closed tables. `release` holds the commands a user of the engine needs.
-//! `dev` holds the benches, the kernel checks, the demo, and the tokenizer dump.
-//! The release binary dispatches over `release`, and `zigferencer-dev`
-//! dispatches over `release ++ dev`. The release binary names the dev commands
-//! only as strings, so it never analyzes a dev handler. The same `summary`
-//! string feeds the no-args usage screen, so help and dispatch cannot drift.
+//! Command dispatch: argv to a command handler, the one entry point from `main.zig`.
+//! Each command is a `{ name, summary, handler }` row in `release` or `dev`. `zigferencer`
+//! dispatches
+//! `release`, and `zigferencer-dev` dispatches `release ++ dev`. The release binary names the dev
+//! commands only as strings, so it never analyzes a dev handler. The usage screen reads the same
+//! `summary`, so help and dispatch cannot drift.
 //!
-//! Help-text dialect, uniform across every `--help` so a reader learns it once.
-//! `args.helpBody` generates the flag lines from the flag struct of a command:
-//!   - A `summary` is an imperative fragment of about 55 characters or less.
-//!   - A `--help` prints a `usage:` line, then one sentence, then the flags in
-//!     groups under short lowercase headers (for example tuning, kv, gpu),
-//!     then `examples:`.
+//! Help-text dialect, the same in every `--help`. `args.helpBody` generates the flag lines:
+//!   - A `summary` is an imperative fragment of 55 characters or less.
+//!   - A `--help` prints `usage:`, one sentence, the flags in groups under short lowercase headers
+//!     (for example tuning, kv, gpu), then `examples:`.
 //!   - A default reads as a trailing `[default: X]`, never as inline prose.
 //!   - One qualifier per flag line.
-//!   - A backend caveat goes in a group header (`gpu (fused-GPU build only)`),
-//!     never in a per-line suffix.
-//!   - A shared knob keeps one name and one wording everywhere, because
-//!     `flags.EngineFlags` and `flags.ServeFlags` declare it once.
-//!   - A flag that the build cannot honor stays listed, so it stays
-//!     discoverable. The command rejects it at use with a clear message.
+//!   - A backend caveat goes in a group header (`gpu (fused-GPU build only)`), not on a line.
+//!   - A shared option keeps one name and one wording, because `flags.EngineFlags` and
+//!     `flags.ServeFlags` declare it once.
+//!   - A flag that the build cannot honor stays listed, and the command rejects it at use.
 
 const std = @import("std");
 const Io = std.Io;
@@ -46,42 +40,27 @@ const registry = @import("../core/registry.zig");
 const limits = @import("../core/limits.zig");
 const prompt_cache = @import("../runtime/prompt_cache.zig");
 
-// -- types ------------------------------------------------------------------
+comptime {
+    // A name in both tables makes the dispatch order pick the handler.
+    for (release) |r| {
+        for (dev_names) |d| {
+            if (std.mem.eql(u8, r.name, d)) {
+                @compileError("command '" ++ d ++ "' sits in both tables");
+            }
+        }
+    }
+}
 
-pub const Context = struct {
-    io: Io,
-    arena: Allocator,
-    gpa: Allocator,
-    args: []const [:0]const u8,
-    /// Where models are stored on disk. Resolved once from
-    /// `$ZIGFERENCER_MODELS_DIR` (default `models/`). See core/registry.zig.
-    models_root: []const u8,
-    /// Where the prompt cache keeps snapshots. Resolved once from
-    /// `$ZIGFERENCER_CACHE_DIR` (default `.prompt_cache`). See runtime/prompt_cache.zig.
-    cache_dir: []const u8,
-    /// The storage-buffer range that replaces the one the device reports.
-    /// Resolved once from `$ZIGFERENCER_VK_STORAGE_RANGE` (default: unset, the
-    /// reported range). Every command that opens a Vulkan context passes it.
-    vk_storage_range: ?u64,
-    /// True when stdout takes ANSI color. Resolved once: stdout is a TTY and
-    /// `$NO_COLOR` is unset. Commands build a `style.Palette` from it. See
-    /// cli/style.zig.
-    color: bool,
-    /// True when stderr takes ANSI color. The CLI resolves it apart from `color`
-    /// because the two streams redirect independently. The interactive pickers and
-    /// the confirms write to stderr and key their palette on this.
-    color_err: bool,
-};
+// -- constants --------------------------------------------------------------
 
-// The handlers hold heterogeneous error sets (HTTP, GGUF parse, Vulkan), and one
-// function-pointer table can share only one return type.
-const Handler = *const fn (Context) anyerror!void;
+/// The stack buffer of one stdout writer.
+pub const stdout_buffer_bytes = 4096;
 
-const Subcommand = struct {
-    name: []const u8,
-    summary: []const u8,
-    handler: Handler,
-};
+/// The stack buffer of one error message on stderr.
+const error_buffer_bytes = 256;
+
+/// Spaces for the name column of the usage screen. The widest command name must fit.
+const pad = " " ** 32;
 
 /// The commands of the release binary.
 const release = [_]Subcommand{
@@ -100,15 +79,14 @@ const dev = [_]Subcommand{
     .{ .name = "bench-model", .summary = "Benchmark a model: TTFT, ITL, hash", .handler = bench_model_cmd.run },
     .{ .name = "bench-serve", .summary = "Benchmark serve throughput vs batch size", .handler = bench_serve_cmd.run },
     .{ .name = "bench-swap", .summary = "Benchmark tiered-KV swap cost (go/no-go)", .handler = bench_swap_cmd.run },
-    .{ .name = "bench-decode-host", .summary = "Time the host legs of one decode step", .handler = bench_decode_host_cmd.run },
+    .{ .name = "bench-decode-host", .summary = "Time the host steps of one decode step", .handler = bench_decode_host_cmd.run },
     .{ .name = "gpu-selftest", .summary = "Bit-check a GPU kernel vs its CPU reference", .handler = gpu_selftest_cmd.run },
     .{ .name = "tokens", .summary = "Print a prompt's token ids", .handler = tokens_cmd.run },
     .{ .name = "serve-demo", .summary = "Demo the serve connector end-to-end", .handler = serve_demo_cmd.run },
 };
 
-/// The dev command names as strings, for the hint of the release binary. A read
-/// of `dev` takes the address of every dev handler and analyzes it, so the list
-/// repeats the names. `dispatchDev` checks the two lists against each other.
+/// The dev command names as strings, for the hint of the release binary. A read of `dev` analyzes
+/// every dev handler, so the list repeats the names. `dispatchDev` checks the two lists.
 const dev_names = [_][]const u8{
     "bench-model",
     "bench-serve",
@@ -119,14 +97,34 @@ const dev_names = [_][]const u8{
     "serve-demo",
 };
 
-comptime {
-    // A name in both tables makes the dispatch order decide the handler.
-    for (release) |r| {
-        for (dev_names) |d| {
-            if (std.mem.eql(u8, r.name, d)) @compileError("command '" ++ d ++ "' sits in both tables");
-        }
-    }
-}
+// -- types ------------------------------------------------------------------
+
+pub const Context = struct {
+    io: Io,
+    arena: Allocator,
+    gpa: Allocator,
+    args: []const [:0]const u8,
+    /// Resolved once from `$ZIGFERENCER_MODELS_DIR`. See core/registry.zig.
+    models_root: []const u8,
+    /// Resolved once from `$ZIGFERENCER_CACHE_DIR`. See runtime/prompt_cache.zig.
+    cache_dir: []const u8,
+    /// Replaces the storage-buffer range that the device reports. Every command that opens a
+    /// Vulkan context passes it.
+    vk_storage_range: ?u64,
+    /// True when stdout takes ANSI color. Commands build a `style.Palette` from it.
+    color: bool,
+    /// The same for stderr, which redirects apart from stdout. The pickers key their palette on it.
+    color_err: bool,
+};
+
+// The handlers hold different error sets, and one function-pointer table shares one return type.
+const Handler = *const fn (Context) anyerror!void;
+
+const Subcommand = struct {
+    name: []const u8,
+    summary: []const u8,
+    handler: Handler,
+};
 
 // -- api --------------------------------------------------------------------
 
@@ -139,10 +137,14 @@ pub fn dispatchRelease(init: std.process.Init) !void {
 pub fn dispatchDev(init: std.process.Init) !void {
     comptime {
         std.debug.assert(dev.len == dev_names.len);
+
         for (dev, dev_names) |d, name| {
-            if (!std.mem.eql(u8, d.name, name)) @compileError("dev_names diverges from dev at '" ++ d.name ++ "'");
+            if (!std.mem.eql(u8, d.name, name)) {
+                @compileError("dev_names diverges from dev at '" ++ d.name ++ "'");
+            }
         }
     }
+
     return dispatchOver(init, &(release ++ dev), "zigferencer-dev");
 }
 
@@ -152,13 +154,18 @@ pub fn isHelpWord(arg: []const u8) bool {
     for (words) |w| {
         if (std.mem.eql(u8, arg, w)) return true;
     }
+
     return false;
 }
 
 // -- helpers ----------------------------------------------------------------
 
 /// Resolve `args[1]` against `table` and run its handler.
-fn dispatchOver(init: std.process.Init, comptime table: []const Subcommand, comptime binary_name: []const u8) !void {
+fn dispatchOver(
+    init: std.process.Init,
+    comptime table: []const Subcommand,
+    comptime binary_name: []const u8,
+) !void {
     const arena = init.arena.allocator();
     const args = try init.minimal.args.toSlice(arena);
     std.debug.assert(args.len >= 1);
@@ -171,20 +178,19 @@ fn dispatchOver(init: std.process.Init, comptime table: []const Subcommand, comp
         printUsage(init.io, .stderr(), style.Palette.init(color_err), table, binary_name);
         return;
     }
+
     // Help answers before any environment check, so a bad variable cannot hide it.
     if (isHelpWord(args[1])) {
         printUsage(init.io, .stdout(), style.Palette.init(color), table, binary_name);
         return;
     }
+
     const models_root = registry.resolveRoot(init.environ_map.get(registry.models_dir_env));
-    const cache_dir = prompt_cache.resolveCacheDir(init.environ_map.get(prompt_cache.cache_dir_env));
-    const vk_storage_range: ?u64 = if (init.environ_map.get(limits.storage_range_env)) |text|
-        limits.parseStorageRange(text) catch |err| {
-            printBadStorageRange(init.io, text);
-            return err;
-        }
-    else
-        null;
+    const cache_dir = prompt_cache.resolveCacheDir(
+        init.environ_map.get(prompt_cache.cache_dir_env),
+    );
+    const vk_storage_range = try resolveStorageRange(init);
+
     const sub = args[1];
     for (table) |s| {
         if (std.mem.eql(u8, s.name, sub)) {
@@ -201,66 +207,107 @@ fn dispatchOver(init: std.process.Init, comptime table: []const Subcommand, comp
             });
         }
     }
-    // The dev binary holds every dev name, so only the release binary reaches
-    // the hint.
+
+    // The dev binary holds every dev name, so only the release binary reaches the hint.
     for (dev_names) |name| {
         if (std.mem.eql(u8, name, sub)) {
             printDevCommand(init.io, sub);
             return error.UnknownSubcommand;
         }
     }
+
     printUnknownSubcommand(init.io, sub, binary_name);
     return error.UnknownSubcommand;
 }
 
-// The usage and unknown-subcommand paths discard a failed write, like
-// `args.writeStderr`. A failure there has nowhere useful to go.
-fn printUsage(io: Io, file: Io.File, p: style.Palette, comptime table: []const Subcommand, comptime binary_name: []const u8) void {
-    var buf: [4096]u8 = undefined;
-    var fw: Io.File.Writer = .initStreaming(file, io, &buf);
-    const w = &fw.interface;
-    w.print("{s}" ++ binary_name ++ "{s}: a small LLM inference engine (Zig 0.16)\n\n", .{ p.bold, p.reset }) catch return;
-    w.print("{s}usage:{s} " ++ binary_name ++ " <command> [args]\n\n", .{ p.bold, p.reset }) catch return;
+fn resolveStorageRange(init: std.process.Init) !?u64 {
+    const text = init.environ_map.get(limits.storage_range_env) orelse return null;
+    return limits.parseStorageRange(text) catch |err| {
+        printBadStorageRange(init.io, text);
+        return err;
+    };
+}
+
+// The printers below discard a failed write, like `args.writeStderr`, because the error has
+// nowhere to go.
+fn printUsage(
+    io: Io,
+    file: Io.File,
+    p: style.Palette,
+    comptime table: []const Subcommand,
+    comptime binary_name: []const u8,
+) void {
+    var usage_buffer: [stdout_buffer_bytes]u8 = undefined;
+    var usage_writer: Io.File.Writer = .initStreaming(file, io, &usage_buffer);
+    const w = &usage_writer.interface;
+
+    w.print(
+        "{s}" ++ binary_name ++ "{s}: a small LLM inference engine (Zig 0.16)\n\n",
+        .{ p.bold, p.reset },
+    ) catch return;
+    w.print(
+        "{s}usage:{s} " ++ binary_name ++ " <command> [args]\n\n",
+        .{ p.bold, p.reset },
+    ) catch return;
     w.print("{s}commands:{s}\n", .{ p.bold, p.reset }) catch return;
+
     const width = comptime nameWidth(table);
     for (table) |s| {
-        w.print("  {s}{s}{s}{s} {s}\n", .{ p.green, s.name, p.reset, pad[0 .. width - s.name.len], s.summary }) catch return;
+        w.print(
+            "  {s}{s}{s}{s} {s}\n",
+            .{ p.green, s.name, p.reset, pad[0 .. width - s.name.len], s.summary },
+        ) catch return;
     }
-    w.print("\n{s}'" ++ binary_name ++ " <command> --help' lists a command's flags.{s}\n", .{ p.dim, p.reset }) catch return;
+
+    w.print(
+        "\n{s}'" ++ binary_name ++ " <command> --help' lists a command's flags.{s}\n",
+        .{ p.dim, p.reset },
+    ) catch return;
     w.flush() catch {};
 }
 
 /// The longest command name of `table`, the width of the name column.
 fn nameWidth(comptime table: []const Subcommand) usize {
     var width: usize = 0;
-    for (table) |s| width = @max(width, s.name.len);
+    for (table) |s| {
+        width = @max(width, s.name.len);
+    }
+
     std.debug.assert(width <= pad.len);
     return width;
 }
 
-const pad = " " ** 32;
-
 fn printBadStorageRange(io: Io, text: []const u8) void {
-    var buf: [256]u8 = undefined;
-    var fw: Io.File.Writer = .initStreaming(.stderr(), io, &buf);
-    const w = &fw.interface;
-    w.print("error: " ++ limits.storage_range_env ++ " must be a byte count in 1..{d}. The value is '{s}'\n", .{ limits.storage_range_max, text }) catch return;
+    var stderr_buffer: [error_buffer_bytes]u8 = undefined;
+    var stderr_writer: Io.File.Writer = .initStreaming(.stderr(), io, &stderr_buffer);
+    const w = &stderr_writer.interface;
+
+    w.print(
+        "error: " ++ limits.storage_range_env ++ " must be a byte count in 1..{d}. The " ++
+            "value is '{s}'\n",
+        .{ limits.storage_range_max, text },
+    ) catch return;
     w.flush() catch {};
 }
 
 fn printDevCommand(io: Io, sub: []const u8) void {
-    var buf: [256]u8 = undefined;
-    var fw: Io.File.Writer = .initStreaming(.stderr(), io, &buf);
-    const w = &fw.interface;
-    w.print("error: '{s}' is a developer command. Run it with zigferencer-dev.\n", .{sub}) catch return;
+    var stderr_buffer: [error_buffer_bytes]u8 = undefined;
+    var stderr_writer: Io.File.Writer = .initStreaming(.stderr(), io, &stderr_buffer);
+    const w = &stderr_writer.interface;
+
+    w.print(
+        "error: '{s}' is a developer command. Run it with zigferencer-dev.\n",
+        .{sub},
+    ) catch return;
     w.flush() catch {};
 }
 
 fn printUnknownSubcommand(io: Io, sub: []const u8, comptime binary_name: []const u8) void {
-    var buf: [256]u8 = undefined;
-    var fw: Io.File.Writer = .initStreaming(.stderr(), io, &buf);
-    const w = &fw.interface;
-    w.print("error: unknown subcommand '{s}'\n", .{sub}) catch return;
+    var stderr_buffer: [error_buffer_bytes]u8 = undefined;
+    var stderr_writer: Io.File.Writer = .initStreaming(.stderr(), io, &stderr_buffer);
+    const w = &stderr_writer.interface;
+
+    w.print("error: unknown command '{s}'\n", .{sub}) catch return;
     w.writeAll("run '" ++ binary_name ++ "' with no arguments for usage\n") catch return;
     w.flush() catch {};
 }
@@ -276,5 +323,7 @@ test "isHelpWord: the three help spellings and nothing else" {
         .{ .arg = "--helpme", .want = false },
         .{ .arg = "", .want = false },
     };
-    for (cases) |c| try std.testing.expectEqual(c.want, isHelpWord(c.arg));
+    for (cases) |c| {
+        try std.testing.expectEqual(c.want, isHelpWord(c.arg));
+    }
 }

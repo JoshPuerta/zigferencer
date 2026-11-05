@@ -14,13 +14,17 @@ const loader = @import("../io/gguf/loader.zig");
 /// The per-layer price of the model the card states: the Qwen3.5 vector for a
 /// card with GDN layers, and the Llama vector otherwise.
 pub fn costVector(card: loader.ModelCard, kv_dtype: dtype.KvDtype) kv_budget.KvCostVector {
-    return if (card.gdn != null) qwenCostVector(card, kv_dtype) else llamaCostVector(card, kv_dtype);
+    return if (card.gdn != null) qwenCostVector(
+        card,
+        kv_dtype,
+    ) else llamaCostVector(card, kv_dtype);
 }
 
 /// Every Llama layer holds the same KV and no recurrent state, so the vector
 /// is uniform and its fixed column is zero.
 pub fn llamaCostVector(card: loader.ModelCard, kv_dtype: dtype.KvDtype) kv_budget.KvCostVector {
     std.debug.assert(card.gdn == null);
+
     const vector = kv_budget.KvCostVector.uniform(
         card.n_layers,
         @as(u64, 2) * kv_dtype.rowBytes(card.n_kv_heads * card.head_dim),
@@ -44,8 +48,13 @@ pub fn qwenCostVector(card: loader.ModelCard, kv_dtype: dtype.KvDtype) kv_budget
     var vector = kv_budget.KvCostVector.uniform(card.n_layers, 0);
     var li: u32 = 0;
     while (li < card.n_layers) : (li += 1) {
-        if (g.isFullAttention(li)) vector.set(li, attn_bytes, 0) else vector.set(li, 0, gdn_bytes);
+        if (g.isFullAttention(li)) {
+            vector.set(li, attn_bytes, 0);
+        } else {
+            vector.set(li, 0, gdn_bytes);
+        }
     }
+
     validate(vector, card, kv_dtype);
     return vector;
 }
@@ -115,8 +124,12 @@ test "costVector: the 8B card charges 4096 f16 bytes a token on every layer" {
         try std.testing.expectEqual(@as(u32, 4_096), entry.kv_bytes_per_token);
         try std.testing.expectEqual(@as(u32, 0), entry.fixed_bytes_per_slot);
     }
+
     // f32 doubles the token price.
-    try std.testing.expectEqual(@as(u64, 2 * 32 * 4_096), costVector(llamaCard(), .f32).total().kv_bytes_per_token);
+    try std.testing.expectEqual(
+        @as(u64, 2 * 32 * 4_096),
+        costVector(llamaCard(), .f32).total().kv_bytes_per_token,
+    );
 }
 
 test "costVector: the 2B card prices attention and GDN layers apart, and the dtype moves only the tokens" {

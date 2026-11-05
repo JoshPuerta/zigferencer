@@ -34,7 +34,7 @@ comptime {
     }
 }
 
-// -- api -----------------------------------------------------------------------
+// -- types ------------------------------------------------------------------
 
 pub const Runner = struct {
     gpa: std.mem.Allocator,
@@ -74,29 +74,40 @@ pub const Runner = struct {
     pub fn initWith(gpa: std.mem.Allocator, options: vulkan_ctx.Options) InitError!*Runner {
         const self = try gpa.create(Runner);
         errdefer gpa.destroy(self);
+
         self.gpa = gpa;
         self.ctx = try vulkan_ctx.Context.init(gpa, options);
         errdefer self.ctx.deinit();
+
         // From here on, `&self.ctx` is a stable pointer for the runner's
         // lifetime. Each kernel below stores it.
         self.vec_add = try kernels.VecAdd.init(&self.ctx);
         errdefer self.vec_add.deinit();
+
         self.residual_add = try kernels.ResidualAdd.init(&self.ctx);
         errdefer self.residual_add.deinit();
+
         self.swiglu = try kernels.Swiglu.init(&self.ctx);
         errdefer self.swiglu.deinit();
+
         self.rmsnorm = try kernels.Rmsnorm.init(&self.ctx);
         errdefer self.rmsnorm.deinit();
+
         self.rope = try kernels.Rope.init(&self.ctx);
         errdefer self.rope.deinit();
+
         self.attention = try kernels.Attention.init(&self.ctx);
         errdefer self.attention.deinit();
+
         self.linear_q8_0 = try kernels.LinearQ80.init(&self.ctx);
         errdefer self.linear_q8_0.deinit();
+
         self.linear_q8_0_reduce = try kernels.LinearQ80Reduce.init(&self.ctx);
         errdefer self.linear_q8_0_reduce.deinit();
+
         self.linear_q8_0_subgroup = try kernels.LinearQ80Subgroup.init(&self.ctx);
         errdefer self.linear_q8_0_subgroup.deinit();
+
         self.linear_q4_0_reduce = try kernels.LinearQ40Reduce.init(&self.ctx);
         return self;
     }

@@ -13,7 +13,7 @@ const cli = @import("cli/command.zig");
 const log = @import("core/log.zig");
 const span = @import("core/span.zig");
 
-// -- api --------------------------------------------------------------------
+// -- constants --------------------------------------------------------------
 
 /// Route `std.log` through the stderr handler that the environment gates. The
 /// comptime ceiling is `debug` in every build, so the flow traces always compile
@@ -87,30 +87,38 @@ pub const vulkan_ctx = if (build_options.use_vulkan)
     @import("runtime/vulkan_ctx.zig")
 else
     struct {};
+
 pub const ops_vulkan = if (build_options.use_vulkan)
     @import("ops_vulkan/kernels.zig")
 else
     struct {};
+
 pub const vulkan_runner = if (build_options.use_vulkan)
     @import("runtime/vulkan_runner.zig")
 else
     struct {};
+
 pub const llama_fused = if (build_options.use_vulkan_fused_ops)
     @import("runtime/llama_fused.zig")
 else
     struct {};
+
 pub const qwen_fused = if (build_options.use_vulkan_fused_ops)
     @import("runtime/qwen_fused.zig")
 else
     struct {};
+
 pub const llama_hybrid = if (build_options.use_vulkan_fused_ops)
     @import("runtime/llama_hybrid.zig")
 else
     struct {};
+
 const qwen_hybrid = if (build_options.use_vulkan_fused_ops)
     @import("runtime/qwen_hybrid.zig")
 else
     struct {};
+
+// -- api --------------------------------------------------------------------
 
 pub fn main(init: std.process.Init) !void {
     return entry(init, .release);
@@ -123,9 +131,12 @@ pub fn entry(init: std.process.Init, comptime which: enum { release, dev }) !voi
         .release => cli.dispatchRelease,
         .dev => cli.dispatchDev,
     };
-    // The top-level help runs before the log and trace setup, so a bad trace variable cannot hide it.
+
+    // The top-level help runs before the log and trace setup, so a bad trace variable cannot hide
+    // it.
     const argv = try init.minimal.args.toSlice(init.arena.allocator());
     if (argv.len > 1 and cli.isHelpWord(argv[1])) return dispatch(init);
+
     log.setFromEnv(init.environ_map.get("ZIGFERENCER_LOG"));
     const trace_spans = init.environ_map.get(limits.trace_spans_env);
     span.setFromEnv(init.io, .{
@@ -138,6 +149,7 @@ pub fn entry(init: std.process.Init, comptime which: enum { release, dev }) !voi
         std.process.exit(1);
     };
     defer span.finish();
+
     dispatch(init) catch |err| {
         // A handled user error is one of bad arguments, an unknown model, or no
         // model picked. Its handler already printed a readable message to
@@ -149,6 +161,7 @@ pub fn entry(init: std.process.Init, comptime which: enum { release, dev }) !voi
             span.finish();
             std.process.exit(1);
         }
+
         return err;
     };
 }
@@ -160,7 +173,11 @@ fn printBadTraceSpans(io: std.Io, text: []const u8) void {
     var buf: [256]u8 = undefined;
     var fw: std.Io.File.Writer = .initStreaming(.stderr(), io, &buf);
     const w = &fw.interface;
-    w.print("error: " ++ limits.trace_spans_env ++ " must be a ring capacity in 1..{d}. The value is '{s}'\n", .{ limits.spans_per_thread_max, text }) catch return;
+    w.print(
+        "error: " ++ limits.trace_spans_env ++ " must be a ring capacity in 1..{d}. The " ++
+            "value is '{s}'\n",
+        .{ limits.spans_per_thread_max, text },
+    ) catch return;
     w.flush() catch {};
 }
 
@@ -190,8 +207,6 @@ fn isUserError(err: anyerror) bool {
         error.NotEnoughBytes,
         // The loader already logged the file and the RoPE scaling type.
         error.UnsupportedRopeScaling,
-        // serve: model/arch mismatch explained by the handler's log line.
-        error.UnsupportedServeArch,
         // backend/arch refusals: the handler names the build that works.
         error.UnsupportedServeBackend,
         error.UnsupportedArchForBackend,
@@ -331,6 +346,7 @@ test {
         _ = &ops_vulkan.StreamRing.release;
         _ = &ops_vulkan.StreamRing.deinit;
     }
+
     if (build_options.use_vulkan_fused_ops) {
         _ = llama_fused;
         // The qwen fused runner's tests are device-free (cost vectors, range

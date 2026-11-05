@@ -4,7 +4,7 @@
 //! as a new entry. Every path is best-effort: a refusal or a failure degrades
 //! to a cold prefill.
 //!
-//! The seam with the scheduler. The scheduler keeps every engine call whose
+//! The boundary with the scheduler. The scheduler keeps every engine call whose
 //! result a slot's state machine consumes (`restorePrefix` and `restoreReady`
 //! drive `slot.fed`, `endPrefill`, and `acceptToken`). This module keeps every
 //! engine call whose result only the cache consumes (`snapshotBytesFor`,
@@ -26,6 +26,12 @@ const prompt_cache_mod = @import("../runtime/prompt_cache.zig");
 const OutEvent = event.OutEvent;
 
 const log = std.log.scoped(.serve);
+
+// -- constants --------------------------------------------------------------
+
+/// A connection id no transport can hold. Preload runs before the engine loop
+/// starts, so no live connection exists to collide with it.
+const preload_conn: u32 = std.math.maxInt(u32);
 
 // -- types ------------------------------------------------------------------
 
@@ -78,10 +84,6 @@ const Candidate = struct {
     t_turn_start: Io.Clock.Timestamp,
 };
 
-/// A connection id no transport can hold. Preload runs before the engine loop
-/// starts, so no live connection exists to collide with it.
-const preload_conn: u32 = std.math.maxInt(u32);
-
 /// The boot sink: accept every event, and keep the open result. Nothing parks
 /// here, because `emit` never refuses.
 const PreloadSink = struct {
@@ -91,6 +93,7 @@ const PreloadSink = struct {
 
     pub fn emit(self: *PreloadSink, conn: u32, ev: OutEvent) bool {
         std.debug.assert(conn == preload_conn);
+
         switch (ev.body) {
             .session_opened => |m| self.opened = .{ .sid = ev.session_id, .kv_pos = m.kv_pos },
             .err => |e| {
@@ -99,6 +102,7 @@ const PreloadSink = struct {
             },
             else => {},
         }
+
         return true;
     }
 
@@ -107,8 +111,6 @@ const PreloadSink = struct {
         _ = conn;
     }
 };
-
-// -- api --------------------------------------------------------------------
 
 pub const PrefixManager = struct {
     gpa: Allocator,
@@ -151,11 +153,14 @@ pub const PrefixManager = struct {
                 }
             }
         }
+
         return self;
     }
 
     pub fn deinit(self: *PrefixManager) void {
-        if (self.cache) |*cache| cache.deinit();
+        if (self.cache) |*cache| {
+            cache.deinit();
+        }
     }
 
     pub fn enabled(self: *const PrefixManager) bool {
@@ -167,7 +172,9 @@ pub const PrefixManager = struct {
     }
 
     pub fn logEntryHits(self: *const PrefixManager) void {
-        if (self.cache) |*cache| cache.logEntryHits();
+        if (self.cache) |*cache| {
+            cache.logEntryHits();
+        }
     }
 
     /// The longest cached prefix this turn can restore. An opening turn can
@@ -181,12 +188,14 @@ pub const PrefixManager = struct {
     /// where the engine has already answered.
     pub fn planRestore(self: *PrefixManager, tokens: []const u32, opening: bool) Restore {
         std.debug.assert(self.cache != null);
+
         const cache = &self.cache.?;
         const best = cache.lookupBestPrefix(tokens) orelse return .miss;
         if (!opening and best.n == tokens.len and best.last_logits.len > 0) {
             return .{ .ready = .{ .n = best.n, .blob = best.blob, .logits = best.last_logits } };
         }
         if (opening or best.n < tokens.len) return .{ .rows = .{ .n = best.n, .blob = best.blob } };
+
         const shorter = cache.lookupBestPrefix(tokens[0 .. tokens.len - 1]) orelse return .miss;
         return .{ .rows = .{ .n = shorter.n, .blob = shorter.blob } };
     }
@@ -195,8 +204,11 @@ pub const PrefixManager = struct {
     /// names the tier that served it.
     pub fn recordHit(self: *PrefixManager) void {
         std.debug.assert(self.cache != null);
+
         self.hits += 1;
-        if (self.cache.?.last_hit_from_disk) self.disk_hits += 1;
+        if (self.cache.?.last_hit_from_disk) {
+            self.disk_hits += 1;
+        }
     }
 
     pub fn recordMiss(self: *PrefixManager) void {
@@ -216,12 +228,14 @@ pub const PrefixManager = struct {
         // An exact entry already serves this prefix, and the lookup's LRU
         // bump is the only bookkeeping it needs.
         if (cache.lookup(key, tokens) != null) return;
+
         // Wall time from turn start, so decode interleaving inflates it.
         // The gate then over-admits at the margin, which the LRU absorbs.
         const prefill_ns = nsBetween(c.t_turn_start, Io.Clock.Timestamp.now(self.io, .awake));
         const bytes: usize = @intCast(engine.snapshotBytesFor(n));
         const buf = self.gpa.alloc(u8, bytes) catch return;
         defer self.gpa.free(buf);
+
         // The restore estimate times the copy alone. A hit pays the symmetric
         // device copy, never this transient allocation.
         const t_copy = Io.Clock.Timestamp.now(self.io, .awake);
@@ -237,17 +251,29 @@ pub const PrefixManager = struct {
         // computes no logits and stores none. A failed allocation only
         // downgrades the entry to restore-only.
         var logits: []const f32 = &[_]f32{};
-        const logits_buf: []f32 = if (c.opening) &.{} else self.gpa.alloc(f32, c.vocab_size) catch &.{};
+        const logits_buf: []f32 = if (c.opening) &.{} else self.gpa.alloc(
+            f32,
+            c.vocab_size,
+        ) catch &.{};
+
         defer if (logits_buf.len > 0) self.gpa.free(logits_buf);
+
         if (logits_buf.len > 0) {
             engine.copyFinalLogits(c.engine_id, logits_buf);
             logits = logits_buf;
         }
+
         const admitted = cache.admit(key, tokens, buf, logits, prefill_ns, restore_ns) catch false;
         if (admitted) {
             self.inserts += 1;
-            if (cache.last_admit_disk) self.disk_inserts += 1;
-            log.debug("prefix insert: session {d}, {d} tokens, {d} bytes", .{ c.proto_id, n, bytes });
+            if (cache.last_admit_disk) {
+                self.disk_inserts += 1;
+            }
+
+            log.debug(
+                "prefix insert: session {d}, {d} tokens, {d} bytes",
+                .{ c.proto_id, n, bytes },
+            );
         }
     }
 
@@ -261,15 +287,23 @@ pub const PrefixManager = struct {
     /// `self` and `sched` alias. The body must therefore not hold a manager
     /// field across a tick, because a tick can change every counter and the
     /// cache list.
-    pub fn preload(self: *PrefixManager, sched: anytype, texts: []const []const u8, max_seq: u32) void {
+    pub fn preload(
+        self: *PrefixManager,
+        sched: anytype,
+        texts: []const []const u8,
+        max_seq: u32,
+    ) void {
         if (texts.len == 0) return;
+
         std.debug.assert(texts.len <= limits.serve_preload_max);
         if (self.cache == null) {
             log.warn("preload skipped: the prefix cache is disabled on this configuration", .{});
             return;
         }
+
         for (texts) |text| {
             std.debug.assert(text.len > 0);
+
             var sink: PreloadSink = .{};
             const dup = self.gpa.dupe(u8, text) catch {
                 log.warn("preload abandoned: out of memory", .{});
@@ -289,6 +323,7 @@ pub const PrefixManager = struct {
                     return;
                 }
             }
+
             const o = sink.opened orelse {
                 log.warn("preload refused: {s}", .{sink.err_detail[0..sink.err_len]});
                 continue;

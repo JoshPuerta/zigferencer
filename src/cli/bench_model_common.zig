@@ -1,8 +1,5 @@
-//! Shared values and leaf helpers for the bench-model command, which splits
-//! across `bench_model_{cmd,exec,report,qwen}.zig`. The result structs are the
-//! values those modules pass to each other. The helpers are the one-liners that
-//! more than one of them needs. This module imports nothing from its siblings,
-//! so the siblings cannot form an import cycle.
+//! The values the files of `bench-model` pass to each other, and their leaf
+//! helpers.
 
 const std = @import("std");
 const Io = std.Io;
@@ -11,14 +8,39 @@ const kv_budget = @import("../core/kv_budget.zig");
 const dtype = @import("../core/dtype.zig");
 const limits = @import("../core/limits.zig");
 const step_stats = @import("../core/step_stats.zig");
+const registry = @import("../core/registry.zig");
+const loader = @import("../io/gguf/loader.zig");
+const resolve_mod = @import("../engine/resolve.zig");
+const parallel = @import("../runtime/parallel.zig");
 const args = @import("args.zig");
+const cli = @import("command.zig");
 const flags_mod = @import("flags.zig");
+const serve_common = @import("serve_common.zig");
 
-/// Re-exported so the bench-family modules keep one `common.writeStderr` name
-/// over the single implementation in `cli/args.zig`.
 pub const writeStderr = args.writeStderr;
 
+// -- constants --------------------------------------------------------------
+
+/// Positions per bucket of the ITL depth curve.
+pub const itl_bucket_positions: u32 = 512;
+
 // -- types ------------------------------------------------------------------
+
+/// What every path of one bench reads. `bench_model_cmd` builds it once, after
+/// the load and the resolve.
+pub const Bench = struct {
+    ctx: cli.Context,
+    opt: Options,
+    model: *const registry.Model,
+    loaded: *const loader.Loaded,
+    boot: *const serve_common.DeviceBoot,
+    resolved: *const resolve_mod.Resolved,
+    policy: parallel.Policy,
+
+    pub fn kvDtype(self: *const Bench) dtype.KvDtype {
+        return self.resolved.early.kv_dtype;
+    }
+};
 
 /// The bench-model flag set. `bench_model_cmd` parses it once and hands the
 /// executors one value, which separates what the caller asked for from how the
@@ -32,18 +54,15 @@ pub const Options = struct {
     chat: bool = false,
     json: bool = false,
     /// Synthesize exactly N prompt tokens instead of tokenizing `prompt`.
-    /// Timing is data-independent, so this gives exact, tokenizer-agnostic
-    /// prefill lengths for reproducible TTFT-vs-N sweeps.
     prompt_tokens: ?u32 = null,
     /// Force exactly max_tokens steps per run. Throughput depends only on token
     /// counts, so this gives a clean, model-agnostic ITL even when greedy
     /// decoding degenerates to early EOS.
     ignore_eos: bool = false,
-    /// The bench takes no thinking knob, so the engine thinking stays `auto`.
+    /// The bench takes no thinking option, so the engine thinking stays `auto`.
     engine: flags_mod.EngineFlags = .{},
     /// With a --gpu-layers count: construct the hybrid even at a degenerate
-    /// split (0 or all layers), which production selection never does. The
-    /// cross-runner token-equality gate runs through this.
+    /// split (0 or all layers).
     force_hybrid: bool = false,
     /// CPU backends only, llama and qwen35: prefill the prompt unprofiled, then
     /// decode `max_tokens` steps with the per-op CPU timer
@@ -61,7 +80,8 @@ pub const Options = struct {
     pub const omit: []const []const u8 = &.{ "thinking", "thinking_budget" };
     pub const help: args.Help = .{
         .usage = "zigferencer-dev bench-model <pub_name> [flags]",
-        .about = "Run the full forward pass repeatedly. Report TTFT, ITL, and a token-stream hash.\n",
+        .about = "Run the full forward pass repeatedly. Report TTFT, ITL, and a " ++
+            "token-stream hash.\n",
         .footer =
         \\examples:
         \\  zigferencer-dev bench-model SmolLM2-135M-Instruct-Q8_0 --runs 5
@@ -71,21 +91,35 @@ pub const Options = struct {
     };
     pub const docs = .{
         .prompt = args.Doc{ .group = "common", .text = "text to feed" },
-        .max_tokens = args.Doc{ .group = "common", .text = "the most tokens one run generates, at least 2" },
-        .runs = args.Doc{ .group = "common", .text = std.fmt.comptimePrint("repeat for stddev, at most {d}", .{limits.bench_runs_max}) },
+        .max_tokens = args.Doc{
+            .group = "common",
+            .text = "the most tokens one run generates, at least 2",
+        },
+        .runs = args.Doc{
+            .group = "common",
+            .text = std.fmt.comptimePrint(
+                "repeat for stddev, at most {d}",
+                .{limits.bench_runs_max},
+            ),
+        },
         .chat = args.Doc{ .group = "common", .text = "apply the chat template of the model" },
         .json = args.Doc{
             .group = "common",
-            .text = "machine-readable output (tools/bench_model_all.sh).\nEach run adds itl_by_depth, the mean ITL per 512 KV positions",
+            .text = "machine-readable output (tools/bench_model_all.sh).\nEach run adds " ++
+                "itl_by_depth, the mean ITL per 512 KV positions",
         },
         .prompt_tokens = args.Doc{
             .group = "prompt shape",
             .text = "synthesize N prompt tokens (TTFT-vs-N sweeps, overrides --prompt)",
         },
-        .ignore_eos = args.Doc{ .group = "prompt shape", .text = "spend the full decode budget per run (clean ITL)" },
+        .ignore_eos = args.Doc{
+            .group = "prompt shape",
+            .text = "spend the full decode budget per run (clean ITL)",
+        },
         .force_hybrid = args.Doc{
             .group = "gpu (fused-GPU build only)",
-            .text = "construct the hybrid even at a degenerate split (gate\nruns, llama only). Needs a --gpu-layers count",
+            .text = "construct the hybrid even at a degenerate split (gate\nruns, llama " ++
+                "only). Needs a --gpu-layers count",
         },
         .profile_cpu_decode = args.Doc{
             .group = "profiling (cpu, hot-trace build only: OPT=Debug or TRACE=1)",
@@ -101,7 +135,8 @@ pub const Options = struct {
         },
         .gpu_layers = args.Doc{
             .group = "gpu (fused-GPU build only)",
-            .text = "pin N GPU layers, bench the hybrid split runner.\nauto puts the most layers on the GPU that the free VRAM funds",
+            .text = "pin N GPU layers, bench the hybrid split runner.\nauto puts the most " ++
+                "layers on the GPU that the free VRAM funds",
         },
     };
 };
@@ -113,8 +148,6 @@ pub const PlanInfo = struct {
     n_slots: u32 = 0,
     window: u32 = 0,
     kv_mib: u64 = 0,
-    /// The dtype the plan was priced at, so the report names the run's KV
-    /// element type the way the serve plan line names it.
     kv_dtype: dtype.KvDtype = .f32,
 
     pub fn fromPlan(plan: kv_budget.KvPlan, kv_dtype: dtype.KvDtype) PlanInfo {
@@ -127,9 +160,6 @@ pub const PlanInfo = struct {
     }
 };
 
-/// Positions per bucket of the ITL depth curve.
-pub const itl_bucket_positions: u32 = 512;
-
 /// One bucket of the ITL depth curve: the decode steps that wrote a position
 /// in `pos .. pos + itl_bucket_positions`, and their summed wall time.
 pub const DepthBucket = struct {
@@ -139,14 +169,13 @@ pub const DepthBucket = struct {
 
     pub fn meanMs(b: DepthBucket) f64 {
         std.debug.assert(b.steps > 0);
+
         return @as(f64, @floatFromInt(b.ns)) / @as(f64, @floatFromInt(b.steps)) / 1e6;
     }
 };
 
 /// The per-step decode times of one turn, summed per bucket of
-/// `itl_bucket_positions`. Integer sums are exact, and the report divides once
-/// per bucket, so no rounding error builds up across the steps. The buckets
-/// span the engine bound, so a window at any model ceiling fits.
+/// `itl_bucket_positions`.
 pub const DepthCurve = struct {
     pub const bucket_count = limits.max_model_ctx / itl_bucket_positions;
     comptime {
@@ -158,6 +187,7 @@ pub const DepthCurve = struct {
 
     pub fn add(self: *DepthCurve, pos: u32, ns: u64) void {
         std.debug.assert(pos < limits.max_model_ctx);
+
         const i = pos / itl_bucket_positions;
         self.steps[i] += 1;
         self.ns[i] += ns;
@@ -166,7 +196,10 @@ pub const DepthCurve = struct {
     /// The non-empty buckets in position order, in memory from `arena`.
     pub fn collect(self: *const DepthCurve, arena: Allocator) Allocator.Error![]const DepthBucket {
         var n: usize = 0;
-        for (self.steps) |s| n += @intFromBool(s > 0);
+        for (self.steps) |s| {
+            n += @intFromBool(s > 0);
+        }
+
         const out = try arena.alloc(DepthBucket, n);
         var k: usize = 0;
         for (self.steps, self.ns, 0..) |s, ns, i| {
@@ -174,6 +207,7 @@ pub const DepthCurve = struct {
             out[k] = .{ .pos = @as(u32, @intCast(i)) * itl_bucket_positions, .steps = s, .ns = ns };
             k += 1;
         }
+
         std.debug.assert(k == n);
         return out;
     }
@@ -198,25 +232,36 @@ pub fn toMs(t0: Io.Clock.Timestamp, t1: Io.Clock.Timestamp) f64 {
 }
 
 /// Refuse a bench whose prompt plus decode budget passes the sequence window.
-/// Every bench arm frames one window, so the check lives here once. The message
-/// names the count and the limit, so the CLI exits with no trace.
-pub fn requireSequenceFits(io: Io, prompt_len: usize, decode_len: u32, max_seq: u32) error{PromptTooLong}!void {
+pub fn requireSequenceFits(
+    io: Io,
+    prompt_len: usize,
+    decode_len: u32,
+    max_seq: u32,
+) error{PromptTooLong}!void {
     if (prompt_len + decode_len <= max_seq) return;
+
     var buf: [256]u8 = undefined;
     var fw: Io.File.Writer = .initStreaming(.stderr(), io, &buf);
-    fw.interface.print("error: prompt {d} + decode {d} tokens passes the {d}-token window. Lower --prompt-tokens or --max-tokens\n", .{
-        prompt_len, decode_len, max_seq,
-    }) catch {};
+
+    fw.interface.print(
+        "error: prompt {d} + decode {d} tokens passes the {d}-token window. Lower " ++
+            "--prompt-tokens or --max-tokens\n",
+        .{
+            prompt_len, decode_len, max_seq,
+        },
+    ) catch {};
+
     fw.interface.flush() catch {};
     return error.PromptTooLong;
 }
 
-/// Synthesize `n` deterministic in-range token ids for a TTFT/ITL sweep. The
-/// output text is garbage, and prefill and decode timing is data-independent for
-/// these kernels, so this gives exact, tokenizer-agnostic prefill lengths.
+/// Synthesize `n` deterministic in-range token ids for a TTFT/ITL sweep.
 pub fn synthPromptIds(arena: Allocator, n: u32, vocab: u32) ![]u32 {
     const ids = try arena.alloc(u32, n);
-    for (ids, 0..) |*id, i| id.* = @intCast((i * 131 + 7) % vocab);
+    for (ids, 0..) |*id, i| {
+        id.* = @intCast((i * 131 + 7) % vocab);
+    }
+
     return ids;
 }
 
@@ -240,7 +285,10 @@ test "DepthCurve: bucket steps and nanoseconds sum to the stream totals exactly"
         var total_ns: u64 = 0;
         var i: u32 = 0;
         while (i < len) : (i += 1) {
-            pos = if (walk) (pos + 1) % limits.max_model_ctx else rand.uintLessThan(u32, limits.max_model_ctx);
+            pos = if (walk) (pos + 1) % limits.max_model_ctx else rand.uintLessThan(
+                u32,
+                limits.max_model_ctx,
+            );
             const ns = rand.uintAtMost(u64, 2_000_000_000);
             curve.add(pos, ns);
             seen[pos / itl_bucket_positions] = true;
@@ -249,19 +297,27 @@ test "DepthCurve: bucket steps and nanoseconds sum to the stream totals exactly"
 
         const buckets = try curve.collect(std.testing.allocator);
         defer std.testing.allocator.free(buckets);
+
         var steps_sum: u64 = 0;
         var ns_sum: u64 = 0;
         var n_seen: usize = 0;
-        for (seen) |b| n_seen += @intFromBool(b);
+        for (seen) |b| {
+            n_seen += @intFromBool(b);
+        }
+
         try std.testing.expectEqual(n_seen, buckets.len);
         for (buckets, 0..) |b, k| {
             try std.testing.expect(b.steps > 0);
             try std.testing.expectEqual(@as(u32, 0), b.pos % itl_bucket_positions);
             try std.testing.expect(seen[b.pos / itl_bucket_positions]);
-            if (k > 0) try std.testing.expect(buckets[k - 1].pos < b.pos);
+            if (k > 0) {
+                try std.testing.expect(buckets[k - 1].pos < b.pos);
+            }
+
             steps_sum += b.steps;
             ns_sum += b.ns;
         }
+
         try std.testing.expectEqual(@as(u64, len), steps_sum);
         try std.testing.expectEqual(total_ns, ns_sum);
     }
@@ -273,6 +329,7 @@ test "DepthCurve: the first and the last position of the engine bound land in th
     curve.add(limits.max_model_ctx - 1, 5);
     const buckets = try curve.collect(std.testing.allocator);
     defer std.testing.allocator.free(buckets);
+
     try std.testing.expectEqual(@as(usize, 2), buckets.len);
     try std.testing.expectEqual(@as(u32, 0), buckets[0].pos);
     try std.testing.expectEqual(@as(u64, 3), buckets[0].ns);

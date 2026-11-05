@@ -22,10 +22,7 @@ const OutEvent = event.OutEvent;
 
 const log = std.log.scoped(.serve);
 
-// -- types ------------------------------------------------------------------
-
-/// Where to bind (TCP or unix). Re-exported so callers keep one name.
-pub const Transport = engine_mod.Endpoint;
+// -- constants --------------------------------------------------------------
 
 /// The long ZMTP frame head: one flags byte and an 8-byte size.
 const zmtp_head_bytes: usize = 9;
@@ -34,6 +31,11 @@ const zmtp_head_bytes: usize = 9;
 /// `zmtp_head_bytes + protocol.max_server_frame_bytes`. The PONG and ERROR
 /// command bodies are smaller than that body.
 const writer_frame_bytes: usize = zmtp_head_bytes + protocol.max_server_frame_bytes;
+
+// -- types ------------------------------------------------------------------
+
+/// Where to bind (TCP or unix). Re-exported so callers keep one name.
+pub const Transport = engine_mod.Endpoint;
 
 /// The reader maps these errors to a silent close or to a ZMTP ERROR.
 const HandshakeError = Io.Reader.Error || zmtp.Error || error{ReadyExpected};
@@ -94,6 +96,7 @@ const BinaryAdapter = struct {
             writeEvent(&w.interface, &frame, &ev) catch break :send;
             w.interface.flush() catch break :send;
         }
+
         // A close over the unread peer handshake resets the connection. The
         // FIN of the send shutdown reaches the peer first, so the peer reads
         // the refusal and then the end of the stream.
@@ -102,14 +105,11 @@ const BinaryAdapter = struct {
     }
 };
 
-// -- api --------------------------------------------------------------------
-
 /// The serve engine wearing the binary transport.
 pub fn Server(comptime Engine: type, comptime CodecT: type) type {
     return engine_mod.ServeEngine(Engine, CodecT, BinaryAdapter);
 }
 
-// -- helpers ----------------------------------------------------------------
 //
 // The per-connection tasks are concrete over the engine type. `io.concurrent`
 // builds an argument tuple for the function it spawns, and it cannot do that
@@ -117,7 +117,6 @@ pub fn Server(comptime Engine: type, comptime CodecT: type) type {
 // a struct keyed on the engine. The helpers they call (`readerLoop`,
 // `fatalFrame`) stay `anytype`, because a caller invokes them and no spawn
 // takes them.
-
 fn BinaryTasks(comptime Eng: type) type {
     return struct {
         fn reader(engine: *Eng, conn: *Eng.Conn) void {
@@ -150,16 +149,22 @@ fn BinaryTasks(comptime Eng: type) type {
                     const ev = conn.out_q.getOne(engine.io) catch break;
                     const sp = span.begin(.socket_write);
                     defer sp.end();
+
                     writeEvent(&w.interface, &frame, &ev) catch break;
                     w.interface.flush() catch break;
-                    if (conn.parked_hint.swap(false, .acq_rel)) engine.wake(conn.id);
+                    if (conn.parked_hint.swap(false, .acq_rel)) {
+                        engine.wake(conn.id);
+                    }
                 }
             }
+
             conn.stream.shutdown(engine.io, .both) catch {};
             engine.taskExit(conn);
         }
     };
 }
+
+// -- helpers ----------------------------------------------------------------
 
 fn readerLoop(engine: anytype, conn: anytype) void {
     var read_buf: [4096]u8 = undefined;
@@ -176,6 +181,7 @@ fn readerLoop(engine: anytype, conn: anytype) void {
             error.PeerTypeRefused => "DEALER only",
             error.ReadyExpected, error.Malformed, error.MessageTooLarge => "READY expected",
         };
+
         return fatalHandshake(engine, conn, reason);
     };
     log.debug("handshake: conn {d} accepted peer type '{s}'", .{ conn.id, peer });
@@ -191,27 +197,49 @@ fn readerLoop(engine: anytype, conn: anytype) void {
         // The span starts after the frame head, so it holds no idle wait.
         const sp = span.begin(.socket_read);
         defer sp.end();
+
         if (head.command) {
-            if (head.size > zmtp.max_ready_bytes) return fatalFrame(engine, conn, .frame_too_large, "command too large");
+            if (head.size > zmtp.max_ready_bytes) {
+                return fatalFrame(engine, conn, .frame_too_large, "command too large");
+            }
+
             const body = conn.ext.payload_buf[0..@intCast(head.size)];
             r.interface.readSliceAll(body) catch return;
-            const command = zmtp.decodeCommand(body) catch return fatalFrame(engine, conn, .malformed_frame, "bad command");
+            const command = zmtp.decodeCommand(body) catch return fatalFrame(
+                engine,
+                conn,
+                .malformed_frame,
+                "bad command",
+            );
             switch (command) {
                 // A full queue holds the reader here until the writer drains.
-                .ping => |ping| conn.out_q.putOne(engine.io, OutEvent.zmtpPong(ping.context)) catch return,
+                .ping => |ping| conn.out_q.putOne(
+                    engine.io,
+                    OutEvent.zmtpPong(ping.context),
+                ) catch return,
                 .ready, .pong, .err, .other => {},
             }
+
             continue;
         }
-        if (head.more or head.size < protocol.header_bytes) return fatalFrame(engine, conn, .malformed_frame, "not one frame");
-        if (head.size > zmtp.max_message_bytes) return fatalFrame(engine, conn, .frame_too_large, "message too large");
+
+        if (head.more or head.size < protocol.header_bytes) {
+            return fatalFrame(engine, conn, .malformed_frame, "not one frame");
+        }
+        if (head.size > zmtp.max_message_bytes) {
+            return fatalFrame(engine, conn, .frame_too_large, "message too large");
+        }
+
         const message = conn.ext.payload_buf[0..@intCast(head.size)];
         r.interface.readSliceAll(message) catch return;
         const h = protocol.decodeHeader(message[0..protocol.header_bytes]) catch |e| {
             return fatalFrame(engine, conn, decodeErrorCode(e), @errorName(e));
         };
         const payload = message[protocol.header_bytes..];
-        if (h.payload_len != payload.len) return fatalFrame(engine, conn, .malformed_frame, "payload_len mismatch");
+        if (h.payload_len != payload.len) {
+            return fatalFrame(engine, conn, .malformed_frame, "payload_len mismatch");
+        }
+
         const msg = protocol.decodeClientPayload(h.msg_type, payload) catch |e| {
             return fatalFrame(engine, conn, decodeErrorCode(e), @errorName(e));
         };
@@ -228,16 +256,20 @@ fn readerLoop(engine: anytype, conn: anytype) void {
 /// the peer socket type, which borrows `body_buf`.
 fn readHandshake(r: *Io.Reader, body_buf: []u8) HandshakeError![]const u8 {
     std.debug.assert(body_buf.len >= zmtp.max_ready_bytes);
+
     try zmtp.decodeGreeting(try r.takeArray(zmtp.greeting_bytes));
     const head = try readFrameHead(r);
     if (!head.command or head.size > zmtp.max_ready_bytes) return error.ReadyExpected;
+
     const body = body_buf[0..@intCast(head.size)];
     try r.readSliceAll(body);
     const ready = switch (try zmtp.decodeCommand(body)) {
         .ready => |ready| ready,
         .ping, .pong, .err, .other => return error.ReadyExpected,
     };
+
     if (!zmtp.peerAccepted(ready.socket_type)) return error.PeerTypeRefused;
+
     return ready.socket_type;
 }
 
@@ -293,7 +325,11 @@ fn writeOpening(w: *Io.Writer, frame: *[writer_frame_bytes]u8) Io.Writer.Error!v
 /// Writes one event as one ZMTP frame. A ZMTP variant becomes a command
 /// frame, and every other variant becomes a message that holds one
 /// `protocol.zig` frame.
-fn writeEvent(w: *Io.Writer, frame: *[writer_frame_bytes]u8, ev: *const OutEvent) Io.Writer.Error!void {
+fn writeEvent(
+    w: *Io.Writer,
+    frame: *[writer_frame_bytes]u8,
+    ev: *const OutEvent,
+) Io.Writer.Error!void {
     const body = frame[zmtp_head_bytes..];
     const command = ev.body == .zmtp_pong or ev.body == .zmtp_error;
     const n = switch (ev.body) {
@@ -301,6 +337,7 @@ fn writeEvent(w: *Io.Writer, frame: *[writer_frame_bytes]u8, ev: *const OutEvent
         .zmtp_error => |*m| zmtp.encodeError(m.reason[0..m.len], body),
         else => encodeMessage(ev, body),
     };
+
     std.debug.assert(n <= protocol.max_server_frame_bytes);
     const head_len = zmtp.encodeFrameHead(n, command, frame[0..zmtp_head_bytes]);
     try w.writeAll(frame[0..head_len]);
@@ -309,7 +346,12 @@ fn writeEvent(w: *Io.Writer, frame: *[writer_frame_bytes]u8, ev: *const OutEvent
 
 /// Lift a borrowed wire message into an owned Request. This dupes the text into
 /// the gpa, and the scheduler frees it.
-fn toRequest(gpa: Allocator, conn_id: u32, h: protocol.Header, msg: protocol.ClientMsg) Allocator.Error!Request {
+fn toRequest(
+    gpa: Allocator,
+    conn_id: u32,
+    h: protocol.Header,
+    msg: protocol.ClientMsg,
+) Allocator.Error!Request {
     const body: Request.Body = switch (msg) {
         .hello => .hello,
         .cancel => .cancel,
@@ -337,6 +379,7 @@ fn toRequest(gpa: Allocator, conn_id: u32, h: protocol.Header, msg: protocol.Cli
             .bytes = try gpa.dupe(u8, m.bytes),
         } },
     };
+
     return .{
         .conn = conn_id,
         .request_id = h.request_id,
@@ -366,7 +409,13 @@ fn encodeMessage(ev: *const OutEvent, frame: []u8) usize {
             .model_name = m.name[0..m.name_len],
         } },
         .session_opened => |m| .{ .session_opened = .{ .kv_pos = m.kv_pos } },
-        .token => |*m| .{ .token = .{ .token_id = m.token_id, .channel = m.channel, .text = m.text[0..m.text_len] } },
+        .token => |*m| .{
+            .token = .{
+                .token_id = m.token_id,
+                .channel = m.channel,
+                .text = m.text[0..m.text_len],
+            },
+        },
         .done => |m| .{ .done = .{
             .finish_reason = m.finish_reason,
             .turn_prompt_tokens = m.turn_prompt_tokens,
@@ -392,10 +441,12 @@ fn encodeMessage(ev: *const OutEvent, frame: []u8) usize {
         // `writeEvent` encodes these as command frames.
         .zmtp_pong, .zmtp_error => unreachable,
     };
+
     return protocol.encodeServerMsg(msg, ev.request_id, ev.session_id, frame);
 }
 
-// -- tests: the loopback path over real sockets with a fake model -----------
+// -- tests ------------------------------------------------------------------
+
 //
 // The test drives the whole adapter over 127.0.0.1. It covers accept, frame
 // decode, the queues, the engine loop, the writer, and the shutdown handshake.
@@ -403,7 +454,6 @@ fn encodeMessage(ev: *const OutEvent, frame: []u8) usize {
 // `next = (token + 1) % 8`, its codec maps `byte % 8`, a piece is '0' + id,
 // and eos is 7. Every suite run includes this test. It skips when the sandbox
 // forbids a loopback bind.
-
 const Sessions = @import("../runtime/session.zig").Sessions;
 const StepRow = @import("../runtime/step_row.zig").StepRow;
 const Client = @import("client.zig").Client;
@@ -430,25 +480,49 @@ const FakeCodec = struct {
 
     fn initFake() FakeCodec {
         var t: [test_vocab][1]u8 = undefined;
-        for (&t, 0..) |*p, i| p[0] = @intCast('0' + i);
+        for (&t, 0..) |*p, i| {
+            p[0] = @intCast('0' + i);
+        }
+
         return .{ .piece_table = t };
     }
 
-    pub fn turnTokens(self: *const FakeCodec, gpa: Allocator, turn: event.TurnKind, text: []const u8, open: bool) ![]u32 {
+    pub fn turnTokens(
+        self: *const FakeCodec,
+        gpa: Allocator,
+        turn: event.TurnKind,
+        text: []const u8,
+        open: bool,
+    ) ![]u32 {
         _ = self;
         _ = turn;
         _ = open;
         const ids = try gpa.alloc(u32, text.len);
-        for (text, 0..) |b, i| ids[i] = @intCast(b % test_vocab);
+        for (text, 0..) |b, i| {
+            ids[i] = @intCast(b % test_vocab);
+        }
+
         return ids;
     }
 
-    pub fn pairTokens(self: *const FakeCodec, gpa: Allocator, place: chat.PairPlace, user: []const u8, assistant: []const u8) ![]u32 {
+    pub fn pairTokens(
+        self: *const FakeCodec,
+        gpa: Allocator,
+        place: chat.PairPlace,
+        user: []const u8,
+        assistant: []const u8,
+    ) ![]u32 {
         _ = self;
         _ = place;
         const ids = try gpa.alloc(u32, user.len + assistant.len);
-        for (user, 0..) |b, i| ids[i] = @intCast(b % test_vocab);
-        for (assistant, 0..) |b, i| ids[user.len + i] = @intCast(b % test_vocab);
+        for (user, 0..) |b, i| {
+            ids[i] = @intCast(b % test_vocab);
+        }
+
+        for (assistant, 0..) |b, i| {
+            ids[user.len + i] = @intCast(b % test_vocab);
+        }
+
         return ids;
     }
 
@@ -468,6 +542,7 @@ test "loopback: hello, system-prompt session, one turn, clean shutdown" {
     const io = std.testing.io;
     var arena_state = std.heap.ArenaAllocator.init(gpa);
     defer arena_state.deinit();
+
     const arena = arena_state.allocator();
 
     var runner: TestRunner = .{
@@ -533,7 +608,10 @@ test "loopback: hello, system-prompt session, one turn, clean shutdown" {
     // An append over the wire returns the position after each pair. The fake
     // codec maps each byte to one id.
     const kept = try client.openSession("", protocol.Sampling.greedy);
-    const appended = try client.append(kept, &.{ .{ .user = "ab", .assistant = "c" }, .{ .user = "d", .assistant = "" } });
+    const appended = try client.append(
+        kept,
+        &.{ .{ .user = "ab", .assistant = "c" }, .{ .user = "d", .assistant = "" } },
+    );
     try std.testing.expectEqualSlices(u32, &.{ 3, 4 }, appended.positions());
     try client.closeSession(kept);
 
@@ -546,6 +624,7 @@ test "loopback: keep, hang up, resume on a new connection, and the next turn equ
     const io = std.testing.io;
     var arena_state = std.heap.ArenaAllocator.init(gpa);
     defer arena_state.deinit();
+
     const arena = arena_state.allocator();
 
     var runner: TestRunner = .{
@@ -576,6 +655,7 @@ test "loopback: keep, hang up, resume on a new connection, and the next turn equ
     // The twin runs the same two turns on one connection with no drop.
     var twin = try Client.connectTcp(gpa, io, server.boundAddress());
     defer twin.deinit();
+
     const info = try twin.hello();
     try std.testing.expectEqual(@as(u32, 60_000), info.resume_ttl_max_ms);
     const tsid = try twin.openSession("abc", protocol.Sampling.greedy);
@@ -588,6 +668,7 @@ test "loopback: keep, hang up, resume on a new connection, and the next turn equ
     {
         var first = try Client.connectTcp(gpa, io, server.boundAddress());
         defer first.deinit();
+
         _ = try first.hello();
         const sid = try first.openSession("abc", protocol.Sampling.greedy);
         request_id = try first.generate(sid, "x", 3, null);
@@ -602,11 +683,20 @@ test "loopback: keep, hang up, resume on a new connection, and the next turn equ
     // A new connection resumes at the position of the twin after turn 1.
     var second = try Client.connectTcp(gpa, io, server.boundAddress());
     defer second.deinit();
+
     _ = try second.hello();
     const resumed = try second.resumeSession(token);
     try std.testing.expectEqual(t1.kv_pos, resumed.state.kv_pos);
     try std.testing.expectEqual(@as(u32, 1), resumed.state.turns_done);
-    try std.testing.expectEqual(protocol.LastDone{ .request_id = request_id, .finish = .max_tokens, .gen_tokens = 3, .reasoning_tokens = 0 }, resumed.state.last.?);
+    try std.testing.expectEqual(
+        protocol.LastDone{
+            .request_id = request_id,
+            .finish = .max_tokens,
+            .gen_tokens = 3,
+            .reasoning_tokens = 0,
+        },
+        resumed.state.last.?,
+    );
     try std.testing.expect(!std.mem.eql(u8, &token, &resumed.state.token));
 
     // The old token is spent.

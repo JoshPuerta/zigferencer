@@ -42,7 +42,11 @@ const long_turn_tokens: u32 = 40;
 
 /// Four clients of two sessions each fill both the pool and the batch.
 const n_clients = 4;
-const clients_opts: harness.Options = .{ .max_sessions = 8, .max_batch = 8, .max_connections = n_clients };
+const clients_opts: harness.Options = .{
+    .max_sessions = 8,
+    .max_batch = 8,
+    .max_connections = n_clients,
+};
 
 const Done = @FieldType(protocol.ServerMsg, "done");
 
@@ -75,10 +79,15 @@ fn readTurn(client: *Client) !TurnEnd {
         const ev = try client.next();
         switch (ev.msg) {
             .token => tokens += 1,
-            .done => |d| return .{ .tokens = tokens, .done = d, .request_id = ev.header.request_id },
+            .done => |d| return .{
+                .tokens = tokens,
+                .done = d,
+                .request_id = ev.header.request_id,
+            },
             else => return error.UnexpectedReply,
         }
     }
+
     return error.TurnNeverEnded;
 }
 
@@ -96,6 +105,7 @@ fn collectInterleaved(client: *Client, sids: [prompts.len]u32) ![prompts.len]Str
         const slot: usize = for (sids, 0..) |sid, i| {
             if (ev.header.session_id == sid) break i;
         } else return error.UnknownSession;
+
         try std.testing.expect(!done_seen[slot]);
         switch (ev.msg) {
             .token => |t| {
@@ -111,6 +121,7 @@ fn collectInterleaved(client: *Client, sids: [prompts.len]u32) ![prompts.len]Str
             else => return error.UnexpectedReply,
         }
     }
+
     return got;
 }
 
@@ -126,6 +137,7 @@ fn expectTokens(client: *Client, n: usize) !void {
 fn turnTokenCount(h: *const Harness, turn: event.TurnKind, text: []const u8) !usize {
     const ids = try h.codec.turnTokens(std.testing.allocator, turn, text, false);
     defer std.testing.allocator.free(ids);
+
     return ids.len;
 }
 
@@ -146,9 +158,11 @@ fn expectTurnTooLong(client: *Client, request_id: u32, tokens: usize, room: u32)
 test "interleaved sessions match their solo reference streams over the wire" {
     var h = try Harness.boot(std.testing.allocator, std.testing.io, .tcp, .{});
     defer h.deinit();
+
     var client = try h.connect();
     defer client.deinit();
     defer h.stop(&client);
+
     _ = try client.hello();
 
     // -- reference: each prompt alone, fresh session, closed after ----------
@@ -164,10 +178,18 @@ test "interleaved sessions match their solo reference streams over the wire" {
 
     // -- interleaved: both turns in flight, events multiplexed by id --------
     var sids: [prompts.len]u32 = undefined;
-    for (&sids) |*sid| sid.* = try client.openSession("", protocol.Sampling.greedy);
-    for (prompts, 0..) |prompt, i| _ = try client.generate(sids[i], prompt, turn_tokens_max, null);
+    for (&sids) |*sid| {
+        sid.* = try client.openSession("", protocol.Sampling.greedy);
+    }
+
+    for (prompts, 0..) |prompt, i| {
+        _ = try client.generate(sids[i], prompt, turn_tokens_max, null);
+    }
+
     const got = try collectInterleaved(&client, sids);
-    for (reference, got) |ref, g| try expectSameStream(ref, g);
+    for (reference, got) |ref, g| {
+        try expectSameStream(ref, g);
+    }
 
     // -- context_full is a done, and the session reports honestly -----------
     {
@@ -190,8 +212,13 @@ test "interleaved sessions match their solo reference streams over the wire" {
         var seen_tokens: usize = 0;
         while (seen_tokens < 2) {
             const ev = try client.next();
-            if (ev.msg == .token) seen_tokens += 1 else return error.UnexpectedReply;
+            if (ev.msg == .token) {
+                seen_tokens += 1;
+            } else {
+                return error.UnexpectedReply;
+            }
         }
+
         _ = try client.send(.session_close, sid);
         while (true) {
             const ev = try client.next();
@@ -200,6 +227,7 @@ test "interleaved sessions match their solo reference streams over the wire" {
             // (a done) before the close lands. Anything else is a failure.
             try std.testing.expect(ev.msg == .token or ev.msg == .done);
         }
+
         const sid2 = try client.openSession("", protocol.Sampling.greedy);
         const again = try oneTurn(&client, sid2, prompts[0]);
         try expectSameStream(reference[0], again);
@@ -209,6 +237,7 @@ test "interleaved sessions match their solo reference streams over the wire" {
 test "turn_too_long names its numbers, and the same session then answers a fitting turn" {
     var h = try Harness.boot(std.testing.allocator, std.testing.io, .tcp, .{});
     defer h.deinit();
+
     var client = try h.connect();
     defer client.deinit();
     defer h.stop(&client);
@@ -230,6 +259,7 @@ test "turn_too_long names its numbers, and the same session then answers a fitti
 test "a turn capped at the window ends context_full, and the next turn gets the numbers" {
     var h = try Harness.boot(std.testing.allocator, std.testing.io, .tcp, .{});
     defer h.deinit();
+
     var client = try h.connect();
     defer client.deinit();
     defer h.stop(&client);
@@ -258,6 +288,7 @@ test "a turn capped at the window ends context_full, and the next turn gets the 
 test "ping answers pong on the server scope" {
     var h = try Harness.boot(std.testing.allocator, std.testing.io, .tcp, .{});
     defer h.deinit();
+
     var client = try h.connect();
     defer client.deinit();
     defer h.stop(&client);
@@ -277,6 +308,7 @@ test "ping answers pong on the server scope" {
 test "stats counts open sessions and generated tokens" {
     var h = try Harness.boot(std.testing.allocator, std.testing.io, .tcp, .{});
     defer h.deinit();
+
     var client = try h.connect();
     defer client.deinit();
     defer h.stop(&client);
@@ -292,6 +324,7 @@ test "stats counts open sessions and generated tokens" {
         try std.testing.expectEqual(end.tokens, end.done.gen_tokens);
         gen_sum += end.done.gen_tokens;
     }
+
     try std.testing.expect(gen_sum > 0);
 
     const first = try client.stats();
@@ -305,6 +338,7 @@ test "stats counts open sessions and generated tokens" {
 test "close on an idle session frees its id" {
     var h = try Harness.boot(std.testing.allocator, std.testing.io, .tcp, .{});
     defer h.deinit();
+
     var client = try h.connect();
     defer client.deinit();
     defer h.stop(&client);
@@ -321,6 +355,7 @@ test "close on an idle session frees its id" {
 test "close during a turn drains the stream before session_closed" {
     var h = try Harness.boot(std.testing.allocator, std.testing.io, .tcp, .{});
     defer h.deinit();
+
     var client = try h.connect();
     defer client.deinit();
     defer h.stop(&client);
@@ -340,6 +375,7 @@ test "close during a turn drains the stream before session_closed" {
 test "clone continues exactly like its source" {
     var h = try Harness.boot(std.testing.allocator, std.testing.io, .tcp, .{});
     defer h.deinit();
+
     var client = try h.connect();
     defer client.deinit();
     defer h.stop(&client);
@@ -358,8 +394,14 @@ test "clone continues exactly like its source" {
 }
 
 test "cancel during prefill finishes the turn with no tokens" {
-    var h = try Harness.boot(std.testing.allocator, std.testing.io, .tcp, .{ .prefill = .spare_rows });
+    var h = try Harness.boot(
+        std.testing.allocator,
+        std.testing.io,
+        .tcp,
+        .{ .prefill = .spare_rows },
+    );
     defer h.deinit();
+
     var client = try h.connect();
     defer client.deinit();
     defer h.stop(&client);
@@ -392,6 +434,7 @@ test "cancel during prefill finishes the turn with no tokens" {
 test "cancel during decode finishes the turn as cancelled" {
     var h = try Harness.boot(std.testing.allocator, std.testing.io, .tcp, .{});
     defer h.deinit();
+
     var client = try h.connect();
     defer client.deinit();
     defer h.stop(&client);
@@ -417,6 +460,7 @@ test "cancel during decode finishes the turn as cancelled" {
 test "cancel on an idle session sends nothing" {
     var h = try Harness.boot(std.testing.allocator, std.testing.io, .tcp, .{});
     defer h.deinit();
+
     var client = try h.connect();
     defer client.deinit();
     defer h.stop(&client);
@@ -435,6 +479,7 @@ test "cancel on an idle session sends nothing" {
 test "cancel on an unknown session fails with unknown_session" {
     var h = try Harness.boot(std.testing.allocator, std.testing.io, .tcp, .{});
     defer h.deinit();
+
     var client = try h.connect();
     defer client.deinit();
     defer h.stop(&client);
@@ -452,17 +497,21 @@ test "the unix transport carries the same stream as tcp" {
     const over_tcp = blk: {
         var h = try Harness.boot(gpa, io, .tcp, .{});
         defer h.deinit();
+
         var client = try h.connect();
         defer client.deinit();
         defer h.stop(&client);
+
         break :blk try soloReference(&client, prompts[0]);
     };
 
     var h = try Harness.boot(gpa, io, .unix, .{});
     defer h.deinit();
+
     var client = try h.connect();
     defer client.deinit();
     defer h.stop(&client);
+
     const info = try client.hello();
     try std.testing.expectEqual(max_seq, info.max_seq);
     try expectSameStream(over_tcp, try soloReference(&client, prompts[0]));
@@ -471,27 +520,42 @@ test "the unix transport carries the same stream as tcp" {
 test "four connections interleave sessions and each stream equals its solo reference" {
     var h = try Harness.boot(std.testing.allocator, std.testing.io, .tcp, clients_opts);
     defer h.deinit();
+
     var clients: [n_clients]Client = undefined;
     var n_live: usize = 0;
     defer for (clients[0..n_live]) |*c| c.deinit();
     defer if (n_live > 0) h.stop(&clients[0]);
-    while (n_live < n_clients) : (n_live += 1) clients[n_live] = try h.connect();
+
+    while (n_live < n_clients) : (n_live += 1) {
+        clients[n_live] = try h.connect();
+    }
 
     var reference: [prompts.len]Stream = undefined;
-    for (&reference, prompts) |*ref, prompt| ref.* = try soloReference(&clients[0], prompt);
+    for (&reference, prompts) |*ref, prompt| {
+        ref.* = try soloReference(&clients[0], prompt);
+    }
 
     // The test sends every turn before it reads any frame, so the eight
     // sessions share the batch.
     var sids: [n_clients][prompts.len]u32 = undefined;
     for (&clients, &sids) |*c, *row| {
-        for (row) |*sid| sid.* = try openGreedy(c);
+        for (row) |*sid| {
+            sid.* = try openGreedy(c);
+        }
     }
+
     for (&clients, sids) |*c, row| {
-        for (row, prompts) |sid, prompt| _ = try c.generate(sid, prompt, turn_tokens_max, null);
+        for (row, prompts) |sid, prompt| {
+            _ = try c.generate(sid, prompt, turn_tokens_max, null);
+        }
     }
+
     for (&clients, sids) |*c, row| {
         const got = try collectInterleaved(c, row);
-        for (reference, got) |ref, g| try expectSameStream(ref, g);
+        for (reference, got) |ref, g| {
+            try expectSameStream(ref, g);
+        }
+
         // A third done or a stray token arrives before the pong, and `ping`
         // fails on it. So this client saw exactly its two dones.
         try c.ping();
@@ -501,28 +565,44 @@ test "four connections interleave sessions and each stream equals its solo refer
 test "the connection past the cap is refused after the handshake" {
     var h = try Harness.boot(std.testing.allocator, std.testing.io, .tcp, clients_opts);
     defer h.deinit();
+
     var clients: [n_clients]Client = undefined;
     var n_live: usize = 0;
     defer for (clients[0..n_live]) |*c| c.deinit();
     defer if (n_live > 0) h.stop(&clients[0]);
-    while (n_live < n_clients) : (n_live += 1) clients[n_live] = try h.connect();
+
+    while (n_live < n_clients) : (n_live += 1) {
+        clients[n_live] = try h.connect();
+    }
+
     // A pong proves that the acceptor gave the connection a slot, so all four
     // slots are taken before the fifth connection arrives.
-    for (&clients) |*c| try c.ping();
+    for (&clients) |*c| {
+        try c.ping();
+    }
 
     var fifth = try h.connect();
     defer fifth.deinit();
+
     const ev = try fifth.next();
     try std.testing.expect(ev.msg == .err);
     try std.testing.expectEqual(protocol.ErrorCode.connections_exhausted, ev.msg.err.code);
     try std.testing.expectError(error.EndOfStream, fifth.next());
 
-    for (&clients) |*c| try c.ping();
+    for (&clients) |*c| {
+        try c.ping();
+    }
 }
 
 test "a hang-up mid-turn sweeps only its own sessions" {
-    var h = try Harness.boot(std.testing.allocator, std.testing.io, .tcp, .{ .max_sessions = 2, .max_batch = 2, .max_connections = 4 });
+    var h = try Harness.boot(
+        std.testing.allocator,
+        std.testing.io,
+        .tcp,
+        .{ .max_sessions = 2, .max_batch = 2, .max_connections = 4 },
+    );
     defer h.deinit();
+
     var b = try h.connect();
     defer b.deinit();
     defer h.stop(&b);
@@ -535,6 +615,7 @@ test "a hang-up mid-turn sweeps only its own sessions" {
         // prompt, so a stream that crosses sessions fails the comparison.
         var a = try h.connect();
         defer a.deinit();
+
         const sid_a = try openGreedy(&a);
         _ = try a.generate(sid_a, prompts[0], long_turn_tokens, null);
         try expectTokens(&a, 2);
@@ -543,6 +624,7 @@ test "a hang-up mid-turn sweeps only its own sessions" {
         try std.testing.expectEqual(protocol.ErrorCode.sessions_exhausted, b.last_error.?.code);
         a.hangUp();
     }
+
     try expectSameStream(reference, try oneTurn(&b, sid_b, prompts[1]));
 
     // The sweep of A's session and this open travel on two connections, and
@@ -559,19 +641,31 @@ test "a hang-up mid-turn sweeps only its own sessions" {
         };
         break;
     }
+
     if (sid_new == null) {
-        std.debug.print("the hang-up sweep freed no session within {d} open attempts\n", .{open_attempts_max});
+        std.debug.print(
+            "the hang-up sweep freed no session within {d} open attempts\n",
+            .{open_attempts_max},
+        );
         return error.TestUnexpectedResult;
     }
+
     try std.testing.expectEqual(@as(u16, 2), (try b.stats()).sessions_open);
 }
 
 test "a connection past its session share gets sessions_exhausted" {
-    var h = try Harness.boot(std.testing.allocator, std.testing.io, .tcp, .{ .max_sessions = 4, .sessions_per_connection = 2 });
+    var h = try Harness.boot(
+        std.testing.allocator,
+        std.testing.io,
+        .tcp,
+        .{ .max_sessions = 4, .sessions_per_connection = 2 },
+    );
     defer h.deinit();
+
     var a = try h.connect();
     defer a.deinit();
     defer h.stop(&a);
+
     var b = try h.connect();
     defer b.deinit();
 
@@ -586,8 +680,14 @@ test "a connection past its session share gets sessions_exhausted" {
 }
 
 test "shutdown from the wire is refused unless allowed" {
-    var h = try Harness.boot(std.testing.allocator, std.testing.io, .tcp, .{ .allow_shutdown = false });
+    var h = try Harness.boot(
+        std.testing.allocator,
+        std.testing.io,
+        .tcp,
+        .{ .allow_shutdown = false },
+    );
     defer h.deinit();
+
     var client = try h.connect();
     defer client.deinit();
 
@@ -612,14 +712,26 @@ const kept_prompts = [_][]const u8{ "Name a color.", "Name an animal.", "Name a 
 const kept_window: u32 = 256;
 const kept_turn_tokens: u32 = 16;
 
-const LiveTurn = struct { reply: [512]u8 = undefined, len: usize = 0, kv_pos: u32 = 0, carried: bool = false };
+const LiveTurn = struct {
+    reply: [512]u8 = undefined,
+    len: usize = 0,
+    kv_pos: u32 = 0,
+    carried: bool = false,
+};
 
 fn keptPairsMatchLive(comptime H: type, kind: harness.ChatKind) !void {
-    var h = try H.boot(std.testing.allocator, std.testing.io, .tcp, .{ .window = kept_window, .kind = kind });
+    var h = try H.boot(
+        std.testing.allocator,
+        std.testing.io,
+        .tcp,
+        .{ .window = kept_window, .kind = kind },
+    );
     defer h.deinit();
+
     var client = try h.connect();
     defer client.deinit();
     defer h.stop(&client);
+
     _ = try client.hello();
 
     const live = try client.openSession(kept_system, protocol.Sampling.greedy);
@@ -643,8 +755,14 @@ fn keptPairsMatchLive(comptime H: type, kind: harness.ChatKind) !void {
     // A carried token sits at the start of the next live turn, and inside
     // the reply of its own pair. Each position therefore differs from the
     // live one by the carry of its own turn.
-    try std.testing.expectEqual(turns[0].kv_pos + @intFromBool(turns[0].carried), appended.positions()[0]);
-    try std.testing.expectEqual(turns[1].kv_pos + @intFromBool(turns[1].carried), appended.positions()[1]);
+    try std.testing.expectEqual(
+        turns[0].kv_pos + @intFromBool(turns[0].carried),
+        appended.positions()[0],
+    );
+    try std.testing.expectEqual(
+        turns[1].kv_pos + @intFromBool(turns[1].carried),
+        appended.positions()[1],
+    );
 
     var live_ids: [kept_turn_tokens]u32 = undefined;
     var kept_ids: [kept_turn_tokens]u32 = undefined;

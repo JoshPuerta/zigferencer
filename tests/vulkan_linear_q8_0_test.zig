@@ -2,7 +2,7 @@
 //!
 //! The gate runs `linearF32Q80` through `ops_vulkan.LinearQ80`, and the result
 //! must equal the CPU naive op `z.ops.linearF32Q80` bit for bit. That op is the
-//! correctness oracle of the project.
+//! correctness reference of the project.
 //!
 //! Bit equality is reachable, so the gate asks for it. The kernel reproduces
 //! the exact f32 reduction order of the naive op: a scalar accumulate,
@@ -68,6 +68,7 @@ fn runLinearQ80Check(
         else => return e,
     };
     defer runner.deinit();
+
     const kernel = &runner.linear_q8_0;
 
     const blocks_per_row = in_features / q8_0_block_elems;
@@ -76,17 +77,23 @@ fn runLinearQ80Check(
 
     const input = try allocator.alloc(f32, in_features);
     defer allocator.free(input);
+
     const weight_bytes = try allocator.alloc(u8, total_w_bytes);
     defer allocator.free(weight_bytes);
+
     const out_gpu = try allocator.alloc(f32, out_features);
     defer allocator.free(out_gpu);
+
     const out_cpu = try allocator.alloc(f32, out_features);
     defer allocator.free(out_cpu);
 
     // `@sin(i)` is the input pattern of the linear bench cases in
     // tools/bench.zig. The same pattern keeps the numerics in a realistic
     // range without adversarial values.
-    for (input, 0..) |*v, i| v.* = @sin(@as(f32, @floatFromInt(i)));
+    for (input, 0..) |*v, i| {
+        v.* = @sin(@as(f32, @floatFromInt(i)));
+    }
+
     buildSyntheticWeight(weight_bytes, in_features, out_features);
 
     try kernel.runOneShot(input, weight_bytes, in_features, out_features, out_gpu);

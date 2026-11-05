@@ -22,7 +22,7 @@ const limits = @import("limits.zig");
 
 const assert = std.debug.assert;
 
-// -- types ------------------------------------------------------------------
+// -- constants --------------------------------------------------------------
 
 /// Positions one tile holds.
 const tile: u32 = limits.attn_cpu_tile;
@@ -38,6 +38,8 @@ comptime {
     assert(@as(u64, limits.max_model_ctx) + tile - 1 <= std.math.maxInt(u32));
 }
 
+// -- types ------------------------------------------------------------------
+
 /// The positions `[t_lo, t_hi)` that one part of a row owns.
 pub const Part = struct {
     t_lo: u32,
@@ -45,19 +47,6 @@ pub const Part = struct {
 };
 
 // -- api --------------------------------------------------------------------
-
-/// The tiles a row of `t_len` positions walks: `ceil(t_len / attn_cpu_tile)`.
-fn tileCount(t_len: u32) u32 {
-    assert(t_len >= 1);
-    assert(t_len <= limits.max_model_ctx);
-    const count = (t_len + tile - 1) / tile;
-    assert(count >= 1);
-    // The last tile starts inside the row, so no tile is empty.
-    assert(@as(u64, count - 1) * tile < t_len);
-    // The tiles cover the row.
-    assert(@as(u64, count) * tile >= t_len);
-    return count;
-}
 
 /// The parts a row of `t_len` positions splits into:
 /// `min(attn_cpu_parts, tileCount(t_len))`.
@@ -88,6 +77,7 @@ pub fn partRange(t_len: u32, p: u32) Part {
     // The first part starts the row, and the last part ends it.
     if (p == 0) assert(part.t_lo == 0);
     if (p == count - 1) assert(part.t_hi == t_len);
+
     return part;
 }
 
@@ -97,6 +87,7 @@ pub fn recordElems(head_dim: u32) u32 {
     assert(head_dim >= 1);
     // The maximum and the sum fit beside the value sums inside 32 bits.
     assert(head_dim <= std.math.maxInt(u32) - 2);
+
     const elems = head_dim + 2;
     assert(elems > head_dim);
     return elems;
@@ -115,6 +106,7 @@ pub fn recordStride(head_dim: u32) usize {
 pub fn recordOffset(n_heads: u32, head_dim: u32, h: u32, p: u32) usize {
     assert(h < n_heads);
     assert(p < max_parts);
+
     const record = recordElems(head_dim);
     const offset = (@as(usize, h) * max_parts + p) * record;
     // The whole record lies inside the partial buffer.
@@ -126,6 +118,7 @@ pub fn recordOffset(n_heads: u32, head_dim: u32, h: u32, p: u32) usize {
 /// and part. The window does not change it.
 pub fn partialLen(n_heads: u32, head_dim: u32) usize {
     assert(n_heads >= 1);
+
     const record = recordElems(head_dim);
     // The engine sets no bound on the head count or the head width. So the
     // function checks the byte total in 128 bits, and every 64-bit product
@@ -139,15 +132,31 @@ pub fn partialLen(n_heads: u32, head_dim: u32) usize {
 
 // -- helpers ----------------------------------------------------------------
 
+/// The tiles a row of `t_len` positions walks: `ceil(t_len / attn_cpu_tile)`.
+fn tileCount(t_len: u32) u32 {
+    assert(t_len >= 1);
+    assert(t_len <= limits.max_model_ctx);
+
+    const count = (t_len + tile - 1) / tile;
+    assert(count >= 1);
+    // The last tile starts inside the row, so no tile is empty.
+    assert(@as(u64, count - 1) * tile < t_len);
+    // The tiles cover the row.
+    assert(@as(u64, count) * tile >= t_len);
+    return count;
+}
+
 /// The first tile of part `p` of `count` parts over `tiles` tiles.
 fn partStart(tiles: u32, count: u32, p: u32) u32 {
     assert(count >= 1);
     assert(count <= tiles);
     assert(p <= count);
+
     const start = @as(u64, p) * tiles / count;
     assert(start <= tiles);
     if (p == 0) assert(start == 0);
     if (p == count) assert(start == tiles);
+
     return @intCast(start);
 }
 
@@ -174,7 +183,9 @@ comptime {
 /// The next row length of the geometry walk after `t_len`.
 fn nextTestLen(t_len: u32) u32 {
     assert(t_len >= 1);
+
     if (t_len < dense_tiles * T or t_len % T == 0) return t_len + 1;
+
     const next_edge = (t_len + T - 1) / T * T;
     const next = @min(t_len + sparse_stride, next_edge);
     assert(next > t_len);
@@ -209,6 +220,7 @@ test "partRange: the parts of every walked row up to 40 tiles are non-empty, con
             try testing.expect(tileCount(prev_len) <= tiles);
             try testing.expect(partCount(prev_len) <= count);
         }
+
         prev_len = t_len;
         var next_lo: u32 = 0;
         var p: u32 = 0;
@@ -225,25 +237,35 @@ test "partRange: the parts of every walked row up to 40 tiles are non-empty, con
             try testing.expect(part_tiles <= (tiles + count - 1) / count);
             next_lo = part.t_hi;
         }
+
         try testing.expectEqual(t_len, next_lo);
     }
+
     // The walk ends on the last edge, and it reaches every tile count.
     try testing.expectEqual(test_tiles * T, prev_len);
-    for (tiles_seen[1..]) |seen| try testing.expect(seen);
+    for (tiles_seen[1..]) |seen| {
+        try testing.expect(seen);
+    }
 }
 
 test "partRange: every position of a walked row lies in exactly one part" {
     const owners = try testing.allocator.alloc(u8, test_tiles * T);
     defer testing.allocator.free(owners);
+
     var t_len: u32 = 1;
     while (t_len <= test_tiles * T) : (t_len = nextTestLen(t_len)) {
         @memset(owners[0..t_len], 0);
         var p: u32 = 0;
         while (p < partCount(t_len)) : (p += 1) {
             const part = partRange(t_len, p);
-            for (owners[part.t_lo..part.t_hi]) |*owner| owner.* += 1;
+            for (owners[part.t_lo..part.t_hi]) |*owner| {
+                owner.* += 1;
+            }
         }
-        for (owners[0..t_len]) |owner| try testing.expectEqual(@as(u8, 1), owner);
+
+        for (owners[0..t_len]) |owner| {
+            try testing.expectEqual(@as(u8, 1), owner);
+        }
     }
 }
 
@@ -265,11 +287,18 @@ test "recordOffset: every head, part, and element of a small box gets its own el
                         const above = recordOffset(n_heads, head_dim, @intCast(h - 1), @intCast(p));
                         try testing.expectEqual(above + recordStride(head_dim), at);
                     }
+
                     // The records of one head follow each other in part order.
                     if (p > 0) {
-                        const before = recordOffset(n_heads, head_dim, @intCast(h), @intCast(p - 1));
+                        const before = recordOffset(
+                            n_heads,
+                            head_dim,
+                            @intCast(h),
+                            @intCast(p - 1),
+                        );
                         try testing.expectEqual(before + record, at);
                     }
+
                     for (0..record) |e| {
                         try testing.expect(at + e < len);
                         try testing.expect(!seen[at + e]);
@@ -278,10 +307,14 @@ test "recordOffset: every head, part, and element of a small box gets its own el
                     }
                 }
             }
+
             // The box and the buffer have one size, so the last record ends
             // the buffer.
             try testing.expectEqual(len, count);
-            try testing.expectEqual(len, recordOffset(n_heads, head_dim, n_heads - 1, P - 1) + record);
+            try testing.expectEqual(
+                len,
+                recordOffset(n_heads, head_dim, n_heads - 1, P - 1) + record,
+            );
         }
     }
 }
@@ -307,6 +340,7 @@ test "anchors: the tiles, the parts, and the records at T = 2048 and P = 16" {
         try testing.expectEqual(a.first, partRange(a.t_len, 0));
         try testing.expectEqual(a.last, partRange(a.t_len, a.parts - 1));
     }
+
     // Qwen3.5-2B: 8 query heads of 256.
     try testing.expectEqual(@as(u32, 258), recordElems(256));
     try testing.expectEqual(@as(usize, 33_024), partialLen(8, 256));

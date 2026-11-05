@@ -37,11 +37,16 @@ fn openRunner(allocator: std.mem.Allocator) !*z.vulkan_runner.Runner {
 }
 
 fn fillN(r: std.Random, slice: []f32, scale: f32) void {
-    for (slice) |*v| v.* = (r.float(f32) - 0.5) * 2.0 * scale;
+    for (slice) |*v| {
+        v.* = (r.float(f32) - 0.5) * 2.0 * scale;
+    }
 }
 
 fn allFinite(slice: []const f32) bool {
-    for (slice) |v| if (!std.math.isFinite(v)) return false;
+    for (slice) |v| {
+        if (!std.math.isFinite(v)) return false;
+    }
+
     return true;
 }
 
@@ -82,18 +87,31 @@ fn settle(
                 continue;
             };
             if (w == got[i][c]) continue;
+
             moved += 1;
-            std.debug.print("{s} {s} column {d}: got 0x{x:0>16}, want 0x{x:0>16}\n", .{ table, labels[i], c, got[i][c], w });
+            std.debug.print(
+                "{s} {s} column {d}: got 0x{x:0>16}, want 0x{x:0>16}\n",
+                .{ table, labels[i], c, got[i][c], w },
+            );
         }
     }
+
     if (missing == 0 and moved == 0) return;
-    std.debug.print("mint: {d} digests missing, {d} moved in {s}. The table of this run:\n", .{ missing, moved, table });
+
+    std.debug.print(
+        "mint: {d} digests missing, {d} moved in {s}. The table of this run:\n",
+        .{ missing, moved, table },
+    );
     std.debug.print("const {s}: [{d}][{d}]?u64 = .{{\n", .{ table, rows, cols });
     for (0..rows) |i| {
         std.debug.print("    .{{", .{});
-        for (0..cols) |c| std.debug.print(" 0x{x:0>16}{s}", .{ got[i][c], if (c + 1 < cols) "," else "" });
+        for (0..cols) |c| {
+            std.debug.print(" 0x{x:0>16}{s}", .{ got[i][c], if (c + 1 < cols) "," else "" });
+        }
+
         std.debug.print(" }}, // {s}\n", .{labels[i]});
     }
+
     std.debug.print("}};\n", .{});
     return if (moved > 0) error.PrefillDigestMoved else error.PrefillDigestNotMinted;
 }
@@ -128,7 +146,10 @@ const Fnv = std.hash.Fnv1a_64;
 
 fn digestSlices(slices: []const []const f32) u64 {
     var h = Fnv.init();
-    for (slices) |s| h.update(std.mem.sliceAsBytes(s));
+    for (slices) |s| {
+        h.update(std.mem.sliceAsBytes(s));
+    }
+
     return h.final();
 }
 
@@ -138,24 +159,34 @@ fn runGdnCase(allocator: std.mem.Allocator, kp: *z.ops_vulkan.GdnChunkParallel, 
     const T: usize = t;
     const qkv = try allocator.alloc(f32, T * conv_dim);
     defer allocator.free(qkv);
+
     const zg = try allocator.alloc(f32, T * value_dim);
     defer allocator.free(zg);
+
     const alpha = try allocator.alloc(f32, T * n_v);
     defer allocator.free(alpha);
+
     const beta = try allocator.alloc(f32, T * n_v);
     defer allocator.free(beta);
+
     const conv_w = try allocator.alloc(f32, @as(usize, conv_kernel) * conv_dim);
     defer allocator.free(conv_w);
+
     const ssm_a = try allocator.alloc(f32, n_v);
     defer allocator.free(ssm_a);
+
     const dt_bias = try allocator.alloc(f32, n_v);
     defer allocator.free(dt_bias);
+
     const ssm_norm = try allocator.alloc(f32, head_dim);
     defer allocator.free(ssm_norm);
+
     const state = try allocator.alloc(f32, value_dim * head_dim);
     defer allocator.free(state);
+
     const ring = try allocator.alloc(f32, @as(usize, conv_kernel - 1) * conv_dim);
     defer allocator.free(ring);
+
     const o_out = try allocator.alloc(f32, T * value_dim);
     defer allocator.free(o_out);
 
@@ -168,18 +199,43 @@ fn runGdnCase(allocator: std.mem.Allocator, kp: *z.ops_vulkan.GdnChunkParallel, 
     fillN(r, conv_w, 0.5);
     fillN(r, dt_bias, 0.3);
     fillN(r, ssm_norm, 0.2);
-    for (ssm_norm) |*v| v.* += 1.0;
+    for (ssm_norm) |*v| {
+        v.* += 1.0;
+    }
+
     fillN(r, state, 0.1);
     fillN(r, ring, 0.3);
-    for (ssm_a) |*v| v.* = -@exp((r.float(f32) - 0.5) * 2.0);
+    for (ssm_a) |*v| {
+        v.* = -@exp((r.float(f32) - 0.5) * 2.0);
+    }
 
-    try kp.runChunkParallel(t, n_k, n_v, head_dim, conv_kernel, qkv, zg, alpha, beta, conv_w, ssm_a, dt_bias, ssm_norm, gdn_eps, state, ring, o_out);
+    try kp.runChunkParallel(
+        t,
+        n_k,
+        n_v,
+        head_dim,
+        conv_kernel,
+        qkv,
+        zg,
+        alpha,
+        beta,
+        conv_w,
+        ssm_a,
+        dt_bias,
+        ssm_norm,
+        gdn_eps,
+        state,
+        ring,
+        o_out,
+    );
 
     // The gate buffers 3, 4, and 5 hold the conv outputs q_n, k_n, and v_conv.
     const q_n = kp.bufs[3].sliceTyped(f32, T * key_dim);
     const k_n = kp.bufs[4].sliceTyped(f32, T * key_dim);
     const v_conv = kp.bufs[5].sliceTyped(f32, T * value_dim);
-    try std.testing.expect(allFinite(q_n) and allFinite(k_n) and allFinite(v_conv) and allFinite(ring));
+    try std.testing.expect(
+        allFinite(q_n) and allFinite(k_n) and allFinite(v_conv) and allFinite(ring),
+    );
     try std.testing.expect(allFinite(o_out) and allFinite(state));
     return .{
         digestSlices(&.{ q_n, k_n, v_conv, ring }),
@@ -191,10 +247,15 @@ fn runGdnDigests() !void {
     const allocator = std.testing.allocator;
     const runner = try openRunner(allocator);
     defer runner.deinit();
+
     var kp = try z.ops_vulkan.GdnChunkParallel.init(&runner.ctx);
     defer kp.deinit();
+
     var got: [gdn_widths.len][2]u64 = undefined;
-    for (gdn_widths, 0..) |t, i| got[i] = try runGdnCase(allocator, &kp, t);
+    for (gdn_widths, 0..) |t, i| {
+        got[i] = try runGdnCase(allocator, &kp, t);
+    }
+
     try settle("gdn_digests", gdn_widths.len, 2, gdn_digests, got, gdn_labels);
 }
 
@@ -226,7 +287,10 @@ const batch_case: GemmCase = .{ .b = 7, .k = 2048, .n = 2048 };
 const batch_label = [_][]const u8{"b=7 k=2048 n=2048"};
 
 comptime {
-    for (gemm_cases) |c| std.debug.assert(c.b >= gemm_min_batch);
+    for (gemm_cases) |c| {
+        std.debug.assert(c.b >= gemm_min_batch);
+    }
+
     std.debug.assert(batch_case.b < gemm_min_batch);
 }
 
@@ -249,12 +313,16 @@ fn runGemmCase(allocator: std.mem.Allocator, kernel: anytype, c: GemmCase) !u64 
     const row_bytes: usize = (c.k / 32) * 34;
     const weight = try allocator.alloc(u8, @as(usize, c.n) * row_bytes);
     defer allocator.free(weight);
+
     const input = try allocator.alloc(f32, @as(usize, c.b) * c.k);
     defer allocator.free(input);
+
     const out = try allocator.alloc(f32, @as(usize, c.b) * c.n);
     defer allocator.free(out);
 
-    var prng = std.Random.DefaultPrng.init(0x6EA77000 + @as(u64, c.b) * 100_003 + @as(u64, c.k) * 7 + c.n);
+    var prng = std.Random.DefaultPrng.init(
+        0x6EA77000 + @as(u64, c.b) * 100_003 + @as(u64, c.k) * 7 + c.n,
+    );
     const r = prng.random();
     buildRandomQ80(r, weight, c.k, c.n);
     fillN(r, input, 1.0);
@@ -267,12 +335,18 @@ fn runGemmDigests() !void {
     const allocator = std.testing.allocator;
     const runner = try openRunner(allocator);
     defer runner.deinit();
+
     var gemm = try z.ops_vulkan.LinearQ80Gemm.init(&runner.ctx);
     defer gemm.deinit();
+
     var batch = try z.ops_vulkan.LinearQ80Batch.init(&runner.ctx);
     defer batch.deinit();
+
     var got: [gemm_cases.len][1]u64 = undefined;
-    for (gemm_cases, 0..) |c, i| got[i][0] = try runGemmCase(allocator, &gemm, c);
+    for (gemm_cases, 0..) |c, i| {
+        got[i][0] = try runGemmCase(allocator, &gemm, c);
+    }
+
     const got_batch: [1][1]u64 = .{.{try runGemmCase(allocator, &batch, batch_case)}};
     try settle("gemm_digests", gemm_cases.len, 1, gemm_digests, got, gemm_labels);
     try settle("batch_digests", 1, 1, batch_digests, got_batch, batch_label);

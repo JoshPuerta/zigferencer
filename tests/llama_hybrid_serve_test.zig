@@ -55,7 +55,11 @@ const n_slots: u32 = 2;
 const window: u32 = 64;
 const turn_tokens_max: u32 = 12;
 
-const prompts = [_][]const u8{ "The dragon flew over", "Tell me a story about", "Once upon a time" };
+const prompts = [_][]const u8{
+    "The dragon flew over",
+    "Tell me a story about",
+    "Once upon a time",
+};
 
 /// The second turn every session takes in the over-subscription gate. One
 /// continuation text serves all three, because the first turns already made
@@ -96,7 +100,14 @@ fn initHybrid(
     const card = loaded.card;
     const n_layers: u32 = card.n_layers;
     std.debug.assert(n_layers >= 2); // a mid split needs a layer on each side
-    const caps = try llama_fused.LlamaFusedRunner.kvCaps(gpa, loaded, limits.contextCeiling(loaded.card.context_length, null), ctxp.deviceLocalAvailableBytes(), n_slots, kv_dtype);
+    const caps = try llama_fused.LlamaFusedRunner.kvCaps(
+        gpa,
+        loaded,
+        limits.contextCeiling(loaded.card.context_length, null),
+        ctxp.deviceLocalAvailableBytes(),
+        n_slots,
+        kv_dtype,
+    );
     const kv_costs = z.kv_cost.llamaCostVector(card, kv_dtype);
     var table: [limits.max_layers]u64 = undefined;
     const plan = kv_budget.placementPlan(
@@ -113,7 +124,16 @@ fn initHybrid(
         .{ .ram_split = .{ .blobs = 0, .prefix = 0 }, .residency = true },
         n_layers / 2,
     ) catch return error.SkipZigTest;
-    const hybrid = LlamaHybridRunner.init(gpa, ctxp, loaded, plan, io, cpu_pool, cpu_cfg, kv_dtype) catch |e| switch (e) {
+    const hybrid = LlamaHybridRunner.init(
+        gpa,
+        ctxp,
+        loaded,
+        plan,
+        io,
+        cpu_pool,
+        cpu_cfg,
+        kv_dtype,
+    ) catch |e| switch (e) {
         error.VramBudgetExceeded => return error.SkipZigTest,
         else => return e,
     };
@@ -129,6 +149,7 @@ fn buildPieces(arena: std.mem.Allocator, v: *const vocab_mod.Vocab) ![]const []c
         piece.* = try bpe.decodeAlloc(v, arena, &[_]u32{@intCast(id)});
         try std.testing.expect(piece.len <= limits.max_token_text_bytes);
     }
+
     return pieces;
 }
 
@@ -166,6 +187,7 @@ fn soloReference(client: *Client, out: []Stream, out2: ?[]Stream) !void {
             second[i] = try oneTurn(client, sid, second_prompt);
             try std.testing.expect(second[i].n > 0);
         }
+
         _ = try client.send(.session_close, sid);
         const ev = try client.next();
         try std.testing.expect(ev.msg == .session_closed);
@@ -178,16 +200,26 @@ fn soloReference(client: *Client, out: []Stream, out2: ?[]Stream) !void {
 fn interleaved(client: *Client, out: []Stream, sids: []u32) !void {
     std.debug.assert(out.len <= prompts.len);
     std.debug.assert(sids.len == out.len);
-    for (sids) |*sid| sid.* = try client.openSession("", protocol.Sampling.greedy);
-    for (sids, 0..) |sid, i| _ = try client.generate(sid, prompts[i], turn_tokens_max, null);
 
-    for (out) |*s| s.* = .{};
+    for (sids) |*sid| {
+        sid.* = try client.openSession("", protocol.Sampling.greedy);
+    }
+
+    for (sids, 0..) |sid, i| {
+        _ = try client.generate(sid, prompts[i], turn_tokens_max, null);
+    }
+
+    for (out) |*s| {
+        s.* = .{};
+    }
+
     var done_count: usize = 0;
     while (done_count < out.len) {
         const ev = try client.next();
         const slot: usize = for (sids, 0..) |sid, i| {
             if (ev.header.session_id == sid) break i;
         } else return error.UnknownSession;
+
         switch (ev.msg) {
             .token => |t| {
                 try std.testing.expect(out[slot].n < out[slot].ids.len);
@@ -220,19 +252,28 @@ fn overSubscribedRoundTrip(kv_dtype: dtype.KvDtype) !void {
     const gpa = std.testing.allocator;
     var arena_state = std.heap.ArenaAllocator.init(gpa);
     defer arena_state.deinit();
+
     const arena = arena_state.allocator();
     const fixture = try z.test_fixtures.path(arena, "SmolLM2-135M-Instruct-Q8_0");
 
     var loaded = try loader.load(io, arena, fixture);
     defer loaded.close();
+
     var v = try vocab_mod.buildFromParsed(arena, loaded.parsed);
-    const codec: event.Codec = .{ .vocab = &v, .kind = .none, .pieces = try buildPieces(arena, &v), .eos_id = v.eos_id };
+    const codec: event.Codec = .{
+        .vocab = &v,
+        .kind = .none,
+        .pieces = try buildPieces(arena, &v),
+        .eos_id = v.eos_id,
+    };
 
     const ctxp = try initCtx(arena);
     defer ctxp.deinit();
+
     var cpu_pool: tp.Pool = undefined;
     try tp.startPool(&cpu_pool, io, cpu_cfg);
     defer cpu_pool.deinit();
+
     const hybrid = try initHybrid(gpa, ctxp, &loaded, io, &cpu_pool, kv_dtype);
     defer hybrid.deinit();
 
@@ -263,10 +304,12 @@ fn overSubscribedRoundTrip(kv_dtype: dtype.KvDtype) !void {
         client.shutdown() catch blk: {
             var fallback = Client.connectTcp(gpa, io, server.boundAddress()) catch break :blk;
             defer fallback.deinit();
+
             fallback.shutdown() catch {};
         };
         run_future.await(io);
     }
+
     _ = try client.hello();
 
     // The solo conversations close each session, so at most one sits resident
@@ -286,7 +329,10 @@ fn overSubscribedRoundTrip(kv_dtype: dtype.KvDtype) !void {
     // restored. That is the swap this test exists to witness, and the
     // pigeonhole forces it rather than the tick timing.
     var got2: [prompts.len]Stream = undefined;
-    for (&got2, sids) |*s, sid| s.* = try oneTurn(&client, sid, second_prompt);
+    for (&got2, sids) |*s, sid| {
+        s.* = try oneTurn(&client, sid, second_prompt);
+    }
+
     try expectSameStreams(&reference2, &got2);
 
     // The claim of this test is that a swapped stream is an unswapped stream.
@@ -303,19 +349,28 @@ test "llama hybrid serve: an interleaved turn matches its solo stream" {
     const gpa = std.testing.allocator;
     var arena_state = std.heap.ArenaAllocator.init(gpa);
     defer arena_state.deinit();
+
     const arena = arena_state.allocator();
     const fixture = try z.test_fixtures.path(arena, "SmolLM2-135M-Instruct-Q8_0");
 
     var loaded = try loader.load(io, arena, fixture);
     defer loaded.close();
+
     var v = try vocab_mod.buildFromParsed(arena, loaded.parsed);
-    const codec: event.Codec = .{ .vocab = &v, .kind = .none, .pieces = try buildPieces(arena, &v), .eos_id = v.eos_id };
+    const codec: event.Codec = .{
+        .vocab = &v,
+        .kind = .none,
+        .pieces = try buildPieces(arena, &v),
+        .eos_id = v.eos_id,
+    };
 
     const ctxp = try initCtx(arena);
     defer ctxp.deinit();
+
     var cpu_pool: tp.Pool = undefined;
     try tp.startPool(&cpu_pool, io, cpu_cfg);
     defer cpu_pool.deinit();
+
     const hybrid = try initHybrid(gpa, ctxp, &loaded, io, &cpu_pool, .f32);
     defer hybrid.deinit();
 
@@ -346,10 +401,12 @@ test "llama hybrid serve: an interleaved turn matches its solo stream" {
         client.shutdown() catch blk: {
             var fallback = Client.connectTcp(gpa, io, server.boundAddress()) catch break :blk;
             defer fallback.deinit();
+
             fallback.shutdown() catch {};
         };
         run_future.await(io);
     }
+
     _ = try client.hello();
 
     var reference: [2]Stream = undefined;
@@ -365,7 +422,7 @@ test "llama hybrid serve: an over-subscribed pool evicts and restores" {
 }
 
 test "llama hybrid serve: an over-subscribed pool evicts and restores at f16" {
-    // Half-width KV rides the same two-tier swap: the narrowing kernel writes
+    // Half-width KV goes through the same two-tier swap: the narrowing kernel writes
     // the slab, and evict and restore carry halved regions. A dropped or
     // mis-sized region diverges a second turn from its solo reference here.
     try overSubscribedRoundTrip(.f16);

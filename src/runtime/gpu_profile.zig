@@ -25,7 +25,12 @@ const record_ring = @import("../core/record_ring.zig");
 const log_dispatch = std.log.scoped(.dispatch);
 const log = std.log.scoped(.gpu);
 
-// -- types ---------------------------------------------------------------------
+// -- constants --------------------------------------------------------------
+
+/// Bound on timestamps per profiled submit (64 layers x ~14 marks + tail).
+pub const prof_max: u32 = 1024;
+
+// -- types ------------------------------------------------------------------
 
 pub const Level = span.GpuLevel;
 
@@ -34,25 +39,8 @@ pub const Level = span.GpuLevel;
 /// books it under `gdn_scan`.
 pub const Phase = span.GpuPhase;
 
-/// True when the phase counts toward the `matmul` summary line.
-fn isMatmul(ph: Phase) bool {
-    return switch (ph) {
-        .matmul_gdn_in, .matmul_attn_in, .matmul_out, .matmul_ffn_up, .matmul_ffn_down => true,
-        else => false,
-    };
-}
-
-/// True when the phase counts toward the `gdn` summary line.
-fn isGdn(ph: Phase) bool {
-    return ph == .gdn_conv or ph == .gdn_scan;
-}
-
-/// Bound on timestamps per profiled submit (64 layers x ~14 marks + tail).
-pub const prof_max: u32 = 1024;
-
 pub const RecordOpts = record_ring.RecordOpts;
 pub const DecodeKey = record_ring.DecodeKey;
-pub const decodeKey = record_ring.decodeKey;
 
 /// One read-back command buffer. The ticks are raw device ticks.
 pub const Readout = struct {
@@ -67,7 +55,13 @@ pub const Readout = struct {
     phase_ns: ?[span.gpu_phase_count]f64,
 
     /// The GPU record of this readout for the span recorder.
-    pub fn record(self: Readout, runner: span.GpuRunner, label: span.GpuLabel, submit: std.Io.Timestamp, wait: std.Io.Timestamp) span.GpuRecord {
+    pub fn record(
+        self: Readout,
+        runner: span.GpuRunner,
+        label: span.GpuLabel,
+        submit: std.Io.Timestamp,
+        wait: std.Io.Timestamp,
+    ) span.GpuRecord {
         var rec: span.GpuRecord = .{
             .runner = runner,
             .label = label,
@@ -80,16 +74,20 @@ pub const Readout = struct {
         };
         if (self.phase_ns) |ph| {
             var out: [span.gpu_phase_count]u64 = undefined;
-            for (ph, &out) |ns, *o| o.* = @intFromFloat(ns);
+            for (ph, &out) |ns, *o| {
+                o.* = @intFromFloat(ns);
+            }
+
             rec.phases = out;
         }
+
         return rec;
     }
 
     /// Print the per-`Phase` table. The output of an opt-in profiler is
     /// program output (stdout). `hdr` labels the run, as in
     /// "[qwen prefill warmup] b=411". The two host-side times state the record
-    /// leg and the submit-plus-wait leg.
+    /// step and the submit-plus-wait step.
     pub fn report(
         self: Readout,
         io: std.Io,
@@ -105,35 +103,52 @@ pub const Readout = struct {
         var fw: std.Io.File.Writer = .initStreaming(.stdout(), io, &buf);
         const w = &fw.interface;
         try w.print(hdr, hdr_args);
-        try w.print(" marks={d} dropped={d} backsteps={d} gpu_total={d:.2}ms (host record={d:.2}ms submit+wait={d:.2}ms)\n", .{ self.marks, self.dropped, self.backsteps, total_ns / 1e6, record_ms, wait_ms });
+        try w.print(
+            " marks={d} dropped={d} backsteps={d} gpu_total={d:.2}ms (host record={d:.2}ms " ++
+                "submit+wait={d:.2}ms)\n",
+            .{ self.marks, self.dropped, self.backsteps, total_ns / 1e6, record_ms, wait_ms },
+        );
         // The summary lines `matmul` and `gdn` keep their names for scripts.
         // Each total is followed by its indented parts.
         var matmul_ns: f64 = 0;
         var gdn_ns: f64 = 0;
         inline for (std.meta.fields(Phase)) |fld| {
             const ph = @field(Phase, fld.name);
-            if (isMatmul(ph)) matmul_ns += bucket[@intFromEnum(ph)];
-            if (isGdn(ph)) gdn_ns += bucket[@intFromEnum(ph)];
+            if (isMatmul(ph)) {
+                matmul_ns += bucket[@intFromEnum(ph)];
+            }
+
+            if (isGdn(ph)) {
+                gdn_ns += bucket[@intFromEnum(ph)];
+            }
         }
+
         try printLine(w, "matmul", matmul_ns, total_ns, 0);
         inline for (std.meta.fields(Phase)) |fld| {
             const ph = @field(Phase, fld.name);
-            if (comptime isMatmul(ph)) try printLine(w, fld.name, bucket[@intFromEnum(ph)], total_ns, 2);
+            if (comptime isMatmul(ph)) {
+                try printLine(w, fld.name, bucket[@intFromEnum(ph)], total_ns, 2);
+            }
         }
+
         try printLine(w, "gdn", gdn_ns, total_ns, 0);
         inline for (std.meta.fields(Phase)) |fld| {
             const ph = @field(Phase, fld.name);
-            if (comptime isGdn(ph)) try printLine(w, fld.name, bucket[@intFromEnum(ph)], total_ns, 2);
+            if (comptime isGdn(ph)) {
+                try printLine(w, fld.name, bucket[@intFromEnum(ph)], total_ns, 2);
+            }
         }
+
         inline for (std.meta.fields(Phase)) |fld| {
             const ph = @field(Phase, fld.name);
-            if (comptime !isMatmul(ph) and !isGdn(ph)) try printLine(w, fld.name, bucket[@intFromEnum(ph)], total_ns, 0);
+            if (comptime !isMatmul(ph) and !isGdn(ph)) {
+                try printLine(w, fld.name, bucket[@intFromEnum(ph)], total_ns, 0);
+            }
         }
+
         try w.flush();
     }
 };
-
-// -- api -----------------------------------------------------------------------
 
 /// The timestamps of one command buffer.
 pub const GpuProfile = struct {
@@ -170,12 +185,16 @@ pub const GpuProfile = struct {
         };
         // `Context.init` drops the level to off on a device that cannot time.
         if (level != .off) std.debug.assert(self.canTime());
+
         try self.ensurePool(@max(slotsFor(level), slotsFor(pool_for)));
         return self;
     }
 
     pub fn deinit(self: *GpuProfile) void {
-        if (self.query_pool != .null_handle) self.ctx.vkd.destroyQueryPool(self.ctx.device, self.query_pool, null);
+        if (self.query_pool != .null_handle) {
+            self.ctx.vkd.destroyQueryPool(self.ctx.device, self.query_pool, null);
+        }
+
         self.* = undefined;
     }
 
@@ -185,9 +204,14 @@ pub const GpuProfile = struct {
     /// no tick period refuses every level above `off` with a log line.
     pub fn reserve(self: *GpuProfile, level: Level) !void {
         if (level != .off and !self.canTime()) {
-            log.err("this GPU queue writes no usable timestamps ({d} valid bits, a period of {d} ns), so a GPU profile cannot run. Run without the profile flag", .{ self.ctx.timestamp_valid_bits, self.period_ns });
+            log.err(
+                "this GPU queue writes no usable timestamps ({d} valid bits, a period of " ++
+                    "{d} ns), so a GPU profile cannot run. Run without the profile flag",
+                .{ self.ctx.timestamp_valid_bits, self.period_ns },
+            );
             return error.TimestampsUnsupported;
         }
+
         try self.ensurePool(slotsFor(level));
         std.debug.assert(self.capacity >= slotsFor(level));
     }
@@ -200,6 +224,7 @@ pub const GpuProfile = struct {
     /// Change the level within the pool. The next record writes at it.
     pub fn setLevel(self: *GpuProfile, level: Level) void {
         std.debug.assert(slotsFor(level) <= self.capacity);
+
         self.level = level;
         self.n = 0;
     }
@@ -208,6 +233,7 @@ pub const GpuProfile = struct {
     /// write the start. Index 0 is the pass start, so no interval precedes it.
     pub fn begin(self: *GpuProfile, cb: vk.CommandBuffer) void {
         if (self.level == .off) return;
+
         const slots = slotsFor(self.level);
         std.debug.assert(slots <= self.capacity);
         self.ctx.vkd.cmdResetQueryPool(cb, self.query_pool, 0, slots);
@@ -220,20 +246,34 @@ pub const GpuProfile = struct {
     /// Tag the interval that just ended with its `Phase`. The `.dispatch` trace
     /// fires on every record pass. The timestamp writes only at `phases`.
     pub fn mark(self: *GpuProfile, cb: vk.CommandBuffer, phase: Phase) void {
-        if (comptime core_log.hot) log_dispatch.debug("mark: {t}", .{phase});
+        if (comptime core_log.hot) {
+            log_dispatch.debug("mark: {t}", .{phase});
+        }
+
         if (self.level != .phases) return;
+
         std.debug.assert(self.n >= 1);
         if (self.n >= prof_max) {
-            if (!self.warned_full) log_dispatch.warn(
-                "profile: the {d}-timestamp bound is full, so the rest of each such submit goes untimed. The readout counts the dropped marks",
-                .{prof_max},
-            );
+            if (!self.warned_full) {
+                log_dispatch.warn(
+                    "profile: the {d}-timestamp bound is full, so the rest of each such " ++
+                        "submit goes untimed. The readout counts the dropped marks",
+                    .{prof_max},
+                );
+            }
+
             self.warned_full = true;
             self.dropped += 1;
             return;
         }
+
         self.labels[self.n] = phase;
-        self.ctx.vkd.cmdWriteTimestamp(cb, .{ .bottom_of_pipe_bit = true }, self.query_pool, self.n);
+        self.ctx.vkd.cmdWriteTimestamp(
+            cb,
+            .{ .bottom_of_pipe_bit = true },
+            self.query_pool,
+            self.n,
+        );
         self.n += 1;
     }
 
@@ -244,7 +284,13 @@ pub const GpuProfile = struct {
             .off => {},
             .submit => {
                 std.debug.assert(self.n == 1);
-                self.ctx.vkd.cmdWriteTimestamp(cb, .{ .bottom_of_pipe_bit = true }, self.query_pool, 1);
+
+                self.ctx.vkd.cmdWriteTimestamp(
+                    cb,
+                    .{ .bottom_of_pipe_bit = true },
+                    self.query_pool,
+                    1,
+                );
                 self.n = 2;
             },
             .phases => std.debug.assert(self.n >= 2),
@@ -256,12 +302,22 @@ pub const GpuProfile = struct {
     /// are available and the wait flag never blocks.
     pub fn collect(self: *GpuProfile) !?Readout {
         if (self.n == 0) return null;
+
         const n = self.n;
         std.debug.assert(n >= 2);
         std.debug.assert(n <= self.capacity);
         self.n = 0;
         var ts: [prof_max]u64 = undefined;
-        _ = try self.ctx.vkd.getQueryPoolResults(self.ctx.device, self.query_pool, 0, n, n * @sizeOf(u64), &ts, @sizeOf(u64), .{ .@"64_bit" = true, .wait_bit = true });
+        _ = try self.ctx.vkd.getQueryPoolResults(
+            self.ctx.device,
+            self.query_pool,
+            0,
+            n,
+            n * @sizeOf(u64),
+            &ts,
+            @sizeOf(u64),
+            .{ .@"64_bit" = true, .wait_bit = true },
+        );
         var deltas: [prof_max - 1]u64 = undefined;
         const t = span.tickSpan(ts[0..n], self.tick_mask, deltas[0 .. n - 1]);
         var r: Readout = .{
@@ -278,8 +334,10 @@ pub const GpuProfile = struct {
             for (deltas[0 .. n - 1], self.labels[1..n]) |dt, label| {
                 bucket[@intFromEnum(label)] += @as(f64, @floatFromInt(dt)) * self.period_ns;
             }
+
             r.phase_ns = bucket;
         }
+
         return r;
     }
 
@@ -298,17 +356,26 @@ pub const GpuProfile = struct {
 
     fn ensurePool(self: *GpuProfile, slots: u32) !void {
         if (slots <= self.capacity) return;
+
         const info: vk.QueryPoolCreateInfo = .{ .query_type = .timestamp, .query_count = slots };
         const pool = try self.ctx.vkd.createQueryPool(self.ctx.device, &info, null);
-        if (self.query_pool != .null_handle) self.ctx.vkd.destroyQueryPool(self.ctx.device, self.query_pool, null);
+        if (self.query_pool != .null_handle) {
+            self.ctx.vkd.destroyQueryPool(self.ctx.device, self.query_pool, null);
+        }
+
         self.query_pool = pool;
         self.capacity = slots;
     }
 };
 
+// -- api --------------------------------------------------------------------
+
+pub const decodeKey = record_ring.decodeKey;
+
 /// The mask of the valid bits of a tick. Zero bits give a zero mask.
 pub fn tickMask(valid_bits: u32) u64 {
     std.debug.assert(valid_bits <= 64);
+
     if (valid_bits == 64) return std.math.maxInt(u64);
     return (@as(u64, 1) << @intCast(valid_bits)) - 1;
 }
@@ -322,7 +389,20 @@ pub fn slotsFor(level: Level) u32 {
     };
 }
 
-// -- helpers -------------------------------------------------------------------
+// -- helpers ----------------------------------------------------------------
+
+/// True when the phase counts toward the `matmul` summary line.
+fn isMatmul(ph: Phase) bool {
+    return switch (ph) {
+        .matmul_gdn_in, .matmul_attn_in, .matmul_out, .matmul_ffn_up, .matmul_ffn_down => true,
+        else => false,
+    };
+}
+
+/// True when the phase counts toward the `gdn` summary line.
+fn isGdn(ph: Phase) bool {
+    return ph == .gdn_conv or ph == .gdn_scan;
+}
 
 /// One report row. A part row sits `indent` spaces in and keeps the columns.
 fn printLine(w: *std.Io.Writer, name: []const u8, ns: f64, total_ns: f64, indent: usize) !void {
@@ -330,20 +410,30 @@ fn printLine(w: *std.Io.Writer, name: []const u8, ns: f64, total_ns: f64, indent
     std.debug.assert(indent + name.len <= label.len);
     @memset(label[0..indent], ' ');
     @memcpy(label[indent..][0..name.len], name);
-    try w.print("  {s:<18} {d:>8.2} ms  ({d:>5.1}%)\n", .{ label[0 .. indent + name.len], ns / 1e6, 100.0 * ns / total_ns });
+    try w.print(
+        "  {s:<18} {d:>8.2} ms  ({d:>5.1}%)\n",
+        .{ label[0 .. indent + name.len], ns / 1e6, 100.0 * ns / total_ns },
+    );
 }
 
-// -- tests ---------------------------------------------------------------------
+// -- tests ------------------------------------------------------------------
 
 test "every phase counts in at most one report group" {
     var matmul: usize = 0;
     var gdn: usize = 0;
     inline for (std.meta.fields(Phase)) |fld| {
         const ph = @field(Phase, fld.name);
-        if (isMatmul(ph)) matmul += 1;
-        if (isGdn(ph)) gdn += 1;
+        if (isMatmul(ph)) {
+            matmul += 1;
+        }
+
+        if (isGdn(ph)) {
+            gdn += 1;
+        }
+
         try std.testing.expect(!(isMatmul(ph) and isGdn(ph)));
     }
+
     try std.testing.expectEqual(@as(usize, 5), matmul);
     try std.testing.expectEqual(@as(usize, 2), gdn);
 }

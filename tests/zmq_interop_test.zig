@@ -1,10 +1,10 @@
 //! The interop oracle for the serve wire. The reference client is a port of
 //! the protocol, so a test that uses it alone proves only that the two ports
-//! agree. A real libzmq DEALER proves that the server speaks the ZeroMQ wire
+//! agree. A real libzmq DEALER proves that the server speaks the ZMQ wire
 //! that other bindings speak. Each test drives the server through the system
 //! libzmq and compares the stream with the stream of the reference client.
 //!
-//! The tests open `libzmq.so.5` at run time, so the build needs no ZeroMQ
+//! The tests open `libzmq.so.5` at run time, so the build needs no ZMQ
 //! headers or link step. A test skips where the library is absent, and it
 //! logs the libzmq version it drove at the info level. Every test also
 //! returns `error.SkipZigTest` when no fixture exists.
@@ -59,6 +59,7 @@ const Zmq = struct {
     fn open() !?Zmq {
         var lib = std.DynLib.open("libzmq.so.5") catch return null;
         errdefer lib.close();
+
         var self: Zmq = undefined;
         self.lib = lib;
         inline for (@typeInfo(Zmq).@"struct".fields[1..]) |field| {
@@ -67,6 +68,7 @@ const Zmq = struct {
                 return error.ZmqSymbolMissing;
             };
         }
+
         return self;
     }
 
@@ -108,20 +110,29 @@ const Dealer = struct {
     fn init(zmq: *const Zmq, address: [:0]const u8) !Dealer {
         const ctx = zmq.ctx_new() orelse return zmq.fail("zmq_ctx_new");
         errdefer _ = zmq.ctx_term(ctx);
+
         const sock = zmq.socket(ctx, zmq_dealer) orelse return zmq.fail("zmq_socket");
         errdefer _ = zmq.close(sock);
+
         // Linger 0 lets `zmq_ctx_term` return at once after a failed test
         // that leaves messages unsent.
         try setInt(zmq, sock, zmq_linger, 0);
         try setInt(zmq, sock, zmq_rcvtimeo, io_timeout_ms);
         try setInt(zmq, sock, zmq_sndtimeo, io_timeout_ms);
         if (zmq.connect(sock, address.ptr) != 0) return zmq.fail("zmq_connect");
+
         return .{ .zmq = zmq, .ctx = ctx, .sock = sock };
     }
 
     fn deinit(self: *Dealer) void {
-        if (self.zmq.close(self.sock) != 0) self.zmq.report("zmq_close");
-        if (self.zmq.ctx_term(self.ctx) != 0) self.zmq.report("zmq_ctx_term");
+        if (self.zmq.close(self.sock) != 0) {
+            self.zmq.report("zmq_close");
+        }
+
+        if (self.zmq.ctx_term(self.ctx) != 0) {
+            self.zmq.report("zmq_ctx_term");
+        }
+
         self.* = undefined;
     }
 
@@ -131,6 +142,7 @@ const Dealer = struct {
         const n = protocol.encodeClientMsg(msg, request_id, session_id, &out);
         const sent = self.zmq.send(self.sock, &out, n, 0);
         if (sent < 0) return self.zmq.fail("zmq_send");
+
         try std.testing.expectEqual(n, @as(usize, @intCast(sent)));
     }
 
@@ -138,14 +150,19 @@ const Dealer = struct {
     fn recv(self: *Dealer) !Event {
         const got = self.zmq.recv(self.sock, &self.buf, self.buf.len, 0);
         if (got < 0) return self.zmq.fail("zmq_recv");
+
         const n: usize = @intCast(got);
         // libzmq reports the full size of a message that it cut to the
         // buffer, and the server never sends a message above the bound.
         try std.testing.expect(n <= self.buf.len);
         if (n < protocol.header_bytes) return error.MessageTooShort;
+
         const h = try protocol.decodeHeader(self.buf[0..protocol.header_bytes]);
         try std.testing.expectEqual(n - protocol.header_bytes, h.payload_len);
-        const msg = try protocol.decodeServerPayload(h.msg_type, self.buf[protocol.header_bytes..n]);
+        const msg = try protocol.decodeServerPayload(
+            h.msg_type,
+            self.buf[protocol.header_bytes..n],
+        );
         return .{ .header = h, .msg = msg };
     }
 
@@ -171,6 +188,7 @@ const Dealer = struct {
                 else => return error.UnexpectedReply,
             }
         }
+
         return error.TurnNeverEnded;
     }
 
@@ -183,7 +201,11 @@ const Dealer = struct {
     }
 
     fn openGreedy(self: *Dealer, request_id: u32) !u32 {
-        try self.send(.{ .session_open = .{ .sampling = protocol.Sampling.greedy, .system_prompt = "" } }, request_id, 0);
+        try self.send(
+            .{ .session_open = .{ .sampling = protocol.Sampling.greedy, .system_prompt = "" } },
+            request_id,
+            0,
+        );
         const ev = try self.recv();
         try std.testing.expect(ev.msg == .session_opened);
         try std.testing.expectEqual(request_id, ev.header.request_id);
@@ -192,7 +214,11 @@ const Dealer = struct {
     }
 
     fn generate(self: *Dealer, request_id: u32, session_id: u32, prompt: []const u8) !void {
-        try self.send(.{ .generate = .{ .max_tokens = turn_tokens_max, .sampling = null, .text = prompt } }, request_id, session_id);
+        try self.send(
+            .{ .generate = .{ .max_tokens = turn_tokens_max, .sampling = null, .text = prompt } },
+            request_id,
+            session_id,
+        );
     }
 
     fn closeSession(self: *Dealer, request_id: u32, session_id: u32) !void {
@@ -205,7 +231,9 @@ const Dealer = struct {
 };
 
 fn setInt(zmq: *const Zmq, sock: *anyopaque, option: c_int, value: c_int) !void {
-    if (zmq.setsockopt(sock, option, &value, @sizeOf(c_int)) != 0) return zmq.fail("zmq_setsockopt");
+    if (zmq.setsockopt(sock, option, &value, @sizeOf(c_int)) != 0) {
+        return zmq.fail("zmq_setsockopt");
+    }
 }
 
 /// A prompt alone on a fresh session of the reference client, closed after.
@@ -236,70 +264,99 @@ fn tcpEndpoint(buf: []u8, h: *const Harness) ![:0]const u8 {
 test "a libzmq DEALER drives the server over tcp" {
     var zmq = (try Zmq.open()) orelse return error.SkipZigTest;
     defer zmq.deinit();
+
     zmq.logVersion();
 
     var h = try Harness.boot(std.testing.allocator, std.testing.io, .tcp, .{});
     defer h.deinit();
+
     var client = try h.connect();
     defer client.deinit();
     defer h.stop(&client);
+
     const reference = try soloReference(&client, prompts[0]);
 
     var endpoint_buf: [64]u8 = undefined;
     var dealer = try Dealer.init(&zmq, try tcpEndpoint(&endpoint_buf, &h));
     defer dealer.deinit();
+
     try expectSameStream(reference, try dealerTurn(&dealer, prompts[0]));
 }
 
 test "a libzmq DEALER drives the server over ipc" {
     var zmq = (try Zmq.open()) orelse return error.SkipZigTest;
     defer zmq.deinit();
+
     zmq.logVersion();
 
     var h = try Harness.boot(std.testing.allocator, std.testing.io, .unix, .{});
     defer h.deinit();
+
     var client = try h.connect();
     defer client.deinit();
     defer h.stop(&client);
+
     const reference = try soloReference(&client, prompts[0]);
 
     // The socket path is relative to the cwd, and libzmq resolves an `ipc://`
     // path against the same cwd.
     var endpoint_buf: [16 + std.Io.net.UnixAddress.max_len]u8 = undefined;
-    const endpoint = try std.fmt.bufPrintZ(&endpoint_buf, "ipc://{s}", .{h.path_buf[0..h.path_len]});
+    const endpoint = try std.fmt.bufPrintZ(
+        &endpoint_buf,
+        "ipc://{s}",
+        .{h.path_buf[0..h.path_len]},
+    );
     var dealer = try Dealer.init(&zmq, endpoint);
     defer dealer.deinit();
+
     try expectSameStream(reference, try dealerTurn(&dealer, prompts[0]));
 }
 
 test "two libzmq DEALERs hold sessions at once and each stream equals its reference" {
     var zmq = (try Zmq.open()) orelse return error.SkipZigTest;
     defer zmq.deinit();
+
     zmq.logVersion();
 
-    var h = try Harness.boot(std.testing.allocator, std.testing.io, .tcp, .{ .max_sessions = 4, .max_batch = 4 });
+    var h = try Harness.boot(
+        std.testing.allocator,
+        std.testing.io,
+        .tcp,
+        .{ .max_sessions = 4, .max_batch = 4 },
+    );
     defer h.deinit();
+
     var client = try h.connect();
     defer client.deinit();
     defer h.stop(&client);
+
     var reference: [prompts.len]Stream = undefined;
-    for (&reference, prompts) |*ref, prompt| ref.* = try soloReference(&client, prompt);
+    for (&reference, prompts) |*ref, prompt| {
+        ref.* = try soloReference(&client, prompt);
+    }
 
     var endpoint_buf: [64]u8 = undefined;
     const endpoint = try tcpEndpoint(&endpoint_buf, &h);
     var dealers: [prompts.len]Dealer = undefined;
     var n_live: usize = 0;
     defer for (dealers[0..n_live]) |*d| d.deinit();
-    while (n_live < prompts.len) : (n_live += 1) dealers[n_live] = try Dealer.init(&zmq, endpoint);
+
+    while (n_live < prompts.len) : (n_live += 1) {
+        dealers[n_live] = try Dealer.init(&zmq, endpoint);
+    }
 
     var sids: [prompts.len]u32 = undefined;
     for (&dealers, &sids) |*d, *sid| {
         try d.hello(1);
         sid.* = try d.openGreedy(2);
     }
+
     // The test sends both turns before it reads any frame, so the two
     // sessions share the batch.
-    for (&dealers, sids, prompts) |*d, sid, prompt| try d.generate(3, sid, prompt);
+    for (&dealers, sids, prompts) |*d, sid, prompt| {
+        try d.generate(3, sid, prompt);
+    }
+
     for (&dealers, sids, reference) |*d, sid, ref| {
         try expectSameStream(ref, try d.readTurn(3, sid));
         try d.closeSession(4, sid);
@@ -309,10 +366,12 @@ test "two libzmq DEALERs hold sessions at once and each stream equals its refere
 test "a libzmq DEALER appends kept pairs and reads the position after each" {
     var zmq = (try Zmq.open()) orelse return error.SkipZigTest;
     defer zmq.deinit();
+
     zmq.logVersion();
 
     var h = try Harness.boot(std.testing.allocator, std.testing.io, .tcp, .{});
     defer h.deinit();
+
     var client = try h.connect();
     defer client.deinit();
     defer h.stop(&client);
@@ -329,6 +388,7 @@ test "a libzmq DEALER appends kept pairs and reads the position after each" {
     var endpoint_buf: [64]u8 = undefined;
     var dealer = try Dealer.init(&zmq, try tcpEndpoint(&endpoint_buf, &h));
     defer dealer.deinit();
+
     try dealer.hello(1);
     const sid = try dealer.openGreedy(2);
     var pair_buf: [256]u8 = undefined;
@@ -345,10 +405,12 @@ test "a libzmq DEALER appends kept pairs and reads the position after each" {
 test "a libzmq DEALER that speaks version 2 gets unsupported_version" {
     var zmq = (try Zmq.open()) orelse return error.SkipZigTest;
     defer zmq.deinit();
+
     zmq.logVersion();
 
     var h = try Harness.boot(std.testing.allocator, std.testing.io, .tcp, .{});
     defer h.deinit();
+
     var client = try h.connect();
     defer client.deinit();
     defer h.stop(&client);
@@ -356,6 +418,7 @@ test "a libzmq DEALER that speaks version 2 gets unsupported_version" {
     var endpoint_buf: [64]u8 = undefined;
     var dealer = try Dealer.init(&zmq, try tcpEndpoint(&endpoint_buf, &h));
     defer dealer.deinit();
+
     var out: [protocol.header_bytes]u8 = undefined;
     const n = protocol.encodeClientMsg(.hello, 1, 0, &out);
     std.mem.writeInt(u16, out[4..6], 2, .little);
@@ -369,10 +432,17 @@ test "a libzmq DEALER that speaks version 2 gets unsupported_version" {
 test "a libzmq DEALER keeps a session, closes, and a new DEALER resumes it" {
     var zmq = (try Zmq.open()) orelse return error.SkipZigTest;
     defer zmq.deinit();
+
     zmq.logVersion();
 
-    var h = try Harness.boot(std.testing.allocator, std.testing.io, .tcp, .{ .resume_ttl_max_ms = 60_000 });
+    var h = try Harness.boot(
+        std.testing.allocator,
+        std.testing.io,
+        .tcp,
+        .{ .resume_ttl_max_ms = 60_000 },
+    );
     defer h.deinit();
+
     var client = try h.connect();
     defer client.deinit();
     defer h.stop(&client);
@@ -390,6 +460,7 @@ test "a libzmq DEALER keeps a session, closes, and a new DEALER resumes it" {
     {
         var first = try Dealer.init(&zmq, endpoint);
         defer first.deinit();
+
         try first.hello(1);
         sid = try first.openGreedy(2);
         try first.generate(3, sid, prompts[0]);
@@ -404,6 +475,7 @@ test "a libzmq DEALER keeps a session, closes, and a new DEALER resumes it" {
 
     var second = try Dealer.init(&zmq, endpoint);
     defer second.deinit();
+
     try second.hello(1);
     try second.send(.{ .session_resume = .{ .token = token } }, 2, 0);
     const ev = try second.recv();

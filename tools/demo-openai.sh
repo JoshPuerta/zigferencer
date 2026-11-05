@@ -3,8 +3,7 @@
 # `serve-openai`, discover its model, run a buffered and a streamed chat
 # completion, then reap the server.
 #
-# `make demo-openai` calls it, and builds a CPU binary first, because
-# serve-openai runs on the CPU alone. Args:
+# `make demo-openai` calls it, and builds the default CPU binary first. Args:
 #   $1  model registry name (make resolves it first, because the spawned server
 #       cannot prompt)
 #   $2  tcp port            (0 = ephemeral. The bound port is read off READY)

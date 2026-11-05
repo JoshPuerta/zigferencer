@@ -1,7 +1,7 @@
 //! Golden-id gate for the llama3 (`llama-bpe`) pre-tokenizer against the real
 //! Meta-Llama-3.1-8B-Instruct-Q8_0 GGUF.
 //!
-//! The expected ids come from the llama.cpp `llama-tokenize --ids` oracle, so
+//! The expected ids come from the llama.cpp `llama-tokenize --ids` reference, so
 //! the ids must match it exactly. The gate pins the regex pre-split and
 //! `ignore_merges` to that reference. The digit run is the case of interest,
 //! because the pre-split turns "2147" into "214" and "7". The test finds the
@@ -34,6 +34,7 @@ test "llama3 pre-tokenizer matches the llama.cpp oracle (golden ids)" {
     const gpa = std.testing.allocator;
     var arena_state = std.heap.ArenaAllocator.init(gpa);
     defer arena_state.deinit();
+
     const arena = arena_state.allocator();
     const path = try zigferencer.test_fixtures.path(arena, "Meta-Llama-3.1-8B-Instruct-Q8_0");
 
@@ -41,12 +42,14 @@ test "llama3 pre-tokenizer matches the llama.cpp oracle (golden ids)" {
     // 8 GB of weights.
     var loaded = try loader.loadWith(io, arena, path, .{ .prefault = false });
     defer loaded.close();
+
     var vocab = try vocab_mod.buildFromParsed(arena, loaded.parsed);
     try std.testing.expectEqual(vocab_mod.PreType.llama3, vocab.pre);
 
     for (golden) |c| {
         const ids = try bpe.encodeAlloc(&vocab, gpa, c.text, true);
         defer gpa.free(ids);
+
         try std.testing.expectEqualSlices(u32, c.ids, ids);
     }
 }

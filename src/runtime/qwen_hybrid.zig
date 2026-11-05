@@ -6,7 +6,7 @@
 //! fits VRAM and a model that runs CPU-only.
 //!
 //! The Llama twin (`llama_hybrid.zig`) records its own GPU layer bodies. This
-//! runner instead COMPOSES the two shipped runners over two seams.
+//! runner instead COMPOSES the two shipped runners over two boundaries.
 //! `QwenRunner.initPrefix` builds the host prefix, and the hidden-row
 //! entry points of `QwenFusedRunner` take the crossing rows. No dispatch is
 //! recorded here, and no layer body is copied.
@@ -17,7 +17,7 @@
 //!
 //! A slot's state spans both tiers, so every slot hook does too. The blob stays
 //! ONE walk in whole-model order, the prefix's regions first and the suffix's
-//! after, and the seam offset is the prefix's own byte count. `blobSpanBytes`
+//! after, and the boundary offset is the prefix's own byte count. `blobSpanBytes`
 //! states that partition, and every call checks it against what the two runners
 //! report for themselves.
 //!
@@ -56,7 +56,7 @@ comptime {
     }
 }
 
-// -- api --------------------------------------------------------------------
+// -- types ------------------------------------------------------------------
 
 pub const QwenHybridRunner = struct {
     gpa: Allocator,
@@ -73,7 +73,7 @@ pub const QwenHybridRunner = struct {
     hidden: u32,
     card: loader.ModelCard,
     /// The element type every full-attention KV row is framed at, on both
-    /// tiers. One dtype crosses the seam, so the blob keeps one row stride.
+    /// tiers. One dtype crosses the boundary, so the blob keeps one row stride.
     kv_dtype: dtype.KvDtype,
 
     // -- session surface ----------------------------------------------------
@@ -125,6 +125,7 @@ pub const QwenHybridRunner = struct {
     /// that makes the format here infallible.
     pub fn backendTag(buf: []u8, split: u32, kv_dtype: dtype.KvDtype) []const u8 {
         std.debug.assert(buf.len >= backend_tag_buf_len);
+
         return std.fmt.bufPrint(
             buf,
             tag_prefix ++ "{d}:" ++ quant_tag ++ "{s}",
@@ -179,7 +180,9 @@ pub const QwenHybridRunner = struct {
         const device_span = kv_budget.slotSpanBytes(kv_struct, split, n_layers);
         std.debug.assert(plan.kv_host == @as(u64, plan.n_slots) * host_span);
         std.debug.assert(plan.kv_vram == @as(u64, plan.n_slots) * device_span);
-        std.debug.assert(host_span + device_span == kv_budget.slotSpanBytes(kv_struct, 0, n_layers));
+        std.debug.assert(
+            host_span + device_span == kv_budget.slotSpanBytes(kv_struct, 0, n_layers),
+        );
         std.debug.assert(plan.ram.host_kv == plan.kv_host);
         // One swap stage holds one chunk of the device half of one slot blob,
         // or the whole half at the window when that is smaller. A residency
@@ -187,7 +190,11 @@ pub const QwenHybridRunner = struct {
         // never swaps.
         const stage_one = blobSpanBytes(card, kv_dtype, plan.window, split, n_layers);
         std.debug.assert(stage_one == device_span);
-        std.debug.assert(plan.ram.swap_stages == 0 or plan.ram.swap_stages == 2 * kv_budget.stageBytes(stage_one));
+        std.debug.assert(
+            plan.ram.swap_stages == 0 or plan.ram.swap_stages == 2 * kv_budget.stageBytes(
+                stage_one,
+            ),
+        );
         const swap_priced = plan.ram.swap_stages == 2 * kv_budget.stageBytes(stage_one);
         std.debug.assert(plan.ram.swap_stages <= 2 * limits.swap_stage_chunk_bytes);
         std.debug.assert(plan.ram.swap_stages * plan.n_slots <= 2 * plan.kv_vram);
@@ -256,9 +263,13 @@ pub const QwenHybridRunner = struct {
         std.debug.assert(self.prefix.max_seq == self.max_seq);
         std.debug.assert(self.prefix.layers.len == split);
 
-        log.debug("init qwen hybrid: split {d} of {d} layers ({d} on gpu), {d} slots, max_seq {d}, kv {t}", .{
-            split, n_layers, n_layers - split, plan.n_slots, plan.window, kv_dtype,
-        });
+        log.debug(
+            "init qwen hybrid: split {d} of {d} layers ({d} on gpu), {d} slots, max_seq " ++
+                "{d}, kv {t}",
+            .{
+                split, n_layers, n_layers - split, plan.n_slots, plan.window, kv_dtype,
+            },
+        );
         return self;
     }
 
@@ -289,14 +300,18 @@ pub const QwenHybridRunner = struct {
     fn hostPrefix(self: *QwenHybridRunner, rows: []const StepRow) qwen_runner.Error!void {
         const sp = span.beginHot(.host_prefix);
         defer sp.end();
+
         std.debug.assert(rows.len >= 1);
         std.debug.assert(rows.len <= self.prefix.max_rows);
         const d = self.hidden;
         for (rows, 0..) |r, i| {
             naive.embedLookup(self.prefix.embed.*, r.token, d, self.prefix.x[i * d ..][0..d]);
         }
+
         var l: u32 = 0;
-        while (l < self.split) : (l += 1) try self.prefix.layerForward(l, rows);
+        while (l < self.split) : (l += 1) {
+            try self.prefix.layerForward(l, rows);
+        }
     }
 
     /// The residual rows the prefix just wrote: the value that crosses the
@@ -304,6 +319,7 @@ pub const QwenHybridRunner = struct {
     fn crossing(self: *const QwenHybridRunner, n_rows: usize) []const f32 {
         std.debug.assert(n_rows >= 1);
         std.debug.assert(n_rows <= self.prefix.max_rows);
+
         return self.prefix.x[0 .. n_rows * @as(usize, self.hidden)];
     }
 
@@ -311,6 +327,7 @@ pub const QwenHybridRunner = struct {
     /// call.
     pub fn step(self: *QwenHybridRunner, token_id: u32, pos: u32) ![]f32 {
         if (pos >= self.max_seq) return error.PositionOutOfRange;
+
         const row = [_]StepRow{.{ .slot = 0, .token = token_id, .pos = pos, .want_logits = true }};
         try self.hostPrefix(&row);
         return self.suffix.stepHidden(self.crossing(1), pos);
@@ -344,6 +361,7 @@ pub const QwenHybridRunner = struct {
                 .want_logits = i == tokens.len - 1,
             };
         }
+
         try self.hostPrefix(rows_buf[0..b]);
         return self.suffix.prefillBatchHidden(self.crossing(b), b, start_pos);
     }
@@ -358,6 +376,7 @@ pub const QwenHybridRunner = struct {
     /// inherits the previous conversation's recurrent state.
     pub fn resetSlotState(self: *QwenHybridRunner, slot: u32) void {
         std.debug.assert(slot < self.n_slots);
+
         self.prefix.resetSlotState(slot);
         self.suffix.resetSlotState(slot);
     }
@@ -365,11 +384,17 @@ pub const QwenHybridRunner = struct {
     /// Fork slot state for a session clone across both tiers. One slot id spans
     /// them, because both carry the same slot count. `Sessions.clone` calls
     /// this.
-    pub fn cloneSlotState(self: *QwenHybridRunner, source_slot: u32, target_slot: u32, pos: u32) void {
+    pub fn cloneSlotState(
+        self: *QwenHybridRunner,
+        source_slot: u32,
+        target_slot: u32,
+        pos: u32,
+    ) void {
         std.debug.assert(source_slot < self.n_slots);
         std.debug.assert(target_slot < self.n_slots);
         std.debug.assert(source_slot != target_slot);
         std.debug.assert(pos <= self.max_seq);
+
         self.prefix.cloneSlotState(source_slot, target_slot, pos);
         self.suffix.cloneSlotState(source_slot, target_slot, pos);
     }
@@ -387,9 +412,15 @@ pub const QwenHybridRunner = struct {
     /// `[from..to)` at `n_rows` committed positions: KV rows on the
     /// full-attention layers, and the whole recurrent slabs on the GDN ones,
     /// which have no position axis. It is the planner's `slotSpanBytes` with the
-    /// row count in the window's place, so the seam offset and both halves come
+    /// row count in the window's place, so the boundary offset and both halves come
     /// from ONE walk.
-    pub fn blobSpanBytes(card: loader.ModelCard, kv_dtype: dtype.KvDtype, n_rows: u32, from: u32, to: u32) u64 {
+    pub fn blobSpanBytes(
+        card: loader.ModelCard,
+        kv_dtype: dtype.KvDtype,
+        n_rows: u32,
+        from: u32,
+        to: u32,
+    ) u64 {
         return QwenFusedRunner.rangeSlotBytes(card, kv_dtype, n_rows, from, to).total();
     }
 
@@ -399,12 +430,16 @@ pub const QwenHybridRunner = struct {
         return blobSpanBytes(self.card, self.kv_dtype, n_rows, 0, self.n_layers);
     }
 
-    /// The blob seam: the offset the device half starts at. It states the
+    /// The blob boundary: the offset the device half starts at. It states the
     /// partition both directions depend on, each runner's own figure against
     /// the whole-model walk, so neither direction can drift from the other.
     fn seam(self: *const QwenHybridRunner, n_rows: u32, blob_len: usize) usize {
-        const host: usize = @intCast(blobSpanBytes(self.card, self.kv_dtype, n_rows, 0, self.split));
-        const device: usize = @intCast(blobSpanBytes(self.card, self.kv_dtype, n_rows, self.split, self.n_layers));
+        const host: usize = @intCast(
+            blobSpanBytes(self.card, self.kv_dtype, n_rows, 0, self.split),
+        );
+        const device: usize = @intCast(
+            blobSpanBytes(self.card, self.kv_dtype, n_rows, self.split, self.n_layers),
+        );
         std.debug.assert(host == @as(usize, @intCast(self.prefix.evictSlotBytesFor(n_rows))));
         std.debug.assert(device == @as(usize, @intCast(self.suffix.evictSlotBytesFor(n_rows))));
         std.debug.assert(host + device == @as(usize, @intCast(self.evictSlotBytesFor(n_rows))));
@@ -423,6 +458,7 @@ pub const QwenHybridRunner = struct {
         std.debug.assert(slot < self.n_slots);
         std.debug.assert(n_rows >= 1); // a blob must hold rows to restore from
         std.debug.assert(n_rows <= self.max_seq);
+
         const at = self.seam(n_rows, out.len);
         try self.prefix.evictSlot(slot, n_rows, out[0..at]);
         try self.suffix.evictSlot(slot, n_rows, out[at..]);
@@ -439,6 +475,7 @@ pub const QwenHybridRunner = struct {
         std.debug.assert(slot < self.n_slots);
         std.debug.assert(n_rows >= 1); // a blob must hold rows to restore from
         std.debug.assert(n_rows <= self.max_seq);
+
         const at = self.seam(n_rows, blob.len);
         try self.prefix.restoreSlot(slot, n_rows, blob[0..at]);
         try self.suffix.restoreSlot(slot, n_rows, blob[at..]);
@@ -449,8 +486,8 @@ pub const QwenHybridRunner = struct {
 };
 
 // -- tests ------------------------------------------------------------------
-// Blob framing and tag anchors, all device-free arithmetic.
 
+// Blob framing and tag anchors, all device-free arithmetic.
 /// The 2B anchor card. Both files reason about one Qwen3.5 geometry, so one
 /// declaration holds it and drift cannot open between the two cost models.
 const testCard = qwen_fused.testCard;
@@ -484,6 +521,7 @@ fn testTensors() [26]loader.TensorRef {
             .tensor = layer_t,
         };
     }
+
     refs[24] = .{ .name = "output_norm.weight", .tensor = layer_t };
     refs[25] = .{ .name = "token_embd.weight", .tensor = head_t };
     return refs;
@@ -501,9 +539,16 @@ test "qwen split: the cost vector prices six attention layers and eighteen slabs
         try std.testing.expectEqual(@as(u32, 24), costs.n_layers);
         for (costs.layers(), 0..) |entry, i| {
             const full = (i + 1) % 4 == 0;
-            try std.testing.expectEqual(if (full) row_pair else 0, @as(u64, entry.kv_bytes_per_token));
-            try std.testing.expectEqual(if (full) 0 else gdn_bytes, @as(u64, entry.fixed_bytes_per_slot));
+            try std.testing.expectEqual(
+                if (full) row_pair else 0,
+                @as(u64, entry.kv_bytes_per_token),
+            );
+            try std.testing.expectEqual(
+                if (full) 0 else gdn_bytes,
+                @as(u64, entry.fixed_bytes_per_slot),
+            );
         }
+
         // A uniform per-layer price charges a different number at every split,
         // so the divisibility accident on this model cannot stand in for the
         // vector.
@@ -525,19 +570,30 @@ test "qwen split: a mid split prices each tier by the layers it holds" {
         .default_ceil = limits.min_kv_window,
     };
     const kv_dtype: dtype.KvDtype = .f32;
-    const kv: kv_budget.KvStructure = .{ .n_slots = 2, .window = 512, .costs = kv_cost.qwenCostVector(card, kv_dtype) };
+    const kv: kv_budget.KvStructure = .{
+        .n_slots = 2,
+        .window = 512,
+        .costs = kv_cost.qwenCostVector(card, kv_dtype),
+    };
     var table: [limits.max_layers]u64 = undefined;
     // Twelve GPU layers leave the split at 12, and each half holds three
     // attention layers and nine recurrent ones.
-    const plan = try kv_budget.placementPlan(caps, tensor_lookup.layerWeightBytes(&refs, card.n_layers, &table), tensor_lookup.headWeightBytes(&refs), kv, .{
-        .ram_split = .{ .blobs = 0, .prefix = 0 },
-        .residency = true,
-    }, 12);
+    const plan = try kv_budget.placementPlan(
+        caps,
+        tensor_lookup.layerWeightBytes(&refs, card.n_layers, &table),
+        tensor_lookup.headWeightBytes(&refs),
+        kv,
+        .{
+            .ram_split = .{ .blobs = 0, .prefix = 0 },
+            .residency = true,
+        },
+        12,
+    );
     const half: u64 = @as(u64, kv.n_slots) * (@as(u64, kv.window) * 3 * 4_096 + 9 * 1_122_304);
     try std.testing.expectEqual(@as(u32, 12), plan.split);
     try std.testing.expectEqual(half, plan.kv_vram);
     try std.testing.expectEqual(half, plan.kv_host);
-    // The seam the runner walks is the same span the planner priced, which is
+    // The boundary the runner walks is the same span the planner priced, which is
     // the equality `init` asserts before it allocates.
     try std.testing.expectEqual(
         kv_budget.slotSpanBytes(kv, 0, plan.split),
@@ -549,7 +605,9 @@ test "qwen split: a mid split prices each tier by the layers it holds" {
     // window, or the whole half when that is smaller, the figure `init`
     // asserts against the planner's suffix span.
     try std.testing.expectEqual(
-        2 * kv_budget.stageBytes(QwenHybridRunner.blobSpanBytes(card, kv_dtype, kv.window, plan.split, 24)),
+        2 * kv_budget.stageBytes(
+            QwenHybridRunner.blobSpanBytes(card, kv_dtype, kv.window, plan.split, 24),
+        ),
         plan.ram.swap_stages,
     );
 }
@@ -567,12 +625,15 @@ test "qwen hybrid blob: the seam offset partitions the whole-model walk" {
                 const host = H.blobSpanBytes(card, kv_dtype, n_rows, 0, k);
                 const device = H.blobSpanBytes(card, kv_dtype, n_rows, k, 24);
                 try std.testing.expectEqual(whole, host + device);
-                // The seam only moves forward, so a wider prefix never shrinks
+                // The boundary only moves forward, so a wider prefix never shrinks
                 // the host half.
                 if (k > 0) {
-                    try std.testing.expect(host >= H.blobSpanBytes(card, kv_dtype, n_rows, 0, k - 1));
+                    try std.testing.expect(
+                        host >= H.blobSpanBytes(card, kv_dtype, n_rows, 0, k - 1),
+                    );
                 }
             }
+
             // The ends empty the half they leave behind, and every accepted
             // split leaves both halves non-empty.
             try std.testing.expectEqual(@as(u64, 0), H.blobSpanBytes(card, kv_dtype, n_rows, 0, 0));
@@ -606,6 +667,7 @@ test "qwen hybrid blob: rows price the attention layers and never the slabs" {
             const device = H.blobSpanBytes(card, kv_dtype, n_rows, 12, 24);
             try std.testing.expectEqual(9 * gdn_bytes + 3 * n_rows * row_bytes, device);
         }
+
         // The dtype halves the row-priced half and leaves the slabs equal.
         try std.testing.expectEqual(
             18 * gdn_bytes + 6 * @as(u64, 512) * row_bytes,

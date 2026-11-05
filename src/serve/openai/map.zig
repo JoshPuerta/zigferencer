@@ -18,6 +18,26 @@ const prop = @import("../../core/prop.zig");
 
 const log = std.log.scoped(.serve_openai);
 
+// -- constants --------------------------------------------------------------
+
+/// The refusal message of each known field with a value of the wrong type.
+const bad_field_messages = blk: {
+    const fields = @typeInfo(types.ChatRequest).@"struct".fields;
+    var messages: [fields.len][]const u8 = undefined;
+    for (fields, &messages) |f, *m| {
+        m.* = "'" ++ f.name ++ "' has a value of the wrong JSON type";
+    }
+
+    break :blk messages;
+};
+
+const thinking_unsupported_message = "enable_thinking true does not apply to this model, " ++
+    "because its chat template has no thinking mode";
+const budget_unsupported_message = "thinking_token_budget above 0 does not apply to this " ++
+    "model, because its chat template has no thinking mode";
+const budget_no_forced_close_message = "thinking_token_budget above 0 does not apply to " ++
+    "this model, because the server has no forced close for its think block";
+
 // -- types ------------------------------------------------------------------
 
 pub const ReqError = error{
@@ -70,16 +90,22 @@ pub const UnknownFields = struct {
     /// table is full. `seen` needs no log.
     pub fn note(self: *UnknownFields, name: []const u8) Verdict {
         const key = capped(name);
-        while (!self.lock.tryLock()) std.atomic.spinLoopHint();
+        while (!self.lock.tryLock()) {
+            std.atomic.spinLoopHint();
+        }
+
         defer self.lock.unlock();
+
         for (self.names[0..self.count], self.lens[0..self.count]) |*have, len| {
             if (std.mem.eql(u8, have[0..len], key)) return .seen;
         }
+
         if (self.count == table_cap) {
             if (self.full_reported) return .seen;
             self.full_reported = true;
             return .full;
         }
+
         @memcpy(self.names[self.count][0..key.len], key);
         self.lens[self.count] = @intCast(key.len);
         self.count += 1;
@@ -92,34 +118,6 @@ pub const UnknownFields = struct {
         return name[0..@min(name.len, name_cap)];
     }
 };
-
-var unknown_fields: UnknownFields = .{};
-
-fn reportUnknown(seen: *UnknownFields, name: []const u8) void {
-    switch (seen.note(name)) {
-        .seen => {},
-        .new => log.info("request field \"{f}\" is not supported, so the server ignores it", .{unknownName(name)}),
-        .full => log.info("the table of ignored request field names is full, so later unknown names are not logged", .{}),
-    }
-}
-
-/// The client chooses the name, so the log prints its capped part with every
-/// control byte and quote escaped.
-fn unknownName(name: []const u8) std.fmt.Alt([]const u8, std.zig.stringEscape) {
-    return std.zig.fmtString(UnknownFields.capped(name));
-}
-
-/// The refusal message of each known field with a value of the wrong type.
-const bad_field_messages = blk: {
-    const fields = @typeInfo(types.ChatRequest).@"struct".fields;
-    var messages: [fields.len][]const u8 = undefined;
-    for (fields, &messages) |f, *m| m.* = "'" ++ f.name ++ "' has a value of the wrong JSON type";
-    break :blk messages;
-};
-
-const thinking_unsupported_message = "enable_thinking true does not apply to this model, because its chat template has no thinking mode";
-const budget_unsupported_message = "thinking_token_budget above 0 does not apply to this model, because its chat template has no thinking mode";
-const budget_no_forced_close_message = "thinking_token_budget above 0 does not apply to this model, because the server has no forced close for its think block";
 
 /// The source of an omitted sampling field. `model` takes the card row of
 /// the resolved thinking mode, the vLLM priority. `greedy` keeps the greedy
@@ -139,12 +137,20 @@ pub const DefaultRows = struct {
     think: protocol.Sampling,
     plain: protocol.Sampling,
 
-    pub const greedy: DefaultRows = .{ .think = protocol.Sampling.greedy, .plain = protocol.Sampling.greedy };
+    pub const greedy: DefaultRows = .{
+        .think = protocol.Sampling.greedy,
+        .plain = protocol.Sampling.greedy,
+    };
 
-    pub fn init(mode: SamplingDefaults, card_think: protocol.Sampling, card_plain: protocol.Sampling) DefaultRows {
+    pub fn init(
+        mode: SamplingDefaults,
+        card_think: protocol.Sampling,
+        card_plain: protocol.Sampling,
+    ) DefaultRows {
         // The engine has no frequency penalty, so a card row never carries one.
         std.debug.assert(card_think.frequency_penalty == 0);
         std.debug.assert(card_plain.frequency_penalty == 0);
+
         return switch (mode) {
             .model => .{ .think = card_think, .plain = card_plain },
             .greedy => greedy,
@@ -241,30 +247,40 @@ pub const ReasoningSplit = struct {
     /// tag, or a piece of newlines alone right after a close.
     pub fn route(self: *ReasoningSplit, id: u32, text: []const u8) ?Routed {
         if (self.trim) std.debug.assert(self.field == .content);
+
         const tags = self.tags orelse return .{ .field = .content, .text = text };
         if (id == tags.open) {
             self.field = .reasoning;
             self.trim = false;
             return null;
         }
+
         if (id == tags.close and self.field == .reasoning) {
             self.field = .content;
             self.trim = true;
             return null;
         }
+
         if (!self.trim) return .{ .field = self.field, .text = text };
+
         const reply = std.mem.trimStart(u8, text, "\n");
         if (reply.len == 0) return null;
+
         self.trim = false;
         return .{ .field = .content, .text = reply };
     }
 };
+
+// -- state ------------------------------------------------------------------
+
+var unknown_fields: UnknownFields = .{};
 
 // -- api --------------------------------------------------------------------
 
 /// The budget of a request that names none. A flag of 0 is the whole window.
 pub fn resolveDefaultMaxTokens(flag: u32, max_seq: u32) u32 {
     std.debug.assert(max_seq >= 1);
+
     const resolved = if (flag == 0) max_seq else @min(flag, max_seq);
     std.debug.assert(resolved >= 1);
     std.debug.assert(resolved <= max_seq);
@@ -273,8 +289,16 @@ pub fn resolveDefaultMaxTokens(flag: u32, max_seq: u32) u32 {
 
 /// The llama.cpp answer to a prompt longer than the window. A client can read
 /// both numbers and shorten the conversation.
-pub fn exceedContextError(arena: Allocator, n_prompt_tokens: u32, n_ctx: u32) error{OutOfMemory}!HttpError {
-    const message = try std.fmt.allocPrint(arena, "the request of {d} tokens exceeds the context of {d} tokens", .{ n_prompt_tokens, n_ctx });
+pub fn exceedContextError(
+    arena: Allocator,
+    n_prompt_tokens: u32,
+    n_ctx: u32,
+) error{OutOfMemory}!HttpError {
+    const message = try std.fmt.allocPrint(
+        arena,
+        "the request of {d} tokens exceeds the context of {d} tokens",
+        .{ n_prompt_tokens, n_ctx },
+    );
     return .{
         .status = 400,
         .type = "exceed_context_size_error",
@@ -285,7 +309,9 @@ pub fn exceedContextError(arena: Allocator, n_prompt_tokens: u32, n_ctx: u32) er
 
 /// The wire value of an HTTP error.
 pub fn errorObject(e: HttpError) types.ErrorObject {
-    const overflow = e.overflow orelse return .{ .@"error" = .{ .message = e.message, .type = e.type } };
+    const overflow = e.overflow orelse return .{
+        .@"error" = .{ .message = e.message, .type = e.type },
+    };
     return .{ .@"error" = .{
         .code = e.status,
         .message = e.message,
@@ -301,6 +327,7 @@ pub fn errorObject(e: HttpError) types.ErrorObject {
 pub fn reqErrorToHttp(e: ReqError, diag: Diag) HttpError {
     if (e == error.BadField) std.debug.assert(diag.field != null);
     if (e != error.BadField) std.debug.assert(diag.field == null);
+
     const message: []const u8 = switch (e) {
         error.BadJson => "malformed JSON body",
         error.BadField => bad_field_messages[@intFromEnum(diag.field.?)],
@@ -309,17 +336,35 @@ pub fn reqErrorToHttp(e: ReqError, diag: Diag) HttpError {
         error.NTooLarge => "only n=1 is supported",
         error.BadTemperature => "temperature must be a finite number of 0 or more",
         error.BadTopP => "top_p must be more than 0 and at most 1",
-        error.BadTopK => std.fmt.comptimePrint("top_k must be -1 or in the range 0 to {d}", .{limits.max_top_k}),
+        error.BadTopK => std.fmt.comptimePrint(
+            "top_k must be -1 or in the range 0 to {d}",
+            .{limits.max_top_k},
+        ),
         error.BadMinP => "min_p must be in the range 0 to 1",
-        error.BadPresencePenalty => std.fmt.comptimePrint("presence_penalty must be in the range -{d} to {d}", .{ limits.max_presence_penalty, limits.max_presence_penalty }),
-        error.BadRepetitionPenalty => std.fmt.comptimePrint("repetition_penalty must be more than 0 and at most {d}", .{limits.max_repetition_penalty}),
-        error.FrequencyUnsupported => protocol.frequency_unsupported_detail ++ ". The only accepted value is 0",
-        error.BadThinkingBudget => std.fmt.comptimePrint("thinking_token_budget must be -1, 0, or a count from 1 to {d}", .{limits.max_model_ctx}),
+        error.BadPresencePenalty => std.fmt.comptimePrint(
+            "presence_penalty must be in the range -{d} to {d}",
+            .{ limits.max_presence_penalty, limits.max_presence_penalty },
+        ),
+        error.BadRepetitionPenalty => std.fmt.comptimePrint(
+            "repetition_penalty must be more than 0 and at most {d}",
+            .{limits.max_repetition_penalty},
+        ),
+        error.FrequencyUnsupported => protocol.frequency_unsupported_detail ++
+            ". The only accepted value is 0",
+        error.BadThinkingBudget => std.fmt.comptimePrint(
+            "thinking_token_budget must be -1, 0, or a count from 1 to {d}",
+            .{limits.max_model_ctx},
+        ),
         error.ThinkingUnsupported => thinking_unsupported_message,
         error.BudgetUnsupported => budget_unsupported_message,
         error.BudgetNoForcedClose => budget_no_forced_close_message,
-        error.OutOfMemory => return .{ .status = 500, .type = "server_error", .message = "out of memory" },
+        error.OutOfMemory => return .{
+            .status = 500,
+            .type = "server_error",
+            .message = "out of memory",
+        },
     };
+
     return .{ .status = 400, .type = "invalid_request_error", .message = message };
 }
 
@@ -327,24 +372,41 @@ pub fn reqErrorToHttp(e: ReqError, diag: Diag) HttpError {
 /// vLLM rule, so it wins over `enable_thinking`. A model with no think tags
 /// accepts only the closed modes, the rule of the binary wire. A budget
 /// above 0 also needs the ids of a forced close, or the scheduler refuses it.
-pub fn resolveTurn(server_kind: chat.Kind, flag: chat.ThinkingFlag, budget: ThinkBudget, forced_close: bool) error{ ThinkingUnsupported, BudgetUnsupported, BudgetNoForcedClose }!TurnMode {
+pub fn resolveTurn(
+    server_kind: chat.Kind,
+    flag: chat.ThinkingFlag,
+    budget: ThinkBudget,
+    forced_close: bool,
+) error{ ThinkingUnsupported, BudgetUnsupported, BudgetNoForcedClose }!TurnMode {
     const tagged = chat.thinkText(server_kind) != null;
     const effective: chat.ThinkingFlag = if (budget == .off) .off else flag;
     const kind = try chat.resolveThinking(server_kind, effective);
     const think_budget: ?u32 = switch (budget) {
         .server, .off => null,
-        .tokens => |n| if (!tagged) return error.BudgetUnsupported else if (!forced_close) return error.BudgetNoForcedClose else n,
+        .tokens => |n| blk: {
+            if (!tagged) return error.BudgetUnsupported;
+            if (!forced_close) return error.BudgetNoForcedClose;
+            break :blk n;
+        },
     };
+
     if (budget == .off) std.debug.assert(!chat.thinkOpen(kind));
     if (think_budget) |n| std.debug.assert(n >= 1 and n <= limits.max_model_ctx);
+
     return .{ .kind = kind, .think_budget = think_budget };
 }
 
 /// The sampling of one request: each field the request sent, else the field
 /// of the default row. `seed` is the request seed or a fresh draw.
-pub fn resolveSampling(fields: SamplingFields, row: protocol.Sampling, seed: u64) protocol.Sampling {
+pub fn resolveSampling(
+    fields: SamplingFields,
+    row: protocol.Sampling,
+    seed: u64,
+) protocol.Sampling {
     std.debug.assert(row.frequency_penalty == 0);
+
     if (fields.seed) |s| std.debug.assert(s == seed);
+
     const out: protocol.Sampling = .{
         .temperature = fields.temperature orelse row.temperature,
         .top_k = fields.top_k orelse row.top_k,
@@ -359,7 +421,9 @@ pub fn resolveSampling(fields: SamplingFields, row: protocol.Sampling, seed: u64
     std.debug.assert(out.top_p > 0 and out.top_p <= 1);
     std.debug.assert(out.top_k <= limits.max_top_k);
     std.debug.assert(out.min_p >= 0 and out.min_p <= 1);
-    std.debug.assert(out.repetition_penalty > 0 and out.repetition_penalty <= limits.max_repetition_penalty);
+    std.debug.assert(
+        out.repetition_penalty > 0 and out.repetition_penalty <= limits.max_repetition_penalty,
+    );
     std.debug.assert(out.frequency_penalty == 0);
     return out;
 }
@@ -372,18 +436,88 @@ pub fn resolveSampling(fields: SamplingFields, row: protocol.Sampling, seed: u64
 /// OpenAI client works. It logs each ignored field name once per process.
 /// The `model` string passes through for the shell to check. A known field
 /// with a value of the wrong type is `error.BadField`, and `diag` names it.
-pub fn parseChatRequest(arena: Allocator, body: []const u8, default_max_tokens: u32, max_seq: u32, diag: *Diag) ReqError!Request {
+pub fn parseChatRequest(
+    arena: Allocator,
+    body: []const u8,
+    default_max_tokens: u32,
+    max_seq: u32,
+    diag: *Diag,
+) ReqError!Request {
     return parseChatRequestWith(&unknown_fields, arena, body, default_max_tokens, max_seq, diag);
 }
 
-fn parseChatRequestWith(seen: *UnknownFields, arena: Allocator, body: []const u8, default_max_tokens: u32, max_seq: u32, diag: *Diag) ReqError!Request {
+/// Length of the longest prefix of `bytes` that ends on a UTF-8 codepoint
+/// boundary. A streamed token can be a partial multi-byte sequence
+/// (byte-fallback tokens, emoji). A JSON string must be valid UTF-8, so the
+/// shell emits this prefix now and carries the remainder of at most three
+/// bytes into the next chunk.
+pub fn completeUtf8Len(bytes: []const u8) usize {
+    if (bytes.len == 0) return 0;
+
+    const max_back = @min(bytes.len, 4);
+    var back: usize = 1;
+    while (back <= max_back) : (back += 1) {
+        const b = bytes[bytes.len - back];
+        if (b & 0xC0 == 0x80) continue; // a continuation byte, so keep walking left
+
+        const seq_len = std.unicode.utf8ByteSequenceLength(
+            b,
+        ) catch return bytes.len; // invalid lead -> emit as-is
+        return if (back == seq_len) bytes.len else bytes.len - back;
+    }
+
+    return bytes.len; // no lead byte in the last 4 (malformed) -> emit as-is
+}
+
+// -- helpers ----------------------------------------------------------------
+
+fn reportUnknown(seen: *UnknownFields, name: []const u8) void {
+    switch (seen.note(name)) {
+        .seen => {},
+        .new => log.info(
+            "request field \"{f}\" is not supported, so the server ignores it",
+            .{unknownName(name)},
+        ),
+        .full => log.info(
+            "the table of ignored request field names is full, so later unknown names are " ++
+                "not logged",
+            .{},
+        ),
+    }
+}
+
+/// The client chooses the name, so the log prints its capped part with every
+/// control byte and quote escaped.
+fn unknownName(name: []const u8) std.fmt.Alt([]const u8, std.zig.stringEscape) {
+    return std.zig.fmtString(UnknownFields.capped(name));
+}
+
+fn parseChatRequestWith(
+    seen: *UnknownFields,
+    arena: Allocator,
+    body: []const u8,
+    default_max_tokens: u32,
+    max_seq: u32,
+    diag: *Diag,
+) ReqError!Request {
     diag.* = .{};
-    const tree = std.json.parseFromSliceLeaky(std.json.Value, arena, body, .{}) catch |err| switch (err) {
+    const tree = std.json.parseFromSliceLeaky(
+        std.json.Value,
+        arena,
+        body,
+        .{},
+    ) catch |err| switch (err) {
         error.OutOfMemory => return error.OutOfMemory,
         else => return error.BadJson,
     };
     if (tree != .object) return error.BadJson;
-    const req = std.json.parseFromValueLeaky(types.ChatRequest, arena, tree, json_options) catch |err| switch (err) {
+
+    const req = std.json.parseFromValueLeaky(
+        types.ChatRequest,
+        arena,
+        tree,
+        json_options,
+    ) catch |err| switch (err) {
         error.OutOfMemory => return error.OutOfMemory,
         else => {
             diag.field = try wrongTypedField(arena, tree.object) orelse return error.BadJson;
@@ -394,12 +528,18 @@ fn parseChatRequestWith(seen: *UnknownFields, arena: Allocator, body: []const u8
         const known = inline for (@typeInfo(types.ChatRequest).@"struct".fields) |f| {
             if (std.mem.eql(u8, key, f.name)) break true;
         } else false;
-        if (!known) reportUnknown(seen, key);
+
+        if (!known) {
+            reportUnknown(seen, key);
+        }
     }
 
     if (req.messages.len == 0) return error.NoMessages;
     if (req.messages.len > limits.openai_max_messages) return error.TooManyMessages;
-    if (req.n) |n| if (n > 1) return error.NTooLarge;
+
+    if (req.n) |n| {
+        if (n > 1) return error.NTooLarge;
+    }
 
     const msgs = try arena.alloc(chat.Message, req.messages.len);
     for (req.messages, msgs) |src, *dst| {
@@ -414,7 +554,10 @@ fn parseChatRequestWith(seen: *UnknownFields, arena: Allocator, body: []const u8
     std.debug.assert(max_tokens >= 1);
 
     const kwargs = req.chat_template_kwargs orelse types.ChatTemplateKwargs{};
-    const thinking: chat.ThinkingFlag = if (kwargs.enable_thinking) |on| (if (on) .on else .off) else .auto;
+    const thinking: chat.ThinkingFlag = if (kwargs.enable_thinking) |on|
+        (if (on) .on else .off)
+    else
+        .auto;
 
     return .{
         .model = req.model,
@@ -427,26 +570,6 @@ fn parseChatRequestWith(seen: *UnknownFields, arena: Allocator, body: []const u8
     };
 }
 
-/// Length of the longest prefix of `bytes` that ends on a UTF-8 codepoint
-/// boundary. A streamed token can be a partial multi-byte sequence
-/// (byte-fallback tokens, emoji). A JSON string must be valid UTF-8, so the
-/// shell emits this prefix now and carries the remainder of at most three
-/// bytes into the next chunk.
-pub fn completeUtf8Len(bytes: []const u8) usize {
-    if (bytes.len == 0) return 0;
-    const max_back = @min(bytes.len, 4);
-    var back: usize = 1;
-    while (back <= max_back) : (back += 1) {
-        const b = bytes[bytes.len - back];
-        if (b & 0xC0 == 0x80) continue; // a continuation byte, so keep walking left
-        const seq_len = std.unicode.utf8ByteSequenceLength(b) catch return bytes.len; // invalid lead -> emit as-is
-        return if (back == seq_len) bytes.len else bytes.len - back;
-    }
-    return bytes.len; // no lead byte in the last 4 (malformed) -> emit as-is
-}
-
-// -- helpers ----------------------------------------------------------------
-
 const json_options: std.json.ParseOptions = .{ .ignore_unknown_fields = true };
 
 /// The first known field whose value does not parse as its own type, or null
@@ -455,12 +578,18 @@ const json_options: std.json.ParseOptions = .{ .ignore_unknown_fields = true };
 fn wrongTypedField(arena: Allocator, object: std.json.ObjectMap) error{OutOfMemory}!?ChatField {
     inline for (@typeInfo(types.ChatRequest).@"struct".fields) |f| {
         if (object.get(f.name)) |value| {
-            _ = std.json.parseFromValueLeaky(f.type, arena, value, json_options) catch |err| switch (err) {
+            _ = std.json.parseFromValueLeaky(
+                f.type,
+                arena,
+                value,
+                json_options,
+            ) catch |err| switch (err) {
                 error.OutOfMemory => return error.OutOfMemory,
                 else => return @field(ChatField, f.name),
             };
         }
     }
+
     return null;
 }
 
@@ -473,30 +602,39 @@ fn parseSampling(req: types.ChatRequest) ReqError!SamplingFields {
         if (!(std.math.isFinite(t) and t >= 0)) return error.BadTemperature;
         out.temperature = t;
     }
+
     if (req.top_p) |p| {
         if (!(p > 0 and p <= 1)) return error.BadTopP;
         out.top_p = p;
     }
+
     if (req.top_k) |k| {
         // -1 is the vLLM value for no top_k cut, the same as 0 here.
         if (!(k >= -1 and k <= limits.max_top_k)) return error.BadTopK;
         out.top_k = if (k == -1) 0 else @intCast(k);
     }
+
     if (req.min_p) |m| {
         if (!(m >= 0 and m <= 1)) return error.BadMinP;
         out.min_p = m;
     }
+
     if (req.presence_penalty) |pp| {
         if (!(@abs(pp) <= limits.max_presence_penalty)) return error.BadPresencePenalty;
         out.presence_penalty = pp;
     }
+
     if (req.repetition_penalty) |r| {
         if (!(r > 0 and r <= limits.max_repetition_penalty)) return error.BadRepetitionPenalty;
         out.repetition_penalty = r;
     }
+
     // The engine has no frequency penalty. The refusal tells the client that
     // the server did not apply the value.
-    if (req.frequency_penalty) |f| if (f != 0) return error.FrequencyUnsupported;
+    if (req.frequency_penalty) |f| {
+        if (f != 0) return error.FrequencyUnsupported;
+    }
+
     return out;
 }
 
@@ -505,6 +643,7 @@ fn parseThinkBudget(raw: ?i64) ReqError!ThinkBudget {
     if (n == -1) return .server;
     if (n == 0) return .off;
     if (!(n >= 1 and n <= limits.max_model_ctx)) return error.BadThinkingBudget;
+
     return .{ .tokens = @intCast(n) };
 }
 
@@ -548,21 +687,55 @@ fn withExtra(comptime extra: []const u8) []const u8 {
 fn checkParse(c: ParseCase) !void {
     var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena_state.deinit();
+
     var diag: Diag = .{};
-    const got = parseChatRequest(arena_state.allocator(), c.body, c.default_max_tokens, c.window, &diag);
+    const got = parseChatRequest(
+        arena_state.allocator(),
+        c.body,
+        c.default_max_tokens,
+        c.window,
+        &diag,
+    );
     try std.testing.expectEqual(c.want.field, diag.field);
     if (c.want.err) |err| return std.testing.expectError(err, got);
+
     const r = try got;
     const w = c.want;
-    if (w.model) |v| try std.testing.expectEqualStrings(v, r.model);
-    if (w.messages) |v| try std.testing.expectEqual(v, r.messages.len);
-    if (w.first_role) |v| try std.testing.expectEqual(v, r.messages[0].role);
-    if (w.first_content) |v| try std.testing.expectEqualStrings(v, r.messages[0].content);
-    if (w.stream) |v| try std.testing.expectEqual(v, r.stream);
-    if (w.max_tokens) |v| try std.testing.expectEqual(v, r.max_tokens);
-    if (w.sampling) |v| try std.testing.expectEqual(v, r.sampling);
-    if (w.think_budget) |v| try std.testing.expectEqual(v, r.think_budget);
-    if (w.thinking) |v| try std.testing.expectEqual(v, r.thinking);
+    if (w.model) |v| {
+        try std.testing.expectEqualStrings(v, r.model);
+    }
+
+    if (w.messages) |v| {
+        try std.testing.expectEqual(v, r.messages.len);
+    }
+
+    if (w.first_role) |v| {
+        try std.testing.expectEqual(v, r.messages[0].role);
+    }
+
+    if (w.first_content) |v| {
+        try std.testing.expectEqualStrings(v, r.messages[0].content);
+    }
+
+    if (w.stream) |v| {
+        try std.testing.expectEqual(v, r.stream);
+    }
+
+    if (w.max_tokens) |v| {
+        try std.testing.expectEqual(v, r.max_tokens);
+    }
+
+    if (w.sampling) |v| {
+        try std.testing.expectEqual(v, r.sampling);
+    }
+
+    if (w.think_budget) |v| {
+        try std.testing.expectEqual(v, r.think_budget);
+    }
+
+    if (w.thinking) |v| {
+        try std.testing.expectEqual(v, r.thinking);
+    }
 }
 
 fn budgetField(comptime n: u32) []const u8 {
@@ -572,6 +745,7 @@ fn budgetField(comptime n: u32) []const u8 {
 test "parseChatRequest: unknown fields parse and each name is recorded once" {
     var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena_state.deinit();
+
     var seen: UnknownFields = .{};
     const body = withExtra(",\"reasoning_effort\":\"low\",\"tools\":[]");
     for (0..2) |_| {
@@ -579,6 +753,7 @@ test "parseChatRequest: unknown fields parse and each name is recorded once" {
         const req = try parseChatRequestWith(&seen, arena_state.allocator(), body, 64, 512, &diag);
         try std.testing.expectEqual(@as(usize, 1), req.messages.len);
     }
+
     try std.testing.expectEqual(@as(u32, 2), seen.count);
     try std.testing.expectEqual(UnknownFields.Verdict.seen, seen.note("reasoning_effort"));
     try std.testing.expectEqual(UnknownFields.Verdict.seen, seen.note("tools"));
@@ -592,6 +767,7 @@ test "UnknownFields: a full table reports once, then stays quiet" {
         const name = std.fmt.bufPrint(&buf, "f{d}", .{i}) catch unreachable;
         try std.testing.expectEqual(UnknownFields.Verdict.new, seen.note(name));
     }
+
     try std.testing.expectEqual(UnknownFields.Verdict.full, seen.note("extra"));
     try std.testing.expectEqual(UnknownFields.Verdict.seen, seen.note("extra2"));
     try std.testing.expectEqual(UnknownFields.Verdict.seen, seen.note("f0"));
@@ -599,16 +775,29 @@ test "UnknownFields: a full table reports once, then stays quiet" {
 
 test "unknownName: the log prints the capped name with no raw control byte" {
     var long: [3 * UnknownFields.name_cap]u8 = undefined;
-    for (&long, 0..) |*b, i| b.* = @intCast(i % 256);
+    for (&long, 0..) |*b, i| {
+        b.* = @intCast(i % 256);
+    }
+
     const names = [_][]const u8{ "tools", "a\"b\\c", "line\nbreak\x1b[31m", "\xff\x00", &long };
     var buf: [4 * UnknownFields.name_cap]u8 = undefined;
     for (names) |name| {
         const shown = try std.fmt.bufPrint(&buf, "{f}", .{unknownName(name)});
-        for (shown) |b| try std.testing.expect(b >= 0x20 and b < 0x7f);
+        for (shown) |b| {
+            try std.testing.expect(b >= 0x20 and b < 0x7f);
+        }
+
         try std.testing.expect(shown.len <= 4 * UnknownFields.name_cap);
     }
-    try std.testing.expectEqualStrings("tools", try std.fmt.bufPrint(&buf, "{f}", .{unknownName("tools")}));
-    try std.testing.expectEqualStrings("line\\nbreak\\x1b[31m", try std.fmt.bufPrint(&buf, "{f}", .{unknownName("line\nbreak\x1b[31m")}));
+
+    try std.testing.expectEqualStrings(
+        "tools",
+        try std.fmt.bufPrint(&buf, "{f}", .{unknownName("tools")}),
+    );
+    try std.testing.expectEqualStrings(
+        "line\\nbreak\\x1b[31m",
+        try std.fmt.bufPrint(&buf, "{f}", .{unknownName("line\nbreak\x1b[31m")}),
+    );
 }
 
 test "parseChatRequest: each field maps to its value, and a value past its edge is refused" {
@@ -618,12 +807,26 @@ test "parseChatRequest: each field maps to its value, and a value past its edge 
         .{
             .body = "{\"model\":\"m\",\"messages\":[{\"role\":\"user\",\"content\":\"hi\"}],\"frequency_penalty\":0,\"tools\":[],\"stop\":[\"x\"]}",
             .default_max_tokens = 128,
-            .want = .{ .model = "m", .messages = 1, .first_role = .user, .first_content = "hi", .sampling = .{}, .think_budget = .server, .max_tokens = 128, .stream = false },
+            .want = .{
+                .model = "m",
+                .messages = 1,
+                .first_role = .user,
+                .first_content = "hi",
+                .sampling = .{},
+                .think_budget = .server,
+                .max_tokens = 128,
+                .stream = false,
+            },
         },
         .{
             .body = "{\"messages\":[{\"role\":\"system\",\"content\":\"s\"},{\"role\":\"user\",\"content\":\"u\"}],\"stream\":true,\"temperature\":0.7,\"max_tokens\":99999}",
             .default_max_tokens = 128,
-            .want = .{ .messages = 2, .stream = true, .sampling = .{ .temperature = 0.7 }, .max_tokens = 512 },
+            .want = .{
+                .messages = 2,
+                .stream = true,
+                .sampling = .{ .temperature = 0.7 },
+                .max_tokens = 512,
+            },
         },
         .{ .body = "{not json", .want = .{ .err = error.BadJson } },
         .{ .body = "{\"messages\":[]}", .want = .{ .err = error.NoMessages } },
@@ -698,6 +901,7 @@ test "parseChatRequest: each field maps to its value, and a value past its edge 
     };
     for (cases, 0..) |c, i| {
         errdefer std.debug.print("parse case {d}: {s}\n", .{ i, c.body });
+
         try checkParse(c);
     }
 }
@@ -718,7 +922,10 @@ test "reqErrorToHttp: every field refusal is a 400 that names the field and its 
     };
     const bad_top_k = reqErrorToHttp(error.BadField, .{ .field = .top_k });
     try std.testing.expectEqual(@as(u16, 400), bad_top_k.status);
-    try std.testing.expectEqualStrings("'top_k' has a value of the wrong JSON type", bad_top_k.message);
+    try std.testing.expectEqualStrings(
+        "'top_k' has a value of the wrong JSON type",
+        bad_top_k.message,
+    );
     for (cases) |c| {
         const h = reqErrorToHttp(c.e, .{});
         try std.testing.expectEqual(@as(u16, 400), h.status);
@@ -727,19 +934,62 @@ test "reqErrorToHttp: every field refusal is a 400 that names the field and its 
     }
 }
 
-const test_card_think: protocol.Sampling = .{ .temperature = 0.6, .top_k = 20, .top_p = 0.95, .seed = 0, .presence_penalty = 1.5 };
-const test_card_plain: protocol.Sampling = .{ .temperature = 0.7, .top_k = 20, .top_p = 0.8, .seed = 0, .min_p = 0.05, .repetition_penalty = 1.1 };
+const test_card_think: protocol.Sampling = .{
+    .temperature = 0.6,
+    .top_k = 20,
+    .top_p = 0.95,
+    .seed = 0,
+    .presence_penalty = 1.5,
+};
+const test_card_plain: protocol.Sampling = .{
+    .temperature = 0.7,
+    .top_k = 20,
+    .top_p = 0.8,
+    .seed = 0,
+    .min_p = 0.05,
+    .repetition_penalty = 1.1,
+};
 
 test "resolveSampling: an omitted field takes the row of the resolved mode, a sent field wins" {
     const rows: DefaultRows = .init(.model, test_card_think, test_card_plain);
     const think = resolveSampling(.{}, rows.row(true), 9);
-    try std.testing.expectEqual(protocol.Sampling{ .temperature = 0.6, .top_k = 20, .top_p = 0.95, .seed = 9, .presence_penalty = 1.5 }, think);
+    try std.testing.expectEqual(
+        protocol.Sampling{
+            .temperature = 0.6,
+            .top_k = 20,
+            .top_p = 0.95,
+            .seed = 9,
+            .presence_penalty = 1.5,
+        },
+        think,
+    );
     const plain = resolveSampling(.{}, rows.row(false), 9);
-    try std.testing.expectEqual(protocol.Sampling{ .temperature = 0.7, .top_k = 20, .top_p = 0.8, .seed = 9, .min_p = 0.05, .repetition_penalty = 1.1 }, plain);
+    try std.testing.expectEqual(
+        protocol.Sampling{
+            .temperature = 0.7,
+            .top_k = 20,
+            .top_p = 0.8,
+            .seed = 9,
+            .min_p = 0.05,
+            .repetition_penalty = 1.1,
+        },
+        plain,
+    );
 
     // Each sent field beats its card field, and only that field moves.
-    const sent: SamplingFields = .{ .temperature = 0, .top_k = 0, .top_p = 1, .min_p = 0, .presence_penalty = 0, .repetition_penalty = 1, .seed = 5 };
-    try std.testing.expectEqual(protocol.Sampling{ .temperature = 0, .top_k = 0, .top_p = 1, .seed = 5 }, resolveSampling(sent, rows.row(true), 5));
+    const sent: SamplingFields = .{
+        .temperature = 0,
+        .top_k = 0,
+        .top_p = 1,
+        .min_p = 0,
+        .presence_penalty = 0,
+        .repetition_penalty = 1,
+        .seed = 5,
+    };
+    try std.testing.expectEqual(
+        protocol.Sampling{ .temperature = 0, .top_k = 0, .top_p = 1, .seed = 5 },
+        resolveSampling(sent, rows.row(true), 5),
+    );
     const one = resolveSampling(.{ .min_p = 0.2 }, rows.row(true), 3);
     try std.testing.expectEqual(@as(f32, 0.2), one.min_p);
     try std.testing.expectEqual(@as(f32, 0.6), one.temperature);
@@ -750,13 +1000,20 @@ test "resolveSampling: greedy defaults keep every omitted field at the greedy id
     const rows: DefaultRows = .init(.greedy, test_card_think, test_card_plain);
     for ([_]bool{ true, false }) |open| {
         const s = resolveSampling(.{}, rows.row(open), 11);
-        try std.testing.expectEqual(protocol.Sampling{ .temperature = 0, .top_k = 0, .top_p = 1, .seed = 11 }, s);
+        try std.testing.expectEqual(
+            protocol.Sampling{ .temperature = 0, .top_k = 0, .top_p = 1, .seed = 11 },
+            s,
+        );
     }
+
     // A model with no card has the greedy rows under `model` too.
     const no_card: DefaultRows = .init(.model, protocol.Sampling.greedy, protocol.Sampling.greedy);
     try std.testing.expectEqual(DefaultRows.greedy, no_card);
     // A sent field still wins under the greedy defaults.
-    try std.testing.expectEqual(@as(f32, 0.9), resolveSampling(.{ .temperature = 0.9 }, rows.row(false), 1).temperature);
+    try std.testing.expectEqual(
+        @as(f32, 0.9),
+        resolveSampling(.{ .temperature = 0.9 }, rows.row(false), 1).temperature,
+    );
     try std.testing.expectEqual(SamplingDefaults.greedy, SamplingDefaults.parse("greedy").?);
     try std.testing.expectEqual(SamplingDefaults.model, SamplingDefaults.parse("model").?);
     try std.testing.expect(SamplingDefaults.parse("card") == null);
@@ -772,6 +1029,7 @@ test "resolveTurn: the budget picks the mode, and a tagless model accepts only t
         try std.testing.expect(!chat.thinkOpen(t.kind));
         try std.testing.expectEqual(@as(?u32, null), t.think_budget);
     }
+
     const server = try resolveTurn(qwen_on, .auto, .server, true);
     try std.testing.expect(chat.thinkOpen(server.kind));
     try std.testing.expectEqual(@as(?u32, null), server.think_budget);
@@ -783,18 +1041,27 @@ test "resolveTurn: the budget picks the mode, and a tagless model accepts only t
     try std.testing.expect(!chat.thinkOpen(closed.kind));
 
     const smol: chat.Kind = .chatml_smollm2;
-    try std.testing.expectError(error.BudgetUnsupported, resolveTurn(smol, .auto, .{ .tokens = 1 }, true));
+    try std.testing.expectError(
+        error.BudgetUnsupported,
+        resolveTurn(smol, .auto, .{ .tokens = 1 }, true),
+    );
     try std.testing.expectError(error.ThinkingUnsupported, resolveTurn(smol, .on, .server, true));
     for ([_]ThinkBudget{ .server, .off }) |b| {
         const t = try resolveTurn(smol, .auto, b, true);
         try std.testing.expectEqual(smol, t.kind);
         try std.testing.expectEqual(@as(?u32, null), t.think_budget);
     }
+
     // Budget 0 turns enable_thinking true into off, so it passes on a tagless model.
     _ = try resolveTurn(smol, .on, .off, true);
     // A tagged model with no forced close refuses a budget above 0 and keeps the rest.
-    try std.testing.expectError(error.BudgetNoForcedClose, resolveTurn(qwen_on, .auto, .{ .tokens = 8 }, false));
-    for ([_]ThinkBudget{ .server, .off }) |b| _ = try resolveTurn(qwen_on, .auto, b, false);
+    try std.testing.expectError(
+        error.BudgetNoForcedClose,
+        resolveTurn(qwen_on, .auto, .{ .tokens = 8 }, false),
+    );
+    for ([_]ThinkBudget{ .server, .off }) |b| {
+        _ = try resolveTurn(qwen_on, .auto, b, false);
+    }
 }
 
 test "resolveDefaultMaxTokens: zero is the window, a flag past the window is the window" {
@@ -807,6 +1074,7 @@ test "resolveDefaultMaxTokens: zero is the window, a flag past the window is the
         const want = if (flag == 0 or flag > window) window else flag;
         try std.testing.expectEqual(want, resolved);
     }
+
     try std.testing.expectEqual(window, resolveDefaultMaxTokens(std.math.maxInt(u32), window));
     try std.testing.expectEqual(@as(u32, 1), resolveDefaultMaxTokens(0, 1));
 }
@@ -814,25 +1082,36 @@ test "resolveDefaultMaxTokens: zero is the window, a flag past the window is the
 test "parseChatRequest: an omitted budget under the default flag is the whole window" {
     var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena_state.deinit();
+
     const arena = arena_state.allocator();
 
     const window: u32 = 512;
     const default_max_tokens = resolveDefaultMaxTokens(limits.openai_default_max_tokens, window);
     try std.testing.expectEqual(window, default_max_tokens);
     var diag: Diag = .{};
-    const r = try parseChatRequest(arena, "{\"messages\":[{\"role\":\"user\",\"content\":\"x\"}]}", default_max_tokens, window, &diag);
+    const r = try parseChatRequest(
+        arena,
+        "{\"messages\":[{\"role\":\"user\",\"content\":\"x\"}]}",
+        default_max_tokens,
+        window,
+        &diag,
+    );
     try std.testing.expectEqual(window, r.max_tokens);
 }
 
 test "exceedContextError: the overflow carries both numbers, other errors carry none" {
     var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena_state.deinit();
+
     const arena = arena_state.allocator();
 
     const e = try exceedContextError(arena, 130, 128);
     try std.testing.expectEqual(@as(u16, 400), e.status);
     try std.testing.expectEqualStrings("exceed_context_size_error", e.type);
-    try std.testing.expectEqualStrings("the request of 130 tokens exceeds the context of 128 tokens", e.message);
+    try std.testing.expectEqualStrings(
+        "the request of 130 tokens exceeds the context of 128 tokens",
+        e.message,
+    );
     const wire = errorObject(e).@"error";
     try std.testing.expectEqual(@as(?u16, 400), wire.code);
     try std.testing.expectEqual(@as(?u32, 130), wire.n_prompt_tokens);
@@ -858,12 +1137,16 @@ test "completeUtf8Len: holds a split codepoint, passes a whole one" {
 }
 
 test "reqErrorToHttp: thinking on a model without a thinking mode is a 400 in one sentence" {
-    try std.testing.expectError(error.ThinkingUnsupported, chat.resolveThinking(.chatml_smollm2, .on));
+    try std.testing.expectError(
+        error.ThinkingUnsupported,
+        chat.resolveThinking(.chatml_smollm2, .on),
+    );
     const e = reqErrorToHttp(error.ThinkingUnsupported, .{});
     try std.testing.expectEqual(@as(u16, 400), e.status);
     try std.testing.expectEqualStrings("invalid_request_error", e.type);
     try std.testing.expectEqualStrings(
-        "enable_thinking true does not apply to this model, because its chat template has no thinking mode",
+        "enable_thinking true does not apply to this model, because its chat template has " ++
+            "no thinking mode",
         e.message,
     );
 }
@@ -874,7 +1157,12 @@ const TestEvent = struct { id: u32, text: []const u8 };
 
 const TestSplit = struct { reasoning: []const u8, content: []const u8 };
 
-fn splitAll(arena: Allocator, tags: ?chat.ThinkIds, open: bool, events: []const TestEvent) !TestSplit {
+fn splitAll(
+    arena: Allocator,
+    tags: ?chat.ThinkIds,
+    open: bool,
+    events: []const TestEvent,
+) !TestSplit {
     var split: ReasoningSplit = .init(tags, open);
     var reasoning: std.ArrayList(u8) = .empty;
     var content: std.ArrayList(u8) = .empty;
@@ -885,12 +1173,14 @@ fn splitAll(arena: Allocator, tags: ?chat.ThinkIds, open: bool, events: []const 
             .content => try content.appendSlice(arena, routed.text),
         }
     }
+
     return .{ .reasoning = reasoning.items, .content = content.items };
 }
 
 test "ReasoningSplit: a turn that opens in the block splits at the natural close" {
     var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena_state.deinit();
+
     const events = [_]TestEvent{
         .{ .id = 1, .text = "<think>" },
         .{ .id = 10, .text = "Let me" },
@@ -908,6 +1198,7 @@ test "ReasoningSplit: a turn that opens in the block splits at the natural close
 test "ReasoningSplit: a turn that opens closed keeps every piece as content" {
     var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena_state.deinit();
+
     // A close outside the block is reply text, and no newline drops after it.
     const events = [_]TestEvent{
         .{ .id = 10, .text = "Hi" },
@@ -923,6 +1214,7 @@ test "ReasoningSplit: a turn that opens closed keeps every piece as content" {
 test "ReasoningSplit: a block with no close before the finish is all reasoning" {
     var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena_state.deinit();
+
     const events = [_]TestEvent{
         .{ .id = 1, .text = "<think>" },
         .{ .id = 10, .text = "a" },
@@ -937,6 +1229,7 @@ test "ReasoningSplit: a block with no close before the finish is all reasoning" 
 test "ReasoningSplit: the newlines after the close drop across events" {
     var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena_state.deinit();
+
     const arena = arena_state.allocator();
     const spread = [_]TestEvent{
         .{ .id = 1, .text = "<think>" },
@@ -965,6 +1258,7 @@ test "ReasoningSplit: the newlines after the close drop across events" {
 test "ReasoningSplit: a model with no think tags passes every piece through" {
     var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena_state.deinit();
+
     const events = [_]TestEvent{
         .{ .id = 1, .text = "<think>" },
         .{ .id = 10, .text = "a" },
@@ -981,6 +1275,7 @@ fn checkReasoningSplit(_: void, seed: u64) anyerror!void {
     const run_max = 12;
     var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena_state.deinit();
+
     var prng = std.Random.DefaultPrng.init(seed);
     const r = prng.random();
     const arena = arena_state.allocator();
@@ -1001,7 +1296,11 @@ fn checkReasoningSplit(_: void, seed: u64) anyerror!void {
             try untagged.appendSlice(arena, pieces[k]);
         }
     }
-    if (closes) try events.append(arena, .{ .id = test_tags.close, .text = "</think>" });
+
+    if (closes) {
+        try events.append(arena, .{ .id = test_tags.close, .text = "</think>" });
+    }
+
     if (!open or closes) {
         for (0..r.uintLessThan(usize, run_max + 1)) |_| {
             const k = r.uintLessThan(usize, pieces.len);
@@ -1010,6 +1309,7 @@ fn checkReasoningSplit(_: void, seed: u64) anyerror!void {
             try untagged.appendSlice(arena, pieces[k]);
         }
     }
+
     const want_content = if (closes) std.mem.trimStart(u8, tail.items, "\n") else tail.items;
     const dropped = tail.items.len - want_content.len;
 
@@ -1017,14 +1317,27 @@ fn checkReasoningSplit(_: void, seed: u64) anyerror!void {
     try std.testing.expectEqualStrings(want_reasoning.items, got.reasoning);
     try std.testing.expectEqualStrings(want_content, got.content);
     const at = got.reasoning.len;
-    for (untagged.items[at..][0..dropped]) |b| try std.testing.expectEqual(@as(u8, '\n'), b);
+    for (untagged.items[at..][0..dropped]) |b| {
+        try std.testing.expectEqual(@as(u8, '\n'), b);
+    }
+
     const joined = try std.mem.concat(arena, u8, &.{ got.reasoning, got.content });
-    const kept = try std.mem.concat(arena, u8, &.{ untagged.items[0..at], untagged.items[at + dropped ..] });
+    const kept = try std.mem.concat(
+        arena,
+        u8,
+        &.{ untagged.items[0..at], untagged.items[at + dropped ..] },
+    );
     try std.testing.expectEqualStrings(kept, joined);
 }
 
 test "ReasoningSplit property: reasoning then content is the stream without the tags and the dropped newlines" {
-    try prop.forAll(.{ .site = 0x5E1D_7A65, .cases = 2000 }, {}, u64, prop.genSeed(void), checkReasoningSplit);
+    try prop.forAll(
+        .{ .site = 0x5E1D_7A65, .cases = 2000 },
+        {},
+        u64,
+        prop.genSeed(void),
+        checkReasoningSplit,
+    );
 }
 
 /// The name that the message of each field refusal carries.
@@ -1041,7 +1354,10 @@ fn refusedField(e: ReqError, diag: Diag) []const u8 {
         error.BadPresencePenalty => "presence_penalty",
         error.BadRepetitionPenalty => "repetition_penalty",
         error.FrequencyUnsupported => "frequency_penalty",
-        error.BadThinkingBudget, error.BudgetUnsupported, error.BudgetNoForcedClose => "thinking_token_budget",
+        error.BadThinkingBudget,
+        error.BudgetUnsupported,
+        error.BudgetNoForcedClose,
+        => "thinking_token_budget",
         error.ThinkingUnsupported => "enable_thinking",
         error.OutOfMemory => unreachable,
     };
@@ -1108,6 +1424,7 @@ fn checkChatMutation(_: void, seed: u64) anyerror!void {
     const r = prng.random();
     var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena_state.deinit();
+
     const arena = arena_state.allocator();
 
     var body: std.ArrayList(u8) = .empty;
@@ -1123,14 +1440,21 @@ fn checkChatMutation(_: void, seed: u64) anyerror!void {
             },
             else => field.valid,
         };
-        if (!first) try body.append(arena, ',');
+
+        if (!first) {
+            try body.append(arena, ',');
+        }
+
         first = false;
         try body.print(arena, "\"{s}\":{s}", .{ field.name, value });
     }
+
     try body.append(arena, '}');
     const raw = r.uintLessThan(u8, 4) == 0;
     if (raw) {
-        for (0..1 + r.uintLessThan(usize, 4)) |_| body.items[r.uintLessThan(usize, body.items.len)] = r.int(u8);
+        for (0..1 + r.uintLessThan(usize, 4)) |_| {
+            body.items[r.uintLessThan(usize, body.items.len)] = r.int(u8);
+        }
     }
 
     const window = 1 + r.uintLessThan(u32, 4096);
@@ -1142,34 +1466,62 @@ fn checkChatMutation(_: void, seed: u64) anyerror!void {
         try std.testing.expect(std.mem.indexOf(u8, http.message, refusedField(err, diag)) != null);
         // A body with whole JSON syntax is never malformed JSON, and a wrong
         // type refusal names a field that took an edge value.
-        if (!raw) try std.testing.expect(err != error.BadJson);
+        if (!raw) {
+            try std.testing.expect(err != error.BadJson);
+        }
+
         if (!raw and err == error.BadField) {
             const name = @tagName(diag.field.?);
             const at = for (body_fields, 0..) |field, i| {
                 if (std.mem.eql(u8, field.name, name)) break i;
             } else return error.TestUnexpectedResult;
+
             try std.testing.expect(edged.isSet(at));
         }
+
         return;
     };
     try std.testing.expect(req.messages.len >= 1);
     try std.testing.expect(req.max_tokens >= 1 and req.max_tokens <= window);
-    const kinds = [_]chat.Kind{ .none, .chatml_smollm2, .llama3, .{ .chatml_qwen = .off }, .{ .chatml_qwen = .on } };
+    const kinds = [_]chat.Kind{
+        .none,
+        .chatml_smollm2,
+        .llama3,
+        .{ .chatml_qwen = .off },
+        .{ .chatml_qwen = .on },
+    };
     for (kinds) |kind| {
         for ([_]bool{ false, true }) |forced_close| {
-            const turn = resolveTurn(kind, req.thinking, req.think_budget, forced_close) catch |err| {
+            const turn = resolveTurn(
+                kind,
+                req.thinking,
+                req.think_budget,
+                forced_close,
+            ) catch |err| {
                 const http = reqErrorToHttp(err, .{});
                 try std.testing.expectEqual(@as(u16, 400), http.status);
-                try std.testing.expect(std.mem.indexOf(u8, http.message, refusedField(err, .{})) != null);
+                try std.testing.expect(
+                    std.mem.indexOf(u8, http.message, refusedField(err, .{})) != null,
+                );
                 continue;
             };
             const rows = DefaultRows.init(.model, test_card_think, test_card_plain);
             // The resolver asserts every range that the wire guards hold.
-            _ = resolveSampling(req.sampling, rows.row(chat.thinkOpen(turn.kind)), req.sampling.seed orelse 0);
+            _ = resolveSampling(
+                req.sampling,
+                rows.row(chat.thinkOpen(turn.kind)),
+                req.sampling.seed orelse 0,
+            );
         }
     }
 }
 
 test "property: a mutated chat body is a 400 that names its field, or a request every resolver accepts" {
-    try prop.forAll(.{ .site = 0x0A1_B0D1, .cases = 1500 }, {}, u64, prop.genSeed(void), checkChatMutation);
+    try prop.forAll(
+        .{ .site = 0x0A1_B0D1, .cases = 1500 },
+        {},
+        u64,
+        prop.genSeed(void),
+        checkChatMutation,
+    );
 }

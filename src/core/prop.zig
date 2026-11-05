@@ -20,6 +20,13 @@ pub const Options = struct {
     max_size: u32 = 64,
 };
 
+/// A case that knows its number, for a property that alternates its shape by
+/// parity. The number is the size, so the options must set `max_size` to
+/// `cases - 1`.
+pub const Trial = struct { index: u32, seed: u64 };
+
+const Failure = struct { index: u32, size: u32, err: anyerror };
+
 // -- api --------------------------------------------------------------------
 
 /// Check `check(context, gen(context, random, size))` for every case. The first
@@ -35,7 +42,8 @@ pub fn forAll(
     const failure = firstFailure(opts, context, Case, gen, check) orelse return;
     const seed = std.testing.random_seed;
     std.debug.print(
-        "prop: case {d} size {d} returned {s} (seed 0x{x}, site 0x{x}). Rerun: zig build test --seed 0x{x}\n",
+        "prop: case {d} size {d} returned {s} (seed 0x{x}, site 0x{x}). Rerun: zig build " ++
+            "test --seed 0x{x}\n",
         .{ failure.index, failure.size, @errorName(failure.err), seed, opts.site, seed },
     );
     return failure.err;
@@ -52,11 +60,6 @@ pub fn genSeed(comptime Context: type) fn (Context, std.Random, u32) u64 {
     }.gen;
 }
 
-/// A case that knows its number, for a property that alternates its shape by
-/// parity. The number is the size, so the options must set `max_size` to
-/// `cases - 1`.
-pub const Trial = struct { index: u32, seed: u64 };
-
 pub fn genTrial(comptime Context: type) fn (Context, std.Random, u32) Trial {
     return struct {
         fn gen(_: Context, random: std.Random, size: u32) Trial {
@@ -66,8 +69,6 @@ pub fn genTrial(comptime Context: type) fn (Context, std.Random, u32) Trial {
 }
 
 // -- helpers ----------------------------------------------------------------
-
-const Failure = struct { index: u32, size: u32, err: anyerror };
 
 // The self-tests call this directly, because a test binary that writes to
 // stderr makes the build runner print the command as failed.
@@ -79,6 +80,7 @@ fn firstFailure(
     comptime check: fn (@TypeOf(context), Case) anyerror!void,
 ) ?Failure {
     assert(opts.cases > 0);
+
     const seed = std.testing.random_seed;
     var i: u32 = 0;
     while (i < opts.cases) : (i += 1) {
@@ -88,6 +90,7 @@ fn firstFailure(
         const case = gen(context, prng.random(), size);
         check(context, case) catch |err| return .{ .index = i, .size = size, .err = err };
     }
+
     return null;
 }
 
@@ -113,6 +116,7 @@ const Recorder = struct {
 
     fn gen(r: *Recorder, random: std.Random, size: u32) u32 {
         assert(r.generated < capacity);
+
         r.sizes[r.generated] = size;
         r.draws[r.generated] = random.int(u64);
         r.generated += 1;
@@ -123,6 +127,7 @@ const Recorder = struct {
         r.checked += 1;
         if (size >= r.fail_from) {
             assert(r.failed_at == null);
+
             r.failed_at = r.checked - 1;
             return error.PropertyFalse;
         }

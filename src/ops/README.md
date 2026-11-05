@@ -11,7 +11,7 @@ branches on no backend.
 
 | File | Role |
 | --- | --- |
-| `naive.zig` | The scalar f32 reference and the in-repository oracle. It holds the full op set a forward pass needs. The set has embed lookup, RMSNorm, SwiGLU, residual add, and RoPE in both styles. It has decode attention over either KV element type: the part kernel, the ordered merge of the parts, and the serial row. It also has the Q8_0, Q4_0, Q4_1, and Q6_K dequant and linear kernels. |
+| `naive.zig` | The scalar f32 reference that every other backend must match. It holds the full op set a forward pass needs. The set has embed lookup, RMSNorm, SwiGLU, residual add, and RoPE in both styles. It has decode attention over either KV element type: the part kernel, the ordered merge of the parts, and the serial row. It also has the Q8_0, Q4_0, Q4_1, and Q6_K dequant and linear kernels. |
 | `simd.zig` | The `@Vector(8)` AVX2 and FMA variant. It overrides `linearF32` and `linearF32Q80` and their `Batch` forms, takes attention from `attention_simd.zig`, and re-exports every other op from `naive`. Width 8 matches the 256-bit register, and Zig lowers it to a NEON 4 plus 4 pair. |
 | `simd_pf.zig` | A register-blocked f32 against Q8_0 microkernel with software prefetch, four output rows per inner block. It overrides `linearF32Q80` and `linearF32Q80Batch`, takes the prefetching attention kernels from `attention_simd.zig`, and re-exports the rest. It is the automatic default on a target with AVX2 and FMA. |
 | `attention_simd.zig` | The vector part kernel of decode attention for both SIMD variants: `@Vector(8)` dot products with 8 register chains, F16C widening of f16 KV rows, a fixed lane tree, and the value sums in registers. It keeps the tiles, the fold, and the record layout of the naive part kernel. One head gets the same bits at any head block, thread count, or prefetch. A head width off the lane grid runs the naive kernel. Its tests and the naive tests share the f64 reference and the checks of `attention_ref.zig`, a test-support file. |
@@ -32,7 +32,7 @@ budget. A runner therefore swaps one import and gets a complete set.
   runner ---> simd_pf.zig                                          |
    import      |  override: linearF32Q80, linearF32Q80Batch        |
                |  attention: attention_simd.zig, with prefetch     |
-               +-----------------------------------------> naive.zig (the oracle)
+               +-----------------------------------------> naive.zig (the reference)
               simd.zig                                             ^
                   override: linearF32, linearF32Q80, both Batch ---+
                   attention: attention_simd.zig
@@ -59,7 +59,7 @@ it. Its own test pins it against the sequential recurrence, and
 
 - Every op asserts its shape preconditions. Under runtime safety every op also
   asserts that its output is finite. Two asserts per kernel is the floor.
-- `naive` declares `.{ .arch = .any }` and is the oracle. Every other variant
+- `naive` declares `.{ .arch = .any }` and is the reference. Every other variant
   must match its output. A variant that keeps the reduction order matches bit for
   bit. A variant that reorders declares a measured `.relative` tolerance in its
   `OpRequires`, and `tools/bench.zig` prints the relative error per variant and

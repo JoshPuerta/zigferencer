@@ -1,12 +1,11 @@
-//! Project-wide static engine limits, not model facts. Each one has a single
-//! home, so a relaxation is one edit and every site reads the same constant.
+//! Project-wide static engine limits.
 //! The loader rejects a model that exceeds a structural bound with a typed
 //! error at load. It caps a declared context at `max_model_ctx` and logs the
 //! cut. It never truncates in silence (see `io/gguf/loader.zig`).
 
 const std = @import("std");
 
-// -- api --------------------------------------------------------------------
+// -- constants --------------------------------------------------------------
 
 /// Tensor rank ceiling.
 pub const max_n_dims: u8 = 4;
@@ -16,8 +15,7 @@ pub const max_n_dims: u8 = 4;
 /// and a merge pass combines the runs in split order. A row of at most this
 /// length runs a resident kernel. The build feeds the value to glslc as
 /// ATTN_SPLIT, and the resident and split shaders size their shared score row
-/// with it, 1 KiB at 256. At 256, a Qwen3.5-2B row at depth 8064 walks 32
-/// runs.
+/// with it, 1 KiB at 256.
 pub const attn_split_len: u32 = 256;
 
 /// Rows of the split-attention scratch: the split rows that one batched step
@@ -33,7 +31,8 @@ pub const attn_split_rows: u32 = 4;
 /// once for up to this many heads. A group of G heads takes
 /// `ceil(G / attn_split_queries)` workgroups. The build feeds the value to
 /// glslc as ATTN_QUERIES, and the value must not pass
-/// `attn_split_queries_max`. A grid sweep of 8, 4, and 2 picked 4: at 8 the LDS of a workgroup halves the
+/// `attn_split_queries_max`. A grid sweep of 8, 4, and 2 picked 4: at 8 the LDS of a workgroup
+/// halves the
 /// resident workgroups, and at 2 a group of 4 heads reads K and V twice. A
 /// group wider than 4 reads K and V once per 4 heads.
 pub const attn_split_queries: u32 = 4;
@@ -82,12 +81,14 @@ pub const attn_cpu_parts: u32 = 16;
 /// host dispatches read one number. `N_TILE` is the workgroup width, so it must
 /// stay a multiple of 32, the wave width the kernel pins.
 pub const q8_batch_b_tile: u32 = 16;
+
 pub const q8_batch_n_tile: u32 = 32;
 
 /// The same geometry for the Q4_0 prefill matmul, 8 batch rows by 32 output
 /// features. The nibble weight holds half the bytes per column, so this kernel
 /// carries half the batch rows of the Q8_0 sibling.
 pub const q4_batch_b_tile: u32 = 8;
+
 pub const q4_batch_n_tile: u32 = 32;
 
 /// Output-tile geometry of the register-blocked Q8_0 GEMM, 64 by 64 per
@@ -95,6 +96,7 @@ pub const q4_batch_n_tile: u32 = 32;
 /// defines of `linear_q8_0_gemm.comp`. A workgroup stages one weight tile
 /// through shared memory and every one of the 64 rows reuses it.
 pub const gemm_m_tile: u32 = 64;
+
 pub const gemm_n_tile: u32 = 64;
 
 /// Geometry of the chunked GDN prefill scan. The build feeds the pair to glslc
@@ -104,6 +106,7 @@ pub const gemm_n_tile: u32 = 64;
 /// one workgroup and its lane count, so it must stay a multiple of 32, the
 /// RDNA2 wave width.
 pub const gdn_scan_sub: u32 = 16;
+
 pub const gdn_scan_cols: u32 = 32;
 
 /// The value-head width the GDN chunk kernels support. The build feeds it to
@@ -142,6 +145,7 @@ pub const bench_runs_max: u32 = 1000;
 /// figures. A cheaper KV family gets a deeper window. The model picker shows
 /// both windows of each model before a run.
 pub const run_session_kv_bytes: u64 = 2 << 30;
+
 pub const serve_session_kv_bytes: u64 = 128 << 20;
 
 /// A default window rounds down to a multiple of this token count.
@@ -268,9 +272,12 @@ pub const max_append_pairs: u16 = 64;
 /// input, so each is a hard guard at the boundary, never a hint. A request
 /// past a limit gets a 4xx, never a truncation or an assert.
 pub const openai_max_request_bytes: usize = 256 * 1024; // POST body cap (413 past it)
+
 pub const openai_max_header_bytes: usize = 16 * 1024; // http.Server head buffer (431 past it)
 pub const openai_max_messages: usize = 64; // messages[] length cap
-pub const openai_default_max_tokens: u32 = 0; // when a request omits max_tokens. 0 is the whole window
+
+/// The `max_tokens` of a request that omits it. 0 is the whole window.
+pub const openai_default_max_tokens: u32 = 0;
 
 /// Floor on a budget-derived per-session KV window. Below this a session is too
 /// cramped to be useful. The planner (`core/kv_budget.zig`) refuses a budget
@@ -326,16 +333,8 @@ pub const prompt_cache_disk_default: u64 = 16 << 30;
 /// refuses over this line with a typed error, rather than letting
 /// `vkAllocateMemory` run out mid-init and remove the device.
 pub const vram_usable_num: u64 = 7;
-pub const vram_usable_den: u64 = 8;
 
-/// The usable share of `available_bytes` of VRAM, rounded down.
-pub fn vramUsable(available_bytes: u64) u64 {
-    const usable = available_bytes / vram_usable_den * vram_usable_num;
-    std.debug.assert(usable <= available_bytes);
-    // The reserve is never empty, so a plan never takes the whole budget.
-    if (available_bytes > 0) std.debug.assert(usable < available_bytes);
-    return usable;
-}
+pub const vram_usable_den: u64 = 8;
 
 /// Usable share of the RAM that `MemAvailable` reports at boot, which a hybrid
 /// placement can plan to occupy with anonymous memory: host KV, swap stages,
@@ -345,22 +344,28 @@ pub fn vramUsable(available_bytes: u64) u64 {
 /// refuses over this line with a typed error. The rule matches the VRAM rule,
 /// but the constants stay separate because the reserve has a different reason.
 pub const ram_usable_num: u64 = 7;
+
 pub const ram_usable_den: u64 = 8;
 
-/// The usable share of `available_bytes` of RAM, rounded down.
-pub fn ramUsable(available_bytes: u64) u64 {
-    const usable = available_bytes / ram_usable_den * ram_usable_num;
-    std.debug.assert(usable <= available_bytes);
-    // The reserve is never empty, so a plan never takes the whole RAM.
-    if (available_bytes > 0) std.debug.assert(usable < available_bytes);
-    return usable;
-}
+/// Elements one KV row can hold: the KV heads times the head width. The bound
+/// keeps every byte product of a KV layout inside a `u64`.
+pub const max_kv_row_elems: u32 = 1 << 20;
 
-/// Whether a planned device-local footprint fits the usable share of `available`
-/// VRAM (the live budget, or the heap size when the budget extension is absent).
-pub fn vramPlanFits(planned_bytes: u64, available_bytes: u64) bool {
-    return planned_bytes <= vramUsable(available_bytes);
-}
+/// Elements one KV region can hold. The shaders index KV with a 32-bit value,
+/// and SPIR-V reads an access-chain index as signed, so the last index must
+/// stay below 2^31.
+pub const max_kv_index_elems: u64 = 1 << 31;
+
+/// The environment variable that replaces the reported storage-buffer range.
+/// A driver can report the spec minimum while it reads correctly past it. An
+/// operator who proved a larger range on a device can state that range here.
+pub const storage_range_env = "ZIGFERENCER_VK_STORAGE_RANGE";
+
+/// The largest value `storage_range_env` takes. Vulkan states the range as a
+/// 32-bit count.
+pub const storage_range_max: u64 = std.math.maxInt(u32);
+
+// -- types ------------------------------------------------------------------
 
 /// The storage-buffer limits of one device, read once when its context opens.
 pub const BufferLimits = struct {
@@ -374,15 +379,6 @@ pub const BufferLimits = struct {
     offset_alignment: u64,
 };
 
-/// Elements one KV row can hold: the KV heads times the head width. The bound
-/// keeps every byte product of a KV layout inside a `u64`.
-pub const max_kv_row_elems: u32 = 1 << 20;
-
-/// Elements one KV region can hold. The shaders index KV with a 32-bit value,
-/// and SPIR-V reads an access-chain index as signed, so the last index must
-/// stay below 2^31.
-pub const max_kv_index_elems: u64 = 1 << 31;
-
 /// The first limit a buffer breaks, in the order `bufferFits` checks them.
 pub const BufferVerdict = enum {
     fits,
@@ -392,14 +388,36 @@ pub const BufferVerdict = enum {
     misaligned,
 };
 
-/// The environment variable that replaces the reported storage-buffer range.
-/// A driver can report the spec minimum while it reads correctly past it. An
-/// operator who proved a larger range on a device can state that range here.
-pub const storage_range_env = "ZIGFERENCER_VK_STORAGE_RANGE";
+/// The state cell of one GDN scan lane: a value head and a column of its state.
+pub const GdnScanCell = struct { head: u32, column: u32 };
 
-/// The largest value `storage_range_env` takes. Vulkan states the range as a
-/// 32-bit count.
-pub const storage_range_max: u64 = std.math.maxInt(u32);
+// -- api --------------------------------------------------------------------
+
+/// The usable share of `available_bytes` of VRAM, rounded down.
+pub fn vramUsable(available_bytes: u64) u64 {
+    const usable = available_bytes / vram_usable_den * vram_usable_num;
+    std.debug.assert(usable <= available_bytes);
+    // The reserve is never empty, so a plan never takes the whole budget.
+    if (available_bytes > 0) std.debug.assert(usable < available_bytes);
+
+    return usable;
+}
+
+/// The usable share of `available_bytes` of RAM, rounded down.
+pub fn ramUsable(available_bytes: u64) u64 {
+    const usable = available_bytes / ram_usable_den * ram_usable_num;
+    std.debug.assert(usable <= available_bytes);
+    // The reserve is never empty, so a plan never takes the whole RAM.
+    if (available_bytes > 0) std.debug.assert(usable < available_bytes);
+
+    return usable;
+}
+
+/// Whether a planned device-local footprint fits the usable share of `available`
+/// VRAM (the live budget, or the heap size when the budget extension is absent).
+pub fn vramPlanFits(planned_bytes: u64, available_bytes: u64) bool {
+    return planned_bytes <= vramUsable(available_bytes);
+}
 
 /// Check a buffer of `elems` elements and `bytes` bytes against the device
 /// limits. The checks run in the `BufferVerdict` order, and each bound is
@@ -411,10 +429,12 @@ pub fn bufferFits(elems: u64, bytes: u64, lim: BufferLimits) BufferVerdict {
     std.debug.assert(lim.allocation_size >= 1);
     std.debug.assert(lim.offset_alignment >= 1);
     std.debug.assert(std.math.isPowerOfTwo(lim.offset_alignment));
+
     if (elems > max_kv_index_elems) return .index_past_31_bits;
     if (bytes > lim.allocation_size) return .past_allocation_size;
     if (bytes > lim.storage_range) return .past_storage_range;
     if (bytes % lim.offset_alignment != 0) return .misaligned;
+
     return .fits;
 }
 
@@ -431,11 +451,14 @@ pub fn floorToGranule(n: u64) u64 {
 /// `1..storage_range_max`, digits only.
 pub fn parseStorageRange(text: []const u8) error{InvalidStorageRange}!u64 {
     if (text.len == 0) return error.InvalidStorageRange;
+
     for (text) |c| {
         if (!std.ascii.isDigit(c)) return error.InvalidStorageRange;
     }
+
     const value = std.fmt.parseInt(u64, text, 10) catch return error.InvalidStorageRange;
     if (value < 1 or value > storage_range_max) return error.InvalidStorageRange;
+
     std.debug.assert(value >= 1);
     std.debug.assert(value <= storage_range_max);
     return value;
@@ -445,11 +468,14 @@ pub fn parseStorageRange(text: []const u8) error{InvalidStorageRange}!u64 {
 /// `1..spans_per_thread_max`, digits only.
 pub fn parseTraceSpans(text: []const u8) error{InvalidTraceSpans}!u32 {
     if (text.len == 0) return error.InvalidTraceSpans;
+
     for (text) |c| {
         if (!std.ascii.isDigit(c)) return error.InvalidTraceSpans;
     }
+
     const value = std.fmt.parseInt(u32, text, 10) catch return error.InvalidTraceSpans;
     if (value < 1 or value > spans_per_thread_max) return error.InvalidTraceSpans;
+
     std.debug.assert(value >= 1);
     std.debug.assert(value <= spans_per_thread_max);
     return value;
@@ -460,13 +486,16 @@ pub fn parseTraceSpans(text: []const u8) error{InvalidTraceSpans}!u32 {
 /// lower the ceiling.
 pub fn contextCeiling(context_length: u32, override: ?u32) u32 {
     std.debug.assert(context_length >= 1);
+
     if (override) |o| std.debug.assert(o >= 1);
+
     const engine_capped = @min(context_length, max_model_ctx);
     const ceiling = if (override) |o| @min(engine_capped, o) else engine_capped;
     std.debug.assert(ceiling >= 1);
     std.debug.assert(ceiling <= max_model_ctx);
     std.debug.assert(ceiling <= context_length);
     if (override) |o| std.debug.assert(ceiling <= o);
+
     return ceiling;
 }
 
@@ -485,14 +514,12 @@ pub fn gdnScanLdsBytes() u32 {
 /// blocks for each value head.
 pub fn gdnScanGroups(n_v_heads: u32) u32 {
     std.debug.assert(n_v_heads >= 1);
+
     const groups = n_v_heads * (gdn_head_dim / gdn_scan_cols);
     std.debug.assert(groups % n_v_heads == 0);
     std.debug.assert(groups * gdn_scan_cols == n_v_heads * gdn_head_dim);
     return groups;
 }
-
-/// The state cell of one GDN scan lane: a value head and a column of its state.
-pub const GdnScanCell = struct { head: u32, column: u32 };
 
 /// The cell that lane `lane` of workgroup `group` owns. It mirrors the index
 /// arithmetic at the top of `gdn_chunk_scan.comp`. The workgroups of one head
@@ -500,8 +527,12 @@ pub const GdnScanCell = struct { head: u32, column: u32 };
 /// `c * gdn_scan_cols + lane`.
 pub fn gdnScanCell(group: u32, lane: u32) GdnScanCell {
     std.debug.assert(lane < gdn_scan_cols);
+
     const blocks = gdn_head_dim / gdn_scan_cols;
-    const cell: GdnScanCell = .{ .head = group / blocks, .column = (group % blocks) * gdn_scan_cols + lane };
+    const cell: GdnScanCell = .{
+        .head = group / blocks,
+        .column = (group % blocks) * gdn_scan_cols + lane,
+    };
     std.debug.assert(cell.column < gdn_head_dim);
     std.debug.assert(cell.column % gdn_scan_cols == lane);
     return cell;
@@ -529,7 +560,11 @@ comptime {
     // queries in the 32 KiB of shared memory that the target driver allows.
     std.debug.assert(attn_split_queries >= 1);
     std.debug.assert(attn_split_queries <= attn_split_queries_max);
-    std.debug.assert(attn_split_queries * (attn_split_len + attn_max_head_dim + 64 + 1) * @sizeOf(f32) <= 32 * 1024);
+    std.debug.assert(
+        attn_split_queries * (attn_split_len + attn_max_head_dim + 64 + 1) * @sizeOf(
+            f32,
+        ) <= 32 * 1024,
+    );
     // The SIMD kernel reduces the scores of a tile eight at a time, one per
     // lane of its 8-wide f32 vector.
     std.debug.assert(attn_cpu_tile >= 8);
@@ -596,10 +631,14 @@ test "ramUsable: seven eighths of the free RAM, rounded down, with a reserve tha
     var available: u64 = 0;
     while (available < 4096) : (available += 1) {
         const usable = ramUsable(available * 1_000_003);
-        if (available > 0) try std.testing.expect(usable < available * 1_000_003);
+        if (available > 0) {
+            try std.testing.expect(usable < available * 1_000_003);
+        }
+
         try std.testing.expect(usable >= previous);
         previous = usable;
     }
+
     const top = ramUsable(std.math.maxInt(u64));
     try std.testing.expect(top < std.math.maxInt(u64));
     try std.testing.expectEqual(std.math.maxInt(u64) / 8 * 7, top);
@@ -639,16 +678,36 @@ test "bufferFits: each bound passes at the limit and fails one past it" {
     const lim = test_buffer_limits;
     try std.testing.expectEqual(BufferVerdict.fits, bufferFits(16, 16, lim));
     // The index bound, with the bytes inside every other bound.
-    const wide: BufferLimits = .{ .storage_range = 1 << 40, .allocation_size = 1 << 40, .offset_alignment = 16 };
-    try std.testing.expectEqual(BufferVerdict.fits, bufferFits(max_kv_index_elems, max_kv_index_elems * 2, wide));
-    try std.testing.expectEqual(BufferVerdict.index_past_31_bits, bufferFits(max_kv_index_elems + 1, max_kv_index_elems * 2 + 16, wide));
+    const wide: BufferLimits = .{
+        .storage_range = 1 << 40,
+        .allocation_size = 1 << 40,
+        .offset_alignment = 16,
+    };
+    try std.testing.expectEqual(
+        BufferVerdict.fits,
+        bufferFits(max_kv_index_elems, max_kv_index_elems * 2, wide),
+    );
+    try std.testing.expectEqual(
+        BufferVerdict.index_past_31_bits,
+        bufferFits(max_kv_index_elems + 1, max_kv_index_elems * 2 + 16, wide),
+    );
     // The allocation size, with a storage range that allows it.
-    const deep_range: BufferLimits = .{ .storage_range = 4 << 30, .allocation_size = 2 << 30, .offset_alignment = 16 };
+    const deep_range: BufferLimits = .{
+        .storage_range = 4 << 30,
+        .allocation_size = 2 << 30,
+        .offset_alignment = 16,
+    };
     try std.testing.expectEqual(BufferVerdict.fits, bufferFits(1 << 29, 2 << 30, deep_range));
-    try std.testing.expectEqual(BufferVerdict.past_allocation_size, bufferFits(1 << 29, (2 << 30) + 16, deep_range));
+    try std.testing.expectEqual(
+        BufferVerdict.past_allocation_size,
+        bufferFits(1 << 29, (2 << 30) + 16, deep_range),
+    );
     // The storage range.
     try std.testing.expectEqual(BufferVerdict.fits, bufferFits(1 << 25, 128 << 20, lim));
-    try std.testing.expectEqual(BufferVerdict.past_storage_range, bufferFits(1 << 25, (128 << 20) + 16, lim));
+    try std.testing.expectEqual(
+        BufferVerdict.past_storage_range,
+        bufferFits(1 << 25, (128 << 20) + 16, lim),
+    );
     // The alignment.
     try std.testing.expectEqual(BufferVerdict.fits, bufferFits(4, 32, lim));
     try std.testing.expectEqual(BufferVerdict.misaligned, bufferFits(4, 33, lim));
@@ -657,18 +716,39 @@ test "bufferFits: each bound passes at the limit and fails one past it" {
 test "bufferFits: the first broken limit in check order wins" {
     const lim = test_buffer_limits;
     // Index and allocation both broken: the index wins.
-    try std.testing.expectEqual(BufferVerdict.index_past_31_bits, bufferFits(max_kv_index_elems + 1, 16 << 30, lim));
+    try std.testing.expectEqual(
+        BufferVerdict.index_past_31_bits,
+        bufferFits(max_kv_index_elems + 1, 16 << 30, lim),
+    );
     // Allocation and storage range both broken: the allocation wins.
-    try std.testing.expectEqual(BufferVerdict.past_allocation_size, bufferFits(1 << 20, (2 << 30) + 16, lim));
+    try std.testing.expectEqual(
+        BufferVerdict.past_allocation_size,
+        bufferFits(1 << 20, (2 << 30) + 16, lim),
+    );
     // Storage range and alignment both broken: the storage range wins.
-    try std.testing.expectEqual(BufferVerdict.past_storage_range, bufferFits(1 << 20, (128 << 20) + 1, lim));
+    try std.testing.expectEqual(
+        BufferVerdict.past_storage_range,
+        bufferFits(1 << 20, (128 << 20) + 1, lim),
+    );
 }
 
 test "parseStorageRange: digits in 1..2^32-1 only" {
     try std.testing.expectEqual(@as(u64, 1), try parseStorageRange("1"));
     try std.testing.expectEqual(@as(u64, 134_217_728), try parseStorageRange("134217728"));
     try std.testing.expectEqual(storage_range_max, try parseStorageRange("4294967295"));
-    const bad = [_][]const u8{ "", "0", "4294967296", "99999999999999999999999", "abc", "+5", "-1", "1_000", " 5", "5 ", "0x10" };
+    const bad = [_][]const u8{
+        "",
+        "0",
+        "4294967296",
+        "99999999999999999999999",
+        "abc",
+        "+5",
+        "-1",
+        "1_000",
+        " 5",
+        "5 ",
+        "0x10",
+    };
     for (bad) |text| {
         try std.testing.expectError(error.InvalidStorageRange, parseStorageRange(text));
     }
@@ -678,7 +758,20 @@ test "parseTraceSpans: digits in 1..spans_per_thread_max only" {
     try std.testing.expectEqual(@as(u32, 1), try parseTraceSpans("1"));
     try std.testing.expectEqual(spans_per_thread, try parseTraceSpans("16384"));
     try std.testing.expectEqual(spans_per_thread_max, try parseTraceSpans("4194304"));
-    const bad = [_][]const u8{ "", "0", "4194305", "4294967296", "99999999999999999999999", "abc", "+5", "-1", "1_000", " 5", "5 ", "0x10" };
+    const bad = [_][]const u8{
+        "",
+        "0",
+        "4194305",
+        "4294967296",
+        "99999999999999999999999",
+        "abc",
+        "+5",
+        "-1",
+        "1_000",
+        " 5",
+        "5 ",
+        "0x10",
+    };
     for (bad) |text| {
         try std.testing.expectError(error.InvalidTraceSpans, parseTraceSpans(text));
     }
@@ -699,9 +792,16 @@ test "gdnScanCell: every state column of every head has exactly one owner lane" 
                 owners[cell.head * gdn_head_dim + cell.column] += 1;
             }
         }
-        for (owners[0 .. n_v * gdn_head_dim]) |count| try std.testing.expectEqual(@as(u8, 1), count);
-        for (owners[n_v * gdn_head_dim ..]) |count| try std.testing.expectEqual(@as(u8, 0), count);
+
+        for (owners[0 .. n_v * gdn_head_dim]) |count| {
+            try std.testing.expectEqual(@as(u8, 1), count);
+        }
+
+        for (owners[n_v * gdn_head_dim ..]) |count| {
+            try std.testing.expectEqual(@as(u8, 0), count);
+        }
     }
+
     try std.testing.expectEqual(@as(u32, 64), gdnScanGroups(16));
     try std.testing.expectEqual(@as(u32, 20_736), gdnScanLdsBytes());
 }

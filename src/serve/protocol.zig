@@ -1,6 +1,6 @@
 //! The wire format between the serve layer and a client, and the document a
 //! client implementer reads. The frames are binary and little-endian
-//! throughout, and they do not depend on a transport. A ZeroMQ message
+//! throughout, and they do not depend on a transport. A ZMQ message
 //! carries one frame. The server speaks ZMTP 3.x with the NULL security
 //! method, and a DEALER socket is the client.
 //!
@@ -32,7 +32,7 @@ const std = @import("std");
 const limits = @import("../core/limits.zig");
 const prop = @import("../core/prop.zig");
 
-// -- types ------------------------------------------------------------------
+// -- constants --------------------------------------------------------------
 
 pub const magic: u32 = 0x4647495A;
 pub const protocol_version: u16 = 3;
@@ -45,18 +45,21 @@ pub const header_bytes: usize = 20;
 pub const max_frame_payload_bytes: u32 = 64 * 1024;
 
 /// The largest system prompt that one `session_open` frame carries. The
-/// payload holds the sampling knobs, a u32 length, and the prompt.
+/// payload holds the sampling settings, a u32 length, and the prompt.
 pub const system_prompt_bytes_max: usize = max_frame_payload_bytes - Sampling.wire_bytes - 4;
 
 comptime {
     const prompt = [_]u8{0} ** system_prompt_bytes_max;
-    const open: ClientMsg = .{ .session_open = .{ .sampling = Sampling.greedy, .system_prompt = &prompt } };
+    const open: ClientMsg = .{
+        .session_open = .{ .sampling = Sampling.greedy, .system_prompt = &prompt },
+    };
     std.debug.assert(clientFrameLen(open) == header_bytes + max_frame_payload_bytes);
 }
 
 /// The detail texts of a `turn_too_long` refusal. They live with the wire
 /// because a client reads the numbers back from the detail.
 pub const turn_too_long_fmt = "turn of {d} tokens, {d} positions left";
+
 pub const system_too_long_fmt = "system prompt of {d} tokens, window of {d} positions";
 
 /// The largest frame the server encodes. A `token` payload is the largest:
@@ -71,12 +74,10 @@ pub const max_server_frame_bytes: usize = header_bytes + 4 + 1 + 2 + limits.max_
 /// The bytes of a lease token on the wire.
 pub const token_bytes: usize = 16;
 
-/// The bearer secret of a session lease. All zero bytes name no lease.
-pub const Token = [token_bytes]u8;
-
 /// The flag bits of a `generate` payload. Bit 2 is legal only with bit 1,
 /// bit 4 only with bit 0, and bits 5 to 7 are refused.
 const generate_flag_sampling: u8 = 1 << 0;
+
 const generate_flag_think_switch: u8 = 1 << 1;
 const generate_flag_think_open: u8 = 1 << 2;
 const generate_flag_think_budget: u8 = 1 << 3;
@@ -98,11 +99,77 @@ pub const append_pairs_bytes_max: usize = max_frame_payload_bytes - 2;
 pub const pair_overhead_bytes: usize = 8;
 
 comptime {
-    std.debug.assert(header_bytes + 2 + 4 * @as(usize, limits.max_append_pairs) <= max_server_frame_bytes);
+    std.debug.assert(
+        header_bytes + 2 + 4 * @as(usize, limits.max_append_pairs) <= max_server_frame_bytes,
+    );
     // A pair costs at least its two length fields, so one frame cannot name
     // more pairs than this.
     std.debug.assert(limits.max_append_pairs <= append_pairs_bytes_max / pair_overhead_bytes);
 }
+
+/// The detail of the refusal of a nonzero frequency penalty. The decoder
+/// accepts the value in range, and the server refuses the request.
+pub const frequency_unsupported_detail = "frequency_penalty is not supported";
+
+/// The OpenAI range of the frequency penalty is the presence range, [-2, 2].
+pub const frequency_penalty_max: f32 = limits.max_presence_penalty;
+
+/// The `hello_ack` payload bytes outside the model name.
+const hello_ack_fixed_bytes: usize = 2 + 4 + 2 + 2 + 4 + 4 + 1 + 4 + 4 + 2 * Sampling.wire_bytes +
+    2;
+
+comptime {
+    // Every server frame fits the writer frame, at its largest form.
+    const name = [_]u8{'m'} ** limits.max_model_name_bytes;
+    const hello: ServerMsg = .{ .hello_ack = .{
+        .protocol_version = protocol_version,
+        .max_seq = 0,
+        .max_sessions = 0,
+        .max_batch = 0,
+        .vocab_size = 0,
+        .eos_id = 0,
+        .think_mode = .none,
+        .think_budget = 0,
+        .resume_ttl_max_ms = 0,
+        .recommended_think = Sampling.greedy,
+        .recommended_plain = Sampling.greedy,
+        .model_name = &name,
+    } };
+    std.debug.assert(serverFrameLen(hello) == header_bytes + 165);
+    std.debug.assert(serverFrameLen(hello) <= max_server_frame_bytes);
+    const kept: ServerMsg = .{ .kept = .{ .granted_ms = 0, .token = @splat(0) } };
+    std.debug.assert(serverFrameLen(kept) == 40);
+    const resumed: ServerMsg = .{
+        .resumed = .{ .token = @splat(1), .kv_pos = 0, .turns_done = 0, .last = null },
+    };
+    std.debug.assert(serverFrameLen(resumed) == 58);
+    std.debug.assert(serverFrameLen(resumed) <= max_server_frame_bytes);
+    // Every client frame outside the text fits the payload bound.
+    const keep: ClientMsg = .{ .session_keep = .{ .ttl_ms = 0 } };
+    std.debug.assert(clientFrameLen(keep) == header_bytes + 4);
+    const resume_msg: ClientMsg = .{ .session_resume = .{ .token = @splat(1) } };
+    std.debug.assert(clientFrameLen(resume_msg) == header_bytes + token_bytes);
+    const gen: ClientMsg = .{
+        .generate = .{
+            .max_tokens = 1,
+            .sampling = Sampling.greedy,
+            .text = "",
+            .think_open = true,
+            .think_budget = 0,
+            .reseed = true,
+        },
+    };
+    std.debug.assert(clientFrameLen(gen) == header_bytes + generate_fixed_bytes_max);
+    // The longest text with every optional field fills the payload bound.
+    std.debug.assert(
+        clientFrameLen(gen) + generate_text_bytes_max == header_bytes + max_frame_payload_bytes,
+    );
+}
+
+// -- types ------------------------------------------------------------------
+
+/// The bearer secret of a session lease. All zero bytes name no lease.
+pub const Token = [token_bytes]u8;
 
 pub const MsgType = enum(u16) {
     hello = 0x0001,
@@ -168,7 +235,7 @@ pub const FinishReason = enum(u8) {
     cancelled = 3,
 };
 
-/// Sampling knobs on the wire, 36 bytes:
+/// Sampling settings on the wire, 36 bytes:
 ///
 ///     off  field               type  rule
 ///     0    temperature         f32   finite, >= 0. 0 is greedy.
@@ -267,8 +334,10 @@ pub const PairIterator = struct {
     pub fn next(it: *PairIterator) ?Pair {
         if (it.left == 0) {
             std.debug.assert(it.i == it.bytes.len);
+
             return null;
         }
+
         it.left -= 1;
         const user = it.field();
         const assistant = it.field();
@@ -277,10 +346,12 @@ pub const PairIterator = struct {
 
     fn field(it: *PairIterator) []const u8 {
         std.debug.assert(it.i + 4 <= it.bytes.len);
+
         const len = std.mem.readInt(u32, it.bytes[it.i..][0..4], .little);
         it.i += 4;
         std.debug.assert(it.i + len <= it.bytes.len);
         defer it.i += len;
+
         return it.bytes[it.i..][0..len];
     }
 };
@@ -293,6 +364,7 @@ pub const Appended = struct {
     pub fn positions(self: *const Appended) []const u32 {
         std.debug.assert(self.n >= 1);
         std.debug.assert(self.n <= limits.max_append_pairs);
+
         return self.kv_pos[0..self.n];
     }
 };
@@ -341,7 +413,8 @@ pub const ClientMsg = union(enum) {
     /// `internal` (no secure random source).
     session_keep: struct { ttl_ms: u32 },
     /// Attach the session of `token` to this connection. The header session
-    /// id must be 0, and any other id is malformed. Reply is `resumed`, sent when the session is idle. Errors:
+    /// id must be 0, and any other id is malformed. Reply is `resumed`, sent when the session is
+    /// idle. Errors:
     /// `unknown_session` (no such lease), `sessions_exhausted`, `internal`.
     session_resume: struct { token: Token },
 };
@@ -404,12 +477,6 @@ pub const DecodeError = error{
     PayloadMalformed,
 };
 
-/// The detail of the refusal of a nonzero frequency penalty. The decoder
-/// accepts the value in range, and the server refuses the request.
-pub const frequency_unsupported_detail = "frequency_penalty is not supported";
-/// The OpenAI range of the frequency penalty is the presence range, [-2, 2].
-pub const frequency_penalty_max: f32 = limits.max_presence_penalty;
-
 /// Bounds-checked little-endian reader over a payload. A `take` past the end
 /// returns `PayloadMalformed`. `expectDone` rejects trailing bytes, so a frame
 /// parses exactly or not at all.
@@ -420,7 +487,9 @@ const Cursor = struct {
     fn take(c: *Cursor, comptime T: type) DecodeError!T {
         const n = @sizeOf(T);
         if (c.i + n > c.buf.len) return error.PayloadMalformed;
+
         defer c.i += n;
+
         return switch (T) {
             f32 => @bitCast(std.mem.readInt(u32, c.buf[c.i..][0..4], .little)),
             else => std.mem.readInt(T, c.buf[c.i..][0..n], .little),
@@ -430,6 +499,7 @@ const Cursor = struct {
     fn takeSlice(c: *Cursor, len: usize) DecodeError![]const u8 {
         if (c.i + len > c.buf.len) return error.PayloadMalformed;
         defer c.i += len;
+
         return c.buf[c.i..][0..len];
     }
 
@@ -449,6 +519,7 @@ const Writer = struct {
         const n = @sizeOf(T);
         std.debug.assert(w.i + n <= w.buf.len);
         defer w.i += n;
+
         switch (T) {
             f32 => std.mem.writeInt(u32, w.buf[w.i..][0..4], @bitCast(v), .little),
             else => std.mem.writeInt(T, w.buf[w.i..][0..n], v, .little),
@@ -457,6 +528,7 @@ const Writer = struct {
 
     fn putSlice(w: *Writer, bytes: []const u8) void {
         std.debug.assert(w.i + bytes.len <= w.buf.len);
+
         @memcpy(w.buf[w.i..][0..bytes.len], bytes);
         w.i += bytes.len;
     }
@@ -467,30 +539,23 @@ const Writer = struct {
 pub fn decodeHeader(bytes: *const [header_bytes]u8) DecodeError!Header {
     if (std.mem.readInt(u32, bytes[0..4], .little) != magic) return error.BadMagic;
     if (std.mem.readInt(u16, bytes[4..6], .little) != protocol_version) return error.BadVersion;
+
     const raw_type = std.mem.readInt(u16, bytes[6..8], .little);
     const msg_type = std.enums.fromInt(MsgType, raw_type) orelse return error.UnknownMsgType;
     const payload_len = std.mem.readInt(u32, bytes[16..20], .little);
     if (payload_len > max_frame_payload_bytes) return error.FrameTooLarge;
+
     const session_id = std.mem.readInt(u32, bytes[12..16], .little);
     // A resume names its session by the token alone, so a header id is a
     // client fault and not a second key.
     if (msg_type == .session_resume and session_id != 0) return error.PayloadMalformed;
+
     return .{
         .msg_type = msg_type,
         .request_id = std.mem.readInt(u32, bytes[8..12], .little),
         .session_id = session_id,
         .payload_len = payload_len,
     };
-}
-
-fn encodeHeader(h: Header, out: *[header_bytes]u8) void {
-    std.debug.assert(h.payload_len <= max_frame_payload_bytes);
-    std.mem.writeInt(u32, out[0..4], magic, .little);
-    std.mem.writeInt(u16, out[4..6], protocol_version, .little);
-    std.mem.writeInt(u16, out[6..8], @intFromEnum(h.msg_type), .little);
-    std.mem.writeInt(u32, out[8..12], h.request_id, .little);
-    std.mem.writeInt(u32, out[12..16], h.session_id, .little);
-    std.mem.writeInt(u32, out[16..20], h.payload_len, .little);
 }
 
 /// Decode a client-direction payload. Slices borrow from `payload`.
@@ -518,18 +583,29 @@ pub fn decodeClientPayload(t: MsgType, payload: []const u8) DecodeError!ClientMs
         .generate => blk: {
             const max_tokens = try c.take(u32);
             if (max_tokens == 0) return error.PayloadMalformed;
+
             const flags = try c.take(u8);
             if (flags & ~generate_flags_known != 0) return error.PayloadMalformed;
+
             const has_switch = flags & generate_flag_think_switch != 0;
             const open = flags & generate_flag_think_open != 0;
             if (open and !has_switch) return error.PayloadMalformed;
+
             const reseed = flags & generate_flag_reseed != 0;
             if (reseed and flags & generate_flag_sampling == 0) return error.PayloadMalformed;
-            const sampling: ?Sampling = if (flags & generate_flag_sampling != 0) try takeSampling(&c) else null;
-            const budget: ?u32 = if (flags & generate_flag_think_budget != 0) try c.take(u32) else null;
+
+            const sampling: ?Sampling = if (flags & generate_flag_sampling != 0) try takeSampling(
+                &c,
+            ) else null;
+
+            const budget: ?u32 = if (flags & generate_flag_think_budget != 0) try c.take(
+                u32,
+            ) else null;
+
             if (budget) |b| {
                 if (b > limits.max_model_ctx) return error.PayloadMalformed;
             }
+
             const text = try c.takeSlice(try c.take(u32));
             break :blk .{ .generate = .{
                 .max_tokens = max_tokens,
@@ -542,6 +618,7 @@ pub fn decodeClientPayload(t: MsgType, payload: []const u8) DecodeError!ClientMs
         },
         else => return error.UnknownMsgType, // a server-direction type on the client path
     };
+
     try c.expectDone();
     return msg;
 }
@@ -561,14 +638,19 @@ pub fn decodeServerPayload(t: MsgType, payload: []const u8) DecodeError!ServerMs
             const max_batch = try c.take(u16);
             const vocab_size = try c.take(u32);
             const eos_id = try c.take(u32);
-            const think_mode = std.enums.fromInt(ThinkMode, try c.take(u8)) orelse return error.PayloadMalformed;
+            const think_mode = std.enums.fromInt(
+                ThinkMode,
+                try c.take(u8),
+            ) orelse return error.PayloadMalformed;
             const think_budget = try c.take(u32);
             const resume_ttl_max_ms = try c.take(u32);
             if (resume_ttl_max_ms > limits.max_resume_ttl_ms) return error.PayloadMalformed;
+
             const recommended_think = try takeSampling(&c);
             const recommended_plain = try takeSampling(&c);
             const name = try c.takeSlice(try c.take(u16));
             if (name.len > limits.max_model_name_bytes) return error.PayloadMalformed;
+
             break :blk .{ .hello_ack = .{
                 .protocol_version = ver,
                 .max_seq = max_seq,
@@ -587,13 +669,20 @@ pub fn decodeServerPayload(t: MsgType, payload: []const u8) DecodeError!ServerMs
         .session_opened => .{ .session_opened = .{ .kv_pos = try c.take(u32) } },
         .token => blk: {
             const id = try c.take(u32);
-            const channel = std.enums.fromInt(Channel, try c.take(u8)) orelse return error.PayloadMalformed;
+            const channel = std.enums.fromInt(
+                Channel,
+                try c.take(u8),
+            ) orelse return error.PayloadMalformed;
             const text = try c.takeSlice(try c.take(u16));
             if (text.len > limits.max_token_text_bytes) return error.PayloadMalformed;
+
             break :blk .{ .token = .{ .token_id = id, .channel = channel, .text = text } };
         },
         .done => .{ .done = .{
-            .finish_reason = std.enums.fromInt(FinishReason, try c.take(u8)) orelse return error.PayloadMalformed,
+            .finish_reason = std.enums.fromInt(
+                FinishReason,
+                try c.take(u8),
+            ) orelse return error.PayloadMalformed,
             .turn_prompt_tokens = try c.take(u32),
             .gen_tokens = try c.take(u32),
             .kv_pos = try c.take(u32),
@@ -602,7 +691,10 @@ pub fn decodeServerPayload(t: MsgType, payload: []const u8) DecodeError!ServerMs
             .reasoning_tokens = try c.take(u32),
         } },
         .err => blk: {
-            const code = std.enums.fromInt(ErrorCode, try c.take(u16)) orelse return error.PayloadMalformed;
+            const code = std.enums.fromInt(
+                ErrorCode,
+                try c.take(u16),
+            ) orelse return error.PayloadMalformed;
             const detail = try c.takeSlice(try c.take(u16));
             break :blk .{ .err = .{ .code = code, .detail = detail } };
         },
@@ -618,11 +710,13 @@ pub fn decodeServerPayload(t: MsgType, payload: []const u8) DecodeError!ServerMs
             const token = try takeToken(&c);
             if (granted > limits.max_resume_ttl_ms) return error.PayloadMalformed;
             if ((granted == 0) != std.mem.allEqual(u8, &token, 0)) return error.PayloadMalformed;
+
             break :blk .{ .kept = .{ .granted_ms = granted, .token = token } };
         },
         .resumed => .{ .resumed = try takeResumed(&c) },
         else => return error.UnknownMsgType, // a client-direction type on the server path
     };
+
     try c.expectDone();
     return msg;
 }
@@ -632,6 +726,7 @@ pub fn decodeServerPayload(t: MsgType, payload: []const u8) DecodeError!ServerMs
 /// `clientFrameLen`.
 pub fn encodeClientMsg(msg: ClientMsg, request_id: u32, session_id: u32, out: []u8) usize {
     std.debug.assert(out.len >= clientFrameLen(msg));
+
     var w: Writer = .{ .buf = out[header_bytes..] };
     switch (msg) {
         .hello, .cancel, .session_close, .stats, .ping, .shutdown => {},
@@ -644,27 +739,41 @@ pub fn encodeClientMsg(msg: ClientMsg, request_id: u32, session_id: u32, out: []
         .session_append => |m| {
             std.debug.assert(m.n >= 1);
             std.debug.assert(m.n <= limits.max_append_pairs);
+
             w.put(u16, m.n);
             w.putSlice(m.bytes);
         },
         .generate => |m| {
             std.debug.assert(m.max_tokens > 0);
+
             if (m.think_budget) |b| std.debug.assert(b <= limits.max_model_ctx);
             if (m.reseed) std.debug.assert(m.sampling != null);
+
             std.debug.assert(m.text.len <= generate_text_bytes_max);
             w.put(u32, m.max_tokens);
-            w.put(u8, generateFlags(m.sampling != null, m.think_open, m.think_budget != null, m.reseed));
-            if (m.sampling) |s| putSampling(&w, s);
-            if (m.think_budget) |b| w.put(u32, b);
+            w.put(
+                u8,
+                generateFlags(m.sampling != null, m.think_open, m.think_budget != null, m.reseed),
+            );
+            if (m.sampling) |s| {
+                putSampling(&w, s);
+            }
+
+            if (m.think_budget) |b| {
+                w.put(u32, b);
+            }
+
             w.put(u32, @intCast(m.text.len));
             w.putSlice(m.text);
         },
         .session_keep => |m| w.put(u32, m.ttl_ms),
         .session_resume => |m| {
             std.debug.assert(!std.mem.allEqual(u8, &m.token, 0));
+
             w.putSlice(&m.token);
         },
     }
+
     encodeHeader(.{
         .msg_type = clientMsgType(msg),
         .request_id = request_id,
@@ -676,11 +785,13 @@ pub fn encodeClientMsg(msg: ClientMsg, request_id: u32, session_id: u32, out: []
 
 pub fn encodeServerMsg(msg: ServerMsg, request_id: u32, session_id: u32, out: []u8) usize {
     std.debug.assert(out.len >= serverFrameLen(msg));
+
     var w: Writer = .{ .buf = out[header_bytes..] };
     switch (msg) {
         .pong, .session_closed, .shutdown_ack => {},
         .hello_ack => |m| {
             std.debug.assert(m.model_name.len <= limits.max_model_name_bytes);
+
             w.put(u16, m.protocol_version);
             w.put(u32, m.max_seq);
             w.put(u16, m.max_sessions);
@@ -699,6 +810,7 @@ pub fn encodeServerMsg(msg: ServerMsg, request_id: u32, session_id: u32, out: []
         .session_opened => |m| w.put(u32, m.kv_pos),
         .token => |m| {
             std.debug.assert(m.text.len <= limits.max_token_text_bytes);
+
             w.put(u32, m.token_id);
             w.put(u8, @intFromEnum(m.channel));
             w.put(u16, @intCast(m.text.len));
@@ -735,11 +847,13 @@ pub fn encodeServerMsg(msg: ServerMsg, request_id: u32, session_id: u32, out: []
         .kept => |m| {
             std.debug.assert(m.granted_ms <= limits.max_resume_ttl_ms);
             std.debug.assert((m.granted_ms == 0) == std.mem.allEqual(u8, &m.token, 0));
+
             w.put(u32, m.granted_ms);
             w.putSlice(&m.token);
         },
         .resumed => |m| putResumed(&w, m),
     }
+
     encodeHeader(.{
         .msg_type = serverMsgType(msg),
         .request_id = request_id,
@@ -747,6 +861,49 @@ pub fn encodeServerMsg(msg: ServerMsg, request_id: u32, session_id: u32, out: []
         .payload_len = @intCast(w.i),
     }, out[0..header_bytes]);
     return header_bytes + w.i;
+}
+
+/// The bytes that `pairs` take inside a `session_append` payload, after `n`.
+pub fn appendPairsBytes(pairs: []const Pair) usize {
+    var total: usize = 0;
+    for (pairs) |p| {
+        total += pair_overhead_bytes + p.user.len + p.assistant.len;
+    }
+
+    return total;
+}
+
+/// Write the pair records of `pairs` into `out` and return the frame value.
+/// `out` must hold `appendPairsBytes(pairs)`.
+pub fn encodeAppendPairs(pairs: []const Pair, out: []u8) AppendPairs {
+    std.debug.assert(pairs.len >= 1);
+    std.debug.assert(pairs.len <= limits.max_append_pairs);
+
+    const len = appendPairsBytes(pairs);
+    std.debug.assert(out.len >= len);
+    var w: Writer = .{ .buf = out[0..len] };
+    for (pairs) |p| {
+        w.put(u32, @intCast(p.user.len));
+        w.putSlice(p.user);
+        w.put(u32, @intCast(p.assistant.len));
+        w.putSlice(p.assistant);
+    }
+
+    std.debug.assert(w.i == len);
+    return .{ .n = @intCast(pairs.len), .bytes = out[0..len] };
+}
+
+// -- helpers ----------------------------------------------------------------
+
+fn encodeHeader(h: Header, out: *[header_bytes]u8) void {
+    std.debug.assert(h.payload_len <= max_frame_payload_bytes);
+
+    std.mem.writeInt(u32, out[0..4], magic, .little);
+    std.mem.writeInt(u16, out[4..6], protocol_version, .little);
+    std.mem.writeInt(u16, out[6..8], @intFromEnum(h.msg_type), .little);
+    std.mem.writeInt(u32, out[8..12], h.request_id, .little);
+    std.mem.writeInt(u32, out[12..16], h.session_id, .little);
+    std.mem.writeInt(u32, out[16..20], h.payload_len, .little);
 }
 
 fn clientFrameLen(msg: ClientMsg) usize {
@@ -776,71 +933,6 @@ fn serverFrameLen(msg: ServerMsg) usize {
         .resumed => Resumed.wire_bytes,
     };
 }
-
-/// The `hello_ack` payload bytes outside the model name.
-const hello_ack_fixed_bytes: usize = 2 + 4 + 2 + 2 + 4 + 4 + 1 + 4 + 4 + 2 * Sampling.wire_bytes + 2;
-
-comptime {
-    // Every server frame fits the writer frame, at its largest form.
-    const name = [_]u8{'m'} ** limits.max_model_name_bytes;
-    const hello: ServerMsg = .{ .hello_ack = .{
-        .protocol_version = protocol_version,
-        .max_seq = 0,
-        .max_sessions = 0,
-        .max_batch = 0,
-        .vocab_size = 0,
-        .eos_id = 0,
-        .think_mode = .none,
-        .think_budget = 0,
-        .resume_ttl_max_ms = 0,
-        .recommended_think = Sampling.greedy,
-        .recommended_plain = Sampling.greedy,
-        .model_name = &name,
-    } };
-    std.debug.assert(serverFrameLen(hello) == header_bytes + 165);
-    std.debug.assert(serverFrameLen(hello) <= max_server_frame_bytes);
-    const kept: ServerMsg = .{ .kept = .{ .granted_ms = 0, .token = @splat(0) } };
-    std.debug.assert(serverFrameLen(kept) == 40);
-    const resumed: ServerMsg = .{ .resumed = .{ .token = @splat(1), .kv_pos = 0, .turns_done = 0, .last = null } };
-    std.debug.assert(serverFrameLen(resumed) == 58);
-    std.debug.assert(serverFrameLen(resumed) <= max_server_frame_bytes);
-    // Every client frame outside the text fits the payload bound.
-    const keep: ClientMsg = .{ .session_keep = .{ .ttl_ms = 0 } };
-    std.debug.assert(clientFrameLen(keep) == header_bytes + 4);
-    const resume_msg: ClientMsg = .{ .session_resume = .{ .token = @splat(1) } };
-    std.debug.assert(clientFrameLen(resume_msg) == header_bytes + token_bytes);
-    const gen: ClientMsg = .{ .generate = .{ .max_tokens = 1, .sampling = Sampling.greedy, .text = "", .think_open = true, .think_budget = 0, .reseed = true } };
-    std.debug.assert(clientFrameLen(gen) == header_bytes + generate_fixed_bytes_max);
-    // The longest text with every optional field fills the payload bound.
-    std.debug.assert(clientFrameLen(gen) + generate_text_bytes_max == header_bytes + max_frame_payload_bytes);
-}
-
-/// The bytes that `pairs` take inside a `session_append` payload, after `n`.
-pub fn appendPairsBytes(pairs: []const Pair) usize {
-    var total: usize = 0;
-    for (pairs) |p| total += pair_overhead_bytes + p.user.len + p.assistant.len;
-    return total;
-}
-
-/// Write the pair records of `pairs` into `out` and return the frame value.
-/// `out` must hold `appendPairsBytes(pairs)`.
-pub fn encodeAppendPairs(pairs: []const Pair, out: []u8) AppendPairs {
-    std.debug.assert(pairs.len >= 1);
-    std.debug.assert(pairs.len <= limits.max_append_pairs);
-    const len = appendPairsBytes(pairs);
-    std.debug.assert(out.len >= len);
-    var w: Writer = .{ .buf = out[0..len] };
-    for (pairs) |p| {
-        w.put(u32, @intCast(p.user.len));
-        w.putSlice(p.user);
-        w.put(u32, @intCast(p.assistant.len));
-        w.putSlice(p.assistant);
-    }
-    std.debug.assert(w.i == len);
-    return .{ .n = @intCast(pairs.len), .bytes = out[0..len] };
-}
-
-// -- helpers ----------------------------------------------------------------
 
 fn clientMsgType(msg: ClientMsg) MsgType {
     return switch (msg) {
@@ -893,10 +985,17 @@ fn takeSampling(c: *Cursor) DecodeError!Sampling {
     if (!std.math.isFinite(s.temperature) or s.temperature < 0) return error.PayloadMalformed;
     if (!std.math.isFinite(s.top_p) or s.top_p <= 0 or s.top_p > 1) return error.PayloadMalformed;
     if (s.top_k > limits.max_top_k) return error.PayloadMalformed;
-    if (!std.math.isFinite(s.presence_penalty) or @abs(s.presence_penalty) > limits.max_presence_penalty) return error.PayloadMalformed;
-    if (!(s.repetition_penalty > 0 and s.repetition_penalty <= limits.max_repetition_penalty)) return error.PayloadMalformed;
+    if (!std.math.isFinite(
+        s.presence_penalty,
+    ) or @abs(s.presence_penalty) > limits.max_presence_penalty) {
+        return error.PayloadMalformed;
+    }
+    if (!(s.repetition_penalty > 0 and s.repetition_penalty <= limits.max_repetition_penalty)) {
+        return error.PayloadMalformed;
+    }
     if (!(s.min_p >= 0 and s.min_p <= 1)) return error.PayloadMalformed;
     if (!(@abs(s.frequency_penalty) <= frequency_penalty_max)) return error.PayloadMalformed;
+
     return s;
 }
 
@@ -909,18 +1008,24 @@ fn takeToken(c: *Cursor) DecodeError!Token {
 fn takeResumed(c: *Cursor) DecodeError!Resumed {
     const token = try takeToken(c);
     if (std.mem.allEqual(u8, &token, 0)) return error.PayloadMalformed;
+
     const kv_pos = try c.take(u32);
     const turns_done = try c.take(u32);
     const has_last = try c.take(u8);
     if (has_last > 1) return error.PayloadMalformed;
+
     const request_id = try c.take(u32);
     const finish_raw = try c.take(u8);
     const gen_tokens = try c.take(u32);
     const reasoning_tokens = try c.take(u32);
     if (has_last == 0) {
-        if (request_id != 0 or finish_raw != 0 or gen_tokens != 0 or reasoning_tokens != 0) return error.PayloadMalformed;
+        if (request_id != 0 or finish_raw != 0 or gen_tokens != 0 or reasoning_tokens != 0) {
+            return error.PayloadMalformed;
+        }
+
         return .{ .token = token, .kv_pos = kv_pos, .turns_done = turns_done, .last = null };
     }
+
     const finish = std.enums.fromInt(FinishReason, finish_raw) orelse return error.PayloadMalformed;
     return .{ .token = token, .kv_pos = kv_pos, .turns_done = turns_done, .last = .{
         .request_id = request_id,
@@ -932,11 +1037,17 @@ fn takeResumed(c: *Cursor) DecodeError!Resumed {
 
 fn putResumed(w: *Writer, r: Resumed) void {
     std.debug.assert(!std.mem.allEqual(u8, &r.token, 0));
+
     const start = w.i;
     w.putSlice(&r.token);
     w.put(u32, r.kv_pos);
     w.put(u32, r.turns_done);
-    const last: LastDone = r.last orelse .{ .request_id = 0, .finish = .eos, .gen_tokens = 0, .reasoning_tokens = 0 };
+    const last: LastDone = r.last orelse .{
+        .request_id = 0,
+        .finish = .eos,
+        .gen_tokens = 0,
+        .reasoning_tokens = 0,
+    };
     w.put(u8, @intFromBool(r.last != null));
     w.put(u32, last.request_id);
     w.put(u8, @intFromEnum(last.finish));
@@ -949,13 +1060,25 @@ fn putResumed(w: *Writer, r: Resumed) void {
 /// think bit.
 fn generateFlags(sampling: bool, think_open: ?bool, budget: bool, reseed: bool) u8 {
     var flags: u8 = 0;
-    if (sampling) flags |= generate_flag_sampling;
-    if (reseed) flags |= generate_flag_reseed;
+    if (sampling) {
+        flags |= generate_flag_sampling;
+    }
+
+    if (reseed) {
+        flags |= generate_flag_reseed;
+    }
+
     if (think_open) |open| {
         flags |= generate_flag_think_switch;
-        if (open) flags |= generate_flag_think_open;
+        if (open) {
+            flags |= generate_flag_think_open;
+        }
     }
-    if (budget) flags |= generate_flag_think_budget;
+
+    if (budget) {
+        flags |= generate_flag_think_budget;
+    }
+
     std.debug.assert(flags & ~generate_flags_known == 0);
     return flags;
 }
@@ -965,11 +1088,13 @@ fn generateFlags(sampling: bool, think_open: ?bool, budget: bool, reseed: bool) 
 fn takeAppendPairs(c: *Cursor) DecodeError!AppendPairs {
     const n = try c.take(u16);
     if (n == 0 or n > limits.max_append_pairs) return error.PayloadMalformed;
+
     const start = c.i;
     for (0..n) |_| {
         _ = try c.takeSlice(try c.take(u32));
         _ = try c.takeSlice(try c.take(u32));
     }
+
     return .{ .n = n, .bytes = c.buf[start..c.i] };
 }
 
@@ -977,11 +1102,13 @@ fn takeAppendPairs(c: *Cursor) DecodeError!AppendPairs {
 fn takeAppended(c: *Cursor) DecodeError!Appended {
     const n = try c.take(u16);
     if (n == 0 or n > limits.max_append_pairs) return error.PayloadMalformed;
+
     var a: Appended = .{ .n = n };
     for (a.kv_pos[0..n], 0..) |*pos, i| {
         pos.* = try c.take(u32);
         if (i > 0 and a.kv_pos[i - 1] > pos.*) return error.PayloadMalformed;
     }
+
     return a;
 }
 
@@ -1027,7 +1154,11 @@ test "round-trip: every client message" {
         .sampling = .{ .temperature = 0.8, .top_k = 40, .top_p = 0.95, .seed = 0xDEAD_BEEF },
         .system_prompt = "You are a helpful assistant.",
     } }, 2, 0);
-    try roundTripClient(.{ .generate = .{ .max_tokens = 64, .sampling = null, .text = "Hi" } }, 3, 7);
+    try roundTripClient(
+        .{ .generate = .{ .max_tokens = 64, .sampling = null, .text = "Hi" } },
+        3,
+        7,
+    );
     try roundTripClient(.{ .generate = .{
         .max_tokens = 8,
         .sampling = Sampling.greedy,
@@ -1039,12 +1170,23 @@ test "round-trip: every client message" {
     try roundTripClient(.ping, 8, 0);
     try roundTripClient(.shutdown, 9, 0);
     try roundTripClient(.{ .session_clone = .{
-        .sampling = .{ .temperature = 0.6, .top_k = 20, .top_p = 0.9, .seed = 42, .presence_penalty = -1.5, .repetition_penalty = 1.3, .min_p = 0.05 },
+        .sampling = .{
+            .temperature = 0.6,
+            .top_k = 20,
+            .top_p = 0.9,
+            .seed = 42,
+            .presence_penalty = -1.5,
+            .repetition_penalty = 1.3,
+            .min_p = 0.05,
+        },
     } }, 10, 7);
     // Every combination of the generate flags round trips.
     for ([_]?bool{ null, false, true }) |think_open| {
         for ([_]?u32{ null, 0, 512, limits.max_model_ctx }) |think_budget| {
-            for ([_]?Sampling{ null, .{ .temperature = 0.7, .top_k = 40, .top_p = 0.8, .seed = 9, .min_p = 1, .repetition_penalty = 2 } }) |sampling| {
+            for ([_]?Sampling{
+                null,
+                .{ .temperature = 0.7, .top_k = 40, .top_p = 0.8, .seed = 9, .min_p = 1, .repetition_penalty = 2 },
+            }) |sampling| {
                 try roundTripClient(.{ .generate = .{
                     .max_tokens = 5,
                     .sampling = sampling,
@@ -1055,6 +1197,7 @@ test "round-trip: every client message" {
             }
         }
     }
+
     try roundTripClient(.{ .session_keep = .{ .ttl_ms = 0 } }, 13, 7);
     try roundTripClient(.{ .session_keep = .{ .ttl_ms = 60_000 } }, 14, 7);
     var token: Token = @splat(0xA5);
@@ -1075,6 +1218,7 @@ test "round-trip: every client message" {
         try std.testing.expectEqualStrings(want.user, got.user);
         try std.testing.expectEqualStrings(want.assistant, got.assistant);
     }
+
     try std.testing.expect(it.next() == null);
 }
 
@@ -1089,25 +1233,57 @@ test "round-trip: every server message" {
         .think_mode = .on,
         .think_budget = 512,
         .resume_ttl_max_ms = 60_000,
-        .recommended_think = .{ .temperature = 1, .top_k = 20, .top_p = 0.95, .seed = 0, .presence_penalty = 1.5 },
-        .recommended_plain = .{ .temperature = 0.7, .top_k = 20, .top_p = 0.8, .seed = 0, .presence_penalty = 1.5, .min_p = 0.1, .repetition_penalty = 1.1 },
+        .recommended_think = .{
+            .temperature = 1,
+            .top_k = 20,
+            .top_p = 0.95,
+            .seed = 0,
+            .presence_penalty = 1.5,
+        },
+        .recommended_plain = .{
+            .temperature = 0.7,
+            .top_k = 20,
+            .top_p = 0.8,
+            .seed = 0,
+            .presence_penalty = 1.5,
+            .min_p = 0.1,
+            .repetition_penalty = 1.1,
+        },
         .model_name = "SmolLM2-135M-Instruct-Q8_0",
     } }, 1, 0);
     try roundTripServer(.{ .kept = .{ .granted_ms = 0, .token = @splat(0) } }, 11, 3);
-    try roundTripServer(.{ .kept = .{ .granted_ms = limits.max_resume_ttl_ms, .token = @splat(7) } }, 12, 3);
-    try roundTripServer(.{ .resumed = .{ .token = @splat(9), .kv_pos = 40, .turns_done = 3, .last = null } }, 13, 3);
+    try roundTripServer(
+        .{ .kept = .{ .granted_ms = limits.max_resume_ttl_ms, .token = @splat(7) } },
+        12,
+        3,
+    );
+    try roundTripServer(
+        .{ .resumed = .{ .token = @splat(9), .kv_pos = 40, .turns_done = 3, .last = null } },
+        13,
+        3,
+    );
     for (std.enums.values(FinishReason)) |finish| {
-        try roundTripServer(.{ .resumed = .{ .token = @splat(9), .kv_pos = 40, .turns_done = 3, .last = .{
-            .request_id = 77,
-            .finish = finish,
-            .gen_tokens = 12,
-            .reasoning_tokens = 5,
-        } } }, 14, 3);
+        try roundTripServer(
+            .{ .resumed = .{ .token = @splat(9), .kv_pos = 40, .turns_done = 3, .last = .{
+                .request_id = 77,
+                .finish = finish,
+                .gen_tokens = 12,
+                .reasoning_tokens = 5,
+            } } },
+            14,
+            3,
+        );
     }
+
     try roundTripServer(.{ .session_opened = .{ .kv_pos = 37 } }, 2, 3);
     for (std.enums.values(Channel)) |channel| {
-        try roundTripServer(.{ .token = .{ .token_id = 1234, .channel = channel, .text = " hello" } }, 3, 3);
+        try roundTripServer(
+            .{ .token = .{ .token_id = 1234, .channel = channel, .text = " hello" } },
+            3,
+            3,
+        );
     }
+
     try roundTripServer(.{ .done = .{
         .finish_reason = .eos,
         .turn_prompt_tokens = 12,
@@ -1120,10 +1296,15 @@ test "round-trip: every server message" {
     var appended: Appended = .{ .n = 3 };
     appended.kv_pos[0..3].* = .{ 40, 40, 97 };
     try roundTripServer(.{ .appended = appended }, 10, 3);
-    try roundTripServer(.{ .err = .{ .code = .turn_too_long, .detail = "turn exceeds context" } }, 5, 3);
+    try roundTripServer(
+        .{ .err = .{ .code = .turn_too_long, .detail = "turn exceeds context" } },
+        5,
+        3,
+    );
     for (std.enums.values(ErrorCode)) |code| {
         try roundTripServer(.{ .err = .{ .code = code, .detail = @tagName(code) } }, 5, 0);
     }
+
     try roundTripServer(.{ .stats_ack = .{
         .sessions_open = 2,
         .sessions_decoding = 1,
@@ -1138,7 +1319,9 @@ test "round-trip: every server message" {
 test "the longest token message fills max_server_frame_bytes" {
     const text = [_]u8{'t'} ** 256;
     try std.testing.expectEqual(limits.max_token_text_bytes, text.len);
-    const token: ServerMsg = .{ .token = .{ .token_id = 1234, .channel = .reasoning, .text = &text } };
+    const token: ServerMsg = .{
+        .token = .{ .token_id = 1234, .channel = .reasoning, .text = &text },
+    };
     try std.testing.expectEqual(max_server_frame_bytes, serverFrameLen(token));
     try std.testing.expectEqual(@as(usize, 283), max_server_frame_bytes);
 
@@ -1208,35 +1391,43 @@ fn checkGuard(c: GuardCase) !void {
         .client => |m| encodeClientMsg(m, 1, c.session_id, &buf),
         .server => |m| encodeServerMsg(m, 1, c.session_id, &buf),
     };
+
     try std.testing.expectEqual(protocol_version, std.mem.readInt(u16, buf[4..6], .little));
-    for (c.patches) |patch| switch (patch) {
-        .set => |s| @memcpy(buf[s.at..][0..s.bytes.len], s.bytes),
-        .zero_from => |at| @memset(buf[at..end], 0),
-        .truncate => |len| end = header_bytes + len,
-        .shorten => |n| end -= n,
-        .extend => |n| {
-            @memset(buf[end..][0..n], 0);
-            end += n;
-        },
-    };
+    for (c.patches) |patch| {
+        switch (patch) {
+            .set => |s| @memcpy(buf[s.at..][0..s.bytes.len], s.bytes),
+            .zero_from => |at| @memset(buf[at..end], 0),
+            .truncate => |len| end = header_bytes + len,
+            .shorten => |n| end -= n,
+            .extend => |n| {
+                @memset(buf[end..][0..n], 0);
+                end += n;
+            },
+        }
+    }
+
     if (c.header_only) {
         const got = decodeHeader(buf[0..header_bytes]);
         if (c.want) |err| return std.testing.expectError(err, got);
+
         try std.testing.expectEqual(c.session_id, (try got).session_id);
         return;
     }
+
     const payload = buf[header_bytes..end];
     var again: [512]u8 = undefined;
     switch (c.msg) {
         .client => |m| {
             const t = c.decode_as orelse clientMsgType(m);
             if (c.want) |err| return std.testing.expectError(err, decodeClientPayload(t, payload));
+
             const k = encodeClientMsg(try decodeClientPayload(t, payload), 1, c.session_id, &again);
             try std.testing.expectEqualSlices(u8, payload, again[header_bytes..k]);
         },
         .server => |m| {
             const t = c.decode_as orelse serverMsgType(m);
             if (c.want) |err| return std.testing.expectError(err, decodeServerPayload(t, payload));
+
             const k = encodeServerMsg(try decodeServerPayload(t, payload), 1, c.session_id, &again);
             try std.testing.expectEqualSlices(u8, payload, again[header_bytes..k]);
         },
@@ -1247,22 +1438,34 @@ fn setAt(comptime at: usize, comptime bytes: []const u8) []const Patch {
     return &.{.{ .set = .{ .at = at, .bytes = bytes } }};
 }
 
-const gen_x: GuardMsg = .{ .client = .{ .generate = .{ .max_tokens = 4, .sampling = null, .text = "x" } } };
-const open_greedy: GuardMsg = .{ .client = .{ .session_open = .{ .sampling = Sampling.greedy, .system_prompt = "" } } };
+const gen_x: GuardMsg = .{
+    .client = .{ .generate = .{ .max_tokens = 4, .sampling = null, .text = "x" } },
+};
+const open_greedy: GuardMsg = .{
+    .client = .{ .session_open = .{ .sampling = Sampling.greedy, .system_prompt = "" } },
+};
 const ping_msg: GuardMsg = .{ .client = .ping };
 const flags_at = header_bytes + 4;
 const frequency_at = header_bytes + 24;
 const repetition_at = header_bytes + 28;
 const min_p_at = header_bytes + 32;
 
-fn samplingGuard(comptime name: []const u8, comptime at: usize, comptime v: f32, want: ?DecodeError) GuardCase {
+fn samplingGuard(
+    comptime name: []const u8,
+    comptime at: usize,
+    comptime v: f32,
+    want: ?DecodeError,
+) GuardCase {
     return .{ .name = name, .msg = open_greedy, .patches = setAt(at, &f32le(v)), .want = want };
 }
 
 fn penaltyOk(comptime field: []const u8, comptime v: f32) GuardCase {
     var s = Sampling.greedy;
     @field(s, field) = v;
-    return .{ .name = "penalty in range decodes", .msg = .{ .client = .{ .session_open = .{ .sampling = s, .system_prompt = "" } } } };
+    return .{
+        .name = "penalty in range decodes",
+        .msg = .{ .client = .{ .session_open = .{ .sampling = s, .system_prompt = "" } } },
+    };
 }
 
 fn kvPosAppended() GuardMsg {
@@ -1276,13 +1479,17 @@ const append_two: GuardMsg = .{ .client = .{ .session_append = .{
     .bytes = &.{ 2, 0, 0, 0, 'a', 'b', 1, 0, 0, 0, 'c', 1, 0, 0, 0, 'd', 0, 0, 0, 0 },
 } } };
 
-const resumed_full: GuardMsg = .{ .server = .{ .resumed = .{ .token = @splat(9), .kv_pos = 4, .turns_done = 1, .last = .{
-    .request_id = 3,
-    .finish = .eos,
-    .gen_tokens = 2,
-    .reasoning_tokens = 0,
-} } } };
-const resumed_none: GuardMsg = .{ .server = .{ .resumed = .{ .token = @splat(9), .kv_pos = 4, .turns_done = 1, .last = null } } };
+const resumed_full: GuardMsg = .{
+    .server = .{ .resumed = .{ .token = @splat(9), .kv_pos = 4, .turns_done = 1, .last = .{
+        .request_id = 3,
+        .finish = .eos,
+        .gen_tokens = 2,
+        .reasoning_tokens = 0,
+    } } },
+};
+const resumed_none: GuardMsg = .{
+    .server = .{ .resumed = .{ .token = @splat(9), .kv_pos = 4, .turns_done = 1, .last = null } },
+};
 const kept_msg: GuardMsg = .{ .server = .{ .kept = .{ .granted_ms = 10, .token = @splat(4) } } };
 const rp = header_bytes;
 
@@ -1317,7 +1524,16 @@ test "guards: every refused frame returns its typed error, and every edge decode
         .{ .name = "think budget at the bound", .msg = .{ .client = .{ .generate = .{ .max_tokens = 4, .sampling = null, .text = "x", .think_budget = limits.max_model_ctx } } } },
         .{
             .name = "think budget past the bound",
-            .msg = .{ .client = .{ .generate = .{ .max_tokens = 4, .sampling = null, .text = "x", .think_budget = limits.max_model_ctx } } },
+            .msg = .{
+                .client = .{
+                    .generate = .{
+                        .max_tokens = 4,
+                        .sampling = null,
+                        .text = "x",
+                        .think_budget = limits.max_model_ctx,
+                    },
+                },
+            },
             .patches = setAt(header_bytes + 5, &le(u32, limits.max_model_ctx + 1)),
             .want = bad,
         },
@@ -1349,7 +1565,12 @@ test "guards: every refused frame returns its typed error, and every edge decode
         penaltyOk("frequency_penalty", 2),
         samplingGuard("repetition 0", repetition_at, 0, bad),
         samplingGuard("repetition -1", repetition_at, -1, bad),
-        samplingGuard("repetition past the ceiling", repetition_at, limits.max_repetition_penalty + 0.01, bad),
+        samplingGuard(
+            "repetition past the ceiling",
+            repetition_at,
+            limits.max_repetition_penalty + 0.01,
+            bad,
+        ),
         samplingGuard("repetition NaN", repetition_at, std.math.nan(f32), bad),
         samplingGuard("min_p -0.01", min_p_at, -0.01, bad),
         samplingGuard("min_p 1.01", min_p_at, 1.01, bad),
@@ -1389,6 +1610,7 @@ test "guards: every refused frame returns its typed error, and every edge decode
     };
     for (cases) |c| {
         errdefer std.debug.print("guard case: {s}\n", .{c.name});
+
         try checkGuard(c);
     }
 }
@@ -1415,7 +1637,10 @@ test "mutation: one flipped byte in each new frame decodes to a typed error or a
             for (0..8) |bit| {
                 var m = buf;
                 m[at] ^= @as(u8, 1) << @intCast(bit);
-                const got = decodeClientPayload(clientMsgType(msg), m[header_bytes..n]) catch continue;
+                const got = decodeClientPayload(
+                    clientMsgType(msg),
+                    m[header_bytes..n],
+                ) catch continue;
                 // A decoded mutant re-encodes to its own bytes, so no field
                 // is dropped or read twice.
                 var again: [256]u8 = undefined;
@@ -1424,6 +1649,7 @@ test "mutation: one flipped byte in each new frame decodes to a typed error or a
             }
         }
     }
+
     const servers = [_]ServerMsg{
         .{ .kept = .{ .granted_ms = 500, .token = token } },
         .{ .resumed = .{ .token = token, .kv_pos = 9, .turns_done = 2, .last = .{ .request_id = 4, .finish = .max_tokens, .gen_tokens = 3, .reasoning_tokens = 1 } } },
@@ -1434,7 +1660,10 @@ test "mutation: one flipped byte in each new frame decodes to a typed error or a
             for (0..8) |bit| {
                 var m = buf;
                 m[at] ^= @as(u8, 1) << @intCast(bit);
-                const got = decodeServerPayload(serverMsgType(msg), m[header_bytes..n]) catch continue;
+                const got = decodeServerPayload(
+                    serverMsgType(msg),
+                    m[header_bytes..n],
+                ) catch continue;
                 var again: [256]u8 = undefined;
                 const k = encodeServerMsg(got, 1, 1, &again);
                 try std.testing.expectEqualSlices(u8, m[header_bytes..n], again[header_bytes..k]);
@@ -1471,6 +1700,7 @@ fn checkMutation(_: void, c: MutationCase) anyerror!void {
     for (0..flips) |_| {
         mutated[random.uintLessThan(usize, n)] ^= @as(u8, 1) << random.int(u3);
     }
+
     const h = decodeHeader(mutated[0..header_bytes]) catch return;
     const end = @min(header_bytes + h.payload_len, n);
     const got = decodeClientPayload(h.msg_type, mutated[header_bytes..end]) catch return;
@@ -1481,7 +1711,13 @@ fn checkMutation(_: void, c: MutationCase) anyerror!void {
 }
 
 test "property: random byte mutations decode to a typed error or a valid message, never a crash" {
-    try prop.forAll(.{ .site = 0x5EED, .cases = 1200 }, {}, MutationCase, genMutation, checkMutation);
+    try prop.forAll(
+        .{ .site = 0x5EED, .cases = 1200 },
+        {},
+        MutationCase,
+        genMutation,
+        checkMutation,
+    );
 }
 
 /// A case of the codec properties: one seed, and a size that bounds every
@@ -1534,7 +1770,12 @@ fn genClientMsg(r: std.Random, size: u32, text: *[256]u8, pair_buf: *[256]u8) Cl
     const tag = r.enumValue(std.meta.Tag(ClientMsg));
     return switch (tag) {
         inline .hello, .cancel, .session_close, .stats, .ping, .shutdown => |t| t,
-        .session_open => .{ .session_open = .{ .sampling = genSampling(r), .system_prompt = genBytes(r, text, size * 4) } },
+        .session_open => .{
+            .session_open = .{
+                .sampling = genSampling(r),
+                .system_prompt = genBytes(r, text, size * 4),
+            },
+        },
         .session_clone => .{ .session_clone = .{ .sampling = genSampling(r) } },
         .session_keep => .{ .session_keep = .{ .ttl_ms = r.int(u32) } },
         .session_resume => .{ .session_resume = .{ .token = genToken(r) } },
@@ -1559,6 +1800,7 @@ fn genClientMsg(r: std.Random, size: u32, text: *[256]u8, pair_buf: *[256]u8) Cl
                 p.assistant = genBytes(r, text[used..], 8);
                 used += p.assistant.len;
             }
+
             break :blk .{ .session_append = encodeAppendPairs(pairs[0..n], pair_buf) };
         },
     };
@@ -1597,7 +1839,9 @@ fn genServerMsg(r: std.Random, size: u32, text: *[256]u8) ServerMsg {
             .decode_ms = floatIn(r, 0, 1e6),
             .reasoning_tokens = r.int(u32),
         } },
-        .err => .{ .err = .{ .code = r.enumValue(ErrorCode), .detail = genBytes(r, text, size * 4) } },
+        .err => .{
+            .err = .{ .code = r.enumValue(ErrorCode), .detail = genBytes(r, text, size * 4) },
+        },
         .stats_ack => .{ .stats_ack = .{
             .sessions_open = r.int(u16),
             .sessions_decoding = r.int(u16),
@@ -1611,11 +1855,17 @@ fn genServerMsg(r: std.Random, size: u32, text: *[256]u8) ServerMsg {
                 pos += r.uintAtMost(u32, 64);
                 p.* = pos;
             }
+
             break :blk .{ .appended = a };
         },
         .kept => blk: {
             const granted = r.uintAtMost(u32, limits.max_resume_ttl_ms);
-            break :blk .{ .kept = .{ .granted_ms = granted, .token = if (granted == 0) @splat(0) else genToken(r) } };
+            break :blk .{
+                .kept = .{
+                    .granted_ms = granted,
+                    .token = if (granted == 0) @splat(0) else genToken(r),
+                },
+            };
         },
         .resumed => .{ .resumed = .{
             .token = genToken(r),
@@ -1639,6 +1889,7 @@ fn expectCutsRefused(msg: GuardMsg, session_id: u32) !void {
         .client => |m| encodeClientMsg(m, 1, session_id, &buf),
         .server => |m| encodeServerMsg(m, 1, session_id, &buf),
     };
+
     for (1..n - header_bytes + 1) |cut| {
         try checkGuard(.{
             .name = "cut",

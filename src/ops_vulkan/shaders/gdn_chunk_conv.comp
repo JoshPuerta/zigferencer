@@ -1,4 +1,4 @@
-// Conv1d, SiLU, and L2-norm front end for the chunked GDN prefill of Qwen3.5. It
+// Conv1d, SiLU, and L2-norm frontend for the chunked GDN prefill of Qwen3.5. It
 // pairs with `gdn_chunk_scan.comp`, which consumes what this kernel writes, and
 // it mirrors the conv and L2-norm front of ops/gdn.zig step().
 //

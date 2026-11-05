@@ -15,6 +15,152 @@ const dtype = @import("dtype.zig");
 const limits = @import("limits.zig");
 const log = std.log.scoped(.run);
 
+// -- constants --------------------------------------------------------------
+
+const models = [_]Model{
+    // Primary small model. Llama-family, ByteLevel BPE tokenizer.
+    // The upstream HuggingFaceTB GGUF repo is gated. bartowski's mirror is public.
+    .{
+        .pub_name = "SmolLM2-135M-Instruct-Q8_0",
+        .local_path = "bartowski_SmolLM2-135M-Instruct-GGUF",
+        .file_name = "SmolLM2-135M-Instruct-Q8_0.gguf",
+        .download_url = "https://huggingface.co/bartowski/SmolLM2-135M-Instruct-GGUF/resolve/main/SmolLM2-135M-Instruct-Q8_0.gguf",
+        .chat_template_kind = .chatml_smollm2,
+    },
+    // Stretch target. The simd_pf CPU backend runs it end to end.
+    .{
+        .pub_name = "Meta-Llama-3.1-8B-Instruct-Q8_0",
+        .local_path = "bartowski_Meta-Llama-3.1-8B-Instruct-GGUF",
+        .file_name = "Meta-Llama-3.1-8B-Instruct-Q8_0.gguf",
+        .download_url = "https://huggingface.co/bartowski/Meta-Llama-3.1-8B-Instruct-GGUF/resolve/main/Meta-Llama-3.1-8B-Instruct-Q8_0.gguf",
+        .chat_template_kind = .llama3,
+        // f16 KV is the default: outputs are byte identical to f32 on every
+        // arm, latency is at parity or ahead, and the 32-token reference hash
+        // does not move. Half the KV bytes buy double the serve residency and
+        // 1.78x swap.
+        .kv_dtype_default = .f16,
+    },
+    // Q4_0 variants for the GPU bandwidth-win measurement (decode is
+    // memory-bound, and Q4_0 halves the weight stream). bartowski ships plain
+    // Q4_0 for SmolLM2. For Llama-3.1-8B bartowski only has the ARM-repacked
+    // Q4_0_4_4/_4_8/_8_8 (incompatible layout), so the entry uses QuantFactory's
+    // plain Q4_0.
+    .{
+        .pub_name = "SmolLM2-135M-Instruct-Q4_0",
+        .local_path = "bartowski_SmolLM2-135M-Instruct-GGUF",
+        .file_name = "SmolLM2-135M-Instruct-Q4_0.gguf",
+        .download_url = "https://huggingface.co/bartowski/SmolLM2-135M-Instruct-GGUF/resolve/main/SmolLM2-135M-Instruct-Q4_0.gguf",
+        .chat_template_kind = .chatml_smollm2,
+    },
+    .{
+        .pub_name = "Meta-Llama-3.1-8B-Instruct-Q4_0",
+        .local_path = "QuantFactory_Meta-Llama-3.1-8B-Instruct-GGUF",
+        .file_name = "Meta-Llama-3.1-8B-Instruct.Q4_0.gguf",
+        .download_url = "https://huggingface.co/QuantFactory/Meta-Llama-3.1-8B-Instruct-GGUF/resolve/main/Meta-Llama-3.1-8B-Instruct.Q4_0.gguf",
+        .chat_template_kind = .llama3,
+        // The file declares 131072 positions but carries no llama3 RoPE
+        // factors, so positions past the original 8192 context are outside
+        // its training.
+        .context_limit = 8192,
+    },
+    // Qwen3.5 hybrid Gated-DeltaNet + full-attention models. The 2B is the
+    // dev/correctness target (small, fast, low VRAM). The 9B is the
+    // measurement target. ChatML template (see `core/chat.zig`). Only
+    // k-quants + Q8_0 ship (no Q4_0).
+    .{
+        .pub_name = "Qwen3.5-2B-Q8_0",
+        .local_path = "lmstudio-community_Qwen3.5-2B-GGUF",
+        .file_name = "Qwen3.5-2B-Q8_0.gguf",
+        .download_url = "https://huggingface.co/lmstudio-community/Qwen3.5-2B-GGUF/resolve/main/Qwen3.5-2B-Q8_0.gguf",
+        // The model file's template thinks only when enable_thinking is true.
+        .chat_template_kind = .{ .chatml_qwen = .off },
+        // f16 KV is the default: outputs are byte identical across backends
+        // and dtypes at depth, fused prefill is 7% ahead, and every other arm
+        // is at parity. The fixed GDN state stays f32, so blobs shrink to
+        // 0.64x.
+        .kv_dtype_default = .f16,
+        // The card values for text tasks, from
+        // https://huggingface.co/Qwen/Qwen3.5-2B/raw/main/README.md.
+        .sampling = .{
+            .thinking = .{
+                .temperature = 1.0,
+                .top_k = 20,
+                .top_p = 0.95,
+                .presence_penalty = 1.5,
+                .min_p = 0,
+                .repetition_penalty = 1,
+            },
+            .non_thinking = .{
+                .temperature = 1.0,
+                .top_k = 20,
+                .top_p = 1.0,
+                .presence_penalty = 2.0,
+                .min_p = 0,
+                .repetition_penalty = 1,
+            },
+        },
+    },
+    .{
+        .pub_name = "Qwen3.5-9B-Q8_0",
+        .local_path = "lmstudio-community_Qwen3.5-9B-GGUF",
+        .file_name = "Qwen3.5-9B-Q8_0.gguf",
+        .download_url = "https://huggingface.co/lmstudio-community/Qwen3.5-9B-GGUF/resolve/main/Qwen3.5-9B-Q8_0.gguf",
+        // The model file's template thinks unless enable_thinking is false.
+        .chat_template_kind = .{ .chatml_qwen = .on },
+        // f16 KV is the default: the 2B shape repeats at four times the scale,
+        // and about 110 slots fit in free VRAM where f32 fits about 88.
+        .kv_dtype_default = .f16,
+        // The card values for general tasks, from
+        // https://huggingface.co/Qwen/Qwen3.5-9B/raw/main/README.md.
+        .sampling = .{
+            .thinking = .{
+                .temperature = 1.0,
+                .top_k = 20,
+                .top_p = 0.95,
+                .presence_penalty = 1.5,
+                .min_p = 0,
+                .repetition_penalty = 1,
+            },
+            .non_thinking = .{
+                .temperature = 0.7,
+                .top_k = 20,
+                .top_p = 0.8,
+                .presence_penalty = 1.5,
+                .min_p = 0,
+                .repetition_penalty = 1,
+            },
+        },
+    },
+};
+
+// The card values cross the wire in every `hello_ack`, and the client
+// decoder applies the wire guards to them. A card outside the guards makes
+// every hello malformed, so the build refuses it.
+comptime {
+    for (models) |m| {
+        const card = m.sampling orelse continue;
+        for ([_]Recommended{ card.thinking, card.non_thinking }) |r| {
+            std.debug.assert(r.temperature >= 0);
+            std.debug.assert(r.top_p > 0 and r.top_p <= 1);
+            std.debug.assert(r.top_k <= limits.max_top_k);
+            std.debug.assert(@abs(r.presence_penalty) <= limits.max_presence_penalty);
+            std.debug.assert(r.min_p >= 0 and r.min_p <= 1);
+            std.debug.assert(
+                r.repetition_penalty > 0 and r.repetition_penalty <= limits.max_repetition_penalty,
+            );
+        }
+    }
+}
+
+/// Environment variable naming a secondary models store on another (e.g.
+/// bigger) disk: `ZIGFERENCER_MODELS_DIR=/data/big/models`. The per-model
+/// subdirectory (`<org>_<repo>/`) is appended underneath it. Reads check the
+/// repo-local `models/` first and then this store (`locate`). When the
+/// variable is set, `fetch` downloads into the store rather than `models/`.
+pub const models_dir_env = "ZIGFERENCER_MODELS_DIR";
+
+pub const default_models_root = "models";
+
 // -- types ------------------------------------------------------------------
 
 /// The sampling that a model card recommends for one thinking mode. The
@@ -71,124 +217,11 @@ pub const Model = struct {
     sampling: ?SamplingCard = null,
 };
 
-const models = [_]Model{
-    // Primary small model. Llama-family, ByteLevel BPE tokenizer.
-    // The upstream HuggingFaceTB GGUF repo is gated. bartowski's mirror is public.
-    .{
-        .pub_name = "SmolLM2-135M-Instruct-Q8_0",
-        .local_path = "bartowski_SmolLM2-135M-Instruct-GGUF",
-        .file_name = "SmolLM2-135M-Instruct-Q8_0.gguf",
-        .download_url = "https://huggingface.co/bartowski/SmolLM2-135M-Instruct-GGUF/resolve/main/SmolLM2-135M-Instruct-Q8_0.gguf",
-        .chat_template_kind = .chatml_smollm2,
-    },
-    // Stretch target. The simd_pf CPU backend runs it end to end.
-    .{
-        .pub_name = "Meta-Llama-3.1-8B-Instruct-Q8_0",
-        .local_path = "bartowski_Meta-Llama-3.1-8B-Instruct-GGUF",
-        .file_name = "Meta-Llama-3.1-8B-Instruct-Q8_0.gguf",
-        .download_url = "https://huggingface.co/bartowski/Meta-Llama-3.1-8B-Instruct-GGUF/resolve/main/Meta-Llama-3.1-8B-Instruct-Q8_0.gguf",
-        .chat_template_kind = .llama3,
-        // f16 KV is the default: outputs are byte identical to f32 on every
-        // arm, latency is at parity or ahead, and the 32-token oracle hash
-        // does not move. Half the KV bytes buy double the serve residency and
-        // 1.78x swap.
-        .kv_dtype_default = .f16,
-    },
-    // Q4_0 variants for the GPU bandwidth-win measurement (decode is
-    // memory-bound, and Q4_0 halves the weight stream). bartowski ships plain
-    // Q4_0 for SmolLM2. For Llama-3.1-8B bartowski only has the ARM-repacked
-    // Q4_0_4_4/_4_8/_8_8 (incompatible layout), so the entry uses QuantFactory's
-    // plain Q4_0.
-    .{
-        .pub_name = "SmolLM2-135M-Instruct-Q4_0",
-        .local_path = "bartowski_SmolLM2-135M-Instruct-GGUF",
-        .file_name = "SmolLM2-135M-Instruct-Q4_0.gguf",
-        .download_url = "https://huggingface.co/bartowski/SmolLM2-135M-Instruct-GGUF/resolve/main/SmolLM2-135M-Instruct-Q4_0.gguf",
-        .chat_template_kind = .chatml_smollm2,
-    },
-    .{
-        .pub_name = "Meta-Llama-3.1-8B-Instruct-Q4_0",
-        .local_path = "QuantFactory_Meta-Llama-3.1-8B-Instruct-GGUF",
-        .file_name = "Meta-Llama-3.1-8B-Instruct.Q4_0.gguf",
-        .download_url = "https://huggingface.co/QuantFactory/Meta-Llama-3.1-8B-Instruct-GGUF/resolve/main/Meta-Llama-3.1-8B-Instruct.Q4_0.gguf",
-        .chat_template_kind = .llama3,
-        // The file declares 131072 positions but carries no llama3 RoPE
-        // factors, so positions past the original 8192 context are outside
-        // its training.
-        .context_limit = 8192,
-    },
-    // Qwen3.5 hybrid Gated-DeltaNet + full-attention models. The 2B is the
-    // dev/correctness target (small, fast, low VRAM). The 9B is the
-    // measurement target. ChatML template (see `core/chat.zig`). Only
-    // k-quants + Q8_0 ship (no Q4_0).
-    .{
-        .pub_name = "Qwen3.5-2B-Q8_0",
-        .local_path = "lmstudio-community_Qwen3.5-2B-GGUF",
-        .file_name = "Qwen3.5-2B-Q8_0.gguf",
-        .download_url = "https://huggingface.co/lmstudio-community/Qwen3.5-2B-GGUF/resolve/main/Qwen3.5-2B-Q8_0.gguf",
-        // The model file's template thinks only when enable_thinking is true.
-        .chat_template_kind = .{ .chatml_qwen = .off },
-        // f16 KV is the default: outputs are byte identical across backends
-        // and dtypes at depth, fused prefill is 7% ahead, and every other arm
-        // is at parity. The fixed GDN state rides f32, so blobs shrink to
-        // 0.64x.
-        .kv_dtype_default = .f16,
-        // The card values for text tasks, from
-        // https://huggingface.co/Qwen/Qwen3.5-2B/raw/main/README.md.
-        .sampling = .{
-            .thinking = .{ .temperature = 1.0, .top_k = 20, .top_p = 0.95, .presence_penalty = 1.5, .min_p = 0, .repetition_penalty = 1 },
-            .non_thinking = .{ .temperature = 1.0, .top_k = 20, .top_p = 1.0, .presence_penalty = 2.0, .min_p = 0, .repetition_penalty = 1 },
-        },
-    },
-    .{
-        .pub_name = "Qwen3.5-9B-Q8_0",
-        .local_path = "lmstudio-community_Qwen3.5-9B-GGUF",
-        .file_name = "Qwen3.5-9B-Q8_0.gguf",
-        .download_url = "https://huggingface.co/lmstudio-community/Qwen3.5-9B-GGUF/resolve/main/Qwen3.5-9B-Q8_0.gguf",
-        // The model file's template thinks unless enable_thinking is false.
-        .chat_template_kind = .{ .chatml_qwen = .on },
-        // f16 KV is the default: the 2B shape repeats at four times the scale,
-        // and about 110 slots fit in free VRAM where f32 fits about 88.
-        .kv_dtype_default = .f16,
-        // The card values for general tasks, from
-        // https://huggingface.co/Qwen/Qwen3.5-9B/raw/main/README.md.
-        .sampling = .{
-            .thinking = .{ .temperature = 1.0, .top_k = 20, .top_p = 0.95, .presence_penalty = 1.5, .min_p = 0, .repetition_penalty = 1 },
-            .non_thinking = .{ .temperature = 0.7, .top_k = 20, .top_p = 0.8, .presence_penalty = 1.5, .min_p = 0, .repetition_penalty = 1 },
-        },
-    },
-};
-
-// The card values cross the wire in every `hello_ack`, and the client
-// decoder applies the wire guards to them. A card outside the guards makes
-// every hello malformed, so the build refuses it.
-comptime {
-    for (models) |m| {
-        const card = m.sampling orelse continue;
-        for ([_]Recommended{ card.thinking, card.non_thinking }) |r| {
-            std.debug.assert(r.temperature >= 0);
-            std.debug.assert(r.top_p > 0 and r.top_p <= 1);
-            std.debug.assert(r.top_k <= limits.max_top_k);
-            std.debug.assert(@abs(r.presence_penalty) <= limits.max_presence_penalty);
-            std.debug.assert(r.min_p >= 0 and r.min_p <= 1);
-            std.debug.assert(r.repetition_penalty > 0 and r.repetition_penalty <= limits.max_repetition_penalty);
-        }
-    }
-}
-
 // -- api --------------------------------------------------------------------
-
-/// Environment variable naming a secondary models store on another (e.g.
-/// bigger) disk: `ZIGFERENCER_MODELS_DIR=/data/big/models`. The per-model
-/// subdirectory (`<org>_<repo>/`) is appended underneath it. Reads check the
-/// repo-local `models/` first and then this store (`locate`). When the
-/// variable is set, `fetch` downloads into the store rather than `models/`.
-pub const models_dir_env = "ZIGFERENCER_MODELS_DIR";
-pub const default_models_root = "models";
 
 /// Apply the default policy to a raw env value: null (unset) or empty maps
 /// to `models`. The env itself is read once at startup (the Io model threads
-/// it through `std.process.Init.environ_map`), and the resolved root rides on
+/// it through `std.process.Init.environ_map`), and the resolved root goes with
 /// the CLI Context. These path helpers therefore stay pure string joins.
 pub fn resolveRoot(env_value: ?[]const u8) []const u8 {
     const v = env_value orelse return default_models_root;
@@ -210,18 +243,28 @@ pub fn modelFilePath(arena: Allocator, root: []const u8, model: Model) Allocator
 /// `$ZIGFERENCER_MODELS_DIR` store) when that differs, so a repo-local file
 /// wins over the external store. A non-null result guarantees the file exists
 /// there. It is not a guess at where a download lands.
-pub fn locate(arena: Allocator, io: Io, root: []const u8, model: Model) Allocator.Error!?[]const u8 {
+pub fn locate(
+    arena: Allocator,
+    io: Io,
+    root: []const u8,
+    model: Model,
+) Allocator.Error!?[]const u8 {
     var cwd = Io.Dir.cwd();
-    const local = try std.fs.path.join(arena, &.{ default_models_root, model.local_path, model.file_name });
+    const local = try std.fs.path.join(
+        arena,
+        &.{ default_models_root, model.local_path, model.file_name },
+    );
     if (fileExists(io, &cwd, local)) {
         log.debug("model resolve: {s} -> local {s}", .{ model.pub_name, local });
         return local;
     }
+
     const configured = try modelFilePath(arena, root, model);
     if (!std.mem.eql(u8, configured, local) and fileExists(io, &cwd, configured)) {
         log.debug("model resolve: {s} -> store {s}", .{ model.pub_name, configured });
         return configured;
     }
+
     log.debug("model resolve: {s} -> absent", .{model.pub_name});
     return null;
 }
@@ -229,7 +272,12 @@ pub fn locate(arena: Allocator, io: Io, root: []const u8, model: Model) Allocato
 /// Path to LOAD `model` from: where it is, or, when it is absent, the
 /// configured target a fresh download lands in, so a load failure names that
 /// location.
-pub fn resolveLoadPath(arena: Allocator, io: Io, root: []const u8, model: Model) Allocator.Error![]const u8 {
+pub fn resolveLoadPath(
+    arena: Allocator,
+    io: Io,
+    root: []const u8,
+    model: Model,
+) Allocator.Error![]const u8 {
     return (try locate(arena, io, root, model)) orelse try modelFilePath(arena, root, model);
 }
 
@@ -244,6 +292,7 @@ pub fn lookup(pub_name: []const u8) ?*const Model {
     while (i < models.len) : (i += 1) {
         if (std.mem.eql(u8, models[i].pub_name, pub_name)) return &models[i];
     }
+
     return null;
 }
 
@@ -288,13 +337,19 @@ test "the KV and context defaults match each entry's verification record" {
     for (all()) |m| {
         var want: dtype.KvDtype = .f32;
         for (flipped) |name| {
-            if (std.mem.eql(u8, m.pub_name, name)) want = .f16;
+            if (std.mem.eql(u8, m.pub_name, name)) {
+                want = .f16;
+            }
         }
+
         try std.testing.expectEqual(want, m.kv_dtype_default);
         var want_limit: ?u32 = null;
         for (limited) |entry| {
-            if (std.mem.eql(u8, m.pub_name, entry.name)) want_limit = entry.limit;
+            if (std.mem.eql(u8, m.pub_name, entry.name)) {
+                want_limit = entry.limit;
+            }
         }
+
         try std.testing.expectEqual(want_limit, m.context_limit);
     }
 }
@@ -310,12 +365,43 @@ test "the qwen entries carry the card sampling of each mode, and the rest none" 
         const qwen = std.mem.startsWith(u8, m.pub_name, "Qwen3.5-");
         try std.testing.expectEqual(qwen, m.sampling != null);
     }
+
     const think = recommendedSampling("Qwen3.5-2B-Q8_0", true).?;
-    try std.testing.expectEqual(Recommended{ .temperature = 1.0, .top_k = 20, .top_p = 0.95, .presence_penalty = 1.5, .min_p = 0, .repetition_penalty = 1 }, think);
+    try std.testing.expectEqual(
+        Recommended{
+            .temperature = 1.0,
+            .top_k = 20,
+            .top_p = 0.95,
+            .presence_penalty = 1.5,
+            .min_p = 0,
+            .repetition_penalty = 1,
+        },
+        think,
+    );
     const plain = recommendedSampling("Qwen3.5-2B-Q8_0", false).?;
-    try std.testing.expectEqual(Recommended{ .temperature = 1.0, .top_k = 20, .top_p = 1.0, .presence_penalty = 2.0, .min_p = 0, .repetition_penalty = 1 }, plain);
+    try std.testing.expectEqual(
+        Recommended{
+            .temperature = 1.0,
+            .top_k = 20,
+            .top_p = 1.0,
+            .presence_penalty = 2.0,
+            .min_p = 0,
+            .repetition_penalty = 1,
+        },
+        plain,
+    );
     const big = recommendedSampling("Qwen3.5-9B-Q8_0", false).?;
-    try std.testing.expectEqual(Recommended{ .temperature = 0.7, .top_k = 20, .top_p = 0.8, .presence_penalty = 1.5, .min_p = 0, .repetition_penalty = 1 }, big);
+    try std.testing.expectEqual(
+        Recommended{
+            .temperature = 0.7,
+            .top_k = 20,
+            .top_p = 0.8,
+            .presence_penalty = 1.5,
+            .min_p = 0,
+            .repetition_penalty = 1,
+        },
+        big,
+    );
     try std.testing.expectEqual(think, recommendedSampling("Qwen3.5-9B-Q8_0", true).?);
     try std.testing.expect(recommendedSampling("SmolLM2-135M-Instruct-Q8_0", false) == null);
     try std.testing.expect(recommendedSampling("does-not-exist", true) == null);

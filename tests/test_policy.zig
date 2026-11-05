@@ -18,9 +18,13 @@ comptime {
 
 /// The policy of a runner test whose thread count is incidental. The floor
 /// of zero fans out every op on more than one thread, so the suite runs the
-/// pool path at short rows. A serial reference leg uses `.{ .n_threads = 1 }`.
+/// pool path at short rows. A serial reference path uses `.{ .n_threads = 1 }`.
 pub fn policy() Policy {
-    return .{ .n_threads = test_threads, .min_parallel_flops = 0, .spin_ns = z.parallel.default_spin_ns };
+    return .{
+        .n_threads = test_threads,
+        .min_parallel_flops = 0,
+        .spin_ns = z.parallel.default_spin_ns,
+    };
 }
 
 /// Start `pool` for `pool_policy`. The caller owns the pool and must call

@@ -1,13 +1,6 @@
-//! `zigferencer info`: print the host hardware card, the build's selected ops
-//! backend and optimize level, the runtime threading defaults, and the
-//! architecture support matrix. The binary records its chosen backend in
-//! `build_options`, `OpRequires` declares what each variant needs, and
-//! `hwinfo.detect` reads the host card. One command therefore
-//! shows whether the binary fits the host it runs on.
-//!
-//! The scope is the CPU and the host. A Vulkan build also opens the device
-//! context once and prints its storage-buffer limits, because those limits
-//! bound the KV window. The kernel checks belong to the `gpu-selftest` command.
+//! `zigferencer info`: print the host hardware card, the build options, the
+//! threading defaults, and the architecture support matrix. A Vulkan build also
+//! prints the storage-buffer limits of the device, because they bound the KV window.
 
 const std = @import("std");
 const Io = std.Io;
@@ -28,15 +21,7 @@ const parallel = @import("../runtime/parallel.zig");
 const limits = @import("../core/limits.zig");
 const vulkan_ctx = if (build_options.use_vulkan) @import("../runtime/vulkan_ctx.zig") else void;
 
-// -- types ------------------------------------------------------------------
-
-const BackendEntry = struct {
-    name: []const u8,
-    // Null marks a GPU backend. Host eligibility is then "a GPU is present", and
-    // `note` carries the one-line descriptor in place of the arch and SIMD fields.
-    req: ?op_requires.OpRequires = null,
-    note: []const u8 = "",
-};
+// -- constants --------------------------------------------------------------
 
 const all_backends = [_]BackendEntry{
     .{ .name = "naive", .req = naive_ops.requires },
@@ -44,6 +29,15 @@ const all_backends = [_]BackendEntry{
     .{ .name = "simd_pf", .req = simd_pf_ops.requires },
     .{ .name = "vulkan", .note = "GPU per-op    (needs -Druntime=vulkan)" },
     .{ .name = "vulkan_fused", .note = "GPU fused     (needs -Druntime=vulkan)" },
+};
+
+// -- types ------------------------------------------------------------------
+
+const BackendEntry = struct {
+    name: []const u8,
+    // Null marks a GPU backend. `note` then replaces the arch and SIMD fields.
+    req: ?op_requires.OpRequires = null,
+    note: []const u8 = "",
 };
 
 /// The flags of `info`. It takes none.
@@ -70,49 +64,91 @@ pub fn run(ctx: cli.Context) !void {
     const card = hwinfo.detect(ctx.io, ctx.arena);
     const p = style.Palette.init(ctx.color);
 
-    var buf: [4096]u8 = undefined;
-    var fw: Io.File.Writer = .initStreaming(.stdout(), ctx.io, &buf);
-    const w = &fw.interface;
+    var stdout_buffer: [cli.stdout_buffer_bytes]u8 = undefined;
+    var stdout_writer: Io.File.Writer = .initStreaming(.stdout(), ctx.io, &stdout_buffer);
+    const w = &stdout_writer.interface;
 
+    try printHost(w, p, card);
+    try printSimd(w, p, card.simd);
+    try printBuild(w, p);
+    try printBackends(w, p, card);
+    try printThreading(ctx, w, p);
+    try arch_matrix.print(w, p);
+
+    if (comptime build_options.use_vulkan) {
+        try printBufferLimits(ctx, w, p);
+    }
+
+    try w.flush();
+}
+
+// -- helpers ----------------------------------------------------------------
+
+fn printHost(w: *Io.Writer, p: style.Palette, card: hwinfo.HwCard) !void {
     try w.print("{s}Host:{s}\n", .{ p.bold, p.reset });
     try w.print("  arch:      {s}\n", .{card.arch});
     try w.print("  os:        {s}\n", .{card.os});
-    if (card.cpu_model) |m| try w.print("  cpu:       {s}\n", .{m});
+    if (card.cpu_model) |m| {
+        try w.print("  cpu:       {s}\n", .{m});
+    }
+
     try w.print("  cores:     {d}\n", .{card.cores_total});
-    if (card.ram_total_bytes) |r| try w.print("  ram:       {d:.1} GiB\n", .{
-        @as(f64, @floatFromInt(r)) / (1024.0 * 1024.0 * 1024.0),
-    });
+    if (card.ram_total_bytes) |r| {
+        try w.print("  ram:       {d:.1} GiB\n", .{
+            @as(f64, @floatFromInt(r)) / (1024.0 * 1024.0 * 1024.0),
+        });
+    }
+
     const gpu_c = if (card.gpu.present) p.green else p.dim;
     try w.print("  gpu:       {s}{s}{s}\n", .{ gpu_c, card.gpu.label, p.reset });
+}
 
-    try printSimd(w, p, card.simd);
-
-    // The build identity is the two axes the build system exposes, -Druntime and
-    // -Dops-backend. The runtime axis prints inline. The ops-backend axis is the
-    // table below. The two selected values carry the highlight.
+/// The build identity is the two build options -Druntime and -Dops-backend.
+fn printBuild(w: *Io.Writer, p: style.Palette) !void {
     try w.print("\n{s}Build (this binary):{s}\n", .{ p.bold, p.reset });
     try w.print("  optimize:        {s}\n", .{@tagName(builtin.mode)});
+
     // Asserts run in Debug and ReleaseSafe. ReleaseFast strips them.
     const asserts_on = builtin.mode == .Debug or builtin.mode == .ReleaseSafe;
     const ac = if (asserts_on) p.green else p.dim;
     try w.print("  asserts:         {s}{s}{s}\n", .{
         ac, if (asserts_on) "on" else "off (ReleaseFast, set OPT=ReleaseSafe to enable)", p.reset,
     });
-    try w.print("  runtime:         {s}{s:<8}{s}  (cpu | vulkan)\n", .{ p.green, build_options.runtime, p.reset });
+    try w.print(
+        "  runtime:         {s}{s:<8}{s}  (cpu | vulkan)\n",
+        .{ p.green, build_options.runtime, p.reset },
+    );
     try w.print("  ops backend:     {s}{s}{s}\n", .{ p.green, build_options.ops_backend, p.reset });
-    // Every build compiles the .debug traces. This line reports the live runtime
-    // gate from $ZIGFERENCER_LOG, echoed byte for byte so a misspelling is visible.
-    if (log.rawEnv()) |v|
-        try w.print("  trace level:     {s}{s}{s}\n", .{ p.green, v, p.reset })
-    else
-        try w.print("  trace level:     {s}info (unset){s}\n", .{ p.dim, p.reset });
-    try w.print("  {s}($ZIGFERENCER_LOG=debug. Scopes: serve serve_openai serve_demo run runner kv gpu gguf{s}\n", .{ p.dim, p.reset });
-    try w.print("  {s} fetch parallel cache bench_swap bench_serve + hot: layer dispatch token, see core/log.zig){s}\n", .{ p.dim, p.reset });
-    if (log.hot)
-        try w.print("  hot traces:      {s}compiled (-Dtrace){s}\n", .{ p.green, p.reset })
-    else
-        try w.print("  hot traces:      {s}off (release, OPT=Debug or TRACE=1 to compile){s}\n", .{ p.dim, p.reset });
 
+    // The value echoes byte for byte, so a misspelling stays visible.
+    if (log.rawEnv()) |v| {
+        try w.print("  trace level:     {s}{s}{s}\n", .{ p.green, v, p.reset });
+    } else {
+        try w.print("  trace level:     {s}info (unset){s}\n", .{ p.dim, p.reset });
+    }
+
+    try w.print(
+        "  {s}($ZIGFERENCER_LOG=debug. Scopes: serve serve_openai serve_demo run runner kv " ++
+            "gpu gguf{s}\n",
+        .{ p.dim, p.reset },
+    );
+    try w.print(
+        "  {s} fetch parallel cache bench_swap bench_serve + hot: layer dispatch token, see " ++
+            "core/log.zig){s}\n",
+        .{ p.dim, p.reset },
+    );
+
+    if (log.hot) {
+        try w.print("  hot traces:      {s}compiled (-Dtrace){s}\n", .{ p.green, p.reset });
+    } else {
+        try w.print(
+            "  hot traces:      {s}off (release, OPT=Debug or TRACE=1 to compile){s}\n",
+            .{ p.dim, p.reset },
+        );
+    }
+}
+
+fn printBackends(w: *Io.Writer, p: style.Palette, card: hwinfo.HwCard) !void {
     try w.print("\n{s}Op backends{s} ({s}[+]{s} runnable):\n", .{
         p.bold, p.reset, p.green, p.reset,
     });
@@ -122,49 +158,70 @@ pub fn run(ctx: cli.Context) !void {
         const active = std.mem.eql(u8, b.name, build_options.ops_backend);
         try printBackend(w, p, b, eligible, active);
     }
-    try w.print("  {s}(rebuild: -Dops-backend=<name>  [+ -Druntime=vulkan for GPU]){s}\n", .{ p.dim, p.reset });
 
-    const cores = parallel.hostCores(ctx.io);
-    const host_policy = parallel.Policy.forHost(ctx.io);
-    try w.print("\n{s}Threading defaults:{s}\n", .{ p.bold, p.reset });
-    try w.print("  physical cores:        {d}  {s}({s}){s}\n", .{
-        cores.physical, p.dim, if (cores.from_sysfs) "sysfs topology" else "half the logical CPUs", p.reset,
-    });
-    try w.print("  threads:               {d}  {s}(min(physical cores, {d})){s}\n", .{ host_policy.n_threads, p.dim, parallel.max_default_threads, p.reset });
-    try w.print("  min_parallel_flops:    {d}\n", .{host_policy.min_parallel_flops});
-    try w.print("  spin_ns:               {d}\n", .{host_policy.spin_ns});
-    try w.print("  {s}(override: --threads N, --min-parallel-flops F, --spin-us N){s}\n", .{ p.dim, p.reset });
-
-    try arch_matrix.print(w, p);
-
-    if (comptime build_options.use_vulkan) try printBufferLimits(ctx, w, p);
-
-    try w.flush();
+    try w.print(
+        "  {s}(rebuild: -Dops-backend=<name>  [+ -Druntime=vulkan for GPU]){s}\n",
+        .{ p.dim, p.reset },
+    );
 }
 
-// -- helpers ----------------------------------------------------------------
+fn printThreading(ctx: cli.Context, w: *Io.Writer, p: style.Palette) !void {
+    const cores = parallel.hostCores(ctx.io);
+    const host_policy = parallel.Policy.forHost(ctx.io);
+
+    try w.print("\n{s}Threading defaults:{s}\n", .{ p.bold, p.reset });
+    const source = if (cores.from_sysfs) "sysfs topology" else "half the logical CPUs";
+    try w.print("  physical cores:        {d}  {s}({s}){s}\n", .{
+        cores.physical, p.dim, source, p.reset,
+    });
+    try w.print(
+        "  threads:               {d}  {s}(min(physical cores, {d})){s}\n",
+        .{ host_policy.n_threads, p.dim, parallel.max_default_threads, p.reset },
+    );
+    try w.print("  min_parallel_flops:    {d}\n", .{host_policy.min_parallel_flops});
+    try w.print("  spin_ns:               {d}\n", .{host_policy.spin_ns});
+    try w.print(
+        "  {s}(override: --threads N, --min-parallel-flops F, --spin-us N){s}\n",
+        .{ p.dim, p.reset },
+    );
+}
 
 /// Print the storage-buffer limits of the device a Vulkan command opens, and
 /// the range the buffer checks read. A host with no usable device prints the
 /// open error and keeps the rest of the card.
 fn printBufferLimits(ctx: cli.Context, w: *std.Io.Writer, p: style.Palette) !void {
     try w.print("\n{s}GPU buffer limits:{s}\n", .{ p.bold, p.reset });
-    var vc = vulkan_ctx.Context.init(ctx.arena, .{ .storage_range_override = ctx.vk_storage_range }) catch |err| {
+    var vc = vulkan_ctx.Context.init(
+        ctx.arena,
+        .{ .storage_range_override = ctx.vk_storage_range },
+    ) catch |err| {
         try w.print("  {s}no device context ({t}){s}\n", .{ p.dim, err, p.reset });
         return;
     };
     defer vc.deinit();
+
     const lim = vc.buffer_limits;
-    try w.print("  device:                 {s}\n", .{std.mem.sliceTo(&vc.physical_device_props.device_name, 0)});
+    try w.print(
+        "  device:                 {s}\n",
+        .{std.mem.sliceTo(&vc.physical_device_props.device_name, 0)},
+    );
     try w.print("  reported storage range: {d} bytes\n", .{vc.reported_storage_range});
     try w.print("  allocation size:        {d} bytes\n", .{lim.allocation_size});
     try w.print("  offset alignment:       {d} bytes\n", .{lim.offset_alignment});
     if (ctx.vk_storage_range != null) {
-        try w.print("  storage-buffer range {s}{d}{s} bytes (reported {d}, set by " ++ limits.storage_range_env ++ ")\n", .{ p.green, lim.storage_range, p.reset, vc.reported_storage_range });
+        try w.print(
+            "  storage-buffer range {s}{d}{s} bytes (reported {d}, set by " ++
+                "" ++ limits.storage_range_env ++ ")\n",
+            .{ p.green, lim.storage_range, p.reset, vc.reported_storage_range },
+        );
     } else {
         try w.print("  storage-buffer range {d} bytes (reported)\n", .{lim.storage_range});
     }
-    try w.print("  {s}(override: " ++ limits.storage_range_env ++ "=<bytes>, 1..{d}){s}\n", .{ p.dim, limits.storage_range_max, p.reset });
+
+    try w.print(
+        "  {s}(override: " ++ limits.storage_range_env ++ "=<bytes>, 1..{d}){s}\n",
+        .{ p.dim, limits.storage_range_max, p.reset },
+    );
 }
 
 /// Print only the build target's ISA flags. The other ISA's flags are always off
@@ -194,7 +251,13 @@ fn printSimd(w: *std.Io.Writer, p: style.Palette, s: hwinfo.SimdFeatures) !void 
     }
 }
 
-fn printBackend(w: *std.Io.Writer, p: style.Palette, b: BackendEntry, eligible: bool, active: bool) !void {
+fn printBackend(
+    w: *std.Io.Writer,
+    p: style.Palette,
+    b: BackendEntry,
+    eligible: bool,
+    active: bool,
+) !void {
     const mark_c = if (eligible) p.green else p.dim;
     const mark: []const u8 = if (eligible) "+" else "-";
     try w.print("  {s}[{s}]{s} {s:<14} {s}", .{ mark_c, mark, p.reset, b.name, p.dim });
@@ -203,13 +266,19 @@ fn printBackend(w: *std.Io.Writer, p: style.Palette, b: BackendEntry, eligible: 
             try w.writeAll("(no requirements)");
         } else {
             try w.print("arch={s}  min_simd={s}", .{ @tagName(req.arch), @tagName(req.min_simd) });
-            if (req.needs_fma) try w.writeAll("  +fma");
+            if (req.needs_fma) {
+                try w.writeAll("  +fma");
+            }
         }
     } else {
         try w.writeAll(b.note);
     }
+
     try w.writeAll(p.reset);
-    if (active) try w.print("  {s}{s}<-- active{s}", .{ p.bold, p.green, p.reset });
+    if (active) {
+        try w.print("  {s}{s}<-- active{s}", .{ p.bold, p.green, p.reset });
+    }
+
     try w.writeAll("\n");
 }
 

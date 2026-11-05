@@ -50,20 +50,34 @@ pub const DecodeRing = struct {
     pub fn init(ctx: *const vulkan_ctx.Context, runner: span.GpuRunner) !DecodeRing {
         const a = try kernels.allocateOnePrimaryCmdBuffer(ctx);
         errdefer ctx.vkd.freeCommandBuffers(ctx.device, ctx.command_pool, &[_]vk.CommandBuffer{a});
+
         const b = try kernels.allocateOnePrimaryCmdBuffer(ctx);
         errdefer ctx.vkd.freeCommandBuffers(ctx.device, ctx.command_pool, &[_]vk.CommandBuffer{b});
+
         const fence = try ctx.vkd.createFence(ctx.device, &.{}, null);
         errdefer ctx.vkd.destroyFence(ctx.device, fence, null);
+
         const at = span.gpuLevel();
         var pa = try gpu_profile.GpuProfile.init(ctx, at, at);
         errdefer pa.deinit();
+
         const pb = try gpu_profile.GpuProfile.init(ctx, at, at);
-        return .{ .ctx = ctx, .cbs = .{ a, b }, .fence = fence, .profs = .{ pa, pb }, .runner = runner };
+        return .{
+            .ctx = ctx,
+            .cbs = .{ a, b },
+            .fence = fence,
+            .profs = .{ pa, pb },
+            .runner = runner,
+        };
     }
 
     pub fn deinit(self: *DecodeRing) void {
         std.debug.assert(self.ring.pendingCount() == 0);
-        for (&self.profs) |*p| p.deinit();
+
+        for (&self.profs) |*p| {
+            p.deinit();
+        }
+
         self.ctx.vkd.destroyFence(self.ctx.device, self.fence, null);
         self.ctx.vkd.freeCommandBuffers(self.ctx.device, self.ctx.command_pool, &self.cbs);
     }
@@ -77,6 +91,7 @@ pub const DecodeRing = struct {
     /// The level the next decode key carries.
     pub fn level(self: *const DecodeRing) gpu_profile.Level {
         std.debug.assert(self.profs[0].level == self.profs[1].level);
+
         return self.profs[0].level;
     }
 
@@ -88,22 +103,37 @@ pub const DecodeRing = struct {
         std.debug.assert(self.ring.pendingCount() == 0);
         // Both pools grow before either level moves, so a failed reserve
         // leaves both profiles at the old level.
-        for (&self.profs) |*p| try p.reserve(new);
-        for (&self.profs) |*p| p.setLevel(new);
+        for (&self.profs) |*p| {
+            try p.reserve(new);
+        }
+
+        for (&self.profs) |*p| {
+            p.setLevel(new);
+        }
+
         self.last = null;
     }
 
     /// One decode step at `key`. `rec.recordDecode(cb, prof, key)` records the
     /// step into `cb`, with the timestamps of `prof`. On return the GPU has
     /// finished the step, and the other buffer holds `next` when `next` is not
-    /// null. The legs and the ring counts fold into `host`.
-    pub fn step(self: *DecodeRing, key: Key, next: ?Key, rec: anytype, host: *step_stats.DecodeHost) !void {
+    /// null. The host steps and the ring counts fold into `host`.
+    pub fn step(
+        self: *DecodeRing,
+        key: Key,
+        next: ?Key,
+        rec: anytype,
+        host: *step_stats.DecodeHost,
+    ) !void {
         std.debug.assert(self.ring.pendingCount() == 0);
+
         if (next) |k| std.debug.assert(!std.meta.eql(k, key));
+
         std.debug.assert(key.opts.level == self.level());
         // A failed submit or wait leaves the GPU state unknown, so no buffer
         // is trusted after it.
         errdefer self.ring.drop();
+
         const vkd = self.ctx.vkd;
 
         const t0 = core_log.now();
@@ -114,13 +144,16 @@ pub const DecodeRing = struct {
             host.ring.misses += 1;
             try self.recordInto(p.buf, key, rec, host);
         }
+
         const t1 = core_log.now();
 
         self.ring.submit(p.buf, key);
         const fences = [_]vk.Fence{self.fence};
         try vkd.resetFences(self.ctx.device, &fences);
         const cmds = [_]vk.CommandBuffer{self.cbs[@intFromEnum(p.buf)]};
-        const submits = [_]vk.SubmitInfo{.{ .command_buffer_count = 1, .p_command_buffers = &cmds }};
+        const submits = [_]vk.SubmitInfo{
+            .{ .command_buffer_count = 1, .p_command_buffers = &cmds },
+        };
         try vkd.queueSubmit(self.ctx.queue, &submits, self.fence);
         const t2 = core_log.now();
 
@@ -130,9 +163,11 @@ pub const DecodeRing = struct {
         const speculated = if (next) |k| blk: {
             const c = self.ring.speculateTarget(p.buf);
             if (self.ring.holds(c, k)) break :blk {};
+
             host.ring.speculated += 1;
             break :blk self.recordInto(c, k, rec, host);
         } else {};
+
         const t3 = core_log.now();
 
         const result = try vkd.waitForFences(self.ctx.device, &fences, .true, std.math.maxInt(u64));
@@ -159,11 +194,21 @@ pub const DecodeRing = struct {
                 step_stats.nsToMs(step_stats.nsBetween(t1, t4)),
             });
         }
+
         std.debug.assert(self.ring.pendingCount() == 0);
     }
 
-    fn recordInto(self: *DecodeRing, c: record_ring.Buf, key: Key, rec: anytype, host: *step_stats.DecodeHost) !void {
-        if (self.ring.beginRecord(c)) host.ring.wasted += 1;
+    fn recordInto(
+        self: *DecodeRing,
+        c: record_ring.Buf,
+        key: Key,
+        rec: anytype,
+        host: *step_stats.DecodeHost,
+    ) !void {
+        if (self.ring.beginRecord(c)) {
+            host.ring.wasted += 1;
+        }
+
         try rec.recordDecode(self.cbs[@intFromEnum(c)], &self.profs[@intFromEnum(c)], key);
         self.ring.endRecord(c, key);
     }

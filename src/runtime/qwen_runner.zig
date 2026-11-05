@@ -111,8 +111,6 @@ const Layer = struct {
     },
 };
 
-// -- api --------------------------------------------------------------------
-
 /// Qwen3.5 hybrid forward-pass state over `n_slots` session slots (the
 /// Control Unit). `n_slots = 1` is the single-sequence CLI shape.
 pub const QwenRunner = struct {
@@ -217,7 +215,17 @@ pub const QwenRunner = struct {
         policy: parallel.Policy,
         kv_dtype: dtype.KvDtype,
     ) Error!QwenRunner {
-        return initPrefix(arena, loaded, plan, loaded.card.n_layers, max_rows, io, pool, policy, kv_dtype);
+        return initPrefix(
+            arena,
+            loaded,
+            plan,
+            loaded.card.n_layers,
+            max_rows,
+            io,
+            pool,
+            policy,
+            kv_dtype,
+        );
     }
 
     /// A prefix runner executes layers `[0..n_layers)` with weights, KV, and
@@ -247,6 +255,7 @@ pub const QwenRunner = struct {
         std.debug.assert(pool.threads() == @max(policy.n_threads, 1));
         const c = loaded.card;
         if (c.arch != .qwen35) return error.NotQwen;
+
         const g = c.gdn orelse return error.NotQwen;
         std.debug.assert(n_layers >= 1);
         std.debug.assert(n_layers <= c.n_layers);
@@ -277,7 +286,9 @@ pub const QwenRunner = struct {
         {
             var li: u32 = 0;
             while (li < n_layers) : (li += 1) {
-                if (g.isFullAttention(li)) n_full_range += 1;
+                if (g.isFullAttention(li)) {
+                    n_full_range += 1;
+                }
             }
         }
 
@@ -285,14 +296,19 @@ pub const QwenRunner = struct {
         var name_buf: [80]u8 = undefined;
         var i: u32 = 0;
         while (i < n_layers) : (i += 1) {
-            const attn_norm = fp32View(try findByFmt(refs, &name_buf, "blk.{d}.attn_norm.weight", .{i}));
-            const post_attn_norm = fp32View(try findByFmt(refs, &name_buf, "blk.{d}.post_attention_norm.weight", .{i}));
+            const attn_norm = fp32View(
+                try findByFmt(refs, &name_buf, "blk.{d}.attn_norm.weight", .{i}),
+            );
+            const post_attn_norm = fp32View(
+                try findByFmt(refs, &name_buf, "blk.{d}.post_attention_norm.weight", .{i}),
+            );
             const ffn_gate = try findByFmt(refs, &name_buf, "blk.{d}.ffn_gate.weight", .{i});
             const ffn_up = try findByFmt(refs, &name_buf, "blk.{d}.ffn_up.weight", .{i});
             const ffn_down = try findByFmt(refs, &name_buf, "blk.{d}.ffn_down.weight", .{i});
 
             if (g.isFullAttention(i)) {
                 std.debug.assert(n_full < n_full_range); // the index this layer takes
+
                 layers[i] = .{
                     .attn_norm = attn_norm,
                     .post_attn_norm = post_attn_norm,
@@ -304,8 +320,12 @@ pub const QwenRunner = struct {
                         .k = try findByFmt(refs, &name_buf, "blk.{d}.attn_k.weight", .{i}),
                         .v = try findByFmt(refs, &name_buf, "blk.{d}.attn_v.weight", .{i}),
                         .o = try findByFmt(refs, &name_buf, "blk.{d}.attn_output.weight", .{i}),
-                        .q_norm = fp32View(try findByFmt(refs, &name_buf, "blk.{d}.attn_q_norm.weight", .{i})),
-                        .k_norm = fp32View(try findByFmt(refs, &name_buf, "blk.{d}.attn_k_norm.weight", .{i})),
+                        .q_norm = fp32View(
+                            try findByFmt(refs, &name_buf, "blk.{d}.attn_q_norm.weight", .{i}),
+                        ),
+                        .k_norm = fp32View(
+                            try findByFmt(refs, &name_buf, "blk.{d}.attn_k_norm.weight", .{i}),
+                        ),
                         .kv_slot = n_full,
                     } },
                 };
@@ -328,10 +348,16 @@ pub const QwenRunner = struct {
                         .alpha = try findByFmt(refs, &name_buf, "blk.{d}.ssm_alpha.weight", .{i}),
                         .beta = try findByFmt(refs, &name_buf, "blk.{d}.ssm_beta.weight", .{i}),
                         .out = try findByFmt(refs, &name_buf, "blk.{d}.ssm_out.weight", .{i}),
-                        .conv1d = fp32View(try findByFmt(refs, &name_buf, "blk.{d}.ssm_conv1d.weight", .{i})),
+                        .conv1d = fp32View(
+                            try findByFmt(refs, &name_buf, "blk.{d}.ssm_conv1d.weight", .{i}),
+                        ),
                         .ssm_a = fp32View(try findByFmt(refs, &name_buf, "blk.{d}.ssm_a", .{i})),
-                        .dt_bias = fp32View(try findByFmt(refs, &name_buf, "blk.{d}.ssm_dt.bias", .{i})),
-                        .ssm_norm = fp32View(try findByFmt(refs, &name_buf, "blk.{d}.ssm_norm.weight", .{i})),
+                        .dt_bias = fp32View(
+                            try findByFmt(refs, &name_buf, "blk.{d}.ssm_dt.bias", .{i}),
+                        ),
+                        .ssm_norm = fp32View(
+                            try findByFmt(refs, &name_buf, "blk.{d}.ssm_norm.weight", .{i}),
+                        ),
                     } },
                 };
                 var s: u32 = 0;
@@ -360,11 +386,16 @@ pub const QwenRunner = struct {
         // per-slot GDN state and logits below stay sized by the slot count.
         const rows_cap: u32 = @max(n_slots, max_rows);
         std.debug.assert(rows_cap <= limits.max_batch + limits.max_prefill_chunk);
-        const kv_bytes: u64 = 2 * @as(u64, n_slots) * n_full * max_seq * kv_dtype.rowBytes(c.n_kv_heads * c.head_dim);
-        log.debug("init qwen35: {d} layers ({d} full-attn), {d} slots, max_seq {d}, kv {d:.0} MiB", .{
-            n_layers,                                              n_full, n_slots, max_seq,
-            @as(f64, @floatFromInt(kv_bytes)) / (1024.0 * 1024.0),
-        });
+        const kv_bytes: u64 = 2 * @as(u64, n_slots) * n_full * max_seq * kv_dtype.rowBytes(
+            c.n_kv_heads * c.head_dim,
+        );
+        log.debug(
+            "init qwen35: {d} layers ({d} full-attn), {d} slots, max_seq {d}, kv {d:.0} MiB",
+            .{
+                n_layers,                                              n_full, n_slots, max_seq,
+                @as(f64, @floatFromInt(kv_bytes)) / (1024.0 * 1024.0),
+            },
+        );
         return .{
             .card = c,
             .io = io,
@@ -408,7 +439,10 @@ pub const QwenRunner = struct {
             // time, and each call ends before the next starts, so one row of
             // records serves every row of a step. The per-op GPU attention
             // keeps its own records, so that build holds none here.
-            .attn_parts = try arena.alloc(f32, if (build_options.use_vulkan_ops) 0 else attn_cpu.partialLen(c.n_heads, c.head_dim)),
+            .attn_parts = try arena.alloc(
+                f32,
+                if (build_options.use_vulkan_ops) 0 else attn_cpu.partialLen(c.n_heads, c.head_dim),
+            ),
             .mix_out = try arena.alloc(f32, rows_cap * c.embedding_length),
             .ffn_g = try arena.alloc(f32, rows_cap * c.feed_forward_length),
             .ffn_u = try arena.alloc(f32, rows_cap * c.feed_forward_length),
@@ -438,17 +472,28 @@ pub const QwenRunner = struct {
     /// `prefill_batch_max`.
     pub fn prefillBatch(self: *QwenRunner, ids: []const u32, pos: u32) Error![]f32 {
         std.debug.assert(ids.len >= 1);
+
         if (ids.len > self.prefill_batch_max) return error.TooManyRows;
+
         var rows_buf: [limits.max_prefill_chunk]StepRow = undefined;
         for (ids, rows_buf[0..ids.len], 0..) |id, *r, i| {
-            r.* = .{ .slot = 0, .token = id, .pos = pos + @as(u32, @intCast(i)), .want_logits = i == ids.len - 1 };
+            r.* = .{
+                .slot = 0,
+                .token = id,
+                .pos = pos + @as(u32, @intCast(i)),
+                .want_logits = i == ids.len - 1,
+            };
         }
+
         try self.stepBatch(rows_buf[0..ids.len]);
         const out = self.logits[0..self.card.vocab_size];
         std.debug.assert(out.len == self.card.vocab_size);
         if (std.debug.runtime_safety) {
-            for (out) |x| std.debug.assert(std.math.isFinite(x));
+            for (out) |x| {
+                std.debug.assert(std.math.isFinite(x));
+            }
         }
+
         return out;
     }
 
@@ -460,16 +505,22 @@ pub const QwenRunner = struct {
     /// `logits[j * vocab_size ..][0..vocab_size]`.
     pub fn stepBatch(self: *QwenRunner, rows: []const StepRow) Error!void {
         _ = try step_row.validateRows(rows, self.n_slots, self.max_rows, self.max_seq);
-        log.debug("step: {d} rows, slot {d} pos {d}..{d}", .{ rows.len, rows[0].slot, rows[0].pos, rows[rows.len - 1].pos });
+        log.debug(
+            "step: {d} rows, slot {d} pos {d}..{d}",
+            .{ rows.len, rows[0].slot, rows[0].pos, rows[rows.len - 1].pos },
+        );
         const d = self.hidden;
         if (comptime core_log.hot) {
-            if (self.profile) |p| p.steps += 1;
+            if (self.profile) |p| {
+                p.steps += 1;
+            }
         }
 
         const t_embed = self.tBegin();
         for (rows, 0..) |r, i| {
             ops.embedLookup(self.embed.*, r.token, d, self.x[i * d ..][0..d]);
         }
+
         self.tEnd(t_embed, .embed);
 
         const live = (comptime core_log.hot) and core_log.enabled(.layer, .debug);
@@ -477,21 +528,40 @@ pub const QwenRunner = struct {
         var li: u32 = 0;
         while (li < n_layers) : (li += 1) {
             var t_layer: std.Io.Timestamp = undefined;
-            if (live) t_layer = core_log.now();
+            if (live) {
+                t_layer = core_log.now();
+            }
+
             try self.layerForward(li, rows);
-            if (live) log_layer.debug("layer {d} ({t}): {d} rows, {d:.2} ms", .{
-                li, std.meta.activeTag(self.layers[li].kind), rows.len, core_log.msSince(t_layer),
-            });
+            if (live) {
+                log_layer.debug("layer {d} ({t}): {d} rows, {d:.2} ms", .{
+                    li,
+                    std.meta.activeTag(
+                        self.layers[li].kind,
+                    ),
+                    rows.len,
+                    core_log.msSince(t_layer),
+                });
+            }
         }
 
         var first: usize = rows.len;
-        while (first > 0 and rows[first - 1].want_logits) first -= 1;
+        while (first > 0 and rows[first - 1].want_logits) {
+            first -= 1;
+        }
+
         if (first == rows.len) return;
 
         const t_norm = self.tBegin();
         for (rows[first..], first..) |_, i| {
-            ops.rmsnorm(self.x[i * d ..][0..d], self.output_norm, self.rms_eps, self.x_norm[i * d ..][0..d]);
+            ops.rmsnorm(
+                self.x[i * d ..][0..d],
+                self.output_norm,
+                self.rms_eps,
+                self.x_norm[i * d ..][0..d],
+            );
         }
+
         self.tEnd(t_norm, .rmsnorm);
         const n_logits = rows.len - first;
         // Compact: want-logits rows land at logits[0..], so the buffer needs only
@@ -513,6 +583,7 @@ pub const QwenRunner = struct {
     pub fn layerForward(self: *QwenRunner, layer: u32, rows: []const StepRow) Error!void {
         const sp = span.beginHot(.layer_forward);
         defer sp.end();
+
         const d = self.hidden;
         const fd = self.ffn_dim;
         const n = rows.len;
@@ -523,37 +594,57 @@ pub const QwenRunner = struct {
         // -- mixer block ----------------------------------------------------
         const t_an = self.tBegin();
         for (0..n) |i| {
-            ops.rmsnorm(self.x[i * d ..][0..d], lw.attn_norm, self.rms_eps, self.x_norm[i * d ..][0..d]);
+            ops.rmsnorm(
+                self.x[i * d ..][0..d],
+                lw.attn_norm,
+                self.rms_eps,
+                self.x_norm[i * d ..][0..d],
+            );
         }
+
         self.tEnd(t_an, .rmsnorm);
         switch (lw.kind) {
             .gdn => |w| try self.gdnMixer(w, rows, layer),
             .full => |w| try self.fullMixer(w, rows),
         }
+
         const t_res1 = self.tBegin();
         for (0..n) |i| {
             ops.residualAdd(self.mix_out[i * d ..][0..d], self.x[i * d ..][0..d]);
         }
+
         self.tEnd(t_res1, .residual);
 
         // -- FFN / SwiGLU block ---------------------------------------------
         const t_fn = self.tBegin();
         for (0..n) |i| {
-            ops.rmsnorm(self.x[i * d ..][0..d], lw.post_attn_norm, self.rms_eps, self.x_norm[i * d ..][0..d]);
+            ops.rmsnorm(
+                self.x[i * d ..][0..d],
+                lw.post_attn_norm,
+                self.rms_eps,
+                self.x_norm[i * d ..][0..d],
+            );
         }
+
         self.tEnd(t_fn, .rmsnorm);
         try self.linearBatch(self.x_norm[0 .. n * d], lw.ffn_gate.*, self.ffn_g, n, .gate_up_proj);
         try self.linearBatch(self.x_norm[0 .. n * d], lw.ffn_up.*, self.ffn_u, n, .gate_up_proj);
         const t_sg = self.tBegin();
         for (0..n) |i| {
-            ops.swiglu(self.ffn_g[i * fd ..][0..fd], self.ffn_u[i * fd ..][0..fd], self.ffn_g[i * fd ..][0..fd]);
+            ops.swiglu(
+                self.ffn_g[i * fd ..][0..fd],
+                self.ffn_u[i * fd ..][0..fd],
+                self.ffn_g[i * fd ..][0..fd],
+            );
         }
+
         self.tEnd(t_sg, .swiglu);
         try self.linearBatch(self.ffn_g[0 .. n * fd], lw.ffn_down.*, self.mix_out, n, .down_proj);
         const t_res2 = self.tBegin();
         for (0..n) |i| {
             ops.residualAdd(self.mix_out[i * d ..][0..d], self.x[i * d ..][0..d]);
         }
+
         self.tEnd(t_res2, .residual);
     }
 
@@ -566,9 +657,15 @@ pub const QwenRunner = struct {
     /// present.
     pub fn resetSlotState(self: *QwenRunner, slot: u32) void {
         std.debug.assert(slot < self.n_slots);
+
         const base = @as(usize, slot) * self.layers.len;
-        for (self.gdn_state[base..][0..self.layers.len]) |s| @memset(s, 0);
-        for (self.gdn_conv_state[base..][0..self.layers.len]) |s| @memset(s, 0);
+        for (self.gdn_state[base..][0..self.layers.len]) |s| {
+            @memset(s, 0);
+        }
+
+        for (self.gdn_conv_state[base..][0..self.layers.len]) |s| {
+            @memset(s, 0);
+        }
     }
 
     /// Copy slot state for a session fork: KV rows `0..pos` of the
@@ -580,9 +677,13 @@ pub const QwenRunner = struct {
         std.debug.assert(target_slot < self.n_slots);
         std.debug.assert(source_slot != target_slot);
         std.debug.assert(pos <= self.max_seq);
+
         // A runner without a full-attention layer carries no KV to fork, so the
         // GDN slabs below are the whole state.
-        if (self.kv_slots.len > 0) self.kv_slots[target_slot].copyFrom(&self.kv_slots[source_slot], pos);
+        if (self.kv_slots.len > 0) {
+            self.kv_slots[target_slot].copyFrom(&self.kv_slots[source_slot], pos);
+        }
+
         const source_base = @as(usize, source_slot) * self.layers.len;
         const target_base = @as(usize, target_slot) * self.layers.len;
         for (0..self.layers.len) |li| {
@@ -608,13 +709,19 @@ pub const QwenRunner = struct {
     pub fn evictSlotBytesFor(self: *const QwenRunner, n_rows: u32) u64 {
         const row_bytes: u64 = self.kv_dtype.rowBytes(self.n_kv_heads * self.head_dim);
         var total: u64 = 0;
-        for (self.layers) |*layer| switch (layer.kind) {
-            .full => total += @as(u64, 2) * n_rows * row_bytes,
-            // The GDN state keeps f32 under every KV dtype. The planner prices
-            // the per-slot fixed state as one constant, so a dtype-varying slab
-            // breaks that pricing.
-            .gdn => total += (@as(u64, self.gdn_dims.stateLen()) + self.gdn_dims.convStateLen()) * @sizeOf(f32),
-        };
+        for (self.layers) |*layer| {
+            switch (layer.kind) {
+                .full => total += @as(u64, 2) * n_rows * row_bytes,
+                // The GDN state keeps f32 under every KV dtype. The planner prices
+                // the per-slot fixed state as one constant, so a dtype-varying slab
+                // breaks that pricing.
+                .gdn => total += (@as(
+                    u64,
+                    self.gdn_dims.stateLen(),
+                ) + self.gdn_dims.convStateLen()) * @sizeOf(f32),
+            }
+        }
+
         return total;
     }
 
@@ -624,26 +731,36 @@ pub const QwenRunner = struct {
         std.debug.assert(n_rows >= 1); // a blob must hold rows to restore from
         std.debug.assert(n_rows <= self.max_seq);
         std.debug.assert(out.len == @as(usize, @intCast(self.evictSlotBytesFor(n_rows))));
+
         const base = @as(usize, slot) * self.layers.len;
         var off: usize = 0;
-        for (self.layers, 0..) |*layer, li| switch (layer.kind) {
-            // The cache binding lives in this arm, because a runner without a
-            // full-attention layer has no slot vector to index.
-            .full => |*w| {
-                const kv = &self.kv_slots[slot];
-                for ([_][]const u8{ kv.kRowsBytes(w.kv_slot, n_rows), kv.vRowsBytes(w.kv_slot, n_rows) }) |bytes| {
-                    @memcpy(out[off..][0..bytes.len], bytes);
-                    off += bytes.len;
-                }
-            },
-            .gdn => {
-                for ([_][]const f32{ self.gdn_state[base + li], self.gdn_conv_state[base + li] }) |slab| {
-                    const bytes = std.mem.sliceAsBytes(slab);
-                    @memcpy(out[off..][0..bytes.len], bytes);
-                    off += bytes.len;
-                }
-            },
-        };
+        for (self.layers, 0..) |*layer, li| {
+            switch (layer.kind) {
+                // The cache binding lives in this arm, because a runner without a
+                // full-attention layer has no slot vector to index.
+                .full => |*w| {
+                    const kv = &self.kv_slots[slot];
+                    for ([_][]const u8{
+                        kv.kRowsBytes(w.kv_slot, n_rows),
+                        kv.vRowsBytes(w.kv_slot, n_rows),
+                    }) |bytes| {
+                        @memcpy(out[off..][0..bytes.len], bytes);
+                        off += bytes.len;
+                    }
+                },
+                .gdn => {
+                    for ([_][]const f32{
+                        self.gdn_state[base + li],
+                        self.gdn_conv_state[base + li],
+                    }) |slab| {
+                        const bytes = std.mem.sliceAsBytes(slab);
+                        @memcpy(out[off..][0..bytes.len], bytes);
+                        off += bytes.len;
+                    }
+                },
+            }
+        }
+
         std.debug.assert(off == out.len);
     }
 
@@ -653,26 +770,36 @@ pub const QwenRunner = struct {
         std.debug.assert(n_rows >= 1); // a blob must hold rows to restore from
         std.debug.assert(n_rows <= self.max_seq);
         std.debug.assert(blob.len == @as(usize, @intCast(self.evictSlotBytesFor(n_rows))));
+
         const base = @as(usize, slot) * self.layers.len;
         var off: usize = 0;
-        for (self.layers, 0..) |*layer, li| switch (layer.kind) {
-            // The cache binding lives in this arm, because a runner without a
-            // full-attention layer has no slot vector to index.
-            .full => |*w| {
-                const kv = &self.kv_slots[slot];
-                for ([_][]u8{ kv.kRowsBytesMut(w.kv_slot, n_rows), kv.vRowsBytesMut(w.kv_slot, n_rows) }) |bytes| {
-                    @memcpy(bytes, blob[off..][0..bytes.len]);
-                    off += bytes.len;
-                }
-            },
-            .gdn => {
-                for ([_][]f32{ self.gdn_state[base + li], self.gdn_conv_state[base + li] }) |slab| {
-                    const bytes = std.mem.sliceAsBytes(slab);
-                    @memcpy(bytes, blob[off..][0..bytes.len]);
-                    off += bytes.len;
-                }
-            },
-        };
+        for (self.layers, 0..) |*layer, li| {
+            switch (layer.kind) {
+                // The cache binding lives in this arm, because a runner without a
+                // full-attention layer has no slot vector to index.
+                .full => |*w| {
+                    const kv = &self.kv_slots[slot];
+                    for ([_][]u8{
+                        kv.kRowsBytesMut(w.kv_slot, n_rows),
+                        kv.vRowsBytesMut(w.kv_slot, n_rows),
+                    }) |bytes| {
+                        @memcpy(bytes, blob[off..][0..bytes.len]);
+                        off += bytes.len;
+                    }
+                },
+                .gdn => {
+                    for ([_][]f32{
+                        self.gdn_state[base + li],
+                        self.gdn_conv_state[base + li],
+                    }) |slab| {
+                        const bytes = std.mem.sliceAsBytes(slab);
+                        @memcpy(bytes, blob[off..][0..bytes.len]);
+                        off += bytes.len;
+                    }
+                },
+            }
+        }
+
         std.debug.assert(off == blob.len);
     }
 
@@ -725,20 +852,29 @@ pub const QwenRunner = struct {
                     o_row,
                 );
             } else {
-                parallel.gdnStep(self.pool, self.policy, d, qkv_row, w.conv1d, self.gdn_conv_state[state_idx], .{
-                    .qkv = qkv_row,
-                    .z = z_row,
-                    .a = a_row,
-                    .b = b_row,
-                    .ssm_a = w.ssm_a,
-                    .dt_bias = w.dt_bias,
-                    .ssm_norm = w.ssm_norm,
-                    .rms_eps = self.rms_eps,
-                    .state = self.gdn_state[state_idx],
-                    .o_out = o_row,
-                });
+                parallel.gdnStep(
+                    self.pool,
+                    self.policy,
+                    d,
+                    qkv_row,
+                    w.conv1d,
+                    self.gdn_conv_state[state_idx],
+                    .{
+                        .qkv = qkv_row,
+                        .z = z_row,
+                        .a = a_row,
+                        .b = b_row,
+                        .ssm_a = w.ssm_a,
+                        .dt_bias = w.dt_bias,
+                        .ssm_norm = w.ssm_norm,
+                        .rms_eps = self.rms_eps,
+                        .state = self.gdn_state[state_idx],
+                        .o_out = o_row,
+                    },
+                );
             }
         }
+
         self.tEnd(t_step, .gdn_step);
         try self.linearBatch(self.mix_o[0 .. n * vd], w.out.*, self.mix_out, n, .gdn_out);
     }
@@ -757,6 +893,7 @@ pub const QwenRunner = struct {
         // index reads the rows of another layer and never fails a bound.
         std.debug.assert(self.kv_slots.len == self.n_slots);
         std.debug.assert(w.kv_slot < self.kv_slots[0].n_layers);
+
         const hd = self.head_dim;
         const n = rows.len;
         const hidden = self.hidden;
@@ -786,22 +923,30 @@ pub const QwenRunner = struct {
                 ops.rmsnorm(qh, w.q_norm, self.rms_eps, qh);
                 ops.ropeInplace(qh, r.pos, self.rope_dim, self.rope_base, .neox, null);
             }
+
             h = 0;
             while (h < self.n_kv_heads) : (h += 1) {
                 const kh = self.k_buf[i * kvd + h * hd ..][0..hd];
                 ops.rmsnorm(kh, w.k_norm, self.rms_eps, kh);
                 ops.ropeInplace(kh, r.pos, self.rope_dim, self.rope_base, .neox, null);
             }
+
             self.tEnd(t_qk, .qk_norm_rope);
             const t_kv = self.tBegin();
-            // The one conversion seam: the f32 scratch pipeline never learns
+            // The one conversion boundary: the f32 scratch pipeline never learns
             // the dtype, and the commit narrows the finished rows. Zen 3 carries
             // F16C, so the compiler vectorizes this into hardware
             // round-to-nearest-even.
             switch (self.kv_dtype) {
                 .f32 => {
-                    @memcpy(self.kv_slots[r.slot].kDst(w.kv_slot, r.pos), self.k_buf[i * kvd ..][0..kvd]);
-                    @memcpy(self.kv_slots[r.slot].vDst(w.kv_slot, r.pos), self.v_buf[i * kvd ..][0..kvd]);
+                    @memcpy(
+                        self.kv_slots[r.slot].kDst(w.kv_slot, r.pos),
+                        self.k_buf[i * kvd ..][0..kvd],
+                    );
+                    @memcpy(
+                        self.kv_slots[r.slot].vDst(w.kv_slot, r.pos),
+                        self.v_buf[i * kvd ..][0..kvd],
+                    );
                 },
                 .f16 => {
                     const k_dst = self.kv_slots[r.slot].kDstAs(f16, w.kv_slot, r.pos);
@@ -814,6 +959,7 @@ pub const QwenRunner = struct {
                     }
                 },
             }
+
             self.tEnd(t_kv, .kv_commit);
         }
 
@@ -824,6 +970,7 @@ pub const QwenRunner = struct {
                 // Flag resolution refuses every dtype but f32 on this build arm,
                 // because `wrap.attentionSingle` uploads the slab as f32.
                 std.debug.assert(self.kv_dtype == .f32);
+
                 ops.attentionSingle(
                     self.q_full[i * qd ..][0..qd],
                     self.n_heads,
@@ -834,46 +981,53 @@ pub const QwenRunner = struct {
                     t_len,
                     self.attn_out[i * qd ..][0..qd],
                 );
-            } else switch (self.kv_dtype) {
-                .f32 => parallel.attentionTyped(
-                    f32,
-                    ops,
-                    self.pool,
-                    self.policy,
-                    self.q_full[i * qd ..][0..qd],
-                    self.n_heads,
-                    hd,
-                    self.kv_slots[r.slot].kSlice(w.kv_slot, r.pos),
-                    self.kv_slots[r.slot].vSlice(w.kv_slot, r.pos),
-                    self.n_kv_heads,
-                    t_len,
-                    self.attn_parts,
-                    self.attn_out[i * qd ..][0..qd],
-                ),
-                .f16 => parallel.attentionTyped(
-                    f16,
-                    ops,
-                    self.pool,
-                    self.policy,
-                    self.q_full[i * qd ..][0..qd],
-                    self.n_heads,
-                    hd,
-                    self.kv_slots[r.slot].kSliceAs(f16, w.kv_slot, r.pos),
-                    self.kv_slots[r.slot].vSliceAs(f16, w.kv_slot, r.pos),
-                    self.n_kv_heads,
-                    t_len,
-                    self.attn_parts,
-                    self.attn_out[i * qd ..][0..qd],
-                ),
+            } else {
+                switch (self.kv_dtype) {
+                    .f32 => parallel.attentionTyped(
+                        f32,
+                        ops,
+                        self.pool,
+                        self.policy,
+                        self.q_full[i * qd ..][0..qd],
+                        self.n_heads,
+                        hd,
+                        self.kv_slots[r.slot].kSlice(w.kv_slot, r.pos),
+                        self.kv_slots[r.slot].vSlice(w.kv_slot, r.pos),
+                        self.n_kv_heads,
+                        t_len,
+                        self.attn_parts,
+                        self.attn_out[i * qd ..][0..qd],
+                    ),
+                    .f16 => parallel.attentionTyped(
+                        f16,
+                        ops,
+                        self.pool,
+                        self.policy,
+                        self.q_full[i * qd ..][0..qd],
+                        self.n_heads,
+                        hd,
+                        self.kv_slots[r.slot].kSliceAs(f16, w.kv_slot, r.pos),
+                        self.kv_slots[r.slot].vSliceAs(f16, w.kv_slot, r.pos),
+                        self.n_kv_heads,
+                        t_len,
+                        self.attn_parts,
+                        self.attn_out[i * qd ..][0..qd],
+                    ),
+                }
             }
+
             self.tEnd(t_attn, .attention);
             // Sigmoid output gate.
             const t_gate = self.tBegin();
             const out_row = self.attn_out[i * qd ..][0..qd];
             const gate = self.gate_full[i * qd ..][0..qd];
-            for (out_row, gate) |*o, gv| o.* *= 1.0 / (1.0 + @exp(-gv));
+            for (out_row, gate) |*o, gv| {
+                o.* *= 1.0 / (1.0 + @exp(-gv));
+            }
+
             self.tEnd(t_gate, .attn_gate);
         }
+
         try self.linearBatch(self.attn_out[0 .. n * qd], w.o.*, self.mix_out, n, .o_proj);
     }
 
@@ -882,12 +1036,21 @@ pub const QwenRunner = struct {
     /// Dispatch the right batched linear kernel by weight dtype, with optional
     /// row-parallel fan-out. See the shared `linear_dispatch.linearBatchDispatch`.
     /// The method binds the pool and the policy of this runner. It is
-    /// also the one seam every matmul of the step passes through, so the CPU
+    /// also the one interface every matmul of the step passes through, so the CPU
     /// timer charges every matmul category here.
-    fn linearBatch(self: *const QwenRunner, inputs: []const f32, w: Tensor, outs: []f32, batch: usize, cat: ProfileCat) Error!void {
+    fn linearBatch(
+        self: *const QwenRunner,
+        inputs: []const f32,
+        w: Tensor,
+        outs: []f32,
+        batch: usize,
+        cat: ProfileCat,
+    ) Error!void {
         std.debug.assert(cat.isMatmul());
+
         const t0 = self.tBegin();
         defer self.tEnd(t0, cat);
+
         return linear_dispatch.linearBatchDispatch(self.pool, self.policy, inputs, w, outs, batch);
     }
 
@@ -925,20 +1088,34 @@ test {
 test "cpu profile: the qwen categories partition one decode step" {
     // The instrument exists only in a `-Dtrace` build, and the GPU per-op
     // backend dispatches to a device this test must not touch.
-    if (comptime !core_log.hot or build_options.use_vulkan_ops) return error.SkipZigTest else {
+    if (comptime !core_log.hot or build_options.use_vulkan_ops) {
+        return error.SkipZigTest;
+    } else {
         const io = std.testing.io;
         var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
         defer arena_state.deinit();
+
         const arena = arena_state.allocator();
         const fixture = try test_fixtures.path(arena, "Qwen3.5-2B-Q8_0");
 
         var loaded = try loader.load(io, arena, fixture);
         defer loaded.close();
+
         const max_seq = @min(loaded.card.context_length, test_fakes.test_window);
         var pool: Pool = undefined;
         try pool.init(io, 1, 0);
         defer pool.deinit();
-        var r = try QwenRunner.init(arena, &loaded, kv_budget.pinned(1, max_seq), 0, io, &pool, .{ .n_threads = 1 }, .f32);
+
+        var r = try QwenRunner.init(
+            arena,
+            &loaded,
+            kv_budget.pinned(1, max_seq),
+            0,
+            io,
+            &pool,
+            .{ .n_threads = 1 },
+            .f32,
+        );
 
         // One unprofiled step faults in the weight pages, so the measured step
         // pays no first-touch cost the brackets cannot see.
@@ -963,6 +1140,7 @@ test "cpu profile: the qwen categories partition one decode step" {
                 try std.testing.expectEqual(@as(u64, 0), prof.nsOf(cat));
             }
         }
+
         // Disjoint: two overlapping brackets charge one nanosecond twice, which
         // pushes the sum past the wall time of the step.
         try std.testing.expect(prof.total() <= wall);

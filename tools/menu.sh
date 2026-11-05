@@ -5,7 +5,7 @@
 #   source tools/menu.sh
 #
 # It then provides the prompt and menu functions that the run-style targets use
-# to resolve a knob, the status-line functions that every target uses for output,
+# to resolve a variable, the status-line functions that every target uses for output,
 # and backend_flags, which maps a backend name to its `zig build` flags. One
 # place owns the look and the resolution rules, so `make run`, `make chat`, and
 # `make bench-model` behave the same and read the same.
@@ -25,7 +25,7 @@
 #   [?] bold    a yes/no confirmation               (shared)
 #   [!] red     an error                            (Makefile-only)
 #
-# The resolution rule fixes the order for every knob:
+# The resolution rule fixes the order for every variable:
 #
 #   1. value already set (env var / `make VAR=...`)  -> used as-is, no prompt
 #   2. stdin is not a TTY (a pipe, CI)               -> the default, silently
@@ -46,10 +46,10 @@ else
 fi
 
 # -- trace level -------------------------------------------------------------
-# LOG, a make knob, maps to $ZIGFERENCER_LOG, which every zigferencer process
+# LOG, a make variable, maps to $ZIGFERENCER_LOG, which every zigferencer process
 # reads once at startup. `make run LOG=runner,kv` or `make inspect LOG=gguf`
-# therefore switches traces at run time, with no rebuild. The export happens only
-# when LOG is given, so a $ZIGFERENCER_LOG already in the environment still wins.
+# therefore switches traces at run time, with no rebuild. A given LOG overrides a
+# $ZIGFERENCER_LOG from the environment. With no LOG, that value stays.
 [ -n "${LOG:-}" ] && export ZIGFERENCER_LOG="$LOG"
 
 # -- status lines (stderr. stdout stays reserved for program output) ---------
@@ -72,7 +72,7 @@ run_cmd() {
 
 # -- prompts -----------------------------------------------------------------
 # prompt_value <current> <label> <default>
-# Resolve a free-text knob by the resolution rule above. Echo the result on
+# Resolve a free-text variable by the resolution rule above. Echo the result on
 # stdout.
 prompt_value() {
     local current="$1" label="$2" default="$3" reply
@@ -89,7 +89,7 @@ prompt_value() {
 }
 
 # prompt_choice <current> <label> <default> <option>...
-# Resolve an enumerated knob. The numbered menu marks the default and accepts a
+# Resolve an enumerated variable. The numbered menu marks the default and accepts a
 # 1-based number or an exact option name. Enter takes the default.
 prompt_choice() {
     local current="$1" label="$2" default="$3"; shift 3
@@ -121,7 +121,7 @@ prompt_backend() {
 }
 
 # prompt_model <current> <bin>
-# Resolve the model knob against the models present on disk (<bin> list
+# Resolve the model variable against the models present on disk (<bin> list
 # --present). A run-style target does not need this menu, because its binary
 # prompts by itself. A script-driven target such as bench-openai or demo-openai
 # spawns the server with its output captured, so the picker of the binary cannot
@@ -153,7 +153,7 @@ confirm() {
 # backend_flags <backend>
 # The `zig build` flags that a backend name implies. 'auto', and a blank value,
 # let build.zig pick the strongest eligible CPU variant. The two vulkan backends
-# also switch the runtime to the GPU, and they pass ATTN, the attention kit, when
+# also switch the runtime to the GPU, and they pass ATTN, the attention kernel set, when
 # it is set. The echo is space-separated, for unquoted word-splitting.
 backend_flags() {
     case "$1" in
@@ -221,7 +221,7 @@ simd_report() {
 }
 
 # bin_subcommand <bin> <subcommand...>
-# Run a subcommand on the CURRENT binary, and refuse when no binary exists. It is
+# Run a command on the CURRENT binary, and refuse when no binary exists. It is
 # the shared body of the target that reports on the built binary (info).
 bin_subcommand() {
     local bin="$1"

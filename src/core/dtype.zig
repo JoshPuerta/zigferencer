@@ -22,6 +22,19 @@
 
 const std = @import("std");
 
+// -- constants --------------------------------------------------------------
+
+/// Bytes the widest `tagSuffix` occupies. A caller sizing a tag buffer adds
+/// this to its own frame, which is what makes the format infallible.
+pub const kv_tag_suffix_max: usize = blk: {
+    var widest: usize = 0;
+    for (std.enums.values(KvDtype)) |d| {
+        widest = @max(widest, d.tagSuffix().len);
+    }
+
+    break :blk widest;
+};
+
 // -- types ------------------------------------------------------------------
 
 /// Open enum mirroring ggml's wire type ids (unknown ids stay representable).
@@ -76,6 +89,7 @@ pub const KvDtype = enum {
             .f32 => .f32,
             .f16 => .f16,
         };
+
         return bytesForNumel(t, per_step_elems);
     }
 
@@ -103,14 +117,6 @@ pub const KvDtype = enum {
 };
 
 // -- api --------------------------------------------------------------------
-
-/// Bytes the widest `tagSuffix` occupies. A caller sizing a tag buffer adds
-/// this to its own frame, which is what makes the format infallible.
-pub const kv_tag_suffix_max: usize = blk: {
-    var widest: usize = 0;
-    for (std.enums.values(KvDtype)) |d| widest = @max(widest, d.tagSuffix().len);
-    break :blk widest;
-};
 
 /// True when `blockSize` and `bytesPerBlock` both name `t`. A GGUF can carry a
 /// wire type id with no block geometry here, so a caller at the trust boundary
@@ -254,6 +260,7 @@ test "geometry: each wire tag has its literal block and block bytes, or no geome
         try std.testing.expectEqual(g.block, blockSize(t));
         try std.testing.expectEqual(g.bytes, bytesPerBlock(t));
     }
+
     // An id outside the enum stays representable, and it has no geometry.
     try std.testing.expect(!hasBlockGeometry(@enumFromInt(9999)));
 }
@@ -275,7 +282,10 @@ test "geometry: the size products of a KV row and a tensor, and the checked edge
     const max_f32: u64 = std.math.maxInt(u64) / 4;
     try std.testing.expectEqual(@as(?u64, max_f32 * 4), bytesForNumelChecked(.f32, max_f32));
     try std.testing.expectEqual(@as(?u64, null), bytesForNumelChecked(.f32, max_f32 + 1));
-    try std.testing.expectEqual(@as(?u64, null), bytesForNumelChecked(.q8_0, (std.math.maxInt(u64) / 32) * 32));
+    try std.testing.expectEqual(
+        @as(?u64, null),
+        bytesForNumelChecked(.q8_0, (std.math.maxInt(u64) / 32) * 32),
+    );
 }
 
 test "KvDtype: the plan token names only a non-identity dtype" {

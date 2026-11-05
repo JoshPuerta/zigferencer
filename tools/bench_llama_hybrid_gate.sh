@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # The five-way llama hybrid equality gate. Greedy decoding is deterministic and
-# the GPU kernels are bit-exact against the CPU oracle, so five paths through one
+# the GPU kernels are bit-exact against the CPU reference, so five paths through one
 # llama model must emit one token stream: the CPU runner, the fused runner, the
 # hybrid forced to all-host (k = L), the hybrid forced to all-GPU (k = 0), and
 # the hybrid at a mid split. A mismatch means the split forward pass disagrees with

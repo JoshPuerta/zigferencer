@@ -32,14 +32,14 @@ const prompt = "Hello";
 /// Greedy-decoded first 5 token ids for the prompt "Hello" against
 /// SmolLM2-135M-Instruct-Q8_0 with f32 activations and naive scalar kernels.
 /// The capture ran on x86_64-linux with the current BOS handling
-/// (`vocab.addBos`), which llama.cpp validates as oracle-exact.
+/// (`vocab.addBos`), which llama.cpp validates as reference-exact.
 const expected_q8_0 = [_]u32{ 198, 198, 57, 5248, 18948 };
 
 /// Greedy-decoded first 8 token ids for the prompt "Hello" against the
 /// mixed-quant SmolLM2-135M-Instruct-Q4_0 with f32 activations and naive
 /// scalar kernels. The capture ran on x86_64-linux and matches the llama.cpp
-/// Q4_0 oracle: the ids decode to the greedy continuation of the oracle byte
-/// for byte. The q4 path tracks the oracle over a long greedy prefix before
+/// Q4_0 reference: the ids decode to the greedy continuation of the reference byte
+/// for byte. The q4 path tracks the reference over a long greedy prefix before
 /// f32 near-tie drift flips a token.
 const expected_q4_0 = [_]u32{ 260, 1919, 506, 746, 30, 198, 198, 57 };
 
@@ -47,12 +47,18 @@ const expected_q4_0 = [_]u32{ 260, 1919, 506, 746, 30, 198, 198, 57 };
 /// model `name` on a runner with the policy `cfg`, and compare them to `expected`.
 /// The token stream does not depend on the thread count or the floor, so one
 /// anchor serves every policy.
-fn checkSnapshot(comptime n: usize, name: []const u8, expected: *const [n]u32, cfg: tp.Policy) !void {
+fn checkSnapshot(
+    comptime n: usize,
+    name: []const u8,
+    expected: *const [n]u32,
+    cfg: tp.Policy,
+) !void {
     const io = std.testing.io;
 
     const gpa = std.testing.allocator;
     var arena_state = std.heap.ArenaAllocator.init(gpa);
     defer arena_state.deinit();
+
     const arena = arena_state.allocator();
     const path = try z.test_fixtures.path(arena, name);
 
@@ -63,6 +69,7 @@ fn checkSnapshot(comptime n: usize, name: []const u8, expected: *const [n]u32, c
     var cpu_pool: tp.Pool = undefined;
     try tp.startPool(&cpu_pool, io, cfg);
     defer cpu_pool.deinit();
+
     var runner = try LlamaRunner.init(
         arena,
         &loaded,
@@ -94,9 +101,15 @@ fn checkSnapshot(comptime n: usize, name: []const u8, expected: *const [n]u32, c
     if (!std.mem.eql(u32, expected, &generated)) {
         std.debug.print("\nSNAPSHOT MISMATCH for prompt {s} ({s})\n", .{ prompt, path });
         std.debug.print("  expected: {{ ", .{});
-        for (expected) |id| std.debug.print("{d}, ", .{id});
+        for (expected) |id| {
+            std.debug.print("{d}, ", .{id});
+        }
+
         std.debug.print("}}\n  actual:   {{ ", .{});
-        for (generated) |id| std.debug.print("{d}, ", .{id});
+        for (generated) |id| {
+            std.debug.print("{d}, ", .{id});
+        }
+
         std.debug.print("}}\n", .{});
         return error.SnapshotMismatch;
     }
@@ -107,7 +120,12 @@ fn checkSnapshot(comptime n: usize, name: []const u8, expected: *const [n]u32, c
 test "SmolLM2-Q8_0 greedy first-5 IDs snapshot" {
     // The default policy of the host builds this runner, so the suite runs the
     // shipped thread count and floor at least once.
-    try checkSnapshot(expected_q8_0.len, name_q8_0, &expected_q8_0, tp.Policy.forHost(std.testing.io));
+    try checkSnapshot(
+        expected_q8_0.len,
+        name_q8_0,
+        &expected_q8_0,
+        tp.Policy.forHost(std.testing.io),
+    );
 }
 
 test "SmolLM2-Q4_0 greedy first-8 IDs snapshot" {
@@ -123,6 +141,7 @@ test "SmolLM2-Q8_0 at kv f16: the slab halves and the blob round-trips" {
     const gpa = std.testing.allocator;
     var arena_state = std.heap.ArenaAllocator.init(gpa);
     defer arena_state.deinit();
+
     const arena = arena_state.allocator();
     const path = try z.test_fixtures.path(arena, name_q8_0);
 
@@ -133,6 +152,7 @@ test "SmolLM2-Q8_0 at kv f16: the slab halves and the blob round-trips" {
     var cpu_pool: tp.Pool = undefined;
     try tp.startPool(&cpu_pool, io, cfg);
     defer cpu_pool.deinit();
+
     const plan = z.kv_budget.pinned(1, 64);
     var wide = try LlamaRunner.init(arena, &loaded, plan, 0, io, &cpu_pool, cfg, .f32);
     var narrow = try LlamaRunner.init(arena, &loaded, plan, 0, io, &cpu_pool, cfg, .f16);
@@ -144,7 +164,9 @@ test "SmolLM2-Q8_0 at kv f16: the slab halves and the blob round-trips" {
 
     // Commit real rows, so the blob carries converted values and not zeros.
     var pos: u32 = 0;
-    while (pos < rows) : (pos += 1) _ = try narrow.step(pos + 1, pos);
+    while (pos < rows) : (pos += 1) {
+        _ = try narrow.step(pos + 1, pos);
+    }
 
     const blob = try arena.alloc(u8, @intCast(narrow.evictSlotBytesFor(rows)));
     const again = try arena.alloc(u8, blob.len);
@@ -156,6 +178,9 @@ test "SmolLM2-Q8_0 at kv f16: the slab halves and the blob round-trips" {
     // A zeroed blob passes the round-trip above, so some byte must be
     // non-zero.
     var any: u8 = 0;
-    for (blob) |b| any |= b;
+    for (blob) |b| {
+        any |= b;
+    }
+
     try std.testing.expect(any != 0);
 }

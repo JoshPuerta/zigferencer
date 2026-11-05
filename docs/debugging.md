@@ -10,9 +10,9 @@ executable too.
 
 Run `make debug`. It runs `zig build install dev -Doptimize=Debug -Dllvm=true`
 and installs `zig-out/bin/zigferencer` and `zig-out/bin/zigferencer-dev`. The
-default x86_64 Debug code generator lets a debugger stop at a line, but it emits
-no local variables. The LLVM code generator emits them, and gdb also needs it to
-find a breakpoint by file and line. A Debug binary is much slower than a release
+default x86_64 Debug code generator gives each debugger only a part. lldb stops
+at a line but shows no local variables. gdb shows local variables but cannot find
+a breakpoint by file and line. The LLVM code generator gives both debuggers both. A Debug binary is much slower than a release
 binary, so its times are not engine times. The next `make` target that builds
 replaces it.
 
@@ -30,10 +30,7 @@ replaces it.
 
 A line number moves when the code changes. Before you use a line from this page,
 read that line in the file. Use `--threads 1`. Then the main thread runs the
-whole forward pass, and a breakpoint in a kernel stops on that thread. The same
-lines work with `gdb --args` and `break generate.zig:154`, and `info locals`
-lists the locals. A local below the current line holds the `0xaa` fill of
-`undefined` until the code writes it.
+whole forward pass, and a breakpoint in a kernel stops on that thread.
 
 To step through the server, use two terminals:
 
@@ -60,6 +57,31 @@ selects that integration test, for example `TEST=snapshot_smollm2_test`. An
 unknown name fails the build with the list of names. An integration test finds
 its model files through `$ZIGFERENCER_MODELS_DIR` (default `models/`). Run the
 test binary with no arguments. The test runner then prints one line per test.
+
+## Debug build.zig
+
+`zig build` compiles `build.zig` and the Zig build runner into one executable, and
+then runs it. The `build` function runs at each `zig build`, also with a cached
+runner. Most questions need no debugger:
+
+- `std.debug.print` in `build` writes to stderr at each run. In the `make` function
+  of a step, it prints only when the step runs.
+- `zig build -l` runs `build`, lists the steps, and stops. It takes about 0.2 s.
+- `zig build check -Druntime=vulkan --summary all` prints the tree of steps, with
+  the status and the time of each step.
+- `--verbose` prints each command, for example each `glslc` line. A cached step runs
+  no command. To see every command, add `--cache-dir` with an empty directory.
+- `-freference-trace` shows the chain of calls to a compile error in `build.zig`.
+
+To step through `build.zig`:
+
+1. Run `make debug-build`. It compiles the runner with LLVM to
+   `zig-out/debug/build-runner`. `zig build` cannot do this, because the runner
+   refuses `-fllvm`.
+2. From the repository root, run the `lldb` command that the target prints. It stops
+   in `resolveOpsBackend`. Change the breakpoint to the line that you need.
+3. At the stop, type `frame variable` for the locals and `bt` for the call stack.
+
 
 ## The tools of Zig itself
 

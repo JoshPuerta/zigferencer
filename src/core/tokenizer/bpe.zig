@@ -33,22 +33,36 @@ const Cp = struct { cp: u21, len: usize };
 /// (`vocab.add_bos`) AND `sequence_start` is true, so callers pass text and
 /// never prepend it themselves. Text appended mid-conversation (a follow-up
 /// turn) passes false, so BOS appears only at position 0.
-pub fn encodeAlloc(vocab: *const Vocab, gpa: Allocator, text: []const u8, sequence_start: bool) EncodeError![]u32 {
+pub fn encodeAlloc(
+    vocab: *const Vocab,
+    gpa: Allocator,
+    text: []const u8,
+    sequence_start: bool,
+) EncodeError![]u32 {
     const sp = span.begin(.tokenize);
     defer sp.end();
+
     std.debug.assert(vocab.tokens.len > 0);
     // Non-default tokenizers (llama3 / qwen / smollm) split the text on a
     // GPT-2-style regex before BPE. The default path BPE-merges the whole
     // inter-special span. Branch first so the default path stays byte-identical.
     if (vocab.pre != .default) {
         const pre_ids = try encodePreSplit(vocab, gpa, text, sequence_start);
-        if (std.debug.runtime_safety) for (pre_ids) |id| std.debug.assert(id < vocab.tokens.len);
+        if (std.debug.runtime_safety) {
+            for (pre_ids) |id| {
+                std.debug.assert(id < vocab.tokens.len);
+            }
+        }
+
         return pre_ids;
     }
 
     var ids: std.ArrayList(u32) = .empty;
     errdefer ids.deinit(gpa);
-    if (sequence_start and vocab.add_bos) try ids.append(gpa, vocab.bos_id);
+
+    if (sequence_start and vocab.add_bos) {
+        try ids.append(gpa, vocab.bos_id);
+    }
 
     var pending: std.ArrayList(u32) = .empty;
     defer pending.deinit(gpa);
@@ -62,14 +76,22 @@ pub fn encodeAlloc(vocab: *const Vocab, gpa: Allocator, text: []const u8, sequen
             pos += m.len;
             continue;
         }
+
         const id = vocab.byte_to_id[text[pos]];
         if (id == v.no_token) return error.UntokenizableByte;
+
         try pending.append(gpa, id);
         pos += 1;
     }
+
     try flushSegment(vocab, gpa, &pending, &ids);
     const out = try ids.toOwnedSlice(gpa);
-    if (std.debug.runtime_safety) for (out) |id| std.debug.assert(id < vocab.tokens.len);
+    if (std.debug.runtime_safety) {
+        for (out) |id| {
+            std.debug.assert(id < vocab.tokens.len);
+        }
+    }
+
     return out;
 }
 
@@ -80,6 +102,7 @@ pub fn decodeAlloc(vocab: *const Vocab, gpa: Allocator, ids: []const u32) Alloca
 
     for (ids) |id| {
         if (id >= vocab.tokens.len) continue;
+
         const token_bytes = vocab.tokens[id];
         var i: usize = 0;
         while (i < token_bytes.len) {
@@ -93,6 +116,7 @@ pub fn decodeAlloc(vocab: *const Vocab, gpa: Allocator, ids: []const u32) Alloca
                 i += 1;
                 continue;
             }
+
             const cp = std.unicode.utf8Decode(token_bytes[i..][0..seq_len]) catch {
                 try buf.append(gpa, token_bytes[i]);
                 i += 1;
@@ -103,9 +127,11 @@ pub fn decodeAlloc(vocab: *const Vocab, gpa: Allocator, ids: []const u32) Alloca
             } else {
                 try buf.appendSlice(gpa, token_bytes[i..][0..seq_len]);
             }
+
             i += seq_len;
         }
     }
+
     return buf.toOwnedSlice(gpa);
 }
 
@@ -119,6 +145,7 @@ fn matchSpecial(vocab: *const Vocab, text: []const u8, pos: usize) ?Match {
             return .{ .id = sp.id, .len = sp.bytes.len };
         }
     }
+
     return null;
 }
 
@@ -143,12 +170,20 @@ fn flushSegment(
                 }
             }
         }
+
         if (best_idx == null) break;
+
         const idx = best_idx.?;
-        const merged = vocab.merge_to_id.get(v.pairKey(pending.items[idx], pending.items[idx + 1])).?;
+        const merged = vocab.merge_to_id.get(
+            v.pairKey(pending.items[idx], pending.items[idx + 1]),
+        ).?;
         pending.items[idx] = merged;
         // Shift left to drop the consumed right-hand element.
-        std.mem.copyForwards(u32, pending.items[idx + 1 .. pending.items.len - 1], pending.items[idx + 2 ..]);
+        std.mem.copyForwards(
+            u32,
+            pending.items[idx + 1 .. pending.items.len - 1],
+            pending.items[idx + 2 ..],
+        );
         pending.shrinkRetainingCapacity(pending.items.len - 1);
     }
 
@@ -171,13 +206,22 @@ fn flushSegment(
 // Non-ASCII digits and punctuation are a documented gap, because full Unicode
 // tables are absent.
 
-fn encodePreSplit(vocab: *const Vocab, gpa: Allocator, text: []const u8, sequence_start: bool) EncodeError![]u32 {
+fn encodePreSplit(
+    vocab: *const Vocab,
+    gpa: Allocator,
+    text: []const u8,
+    sequence_start: bool,
+) EncodeError![]u32 {
     var ids: std.ArrayList(u32) = .empty;
     errdefer ids.deinit(gpa);
-    if (sequence_start and vocab.add_bos) try ids.append(gpa, vocab.bos_id);
+
+    if (sequence_start and vocab.add_bos) {
+        try ids.append(gpa, vocab.bos_id);
+    }
 
     var pending: std.ArrayList(u32) = .empty;
     defer pending.deinit(gpa);
+
     var mapped: std.ArrayList(u8) = .empty; // byte-level pre-token, for ignore_merges
     defer mapped.deinit(gpa);
 
@@ -190,26 +234,33 @@ fn encodePreSplit(vocab: *const Vocab, gpa: Allocator, text: []const u8, sequenc
             pos += m.len;
             continue;
         }
+
         const seg = capAtSpecial(vocab, text, pos, preTokenLen(vocab, text, pos));
         const bytes = text[pos..][0..seg];
 
         if (vocab.ignore_merges) {
             mapped.clearRetainingCapacity();
-            for (bytes) |b| try mapped.appendSlice(gpa, v.byteLevel(b));
+            for (bytes) |b| {
+                try mapped.appendSlice(gpa, v.byteLevel(b));
+            }
+
             if (vocab.token_to_id.get(mapped.items)) |id| {
                 try ids.append(gpa, id);
                 pos += seg;
                 continue;
             }
         }
+
         for (bytes) |b| {
             const id = vocab.byte_to_id[b];
             if (id == v.no_token) return error.UntokenizableByte;
             try pending.append(gpa, id);
         }
+
         try flushSegment(vocab, gpa, &pending, &ids); // merges within this pre-token, then clears
         pos += seg;
     }
+
     return ids.toOwnedSlice(gpa);
 }
 
@@ -222,6 +273,7 @@ fn capAtSpecial(vocab: *const Vocab, text: []const u8, from: usize, seg: usize) 
     while (q < end) : (q += 1) {
         if (matchSpecial(vocab, text, q) != null) return q - from;
     }
+
     return seg;
 }
 
@@ -237,12 +289,14 @@ fn classify(cp: u21) CpClass {
             .cr_or_lf = c == '\r' or c == '\n',
         };
     }
+
     return .{ .letter = true, .number = false, .whitespace = false, .cr_or_lf = false };
 }
 
 fn nextCp(text: []const u8, i: usize) Cp {
     const n = std.unicode.utf8ByteSequenceLength(text[i]) catch return .{ .cp = text[i], .len = 1 };
     if (i + n > text.len) return .{ .cp = text[i], .len = 1 };
+
     const cp = std.unicode.utf8Decode(text[i..][0..n]) catch return .{ .cp = text[i], .len = 1 };
     return .{ .cp = cp, .len = n };
 }
@@ -278,7 +332,9 @@ fn preSplitLlama(text: []const u8, from: usize, digit_max: usize) usize {
             if (a == 's' or a == 't' or a == 'm' or a == 'd') return 2;
             if (from + 2 < len) {
                 const b = lowerAscii(text[from + 2]);
-                if ((a == 'r' and b == 'e') or (a == 'v' and b == 'e') or (a == 'l' and b == 'l')) return 3;
+                if ((a == 'r' and b == 'e') or (a == 'v' and b == 'e') or (a == 'l' and b == 'l')) {
+                    return 3;
+                }
             }
         }
     }
@@ -287,6 +343,7 @@ fn preSplitLlama(text: []const u8, from: usize, digit_max: usize) usize {
     if (fc.letter) {
         return lettersRun(text, from + first.len) - from;
     }
+
     if (!fc.cr_or_lf and !fc.number) { // first is a valid optional leading char
         const after = from + first.len;
         if (after < len and classify(nextCp(text, after).cp).letter) {
@@ -301,9 +358,11 @@ fn preSplitLlama(text: []const u8, from: usize, digit_max: usize) usize {
         while (cnt < digit_max and j < len) {
             const nc = nextCp(text, j);
             if (!classify(nc.cp).number) break;
+
             j += nc.len;
             cnt += 1;
         }
+
         return j - from;
     }
 
@@ -313,10 +372,17 @@ fn preSplitLlama(text: []const u8, from: usize, digit_max: usize) usize {
         if (first.cp == ' ' and from + 1 < len and isSymbol(nextCp(text, from + 1).cp)) {
             k = from + 1; // the optional leading space, with symbols after it
         }
+
         if (isSymbol(nextCp(text, k).cp)) {
             var j = k;
-            while (j < len and isSymbol(nextCp(text, j).cp)) j += nextCp(text, j).len;
-            while (j < len and classify(nextCp(text, j).cp).cr_or_lf) j += nextCp(text, j).len;
+            while (j < len and isSymbol(nextCp(text, j).cp)) {
+                j += nextCp(text, j).len;
+            }
+
+            while (j < len and classify(nextCp(text, j).cp).cr_or_lf) {
+                j += nextCp(text, j).len;
+            }
+
             return j - from;
         }
     }
@@ -329,13 +395,18 @@ fn preSplitLlama(text: []const u8, from: usize, digit_max: usize) usize {
         const nc = nextCp(text, j);
         const ncl = classify(nc.cp);
         if (!ncl.whitespace) break;
+
         last_ws_start = j;
         j += nc.len;
-        if (ncl.cr_or_lf) last_nl_end = j;
+        if (ncl.cr_or_lf) {
+            last_nl_end = j;
+        }
     }
+
     if (j == from) return first.len; // safety: nothing classified (unreachable)
     if (last_nl_end > from) return last_nl_end - from; // 5. \s*[\r\n]+
     if (last_ws_start > from and j < len) return last_ws_start - from; // 6. \s+(?!\S)
+
     return j - from; // 7. \s+
 }
 
@@ -358,7 +429,9 @@ fn preSplitGpt2(text: []const u8, from: usize) usize {
         if (a == 's' or a == 't' or a == 'm' or a == 'd') return 2;
         if (from + 2 < len) {
             const b = text[from + 2];
-            if ((a == 'r' and b == 'e') or (a == 'v' and b == 'e') or (a == 'l' and b == 'l')) return 3;
+            if ((a == 'r' and b == 'e') or (a == 'v' and b == 'e') or (a == 'l' and b == 'l')) {
+                return 3;
+            }
         }
     }
 
@@ -374,10 +447,16 @@ fn preSplitGpt2(text: []const u8, from: usize) usize {
     // 4.  ?[^\s\p{L}\p{N}]+  (optional ONE literal space, then symbols, no [\r\n]*)
     {
         var k = from;
-        if (first.cp == ' ' and from + 1 < len and isSymbol(nextCp(text, from + 1).cp)) k = from + 1;
+        if (first.cp == ' ' and from + 1 < len and isSymbol(nextCp(text, from + 1).cp)) {
+            k = from + 1;
+        }
+
         if (isSymbol(nextCp(text, k).cp)) {
             var j = k;
-            while (j < len and isSymbol(nextCp(text, j).cp)) j += nextCp(text, j).len;
+            while (j < len and isSymbol(nextCp(text, j).cp)) {
+                j += nextCp(text, j).len;
+            }
+
             return j - from;
         }
     }
@@ -390,13 +469,17 @@ fn preSplitGpt2(text: []const u8, from: usize) usize {
     while (j < len) {
         const nc = nextCp(text, j);
         if (!classify(nc.cp).whitespace) break;
+
         last_ws_start = j;
         j += nc.len;
     }
+
     if (j == from) return first.len; // unmatched (e.g. a control char) -> 1 codepoint
+
     const boundary = j >= len or classify(nextCp(text, j).cp).number; // EOF or digit
     if (boundary) return j - from; // whole run
     if (last_ws_start > from) return last_ws_start - from; // give back the last ws before \S
+
     return j - from; // a lone whitespace before \S (its own token)
 }
 
@@ -408,6 +491,7 @@ fn lettersRun(text: []const u8, at: usize) usize {
         if (!classify(nc.cp).letter) break;
         j += nc.len;
     }
+
     return j;
 }
 
@@ -425,7 +509,15 @@ const prop = @import("../prop.zig");
 /// The merges of the synthetic vocab, in rank order, as byte-level strings.
 /// They cover letters, a leading space (U+0120), digits, the two bytes of
 /// U+00E9, and a newline pair (U+010A).
-const test_merges = [_][]const u8{ "a b", "ab ab", "\u{120} a", "\u{120}a b", "1 2", "\u{C3} \u{A9}", "\u{10A} \u{10A}" };
+const test_merges = [_][]const u8{
+    "a b",
+    "ab ab",
+    "\u{120} a",
+    "\u{120}a b",
+    "1 2",
+    "\u{C3} \u{A9}",
+    "\u{10A} \u{10A}",
+};
 const test_specials = [_][]const u8{ "<|s|>", "<think>" };
 
 /// A vocab of the 256 byte-level characters, one token per merge, and two
@@ -439,21 +531,27 @@ fn testVocab(arena: Allocator, pre: []const u8) !Vocab {
     for (0..256) |b| {
         const printable = (b >= 33 and b <= 126) or (b >= 161 and b <= 172) or b >= 174;
         const cp: u21 = if (printable) @intCast(b) else escape;
-        if (!printable) escape += 1;
+        if (!printable) {
+            escape += 1;
+        }
+
         var utf8: [4]u8 = undefined;
         const len = try std.unicode.utf8Encode(cp, &utf8);
         try tokens.append(arena, try arena.dupe(u8, utf8[0..len]));
         try types.append(arena, 1);
     }
+
     for (test_merges) |m| {
         const space = std.mem.indexOfScalar(u8, m, ' ').?;
         try tokens.append(arena, try std.mem.concat(arena, u8, &.{ m[0..space], m[space + 1 ..] }));
         try types.append(arena, 1);
     }
+
     for (test_specials, [_]i32{ 3, 4 }) |s, t| {
         try tokens.append(arena, s);
         try types.append(arena, t);
     }
+
     const kvs = try arena.dupe(parser.Kv, &.{
         .{ .key = "tokenizer.ggml.tokens", .value = .{ .array = .{ .strings = tokens.items } } },
         .{ .key = "tokenizer.ggml.merges", .value = .{ .array = .{ .strings = &test_merges } } },
@@ -461,14 +559,38 @@ fn testVocab(arena: Allocator, pre: []const u8) !Vocab {
         .{ .key = "tokenizer.ggml.eos_token_id", .value = .{ .u32_val = 256 } },
         .{ .key = "tokenizer.ggml.pre", .value = .{ .string = pre } },
     });
-    return v.buildFromParsed(arena, .{ .header = undefined, .kvs = kvs, .tensors = &.{}, .data_offset = 0, .alignment = 1 });
+    return v.buildFromParsed(
+        arena,
+        .{ .header = undefined, .kvs = kvs, .tensors = &.{}, .data_offset = 0, .alignment = 1 },
+    );
 }
 
 const TestVocabs = [4]Vocab;
 
 /// Text pieces that hit the merges, the specials, the pre-split classes, and
 /// invalid UTF-8: a lone lead byte, a cut 3-byte sequence, and 0xFF.
-const test_pieces = [_][]const u8{ "a", "b", "ab", " ", " a", "1", "12", "\n", "\n\n", "\xc3\xa9", "<|s|>", "<think>", "<|s", "'s", "\t", "!", "\xc3", "\xe2\x82", "\xff", "\xf0\x9f\x98\x80" };
+const test_pieces = [_][]const u8{
+    "a",
+    "b",
+    "ab",
+    " ",
+    " a",
+    "1",
+    "12",
+    "\n",
+    "\n\n",
+    "\xc3\xa9",
+    "<|s|>",
+    "<think>",
+    "<|s",
+    "'s",
+    "\t",
+    "!",
+    "\xc3",
+    "\xe2\x82",
+    "\xff",
+    "\xf0\x9f\x98\x80",
+};
 
 /// Fills `text` with pieces and raw bytes, valid and invalid UTF-8, and
 /// returns the length.
@@ -485,6 +607,7 @@ fn drawText(r: std.Random, text: *[256]u8) usize {
             n += 1;
         }
     }
+
     return n;
 }
 
@@ -498,8 +621,10 @@ fn checkBpeRoundTrip(vocabs: *const TestVocabs, seed: u64) anyerror!void {
     for (vocabs) |*vocab| {
         const ids = try encodeAlloc(vocab, gpa, text[0..n], false);
         defer gpa.free(ids);
+
         const back = try decodeAlloc(vocab, gpa, ids);
         defer gpa.free(back);
+
         try std.testing.expectEqualSlices(u8, text[0..n], back);
     }
 }
@@ -507,15 +632,28 @@ fn checkBpeRoundTrip(vocabs: *const TestVocabs, seed: u64) anyerror!void {
 test "property: decode(encode(s)) == s over random byte strings for every pre-split family" {
     var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena_state.deinit();
+
     const arena = arena_state.allocator();
     var vocabs: TestVocabs = undefined;
-    for (&vocabs, [_][]const u8{ "", "llama-bpe", "qwen2", "smollm" }) |*vocab, pre| vocab.* = try testVocab(arena, pre);
+    for (&vocabs, [_][]const u8{ "", "llama-bpe", "qwen2", "smollm" }) |*vocab, pre| {
+        vocab.* = try testVocab(arena, pre);
+    }
+
     for (vocabs, [_]v.PreType{ .default, .llama3, .qwen, .smollm }) |vocab, pre| {
         try std.testing.expectEqual(pre, vocab.pre);
         try std.testing.expectEqual(@as(usize, 2), vocab.specials_sorted.len);
-        for (vocab.byte_to_id) |id| try std.testing.expect(id != v.no_token);
+        for (vocab.byte_to_id) |id| {
+            try std.testing.expect(id != v.no_token);
+        }
     }
-    try prop.forAll(.{ .site = 0xB9E0_0001, .cases = 600 }, @as(*const TestVocabs, &vocabs), u64, prop.genSeed(*const TestVocabs), checkBpeRoundTrip);
+
+    try prop.forAll(
+        .{ .site = 0xB9E0_0001, .cases = 600 },
+        @as(*const TestVocabs, &vocabs),
+        u64,
+        prop.genSeed(*const TestVocabs),
+        checkBpeRoundTrip,
+    );
 }
 
 // The naive model. It holds the merge list as literal strings and applies
@@ -531,9 +669,13 @@ fn byteLevelTable() [256]ByteLevel {
     for (&table, 0..) |*entry, b| {
         const printable = (b >= 33 and b <= 126) or (b >= 161 and b <= 172) or b >= 174;
         const cp: u21 = if (printable) @intCast(b) else escape;
-        if (!printable) escape += 1;
+        if (!printable) {
+            escape += 1;
+        }
+
         entry.len = @intCast(std.unicode.utf8Encode(cp, &entry.bytes) catch unreachable);
     }
+
     return table;
 }
 
@@ -542,8 +684,11 @@ fn byteLevelTable() [256]ByteLevel {
 fn naiveRank(left: []const u8, right: []const u8) ?usize {
     for (test_merges, 0..) |line, rank| {
         const space = std.mem.indexOfScalar(u8, line, ' ').?;
-        if (std.mem.eql(u8, line[0..space], left) and std.mem.eql(u8, line[space + 1 ..], right)) return rank;
+        if (std.mem.eql(u8, line[0..space], left) and std.mem.eql(u8, line[space + 1 ..], right)) {
+            return rank;
+        }
     }
+
     return null;
 }
 
@@ -555,11 +700,16 @@ fn naiveId(table: *const [256]ByteLevel, symbol: []const u8) u32 {
         const left = line[0..space];
         const right = line[space + 1 ..];
         if (symbol.len == left.len + right.len and
-            std.mem.startsWith(u8, symbol, left) and std.mem.endsWith(u8, symbol, right)) return @intCast(256 + rank);
+            std.mem.startsWith(u8, symbol, left) and std.mem.endsWith(u8, symbol, right))
+        {
+            return @intCast(256 + rank);
+        }
     }
+
     for (table, 0..) |entry, b| {
         if (std.mem.eql(u8, symbol, entry.bytes[0..entry.len])) return @intCast(b);
     }
+
     unreachable;
 }
 
@@ -574,6 +724,7 @@ fn naiveEncode(arena: Allocator, text: []const u8, out: *std.ArrayList(u32)) !vo
         const special = for (test_specials, 0..) |sp, i| {
             if (std.mem.startsWith(u8, text[pos..], sp)) break i;
         } else null;
+
         if (pos == text.len or special != null) {
             while (true) {
                 var best: ?usize = null;
@@ -585,17 +736,28 @@ fn naiveEncode(arena: Allocator, text: []const u8, out: *std.ArrayList(u32)) !vo
                         best = i;
                     }
                 }
+
                 const i = best orelse break;
-                symbols.items[i] = try std.mem.concat(arena, u8, &.{ symbols.items[i], symbols.items[i + 1] });
+                symbols.items[i] = try std.mem.concat(
+                    arena,
+                    u8,
+                    &.{ symbols.items[i], symbols.items[i + 1] },
+                );
                 _ = symbols.orderedRemove(i + 1);
             }
-            for (symbols.items) |symbol| try out.append(arena, naiveId(&table, symbol));
+
+            for (symbols.items) |symbol| {
+                try out.append(arena, naiveId(&table, symbol));
+            }
+
             symbols.clearRetainingCapacity();
             if (pos == text.len) return;
+
             try out.append(arena, @intCast(256 + test_merges.len + special.?));
             pos += test_specials[special.?].len;
             continue;
         }
+
         const entry = &table[text[pos]];
         try symbols.append(arena, entry.bytes[0..entry.len]);
         pos += 1;
@@ -610,23 +772,33 @@ fn checkBpeAgainstNaive(vocab: *const Vocab, seed: u64) anyerror!void {
     const n = drawText(prng.random(), &text);
     var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena_state.deinit();
+
     var want: std.ArrayList(u32) = .empty;
     try naiveEncode(arena_state.allocator(), text[0..n], &want);
     const got = try encodeAlloc(vocab, std.testing.allocator, text[0..n], false);
     defer std.testing.allocator.free(got);
+
     try std.testing.expectEqualSlices(u32, want.items, got);
 }
 
 test "property: the default family encodes to the ids of a naive lowest-rank-first merge" {
     var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena_state.deinit();
+
     const vocab = try testVocab(arena_state.allocator(), "");
-    try prop.forAll(.{ .site = 0xB9E0_0002, .cases = 600 }, @as(*const Vocab, &vocab), u64, prop.genSeed(*const Vocab), checkBpeAgainstNaive);
+    try prop.forAll(
+        .{ .site = 0xB9E0_0002, .cases = 600 },
+        @as(*const Vocab, &vocab),
+        u64,
+        prop.genSeed(*const Vocab),
+        checkBpeAgainstNaive,
+    );
 }
 
 test "each special piece encodes to its single id under every pre-split family" {
     var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena_state.deinit();
+
     const arena = arena_state.allocator();
     const gpa = std.testing.allocator;
     for ([_][]const u8{ "", "llama-bpe", "qwen2", "smollm" }) |pre| {
@@ -635,11 +807,13 @@ test "each special piece encodes to its single id under every pre-split family" 
             const id: u32 = @intCast(256 + test_merges.len + i);
             const alone = try encodeAlloc(&vocab, gpa, special, false);
             defer gpa.free(alone);
+
             try std.testing.expectEqualSlices(u32, &.{id}, alone);
             // Text on both sides must not swallow the special.
             const text = try std.mem.concat(arena, u8, &.{ "a", special, "b" });
             const between = try encodeAlloc(&vocab, gpa, text, false);
             defer gpa.free(between);
+
             try std.testing.expectEqualSlices(u32, &.{ 'a', id, 'b' }, between);
         }
     }

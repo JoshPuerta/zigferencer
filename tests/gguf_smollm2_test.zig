@@ -17,6 +17,7 @@ test "SmolLM2-135M-Instruct-Q8_0 loads and reports expected ModelCard" {
     const gpa = std.testing.allocator;
     var arena_state = std.heap.ArenaAllocator.init(gpa);
     defer arena_state.deinit();
+
     const arena = arena_state.allocator();
     const test_path = try zigferencer.test_fixtures.path(arena, "SmolLM2-135M-Instruct-Q8_0");
 
@@ -45,8 +46,10 @@ test "SmolLM2-135M-Instruct-Q8_0 loads and reports expected ModelCard" {
         for (loaded.tensors) |ref| {
             if (std.mem.eql(u8, ref.name, "token_embd.weight")) break :blk ref;
         }
+
         return error.MissingTokenEmbedding;
     };
+
     try std.testing.expectEqual(.q8_0, tok_embd.tensor.dtype);
     try std.testing.expectEqual(@as(u32, 576), tok_embd.tensor.shape[0]);
     try std.testing.expectEqual(@as(u32, 49152), tok_embd.tensor.shape[1]);

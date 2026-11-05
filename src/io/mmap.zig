@@ -48,6 +48,7 @@ fn open(io: Io, path: []const u8, populate: bool) !Mapped {
     var cwd = Io.Dir.cwd();
     const file = try cwd.openFile(io, path, .{ .mode = .read_only });
     errdefer file.close(io);
+
     const len = try file.length(io);
     var mm = try File.MemoryMap.create(io, file, .{
         .len = @intCast(len),
@@ -55,5 +56,6 @@ fn open(io: Io, path: []const u8, populate: bool) !Mapped {
         .populate = populate,
     });
     errdefer mm.destroy(io);
+
     return .{ .io = io, .file = file, .mm = mm };
 }

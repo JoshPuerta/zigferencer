@@ -30,14 +30,21 @@ const RawCodec = @import("raw_codec.zig").RawCodec;
 
 const log = std.log.scoped(.serve_openai);
 
-// -- types ------------------------------------------------------------------
+// -- constants --------------------------------------------------------------
 
 const json_opts: std.json.Stringify.Options = .{ .emit_null_optional_fields = false };
 const json_headers = [_]http.Header{.{ .name = "content-type", .value = "application/json" }};
+
 const sse_headers = [_]http.Header{
     .{ .name = "content-type", .value = "text/event-stream" },
     .{ .name = "cache-control", .value = "no-cache" },
 };
+
+/// The body buffer of a streamed reply. A chunk waits here until the sink
+/// flushes it, once per token.
+const sse_body_bytes = 4096;
+
+// -- types ------------------------------------------------------------------
 
 /// One turn as the request resolved it.
 const TurnInput = struct {
@@ -74,7 +81,9 @@ const HttpAdapter = struct {
     /// itself, and a shutdown after that close is EBADF.
     pub fn beginClose(engine: anytype, conn: anytype) void {
         engine.closeOutput(conn);
-        if (engine.claimStreamForTeardown(conn)) conn.stream.shutdown(engine.io, .both) catch {};
+        if (engine.claimStreamForTeardown(conn)) {
+            conn.stream.shutdown(engine.io, .both) catch {};
+        }
     }
 
     pub fn awaitConn(engine: anytype, conn: anytype) void {
@@ -84,7 +93,9 @@ const HttpAdapter = struct {
     pub fn refuse(io: Io, stream: *net.Stream) void {
         var buf: [128]u8 = undefined;
         var w = stream.writer(io, &buf);
-        w.interface.writeAll("HTTP/1.1 503 Service Unavailable\r\ncontent-length: 0\r\nconnection: close\r\n\r\n") catch {};
+        w.interface.writeAll(
+            "HTTP/1.1 503 Service Unavailable\r\ncontent-length: 0\r\nconnection: close\r\n\r\n",
+        ) catch {};
         w.interface.flush() catch {};
         stream.close(io);
     }
@@ -102,13 +113,10 @@ const BufSink = struct {
             .content => &self.content,
             .reasoning => &self.reasoning,
         };
+
         try buf.appendSlice(self.arena, piece);
     }
 };
-
-/// The body buffer of a streamed reply. A chunk waits here until the sink
-/// flushes it, once per token.
-const sse_body_bytes = 4096;
 
 /// The response sink of a streamed chat request. The SSE head goes out with
 /// the first piece or at the finish. An engine error before that point can
@@ -132,6 +140,7 @@ const SseSink = struct {
             self.pending_len = 0;
             self.pending_field = field;
         }
+
         var buf: [4 + limits.max_token_text_bytes]u8 = undefined;
         @memcpy(buf[0..self.pending_len], self.pending[0..self.pending_len]);
         @memcpy(buf[self.pending_len..][0..piece.len], piece);
@@ -141,6 +150,7 @@ const SseSink = struct {
         @memcpy(self.pending[0..rest.len], rest);
         self.pending_len = rest.len;
         if (emit_len == 0) return;
+
         const body = try self.open();
         try writeChunk(body, self.id, self.model, fieldDelta(field, all[0..emit_len]), null);
         // `BodyWriter.flush` sends only the connection buffer. The chunk
@@ -153,22 +163,22 @@ const SseSink = struct {
     /// unflushed, so it reaches the client together with the first token.
     fn open(self: *SseSink) !*http.BodyWriter {
         if (self.body) |*body| return body;
-        self.body = try self.request.respondStreaming(&self.body_buf, .{ .respond_options = .{ .extra_headers = &sse_headers } });
+
+        self.body = try self.request.respondStreaming(
+            &self.body_buf,
+            .{ .respond_options = .{ .extra_headers = &sse_headers } },
+        );
         const body = &self.body.?;
         try writeChunk(body, self.id, self.model, .{ .role = "assistant" }, null);
         return body;
     }
 };
 
-// -- api --------------------------------------------------------------------
-
 /// The serve engine wearing the OpenAI HTTP transport. The codec is the
 /// `RawCodec`, which carries the model metadata the request handler reads.
 pub fn Server(comptime Engine: type) type {
     return engine_mod.ServeEngine(Engine, RawCodec, HttpAdapter);
 }
-
-// -- helpers ----------------------------------------------------------------
 
 fn HttpTasks(comptime Eng: type) type {
     return struct {
@@ -178,7 +188,9 @@ fn HttpTasks(comptime Eng: type) type {
             span.nameThread("zf-http");
             serveConn(engine, c);
             // Tell the engine the connection dropped (sweeps any open session).
-            engine.submit(.{ .conn = c.id, .request_id = 0, .session_id = 0, .body = .conn_closed }) catch {};
+            engine.submit(
+                .{ .conn = c.id, .request_id = 0, .session_id = 0, .body = .conn_closed },
+            ) catch {};
             engine.taskExit(c);
         }
 
@@ -197,45 +209,86 @@ fn HttpTasks(comptime Eng: type) type {
         fn handleRequest(engine: *Eng, c: *Conn, request: *http.Server.Request) !void {
             var arena_state = std.heap.ArenaAllocator.init(engine.gpa);
             defer arena_state.deinit();
+
             const arena = arena_state.allocator();
 
             const method = request.head.method;
             const target = stripQuery(request.head.target);
             log.debug("http: {t} {s}", .{ method, target });
 
-            if (method == .GET and std.mem.eql(u8, target, "/v1/models")) return respondModels(engine, request);
-            if (method == .GET and (std.mem.eql(u8, target, "/healthz") or std.mem.eql(u8, target, "/v1/health"))) {
+            if (method == .GET and std.mem.eql(u8, target, "/v1/models")) {
+                return respondModels(engine, request);
+            }
+            if (method == .GET and (std.mem.eql(u8, target, "/healthz") or std.mem.eql(
+                u8,
+                target,
+                "/v1/health",
+            ))) {
                 return request.respond("{\"status\":\"ok\"}", .{ .extra_headers = &json_headers });
             }
-            if (method == .POST and std.mem.eql(u8, target, "/v1/chat/completions")) return handleChat(engine, c, request, arena);
-            return respondError(request, .{ .status = 404, .type = "invalid_request_error", .message = "unknown route" });
+            if (method == .POST and std.mem.eql(u8, target, "/v1/chat/completions")) {
+                return handleChat(engine, c, request, arena);
+            }
+
+            return respondError(
+                request,
+                .{ .status = 404, .type = "invalid_request_error", .message = "unknown route" },
+            );
         }
 
-        fn handleChat(engine: *Eng, c: *Conn, request: *http.Server.Request, arena: Allocator) !void {
+        fn handleChat(
+            engine: *Eng,
+            c: *Conn,
+            request: *http.Server.Request,
+            arena: Allocator,
+        ) !void {
             const sp = span.begin(.http_chat);
             defer sp.end();
+
             const codec = engine.codec;
             const clen = request.head.content_length orelse 0;
             if (clen > limits.openai_max_request_bytes) {
-                return respondError(request, .{ .status = 413, .type = "invalid_request_error", .message = "request body too large" });
+                return respondError(
+                    request,
+                    .{ .status = 413, .type = "invalid_request_error", .message = "request body too large" },
+                );
             }
+
             var body_rbuf: [4096]u8 = undefined;
             const reader = request.readerExpectContinue(&body_rbuf) catch {
-                return respondError(request, .{ .status = 400, .type = "invalid_request_error", .message = "bad request body" });
+                return respondError(
+                    request,
+                    .{ .status = 400, .type = "invalid_request_error", .message = "bad request body" },
+                );
             };
             const body = try arena.alloc(u8, @intCast(clen));
             reader.readSliceAll(body) catch return error.BodyReadFailed;
 
             var diag: map.Diag = .{};
-            const req = map.parseChatRequest(arena, body, codec.default_max_tokens, codec.max_seq, &diag) catch |e| {
+            const req = map.parseChatRequest(
+                arena,
+                body,
+                codec.default_max_tokens,
+                codec.max_seq,
+                &diag,
+            ) catch |e| {
                 return respondError(request, map.reqErrorToHttp(e, diag));
             };
             // One server answers for one model, so a named model that is not
             // the served one is a 404, the way the OpenAI API answers it.
             if (req.model.len > 0 and !std.mem.eql(u8, req.model, codec.model_id)) {
-                return respondError(request, .{ .status = 404, .type = "model_not_found", .message = "the requested model is not served here. GET /v1/models lists the served id" });
+                return respondError(
+                    request,
+                    .{ .status = 404, .type = "model_not_found", .message = "the requested model is not served here. GET /v1/models lists the served id" },
+                );
             }
-            const mode = map.resolveTurn(codec.kind, req.thinking, req.think_budget, codec.think_forced_close) catch |e| {
+
+            const mode = map.resolveTurn(
+                codec.kind,
+                req.thinking,
+                req.think_budget,
+                codec.think_forced_close,
+            ) catch |e| {
                 return respondError(request, map.reqErrorToHttp(e, .{}));
             };
             const input: TurnInput = .{
@@ -245,17 +298,36 @@ fn HttpTasks(comptime Eng: type) type {
                 .think_budget = mode.think_budget,
             };
             const seed = req.sampling.seed orelse drawSeed(engine.io) orelse {
-                return respondError(request, .{ .status = 500, .type = "server_error", .message = "the server has no random source for a seed. Send a seed field" });
+                return respondError(
+                    request,
+                    .{ .status = 500, .type = "server_error", .message = "the server has no random source for a seed. Send a seed field" },
+                );
             };
-            const sampling = map.resolveSampling(req.sampling, codec.defaults.row(input.think_open), seed);
-            log.debug("chat: {d} B body, stream={}, max_tokens {d}, think open {}, temperature {d}, seed {d}", .{
-                body.len, req.stream, req.max_tokens, input.think_open, sampling.temperature, sampling.seed,
-            });
+            const sampling = map.resolveSampling(
+                req.sampling,
+                codec.defaults.row(input.think_open),
+                seed,
+            );
+            log.debug(
+                "chat: {d} B body, stream={}, max_tokens {d}, think open {}, temperature " ++
+                    "{d}, seed {d}",
+                .{
+                    body.len,
+                    req.stream,
+                    req.max_tokens,
+                    input.think_open,
+                    sampling.temperature,
+                    sampling.seed,
+                },
+            );
 
             // Each request opens its own session, so the open seed starts the
             // stream of this request and the turn needs no reseed.
             const sid = openSession(engine, c, sampling) orelse {
-                return respondError(request, .{ .status = 503, .type = "server_error", .message = "no free session slot" });
+                return respondError(
+                    request,
+                    .{ .status = 503, .type = "server_error", .message = "no free session slot" },
+                );
             };
             defer closeSession(engine, c, sid);
 
@@ -293,13 +365,18 @@ fn HttpTasks(comptime Eng: type) type {
                     .zmtp_pong, .zmtp_error => unreachable,
                     else => {},
                 }
-                if (c.parked_hint.swap(false, .acq_rel)) engine.wake(c.id);
+
+                if (c.parked_hint.swap(false, .acq_rel)) {
+                    engine.wake(c.id);
+                }
             }
         }
 
         fn closeSession(engine: *Eng, c: *Conn, sid: u32) void {
             log.debug("session close: {d}", .{sid});
-            engine.submit(.{ .conn = c.id, .request_id = 3, .session_id = sid, .body = .session_close }) catch {};
+            engine.submit(
+                .{ .conn = c.id, .request_id = 3, .session_id = sid, .body = .session_close },
+            ) catch {};
         }
 
         const Turn = union(enum) {
@@ -311,7 +388,14 @@ fn HttpTasks(comptime Eng: type) type {
         /// each detokenized piece to `sink` with its reply field. The token text
         /// is already in the `OutEvent` (the scheduler detokenized it). Wakes
         /// the engine after a drain so a parked session resumes.
-        fn runTurn(engine: *Eng, c: *Conn, arena: Allocator, sid: u32, input: TurnInput, sink: anytype) !Turn {
+        fn runTurn(
+            engine: *Eng,
+            c: *Conn,
+            arena: Allocator,
+            sid: u32,
+            input: TurnInput,
+            sink: anytype,
+        ) !Turn {
             const text = try engine.gpa.dupe(u8, input.rendered);
             engine.submit(.{ .conn = c.id, .request_id = 2, .session_id = sid, .body = .{
                 .generate = .{
@@ -332,23 +416,47 @@ fn HttpTasks(comptime Eng: type) type {
                     // The scheduler emits the terminal EOS token too (a binary
                     // client decides whether to show it). OpenAI content omits it.
                     .token => |t| if (t.token_id != engine.codec.eos_id) {
-                        if (split.route(t.token_id, t.text[0..t.text_len])) |p| try sink.onPiece(p.field, p.text);
+                        if (split.route(t.token_id, t.text[0..t.text_len])) |p| {
+                            try sink.onPiece(p.field, p.text);
+                        }
                     },
                     .done => |d| {
-                        log.debug("turn: session {d}, {d} tokens, finish {t}", .{ sid, d.gen_tokens, d.finish_reason });
-                        return .{ .done = .{ .n = d.gen_tokens, .reasoning = d.reasoning_tokens, .finish = finishStr(d.finish_reason) } };
+                        log.debug(
+                            "turn: session {d}, {d} tokens, finish {t}",
+                            .{ sid, d.gen_tokens, d.finish_reason },
+                        );
+                        return .{
+                            .done = .{
+                                .n = d.gen_tokens,
+                                .reasoning = d.reasoning_tokens,
+                                .finish = finishStr(d.finish_reason),
+                            },
+                        };
                     },
-                    .err => |e| return .{ .failed = try turnError(engine, arena, e.code, input.rendered) },
+                    .err => |e| return .{
+                        .failed = try turnError(engine, arena, e.code, input.rendered),
+                    },
                     // Only the binary reader task produces these, into the
                     // queue of its own connection.
                     .zmtp_pong, .zmtp_error => unreachable,
                     else => {}, // session_closed from a prior turn, etc.
                 }
-                if (c.parked_hint.swap(false, .acq_rel)) engine.wake(c.id);
+
+                if (c.parked_hint.swap(false, .acq_rel)) {
+                    engine.wake(c.id);
+                }
             }
         }
 
-        fn bufferChat(engine: *Eng, c: *Conn, request: *http.Server.Request, arena: Allocator, sid: u32, input: TurnInput, id_str: []const u8) !void {
+        fn bufferChat(
+            engine: *Eng,
+            c: *Conn,
+            request: *http.Server.Request,
+            arena: Allocator,
+            sid: u32,
+            input: TurnInput,
+            id_str: []const u8,
+        ) !void {
             var sink: BufSink = .{ .arena = arena };
             const turn = switch (try runTurn(engine, c, arena, sid, input, &sink)) {
                 .done => |d| d,
@@ -358,7 +466,10 @@ fn HttpTasks(comptime Eng: type) type {
             const prompt_tokens = countPrompt(engine, input.rendered);
             const message: types.RespMessage = .{
                 .content = sink.content.items,
-                .reasoning_content = if (sink.reasoning.items.len > 0) sink.reasoning.items else null,
+                .reasoning_content = if (sink.reasoning.items.len > 0)
+                    sink.reasoning.items
+                else
+                    null,
             };
             const resp: types.ChatResponse = .{
                 .id = id_str,
@@ -368,19 +479,36 @@ fn HttpTasks(comptime Eng: type) type {
                     .prompt_tokens = prompt_tokens,
                     .completion_tokens = turn.n,
                     .total_tokens = prompt_tokens + turn.n,
-                    .completion_tokens_details = if (turn.reasoning > 0) .{ .reasoning_tokens = turn.reasoning } else null,
+                    .completion_tokens_details = if (turn.reasoning > 0) .{
+                        .reasoning_tokens = turn.reasoning,
+                    } else null,
                 },
             };
             var sbuf: [4096]u8 = undefined;
-            var rbody = try request.respondStreaming(&sbuf, .{ .respond_options = .{ .extra_headers = &json_headers } });
+            var rbody = try request.respondStreaming(
+                &sbuf,
+                .{ .respond_options = .{ .extra_headers = &json_headers } },
+            );
             try std.json.Stringify.value(resp, json_opts, &rbody.writer);
             try rbody.end();
         }
 
         /// An error after the SSE head becomes one error event and then the
         /// `[DONE]` event, the llama.cpp shape. It never reads as a finish.
-        fn streamChat(engine: *Eng, c: *Conn, request: *http.Server.Request, arena: Allocator, sid: u32, input: TurnInput, id_str: []const u8) !void {
-            var sink: SseSink = .{ .request = request, .id = id_str, .model = engine.codec.model_id };
+        fn streamChat(
+            engine: *Eng,
+            c: *Conn,
+            request: *http.Server.Request,
+            arena: Allocator,
+            sid: u32,
+            input: TurnInput,
+            id_str: []const u8,
+        ) !void {
+            var sink: SseSink = .{
+                .request = request,
+                .id = id_str,
+                .model = engine.codec.model_id,
+            };
             switch (try runTurn(engine, c, arena, sid, input, &sink)) {
                 .done => |turn| {
                     const body = try sink.open();
@@ -400,7 +528,10 @@ fn HttpTasks(comptime Eng: type) type {
             const data = [_]types.ModelEntry{.{ .id = engine.codec.model_id }};
             const list: types.ModelsList = .{ .data = &data };
             var sbuf: [1024]u8 = undefined;
-            var rbody = try request.respondStreaming(&sbuf, .{ .respond_options = .{ .extra_headers = &json_headers } });
+            var rbody = try request.respondStreaming(
+                &sbuf,
+                .{ .respond_options = .{ .extra_headers = &json_headers } },
+            );
             try std.json.Stringify.value(list, json_opts, &rbody.writer);
             try rbody.end();
         }
@@ -409,22 +540,43 @@ fn HttpTasks(comptime Eng: type) type {
         /// cost next to a decode, and keeps the count exact without threading it
         /// back through the wire.
         fn countPrompt(engine: *Eng, rendered: []const u8) u32 {
-            const ids = engine.codec.turnTokens(engine.gpa, .open_first, rendered, false) catch return 0;
+            const ids = engine.codec.turnTokens(
+                engine.gpa,
+                .open_first,
+                rendered,
+                false,
+            ) catch return 0;
             defer engine.gpa.free(ids);
+
             return @intCast(ids.len);
         }
 
         /// The session opens empty, so its window is `max_seq` and the
         /// refused turn is the whole rendered prompt.
-        fn turnError(engine: *Eng, arena: Allocator, code: protocol.ErrorCode, rendered: []const u8) !map.HttpError {
+        fn turnError(
+            engine: *Eng,
+            arena: Allocator,
+            code: protocol.ErrorCode,
+            rendered: []const u8,
+        ) !map.HttpError {
             return switch (code) {
-                .turn_too_long => try map.exceedContextError(arena, countPrompt(engine, rendered), engine.codec.max_seq),
-                .sessions_exhausted, .session_busy => .{ .status = 503, .type = "server_error", .message = "server busy" },
+                .turn_too_long => try map.exceedContextError(
+                    arena,
+                    countPrompt(engine, rendered),
+                    engine.codec.max_seq,
+                ),
+                .sessions_exhausted, .session_busy => .{
+                    .status = 503,
+                    .type = "server_error",
+                    .message = "server busy",
+                },
                 else => .{ .status = 500, .type = "server_error", .message = "internal error" },
             };
         }
     };
 }
+
+// -- helpers ----------------------------------------------------------------
 
 /// A request without a seed draws one from the secure source, the vLLM rule,
 /// so two equal sampled requests give two different replies. Null refuses
@@ -441,7 +593,13 @@ fn writeErrorEvent(w: *Io.Writer, e: map.HttpError) Io.Writer.Error!void {
     try w.writeAll("\n\ndata: [DONE]\n\n");
 }
 
-fn writeChunk(body: *http.BodyWriter, id: []const u8, model: []const u8, delta: types.Delta, finish: ?[]const u8) !void {
+fn writeChunk(
+    body: *http.BodyWriter,
+    id: []const u8,
+    model: []const u8,
+    delta: types.Delta,
+    finish: ?[]const u8,
+) !void {
     const chunk: types.ChatChunk = .{
         .id = id,
         .model = model,
@@ -499,6 +657,7 @@ fn statusEnum(code: u16) http.Status {
 test "writeErrorEvent: one error event in the llama.cpp shape, then the end event" {
     var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena_state.deinit();
+
     const overflow = try map.exceedContextError(arena_state.allocator(), 130, 128);
 
     var buf: [512]u8 = undefined;
@@ -516,7 +675,10 @@ test "the reply fields: reasoning_content sits next to content and vanishes when
     var w: Io.Writer = .fixed(&buf);
     const split: types.RespMessage = .{ .content = "A.", .reasoning_content = "R." };
     try std.json.Stringify.value(split, json_opts, &w);
-    try std.testing.expectEqualStrings("{\"role\":\"assistant\",\"content\":\"A.\",\"reasoning_content\":\"R.\"}", w.buffered());
+    try std.testing.expectEqualStrings(
+        "{\"role\":\"assistant\",\"content\":\"A.\",\"reasoning_content\":\"R.\"}",
+        w.buffered(),
+    );
 
     w = .fixed(&buf);
     const plain: types.RespMessage = .{ .content = "A." };

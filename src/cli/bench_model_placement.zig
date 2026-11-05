@@ -1,40 +1,23 @@
-//! The family-independent half of the bench-model placement path: resolve a
-//! `--gpu-layers` split, a count or auto, through the real placement planner,
-//! construct the family's hybrid runner through its real init, and drive the
-//! shared run body.
-//! `--force-hybrid` also constructs at the degenerate splits, which production
-//! selection never does, and that forced construction is the cross-runner token
-//! gate.
-//!
-//! Two families reach this body. `resolve` prices the split of each family
-//! from the facts the boot measured, and `placedBench` logs, constructs, and
-//! benches from the value.
+//! The split path of `bench-model`: `--gpu-layers` names a count or `auto`, the
+//! real planner prices the split, and the real hybrid runner runs it.
+//! `--force-hybrid` also builds at a degenerate split, which production selection
+//! never does. That forced construction is the cross-runner token gate.
 
 const std = @import("std");
 const build_options = @import("build_options");
 
-const cli = @import("command.zig");
 const args = @import("args.zig");
-const registry = @import("../core/registry.zig");
-const loader = @import("../io/gguf/loader.zig");
-const vocab_mod = @import("../core/tokenizer/vocab.zig");
-const bpe = @import("../core/tokenizer/bpe.zig");
-const chat_mod = @import("../core/chat.zig");
-const limits = @import("../core/limits.zig");
+const common = @import("bench_model_common.zig");
+const exec = @import("bench_model_exec.zig");
+const serve_common = @import("serve_common.zig");
+const resolve_mod = @import("../engine/resolve.zig");
 const kv_budget = @import("../core/kv_budget.zig");
-const tensor_lookup = @import("../runtime/tensor_lookup.zig");
+const vocab_mod = @import("../core/tokenizer/vocab.zig");
 const parallel = @import("../runtime/parallel.zig");
 const Pool = @import("../runtime/pool.zig").Pool;
-const dtype = @import("../core/dtype.zig");
 const vulkan_ctx_mod = @import("../runtime/vulkan_ctx.zig");
-const serve_common = @import("serve_common.zig");
-
-const common = @import("bench_model_common.zig");
-const report = @import("bench_model_report.zig");
-const exec = @import("bench_model_exec.zig");
 
 const log = std.log.scoped(.kv);
-const writeStderr = common.writeStderr;
 
 comptime {
     if (!build_options.use_vulkan_fused_ops) {
@@ -42,120 +25,130 @@ comptime {
     }
 }
 
+const Bench = common.Bench;
+const device_arm = resolve_mod.device_arm;
+
+// -- constants --------------------------------------------------------------
+
+const mib = 1024 * 1024;
+
 // -- api --------------------------------------------------------------------
 
-/// The one refusal that costs no device: a pin past the model's layer count.
-/// Both family heads run it before they create a Context.
-pub fn refuseOverLayerCount(ctx: cli.Context, gpu_layers: u32, n_layers: u32) error{UsageError}!void {
-    if (gpu_layers > n_layers) {
-        return args.fail(ctx.io, "--gpu-layers {d} exceeds the model's {d} layers", .{ gpu_layers, n_layers });
-    }
-}
+/// Resolve the split on a new device context, build the hybrid runner of `Family`
+/// at it, and run the series.
+pub fn bench(comptime Family: type, b: *const Bench) !void {
+    const ctx = b.ctx;
+    const opt = b.opt;
+    const kv_dtype = b.kvDtype();
 
-/// Resolve the split on the context, construct `HybridT` at it, and run the
-/// shared run body. The function owns `ctxp` and releases it on every path.
-pub fn placedBench(
-    comptime HybridT: type,
-    ctx: cli.Context,
-    boot: *const serve_common.DeviceBoot,
-    ctxp: *vulkan_ctx_mod.Context,
-    loaded: *const loader.Loaded,
-    model: registry.Model,
-    opt: common.Options,
-    pool: *Pool,
-    policy: parallel.Policy,
-    kv_dtype: dtype.KvDtype,
-) !void {
-    // Declared first, so it runs last: the runner releases its borrow of the context before this.
+    if (comptime !Family.forced_split) {
+        if (opt.force_hybrid) {
+            return args.fail(
+                ctx.io,
+                "--force-hybrid is llama-family only. The qwen hybrid holds no degenerate " ++
+                    "split, so its cross-runner gate compares the fused and CPU runners " ++
+                    "against a real split",
+                .{},
+            );
+        }
+    }
+
+    try refuseOverLayerCount(b);
+
+    var pool: Pool = undefined;
+    try parallel.initPool(&pool, ctx.io, b.policy);
+    defer pool.deinit();
+
+    // Declared first, so it runs last: the runner releases its borrow of the
+    // context before this.
+    const ctxp = try ctx.arena.create(vulkan_ctx_mod.Context);
+    ctxp.* = try vulkan_ctx_mod.Context.init(ctx.arena, .{
+        .storage_range_override = ctx.vk_storage_range,
+    });
     defer ctxp.deinit();
-    const card = loaded.card;
-    const n_layers: u32 = card.n_layers;
-    const dev = try boot.resolveOn(ctx.io, ctxp);
-    const p = dev.placed.?;
-    if (p.clamp) |c| serve_common.logClamp(c);
-    if (p.split) |s| if (p.pin == null) serve_common.logAutoSplit(s.split, n_layers);
-    const h = switch (dev.arm) {
-        .ok => |a| a.hybrid,
-        .refused => |r| return serve_common.refuse(ctx.io, model.pub_name, r),
+
+    const hybrid_placement = try resolveSplit(b, ctxp);
+    const plan = hybrid_placement.plan.?;
+
+    const runner = try Family.Hybrid.init(
+        ctx.gpa,
+        ctxp,
+        b.loaded,
+        plan,
+        ctx.io,
+        &pool,
+        b.policy,
+        kv_dtype,
+    );
+    defer runner.deinit();
+
+    const v = try vocab_mod.buildFromParsed(ctx.arena, b.loaded.parsed);
+    const prompt_ids = try exec.promptIds(b, &v, hybrid_placement.window.base);
+    try exec.warmup(runner, prompt_ids);
+
+    const turn: exec.Turn = .{
+        .vocab = &v,
+        .prompt_ids = prompt_ids,
+        .decode_len = opt.max_tokens,
+        .ignore_eos = opt.ignore_eos,
     };
-    switch (h.quote) {
-        .ok => |q| serve_common.logRamQuote(q, false),
-        .refused => |r| return serve_common.refuse(ctx.io, model.pub_name, r),
-    }
-    const plan = h.plan.?;
-    const max_seq: u32 = h.window.base;
-
-    serve_common.logSessionWindow(h.window);
-    var span_buf: [kv_budget.placement_text_max]u8 = undefined;
-    const span = kv_budget.formatPlacement(plan, &span_buf) catch unreachable;
-    log.info("{s}", .{span});
-    var ledger_buf: [kv_budget.placement_ledger_text_max]u8 = undefined;
-    log.info("{s}", .{kv_budget.formatLedger(plan, &ledger_buf) catch unreachable});
-    const mib = 1024 * 1024;
-
-    const hybrid = try HybridT.init(ctx.gpa, ctxp, loaded, plan, ctx.io, pool, policy, kv_dtype);
-    defer hybrid.deinit();
-
     const plan_info: common.PlanInfo = .{
         .n_slots = plan.n_slots,
         .window = plan.window,
         .kv_mib = plan.kv_vram / mib,
         .kv_dtype = kv_dtype,
     };
+    return exec.runSeries(runner, b, turn, plan_info, true);
+}
 
-    var v = try vocab_mod.buildFromParsed(ctx.arena, loaded.parsed);
+// -- helpers ----------------------------------------------------------------
 
-    const text = if (opt.chat)
-        try chat_mod.wrapAlloc(ctx.arena, model.chat_template_kind, opt.prompt)
-    else
-        opt.prompt;
-    // The fit check runs first, because the synthesis allocates n ids.
-    if (opt.prompt_tokens) |n| try common.requireSequenceFits(ctx.io, n, opt.max_tokens, max_seq);
-    const prompt_ids = if (opt.prompt_tokens) |n|
-        try common.synthPromptIds(ctx.arena, n, card.vocab_size)
-    else
-        try bpe.encodeAlloc(&v, ctx.arena, text, true);
-    if (prompt_ids.len == 0) {
-        writeStderr(ctx.io, "error: the prompt encodes to zero tokens\n");
-        return error.EmptyPrompt;
+/// A pin past the layer count costs no device, so it refuses before the context.
+fn refuseOverLayerCount(b: *const Bench) error{UsageError}!void {
+    const gpu_layers = b.opt.engine.gpu_layers.?.pin() orelse return;
+    const n_layers = b.loaded.card.n_layers;
+
+    if (gpu_layers > n_layers) {
+        const fmt = "--gpu-layers {d} exceeds the model's {d} layers";
+        return args.fail(b.ctx.io, fmt, .{ gpu_layers, n_layers });
     }
-    try common.requireSequenceFits(ctx.io, prompt_ids.len, opt.max_tokens, max_seq);
+}
 
-    // Warmup: one prefill chunk and one decode step, so run 1 starts warm. That
-    // is the fused-bench rule.
-    {
-        const chunk = @min(prompt_ids.len, @as(usize, hybrid.prefill_batch_max));
-        _ = try hybrid.prefillBatch(prompt_ids[0..chunk], 0);
-        _ = try hybrid.step(prompt_ids[prompt_ids.len - 1], @intCast(chunk));
-    }
+/// Resolve the split on the context, and log the placement and its price.
+fn resolveSplit(b: *const Bench, ctxp: *vulkan_ctx_mod.Context) !device_arm.Hybrid {
+    const io = b.ctx.io;
+    const name = b.model.pub_name;
 
-    const results = try ctx.arena.alloc(common.RunResult, opt.runs);
-    var r: u32 = 0;
-    while (r < opt.runs) : (r += 1) {
-        // The warmup and every run fold the prompt into the recurrent state, and
-        // no prefill rewrites it. Positional KV heals on slot reuse, and GDN
-        // state does not. The scrub gives every run one clean start. Without it
-        // the 9B diverges run to run, and the 2B only hides the leak.
-        if (comptime @hasDecl(HybridT, "has_recurrent_state")) hybrid.resetSlotState(0);
-        results[r] = try exec.doOneRun(
-            hybrid,
-            loaded,
-            max_seq,
-            &v,
-            prompt_ids,
-            opt.max_tokens,
-            opt.ignore_eos,
-            ctx,
-            pool,
-            policy,
-            kv_dtype,
-        );
-        results[r].plan = plan_info;
+    const device = try b.boot.resolveOn(io, ctxp);
+    const placed = device.placed.?;
+    if (placed.clamp) |clamp| {
+        serve_common.logClamp(clamp);
     }
 
-    if (opt.json) {
-        try report.printJson(ctx.io, model.pub_name, prompt_ids.len, opt.max_tokens, results, policy);
-    } else {
-        try report.printTable(ctx.io, model.pub_name, opt.prompt, prompt_ids.len, opt.max_tokens, results, policy);
+    if (placed.split) |split| {
+        if (placed.pin == null) {
+            serve_common.logAutoSplit(split.split, b.loaded.card.n_layers);
+        }
     }
+
+    const hybrid = switch (device.arm) {
+        .ok => |arm| arm.hybrid,
+        .refused => |r| return serve_common.refuse(io, name, r),
+    };
+
+    switch (hybrid.quote) {
+        .ok => |quote| serve_common.logRamQuote(quote, false),
+        .refused => |r| return serve_common.refuse(io, name, r),
+    }
+
+    const plan = hybrid.plan.?;
+    serve_common.logSessionWindow(hybrid.window);
+
+    var span_buffer: [kv_budget.placement_text_max]u8 = undefined;
+    log.info("{s}", .{kv_budget.formatPlacement(plan, &span_buffer) catch unreachable});
+
+    var ledger_buffer: [kv_budget.placement_ledger_text_max]u8 = undefined;
+    log.info("{s}", .{kv_budget.formatLedger(plan, &ledger_buffer) catch unreachable});
+
+    return hybrid;
 }

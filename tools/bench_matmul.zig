@@ -1,7 +1,7 @@
 //! Matmul benchmarks: the Q8_0 decode kernel and its CPU and GPU variants, the
 //! Q4_0 decode kernel, and the batched (prefill) Q8_0 kernels. The matmul is the
 //! bandwidth-bound op that decides decode speed, so every variant reports
-//! GFLOP/s next to its relative error against `naive`, the scalar oracle.
+//! GFLOP/s next to its relative error against `naive`, the scalar reference.
 //! `runQ80` owns the variant table and the eligibility report that the decode
 //! matmul rows share.
 
@@ -56,11 +56,26 @@ const BenchResult = struct { ms: f64, gflops: f64, hash: u64 };
 pub fn runQ80(gpa: std.mem.Allocator, io: std.Io, runner: anytype) !void {
     var variants_buf: [16]Variant = undefined;
     var n: usize = 0;
-    variants_buf[n] = .{ .name = "naive", .desc = "scalar f32 reference (the oracle)", .requires = z.ops.requires, .kernel = .{ .cpu = z.ops.linearF32Q80 } };
+    variants_buf[n] = .{
+        .name = "naive",
+        .desc = "scalar f32 reference",
+        .requires = z.ops.requires,
+        .kernel = .{ .cpu = z.ops.linearF32Q80 },
+    };
     n += 1;
-    variants_buf[n] = .{ .name = "simd", .desc = "@Vector(8), AVX2 + FMA", .requires = z.ops_simd.requires, .kernel = .{ .cpu = z.ops_simd.linearF32Q80 } };
+    variants_buf[n] = .{
+        .name = "simd",
+        .desc = "@Vector(8), AVX2 + FMA",
+        .requires = z.ops_simd.requires,
+        .kernel = .{ .cpu = z.ops_simd.linearF32Q80 },
+    };
     n += 1;
-    variants_buf[n] = .{ .name = "simd_pf", .desc = "register-blocked (MR=4) + prefetch", .requires = z.ops_simd_pf.requires, .kernel = .{ .cpu = z.ops_simd_pf.linearF32Q80 } };
+    variants_buf[n] = .{
+        .name = "simd_pf",
+        .desc = "register-blocked (MR=4) + prefetch",
+        .requires = z.ops_simd_pf.requires,
+        .kernel = .{ .cpu = z.ops_simd_pf.linearF32Q80 },
+    };
     n += 1;
     if (comptime build_options.use_vulkan) {
         if (runner) |r| {
@@ -87,6 +102,7 @@ pub fn runQ80(gpa: std.mem.Allocator, io: std.Io, runner: anytype) !void {
             n += 1;
         }
     }
+
     const variants = variants_buf[0..n];
 
     printEligibility(variants);
@@ -120,13 +136,16 @@ pub fn runQ80(gpa: std.mem.Allocator, io: std.Io, runner: anytype) !void {
         // (for CPU kernels), and a `Q80Weight` upload (for GPU kernels). Built
         // once and reused across every eligible variant in this case.
         std.debug.assert(c.in % 32 == 0);
+
         const row_bytes = (c.in / 32) * 34;
         const total_w_bytes = c.out * row_bytes;
 
         const input = try gpa.alignedAlloc(f32, .of(f32), c.in);
         defer gpa.free(input);
+
         const w_bytes = try gpa.alignedAlloc(u8, .@"32", total_w_bytes);
         defer gpa.free(w_bytes);
+
         fillSyntheticInputAndWeight(input, w_bytes, c.in, c.out);
 
         const w_tensor: Tensor = .{
@@ -141,10 +160,14 @@ pub fn runQ80(gpa: std.mem.Allocator, io: std.Io, runner: anytype) !void {
             ?z.ops_vulkan.Q80Weight
         else
             void;
+
         var gpu_weight: GpuWeightOpt = if (comptime build_options.use_vulkan) null else {};
         defer if (comptime build_options.use_vulkan) {
-            if (gpu_weight) |*w| w.deinit();
+            if (gpu_weight) |*w| {
+                w.deinit();
+            }
         };
+
         if (comptime build_options.use_vulkan) {
             if (runner != null) {
                 gpu_weight = try z.ops_vulkan.Q80Weight.init(&runner.?.ctx, w_bytes, c.in, c.out);
@@ -157,11 +180,19 @@ pub fn runQ80(gpa: std.mem.Allocator, io: std.Io, runner: anytype) !void {
 
         for (variants, 0..) |v, i| {
             if (!isEligible(v)) continue;
+
             const is_naive = i == 0;
             const out = if (is_naive) ref_out else try gpa.alignedAlloc(f32, .of(f32), c.out);
             defer if (!is_naive) gpa.free(out);
 
-            const r = runVariant(io, input, w_tensor, gpu_weight, v.kernel, out) catch |e| switch (e) {
+            const r = runVariant(
+                io,
+                input,
+                w_tensor,
+                gpu_weight,
+                v.kernel,
+                out,
+            ) catch |e| switch (e) {
                 // A variant declines a case it cannot serve, such as an
                 // LDS-staged input kernel at k past the LDS capacity. The bench
                 // buffers a "skip(<reason>)" row and goes on to the next row.
@@ -176,10 +207,15 @@ pub fn runQ80(gpa: std.mem.Allocator, io: std.Io, runner: anytype) !void {
             else
                 computeErrors(ref_out, out);
 
-            const ok = op_requires.toleranceSatisfied(v.requires.tolerance, errs.rel, r.hash == hashOut(ref_out));
+            const ok = op_requires.toleranceSatisfied(
+                v.requires.tolerance,
+                errs.rel,
+                r.hash == hashOut(ref_out),
+            );
             const status: []const u8 = if (ok) "ok" else "FAIL";
             rawRow(c.label, v.name, r.ms, r.gflops, errs.rel, r.hash, status);
         }
+
         flush(); // colors the fastest/slowest variant for this shape
     }
 }
@@ -200,13 +236,16 @@ pub fn benchQ40(gpa: std.mem.Allocator, io: std.Io, runner: anytype) !void {
 
     for (cases) |c| {
         std.debug.assert(c.in % 32 == 0);
+
         const row_bytes = (c.in / 32) * 18;
         const total_w_bytes = c.out * row_bytes;
 
         const input = try gpa.alignedAlloc(f32, .of(f32), c.in);
         defer gpa.free(input);
+
         const w_bytes = try gpa.alignedAlloc(u8, .@"32", total_w_bytes);
         defer gpa.free(w_bytes);
+
         fillSyntheticInputAndWeightQ4(input, w_bytes, c.in, c.out);
 
         const w_tensor: Tensor = .{
@@ -230,29 +269,55 @@ pub fn benchQ40(gpa: std.mem.Allocator, io: std.Io, runner: anytype) !void {
             input: []const f32,
             w: Tensor,
             out: []f32,
+
             pub fn run(self: @This()) !void {
                 z.ops.linearF32Q40(self.input, self.w, self.out);
             }
         };
-        try cpuRow(io, scale, c.label, "naive_q4", work, ref_hash, CpuQ4{ .input = input, .w = w_tensor, .out = ref_out });
+        try cpuRow(
+            io,
+            scale,
+            c.label,
+            "naive_q4",
+            work,
+            ref_hash,
+            CpuQ4{ .input = input, .w = w_tensor, .out = ref_out },
+        );
 
-        if (comptime build_options.use_vulkan) if (runner) |r| {
-            var gpu_weight = try z.ops_vulkan.Q80Weight.initQ40(&r.ctx, w_bytes, c.in, c.out);
-            defer gpu_weight.deinit();
-            const gpu_out = try gpa.alignedAlloc(f32, .of(f32), c.out);
-            defer gpa.free(gpu_out);
-            const tol = z.ops_vulkan.LinearQ40Reduce.requires.tolerance;
-            const GpuQ4 = struct {
-                r: *z.vulkan_runner.Runner,
-                w: *const z.ops_vulkan.Q80Weight,
-                input: []const f32,
-                out: []f32,
-                pub fn run(self: @This()) !void {
-                    try self.r.linear_q4_0_reduce.dispatch(self.w, self.input, self.out);
-                }
-            };
-            try gpuRow(io, scale, c.label, "vk_q4_0_re", work, tol, ref_out, ref_hash, gpu_out, GpuQ4{ .r = r, .w = &gpu_weight, .input = input, .out = gpu_out });
-        };
+        if (comptime build_options.use_vulkan) {
+            if (runner) |r| {
+                var gpu_weight = try z.ops_vulkan.Q80Weight.initQ40(&r.ctx, w_bytes, c.in, c.out);
+                defer gpu_weight.deinit();
+
+                const gpu_out = try gpa.alignedAlloc(f32, .of(f32), c.out);
+                defer gpa.free(gpu_out);
+
+                const tol = z.ops_vulkan.LinearQ40Reduce.requires.tolerance;
+                const GpuQ4 = struct {
+                    r: *z.vulkan_runner.Runner,
+                    w: *const z.ops_vulkan.Q80Weight,
+                    input: []const f32,
+                    out: []f32,
+
+                    pub fn run(self: @This()) !void {
+                        try self.r.linear_q4_0_reduce.dispatch(self.w, self.input, self.out);
+                    }
+                };
+                try gpuRow(
+                    io,
+                    scale,
+                    c.label,
+                    "vk_q4_0_re",
+                    work,
+                    tol,
+                    ref_out,
+                    ref_hash,
+                    gpu_out,
+                    GpuQ4{ .r = r, .w = &gpu_weight, .input = input, .out = gpu_out },
+                );
+            }
+        }
+
         flush();
     }
 }
@@ -261,7 +326,11 @@ pub fn benchQ40(gpa: std.mem.Allocator, io: std.Io, runner: anytype) !void {
 /// streamed once for B outputs. Compare GFLOP/s against the decode `vk_q8_0_re`
 /// to see the prefill amortization. GPU-only (no batched CPU op). The CPU
 /// reference is the naive kernel looped over the B rows.
-pub fn benchBatchedMatmul(gpa: std.mem.Allocator, io: std.Io, runner: *z.vulkan_runner.Runner) !void {
+pub fn benchBatchedMatmul(
+    gpa: std.mem.Allocator,
+    io: std.Io,
+    runner: *z.vulkan_runner.Runner,
+) !void {
     printSectionHeader("linearF32Q80 batched (prefill: B rows / dispatch)");
     const B: usize = 64;
     const cases = [_]Case{
@@ -271,19 +340,25 @@ pub fn benchBatchedMatmul(gpa: std.mem.Allocator, io: std.Io, runner: *z.vulkan_
     };
     var batch = try z.ops_vulkan.LinearQ80Batch.init(&runner.ctx);
     defer batch.deinit();
+
     var gemm = try z.ops_vulkan.LinearQ80Gemm.init(&runner.ctx);
     defer gemm.deinit();
 
     for (cases) |c| {
         std.debug.assert(c.in % 32 == 0);
+
         const row_bytes = (c.in / 32) * 34;
         const input = try gpa.alignedAlloc(f32, .of(f32), B * c.in);
         defer gpa.free(input);
+
         const w_bytes = try gpa.alignedAlloc(u8, .@"32", c.out * row_bytes);
         defer gpa.free(w_bytes);
+
         // Fill the weight (first arg gets one input row, overwritten below).
         fillSyntheticInputAndWeight(input[0..c.in], w_bytes, c.in, c.out);
-        for (input, 0..) |*v, i| v.* = @sin(@as(f32, @floatFromInt(i)) * 0.001);
+        for (input, 0..) |*v, i| {
+            v.* = @sin(@as(f32, @floatFromInt(i)) * 0.001);
+        }
 
         const w_tensor: Tensor = .{
             .dtype = .q8_0,
@@ -295,7 +370,15 @@ pub fn benchBatchedMatmul(gpa: std.mem.Allocator, io: std.Io, runner: *z.vulkan_
 
         const ref_out = try gpa.alignedAlloc(f32, .of(f32), B * c.out);
         defer gpa.free(ref_out);
-        for (0..B) |bi| z.ops.linearF32Q80(input[bi * c.in ..][0..c.in], w_tensor, ref_out[bi * c.out ..][0..c.out]);
+
+        for (0..B) |bi| {
+            z.ops.linearF32Q80(
+                input[bi * c.in ..][0..c.in],
+                w_tensor,
+                ref_out[bi * c.out ..][0..c.out],
+            );
+        }
+
         const ref_hash = hashOut(ref_out);
         const work = @as(f64, @floatFromInt(B * c.in * c.out * f32_flops_per_mac));
         const scale = B * c.in * c.out;
@@ -315,11 +398,31 @@ pub fn benchBatchedMatmul(gpa: std.mem.Allocator, io: std.Io, runner: *z.vulkan_
             in: usize,
             out: usize,
             o: []f32,
+
             pub fn run(self: @This()) !void {
                 try self.k.runOneShot(self.input, self.w, self.b, self.in, self.out, self.o);
             }
         };
-        try gpuRow(io, scale, c.label, "vk_q8_batch", work, tol, ref_out, ref_hash, gpu_out, Batch{ .k = &batch, .input = input, .w = w_bytes, .b = B, .in = c.in, .out = c.out, .o = gpu_out });
+        try gpuRow(
+            io,
+            scale,
+            c.label,
+            "vk_q8_batch",
+            work,
+            tol,
+            ref_out,
+            ref_hash,
+            gpu_out,
+            Batch{
+                .k = &batch,
+                .input = input,
+                .w = w_bytes,
+                .b = B,
+                .in = c.in,
+                .out = c.out,
+                .o = gpu_out,
+            },
+        );
 
         const Gemm = struct {
             k: *z.ops_vulkan.LinearQ80Gemm,
@@ -329,11 +432,31 @@ pub fn benchBatchedMatmul(gpa: std.mem.Allocator, io: std.Io, runner: *z.vulkan_
             in: usize,
             out: usize,
             o: []f32,
+
             pub fn run(self: @This()) !void {
                 try self.k.runOneShot(self.input, self.w, self.b, self.in, self.out, self.o);
             }
         };
-        try gpuRow(io, scale, c.label, "vk_q8_gemm", work, tol, ref_out, ref_hash, gpu_out, Gemm{ .k = &gemm, .input = input, .w = w_bytes, .b = B, .in = c.in, .out = c.out, .o = gpu_out });
+        try gpuRow(
+            io,
+            scale,
+            c.label,
+            "vk_q8_gemm",
+            work,
+            tol,
+            ref_out,
+            ref_hash,
+            gpu_out,
+            Gemm{
+                .k = &gemm,
+                .input = input,
+                .w = w_bytes,
+                .b = B,
+                .in = c.in,
+                .out = c.out,
+                .o = gpu_out,
+            },
+        );
         flush();
     }
 }
@@ -343,17 +466,26 @@ pub fn benchBatchedMatmul(gpa: std.mem.Allocator, io: std.Io, runner: *z.vulkan_
 fn isEligible(v: Variant) bool {
     if (!op_requires.isMetBy(v.requires, builtin.cpu)) return false;
     if (build_options.use_vulkan) {
-        return op_requires.runtimeMatches(v.requires, .vulkan) or op_requires.runtimeMatches(v.requires, .cpu);
+        return op_requires.runtimeMatches(
+            v.requires,
+            .vulkan,
+        ) or op_requires.runtimeMatches(v.requires, .cpu);
     } else {
         return op_requires.runtimeMatches(v.requires, .cpu);
     }
 }
 
 fn printEligibility(variants: []const Variant) void {
-    std.debug.print("\nlinearF32Q80 variants for this build target ([+] eligible, [-] not):\n", .{});
+    std.debug.print(
+        "\nlinearF32Q80 variants for this build target ([+] eligible, [-] not):\n",
+        .{},
+    );
     for (variants) |v| {
         const mark: []const u8 = if (isEligible(v)) "+" else "-";
-        std.debug.print("  [{s}] {s:<11} {s:<7} {s}\n", .{ mark, v.name, @tagName(v.requires.runtime), v.desc });
+        std.debug.print(
+            "  [{s}] {s:<11} {s:<7} {s}\n",
+            .{ mark, v.name, @tagName(v.requires.runtime), v.desc },
+        );
     }
 }
 
@@ -378,6 +510,7 @@ fn runVariant(
     while (k < iters) : (k += 1) {
         try callKernel(kernel, input, w_tensor, gpu_weight, out);
     }
+
     const t_end = std.Io.Clock.Timestamp.now(io, .awake);
 
     const elapsed_ns_i96 = t_start.durationTo(t_end).raw.toNanoseconds();
@@ -419,7 +552,10 @@ fn fillSyntheticInputAndWeight(
     in_features: usize,
     out_features: usize,
 ) void {
-    for (input, 0..) |*x, i| x.* = @sin(@as(f32, @floatFromInt(i)));
+    for (input, 0..) |*x, i| {
+        x.* = @sin(@as(f32, @floatFromInt(i)));
+    }
+
     const row_bytes = (in_features / 32) * 34;
     for (0..out_features) |row| {
         const off = row * row_bytes;
@@ -443,7 +579,10 @@ fn fillSyntheticInputAndWeightQ4(
     in_features: usize,
     out_features: usize,
 ) void {
-    for (input, 0..) |*x, i| x.* = @sin(@as(f32, @floatFromInt(i)));
+    for (input, 0..) |*x, i| {
+        x.* = @sin(@as(f32, @floatFromInt(i)));
+    }
+
     const row_bytes = (in_features / 32) * 18;
     for (0..out_features) |row| {
         const off = row * row_bytes;

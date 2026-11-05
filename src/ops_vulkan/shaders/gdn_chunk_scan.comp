@@ -1,6 +1,6 @@
 // Chunked-parallel gated delta-rule scan for the Qwen3.5 GDN value heads over a
 // prefill chunk of T tokens. It mirrors ops/gdn.zig chunkScan, which is validated
-// against the sequential recurrence. The conv and L2-norm front end runs upstream
+// against the sequential recurrence. The conv and L2-norm frontend runs upstream
 // in `gdn_chunk_conv.comp`, so this kernel reads the convolved and L2-normed q_n
 // and k_n of the KEY head of the value head. It also reads the v_conv of the
 // value head and the per-token alpha and beta projections. The gated RMSNorm

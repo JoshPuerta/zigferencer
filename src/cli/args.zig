@@ -1,51 +1,51 @@
-//! The flag parser of every subcommand. A command states its flags as one
-//! struct, and `parseInto` fills a value of it from argv. A field `snake_case`
+//! The flag parser of every command. A field `snake_case`
 //! is the flag `--snake-case`, and the field default is the flag default. The
 //! same struct generates the flag lines of the `--help` text, so the parse and
-//! the help cannot drift. The shape follows the `flags` module of TigerBeetle.
-//!
-//! The field types and their argv forms:
-//!   - `bool`: a bare flag that sets true.
-//!   - an integer or a float: one number. The type bounds the range, and the
-//!     command checks a tighter bound after the parse when it has one.
-//!   - `[]const u8`: one token, taken as it is.
-//!   - an enum: one tag name.
-//!   - a type with `parseFlag`, `flag_value`, and `flag_choices`: one token that
-//!     the type parses. The two names feed the help and the refusal text.
-//!   - `Repeated(T, n)`: a flag that can occur at most n times.
-//!   - `?T`: the form of T. An absent flag leaves null.
-//!   - a nested struct: its fields flatten into the flags of the command.
+//! the help cannot drift.
 //!
 //! A command type declares `help` (the usage line, the prose, the footer) and
 //! `docs` (one `Doc` per flag). It can declare `positional`, the name of one
 //! `?[]const u8` field that takes the one bare argument, and `omit`, nested
 //! fields that the command does not take. A doc of the command replaces the doc
-//! of a nested type for one field, so a shared knob keeps one name and can
+//! of a nested type for one field, so a shared option keeps one name and can
 //! state a default of its own command. A type can also name `docs_from`, a
 //! type whose `docs` cover nested fields that carry no help of their own.
 //!
 //! Every error prints one `error:` line to stderr and returns
 //! `error.UsageError`. `main` exits cleanly on that error, with no developer
-//! stack trace. The full usage block belongs to `--help`. The CLI does not
-//! reprint it after a flag slip.
+//! stack trace. The full usage block belongs to `--help`.
 
 const std = @import("std");
 const Io = std.Io;
 const style = @import("style.zig");
 
+// -- constants --------------------------------------------------------------
+
+const diag_buffer_bytes = 256;
+const help_buffer_bytes = 1024;
+const stderr_buffer_bytes = 512;
+
+/// The compile-time walk over the flag structs of the largest command needs this budget.
+const eval_branch_quota = 200_000;
+
+/// The text column of the flag lines. A longer label puts its text on the next line.
+const label_column_max = 26;
+
+/// The right margin of a flag line, after which a default moves down.
+const line_width_max = 88;
+
 // -- types ------------------------------------------------------------------
 
 /// The help text of one flag.
 pub const Doc = struct {
-    /// The description. A `\n` starts a continuation line under the text column.
+    /// A `\n` starts a continuation line under the text column.
     text: []const u8,
-    /// The group header the flag prints under. The groups print in the order of
-    /// their first flag.
+    /// The header the flag prints under. The groups print in the order of their first flag.
     group: []const u8 = "",
     /// The value placeholder. Null derives it from the type.
     value: ?[]const u8 = null,
-    /// The text of `[default: X]`. Null derives it from the field default, and
-    /// an empty string prints no default.
+    /// The text of `[default: X]`. Null derives it from the field default.
+    /// An empty string prints no default.
     default: ?[]const u8 = null,
     /// A second spelling of the flag, such as `-f`.
     alias: ?[]const u8 = null,
@@ -57,24 +57,26 @@ pub const Help = struct {
     usage: []const u8,
     /// The prose under the usage line. It ends with a newline.
     about: []const u8,
-    /// The text after the flag lines, such as the examples. It ends with a
-    /// newline.
+    /// The text after the flag lines, such as the examples. It ends with a newline.
     footer: []const u8 = "",
 };
 
 /// A flag that can occur up to `cap` times. The parser refuses one more.
 pub fn Repeated(comptime T: type, comptime cap: usize) type {
     comptime std.debug.assert(cap > 0);
+
     return struct {
         const Self = @This();
         pub const Item = T;
         pub const capacity = cap;
+
         /// Only `items[0..len]` is defined.
         items: [cap]T = undefined,
         len: usize = 0,
 
         pub fn slice(self: *const Self) []const T {
             std.debug.assert(self.len <= cap);
+
             return self.items[0..self.len];
         }
     };
@@ -82,7 +84,7 @@ pub fn Repeated(comptime T: type, comptime cap: usize) type {
 
 /// The text of the last parse error, so the parse itself writes nothing.
 pub const Diag = struct {
-    buf: [256]u8 = undefined,
+    buf: [diag_buffer_bytes]u8 = undefined,
     len: usize = 0,
 
     pub fn text(self: *const Diag) []const u8 {
@@ -98,6 +100,53 @@ pub const Diag = struct {
         return error.UsageError;
     }
 };
+
+/// How the parser reads a flag type and how the help prints it.
+const Kind = enum { boolean, int, float, string, enumeration, custom, repeated, nested };
+
+/// One flag of a command, as the parse refusals and the help need it.
+const Entry = struct {
+    /// The long spelling, such as `--max-seq`.
+    name: []const u8,
+    /// The left column of the flag line.
+    label: []const u8,
+    doc: Doc,
+    /// The text of `[default: X]`. An empty string prints no default.
+    default: []const u8,
+    boolean: bool,
+};
+
+/// A read position over `argv`. `Argv` is a slice or an array pointer of byte slices.
+fn Cursor(comptime Argv: type) type {
+    return struct {
+        const Self = @This();
+
+        argv: Argv,
+        index: usize = 0,
+
+        fn next(self: *Self) ?[]const u8 {
+            if (self.index >= self.argv.len) return null;
+
+            const token: []const u8 = self.argv[self.index];
+            self.index += 1;
+            return token;
+        }
+    };
+}
+
+/// One bit per flag of `Top`, set when the flag has been given.
+fn SeenSet(comptime Top: type) type {
+    @setEvalBranchQuota(eval_branch_quota);
+    return std.StaticBitSet(flatten(&.{Top}).len);
+}
+
+/// The type of a flag value, which an optional field wraps.
+fn Base(comptime F: type) type {
+    return switch (@typeInfo(F)) {
+        .optional => |o| o.child,
+        else => F,
+    };
+}
 
 // -- api --------------------------------------------------------------------
 
@@ -119,68 +168,57 @@ pub fn parseInto(comptime T: type, ctx: anytype) error{UsageError}!?T {
 /// nothing. An error leaves its message in `diag`.
 pub fn parse(comptime T: type, argv: anytype, diag: *Diag) error{ UsageError, Help }!T {
     comptime validate(T);
+
     var out: T = .{};
-    var positional_seen = false;
     var seen: SeenSet(T) = .initEmpty();
-    var i: usize = 0;
+    var positional_seen = false;
+    var cursor: Cursor(@TypeOf(argv)) = .{ .argv = argv };
+
     // Each pass consumes at least one token, so the loop ends in argv.len passes.
-    while (i < argv.len) {
-        const token: []const u8 = argv[i];
-        i += 1;
+    while (cursor.next()) |token| {
         if (std.mem.eql(u8, token, "--help") or std.mem.eql(u8, token, "-h")) return error.Help;
+
         if (std.mem.startsWith(u8, token, "-")) {
-            if (!try setFlag(&.{T}, T, &out, token, argv, &i, diag, &seen)) {
-                return failUnknown(T, token, diag);
-            }
+            const taken = try setFlag(&.{T}, &out, token, &cursor, &seen, diag);
+            if (!taken) return failUnknown(T, token, diag);
             continue;
         }
+
         if (comptime !@hasDecl(T, "positional")) {
             return diag.fail("unexpected argument '{s}'", .{token});
         }
         if (positional_seen) return diag.fail("unexpected extra argument '{s}'", .{token});
+
         @field(out, T.positional) = token;
         positional_seen = true;
     }
-    std.debug.assert(i == argv.len);
-    return out;
-}
 
-/// The refusal of a token that no flag takes. A known flag with `=value` gets
-/// the spelling that works, because the parser reads the value as the next token.
-fn failUnknown(comptime T: type, token: []const u8, diag: *Diag) error{UsageError} {
-    const eq = std.mem.indexOfScalar(u8, token, '=') orelse return diag.fail("unknown flag '{s}'", .{token});
-    const head = token[0..eq];
-    inline for (comptime flatten(&.{T})) |e| {
-        const hit = std.mem.eql(u8, head, e.name) or (e.doc.alias != null and std.mem.eql(u8, head, e.doc.alias.?));
-        if (hit) {
-            if (e.boolean) return diag.fail("{s} takes no value", .{head});
-            return diag.fail("unknown flag '{s}'. Write '{s} {s}'", .{ token, head, token[eq + 1 ..] });
-        }
-    }
-    return diag.fail("unknown flag '{s}'", .{token});
+    std.debug.assert(cursor.index == argv.len);
+    return out;
 }
 
 /// The whole `--help` text of `T` after the usage line, built at compile time.
 pub fn helpBody(comptime T: type) []const u8 {
     comptime {
         validate(T);
-        @setEvalBranchQuota(200_000);
+        @setEvalBranchQuota(eval_branch_quota);
+
         const entries = flatten(&.{T});
-        var width: usize = 0;
-        for (entries) |e| width = @max(width, e.label.len);
-        width = @min(width + 2, label_column_max);
+        const width = textColumn(entries);
+
         var out: []const u8 = T.help.about;
         var groups: []const []const u8 = &.{};
         for (entries) |e| {
             if (contains(groups, e.doc.group)) continue;
+
             groups = groups ++ .{e.doc.group};
-            out = out ++ "\n";
-            if (e.doc.group.len > 0) out = out ++ "  " ++ e.doc.group ++ "\n";
-            for (entries) |g| {
-                if (std.mem.eql(u8, g.doc.group, e.doc.group)) out = out ++ flagLines(g, width);
-            }
+            out = out ++ groupLines(entries, e.doc.group, width);
         }
-        if (T.help.footer.len > 0) out = out ++ "\n" ++ T.help.footer;
+
+        if (T.help.footer.len > 0) {
+            out = out ++ "\n" ++ T.help.footer;
+        }
+
         return out;
     }
 }
@@ -189,9 +227,11 @@ pub fn helpBody(comptime T: type) []const u8 {
 /// when a usage error shows it. A failed write has nowhere to go.
 pub fn printHelp(comptime T: type, io: Io, file: Io.File, p: style.Palette) void {
     const body = comptime helpBody(T);
-    var buf: [1024]u8 = undefined;
-    var fw: Io.File.Writer = .initStreaming(file, io, &buf);
-    const w = &fw.interface;
+
+    var buffer: [help_buffer_bytes]u8 = undefined;
+    var file_writer: Io.File.Writer = .initStreaming(file, io, &buffer);
+    const w = &file_writer.interface;
+
     w.print("{s}usage:{s} " ++ T.help.usage ++ "\n\n", .{ p.bold, p.reset }) catch return;
     w.writeAll(body) catch return;
     w.flush() catch return;
@@ -201,136 +241,260 @@ pub fn printHelp(comptime T: type, io: Io, file: Io.File, p: style.Palette) void
 /// failed write, like `std.debug.print`. A broken stderr must not turn a usage
 /// line into a `WriteFailed` that the caller carries back up to `main`.
 pub fn writeStderr(io: Io, bytes: []const u8) void {
-    var buf: [512]u8 = undefined;
-    var fw: Io.File.Writer = .initStreaming(.stderr(), io, &buf);
-    fw.interface.writeAll(bytes) catch return;
-    fw.interface.flush() catch {};
+    var stderr_buffer: [stderr_buffer_bytes]u8 = undefined;
+    var stderr_writer: Io.File.Writer = .initStreaming(.stderr(), io, &stderr_buffer);
+    const w = &stderr_writer.interface;
+
+    w.writeAll(bytes) catch return;
+    w.flush() catch {};
 }
 
-/// Print `error: <msg>` to stderr and return `error.UsageError`. This is the one
-/// place that reports a bad invocation. The parser and the per-command
-/// validation both call it, so flag errors and value-range errors read the same
-/// everywhere.
+/// Print `error: <msg>` to stderr and return `error.UsageError`. The parser and
+/// the validation of each command both call it, so every refusal reads the same.
 pub fn fail(io: Io, comptime fmt: []const u8, fmtargs: anytype) error{UsageError} {
-    var buf: [512]u8 = undefined;
-    var fw: Io.File.Writer = .initStreaming(.stderr(), io, &buf);
-    fw.interface.print("error: " ++ fmt ++ "\n", fmtargs) catch {};
-    fw.interface.flush() catch {};
+    var stderr_buffer: [stderr_buffer_bytes]u8 = undefined;
+    var stderr_writer: Io.File.Writer = .initStreaming(.stderr(), io, &stderr_buffer);
+    const w = &stderr_writer.interface;
+
+    w.print("error: " ++ fmt ++ "\n", fmtargs) catch {};
+    w.flush() catch {};
     return error.UsageError;
 }
 
-// -- helpers ----------------------------------------------------------------
+// -- helpers: parse ---------------------------------------------------------
 
-/// The text column of the flag lines. A longer label puts its text on the next
-/// line.
-const label_column_max = 26;
+/// Set the field whose flag is `token`. False means no field takes it.
+/// `scopes` runs from the command type down to the type of `out`.
+fn setFlag(
+    comptime scopes: []const type,
+    out: *scopes[scopes.len - 1],
+    token: []const u8,
+    cursor: anytype,
+    seen: *SeenSet(scopes[0]),
+    diag: *Diag,
+) error{UsageError}!bool {
+    const Container = scopes[scopes.len - 1];
 
-/// The right margin of a flag line, after which a default moves down.
-const line_width_max = 88;
+    inline for (comptime std.meta.fields(Container)) |f| {
+        if (comptime isPositional(Container, f.name)) continue;
 
-const Kind = enum { boolean, int, float, string, enumeration, custom, repeated, nested };
+        const slot = &@field(out, f.name);
+        if (comptime isNested(f.type)) {
+            if (try setFlag(scopes ++ .{f.type}, slot, token, cursor, seen, diag)) return true;
+            continue;
+        }
 
-fn kindOf(comptime F: type) Kind {
-    return switch (@typeInfo(F)) {
-        .bool => .boolean,
-        .int => .int,
-        .float => .float,
-        .@"enum" => .enumeration,
-        .pointer => if (F == []const u8) .string else @compileError("flag type " ++ @typeName(F) ++ " is not supported"),
-        .@"struct", .@"union" => if (@hasDecl(F, "parseFlag"))
-            .custom
-        else if (@hasDecl(F, "Item") and @hasDecl(F, "capacity"))
-            .repeated
-        else if (@typeInfo(F) == .@"struct")
-            .nested
-        else
-            @compileError("flag type " ++ @typeName(F) ++ " needs parseFlag"),
-        else => @compileError("flag type " ++ @typeName(F) ++ " is not supported"),
-    };
-}
+        if (comptime omitted(scopes[0], f.name)) continue;
 
-fn Base(comptime F: type) type {
-    return switch (@typeInfo(F)) {
-        .optional => |o| o.child,
-        else => F,
-    };
-}
-
-fn isNested(comptime F: type) bool {
-    return @typeInfo(F) != .optional and kindOf(F) == .nested;
-}
-
-fn flagName(comptime field: []const u8) []const u8 {
-    comptime {
-        var name: [field.len]u8 = undefined;
-        for (field, &name) |c, *n| n.* = if (c == '_') '-' else c;
-        const final = name;
-        return "--" ++ &final;
+        const doc = comptime docFor(scopes, f.name);
+        const name = comptime flagName(f.name);
+        if (matches(token, name, doc.alias)) {
+            try refuseRepeat(scopes[0], f.type, name, seen, diag);
+            try setValue(f.type, name, slot, cursor, diag);
+            return true;
+        }
     }
-}
 
-fn contains(comptime list: []const []const u8, comptime name: []const u8) bool {
-    for (list) |item| {
-        if (std.mem.eql(u8, item, name)) return true;
-    }
     return false;
 }
 
-fn omitted(comptime Top: type, comptime name: []const u8) bool {
-    return @hasDecl(Top, "omit") and contains(Top.omit, name);
+fn matches(token: []const u8, name: []const u8, alias: ?[]const u8) bool {
+    if (std.mem.eql(u8, token, name)) return true;
+
+    const spelling = alias orelse return false;
+    return std.mem.eql(u8, token, spelling);
 }
 
-fn isPositional(comptime Container: type, comptime name: []const u8) bool {
-    return @hasDecl(Container, "positional") and std.mem.eql(u8, Container.positional, name);
+/// Refuse a second use of the flag `name` of `Top`, because the last value of a
+/// scalar flag wins in silence. A bool is idempotent, and `Repeated` has its own cap.
+fn refuseRepeat(
+    comptime Top: type,
+    comptime F: type,
+    comptime name: []const u8,
+    seen: *SeenSet(Top),
+    diag: *Diag,
+) error{UsageError}!void {
+    const kind = comptime kindOf(Base(F));
+    if (kind == .repeated or kind == .boolean) return;
+
+    const bit = comptime entryIndex(Top, name);
+    if (seen.isSet(bit)) return diag.fail(name ++ " given twice", .{});
+
+    seen.set(bit);
 }
 
-/// The doc of field `name`. `scopes` runs from the command type down to the
-/// type that holds the field, and the outermost doc wins, so a command can
-/// restate a shared knob.
-fn docFor(comptime scopes: []const type, comptime name: []const u8) Doc {
-    for (scopes) |S| {
-        if (@hasDecl(S, "docs") and @hasField(@TypeOf(S.docs), name)) return @field(S.docs, name);
-        if (@hasDecl(S, "docs_from") and @hasField(@TypeOf(S.docs_from.docs), name)) return @field(S.docs_from.docs, name);
+/// The position of the flag `name` in the flag list of `Top`.
+fn entryIndex(comptime Top: type, comptime name: []const u8) usize {
+    for (flatten(&.{Top}), 0..) |e, k| {
+        if (std.mem.eql(u8, e.name, name)) return k;
     }
-    @compileError("flag field '" ++ name ++ "' of " ++ @typeName(scopes[scopes.len - 1]) ++ " has no doc");
+
+    @compileError("flag " ++ name ++ " is not in " ++ @typeName(Top));
 }
 
-const Entry = struct {
-    name: []const u8,
-    label: []const u8,
-    doc: Doc,
-    default: []const u8,
-    boolean: bool,
-};
+fn setValue(
+    comptime F: type,
+    comptime name: []const u8,
+    slot: *F,
+    cursor: anytype,
+    diag: *Diag,
+) error{UsageError}!void {
+    const B = Base(F);
+    const kind = comptime kindOf(B);
+    if (kind == .boolean) {
+        slot.* = true;
+        return;
+    }
 
-/// Every flag of the last type of `scopes`, nested fields flattened, in field
-/// order.
-fn flatten(comptime scopes: []const type) []const Entry {
-    comptime {
-        const Top = scopes[0];
-        const Container = scopes[scopes.len - 1];
-        var out: []const Entry = &.{};
-        for (std.meta.fields(Container)) |f| {
-            if (isPositional(Container, f.name)) continue;
-            if (isNested(f.type)) {
-                out = out ++ flatten(scopes ++ .{f.type});
-                continue;
-            }
-            if (omitted(Top, f.name)) continue;
-            const doc = docFor(scopes, f.name);
-            const value = doc.value orelse valueName(Base(f.type));
-            const flag = flagName(f.name);
-            const spelled = if (doc.alias) |a| a ++ ", " ++ flag else flag;
-            const label = if (value.len > 0) spelled ++ " " ++ value else spelled;
-            out = out ++ .{Entry{
-                .name = flag,
-                .label = label,
-                .doc = doc,
-                .default = doc.default orelse defaultText(f),
-                .boolean = kindOf(Base(f.type)) == .boolean,
-            }};
+    const raw = cursor.next() orelse return diag.fail(name ++ " requires a value", .{});
+    if (kind == .repeated) {
+        if (slot.len >= B.capacity) {
+            return diag.fail(name ++ " accepts at most {d} values", .{B.capacity});
         }
+
+        slot.items[slot.len] = try parseValue(B.Item, name, raw, diag);
+        slot.len += 1;
+        return;
+    }
+
+    slot.* = try parseValue(B, name, raw, diag);
+}
+
+fn parseValue(
+    comptime B: type,
+    comptime name: []const u8,
+    raw: []const u8,
+    diag: *Diag,
+) error{UsageError}!B {
+    const not_number = name ++ ": '{s}' is not a number";
+    const not_valid = name ++ " '{s}' is not a valid value. Use ";
+
+    return switch (comptime kindOf(B)) {
+        .int => std.fmt.parseInt(B, raw, 10) catch |err| switch (err) {
+            error.Overflow => diag.fail(name ++ ": '{s}' is out of range", .{raw}),
+            error.InvalidCharacter => diag.fail(not_number, .{raw}),
+        },
+        .float => std.fmt.parseFloat(B, raw) catch diag.fail(not_number, .{raw}),
+        .string => raw,
+        .enumeration => std.meta.stringToEnum(B, raw) orelse
+            diag.fail(not_valid ++ comptime tagChoices(B), .{raw}),
+        .custom => B.parseFlag(raw) orelse diag.fail(not_valid ++ B.flag_choices, .{raw}),
+        .boolean, .repeated, .nested => unreachable,
+    };
+}
+
+/// The words of the refusal of a bad enum value: "a or b", or "a, b, or c".
+fn tagChoices(comptime E: type) []const u8 {
+    comptime {
+        const fields = std.meta.fields(E);
+        var out: []const u8 = "";
+        for (fields, 0..) |f, i| {
+            out = out ++ choiceSeparator(i, fields.len) ++ f.name;
+        }
+
         return out;
+    }
+}
+
+/// The words before choice `index` of a list of `count` choices.
+fn choiceSeparator(comptime index: usize, comptime count: usize) []const u8 {
+    if (index == 0) return "";
+    if (index + 1 < count) return ", ";
+    return if (count == 2) " or " else ", or ";
+}
+
+/// The refusal of a token that no flag takes. A known flag with `=value` gets
+/// the spelling that works, because the parser reads the value as the next token.
+fn failUnknown(comptime T: type, token: []const u8, diag: *Diag) error{UsageError} {
+    const eq = std.mem.indexOfScalar(u8, token, '=') orelse
+        return diag.fail("unknown flag '{s}'", .{token});
+
+    const head = token[0..eq];
+    const value = token[eq + 1 ..];
+    inline for (comptime flatten(&.{T})) |e| {
+        if (matches(head, e.name, e.doc.alias)) {
+            if (e.boolean) return diag.fail("{s} takes no value", .{head});
+            return diag.fail("unknown flag '{s}'. Write '{s} {s}'", .{ token, head, value });
+        }
+    }
+
+    return diag.fail("unknown flag '{s}'", .{token});
+}
+
+// -- helpers: help text -----------------------------------------------------
+
+fn textColumn(comptime entries: []const Entry) usize {
+    var width: usize = 0;
+    for (entries) |e| {
+        width = @max(width, e.label.len);
+    }
+
+    return @min(width + 2, label_column_max);
+}
+
+/// The blank line, the header, and the flag lines of one group.
+fn groupLines(
+    comptime entries: []const Entry,
+    comptime group: []const u8,
+    comptime width: usize,
+) []const u8 {
+    comptime {
+        var out: []const u8 = "\n";
+        if (group.len > 0) {
+            out = out ++ "  " ++ group ++ "\n";
+        }
+
+        for (entries) |e| {
+            if (std.mem.eql(u8, e.doc.group, group)) {
+                out = out ++ flagLines(e, width);
+            }
+        }
+
+        return out;
+    }
+}
+
+/// The label in the left column, then the text with its default in the right column.
+fn flagLines(comptime e: Entry, comptime width: usize) []const u8 {
+    comptime {
+        const pad = " " ** (width + 2);
+
+        var out: []const u8 = "  " ++ e.label;
+        if (e.label.len + 2 > width) {
+            out = out ++ "\n" ++ pad;
+        } else {
+            out = out ++ " " ** (width - e.label.len);
+        }
+
+        var lines = std.mem.splitScalar(u8, e.doc.text ++ defaultSuffix(e, width), '\n');
+        out = out ++ lines.first();
+        while (lines.next()) |line| {
+            out = out ++ "\n" ++ pad ++ line;
+        }
+
+        return out ++ "\n";
+    }
+}
+
+/// The `[default: X]` text after the description. A default that runs past the
+/// right margin starts its own line.
+fn defaultSuffix(comptime e: Entry, comptime width: usize) []const u8 {
+    comptime {
+        if (e.default.len == 0) return "";
+
+        const gap = "   ";
+        const open = "[default: ";
+        const close = "]";
+
+        const text = e.doc.text;
+        const text_last_start = if (std.mem.lastIndexOfScalar(u8, text, '\n')) |k| k + 1 else 0;
+        const text_last_len = text.len - text_last_start;
+        const default_head_len = std.mem.indexOfScalar(u8, e.default, '\n') orelse e.default.len;
+
+        const suffix_len = gap.len + open.len + default_head_len + close.len;
+        const line_end = width + 2 + text_last_len + suffix_len;
+        const joint = if (line_end > line_width_max) "\n" else gap;
+        return joint ++ open ++ e.default ++ close;
     }
 }
 
@@ -340,36 +504,29 @@ fn valueName(comptime F: type) []const u8 {
         .int => "N",
         .float => "X",
         .string => "TEXT",
-        .enumeration => tagList(F, "|"),
+        .enumeration => tagList(F),
         .custom => F.flag_value,
         .repeated => valueName(F.Item),
         .nested => unreachable,
     };
 }
 
-fn tagList(comptime E: type, comptime sep: []const u8) []const u8 {
+/// The placeholder of an enum flag: "a|b|c".
+fn tagList(comptime E: type) []const u8 {
     comptime {
         var out: []const u8 = "";
-        for (std.meta.fields(E), 0..) |f, i| out = out ++ (if (i == 0) "" else sep) ++ f.name;
-        return out;
-    }
-}
-
-/// The words of the refusal of a bad enum value: "a, b, or c".
-fn tagChoices(comptime E: type) []const u8 {
-    comptime {
-        const fields = std.meta.fields(E);
-        var out: []const u8 = "";
-        for (fields, 0..) |f, i| {
-            const sep = if (i == 0) "" else if (i + 1 == fields.len) (if (fields.len == 2) " or " else ", or ") else ", ";
-            out = out ++ sep ++ f.name;
+        for (std.meta.fields(E), 0..) |f, i| {
+            out = out ++ (if (i == 0) "" else "|") ++ f.name;
         }
+
         return out;
     }
 }
 
 fn defaultText(comptime f: std.builtin.Type.StructField) []const u8 {
-    const value = f.defaultValue() orelse @compileError("flag field '" ++ f.name ++ "' needs a default");
+    const value = f.defaultValue() orelse
+        @compileError("flag field '" ++ f.name ++ "' needs a default");
+
     return switch (@typeInfo(f.type)) {
         .optional => if (value) |v| valueText(@TypeOf(v), v) else "",
         .bool => "",
@@ -386,72 +543,199 @@ fn valueText(comptime F: type, comptime v: F) []const u8 {
     };
 }
 
-fn flagLines(comptime e: Entry, comptime width: usize) []const u8 {
+// -- helpers: struct reflection ---------------------------------------------
+
+/// Every flag of the last type of `scopes`, nested fields flattened, in field order.
+fn flatten(comptime scopes: []const type) []const Entry {
     comptime {
-        const pad = " " ** (width + 2);
-        const last = if (std.mem.lastIndexOfScalar(u8, e.doc.text, '\n')) |k| e.doc.text.len - k - 1 else e.doc.text.len;
-        const head = if (std.mem.indexOfScalar(u8, e.default, '\n')) |k| k else e.default.len;
-        // A default that runs past the right margin starts its own line.
-        const joint = if (width + 2 + last + 3 + head + 11 > line_width_max) "\n" else "   ";
-        const tail = if (e.default.len > 0) joint ++ "[default: " ++ e.default ++ "]" else "";
-        const text = e.doc.text ++ tail;
-        var out: []const u8 = "  " ++ e.label;
-        if (e.label.len + 2 > width) {
-            out = out ++ "\n" ++ pad;
-        } else {
-            out = out ++ " " ** (width - e.label.len);
+        const Container = scopes[scopes.len - 1];
+
+        var out: []const Entry = &.{};
+        for (std.meta.fields(Container)) |f| {
+            if (isPositional(Container, f.name)) continue;
+
+            if (isNested(f.type)) {
+                out = out ++ flatten(scopes ++ .{f.type});
+                continue;
+            }
+
+            if (omitted(scopes[0], f.name)) continue;
+
+            out = out ++ .{entryOf(f, docFor(scopes, f.name))};
         }
-        var lines = std.mem.splitScalar(u8, text, '\n');
-        var first = true;
-        while (lines.next()) |line| {
-            if (!first) out = out ++ "\n" ++ pad;
-            out = out ++ line;
-            first = false;
-        }
-        return out ++ "\n";
+
+        return out;
     }
 }
+
+fn entryOf(comptime f: std.builtin.Type.StructField, comptime doc: Doc) Entry {
+    const flag = flagName(f.name);
+    const spelled = if (doc.alias) |a| a ++ ", " ++ flag else flag;
+    const value = doc.value orelse valueName(Base(f.type));
+
+    return .{
+        .name = flag,
+        .label = if (value.len > 0) spelled ++ " " ++ value else spelled,
+        .doc = doc,
+        .default = doc.default orelse defaultText(f),
+        .boolean = kindOf(Base(f.type)) == .boolean,
+    };
+}
+
+fn kindOf(comptime F: type) Kind {
+    const unsupported = "flag type " ++ @typeName(F) ++ " is not supported";
+
+    return switch (@typeInfo(F)) {
+        .bool => .boolean,
+        .int => .int,
+        .float => .float,
+        .@"enum" => .enumeration,
+        .pointer => if (F == []const u8) .string else @compileError(unsupported),
+        .@"struct", .@"union" => compositeKind(F),
+        else => @compileError(unsupported),
+    };
+}
+
+/// A struct declares its kind first, because `Repeated` and a custom flag are structs too.
+fn compositeKind(comptime F: type) Kind {
+    if (@hasDecl(F, "parseFlag")) return .custom;
+    if (@hasDecl(F, "Item") and @hasDecl(F, "capacity")) return .repeated;
+    if (@typeInfo(F) == .@"struct") return .nested;
+
+    @compileError("flag type " ++ @typeName(F) ++ " needs parseFlag");
+}
+
+fn isNested(comptime F: type) bool {
+    return @typeInfo(F) != .optional and kindOf(F) == .nested;
+}
+
+fn flagName(comptime field: []const u8) []const u8 {
+    comptime {
+        var name = field[0..field.len].*;
+        std.mem.replaceScalar(u8, &name, '_', '-');
+        const final = name;
+        return "--" ++ &final;
+    }
+}
+
+fn contains(comptime list: []const []const u8, comptime name: []const u8) bool {
+    for (list) |item| {
+        if (std.mem.eql(u8, item, name)) return true;
+    }
+
+    return false;
+}
+
+fn omitted(comptime Top: type, comptime name: []const u8) bool {
+    return @hasDecl(Top, "omit") and contains(Top.omit, name);
+}
+
+fn isPositional(comptime Container: type, comptime name: []const u8) bool {
+    return @hasDecl(Container, "positional") and std.mem.eql(u8, Container.positional, name);
+}
+
+/// The doc of field `name`. `scopes` runs from the command type down to the
+/// type that holds the field, and the outermost doc wins, so a command can
+/// restate a shared option.
+fn docFor(comptime scopes: []const type, comptime name: []const u8) Doc {
+    for (scopes) |S| {
+        if (@hasDecl(S, "docs") and @hasField(@TypeOf(S.docs), name)) {
+            return @field(S.docs, name);
+        }
+        if (@hasDecl(S, "docs_from") and @hasField(@TypeOf(S.docs_from.docs), name)) {
+            return @field(S.docs_from.docs, name);
+        }
+    }
+
+    const holder = @typeName(scopes[scopes.len - 1]);
+    @compileError("flag field '" ++ name ++ "' of " ++ holder ++ " has no doc");
+}
+
+// -- helpers: compile-time checks -------------------------------------------
 
 /// The compile-time checks of a command type: unique flag names, one doc per
 /// flag and no doc for a missing flag, a real positional field, and real omit
 /// names.
 fn validate(comptime T: type) void {
     comptime {
-        @setEvalBranchQuota(200_000);
-        if (!@hasDecl(T, "help")) @compileError(@typeName(T) ++ " needs a help declaration");
-        const entries = flatten(&.{T});
-        var names: []const []const u8 = &.{};
-        for (entries) |e| {
-            if (std.mem.eql(u8, e.name, "--help")) @compileError("--help is reserved");
-            if (contains(names, e.name)) @compileError("flag " ++ e.name ++ " repeats in " ++ @typeName(T));
-            names = names ++ .{e.name};
-            if (e.doc.alias) |a| {
-                if (contains(names, a)) @compileError("flag " ++ a ++ " repeats in " ++ @typeName(T));
-                names = names ++ .{a};
-            }
+        @setEvalBranchQuota(eval_branch_quota);
+
+        if (!@hasDecl(T, "help")) {
+            @compileError(@typeName(T) ++ " needs a help declaration");
         }
+
+        validateNames(T);
         validateDocs(T);
         if (@hasDecl(T, "omit")) {
-            for (T.omit) |o| {
-                if (!hasFlatField(T, o)) @compileError("omit '" ++ o ++ "' of " ++ @typeName(T) ++ " names no field");
-            }
+            validateOmit(T);
         }
+
         if (@hasDecl(T, "positional")) {
-            if (!@hasField(T, T.positional)) @compileError("positional '" ++ T.positional ++ "' names no field");
-            if (@FieldType(T, T.positional) != ?[]const u8) @compileError("positional field must be ?[]const u8");
+            validatePositional(T);
         }
     }
+}
+
+fn validateNames(comptime T: type) void {
+    comptime {
+        var names: []const []const u8 = &.{};
+        for (flatten(&.{T})) |e| {
+            if (std.mem.eql(u8, e.name, "--help")) {
+                @compileError("--help is reserved");
+            }
+
+            names = uniqueName(T, names, e.name);
+            if (e.doc.alias) |a| {
+                names = uniqueName(T, names, a);
+            }
+        }
+    }
+}
+
+fn uniqueName(
+    comptime T: type,
+    comptime names: []const []const u8,
+    comptime name: []const u8,
+) []const []const u8 {
+    if (contains(names, name)) {
+        @compileError("flag " ++ name ++ " repeats in " ++ @typeName(T));
+    }
+
+    return names ++ .{name};
 }
 
 /// Every doc of `Container` and of its nested types names one of their fields.
 fn validateDocs(comptime Container: type) void {
     if (@hasDecl(Container, "docs")) {
         for (std.meta.fields(@TypeOf(Container.docs))) |d| {
-            if (!hasFlatField(Container, d.name)) @compileError("doc '" ++ d.name ++ "' of " ++ @typeName(Container) ++ " names no field");
+            if (!hasFlatField(Container, d.name)) {
+                const holder = @typeName(Container);
+                @compileError("doc '" ++ d.name ++ "' of " ++ holder ++ " names no field");
+            }
         }
     }
+
     for (std.meta.fields(Container)) |f| {
-        if (isNested(f.type)) validateDocs(f.type);
+        if (isNested(f.type)) {
+            validateDocs(f.type);
+        }
+    }
+}
+
+fn validateOmit(comptime T: type) void {
+    for (T.omit) |o| {
+        if (!hasFlatField(T, o)) {
+            @compileError("omit '" ++ o ++ "' of " ++ @typeName(T) ++ " names no field");
+        }
+    }
+}
+
+fn validatePositional(comptime T: type) void {
+    if (!@hasField(T, T.positional)) {
+        @compileError("positional '" ++ T.positional ++ "' names no field");
+    }
+    if (@FieldType(T, T.positional) != ?[]const u8) {
+        @compileError("positional field must be ?[]const u8");
     }
 }
 
@@ -460,90 +744,8 @@ fn hasFlatField(comptime Container: type, comptime name: []const u8) bool {
         if (std.mem.eql(u8, f.name, name)) return true;
         if (isNested(f.type) and hasFlatField(f.type, name)) return true;
     }
+
     return false;
-}
-
-/// Set the field whose flag is `token`. False means no field of `Container`
-/// takes it.
-fn setFlag(
-    comptime scopes: []const type,
-    comptime Container: type,
-    out: *Container,
-    token: []const u8,
-    argv: anytype,
-    i: *usize,
-    diag: *Diag,
-    seen: anytype,
-) error{UsageError}!bool {
-    inline for (comptime std.meta.fields(Container)) |f| {
-        if (comptime isPositional(Container, f.name)) continue;
-        if (comptime isNested(f.type)) {
-            if (try setFlag(scopes ++ .{f.type}, f.type, &@field(out, f.name), token, argv, i, diag, seen)) return true;
-        } else if (comptime !omitted(scopes[0], f.name)) {
-            const doc = comptime docFor(scopes, f.name);
-            const name = comptime flagName(f.name);
-            const hit = std.mem.eql(u8, token, name) or (doc.alias != null and std.mem.eql(u8, token, doc.alias.?));
-            if (hit) {
-                // Without this check a repeated scalar flag keeps the last value in silence. A bool is idempotent.
-                if (comptime kindOf(Base(f.type)) != .repeated and kindOf(Base(f.type)) != .boolean) {
-                    const slot = comptime entryIndex(scopes[0], name);
-                    if (seen.isSet(slot)) return diag.fail(name ++ " given twice", .{});
-                    seen.set(slot);
-                }
-                try setValue(f.type, name, &@field(out, f.name), argv, i, diag);
-                return true;
-            }
-        }
-    }
-    return false;
-}
-
-/// One bit per flag of `Top`, set when the flag has been given.
-fn SeenSet(comptime Top: type) type {
-    @setEvalBranchQuota(200_000);
-    return std.StaticBitSet(flatten(&.{Top}).len);
-}
-
-/// The position of the flag `name` in the flag list of `Top`.
-fn entryIndex(comptime Top: type, comptime name: []const u8) usize {
-    for (flatten(&.{Top}), 0..) |e, k| {
-        if (std.mem.eql(u8, e.name, name)) return k;
-    }
-    @compileError("flag " ++ name ++ " is not in " ++ @typeName(Top));
-}
-
-fn setValue(comptime F: type, comptime name: []const u8, slot: *F, argv: anytype, i: *usize, diag: *Diag) error{UsageError}!void {
-    const B = Base(F);
-    if (comptime kindOf(B) == .boolean) {
-        slot.* = true;
-        return;
-    }
-    if (i.* >= argv.len) return diag.fail(name ++ " requires a value", .{});
-    const raw: []const u8 = argv[i.*];
-    i.* += 1;
-    if (comptime kindOf(B) == .repeated) {
-        if (slot.len >= B.capacity) return diag.fail(name ++ " accepts at most {d} values", .{B.capacity});
-        slot.items[slot.len] = try parseValue(B.Item, name, raw, diag);
-        slot.len += 1;
-        return;
-    }
-    slot.* = try parseValue(B, name, raw, diag);
-}
-
-fn parseValue(comptime B: type, comptime name: []const u8, raw: []const u8, diag: *Diag) error{UsageError}!B {
-    return switch (comptime kindOf(B)) {
-        .int => std.fmt.parseInt(B, raw, 10) catch |err| switch (err) {
-            error.Overflow => diag.fail(name ++ ": '{s}' is out of range", .{raw}),
-            error.InvalidCharacter => diag.fail(name ++ ": '{s}' is not a number", .{raw}),
-        },
-        .float => std.fmt.parseFloat(B, raw) catch diag.fail(name ++ ": '{s}' is not a number", .{raw}),
-        .string => raw,
-        .enumeration => std.meta.stringToEnum(B, raw) orelse
-            diag.fail(name ++ " '{s}' is not a valid value. Use " ++ comptime tagChoices(B), .{raw}),
-        .custom => B.parseFlag(raw) orelse
-            diag.fail(name ++ " '{s}' is not a valid value. Use " ++ B.flag_choices, .{raw}),
-        .boolean, .repeated, .nested => unreachable,
-    };
 }
 
 // -- tests ------------------------------------------------------------------
@@ -633,10 +835,19 @@ test "parse: the messages name the flag and the value" {
     try std.testing.expectEqualStrings("unknown flag '--nope'", diag.text());
     try std.testing.expectError(error.UsageError, parse(Sample, &[_][]const u8{"--count"}, &diag));
     try std.testing.expectEqualStrings("--count requires a value", diag.text());
-    try std.testing.expectError(error.UsageError, parse(Sample, &[_][]const u8{ "--count", "x" }, &diag));
+    try std.testing.expectError(
+        error.UsageError,
+        parse(Sample, &[_][]const u8{ "--count", "x" }, &diag),
+    );
     try std.testing.expectEqualStrings("--count: 'x' is not a number", diag.text());
-    try std.testing.expectError(error.UsageError, parse(Sample, &[_][]const u8{ "--pick", "d" }, &diag));
-    try std.testing.expectEqualStrings("--pick 'd' is not a valid value. Use a, b, or c", diag.text());
+    try std.testing.expectError(
+        error.UsageError,
+        parse(Sample, &[_][]const u8{ "--pick", "d" }, &diag),
+    );
+    try std.testing.expectEqualStrings(
+        "--pick 'd' is not a valid value. Use a, b, or c",
+        diag.text(),
+    );
     try std.testing.expectError(error.UsageError, parse(Sample, &[_][]const u8{ "a", "b" }, &diag));
     try std.testing.expectEqualStrings("unexpected extra argument 'b'", diag.text());
     const messages = [_]struct { argv: []const []const u8, want: []const u8 }{
@@ -651,6 +862,7 @@ test "parse: the messages name the flag and the value" {
         try std.testing.expectError(error.UsageError, parse(Sample, m.argv, &diag));
         try std.testing.expectEqualStrings(m.want, diag.text());
     }
+
     // A token past the buffer keeps the head of the message.
     const long = "--" ++ "x" ** 400;
     try std.testing.expectError(error.UsageError, parse(Sample, &[_][]const u8{long}, &diag));
@@ -685,6 +897,42 @@ test "parse: help, alias, and a value that starts with a dash" {
     try std.testing.expectEqualStrings("m", s.name.?);
 }
 
+test "parse: a refusal keeps the alias spelling and joins two choices with or" {
+    const messages = [_]struct { argv: []const []const u8, want: []const u8 }{
+        .{ .argv = &.{"-v=1"}, .want = "-v takes no value" },
+        .{
+            .argv = &.{ "--mode", "medium" },
+            .want = "--mode 'medium' is not a valid value. Use fast or slow",
+        },
+    };
+    var diag: Diag = .{};
+    for (messages) |m| {
+        try std.testing.expectError(error.UsageError, parse(Sample, m.argv, &diag));
+        try std.testing.expectEqualStrings(m.want, diag.text());
+    }
+}
+
+test "helpBody: a long label and a default past the margin move to their own lines" {
+    const Wide = struct {
+        label_past_the_text_column: u32 = 1,
+        short: u32 = 2,
+
+        pub const help: Help = .{ .usage = "wide", .about = "" };
+        pub const docs = .{
+            .label_past_the_text_column = Doc{ .text = "x" ** 60 },
+            .short = Doc{ .text = "y" },
+        };
+    };
+    const pad = " " ** 28;
+    try std.testing.expectEqualStrings(
+        "\n  --label-past-the-text-column N\n" ++
+            pad ++ "x" ** 60 ++ "\n" ++
+            pad ++ "[default: 1]\n" ++
+            "  --short N" ++ " " ** 17 ++ "y   [default: 2]\n",
+        comptime helpBody(Wide),
+    );
+}
+
 test "helpBody: one line per flag, groups in first-flag order, defaults stated" {
     const body = comptime helpBody(Sample);
     try std.testing.expect(std.mem.startsWith(u8, body, "A test command.\n"));
@@ -693,9 +941,15 @@ test "helpBody: one line per flag, groups in first-flag order, defaults stated" 
     try std.testing.expect(std.mem.indexOf(u8, body, "-v, --verbose") != null);
     try std.testing.expect(std.mem.indexOf(u8, body, "--mode fast|slow") != null);
     try std.testing.expect(std.mem.indexOf(u8, body, "over two lines   [default: \"hi\"]") != null);
-    try std.testing.expect(std.mem.indexOf(u8, body, "the depth the command states   [default: 4]") != null);
+    try std.testing.expect(
+        std.mem.indexOf(u8, body, "the depth the command states   [default: 4]") != null,
+    );
     try std.testing.expect(std.mem.indexOf(u8, body, "--hidden") == null);
     // The ungrouped flags print first, then the inner group under its header.
-    try std.testing.expect(std.mem.indexOf(u8, body, "--count").? < std.mem.indexOf(u8, body, "  inner\n").?);
-    try std.testing.expect(std.mem.indexOf(u8, body, "  inner\n").? < std.mem.indexOf(u8, body, "--depth").?);
+    try std.testing.expect(
+        std.mem.indexOf(u8, body, "--count").? < std.mem.indexOf(u8, body, "  inner\n").?,
+    );
+    try std.testing.expect(
+        std.mem.indexOf(u8, body, "  inner\n").? < std.mem.indexOf(u8, body, "--depth").?,
+    );
 }

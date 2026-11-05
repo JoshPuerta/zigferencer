@@ -1,9 +1,9 @@
-//! Lean per-run timers for the decode step. A `Stat` folds one timed leg into a
+//! Lean per-run timers for the decode step. A `Stat` folds one timed host step into a
 //! sum, a max, and a count, so a run keeps its distribution summary in fixed
-//! space and the hot path allocates nothing. `DecodeHost` names the six legs of
+//! space and the hot path allocates nothing. `DecodeHost` names the six host steps of
 //! one decode step on the host: record, submit, speculate, wait, the logits
 //! copy, and the sampler argmax. It also holds the counts of the record ring.
-//! Values only. The fused runners fill the legs up to the copy and the ring
+//! Values only. The fused runners fill the host steps up to the copy and the ring
 //! counts, the decode loop fills the argmax, and the bench report prints the
 //! result.
 
@@ -65,7 +65,9 @@ pub const RingCounts = struct {
     wasted: u64 = 0,
 
     pub fn merge(self: *RingCounts, other: RingCounts) void {
-        inline for (std.meta.fields(RingCounts)) |f| @field(self, f.name) += @field(other, f.name);
+        inline for (std.meta.fields(RingCounts)) |f| {
+            @field(self, f.name) += @field(other, f.name);
+        }
     }
 };
 
@@ -81,7 +83,9 @@ pub const DecodeHost = struct {
     ring: RingCounts = .{},
 
     pub fn merge(self: *DecodeHost, other: DecodeHost) void {
-        inline for (std.meta.fields(DecodeHost)) |f| @field(self, f.name).merge(@field(other, f.name));
+        inline for (std.meta.fields(DecodeHost)) |f| {
+            @field(self, f.name).merge(@field(other, f.name));
+        }
     }
 
     /// True when a fused runner timed at least one step.
@@ -101,6 +105,7 @@ pub fn nsToMs(ns: u64) f64 {
 /// The clock is monotonic, so the difference is never negative.
 pub fn nsBetween(t0: std.Io.Timestamp, t1: std.Io.Timestamp) u64 {
     std.debug.assert(t1.nanoseconds >= t0.nanoseconds);
+
     return @intCast(t1.nanoseconds - t0.nanoseconds);
 }
 
@@ -139,7 +144,10 @@ test "DecodeHost: merge adds counts and keeps the larger max per leg" {
     a.ring.hits = 3;
     b.ring = .{ .hits = 4, .misses = 1, .speculated = 5, .wasted = 1 };
     a.merge(b);
-    try std.testing.expectEqual(RingCounts{ .hits = 7, .misses = 1, .speculated = 5, .wasted = 1 }, a.ring);
+    try std.testing.expectEqual(
+        RingCounts{ .hits = 7, .misses = 1, .speculated = 5, .wasted = 1 },
+        a.ring,
+    );
 }
 
 test "nsBetween: difference of two timestamps" {

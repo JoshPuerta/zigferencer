@@ -17,6 +17,11 @@ const std = @import("std");
 const core_log = @import("../core/log.zig");
 const span = @import("../core/span.zig");
 
+// -- constants --------------------------------------------------------------
+
+/// The empty slot value of both build modes.
+pub const slot_off: Slot = if (core_log.hot) null else {};
+
 // -- types ------------------------------------------------------------------
 
 /// The runner family a profile belongs to. Each family charges its own subset
@@ -47,10 +52,18 @@ pub const ProfileCat = enum {
     lm_head,
 
     /// True for the row-parallel matmuls. Each runner charges them at its one
-    /// matmul seam, so the layer body carries no matmul bracket.
+    /// matmul boundary, so the layer body carries no matmul bracket.
     pub fn isMatmul(self: ProfileCat) bool {
         return switch (self) {
-            .gdn_proj, .gdn_out, .qkv_proj, .attn_proj, .o_proj, .gate_up_proj, .down_proj, .lm_head => true,
+            .gdn_proj,
+            .gdn_out,
+            .qkv_proj,
+            .attn_proj,
+            .o_proj,
+            .gate_up_proj,
+            .down_proj,
+            .lm_head,
+            => true,
             else => false,
         };
     }
@@ -64,9 +77,25 @@ pub const ProfileCat = enum {
     /// True when `family` charges this category.
     pub fn usedBy(self: ProfileCat, family: Family) bool {
         return switch (self) {
-            .embed, .rmsnorm, .attention, .o_proj, .gate_up_proj, .swiglu, .down_proj, .residual, .lm_head => true,
+            .embed,
+            .rmsnorm,
+            .attention,
+            .o_proj,
+            .gate_up_proj,
+            .swiglu,
+            .down_proj,
+            .residual,
+            .lm_head,
+            => true,
             .qkv_proj, .rope => family == .llama,
-            .gdn_proj, .gdn_step, .gdn_out, .attn_proj, .qk_norm_rope, .kv_commit, .attn_gate => family == .qwen,
+            .gdn_proj,
+            .gdn_step,
+            .gdn_out,
+            .attn_proj,
+            .qk_norm_rope,
+            .kv_commit,
+            .attn_gate,
+            => family == .qwen,
         };
     }
 };
@@ -85,7 +114,10 @@ pub const CpuProfile = if (core_log.hot) struct {
     /// Sum across categories. The per-step CPU time is `total() / steps`.
     pub fn total(self: *const CpuProfile) u64 {
         var sum: u64 = 0;
-        for (self.ns.values) |v| sum += v;
+        for (self.ns.values) |v| {
+            sum += v;
+        }
+
         return sum;
     }
 
@@ -93,8 +125,11 @@ pub const CpuProfile = if (core_log.hot) struct {
     pub fn nsParallel(self: *const CpuProfile) u64 {
         var sum: u64 = 0;
         for (std.enums.values(ProfileCat)) |cat| {
-            if (cat.isParallel()) sum += self.ns.get(cat);
+            if (cat.isParallel()) {
+                sum += self.ns.get(cat);
+            }
         }
+
         return sum;
     }
 } else void;
@@ -102,9 +137,6 @@ pub const CpuProfile = if (core_log.hot) struct {
 /// The runner-side timer slot. It is `void` without `-Dtrace`, so the release
 /// runner carries neither the pointer nor the branch that reads it.
 pub const Slot = if (core_log.hot) ?*CpuProfile else void;
-
-/// The empty slot value of both build modes.
-pub const slot_off: Slot = if (core_log.hot) null else {};
 
 /// One open timing span. It is `void` without `-Dtrace`.
 pub const Span = if (core_log.hot) std.Io.Clock.Timestamp else void;
@@ -117,8 +149,13 @@ pub const Span = if (core_log.hot) std.Io.Clock.Timestamp else void;
 /// path is then two predictable branches and zero clock reads.
 pub inline fn begin(slot: Slot, io: std.Io) Span {
     if (comptime core_log.hot) {
-        return if (slot != null or span.enabled()) std.Io.Clock.Timestamp.now(io, .awake) else undefined;
-    } else return {};
+        return if (slot != null or span.enabled()) std.Io.Clock.Timestamp.now(
+            io,
+            .awake,
+        ) else undefined;
+    } else {
+        return {};
+    }
 }
 
 /// Close a timing span opened by `begin`, charge the elapsed time to `cat`,
@@ -128,12 +165,17 @@ pub inline fn end(slot: Slot, io: std.Io, t0: Span, cat: ProfileCat) void {
     if (comptime core_log.hot) {
         const tracing = span.enabled();
         if (slot == null and !tracing) return;
+
         const t1 = std.Io.Clock.Timestamp.now(io, .awake);
         if (slot) |p| {
             std.debug.assert(cat.usedBy(p.family));
+
             p.ns.getPtr(cat).* += @intCast(t0.durationTo(t1).raw.toNanoseconds());
         }
-        if (tracing) span.record(spanName(cat), t0.raw, t1.raw);
+
+        if (tracing) {
+            span.record(spanName(cat), t0.raw, t1.raw);
+        }
     }
 }
 
@@ -152,9 +194,15 @@ test "cpu profile: each family uses a fixed category set" {
     for (std.enums.values(ProfileCat)) |cat| {
         // No category is dead: at least one family charges it.
         try std.testing.expect(cat.usedBy(.llama) or cat.usedBy(.qwen));
-        if (cat.usedBy(.llama)) llama += 1;
-        if (cat.usedBy(.qwen)) qwen += 1;
+        if (cat.usedBy(.llama)) {
+            llama += 1;
+        }
+
+        if (cat.usedBy(.qwen)) {
+            qwen += 1;
+        }
     }
+
     try std.testing.expectEqual(@as(u32, 11), llama);
     try std.testing.expectEqual(@as(u32, 16), qwen);
     // The lm_head and the FFN matmuls are common to both families.
@@ -163,13 +211,17 @@ test "cpu profile: each family uses a fixed category set" {
         try std.testing.expect(cat.usedBy(.llama));
         try std.testing.expect(cat.usedBy(.qwen));
     }
+
     try std.testing.expect(!ProfileCat.attention.isMatmul());
     try std.testing.expect(!ProfileCat.gdn_step.isMatmul());
     // Every matmul fans out. Attention and the GDN step fan out without a
-    // matmul seam.
+    // matmul boundary.
     for (std.enums.values(ProfileCat)) |cat| {
-        if (cat.isMatmul()) try std.testing.expect(cat.isParallel());
+        if (cat.isMatmul()) {
+            try std.testing.expect(cat.isParallel());
+        }
     }
+
     try std.testing.expect(ProfileCat.attention.isParallel());
     try std.testing.expect(ProfileCat.gdn_step.isParallel());
     try std.testing.expect(!ProfileCat.rmsnorm.isParallel());

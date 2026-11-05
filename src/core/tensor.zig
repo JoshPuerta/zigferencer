@@ -36,7 +36,10 @@ pub const Tensor = struct {
     /// Total element count (product of the active dims).
     pub fn numel(self: Tensor) usize {
         var n: usize = 1;
-        for (self.shape[0..self.n_dims]) |d| n *= d;
+        for (self.shape[0..self.n_dims]) |d| {
+            n *= d;
+        }
+
         return n;
     }
 
@@ -49,7 +52,11 @@ pub const Tensor = struct {
     pub fn assertValid(self: Tensor) void {
         std.debug.assert(self.n_dims >= 1);
         std.debug.assert(self.n_dims <= limits.max_n_dims);
-        for (self.shape[0..self.n_dims]) |d| std.debug.assert(d > 0);
+
+        for (self.shape[0..self.n_dims]) |d| {
+            std.debug.assert(d > 0);
+        }
+
         std.debug.assert(self.data.len >= self.bytesRequired());
     }
 };

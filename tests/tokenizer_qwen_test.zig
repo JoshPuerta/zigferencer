@@ -1,7 +1,7 @@
 //! Golden-id gate for the Qwen (`qwen35`) pre-tokenizer against the real
 //! Qwen3.5-2B-Q8_0 GGUF.
 //!
-//! The expected ids come from the llama.cpp `llama-tokenize --ids` oracle, so
+//! The expected ids come from the llama.cpp `llama-tokenize --ids` reference, so
 //! the ids must match it exactly. The Qwen regex is the llama3 regex with
 //! single-digit runs and no `ignore_merges`. So "2147" becomes 2, 1, 4 and 7,
 //! and a multi-space run keeps its grouping. The added tokens of the vocab
@@ -35,17 +35,20 @@ test "qwen pre-tokenizer matches the llama.cpp oracle (golden ids)" {
     const gpa = std.testing.allocator;
     var arena_state = std.heap.ArenaAllocator.init(gpa);
     defer arena_state.deinit();
+
     const arena = arena_state.allocator();
     const path = try zigferencer.test_fixtures.path(arena, "Qwen3.5-2B-Q8_0");
 
     var loaded = try loader.loadWith(io, arena, path, .{ .prefault = false });
     defer loaded.close();
+
     var vocab = try vocab_mod.buildFromParsed(arena, loaded.parsed);
     try std.testing.expectEqual(vocab_mod.PreType.qwen, vocab.pre);
 
     for (golden) |c| {
         const ids = try bpe.encodeAlloc(&vocab, gpa, c.text, true);
         defer gpa.free(ids);
+
         try std.testing.expectEqualSlices(u32, c.ids, ids);
     }
 }
@@ -56,11 +59,13 @@ test "qwen added tokens encode to one id each and split the text around them" {
     const gpa = std.testing.allocator;
     var arena_state = std.heap.ArenaAllocator.init(gpa);
     defer arena_state.deinit();
+
     const arena = arena_state.allocator();
     const path = try zigferencer.test_fixtures.path(arena, "Qwen3.5-2B-Q8_0");
 
     var loaded = try loader.loadWith(io, arena, path, .{ .prefault = false });
     defer loaded.close();
+
     var vocab = try vocab_mod.buildFromParsed(arena, loaded.parsed);
 
     const think_id: u32 = 248068;
@@ -79,5 +84,9 @@ test "qwen added tokens encode to one id each and split the text around them" {
     const a = try bpe.encodeAlloc(&vocab, arena, "a", true);
     const b = try bpe.encodeAlloc(&vocab, arena, "b", false);
     const want = try std.mem.concat(arena, u32, &.{ a, &.{think_id}, b });
-    try std.testing.expectEqualSlices(u32, want, try bpe.encodeAlloc(&vocab, arena, "a<think>b", true));
+    try std.testing.expectEqualSlices(
+        u32,
+        want,
+        try bpe.encodeAlloc(&vocab, arena, "a<think>b", true),
+    );
 }

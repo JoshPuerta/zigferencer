@@ -35,54 +35,7 @@ const Pool = pool_mod.Pool;
 
 const log = std.log.scoped(.parallel);
 
-// -- types ------------------------------------------------------------------
-
-/// A batched linear kernel: `out = input @ weight.T` with weight in `[in, out]`
-/// (GGUF row-major) layout, over `batch` input rows against one weight. Row b
-/// reads `inputs[b*in ..]` and writes `outs[b*out_stride ..][0..out]`.
-/// `out_stride` lets a kernel given a weight-row *slice* still write into
-/// full-width rows. The kernel is opaque to this module. `llama_runner.zig` passes
-/// the build-selected variant in.
-pub const LinearBatchKernel = *const fn (inputs: []const f32, weight: Tensor, outs: []f32, batch: usize, out_stride: usize) void;
-
-/// The threading policy of one process: the pool size and the gates that
-/// decide when an op runs on the pool. `forHost` gives the defaults, and the
-/// command flags replace single fields through `resolve`.
-pub const Policy = struct {
-    /// The pool size, the calling thread included. 1 (or 0) = single-threaded.
-    n_threads: u32 = 1,
-    /// An op with fewer FLOPs than this runs inline on the caller.
-    min_parallel_flops: u64 = default_min_parallel_flops,
-    /// The time a pool worker spins on the epoch word before it sleeps.
-    spin_ns: u64 = default_spin_ns,
-
-    /// The default policy of the host: `defaultThreads` of the physical cores,
-    /// the default floor, and the default spin budget.
-    pub fn forHost(io: std.Io) Policy {
-        const policy: Policy = .{ .n_threads = defaultThreads(hostCores(io).physical) };
-        std.debug.assert(policy.n_threads >= 1);
-        std.debug.assert(policy.n_threads <= max_default_threads);
-        return policy;
-    }
-
-    /// The participant count of one op on a pool of `threads` threads: 1 runs
-    /// the op inline on the caller. An op runs inline when the pool has one
-    /// thread, when it has fewer than two units, or when its FLOPs fall under
-    /// `min_parallel_flops`. Otherwise `min(threads, n_units)` participants
-    /// claim the units. Every fan-out decision comes here, so a new rule, such
-    /// as a cap for each bound of an op or a floor for each op class, goes here.
-    pub fn parts(self: Policy, threads: u32, n_units: usize, flops: u64) u32 {
-        std.debug.assert(threads >= 1);
-        const result: u32 = if (threads <= 1 or n_units < 2 or flops < self.min_parallel_flops)
-            1
-        else
-            @intCast(@min(threads, n_units));
-        std.debug.assert(result >= 1);
-        std.debug.assert(result <= threads);
-        std.debug.assert(result <= @max(n_units, 1));
-        return result;
-    }
-};
+// -- constants --------------------------------------------------------------
 
 /// The default fan-out floor in FLOPs. One floor serves the matmuls, the
 /// attention, and the Gated-DeltaNet heads. A sweep of the floor measured
@@ -113,6 +66,63 @@ const max_host_cpus: u32 = 512;
 /// The longest `thread_siblings_list` text that `hostCores` keeps.
 const sibling_text_max: usize = 48;
 
+// -- types ------------------------------------------------------------------
+
+/// A batched linear kernel: `out = input @ weight.T` with weight in `[in, out]`
+/// (GGUF row-major) layout, over `batch` input rows against one weight. Row b
+/// reads `inputs[b*in ..]` and writes `outs[b*out_stride ..][0..out]`.
+/// `out_stride` lets a kernel given a weight-row *slice* still write into
+/// full-width rows. The kernel is opaque to this module. `llama_runner.zig` passes
+/// the build-selected variant in.
+pub const LinearBatchKernel = *const fn (
+    inputs: []const f32,
+    weight: Tensor,
+    outs: []f32,
+    batch: usize,
+    out_stride: usize,
+) void;
+
+/// The threading policy of one process: the pool size and the gates that
+/// decide when an op runs on the pool. `forHost` gives the defaults, and the
+/// command flags replace single fields through `resolve`.
+pub const Policy = struct {
+    /// The pool size, the calling thread included. 1 (or 0) = single-threaded.
+    n_threads: u32 = 1,
+    /// An op with fewer FLOPs than this runs inline on the caller.
+    min_parallel_flops: u64 = default_min_parallel_flops,
+    /// The time a pool worker spins on the epoch word before it sleeps.
+    spin_ns: u64 = default_spin_ns,
+
+    /// The default policy of the host: `defaultThreads` of the physical cores,
+    /// the default floor, and the default spin budget.
+    pub fn forHost(io: std.Io) Policy {
+        const policy: Policy = .{ .n_threads = defaultThreads(hostCores(io).physical) };
+        std.debug.assert(policy.n_threads >= 1);
+        std.debug.assert(policy.n_threads <= max_default_threads);
+        return policy;
+    }
+
+    /// The participant count of one op on a pool of `threads` threads: 1 runs
+    /// the op inline on the caller. An op runs inline when the pool has one
+    /// thread, when it has fewer than two units, or when its FLOPs fall under
+    /// `min_parallel_flops`. Otherwise `min(threads, n_units)` participants
+    /// claim the units. Every fan-out decision comes here, so a new rule, such
+    /// as a cap for each bound of an op or a floor for each op class, goes here.
+    pub fn parts(self: Policy, threads: u32, n_units: usize, flops: u64) u32 {
+        std.debug.assert(threads >= 1);
+
+        const result: u32 = if (threads <= 1 or n_units < 2 or flops < self.min_parallel_flops)
+            1
+        else
+            @intCast(@min(threads, n_units));
+
+        std.debug.assert(result >= 1);
+        std.debug.assert(result <= threads);
+        std.debug.assert(result <= @max(n_units, 1));
+        return result;
+    }
+};
+
 /// The physical core count of the host, and where it came from.
 pub const HostCores = struct {
     physical: u32,
@@ -142,12 +152,106 @@ pub const Resolved = struct {
     spin_from: Source,
 };
 
-// -- api --------------------------------------------------------------------
-
 pub const PoolError = pool_mod.InitError || error{TooManyThreads};
 
 /// The flag values that `resolve` refuses.
 pub const ResolveError = error{ TooManyThreads, SpinTooLong };
+
+/// The inputs of one matmul as its units read them. Unit `u` covers the
+/// output rows `[u * rows, min(n, (u + 1) * rows))`.
+const MatmulUnits = struct {
+    kernel: LinearBatchKernel,
+    inputs: []const f32,
+    weight: Tensor,
+    outs: []f32,
+    batch: usize,
+    n: usize,
+    rows: usize,
+
+    fn unit(self: *const MatmulUnits, u: u32) void {
+        const start = @as(usize, u) * self.rows;
+        std.debug.assert(start < self.n);
+        const end = @min(self.n, start + self.rows);
+        const slice = sliceWeightRows(self.weight, start, end);
+        self.kernel(self.inputs, slice, self.outs[start..], self.batch, self.n);
+    }
+};
+
+/// The inputs of one GDN step as its units read them. Unit `u` is value
+/// head `u`.
+const GdnUnits = struct {
+    d: gdn.Dims,
+    heads: gdn.Heads,
+
+    fn unit(self: *const GdnUnits, u: u32) void {
+        std.debug.assert(u < self.d.n_v_heads);
+
+        gdn.stepHeads(self.d, self.heads, u, @as(usize, u) + 1);
+    }
+};
+
+/// The inputs of one attention row as its units read them. The pool erases
+/// the type of the context, so the element type and the kernels bind through
+/// this type.
+fn Units(comptime E: type, comptime Kernels: type) type {
+    return struct {
+        q: []const f32,
+        n_heads: usize,
+        head_dim: usize,
+        k_cache: []const E,
+        v_cache: []const E,
+        n_kv_heads: usize,
+        t_len: u32,
+        n_parts: u32,
+        parts_buf: []f32,
+
+        const Self = @This();
+
+        /// Run the units `[u_lo, u_hi)` in ascending order.
+        fn run(self: *const Self, u_lo: usize, u_hi: usize) void {
+            std.debug.assert(u_lo < u_hi);
+            std.debug.assert(u_hi <= self.n_kv_heads * self.n_parts);
+
+            const n_heads32: u32 = @intCast(self.n_heads);
+            const head_dim32: u32 = @intCast(self.head_dim);
+            const group_size = self.n_heads / self.n_kv_heads;
+            const rec_stride = attn_cpu.recordStride(head_dim32);
+            // The part kernel finds head h at `(h - h_lo) * rec_stride` past
+            // the record of head h_lo, where the merge reads it.
+            std.debug.assert(attn_cpu.recordOffset(n_heads32, head_dim32, n_heads32 - 1, 0) ==
+                (self.n_heads - 1) * rec_stride);
+            var u = u_lo;
+            while (u < u_hi) : (u += 1) {
+                const g = u / self.n_parts;
+                const p: u32 = @intCast(u % self.n_parts);
+                const part = attn_cpu.partRange(self.t_len, p);
+                const h_lo = g * group_size;
+                const rec_lo = attn_cpu.recordOffset(n_heads32, head_dim32, @intCast(h_lo), p);
+                Kernels.attentionPartTyped(
+                    E,
+                    self.q,
+                    h_lo,
+                    h_lo + group_size,
+                    self.n_heads,
+                    self.head_dim,
+                    self.k_cache,
+                    self.v_cache,
+                    self.n_kv_heads,
+                    part.t_lo,
+                    part.t_hi,
+                    self.parts_buf[rec_lo..],
+                    rec_stride,
+                );
+            }
+        }
+
+        fn unit(self: *const Self, u: u32) void {
+            self.run(u, @as(usize, u) + 1);
+        }
+    };
+}
+
+// -- api --------------------------------------------------------------------
 
 /// Start `pool` with the threads and the spin budget of `policy`. A policy over
 /// `limits.max_threads` threads returns `error.TooManyThreads`, because the
@@ -155,6 +259,7 @@ pub const ResolveError = error{ TooManyThreads, SpinTooLong };
 pub fn initPool(pool: *Pool, io: std.Io, policy: Policy) PoolError!void {
     const n_threads = @max(policy.n_threads, 1);
     if (n_threads > limits.max_threads) return error.TooManyThreads;
+
     try pool.init(io, n_threads, policy.spin_ns);
     std.debug.assert(pool.threads() == n_threads);
 }
@@ -162,6 +267,7 @@ pub fn initPool(pool: *Pool, io: std.Io, policy: Policy) PoolError!void {
 /// The default thread count for `physical` cores.
 pub fn defaultThreads(physical: u32) u32 {
     std.debug.assert(physical >= 1);
+
     const threads = @min(physical, max_default_threads);
     std.debug.assert(threads >= 1);
     return threads;
@@ -174,7 +280,13 @@ pub fn defaultThreads(physical: u32) u32 {
 /// `error.SpinTooLong`.
 pub fn resolve(host: Policy, flags: Flags, runs_cpu_ops: bool) ResolveError!Resolved {
     std.debug.assert(host.n_threads >= 1);
-    var out: Resolved = .{ .policy = host, .threads_from = .auto, .flops_from = .auto, .spin_from = .auto };
+
+    var out: Resolved = .{
+        .policy = host,
+        .threads_from = .auto,
+        .flops_from = .auto,
+        .spin_from = .auto,
+    };
     if (flags.threads) |t| {
         if (t > limits.max_threads) return error.TooManyThreads;
         if (t != 0) {
@@ -182,29 +294,41 @@ pub fn resolve(host: Policy, flags: Flags, runs_cpu_ops: bool) ResolveError!Reso
             out.threads_from = .flag;
         }
     }
+
     if (flags.min_parallel_flops) |f| {
         out.policy.min_parallel_flops = f;
         out.flops_from = .flag;
     }
+
     if (flags.spin_us) |us| {
         if (us > max_spin_us) return error.SpinTooLong;
         out.policy.spin_ns = us * std.time.ns_per_us;
         out.spin_from = .flag;
     }
+
     if (!runs_cpu_ops) {
         out.policy.n_threads = 1;
         out.threads_from = .placement;
     }
+
     std.debug.assert(out.policy.n_threads >= 1);
     std.debug.assert(out.policy.n_threads <= limits.max_threads);
-    if (flags.spin_us != null) std.debug.assert(out.policy.spin_ns <= max_spin_us * std.time.ns_per_us);
+    if (flags.spin_us != null) {
+        std.debug.assert(out.policy.spin_ns <= max_spin_us * std.time.ns_per_us);
+    }
+
     return out;
 }
 
 /// Log the resolved policy of a command, with the source of each field.
 pub fn logResolved(r: Resolved) void {
     log.info("threads {d} ({t}), floor {d} FLOPs ({t}), spin {d} ns ({t})", .{
-        r.policy.n_threads, r.threads_from, r.policy.min_parallel_flops, r.flops_from, r.policy.spin_ns, r.spin_from,
+        r.policy.n_threads,
+        r.threads_from,
+        r.policy.min_parallel_flops,
+        r.flops_from,
+        r.policy.spin_ns,
+        r.spin_from,
     });
 }
 
@@ -215,8 +339,10 @@ pub fn logResolved(r: Resolved) void {
 pub fn hostCores(io: std.Io) HostCores {
     if (readSysfsCores(io)) |physical| {
         std.debug.assert(physical >= 1);
+
         return .{ .physical = physical, .from_sysfs = true };
     }
+
     const logical: u32 = @intCast(@max(1, @min(std.Thread.getCpuCount() catch 1, max_host_cpus)));
     const physical: u32 = @max(1, logical / 2);
     std.debug.assert(1 <= physical);
@@ -230,14 +356,19 @@ pub fn hostCores(io: std.Io) HostCores {
 pub fn countCores(lists: []const []const u8) u32 {
     std.debug.assert(lists.len >= 1);
     std.debug.assert(lists.len <= max_host_cpus);
+
     var distinct: u32 = 0;
     for (lists, 0..) |list, i| {
         const text = std.mem.trim(u8, list, " \t\r\n");
         const seen = for (lists[0..i]) |earlier| {
             if (std.mem.eql(u8, std.mem.trim(u8, earlier, " \t\r\n"), text)) break true;
         } else false;
-        if (!seen) distinct += 1;
+
+        if (!seen) {
+            distinct += 1;
+        }
     }
+
     std.debug.assert(distinct >= 1);
     std.debug.assert(distinct <= lists.len);
     return distinct;
@@ -280,11 +411,18 @@ pub fn linearBatch(
 
     const parts = policy.parts(threads, n_units, flops);
     if (parts == 1) {
-        log.debug("linearBatch serial: flops {d}, floor {d}, n {d}, batch {d}", .{ flops, policy.min_parallel_flops, n, batch });
+        log.debug(
+            "linearBatch serial: flops {d}, floor {d}, n {d}, batch {d}",
+            .{ flops, policy.min_parallel_flops, n, batch },
+        );
         kernel(inputs, weight, outs, batch, n);
         return;
     }
-    log.debug("linearBatch fanout: {d} parts, {d} units of {d} rows over n {d}, batch {d}, flops {d}", .{ parts, n_units, rows, n, batch, flops });
+
+    log.debug(
+        "linearBatch fanout: {d} parts, {d} units of {d} rows over n {d}, batch {d}, flops {d}",
+        .{ parts, n_units, rows, n, batch, flops },
+    );
     const ctx: MatmulUnits = .{
         .kernel = kernel,
         .inputs = inputs,
@@ -304,6 +442,7 @@ pub fn linearBatch(
 pub fn matmulUnitRows(n: usize, threads: u32) usize {
     std.debug.assert(n > 0);
     std.debug.assert(threads >= 1);
+
     const per_unit = std.math.divCeil(usize, n, 4 * @as(usize, threads)) catch unreachable;
     const rows = std.mem.alignForward(usize, per_unit, 4);
     std.debug.assert(rows >= 4);
@@ -381,12 +520,19 @@ pub fn attentionTyped(
 
     const parts = policy.parts(threads, n_units, flops);
     if (parts == 1) {
-        log.debug("attention serial: flops {d}, floor {d}, t_len {d}, units {d}", .{ flops, policy.min_parallel_flops, t_len, n_units });
+        log.debug(
+            "attention serial: flops {d}, floor {d}, t_len {d}, units {d}",
+            .{ flops, policy.min_parallel_flops, t_len, n_units },
+        );
         units.run(0, n_units);
     } else {
-        log.debug("attention fanout: {d} parts over {d} units, t_len {d}", .{ parts, n_units, t_len });
+        log.debug(
+            "attention fanout: {d} parts over {d} units, t_len {d}",
+            .{ parts, n_units, t_len },
+        );
         pool.run(Units(E, Kernels), &units, Units(E, Kernels).unit, @intCast(n_units), parts);
     }
+
     Kernels.attentionMerge(parts_buf, units.n_parts, n_heads, head_dim, out);
 }
 
@@ -410,6 +556,7 @@ pub fn gdnStep(
     std.debug.assert(heads.qkv.ptr == qkv.ptr);
     std.debug.assert(heads.qkv.len == qkv.len);
     std.debug.assert(d.n_v_heads >= 1);
+
     const threads = pool.threads();
     std.debug.assert(@max(policy.n_threads, 1) == threads);
     // 7 FLOP per state element: decay 1, key read 2, rank-1 write 2, query read 2.
@@ -419,95 +566,21 @@ pub fn gdnStep(
     const n_units: u32 = @intCast(d.n_v_heads);
     const parts = policy.parts(threads, n_units, flops);
     if (parts == 1) {
-        log.debug("gdn serial: flops {d}, floor {d}, heads {d}", .{ flops, policy.min_parallel_flops, d.n_v_heads });
+        log.debug(
+            "gdn serial: flops {d}, floor {d}, heads {d}",
+            .{ flops, policy.min_parallel_flops, d.n_v_heads },
+        );
         gdn.stepHeads(d, heads, 0, d.n_v_heads);
     } else {
         log.debug("gdn fanout: {d} parts over {d} heads, flops {d}", .{ parts, n_units, flops });
         const ctx: GdnUnits = .{ .d = d, .heads = heads };
         pool.run(GdnUnits, &ctx, GdnUnits.unit, n_units, parts);
     }
+
     gdn.assertFinite(d, heads.o_out);
 }
 
 // -- helpers ----------------------------------------------------------------
-
-/// The inputs of one matmul as its units read them. Unit `u` covers the
-/// output rows `[u * rows, min(n, (u + 1) * rows))`.
-const MatmulUnits = struct {
-    kernel: LinearBatchKernel,
-    inputs: []const f32,
-    weight: Tensor,
-    outs: []f32,
-    batch: usize,
-    n: usize,
-    rows: usize,
-
-    fn unit(self: *const MatmulUnits, u: u32) void {
-        const start = @as(usize, u) * self.rows;
-        std.debug.assert(start < self.n);
-        const end = @min(self.n, start + self.rows);
-        const slice = sliceWeightRows(self.weight, start, end);
-        self.kernel(self.inputs, slice, self.outs[start..], self.batch, self.n);
-    }
-};
-
-/// The inputs of one GDN step as its units read them. Unit `u` is value
-/// head `u`.
-const GdnUnits = struct {
-    d: gdn.Dims,
-    heads: gdn.Heads,
-
-    fn unit(self: *const GdnUnits, u: u32) void {
-        std.debug.assert(u < self.d.n_v_heads);
-        gdn.stepHeads(self.d, self.heads, u, @as(usize, u) + 1);
-    }
-};
-
-/// The inputs of one attention row as its units read them. The pool erases
-/// the type of the context, so the element type and the kernels bind through
-/// this type.
-fn Units(comptime E: type, comptime Kernels: type) type {
-    return struct {
-        q: []const f32,
-        n_heads: usize,
-        head_dim: usize,
-        k_cache: []const E,
-        v_cache: []const E,
-        n_kv_heads: usize,
-        t_len: u32,
-        n_parts: u32,
-        parts_buf: []f32,
-
-        const Self = @This();
-
-        /// Run the units `[u_lo, u_hi)` in ascending order.
-        fn run(self: *const Self, u_lo: usize, u_hi: usize) void {
-            std.debug.assert(u_lo < u_hi);
-            std.debug.assert(u_hi <= self.n_kv_heads * self.n_parts);
-            const n_heads32: u32 = @intCast(self.n_heads);
-            const head_dim32: u32 = @intCast(self.head_dim);
-            const group_size = self.n_heads / self.n_kv_heads;
-            const rec_stride = attn_cpu.recordStride(head_dim32);
-            // The part kernel finds head h at `(h - h_lo) * rec_stride` past
-            // the record of head h_lo, where the merge reads it.
-            std.debug.assert(attn_cpu.recordOffset(n_heads32, head_dim32, n_heads32 - 1, 0) ==
-                (self.n_heads - 1) * rec_stride);
-            var u = u_lo;
-            while (u < u_hi) : (u += 1) {
-                const g = u / self.n_parts;
-                const p: u32 = @intCast(u % self.n_parts);
-                const part = attn_cpu.partRange(self.t_len, p);
-                const h_lo = g * group_size;
-                const rec_lo = attn_cpu.recordOffset(n_heads32, head_dim32, @intCast(h_lo), p);
-                Kernels.attentionPartTyped(E, self.q, h_lo, h_lo + group_size, self.n_heads, self.head_dim, self.k_cache, self.v_cache, self.n_kv_heads, part.t_lo, part.t_hi, self.parts_buf[rec_lo..], rec_stride);
-            }
-        }
-
-        fn unit(self: *const Self, u: u32) void {
-            self.run(u, @as(usize, u) + 1);
-        }
-    };
-}
 
 /// Read the sibling list of each logical CPU from sysfs and count the
 /// physical cores. The read stops at the first CPU without a topology file.
@@ -515,27 +588,42 @@ fn Units(comptime E: type, comptime Kernels: type) type {
 /// the CPU count passes its cap. A cap that cuts the read logs the cause.
 fn readSysfsCores(io: std.Io) ?u32 {
     if (builtin.os.tag != .linux) return null;
+
     var texts: [max_host_cpus][sibling_text_max]u8 = undefined;
     var lists: [max_host_cpus][]const u8 = undefined;
     var n: u32 = 0;
     const cwd = std.Io.Dir.cwd();
     while (n < max_host_cpus) : (n += 1) {
         var path_buf: [96]u8 = undefined;
-        const path = std.fmt.bufPrint(&path_buf, "/sys/devices/system/cpu/cpu{d}/topology/thread_siblings_list", .{n}) catch unreachable;
+        const path = std.fmt.bufPrint(
+            &path_buf,
+            "/sys/devices/system/cpu/cpu{d}/topology/thread_siblings_list",
+            .{n},
+        ) catch unreachable;
         const text = cwd.readFile(io, path, &texts[n]) catch |err| switch (err) {
             error.FileNotFound => break,
             else => return null,
         };
         if (text.len == sibling_text_max) {
-            log.info("cpu{d} sibling list is longer than {d} bytes. The thread default uses the logical estimate", .{ n, sibling_text_max });
+            log.info(
+                "cpu{d} sibling list is longer than {d} bytes. The thread default uses the " ++
+                    "logical estimate",
+                .{ n, sibling_text_max },
+            );
             return null;
         }
+
         lists[n] = text;
     } else {
-        log.info("the host has more than {d} CPUs. The thread default uses the logical estimate", .{max_host_cpus});
+        log.info(
+            "the host has more than {d} CPUs. The thread default uses the logical estimate",
+            .{max_host_cpus},
+        );
         return null;
     }
+
     if (n == 0) return null;
+
     return countCores(lists[0..n]);
 }
 
@@ -549,6 +637,7 @@ fn readSysfsCores(io: std.Io) ?u32 {
 /// it works uniformly for f32, Q8_0, and any dtype added later.
 fn sliceWeightRows(weight: Tensor, start: usize, end: usize) Tensor {
     std.debug.assert(weight.n_dims == 2);
+
     const out_features: usize = @intCast(weight.shape[1]);
     std.debug.assert(out_features > 0);
     std.debug.assert(weight.data.len % out_features == 0);
@@ -628,10 +717,22 @@ test "resolve: zero keeps auto, a flag replaces, the bound refuses, fused gets 1
     try std.testing.expectEqual(Source.flag, spun.spin_from);
     const no_spin = try resolve(host, .{ .spin_us = 0 }, true);
     try std.testing.expectEqual(@as(u64, 0), no_spin.policy.spin_ns);
-    try std.testing.expectEqual(max_spin_us * std.time.ns_per_us, (try resolve(host, .{ .spin_us = max_spin_us }, true)).policy.spin_ns);
-    try std.testing.expectError(error.SpinTooLong, resolve(host, .{ .spin_us = max_spin_us + 1 }, true));
-    try std.testing.expectEqual(limits.max_threads, (try resolve(host, .{ .threads = limits.max_threads }, true)).policy.n_threads);
-    try std.testing.expectError(error.TooManyThreads, resolve(host, .{ .threads = limits.max_threads + 1 }, true));
+    try std.testing.expectEqual(
+        max_spin_us * std.time.ns_per_us,
+        (try resolve(host, .{ .spin_us = max_spin_us }, true)).policy.spin_ns,
+    );
+    try std.testing.expectError(
+        error.SpinTooLong,
+        resolve(host, .{ .spin_us = max_spin_us + 1 }, true),
+    );
+    try std.testing.expectEqual(
+        limits.max_threads,
+        (try resolve(host, .{ .threads = limits.max_threads }, true)).policy.n_threads,
+    );
+    try std.testing.expectError(
+        error.TooManyThreads,
+        resolve(host, .{ .threads = limits.max_threads + 1 }, true),
+    );
     const fused = try resolve(host, .{ .threads = 6 }, false);
     try std.testing.expectEqual(@as(u32, 1), fused.policy.n_threads);
     try std.testing.expectEqual(Source.placement, fused.threads_from);
@@ -661,13 +762,23 @@ const Q80Fixture = struct {
     w_data: []align(32) u8,
     weight: Tensor,
 
-    fn init(gpa: std.mem.Allocator, in_features: usize, out_features: usize, batch: usize) !Q80Fixture {
+    fn init(
+        gpa: std.mem.Allocator,
+        in_features: usize,
+        out_features: usize,
+        batch: usize,
+    ) !Q80Fixture {
         std.debug.assert(in_features % 32 == 0);
+
         const row_bytes = (in_features / 32) * 34;
         const inputs = try gpa.alloc(f32, batch * in_features);
         errdefer gpa.free(inputs);
+
         const w_data = try gpa.alignedAlloc(u8, .@"32", out_features * row_bytes);
-        for (inputs, 0..) |*x, i| x.* = @sin(@as(f32, @floatFromInt(i)) * 0.02);
+        for (inputs, 0..) |*x, i| {
+            x.* = @sin(@as(f32, @floatFromInt(i)) * 0.02);
+        }
+
         for (0..out_features) |row| {
             const off = row * row_bytes;
             var blk: usize = 0;
@@ -681,6 +792,7 @@ const Q80Fixture = struct {
                 }
             }
         }
+
         return .{
             .inputs = inputs,
             .w_data = w_data,
@@ -707,8 +819,10 @@ fn expectFanOutMatchesSerial(out_features: usize, batch: usize, thread_counts: [
     const gpa = std.testing.allocator;
     const fx = try Q80Fixture.init(gpa, 64, out_features, batch);
     defer fx.deinit(gpa);
+
     const outs_serial = try gpa.alloc(f32, batch * out_features);
     defer gpa.free(outs_serial);
+
     const outs_fanout = try gpa.alloc(f32, batch * out_features);
     defer gpa.free(outs_fanout);
 
@@ -717,11 +831,23 @@ fn expectFanOutMatchesSerial(out_features: usize, batch: usize, thread_counts: [
         var pool: Pool = undefined;
         try pool.init(std.testing.io, n_threads, 50_000);
         defer pool.deinit();
+
         const policy: Policy = .{ .n_threads = n_threads, .min_parallel_flops = 0 };
         // Every pool above one thread splits the rows into two units or more.
-        if (n_threads > 1) try std.testing.expect(out_features > matmulUnitRows(out_features, n_threads));
+        if (n_threads > 1) {
+            try std.testing.expect(out_features > matmulUnitRows(out_features, n_threads));
+        }
+
         @memset(outs_fanout, std.math.nan(f32));
-        linearBatch(&pool, policy, naive.linearF32Q80Batch, fx.inputs, fx.weight, outs_fanout, batch);
+        linearBatch(
+            &pool,
+            policy,
+            naive.linearF32Q80Batch,
+            fx.inputs,
+            fx.weight,
+            outs_fanout,
+            batch,
+        );
         for (outs_serial, outs_fanout) |s, f| {
             try std.testing.expectEqual(@as(u32, @bitCast(s)), @as(u32, @bitCast(f)));
         }
@@ -762,7 +888,9 @@ test "attention: forced fan-out at 1, 2, 3, 4, and 16 threads gives the bits of 
     const r = prng.random();
     inline for (.{ f32, f16 }) |E| {
         for (shapes) |s| {
-            for (depths) |t_len| try attention_ref.expectFanOutMatchesRow(.{naive}, E, r, s, t_len);
+            for (depths) |t_len| {
+                try attention_ref.expectFanOutMatchesRow(.{naive}, E, r, s, t_len);
+            }
         }
     }
 }
@@ -783,9 +911,16 @@ test "gdnStep: forced fan-out at 1, 2, 3, 4, and 16 threads gives the bits of gd
         const cd = d.convDim();
         const vd = d.valueDim();
         const nv = d.n_v_heads;
-        const inputs = try gpa.alloc(f32, tokens * cd + vd + 4 * nv + d.conv_kernel * cd + d.head_dim);
+        const inputs = try gpa.alloc(
+            f32,
+            tokens * cd + vd + 4 * nv + d.conv_kernel * cd + d.head_dim,
+        );
         defer gpa.free(inputs);
-        for (inputs) |*x| x.* = r.float(f32) * 2.0 - 1.0;
+
+        for (inputs) |*x| {
+            x.* = r.float(f32) * 2.0 - 1.0;
+        }
+
         const qkv_in = inputs[0 .. tokens * cd];
         var at: usize = tokens * cd;
         const z = inputs[at..][0..vd];
@@ -798,36 +933,67 @@ test "gdnStep: forced fan-out at 1, 2, 3, 4, and 16 threads gives the bits of gd
         const conv_w = inputs[at..][0 .. d.conv_kernel * cd];
         at += d.conv_kernel * cd;
         const ssm_norm = inputs[at..][0..d.head_dim];
-        for (ssm_a) |*x| x.* = -@abs(x.*) - 0.1;
+        for (ssm_a) |*x| {
+            x.* = -@abs(x.*) - 0.1;
+        }
 
         const state0 = try gpa.alloc(f32, d.stateLen());
         defer gpa.free(state0);
-        for (state0) |*x| x.* = (r.float(f32) - 0.5) * 0.2;
+
+        for (state0) |*x| {
+            x.* = (r.float(f32) - 0.5) * 0.2;
+        }
+
         const conv0 = try gpa.alloc(f32, d.convStateLen());
         defer gpa.free(conv0);
-        for (conv0) |*x| x.* = r.float(f32) - 0.5;
+
+        for (conv0) |*x| {
+            x.* = r.float(f32) - 0.5;
+        }
 
         // The serial reference: `gdn.step` over the tokens.
         const state_ref = try gpa.dupe(f32, state0);
         defer gpa.free(state_ref);
+
         const conv_ref = try gpa.dupe(f32, conv0);
         defer gpa.free(conv_ref);
+
         const qkv_ref = try gpa.dupe(f32, qkv_in);
         defer gpa.free(qkv_ref);
+
         const o_ref = try gpa.alloc(f32, tokens * vd);
         defer gpa.free(o_ref);
+
         for (0..tokens) |t| {
-            gdn.step(d, qkv_ref[t * cd ..][0..cd], z, a, b, conv_w, ssm_a, dt_bias, ssm_norm, 1e-6, state_ref, conv_ref, o_ref[t * vd ..][0..vd]);
+            gdn.step(
+                d,
+                qkv_ref[t * cd ..][0..cd],
+                z,
+                a,
+                b,
+                conv_w,
+                ssm_a,
+                dt_bias,
+                ssm_norm,
+                1e-6,
+                state_ref,
+                conv_ref,
+                o_ref[t * vd ..][0..vd],
+            );
         }
 
         const state = try gpa.alloc(f32, d.stateLen());
         defer gpa.free(state);
+
         const conv = try gpa.alloc(f32, d.convStateLen());
         defer gpa.free(conv);
+
         const qkv = try gpa.alloc(f32, tokens * cd);
         defer gpa.free(qkv);
+
         const o = try gpa.alloc(f32, tokens * vd);
         defer gpa.free(o);
+
         for (thread_counts) |n_threads| {
             @memcpy(state, state0);
             @memcpy(conv, conv0);
@@ -836,6 +1002,7 @@ test "gdnStep: forced fan-out at 1, 2, 3, 4, and 16 threads gives the bits of gd
             var pool: Pool = undefined;
             try pool.init(std.testing.io, n_threads, 50_000);
             defer pool.deinit();
+
             const policy: Policy = .{ .n_threads = n_threads, .min_parallel_flops = 0 };
             for (0..tokens) |t| {
                 const qkv_row = qkv[t * cd ..][0..cd];
@@ -852,10 +1019,27 @@ test "gdnStep: forced fan-out at 1, 2, 3, 4, and 16 threads gives the bits of gd
                     .o_out = o[t * vd ..][0..vd],
                 });
             }
-            try std.testing.expectEqualSlices(u8, std.mem.sliceAsBytes(o_ref), std.mem.sliceAsBytes(o));
-            try std.testing.expectEqualSlices(u8, std.mem.sliceAsBytes(state_ref), std.mem.sliceAsBytes(state));
-            try std.testing.expectEqualSlices(u8, std.mem.sliceAsBytes(conv_ref), std.mem.sliceAsBytes(conv));
-            try std.testing.expectEqualSlices(u8, std.mem.sliceAsBytes(qkv_ref), std.mem.sliceAsBytes(qkv));
+
+            try std.testing.expectEqualSlices(
+                u8,
+                std.mem.sliceAsBytes(o_ref),
+                std.mem.sliceAsBytes(o),
+            );
+            try std.testing.expectEqualSlices(
+                u8,
+                std.mem.sliceAsBytes(state_ref),
+                std.mem.sliceAsBytes(state),
+            );
+            try std.testing.expectEqualSlices(
+                u8,
+                std.mem.sliceAsBytes(conv_ref),
+                std.mem.sliceAsBytes(conv),
+            );
+            try std.testing.expectEqualSlices(
+                u8,
+                std.mem.sliceAsBytes(qkv_ref),
+                std.mem.sliceAsBytes(qkv),
+            );
         }
     }
 }

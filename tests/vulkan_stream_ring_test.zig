@@ -90,6 +90,7 @@ test "stream_ring: the anchor trace, uploaded and read back" {
 
     var scratch: z.ops_vulkan.HostBuffer = .{ .ctx = &ctx };
     defer scratch.deinit();
+
     try scratch.ensure(segment_capacity);
 
     var ring = try StreamRing.init(&ctx, segment_capacity);
@@ -107,7 +108,10 @@ test "stream_ring: the anchor trace, uploaded and read back" {
                 const acq = ring.acquire() orelse return error.StreamRingRefusedAcquire;
                 try std.testing.expectEqual(step.slot, acq.slot);
                 try std.testing.expectEqual(@as(usize, @intCast(segment_capacity)), acq.bytes.len);
-                for (acq.bytes, 0..) |*b, j| b.* = patternByte(next_upload, j);
+                for (acq.bytes, 0..) |*b, j| {
+                    b.* = patternByte(next_upload, j);
+                }
+
                 slot_upload[acq.slot] = next_upload;
                 next_upload += 1;
             },
@@ -154,7 +158,10 @@ test "stream_ring: deinit drains from any state" {
     // and leave slot 1 alone.
     var mixed = try StreamRing.init(&ctx, segment_capacity);
     const first = mixed.acquire() orelse return error.StreamRingRefusedAcquire;
-    for (first.bytes, 0..) |*b, j| b.* = patternByte(0, j);
+    for (first.bytes, 0..) |*b, j| {
+        b.* = patternByte(0, j);
+    }
+
     try mixed.submit(first.slot, segment_capacity);
     const second = mixed.acquire() orelse return error.StreamRingRefusedAcquire;
     try std.testing.expectEqual(@as(StreamRing.Slot, 1), second.slot);
@@ -169,6 +176,7 @@ test "stream_ring: overlap does not corrupt" {
 
     var scratch: z.ops_vulkan.HostBuffer = .{ .ctx = &ctx };
     defer scratch.deinit();
+
     try scratch.ensure(segment_capacity);
 
     var ring = try StreamRing.init(&ctx, segment_capacity);
@@ -178,11 +186,17 @@ test "stream_ring: overlap does not corrupt" {
     // the first upload is still outstanding. Only per-slot offsets keep the two
     // apart.
     const first = ring.acquire() orelse return error.StreamRingRefusedAcquire;
-    for (first.bytes, 0..) |*b, j| b.* = patternByte(0, j);
+    for (first.bytes, 0..) |*b, j| {
+        b.* = patternByte(0, j);
+    }
+
     try ring.submit(first.slot, segment_capacity);
 
     const second = ring.acquire() orelse return error.StreamRingRefusedAcquire;
-    for (second.bytes, 0..) |*b, j| b.* = patternByte(1, j);
+    for (second.bytes, 0..) |*b, j| {
+        b.* = patternByte(1, j);
+    }
+
     try ring.submit(second.slot, 2048);
 
     try ring.wait(first.slot);

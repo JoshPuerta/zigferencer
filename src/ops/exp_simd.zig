@@ -9,10 +9,9 @@ const prop = @import("../core/prop.zig");
 
 const assert = std.debug.assert;
 
-// -- types ------------------------------------------------------------------
+// -- constants --------------------------------------------------------------
 
 pub const lanes = 8;
-pub const Vec = @Vector(lanes, f32);
 
 /// The smallest f32 whose exact exponential is a normal f32. Its exponential
 /// is `2^-126` times 1.0000045, and `expNeg` gives 0 below it.
@@ -24,6 +23,10 @@ pub const exp_cut: f32 = @bitCast(@as(u32, 0xc2aeac4f));
 /// of those 1.1e9 inputs err by more than 1 ulp. The bound rounds that
 /// maximum up.
 pub const exp_ulp_tol: f64 = 1.02;
+
+// -- types ------------------------------------------------------------------
+
+pub const Vec = @Vector(lanes, f32);
 
 // -- api --------------------------------------------------------------------
 
@@ -62,7 +65,14 @@ pub inline fn expNeg(x: Vec) Vec {
     const ln2_hi: Vec = @splat(0.693359375);
     const ln2_lo: Vec = @splat(-2.12194440e-4);
     // The coefficients of `P`, the highest degree first.
-    const coeffs = [_]f32{ 1.9875691500e-4, 1.3981999507e-3, 8.3334519073e-3, 4.1665795894e-2, 1.6666665459e-1, 5.0000001201e-1 };
+    const coeffs = [_]f32{
+        1.9875691500e-4,
+        1.3981999507e-3,
+        8.3334519073e-3,
+        4.1665795894e-2,
+        1.6666665459e-1,
+        5.0000001201e-1,
+    };
     const cut: Vec = @splat(exp_cut);
     if (std.debug.runtime_safety) assert(@reduce(.And, x <= @as(Vec, @splat(0))));
 
@@ -70,7 +80,10 @@ pub inline fn expNeg(x: Vec) Vec {
     const n = @floor(@mulAdd(Vec, xc, log2e, @splat(0.5)));
     const r = @mulAdd(Vec, -n, ln2_lo, @mulAdd(Vec, -n, ln2_hi, xc));
     var poly: Vec = @splat(coeffs[0]);
-    inline for (coeffs[1..]) |c| poly = @mulAdd(Vec, poly, r, @splat(c));
+    inline for (coeffs[1..]) |c| {
+        poly = @mulAdd(Vec, poly, r, @splat(c));
+    }
+
     const exp_r = @mulAdd(Vec, poly, r * r, r) + @as(Vec, @splat(1));
 
     const n_int: Int = @intFromFloat(n);
@@ -78,6 +91,7 @@ pub inline fn expNeg(x: Vec) Vec {
         assert(@reduce(.And, n_int >= @as(Int, @splat(-126))));
         assert(@reduce(.And, n_int <= @as(Int, @splat(0))));
     }
+
     const field: @Vector(lanes, u32) = @intCast(n_int + @as(Int, @splat(127)));
     const two_n: Vec = @bitCast(field << @splat(23));
     const y = @select(f32, x < cut, @as(Vec, @splat(0)), exp_r * two_n);
@@ -87,6 +101,7 @@ pub inline fn expNeg(x: Vec) Vec {
         assert(@reduce(.And, y >= @as(Vec, @splat(0))));
         assert(@reduce(.And, y <= @as(Vec, @splat(1))));
     }
+
     return y;
 }
 
@@ -105,7 +120,10 @@ pub fn expUlpErr(x: f32, got: f32) f64 {
 fn expWorstUlp(x: [lanes]f32) f64 {
     const y: [lanes]f32 = expNeg(x);
     var worst: f64 = 0;
-    for (x, y) |xj, yj| worst = @max(worst, expUlpErr(xj, yj));
+    for (x, y) |xj, yj| {
+        worst = @max(worst, expUlpErr(xj, yj));
+    }
+
     return worst;
 }
 
@@ -117,9 +135,15 @@ test "vector exp: expNeg stays inside the ulp bound from the cut to 0" {
     var i: usize = 0;
     while (i < n_grid) : (i += lanes) {
         var x: [lanes]f32 = undefined;
-        for (&x, i..) |*xj, k| xj.* = @floatCast(@as(f64, exp_cut) * @as(f64, @floatFromInt(k)) / @as(f64, n_grid - 1));
+        for (&x, i..) |*xj, k| {
+            xj.* = @floatCast(
+                @as(f64, exp_cut) * @as(f64, @floatFromInt(k)) / @as(f64, n_grid - 1),
+            );
+        }
+
         worst = @max(worst, expWorstUlp(x));
     }
+
     // Every 127th f32 in [-1, 0] by bit pattern, from -0 through the
     // subnormals to -1. The odd stride varies the low significand bits.
     const neg_zero: u32 = 0x8000_0000;
@@ -131,8 +155,10 @@ test "vector exp: expNeg stays inside the ulp bound from the cut to 0" {
             xj.* = @bitCast(@min(b, neg_one));
             b += 127;
         }
+
         worst = @max(worst, expWorstUlp(x));
     }
+
     try std.testing.expect(worst <= exp_ulp_tol);
 }
 
@@ -153,22 +179,40 @@ test "vector exp: 0 and -0 give exactly 1, the cut stays normal, and every input
         try std.testing.expect(yj >= std.math.floatMin(f32));
         try std.testing.expect(expUlpErr(xj, yj) <= exp_ulp_tol);
     }
-    for (y[4..]) |yj| try std.testing.expectEqual(@as(f32, 0), yj);
+
+    for (y[4..]) |yj| {
+        try std.testing.expectEqual(@as(f32, 0), yj);
+    }
 }
 
 fn checkLaneBits(_: void, c: prop.Trial) anyerror!void {
     var prng = std.Random.DefaultPrng.init(c.seed);
     const r = prng.random();
-    const edges = [lanes]f32{ 0, -0.0, exp_cut, -1.0e-40, -0.5 * @log(2.0), -88, -1000, -std.math.inf(f32) };
+    const edges = [lanes]f32{
+        0,
+        -0.0,
+        exp_cut,
+        -1.0e-40,
+        -0.5 * @log(2.0),
+        -88,
+        -1000,
+        -std.math.inf(f32),
+    };
     const round = c.index;
     var src = edges;
     // Inputs from -100 to 0, so some lanes fall under the cut.
     if (round > 0) {
-        for (&src) |*s| s.* = -100.0 * r.float(f32);
+        for (&src) |*s| {
+            s.* = -100.0 * r.float(f32);
+        }
     }
+
     for (0..lanes) |rot| {
         var x: [lanes]f32 = undefined;
-        for (&x, 0..) |*xj, j| xj.* = src[(j + rot) % lanes];
+        for (&x, 0..) |*xj, j| {
+            xj.* = src[(j + rot) % lanes];
+        }
+
         const y: [lanes]f32 = expNeg(x);
         for (x, y) |xj, yj| {
             const alone: f32 = expNeg(@splat(xj))[0];
@@ -178,5 +222,11 @@ fn checkLaneBits(_: void, c: prop.Trial) anyerror!void {
 }
 
 test "vector exp: a lane gives the bits of a splat of its input at every lane position" {
-    try prop.forAll(.{ .site = 0xA770_00AB, .cases = 64, .max_size = 63 }, {}, prop.Trial, prop.genTrial(void), checkLaneBits);
+    try prop.forAll(
+        .{ .site = 0xA770_00AB, .cases = 64, .max_size = 63 },
+        {},
+        prop.Trial,
+        prop.genTrial(void),
+        checkLaneBits,
+    );
 }

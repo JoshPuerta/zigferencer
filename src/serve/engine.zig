@@ -42,16 +42,10 @@ const OutEvent = event.OutEvent;
 
 const log = std.log.scoped(.serve);
 
-// -- types ------------------------------------------------------------------
+// -- constants --------------------------------------------------------------
 
 pub const request_queue_capacity: usize = 64;
 pub const out_queue_capacity: usize = 256;
-
-/// Where to bind. Generic across adapters. Both speak TCP or a unix socket.
-pub const Endpoint = union(enum) {
-    tcp: struct { host: []const u8 = "127.0.0.1", port: u16 = 0 },
-    unix: []const u8,
-};
 
 const conn_free: u8 = 0;
 const conn_live: u8 = 1;
@@ -66,7 +60,13 @@ const fin_live: u8 = 0;
 const fin_task: u8 = 1;
 const fin_teardown: u8 = 2;
 
-// -- api --------------------------------------------------------------------
+// -- types ------------------------------------------------------------------
+
+/// Where to bind. Generic across adapters. Both speak TCP or a unix socket.
+pub const Endpoint = union(enum) {
+    tcp: struct { host: []const u8 = "127.0.0.1", port: u16 = 0 },
+    unix: []const u8,
+};
 
 /// `Engine` and `CodecT` are the scheduler's boundaries (see scheduler.zig).
 /// `Adapter` is the transport. A value must not be moved once `run` has started
@@ -118,6 +118,7 @@ pub fn ServeEngine(comptime Engine: type, comptime CodecT: type, comptime Adapte
         ) !Self {
             std.debug.assert(sched_cfg.max_connections >= 1);
             std.debug.assert(sched_cfg.max_connections <= limits.max_connections);
+
             const listener = switch (endpoint) {
                 .tcp => |t| blk: {
                     const addr = try net.IpAddress.parse(t.host, t.port);
@@ -128,13 +129,17 @@ pub fn ServeEngine(comptime Engine: type, comptime CodecT: type, comptime Adapte
                     break :blk try ua.listen(io, .{});
                 },
             };
+
             log.debug("listen: max {d} connections, max {d} sessions, max_seq {d}", .{
                 sched_cfg.max_connections,
                 sched_cfg.max_sessions,
                 sched_cfg.max_seq,
             });
             const conns = try arena.alloc(Conn, sched_cfg.max_connections);
-            for (conns) |*c| c.* = .{};
+            for (conns) |*c| {
+                c.* = .{};
+            }
+
             const request_buf = try arena.alloc(Request, request_queue_capacity);
             var self: Self = .{
                 .gpa = gpa,
@@ -169,18 +174,27 @@ pub fn ServeEngine(comptime Engine: type, comptime CodecT: type, comptime Adapte
                 const n = self.request_q.get(self.io, &batch, 0) catch break;
                 for (batch[0..n], 0..) |req, i| {
                     if (self.dispatch(req, &sink) == .shutdown) {
-                        for (batch[i + 1 .. n]) |rest| freeRequestText(self.gpa, rest);
+                        for (batch[i + 1 .. n]) |rest| {
+                            freeRequestText(self.gpa, rest);
+                        }
+
                         break :main;
                     }
                 }
+
                 const tick = self.sched.tick(&sink);
-                if (n > 0) log.debug("tick: {d} requests, {s}", .{ n, @tagName(tick) });
+                if (n > 0) {
+                    log.debug("tick: {d} requests, {s}", .{ n, @tagName(tick) });
+                }
+
                 if (tick != .idle) continue;
                 if (n > 0) continue;
+
                 log.debug("idle: blocking on request queue", .{});
                 const req = self.request_q.getOne(self.io) catch break;
                 if (self.dispatch(req, &sink) == .shutdown) break;
             }
+
             self.teardown();
         }
 
@@ -189,8 +203,11 @@ pub fn ServeEngine(comptime Engine: type, comptime CodecT: type, comptime Adapte
             // queue is the engine-side half of conn_closed. The scheduler's half
             // sweeps the sessions.
             if (req.body == .conn_closed) {
-                if (self.findConn(req.conn)) |conn| self.closeOutput(conn);
+                if (self.findConn(req.conn)) |conn| {
+                    self.closeOutput(conn);
+                }
             }
+
             return self.sched.handle(req, sink);
         }
 
@@ -199,32 +216,46 @@ pub fn ServeEngine(comptime Engine: type, comptime CodecT: type, comptime Adapte
             self.request_q.close(self.io);
             // Closing the listening fd does NOT unblock a thread inside accept(2).
             // The cancellation that std.Io delivers is the documented unblock.
-            if (self.acceptor_future) |*f| f.cancel(self.io);
+            if (self.acceptor_future) |*f| {
+                f.cancel(self.io);
+            }
+
             self.listener.deinit(self.io);
             // Only LIVE connections have running tasks to unblock. A reclaimable
             // one already exited and closed its own stream, so a second shutdown
             // hits a dead fd.
             for (self.conns) |*conn| {
-                if (conn.state.load(.acquire) == conn_live) Adapter.beginClose(self, conn);
+                if (conn.state.load(.acquire) == conn_live) {
+                    Adapter.beginClose(self, conn);
+                }
             }
+
             for (self.conns) |*conn| {
                 if (conn.state.load(.acquire) == conn_free) continue;
+
                 Adapter.awaitConn(self, conn);
                 // Exactly one actor has finalized every connection whose tasks
                 // ran: the exited task, or teardown's claim below.
                 std.debug.assert(conn.fin.load(.acquire) != fin_live);
                 // Teardown owns the close only when it claimed the fd (to shut it
                 // down and wake a blocked task). A task-claimed fd is already closed.
-                if (conn.fin.load(.acquire) == fin_teardown) conn.stream.close(self.io);
+                if (conn.fin.load(.acquire) == fin_teardown) {
+                    conn.stream.close(self.io);
+                }
+
                 conn.state.store(conn_free, .release);
             }
+
             // Requests that never reached the scheduler still own their text.
             var drain: [16]Request = undefined;
             while (true) {
                 const n = self.request_q.get(self.io, &drain, 0) catch break;
                 if (n == 0) break;
-                for (drain[0..n]) |req| freeRequestText(self.gpa, req);
+                for (drain[0..n]) |req| {
+                    freeRequestText(self.gpa, req);
+                }
             }
+
             self.sched.deinit();
         }
 
@@ -240,6 +271,7 @@ pub fn ServeEngine(comptime Engine: type, comptime CodecT: type, comptime Adapte
                 const conn = s.engine.findConn(conn_id) orelse return true;
                 const n = conn.out_q.put(s.engine.io, &.{ev}, 0) catch return true;
                 if (n == 1) return true;
+
                 conn.parked_hint.store(true, .release);
                 return false;
             }
@@ -254,6 +286,7 @@ pub fn ServeEngine(comptime Engine: type, comptime CodecT: type, comptime Adapte
             for (self.conns) |*conn| {
                 if (conn.state.load(.acquire) == conn_live and conn.id == conn_id) return conn;
             }
+
             return null;
         }
 
@@ -306,6 +339,7 @@ pub fn ServeEngine(comptime Engine: type, comptime CodecT: type, comptime Adapte
                 if (conn.fin.cmpxchgStrong(fin_live, fin_task, .acq_rel, .acquire) == null) {
                     conn.stream.close(self.io);
                 }
+
                 conn.state.store(conn_reclaimable, .release);
             }
         }
@@ -346,10 +380,13 @@ pub fn ServeEngine(comptime Engine: type, comptime CodecT: type, comptime Adapte
                     else => {},
                 }
             }
+
             return null;
         }
     };
 }
+
+// -- api --------------------------------------------------------------------
 
 /// Free the gpa-owned text a `Request` carries. The reader duped it across the
 /// thread hop, and the scheduler frees it on the happy path. Generic over the

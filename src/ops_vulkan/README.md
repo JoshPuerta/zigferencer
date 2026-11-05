@@ -79,13 +79,13 @@ every method so the build analyzes the bodies, and
   `AttentionSplit`. A prefill chunk runs its resident prefix as one
   `AttentionBatch` dispatch, and `AttentionBatch.recordInto` asserts that the
   prefix ends at or before the split length.
-- **One attention kit per build.** `AttnKit` is the kit that
-  `-Dattn-kernel` selects, `SplitAttnKit` today. A kit has the method set
+- **One attention kernel set per build.** `AttnKit` is the set that
+  `-Dattn-kernel` selects, `SplitAttnKit` today. A kernel set has the method set
   `recordResident`, `recordResidentRun`, `recordSplit`, `recordMerge`, and
   `recordBarrier`, and it
   declares its summation order class and its tolerance. The fused and hybrid
   runners record each attention layer through `runtime/attn_record.zig`, which
-  walks an `attn_split.AttnPlan`. A new kernel is one kit struct and one entry
+  walks an `attn_split.AttnPlan`. A new kernel is one kernel set struct and one entry
   in the build enum.
 - **A kernel needs a stable `Context` address.** Every kernel captures
   `*const Context` at `init`. `runtime/vulkan_runner.Runner.init` heap-allocates

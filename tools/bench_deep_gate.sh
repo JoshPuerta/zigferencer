@@ -7,7 +7,7 @@
 # the CPU attention. So the rows reach the deep attention paths that short
 # gates never run. Every row must equal the hash on record for its model. A
 # change that moves both executors the same way therefore also fails the
-# gate. The hashes on record belong to the default `split` attention kit
+# gate. The hashes on record belong to the default `split` attention kernel set
 # (`ATTN`).
 #
 # The rows run Qwen3.5-2B first, then SmolLM2. The CPU row of the 2B is the

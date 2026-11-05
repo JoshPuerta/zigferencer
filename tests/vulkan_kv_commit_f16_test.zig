@@ -123,13 +123,17 @@ fn deviceBits(
 ) !void {
     var kernel = try z.ops_vulkan.KvCommitF16.init(ctx);
     defer kernel.deinit();
+
     try z.ops_vulkan.kvCommitF16OneShot(&kernel, k_src, v_src, k_bits, v_bits);
 }
 
 /// Write `src` in reverse order into `dst`, the V-side source of every test.
 fn reverseInto(dst: []f32, src: []const f32) void {
     std.debug.assert(dst.len == src.len);
-    for (src, 0..) |v, i| dst[src.len - 1 - i] = v;
+
+    for (src, 0..) |v, i| {
+        dst[src.len - 1 - i] = v;
+    }
 }
 
 /// Accept the two outcomes Vulkan permits for a narrowing overflow, and print
@@ -140,7 +144,10 @@ fn reportOverflow(tensor: []const u8, c: Case, bits: u16) !void {
     if (bits == c.bits) {
         std.debug.print("overflow of {s} {d}: infinity, 0x{X:0>4}\n", .{ tensor, c.v, bits });
     } else if (bits == saturated) {
-        std.debug.print("overflow of {s} {d}: saturated to the largest finite, 0x{X:0>4}\n", .{ tensor, c.v, bits });
+        std.debug.print(
+            "overflow of {s} {d}: saturated to the largest finite, 0x{X:0>4}\n",
+            .{ tensor, c.v, bits },
+        );
     } else {
         std.debug.print(
             "overflow of {s} {d}: 0x{X:0>4}, neither infinity 0x{X:0>4} nor saturation 0x{X:0>4}\n",
@@ -161,6 +168,7 @@ test "kv_commit_f16: finite values round to nearest even" {
         k_src[i] = c.v;
         want[i] = c.bits;
     }
+
     var v_src: [n]f32 = undefined;
     reverseInto(&v_src, &k_src);
 
@@ -168,10 +176,15 @@ test "kv_commit_f16: finite values round to nearest even" {
     // is a fixture bug, and a catch here keeps it from reading as a device
     // fault.
     var k_host: [n]u16 = undefined;
-    for (k_src, 0..) |v, i| k_host[i] = @bitCast(@as(f16, @floatCast(v)));
+    for (k_src, 0..) |v, i| {
+        k_host[i] = @bitCast(@as(f16, @floatCast(v)));
+    }
+
     try std.testing.expectEqualSlices(u16, &want, &k_host);
     var v_host: [n]u16 = undefined;
-    for (v_src, 0..) |v, i| v_host[i] = @bitCast(@as(f16, @floatCast(v)));
+    for (v_src, 0..) |v, i| {
+        v_host[i] = @bitCast(@as(f16, @floatCast(v)));
+    }
 
     var ctx = try initCtx();
     defer ctx.deinit();
@@ -195,28 +208,40 @@ test "kv_commit_f16: a sweep straddles the workgroup boundary" {
     const rand = prng.random();
     const k_src = try allocator.alloc(f32, n);
     defer allocator.free(k_src);
+
     for (k_src, 0..) |*v, i| {
         const scale = std.math.ldexp(@as(f32, 1.0), @as(i32, @intCast(i % 30)) - 20);
         v.* = (rand.float(f32) * 2.0 - 1.0) * scale;
     }
+
     const v_src = try allocator.alloc(f32, n);
     defer allocator.free(v_src);
+
     reverseInto(v_src, k_src);
 
     const k_host = try allocator.alloc(u16, n);
     defer allocator.free(k_host);
-    for (k_src, 0..) |v, i| k_host[i] = @bitCast(@as(f16, @floatCast(v)));
+
+    for (k_src, 0..) |v, i| {
+        k_host[i] = @bitCast(@as(f16, @floatCast(v)));
+    }
+
     const v_host = try allocator.alloc(u16, n);
     defer allocator.free(v_host);
-    for (v_src, 0..) |v, i| v_host[i] = @bitCast(@as(f16, @floatCast(v)));
+
+    for (v_src, 0..) |v, i| {
+        v_host[i] = @bitCast(@as(f16, @floatCast(v)));
+    }
 
     var ctx = try initCtx();
     defer ctx.deinit();
 
     const k_got = try allocator.alloc(u16, n);
     defer allocator.free(k_got);
+
     const v_got = try allocator.alloc(u16, n);
     defer allocator.free(v_got);
+
     try deviceBits(&ctx, k_src, v_src, k_got, v_got);
     try std.testing.expectEqualSlices(u16, k_host, k_got);
     try std.testing.expectEqualSlices(u16, v_host, v_got);
@@ -235,7 +260,10 @@ test "kv_commit_f16: overflow leaves the finite range" {
     // prints the one the device chose. A gate pinned to one outcome makes a
     // legal device read as a broken one.
     var k_src: [n]f32 = undefined;
-    for (overflow_cases, 0..) |c, i| k_src[i] = c.v;
+    for (overflow_cases, 0..) |c, i| {
+        k_src[i] = c.v;
+    }
+
     var v_src: [n]f32 = undefined;
     reverseInto(&v_src, &k_src);
 
@@ -246,6 +274,11 @@ test "kv_commit_f16: overflow leaves the finite range" {
     var v_got: [n]u16 = undefined;
     try deviceBits(&ctx, &k_src, &v_src, &k_got, &v_got);
 
-    for (overflow_cases, k_got) |c, bits| try reportOverflow("k", c, bits);
-    for (0..n) |i| try reportOverflow("v", overflow_cases[n - 1 - i], v_got[i]);
+    for (overflow_cases, k_got) |c, bits| {
+        try reportOverflow("k", c, bits);
+    }
+
+    for (0..n) |i| {
+        try reportOverflow("v", overflow_cases[n - 1 - i], v_got[i]);
+    }
 }

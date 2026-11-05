@@ -26,7 +26,12 @@ const expectSameStream = harness.expectSameStream;
 // -- fixtures ---------------------------------------------------------------
 
 const system = "You are a helpful assistant.";
-const turn_prompts = [_][]const u8{ "Name a color.", "Name an animal.", "Name a city.", "Name a fruit." };
+const turn_prompts = [_][]const u8{
+    "Name a color.",
+    "Name an animal.",
+    "Name a city.",
+    "Name a fruit.",
+};
 const window: u32 = 256;
 const turn_tokens: u32 = 16;
 /// Short turns keep the Qwen case inside its time budget.
@@ -86,7 +91,14 @@ fn collect(client: *Client, request_id: u32) !Turn {
 
 /// Send one turn on each of two sessions before either reads, so the
 /// two share the batch, then collect both.
-fn turnPair(a: *Client, a_sid: u32, b: *Client, b_sid: u32, prompt: []const u8, turn: Client.TurnOptions) ![2]Turn {
+fn turnPair(
+    a: *Client,
+    a_sid: u32,
+    b: *Client,
+    b_sid: u32,
+    prompt: []const u8,
+    turn: Client.TurnOptions,
+) ![2]Turn {
     const a_id = try a.generateWith(a_sid, prompt, turn);
     const b_id = try b.generateWith(b_sid, prompt, turn);
     return .{ try collect(a, a_id), try collect(b, b_id) };
@@ -114,6 +126,7 @@ fn openWhenFree(client: *Client) !u32 {
             continue;
         };
     }
+
     std.debug.print("the drop freed no slot within {d} open attempts\n", .{open_attempts_max});
     return error.TestUnexpectedResult;
 }
@@ -129,8 +142,14 @@ const Counters = struct { expires: u64 = 0, yields: u64 = 0, lost: u64 = 0, cut:
 /// the read must come after the server stops.
 fn counters(h: anytype) Counters {
     std.debug.assert(!h.running);
+
     const s = &h.server.sched;
-    return .{ .expires = s.lease_expires, .yields = s.lease_yields, .lost = s.lease_yields_lost, .cut = s.lease_prefills_cut };
+    return .{
+        .expires = s.lease_expires,
+        .yields = s.lease_yields,
+        .lost = s.lease_yields_lost,
+        .cut = s.lease_prefills_cut,
+    };
 }
 
 fn keep(client: *Client, sid: u32, ttl: u32) !protocol.Token {
@@ -143,7 +162,13 @@ fn keep(client: *Client, sid: u32, ttl: u32) !protocol.Token {
 /// Four turns on a twin and on a session that a client keeps, drops after
 /// turn 3, and resumes on a new connection. Turn 4 must give the ids and
 /// the position of the twin. With `sampling` set, both sides reseed turn 4.
-fn resumeMatchesTwin(comptime H: type, kind: harness.ChatKind, budget: u32, sampling: protocol.Sampling, turn4: ?protocol.Sampling) !void {
+fn resumeMatchesTwin(
+    comptime H: type,
+    kind: harness.ChatKind,
+    budget: u32,
+    sampling: protocol.Sampling,
+    turn4: ?protocol.Sampling,
+) !void {
     return resumeMatchesTwinWith(H, kind, sampling, .{ .max_tokens = budget }, .{
         .max_tokens = budget,
         .sampling = turn4,
@@ -163,6 +188,7 @@ fn resumeMatchesTwinWith(
 ) !void {
     std.debug.assert(early.max_tokens <= turn_tokens);
     std.debug.assert(last.max_tokens <= turn_tokens);
+
     var h = try H.boot(std.testing.allocator, std.testing.io, .tcp, .{
         .max_sessions = 2,
         .max_batch = 2,
@@ -171,8 +197,10 @@ fn resumeMatchesTwinWith(
         .resume_ttl_max_ms = ttl_max_ms,
     });
     defer h.deinit();
+
     var twin = try h.connect();
     defer twin.deinit();
+
     try std.testing.expectEqual(ttl_max_ms, (try twin.hello()).resume_ttl_max_ms);
     const tsid = try twin.openSession(system, sampling);
 
@@ -182,24 +210,30 @@ fn resumeMatchesTwinWith(
     {
         var first = try h.connect();
         defer first.deinit();
+
         _ = try first.hello();
         sid = try first.openSession(system, sampling);
         for (turn_prompts[0..3]) |prompt| {
             turn3 = try turnPair(&twin, tsid, &first, sid, prompt, early);
             try expectSameTurn(turn3[0], turn3[1]);
         }
+
         token = try keep(&first, sid, ttl_ms);
         first.hangUp();
     }
 
     var second = try h.connect();
     defer second.deinit();
+
     _ = try second.hello();
     const r = try second.resumeSession(token);
     try std.testing.expectEqual(sid, r.id);
     try std.testing.expect(!std.mem.eql(u8, &token, &r.state.token));
     // A thinking turn must count reasoning, or the equality below proves nothing.
-    if (early.think_open == true) try std.testing.expect(turn3[0].reasoning_tokens > 0);
+    if (early.think_open == true) {
+        try std.testing.expect(turn3[0].reasoning_tokens > 0);
+    }
+
     try std.testing.expectEqual(turn3[0].kv_pos, r.state.kv_pos);
     try std.testing.expectEqual(@as(u32, 3), r.state.turns_done);
     try std.testing.expectEqual(protocol.LastDone{
@@ -228,7 +262,13 @@ test "resumption: a resumed seeded session reseeded at turn 4 gives the ids of i
 }
 
 test "resumption: a dropped and resumed Qwen session gives the turn 4 ids of its twin, thinking off" {
-    try resumeMatchesTwin(harness.QwenHarness, .{ .chatml_qwen = .off }, qwen_turn_tokens, protocol.Sampling.greedy, null);
+    try resumeMatchesTwin(
+        harness.QwenHarness,
+        .{ .chatml_qwen = .off },
+        qwen_turn_tokens,
+        protocol.Sampling.greedy,
+        null,
+    );
 }
 
 test "resumption: sampling state, presence set, and repetition set carry across a drop" {
@@ -243,12 +283,28 @@ test "resumption: sampling state, presence set, and repetition set carry across 
         .repetition_penalty = 1.3,
         .min_p = 0.05,
     };
-    try resumeMatchesTwinWith(Harness, .chatml_smollm2, open, .{ .max_tokens = turn_tokens }, .{ .max_tokens = turn_tokens });
+    try resumeMatchesTwinWith(
+        Harness,
+        .chatml_smollm2,
+        open,
+        .{ .max_tokens = turn_tokens },
+        .{ .max_tokens = turn_tokens },
+    );
 }
 
 test "resumption: a Qwen session with a think budget gives the turn 4 ids and the reasoning count of its twin" {
-    const turn: Client.TurnOptions = .{ .max_tokens = qwen_think_tokens, .think_open = true, .think_budget = 16 };
-    try resumeMatchesTwinWith(harness.QwenHarness, .{ .chatml_qwen = .on }, protocol.Sampling.greedy, turn, turn);
+    const turn: Client.TurnOptions = .{
+        .max_tokens = qwen_think_tokens,
+        .think_open = true,
+        .think_budget = 16,
+    };
+    try resumeMatchesTwinWith(
+        harness.QwenHarness,
+        .{ .chatml_qwen = .on },
+        protocol.Sampling.greedy,
+        turn,
+        turn,
+    );
 }
 
 test "resumption: a drop mid-decode cuts the turn as cancelled, and the next turn continues from the carry" {
@@ -259,8 +315,10 @@ test "resumption: a drop mid-decode cuts the turn as cancelled, and the next tur
         .resume_ttl_max_ms = ttl_max_ms,
     }));
     defer h.deinit();
+
     var twin = try h.connect();
     defer twin.deinit();
+
     const tsid = try twin.openSession(system, protocol.Sampling.greedy);
 
     var token: protocol.Token = undefined;
@@ -271,11 +329,20 @@ test "resumption: a drop mid-decode cuts the turn as cancelled, and the next tur
     {
         var first = try h.connect();
         defer first.deinit();
+
         sid = try first.openSession(system, protocol.Sampling.greedy);
         for (turn_prompts[0..2]) |prompt| {
-            const t = try turnPair(&twin, tsid, &first, sid, prompt, .{ .max_tokens = turn_tokens });
+            const t = try turnPair(
+                &twin,
+                tsid,
+                &first,
+                sid,
+                prompt,
+                .{ .max_tokens = turn_tokens },
+            );
             try expectSameTurn(t[0], t[1]);
         }
+
         token = try keep(&first, sid, ttl_ms);
         total_before = (try first.stats()).tokens_generated_total;
         cut_id = try first.generate(sid, cut_prompt, cut_tokens, null);
@@ -284,12 +351,14 @@ test "resumption: a drop mid-decode cuts the turn as cancelled, and the next tur
             try std.testing.expect(ev.msg == .token);
             id.* = ev.msg.token.token_id;
         }
+
         first.hangUp();
     }
 
     // The drop takes the cancel rule, so the summary names the cut turn.
     var second = try h.connect();
     defer second.deinit();
+
     const r = try second.resumeSession(token);
     try std.testing.expectEqual(sid, r.id);
     try std.testing.expectEqual(@as(u32, 3), r.state.turns_done);
@@ -299,7 +368,10 @@ test "resumption: a drop mid-decode cuts the turn as cancelled, and the next tur
     try std.testing.expect(last.gen_tokens >= cut_head.len);
     try std.testing.expect(last.gen_tokens < cut_tokens);
     // The server total counts every token of the cut turn, sent or not.
-    try std.testing.expectEqual(total_before + last.gen_tokens, (try second.stats()).tokens_generated_total);
+    try std.testing.expectEqual(
+        total_before + last.gen_tokens,
+        (try second.stats()).tokens_generated_total,
+    );
 
     // A turn that stops at its budget keeps the same carry as a cancel at
     // the same count. The twin thus reaches the position of the resumed
@@ -313,7 +385,14 @@ test "resumption: a drop mid-decode cuts the turn as cancelled, and the next tur
     try std.testing.expectEqualSlices(u32, &cut_head, twin_ids[0..cut_head.len]);
     try std.testing.expectEqual(twin_cut.kv_pos, r.state.kv_pos);
 
-    const t4 = try turnPair(&twin, tsid, &second, r.id, turn_prompts[3], .{ .max_tokens = turn_tokens });
+    const t4 = try turnPair(
+        &twin,
+        tsid,
+        &second,
+        r.id,
+        turn_prompts[3],
+        .{ .max_tokens = turn_tokens },
+    );
     try std.testing.expect(t4[0].n > 0);
     try expectSameTurn(t4[0], t4[1]);
 
@@ -330,11 +409,13 @@ test "resumption: an expired lease is unknown, and kept pairs rebuild the sessio
         .resume_ttl_max_ms = ttl_max_ms,
     }));
     defer h.deinit();
+
     // The pin starts before the first request, so every lease read of the
     // engine thread sees the pinned clock.
     h.server.sched.pinClock(atMs(0));
     var twin = try h.connect();
     defer twin.deinit();
+
     const tsid = try twin.openSession(system, protocol.Sampling.greedy);
 
     var transcript: [3]Turn = undefined;
@@ -342,18 +423,28 @@ test "resumption: an expired lease is unknown, and kept pairs rebuild the sessio
     {
         var first = try h.connect();
         defer first.deinit();
+
         const sid = try first.openSession(system, protocol.Sampling.greedy);
         for (&transcript, turn_prompts[0..3]) |*t, prompt| {
-            const pair = try turnPair(&twin, tsid, &first, sid, prompt, .{ .max_tokens = turn_tokens });
+            const pair = try turnPair(
+                &twin,
+                tsid,
+                &first,
+                sid,
+                prompt,
+                .{ .max_tokens = turn_tokens },
+            );
             try expectSameTurn(pair[0], pair[1]);
             t.* = pair[1];
         }
+
         // The unkept session frees at the drop, and its free slot makes the
         // drop observable from another connection.
         _ = try first.openSession(system, protocol.Sampling.greedy);
         token = try keep(&first, sid, 1);
         first.hangUp();
     }
+
     const probe = try openWhenFree(&twin);
     try twin.closeSession(probe);
     // The detach ran before the probe open, and the deadline is 1 ms after
@@ -364,19 +455,33 @@ test "resumption: an expired lease is unknown, and kept pairs rebuild the sessio
 
     var second = try h.connect();
     defer second.deinit();
+
     try std.testing.expectError(error.ServerError, second.resumeSession(token));
     try expectRefused(&second, .unknown_session, "no such lease");
 
     const rebuilt = try second.openSession(system, protocol.Sampling.greedy);
     var pairs: [transcript.len]protocol.Pair = undefined;
-    for (&pairs, &transcript, turn_prompts[0..3]) |*p, *t, prompt| p.* = .{ .user = prompt, .assistant = t.reply[0..t.len] };
+    for (&pairs, &transcript, turn_prompts[0..3]) |*p, *t, prompt| {
+        p.* = .{ .user = prompt, .assistant = t.reply[0..t.len] };
+    }
+
     const appended = try second.append(rebuilt, &pairs);
     // A turn that stops at its budget carries its last token into the next
     // turn, and the kept pair holds that token in its reply.
     const carried = transcript[2].finish == .max_tokens;
-    try std.testing.expectEqual(transcript[2].kv_pos + @intFromBool(carried), appended.positions()[2]);
+    try std.testing.expectEqual(
+        transcript[2].kv_pos + @intFromBool(carried),
+        appended.positions()[2],
+    );
 
-    const t4 = try turnPair(&twin, tsid, &second, rebuilt, turn_prompts[3], .{ .max_tokens = turn_tokens });
+    const t4 = try turnPair(
+        &twin,
+        tsid,
+        &second,
+        rebuilt,
+        turn_prompts[3],
+        .{ .max_tokens = turn_tokens },
+    );
     try std.testing.expect(t4[0].n > 0);
     try expectSameTurn(t4[0], t4[1]);
 
@@ -385,10 +490,17 @@ test "resumption: an expired lease is unknown, and kept pairs rebuild the sessio
 }
 
 test "resumption: a live open on a full table takes the detached slot with the earliest deadline" {
-    var h = try Harness.boot(std.testing.allocator, std.testing.io, .tcp, .{ .resume_ttl_max_ms = ttl_max_ms });
+    var h = try Harness.boot(
+        std.testing.allocator,
+        std.testing.io,
+        .tcp,
+        .{ .resume_ttl_max_ms = ttl_max_ms },
+    );
     defer h.deinit();
+
     var live = try h.connect();
     defer live.deinit();
+
     const a = try live.openSession(system, protocol.Sampling.greedy);
     const reference = try oneTurn(&live, a, harness.prompts[0]);
     try std.testing.expect(reference.n > 0);
@@ -399,6 +511,7 @@ test "resumption: a live open on a full table takes the detached slot with the e
     {
         var first = try h.connect();
         defer first.deinit();
+
         late_sid = try first.openSession(system, protocol.Sampling.greedy);
         const early_sid = try first.openSession(system, protocol.Sampling.greedy);
         late = try keep(&first, late_sid, ttl_ms);
@@ -421,14 +534,22 @@ test "resumption: a live open on a full table takes the detached slot with the e
 }
 
 test "resumption: with resumption off a keep is forbidden, and a drop frees the session" {
-    var h = try Harness.boot(std.testing.allocator, std.testing.io, .tcp, .{ .max_sessions = 1, .max_batch = 1 });
+    var h = try Harness.boot(
+        std.testing.allocator,
+        std.testing.io,
+        .tcp,
+        .{ .max_sessions = 1, .max_batch = 1 },
+    );
     defer h.deinit();
+
     var other = try h.connect();
     defer other.deinit();
+
     try std.testing.expectEqual(@as(u32, 0), (try other.hello()).resume_ttl_max_ms);
     {
         var first = try h.connect();
         defer first.deinit();
+
         const sid = try first.openSession(system, protocol.Sampling.greedy);
         try std.testing.expectError(error.ServerError, first.keepSession(sid, 1_000));
         try expectRefused(&first, .forbidden, "resumption is off");
@@ -440,6 +561,7 @@ test "resumption: with resumption off a keep is forbidden, and a drop frees the 
         try expectRefused(&first, .unknown_session, "no such lease");
         first.hangUp();
     }
+
     _ = try openWhenFree(&other);
     try std.testing.expectEqual(@as(u16, 1), (try other.stats()).sessions_open);
 

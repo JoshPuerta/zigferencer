@@ -32,6 +32,18 @@
 const std = @import("std");
 const build_options = @import("build_options");
 
+// -- constants --------------------------------------------------------------
+
+/// Bound on distinct scopes nameable in one `$ZIGFERENCER_LOG`. The engine
+/// defines 16 scopes. This leaves headroom without unbounding the surface.
+const max_log_scopes = 24;
+
+/// Comptime gate for hot-path traces (the `layer`, `dispatch`, and `token`
+/// scopes). `-Dtrace` sets it: on in Debug, off in release unless forced. A
+/// call site wraps the whole trace, including any clock read, in
+/// `if (comptime hot)`, so a release build compiles the site out entirely.
+pub const hot = build_options.trace_hot;
+
 // -- types ------------------------------------------------------------------
 
 /// A per-scope ceiling. `level == null` means the scope is silenced (`=off`).
@@ -41,13 +53,10 @@ const LevelSpec = union(enum) { off, level: std.log.Level, unknown };
 
 // -- state ------------------------------------------------------------------
 
-/// Bound on distinct scopes nameable in one `$ZIGFERENCER_LOG`. The engine
-/// defines 16 scopes. This leaves headroom without unbounding the surface.
-const max_log_scopes = 24;
-
 /// Per-scope ceilings parsed from the env once at startup. `name` borrows the env
 /// string, which lives for the process, so no copy. Bounded by `max_log_scopes`.
 var scope_ceilings: [max_log_scopes]ScopeCeiling = undefined;
+
 var scope_count: usize = 0;
 
 /// Global ceiling for any scope not named in the table. `null` = silent. Default
@@ -64,12 +73,6 @@ var raw_env: ?[]const u8 = null;
 var start: ?std.Io.Timestamp = null;
 
 // -- api --------------------------------------------------------------------
-
-/// Comptime gate for hot-path traces (the `layer`, `dispatch`, and `token`
-/// scopes). `-Dtrace` sets it: on in Debug, off in release unless forced. A
-/// call site wraps the whole trace, including any clock read, in
-/// `if (comptime hot)`, so a release build compiles the site out entirely.
-pub const hot = build_options.trace_hot;
 
 /// Monotonic timestamp from the diagnostics clock. `std.Options.debug_io` is
 /// the singleton `std.log.defaultLog` writes stderr through, independent of
@@ -88,7 +91,10 @@ pub fn msSince(t0: std.Io.Timestamp) f64 {
 /// level word reads as a scope name, and an unknown `scope=level` term is
 /// skipped, so a mistake never fails a run.
 pub fn setFromEnv(value: ?[]const u8) void {
-    if (start == null) start = now();
+    if (start == null) {
+        start = now();
+    }
+
     const v = value orelse return;
     raw_env = v;
     scope_count = 0;
@@ -99,6 +105,7 @@ pub fn setFromEnv(value: ?[]const u8) void {
     var it = std.mem.tokenizeScalar(u8, v, ',');
     while (it.next()) |term| {
         std.debug.assert(term.len > 0); // tokenizeScalar drops empties. Defend anyway.
+
         if (std.mem.indexOfScalar(u8, term, '=')) |eq_at| {
             const name = term[0..eq_at];
             if (name.len == 0) continue; // "=debug" malformed -> skip
@@ -113,23 +120,29 @@ pub fn setFromEnv(value: ?[]const u8) void {
                 },
                 .unknown => {}, // mistyped level -> skip the term
             }
-        } else switch (parseLevel(term)) {
-            .off => {
-                threshold = null;
-                saw_level = true;
-            },
-            .level => |l| {
-                threshold = l;
-                saw_level = true;
-            },
-            .unknown => {
-                addScope(term, .debug); // a bare word is a scope name, at debug
-                saw_scope = true;
-            },
+        } else {
+            switch (parseLevel(term)) {
+                .off => {
+                    threshold = null;
+                    saw_level = true;
+                },
+                .level => |l| {
+                    threshold = l;
+                    saw_level = true;
+                },
+                .unknown => {
+                    addScope(term, .debug); // a bare word is a scope name, at debug
+                    saw_scope = true;
+                },
+            }
         }
     }
+
     // Scopes named without an explicit global level mean "only these": quiet the rest.
-    if (saw_scope and !saw_level) threshold = null;
+    if (saw_scope and !saw_level) {
+        threshold = null;
+    }
+
     std.debug.assert(scope_count <= max_log_scopes);
 }
 
@@ -146,13 +159,16 @@ pub fn logFn(
 ) void {
     const ceiling = ceilingFor(scope) orelse return;
     if (@intFromEnum(level) > @intFromEnum(ceiling)) return;
+
     const ns = elapsedNs();
     const io = std.Options.debug_io;
     const prev = io.swapCancelProtection(.blocked);
     defer _ = io.swapCancelProtection(prev);
+
     var buffer: [64]u8 = undefined;
     const stderr = std.debug.lockStderr(&buffer).terminal();
     defer std.debug.unlockStderr();
+
     var prefix_buf: [24]u8 = undefined;
     stderr.setColor(.dim) catch {};
     stderr.writer.writeAll(prefixText(&prefix_buf, ns)) catch {};
@@ -197,15 +213,20 @@ fn prefixText(buf: []u8, ns: u64) []const u8 {
 fn parseLevel(word: []const u8) LevelSpec {
     if (std.mem.eql(u8, word, "off")) return .off;
     if (std.mem.eql(u8, word, "err") or std.mem.eql(u8, word, "error")) return .{ .level = .err };
-    if (std.mem.eql(u8, word, "warn") or std.mem.eql(u8, word, "warning")) return .{ .level = .warn };
+    if (std.mem.eql(u8, word, "warn") or std.mem.eql(u8, word, "warning")) {
+        return .{ .level = .warn };
+    }
     if (std.mem.eql(u8, word, "info")) return .{ .level = .info };
     if (std.mem.eql(u8, word, "debug")) return .{ .level = .debug };
+
     return .unknown;
 }
 
 fn addScope(name: []const u8, level: ?std.log.Level) void {
     std.debug.assert(name.len > 0);
+
     if (scope_count >= max_log_scopes) return; // bounded: a term past the cap drops
+
     std.debug.assert(scope_count < max_log_scopes);
     scope_ceilings[scope_count] = .{ .name = name, .level = level };
     scope_count += 1;
@@ -217,11 +238,13 @@ fn addScope(name: []const u8, level: ?std.log.Level) void {
 /// cleared the comptime ceiling.
 fn ceilingFor(comptime scope: @EnumLiteral()) ?std.log.Level {
     std.debug.assert(scope_count <= max_log_scopes);
+
     const name = @tagName(scope);
     var i: usize = 0;
     while (i < scope_count) : (i += 1) {
         if (std.mem.eql(u8, scope_ceilings[i].name, name)) return scope_ceilings[i].level;
     }
+
     return threshold;
 }
 
@@ -250,12 +273,16 @@ fn checkEnv(c: EnvCase) !void {
     try std.testing.expectEqual(c.parallel, ceilingFor(.parallel));
     for (std.enums.values(std.log.Level)) |level| {
         for ([_]Level{ c.gguf, c.run, c.parallel }, 0..) |want_ceiling, k| {
-            const want = if (want_ceiling) |ceiling| @intFromEnum(level) <= @intFromEnum(ceiling) else false;
+            const want = if (want_ceiling) |ceiling| @intFromEnum(level) <= @intFromEnum(
+                ceiling,
+            ) else false;
+
             const got = switch (k) {
                 0 => enabled(.gguf, level),
                 1 => enabled(.run, level),
                 else => enabled(.parallel, level),
             };
+
             try std.testing.expectEqual(want, got);
         }
     }
@@ -277,6 +304,7 @@ test "setFromEnv: the grammar gives the threshold and the scope ceilings" {
     };
     for (cases) |c| {
         errdefer std.debug.print("env case: {s}\n", .{c.env});
+
         try checkEnv(c);
     }
 }
@@ -285,9 +313,13 @@ test "setFromEnv: the scope table is bounded" {
     const many = comptime blk: {
         var s: []const u8 = "";
         var i: usize = 0;
-        while (i < max_log_scopes + 5) : (i += 1) s = s ++ std.fmt.comptimePrint("s{d},", .{i});
+        while (i < max_log_scopes + 5) : (i += 1) {
+            s = s ++ std.fmt.comptimePrint("s{d},", .{i});
+        }
+
         break :blk s;
     };
+
     setFromEnv(many);
     try std.testing.expectEqual(@as(usize, max_log_scopes), scope_count);
 }

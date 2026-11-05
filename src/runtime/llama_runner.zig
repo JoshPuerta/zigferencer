@@ -80,7 +80,7 @@ else
 const log = std.log.scoped(.runner);
 const log_layer = std.log.scoped(.layer);
 
-// -- api --------------------------------------------------------------------
+// -- types ------------------------------------------------------------------
 
 /// Llama forward-pass state over `n_slots` independent KV slots (the Control
 /// Unit). `n_slots = 1` is the single-sequence CLI shape.
@@ -177,7 +177,17 @@ pub const LlamaRunner = struct {
         policy: parallel.Policy,
         kv_dtype: dtype.KvDtype,
     ) Error!LlamaRunner {
-        return initPrefix(arena, loaded, plan, loaded.card.n_layers, max_rows, io, pool, policy, kv_dtype);
+        return initPrefix(
+            arena,
+            loaded,
+            plan,
+            loaded.card.n_layers,
+            max_rows,
+            io,
+            pool,
+            policy,
+            kv_dtype,
+        );
     }
 
     /// A prefix runner executes layers `[0..n_layers)` with weights and KV sized
@@ -210,10 +220,14 @@ pub const LlamaRunner = struct {
         const embed = try findTensor(loaded.tensors, "token_embd.weight");
         const output_norm = try findTensor(loaded.tensors, "output_norm.weight");
         const output = findOptional(loaded.tensors, "output.weight") orelse embed;
-        const rope_factors: ?[]const f32 = if (findOptional(loaded.tensors, loader.rope_freqs_tensor)) |t|
+        const rope_factors: ?[]const f32 = if (findOptional(
+            loaded.tensors,
+            loader.rope_freqs_tensor,
+        )) |t|
             fp32View(t.*)
         else
             null;
+
         if (rope_factors) |ff| std.debug.assert(ff.len >= c.rope_dim_count / 2);
 
         const attn_norm_w = try arena.alloc(*const Tensor, n_layers);
@@ -229,15 +243,40 @@ pub const LlamaRunner = struct {
         var name_buf: [64]u8 = undefined;
         var i: u32 = 0;
         while (i < n_layers) : (i += 1) {
-            attn_norm_w[i] = try findByFmt(loaded.tensors, &name_buf, "blk.{d}.attn_norm.weight", .{i});
+            attn_norm_w[i] = try findByFmt(
+                loaded.tensors,
+                &name_buf,
+                "blk.{d}.attn_norm.weight",
+                .{i},
+            );
             attn_q_w[i] = try findByFmt(loaded.tensors, &name_buf, "blk.{d}.attn_q.weight", .{i});
             attn_k_w[i] = try findByFmt(loaded.tensors, &name_buf, "blk.{d}.attn_k.weight", .{i});
             attn_v_w[i] = try findByFmt(loaded.tensors, &name_buf, "blk.{d}.attn_v.weight", .{i});
-            attn_o_w[i] = try findByFmt(loaded.tensors, &name_buf, "blk.{d}.attn_output.weight", .{i});
-            ffn_norm_w[i] = try findByFmt(loaded.tensors, &name_buf, "blk.{d}.ffn_norm.weight", .{i});
-            ffn_gate_w[i] = try findByFmt(loaded.tensors, &name_buf, "blk.{d}.ffn_gate.weight", .{i});
+            attn_o_w[i] = try findByFmt(
+                loaded.tensors,
+                &name_buf,
+                "blk.{d}.attn_output.weight",
+                .{i},
+            );
+            ffn_norm_w[i] = try findByFmt(
+                loaded.tensors,
+                &name_buf,
+                "blk.{d}.ffn_norm.weight",
+                .{i},
+            );
+            ffn_gate_w[i] = try findByFmt(
+                loaded.tensors,
+                &name_buf,
+                "blk.{d}.ffn_gate.weight",
+                .{i},
+            );
             ffn_up_w[i] = try findByFmt(loaded.tensors, &name_buf, "blk.{d}.ffn_up.weight", .{i});
-            ffn_down_w[i] = try findByFmt(loaded.tensors, &name_buf, "blk.{d}.ffn_down.weight", .{i});
+            ffn_down_w[i] = try findByFmt(
+                loaded.tensors,
+                &name_buf,
+                "blk.{d}.ffn_down.weight",
+                .{i},
+            );
         }
 
         const kv_slots = try arena.alloc(KvCache, n_slots);
@@ -245,7 +284,9 @@ pub const LlamaRunner = struct {
             slot.* = try KvCache.init(arena, n_layers, c.n_kv_heads, c.head_dim, max_seq, kv_dtype);
         }
 
-        const kv_bytes: u64 = 2 * @as(u64, n_slots) * n_layers * max_seq * kv_dtype.rowBytes(c.n_kv_heads * c.head_dim);
+        const kv_bytes: u64 = 2 * @as(u64, n_slots) * n_layers * max_seq * kv_dtype.rowBytes(
+            c.n_kv_heads * c.head_dim,
+        );
         log.debug("init llama: {d} layers, {d} slots, max_seq {d}, kv {d:.0} MiB", .{
             n_layers,                                              n_slots, max_seq,
             @as(f64, @floatFromInt(kv_bytes)) / (1024.0 * 1024.0),
@@ -286,7 +327,10 @@ pub const LlamaRunner = struct {
             // time, and each call ends before the next starts, so one row of
             // records serves every row of a step. The per-op GPU attention
             // keeps its own records, so that build holds none here.
-            .attn_parts = try arena.alloc(f32, if (build_options.use_vulkan_ops) 0 else attn_cpu.partialLen(c.n_heads, c.head_dim)),
+            .attn_parts = try arena.alloc(
+                f32,
+                if (build_options.use_vulkan_ops) 0 else attn_cpu.partialLen(c.n_heads, c.head_dim),
+            ),
             .ffn_gate = try arena.alloc(f32, rows_cap * c.feed_forward_length),
             .ffn_up = try arena.alloc(f32, rows_cap * c.feed_forward_length),
             .ffn_down = try arena.alloc(f32, rows_cap * c.embedding_length),
@@ -332,17 +376,28 @@ pub const LlamaRunner = struct {
     /// `prefill_batch_max`.
     pub fn prefillBatch(self: *LlamaRunner, ids: []const u32, pos: u32) Error![]f32 {
         std.debug.assert(ids.len >= 1);
+
         if (ids.len > self.prefill_batch_max) return error.TooManyRows;
+
         var rows_buf: [limits.max_prefill_chunk]StepRow = undefined;
         for (ids, rows_buf[0..ids.len], 0..) |id, *r, i| {
-            r.* = .{ .slot = 0, .token = id, .pos = pos + @as(u32, @intCast(i)), .want_logits = i == ids.len - 1 };
+            r.* = .{
+                .slot = 0,
+                .token = id,
+                .pos = pos + @as(u32, @intCast(i)),
+                .want_logits = i == ids.len - 1,
+            };
         }
+
         try self.stepBatch(rows_buf[0..ids.len]);
         const out = self.logits[0..self.card.vocab_size];
         std.debug.assert(out.len == self.card.vocab_size);
         if (std.debug.runtime_safety) {
-            for (out) |x| std.debug.assert(std.math.isFinite(x));
+            for (out) |x| {
+                std.debug.assert(std.math.isFinite(x));
+            }
         }
+
         return out;
     }
 
@@ -352,36 +407,59 @@ pub const LlamaRunner = struct {
     /// `want_logits` row lands at `logits[j * vocab_size ..][0..vocab_size]`.
     pub fn stepBatch(self: *LlamaRunner, rows: []const StepRow) Error!void {
         _ = try step_row.validateRows(rows, self.n_slots, self.max_rows, self.max_seq);
-        log.debug("step: {d} rows, slot {d} pos {d}..{d}", .{ rows.len, rows[0].slot, rows[0].pos, rows[rows.len - 1].pos });
+        log.debug(
+            "step: {d} rows, slot {d} pos {d}..{d}",
+            .{ rows.len, rows[0].slot, rows[0].pos, rows[rows.len - 1].pos },
+        );
         const c = self.card;
         const d = c.embedding_length;
         if (comptime core_log.hot) {
-            if (self.profile) |p| p.steps += 1;
+            if (self.profile) |p| {
+                p.steps += 1;
+            }
         }
 
         const t_embed = self.tBegin();
         for (rows, 0..) |r, i| {
             ops.embedLookup(self.embed.*, r.token, d, self.x[i * d ..][0..d]);
         }
+
         self.tEnd(t_embed, .embed);
 
         const live = (comptime core_log.hot) and core_log.enabled(.layer, .debug);
         var layer: u32 = 0;
         while (layer < self.n_layers) : (layer += 1) {
             var t_layer: std.Io.Timestamp = undefined;
-            if (live) t_layer = core_log.now();
+            if (live) {
+                t_layer = core_log.now();
+            }
+
             try self.layerForward(layer, rows);
-            if (live) log_layer.debug("layer {d}: {d} rows, {d:.2} ms", .{ layer, rows.len, core_log.msSince(t_layer) });
+            if (live) {
+                log_layer.debug(
+                    "layer {d}: {d} rows, {d:.2} ms",
+                    .{ layer, rows.len, core_log.msSince(t_layer) },
+                );
+            }
         }
 
         var first: usize = rows.len;
-        while (first > 0 and rows[first - 1].want_logits) first -= 1;
+        while (first > 0 and rows[first - 1].want_logits) {
+            first -= 1;
+        }
+
         if (first == rows.len) return;
 
         const t_norm = self.tBegin();
         for (rows[first..], first..) |_, i| {
-            ops.rmsnorm(self.x[i * d ..][0..d], fp32View(self.output_norm.*), c.rms_norm_eps, self.x_norm[i * d ..][0..d]);
+            ops.rmsnorm(
+                self.x[i * d ..][0..d],
+                fp32View(self.output_norm.*),
+                c.rms_norm_eps,
+                self.x_norm[i * d ..][0..d],
+            );
         }
+
         self.tEnd(t_norm, .rmsnorm);
         const n_logits = rows.len - first;
         // Compact: the `n_logits` want-logits rows go to logits[0..], not to
@@ -405,6 +483,7 @@ pub const LlamaRunner = struct {
     pub fn layerForward(self: *LlamaRunner, layer: u32, rows: []const StepRow) Error!void {
         const sp = span.beginHot(.layer_forward);
         defer sp.end();
+
         const c = self.card;
         const d = c.embedding_length;
         const qd = c.n_heads * c.head_dim;
@@ -416,12 +495,30 @@ pub const LlamaRunner = struct {
         // -- attention block ------------------------------------------------
         const t_an = self.tBegin();
         for (0..n) |i| {
-            ops.rmsnorm(self.x[i * d ..][0..d], fp32View(self.attn_norm_w[layer].*), c.rms_norm_eps, self.x_norm[i * d ..][0..d]);
+            ops.rmsnorm(
+                self.x[i * d ..][0..d],
+                fp32View(self.attn_norm_w[layer].*),
+                c.rms_norm_eps,
+                self.x_norm[i * d ..][0..d],
+            );
         }
+
         self.tEnd(t_an, .rmsnorm);
         try self.linearBatch(self.x_norm[0 .. n * d], self.attn_q_w[layer].*, self.q, n, .qkv_proj);
-        try self.linearBatch(self.x_norm[0 .. n * d], self.attn_k_w[layer].*, self.k_scratch, n, .qkv_proj);
-        try self.linearBatch(self.x_norm[0 .. n * d], self.attn_v_w[layer].*, self.v_scratch, n, .qkv_proj);
+        try self.linearBatch(
+            self.x_norm[0 .. n * d],
+            self.attn_k_w[layer].*,
+            self.k_scratch,
+            n,
+            .qkv_proj,
+        );
+        try self.linearBatch(
+            self.x_norm[0 .. n * d],
+            self.attn_v_w[layer].*,
+            self.v_scratch,
+            n,
+            .qkv_proj,
+        );
 
         // RoPE each row at its own position, then commit K/V to its slot.
         const t_rope = self.tBegin();
@@ -429,21 +526,43 @@ pub const LlamaRunner = struct {
             var h: u32 = 0;
             while (h < c.n_heads) : (h += 1) {
                 const off = i * qd + h * c.head_dim;
-                ops.ropeInplace(self.q[off..][0..c.head_dim], r.pos, c.rope_dim_count, c.rope_freq_base, .norm, self.rope_factors);
+                ops.ropeInplace(
+                    self.q[off..][0..c.head_dim],
+                    r.pos,
+                    c.rope_dim_count,
+                    c.rope_freq_base,
+                    .norm,
+                    self.rope_factors,
+                );
             }
+
             h = 0;
             while (h < c.n_kv_heads) : (h += 1) {
                 const off = i * kvd + h * c.head_dim;
-                ops.ropeInplace(self.k_scratch[off..][0..c.head_dim], r.pos, c.rope_dim_count, c.rope_freq_base, .norm, self.rope_factors);
+                ops.ropeInplace(
+                    self.k_scratch[off..][0..c.head_dim],
+                    r.pos,
+                    c.rope_dim_count,
+                    c.rope_freq_base,
+                    .norm,
+                    self.rope_factors,
+                );
             }
-            // The one conversion seam: the f32 scratch pipeline never learns
+
+            // The one conversion boundary: the f32 scratch pipeline never learns
             // the dtype, and the commit narrows the finished rows. Zen 3 carries
             // F16C, so the compiler vectorizes this into hardware
             // round-to-nearest-even.
             switch (self.kv_dtype) {
                 .f32 => {
-                    @memcpy(self.kv_slots[r.slot].kDst(layer, r.pos), self.k_scratch[i * kvd ..][0..kvd]);
-                    @memcpy(self.kv_slots[r.slot].vDst(layer, r.pos), self.v_scratch[i * kvd ..][0..kvd]);
+                    @memcpy(
+                        self.kv_slots[r.slot].kDst(layer, r.pos),
+                        self.k_scratch[i * kvd ..][0..kvd],
+                    );
+                    @memcpy(
+                        self.kv_slots[r.slot].vDst(layer, r.pos),
+                        self.v_scratch[i * kvd ..][0..kvd],
+                    );
                 },
                 .f16 => {
                     const k_dst = self.kv_slots[r.slot].kDstAs(f16, layer, r.pos);
@@ -457,6 +576,7 @@ pub const LlamaRunner = struct {
                 },
             }
         }
+
         self.tEnd(t_rope, .rope);
 
         // Causal attention per row over its slot's positions 0..=pos. On the
@@ -469,6 +589,7 @@ pub const LlamaRunner = struct {
                 // Flag resolution refuses every dtype but f32 on this build arm,
                 // because `wrap.attentionSingle` uploads the slab as f32.
                 std.debug.assert(self.kv_dtype == .f32);
+
                 ops.attentionSingle(
                     self.q[i * qd ..][0..qd],
                     c.n_heads,
@@ -479,68 +600,108 @@ pub const LlamaRunner = struct {
                     t_len,
                     self.attn_out[i * qd ..][0..qd],
                 );
-            } else switch (self.kv_dtype) {
-                .f32 => parallel.attentionTyped(
-                    f32,
-                    ops,
-                    self.pool,
-                    self.policy,
-                    self.q[i * qd ..][0..qd],
-                    c.n_heads,
-                    c.head_dim,
-                    self.kv_slots[r.slot].kSlice(layer, r.pos),
-                    self.kv_slots[r.slot].vSlice(layer, r.pos),
-                    c.n_kv_heads,
-                    t_len,
-                    self.attn_parts,
-                    self.attn_out[i * qd ..][0..qd],
-                ),
-                .f16 => parallel.attentionTyped(
-                    f16,
-                    ops,
-                    self.pool,
-                    self.policy,
-                    self.q[i * qd ..][0..qd],
-                    c.n_heads,
-                    c.head_dim,
-                    self.kv_slots[r.slot].kSliceAs(f16, layer, r.pos),
-                    self.kv_slots[r.slot].vSliceAs(f16, layer, r.pos),
-                    c.n_kv_heads,
-                    t_len,
-                    self.attn_parts,
-                    self.attn_out[i * qd ..][0..qd],
-                ),
+            } else {
+                switch (self.kv_dtype) {
+                    .f32 => parallel.attentionTyped(
+                        f32,
+                        ops,
+                        self.pool,
+                        self.policy,
+                        self.q[i * qd ..][0..qd],
+                        c.n_heads,
+                        c.head_dim,
+                        self.kv_slots[r.slot].kSlice(layer, r.pos),
+                        self.kv_slots[r.slot].vSlice(layer, r.pos),
+                        c.n_kv_heads,
+                        t_len,
+                        self.attn_parts,
+                        self.attn_out[i * qd ..][0..qd],
+                    ),
+                    .f16 => parallel.attentionTyped(
+                        f16,
+                        ops,
+                        self.pool,
+                        self.policy,
+                        self.q[i * qd ..][0..qd],
+                        c.n_heads,
+                        c.head_dim,
+                        self.kv_slots[r.slot].kSliceAs(f16, layer, r.pos),
+                        self.kv_slots[r.slot].vSliceAs(f16, layer, r.pos),
+                        c.n_kv_heads,
+                        t_len,
+                        self.attn_parts,
+                        self.attn_out[i * qd ..][0..qd],
+                    ),
+                }
             }
         }
+
         self.tEnd(t_attn, .attention);
 
         // Project + residual.
-        try self.linearBatch(self.attn_out[0 .. n * qd], self.attn_o_w[layer].*, self.x_norm, n, .o_proj);
+        try self.linearBatch(
+            self.attn_out[0 .. n * qd],
+            self.attn_o_w[layer].*,
+            self.x_norm,
+            n,
+            .o_proj,
+        );
         const t_res1 = self.tBegin();
         for (0..n) |i| {
             ops.residualAdd(self.x_norm[i * d ..][0..d], self.x[i * d ..][0..d]);
         }
+
         self.tEnd(t_res1, .residual);
 
         // -- FFN / SwiGLU block ---------------------------------------------
         const t_fn = self.tBegin();
         for (0..n) |i| {
-            ops.rmsnorm(self.x[i * d ..][0..d], fp32View(self.ffn_norm_w[layer].*), c.rms_norm_eps, self.x_norm[i * d ..][0..d]);
+            ops.rmsnorm(
+                self.x[i * d ..][0..d],
+                fp32View(self.ffn_norm_w[layer].*),
+                c.rms_norm_eps,
+                self.x_norm[i * d ..][0..d],
+            );
         }
+
         self.tEnd(t_fn, .rmsnorm);
-        try self.linearBatch(self.x_norm[0 .. n * d], self.ffn_gate_w[layer].*, self.ffn_gate, n, .gate_up_proj);
-        try self.linearBatch(self.x_norm[0 .. n * d], self.ffn_up_w[layer].*, self.ffn_up, n, .gate_up_proj);
+        try self.linearBatch(
+            self.x_norm[0 .. n * d],
+            self.ffn_gate_w[layer].*,
+            self.ffn_gate,
+            n,
+            .gate_up_proj,
+        );
+        try self.linearBatch(
+            self.x_norm[0 .. n * d],
+            self.ffn_up_w[layer].*,
+            self.ffn_up,
+            n,
+            .gate_up_proj,
+        );
         const fd = c.feed_forward_length;
         const t_sg = self.tBegin();
         for (0..n) |i| {
-            ops.swiglu(self.ffn_gate[i * fd ..][0..fd], self.ffn_up[i * fd ..][0..fd], self.ffn_gate[i * fd ..][0..fd]);
+            ops.swiglu(
+                self.ffn_gate[i * fd ..][0..fd],
+                self.ffn_up[i * fd ..][0..fd],
+                self.ffn_gate[i * fd ..][0..fd],
+            );
         }
+
         self.tEnd(t_sg, .swiglu);
-        try self.linearBatch(self.ffn_gate[0 .. n * fd], self.ffn_down_w[layer].*, self.ffn_down, n, .down_proj);
+        try self.linearBatch(
+            self.ffn_gate[0 .. n * fd],
+            self.ffn_down_w[layer].*,
+            self.ffn_down,
+            n,
+            .down_proj,
+        );
         const t_res2 = self.tBegin();
         for (0..n) |i| {
             ops.residualAdd(self.ffn_down[i * d ..][0..d], self.x[i * d ..][0..d]);
         }
+
         self.tEnd(t_res2, .residual);
     }
 
@@ -553,6 +714,7 @@ pub const LlamaRunner = struct {
         std.debug.assert(target_slot < self.n_slots);
         std.debug.assert(source_slot != target_slot);
         std.debug.assert(pos <= self.max_seq);
+
         self.kv_slots[target_slot].copyFrom(&self.kv_slots[source_slot], pos);
     }
 
@@ -580,15 +742,20 @@ pub const LlamaRunner = struct {
         std.debug.assert(n_rows >= 1); // a blob must hold rows to restore from
         std.debug.assert(n_rows <= self.max_seq);
         std.debug.assert(out.len == @as(usize, @intCast(self.evictSlotBytesFor(n_rows))));
+
         const kv = &self.kv_slots[slot];
         var off: usize = 0;
         var layer: u32 = 0;
         while (layer < self.n_layers) : (layer += 1) {
-            for ([_][]const u8{ kv.kRowsBytes(layer, n_rows), kv.vRowsBytes(layer, n_rows) }) |bytes| {
+            for ([_][]const u8{
+                kv.kRowsBytes(layer, n_rows),
+                kv.vRowsBytes(layer, n_rows),
+            }) |bytes| {
                 @memcpy(out[off..][0..bytes.len], bytes);
                 off += bytes.len;
             }
         }
+
         std.debug.assert(off == out.len);
     }
 
@@ -598,29 +765,43 @@ pub const LlamaRunner = struct {
         std.debug.assert(n_rows >= 1); // a blob must hold rows to restore from
         std.debug.assert(n_rows <= self.max_seq);
         std.debug.assert(blob.len == @as(usize, @intCast(self.evictSlotBytesFor(n_rows))));
+
         const kv = &self.kv_slots[slot];
         var off: usize = 0;
         var layer: u32 = 0;
         while (layer < self.n_layers) : (layer += 1) {
-            for ([_][]u8{ kv.kRowsBytesMut(layer, n_rows), kv.vRowsBytesMut(layer, n_rows) }) |bytes| {
+            for ([_][]u8{
+                kv.kRowsBytesMut(layer, n_rows),
+                kv.vRowsBytesMut(layer, n_rows),
+            }) |bytes| {
                 @memcpy(bytes, blob[off..][0..bytes.len]);
                 off += bytes.len;
             }
         }
+
         std.debug.assert(off == blob.len);
     }
 
     // -- matmul dispatch ----------------------------------------------------
 
     /// See the shared `linear_dispatch.linearBatchDispatch`. The method binds
-    /// the pool and the policy of this runner. It is also the one seam
+    /// the pool and the policy of this runner. It is also the one interface
     /// every row-parallel matmul of the step passes through, so the CPU timer
     /// charges all five matmul categories here and the layer body stays a
     /// straight datapath sequence.
-    fn linearBatch(r: *const LlamaRunner, inputs: []const f32, w: Tensor, outs: []f32, batch: usize, cat: ProfileCat) Error!void {
+    fn linearBatch(
+        r: *const LlamaRunner,
+        inputs: []const f32,
+        w: Tensor,
+        outs: []f32,
+        batch: usize,
+        cat: ProfileCat,
+    ) Error!void {
         std.debug.assert(cat.isMatmul());
+
         const t0 = r.tBegin();
         defer r.tEnd(t0, cat);
+
         return linear_dispatch.linearBatchDispatch(r.pool, r.policy, inputs, w, outs, batch);
     }
 };
@@ -633,20 +814,34 @@ const test_fixtures = @import("../core/test_fixtures.zig");
 test "cpu profile: the categories partition one decode step" {
     // The instrument exists only in a `-Dtrace` build, and the GPU per-op
     // backend dispatches to a device this test must not touch.
-    if (comptime !core_log.hot or build_options.use_vulkan_ops) return error.SkipZigTest else {
+    if (comptime !core_log.hot or build_options.use_vulkan_ops) {
+        return error.SkipZigTest;
+    } else {
         const io = std.testing.io;
         var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
         defer arena_state.deinit();
+
         const arena = arena_state.allocator();
         const fixture = try test_fixtures.path(arena, "SmolLM2-135M-Instruct-Q8_0");
 
         var loaded = try loader.load(io, arena, fixture);
         defer loaded.close();
+
         const max_seq = @min(loaded.card.context_length, test_fakes.test_window);
         var pool: Pool = undefined;
         try pool.init(io, 1, 0);
         defer pool.deinit();
-        var r = try LlamaRunner.init(arena, &loaded, kv_budget.pinned(1, max_seq), 0, io, &pool, .{ .n_threads = 1 }, .f32);
+
+        var r = try LlamaRunner.init(
+            arena,
+            &loaded,
+            kv_budget.pinned(1, max_seq),
+            0,
+            io,
+            &pool,
+            .{ .n_threads = 1 },
+            .f32,
+        );
 
         // One unprofiled step faults in the weight pages, so the measured step
         // pays no first-touch cost the brackets cannot see.
@@ -671,6 +866,7 @@ test "cpu profile: the categories partition one decode step" {
                 try std.testing.expectEqual(@as(u64, 0), prof.nsOf(cat));
             }
         }
+
         // Disjoint: two overlapping brackets charge one nanosecond twice, which
         // pushes the sum past the wall time of the step.
         try std.testing.expect(prof.total() <= wall);

@@ -27,19 +27,27 @@ fn runVecAddCheck(allocator: std.mem.Allocator, n: usize) !void {
         else => return e,
     };
     defer runner.deinit();
+
     const kernel = &runner.vec_add;
 
     const a = try allocator.alloc(f32, n);
     defer allocator.free(a);
+
     const b = try allocator.alloc(f32, n);
     defer allocator.free(b);
+
     const out_gpu = try allocator.alloc(f32, n);
     defer allocator.free(out_gpu);
 
     // The ramp exposes an off-by-one index or a wrong stride without a wide
     // range of magnitudes.
-    for (a, 0..) |*v, i| v.* = @floatFromInt(i);
-    for (b, 0..) |*v, i| v.* = @as(f32, @floatFromInt(i)) * -0.5 + 1.0;
+    for (a, 0..) |*v, i| {
+        v.* = @floatFromInt(i);
+    }
+
+    for (b, 0..) |*v, i| {
+        v.* = @as(f32, @floatFromInt(i)) * -0.5 + 1.0;
+    }
 
     try kernel.run(a, b, out_gpu);
 

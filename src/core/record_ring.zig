@@ -60,15 +60,12 @@ pub const DecodeKey = struct {
     pub fn next(self: DecodeKey, max_seq: u32) ?DecodeKey {
         std.debug.assert(self.pos < max_seq);
         std.debug.assert(self.opts.one_time);
+
         if (self.pos + 1 >= max_seq) return null;
+
         return .{ .pos = self.pos + 1, .opts = self.opts };
     }
 };
-
-/// The decode key of `pos` at `level`.
-pub fn decodeKey(pos: u32, level: span.GpuLevel) DecodeKey {
-    return .{ .pos = pos, .opts = .{ .level = level } };
-}
 
 pub fn Slot(comptime Key: type) type {
     return union(enum) {
@@ -116,12 +113,14 @@ pub fn RecordRing(comptime Key: type) type {
         /// is a hit. A miss names buffer `a`, which the caller then records.
         pub fn prepare(self: *const Self, w: Key) Prepared {
             std.debug.assert(self.pendingCount() == 0);
+
             inline for (.{ Buf.a, Buf.b }) |c| {
                 switch (self.get(c)) {
                     .recorded => |k| if (std.meta.eql(k, w)) return .{ .buf = c, .hit = true },
                     else => {},
                 }
             }
+
             return .{ .buf = .a, .hit = false };
         }
 
@@ -129,6 +128,7 @@ pub fn RecordRing(comptime Key: type) type {
         /// this discards a recording that no step submitted.
         pub fn beginRecord(self: *Self, c: Buf) bool {
             std.debug.assert(!self.isPending(c));
+
             const wasted = self.get(c) == .recorded;
             self.slots[@intFromEnum(c)] = .free;
             return wasted;
@@ -137,16 +137,19 @@ pub fn RecordRing(comptime Key: type) type {
         /// Buffer `c` now holds the commands of key `k`.
         pub fn endRecord(self: *Self, c: Buf, k: Key) void {
             std.debug.assert(self.get(c) == .free);
+
             self.slots[@intFromEnum(c)] = .{ .recorded = k };
         }
 
         /// Submit buffer `c`, which must hold `recorded w`.
         pub fn submit(self: *Self, c: Buf, w: Key) void {
             std.debug.assert(self.pendingCount() == 0);
+
             switch (self.get(c)) {
                 .recorded => |k| std.debug.assert(std.meta.eql(k, w)),
                 else => unreachable,
             }
+
             self.slots[@intFromEnum(c)] = .{ .pending = w };
             std.debug.assert(self.pendingCount() == 1);
         }
@@ -156,6 +159,7 @@ pub fn RecordRing(comptime Key: type) type {
         pub fn speculateTarget(self: *const Self, c: Buf) Buf {
             std.debug.assert(self.isPending(c));
             std.debug.assert(!self.isPending(c.other()));
+
             return c.other();
         }
 
@@ -163,6 +167,7 @@ pub fn RecordRing(comptime Key: type) type {
         /// it becomes free.
         pub fn complete(self: *Self, c: Buf) void {
             std.debug.assert(self.isPending(c));
+
             self.slots[@intFromEnum(c)] = .free;
             std.debug.assert(self.pendingCount() == 0);
         }
@@ -171,11 +176,16 @@ pub fn RecordRing(comptime Key: type) type {
         /// the count of recordings that no step submitted.
         pub fn invalidate(self: *Self) u2 {
             std.debug.assert(self.pendingCount() == 0);
+
             var wasted: u2 = 0;
             for (&self.slots) |*s| {
-                if (s.* == .recorded) wasted += 1;
+                if (s.* == .recorded) {
+                    wasted += 1;
+                }
+
                 s.* = .free;
             }
+
             return wasted;
         }
 
@@ -187,6 +197,13 @@ pub fn RecordRing(comptime Key: type) type {
     };
 }
 
+// -- api --------------------------------------------------------------------
+
+/// The decode key of `pos` at `level`.
+pub fn decodeKey(pos: u32, level: span.GpuLevel) DecodeKey {
+    return .{ .pos = pos, .opts = .{ .level = level } };
+}
+
 // -- tests ------------------------------------------------------------------
 
 const Ring = RecordRing(u32);
@@ -196,15 +213,23 @@ const Ring = RecordRing(u32);
 fn stepOnce(r: *Ring, w: u32, next: ?u32, wasted: *u32) Prepared {
     const p = r.prepare(w);
     if (!p.hit) {
-        if (r.beginRecord(p.buf)) wasted.* += 1;
+        if (r.beginRecord(p.buf)) {
+            wasted.* += 1;
+        }
+
         r.endRecord(p.buf, w);
     }
+
     r.submit(p.buf, w);
     if (next) |k| {
         const o = r.speculateTarget(p.buf);
-        if (r.beginRecord(o)) wasted.* += 1;
+        if (r.beginRecord(o)) {
+            wasted.* += 1;
+        }
+
         r.endRecord(o, k);
     }
+
     std.debug.assert(r.pendingCount() == 1);
     r.complete(p.buf);
     return p;
@@ -247,9 +272,15 @@ test "RecordRing: a decode run of n steps hits n - 1 times after the first miss"
     var pos: u32 = 100;
     while (pos < 100 + n) : (pos += 1) {
         const p = stepOnce(&r, pos, pos + 1, &wasted);
-        if (p.hit) hits += 1;
-        if (pos == 100) try std.testing.expect(!p.hit);
+        if (p.hit) {
+            hits += 1;
+        }
+
+        if (pos == 100) {
+            try std.testing.expect(!p.hit);
+        }
     }
+
     try std.testing.expectEqual(n - 1, hits);
     try std.testing.expectEqual(@as(u32, 0), wasted);
     // The last speculation stays recorded until something discards it.
@@ -284,6 +315,7 @@ fn checkRingModel(_: void, seed: u64) anyerror!void {
             // Another submit on the runner.
             else => _ = r.invalidate(),
         }
+
         const before = r;
         const next: ?u32 = if (rnd.boolean()) pos + 1 else null;
         const p = stepOnce(&r, pos, next, &wasted);
@@ -294,15 +326,24 @@ fn checkRingModel(_: void, seed: u64) anyerror!void {
             try std.testing.expect(before.get(.a) != .recorded or before.get(.a).recorded != pos);
             try std.testing.expect(before.get(.b) != .recorded or before.get(.b).recorded != pos);
         }
+
         // After the step the submitted buffer is free and nothing is pending.
         try std.testing.expectEqual(@as(u2, 0), r.pendingCount());
         try std.testing.expectEqual(Ring.SlotT.free, r.get(p.buf));
-        if (next) |k| try std.testing.expectEqual(Ring.SlotT{ .recorded = k }, r.get(p.buf.other()));
+        if (next) |k| {
+            try std.testing.expectEqual(Ring.SlotT{ .recorded = k }, r.get(p.buf.other()));
+        }
     }
 }
 
 test "RecordRing: the model invariants hold over seeded random op sequences" {
-    try prop.forAll(.{ .site = 0x5eed_0036, .cases = 200 }, {}, u64, prop.genSeed(void), checkRingModel);
+    try prop.forAll(
+        .{ .site = 0x5eed_0036, .cases = 200 },
+        {},
+        u64,
+        prop.genSeed(void),
+        checkRingModel,
+    );
 }
 
 test "DecodeKey: a key at one level never equals the key at another" {
@@ -317,5 +358,6 @@ test "DecodeKey: a key at one level never equals the key at another" {
             try std.testing.expectEqual(a == b, std.meta.eql(ka.next(64).?, kb.next(64).?));
         }
     }
+
     try std.testing.expect(decodeKey(63, .submit).next(64) == null);
 }

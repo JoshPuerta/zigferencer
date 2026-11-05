@@ -1,4 +1,4 @@
-//! Equivalence gate for the llama prefix seam. A runner that `initPrefix` builds at
+//! Equivalence gate for the llama prefix boundary. A runner that `initPrefix` builds at
 //! the layer count of the model runs the same layers as the runner that `init`
 //! builds. Both runners use the same weights and the same KV.
 //!
@@ -52,19 +52,32 @@ test "llama initPrefix at the full layer count reproduces the whole-model residu
     const gpa = std.testing.allocator;
     var arena_state = std.heap.ArenaAllocator.init(gpa);
     defer arena_state.deinit();
+
     const arena = arena_state.allocator();
     const fixture = try z.test_fixtures.path(arena, "SmolLM2-135M-Instruct-Q8_0");
 
     var loaded = try loader.load(io, arena, fixture);
     defer loaded.close();
+
     const policy: tp.Policy = .{ .n_threads = 1 };
     var cpu_pool: tp.Pool = undefined;
     try tp.startPool(&cpu_pool, io, policy);
     defer cpu_pool.deinit();
+
     const plan = z.kv_budget.pinned(1, window);
 
     var full = try LlamaRunner.init(arena, &loaded, plan, 0, io, &cpu_pool, policy, .f32);
-    var prefix = try LlamaRunner.initPrefix(arena, &loaded, plan, loaded.card.n_layers, 0, io, &cpu_pool, policy, .f32);
+    var prefix = try LlamaRunner.initPrefix(
+        arena,
+        &loaded,
+        plan,
+        loaded.card.n_layers,
+        0,
+        io,
+        &cpu_pool,
+        policy,
+        .f32,
+    );
     try std.testing.expectEqual(loaded.card.n_layers, full.n_layers);
     try std.testing.expectEqual(full.n_layers, prefix.n_layers);
 
@@ -84,22 +97,35 @@ test "llama initPrefix sizes the weight slices and the KV to its own layer count
     const gpa = std.testing.allocator;
     var arena_state = std.heap.ArenaAllocator.init(gpa);
     defer arena_state.deinit();
+
     const arena = arena_state.allocator();
     const fixture = try z.test_fixtures.path(arena, "SmolLM2-135M-Instruct-Q8_0");
 
     var loaded = try loader.load(io, arena, fixture);
     defer loaded.close();
+
     const policy: tp.Policy = .{ .n_threads = 1 };
     var cpu_pool: tp.Pool = undefined;
     try tp.startPool(&cpu_pool, io, policy);
     defer cpu_pool.deinit();
+
     const plan = z.kv_budget.pinned(1, window);
     const n_layers = loaded.card.n_layers;
     std.debug.assert(n_layers >= 2); // the split needs a layer on each side
 
     const half: u32 = n_layers / 2;
     var full = try LlamaRunner.init(arena, &loaded, plan, 0, io, &cpu_pool, policy, .f32);
-    var short = try LlamaRunner.initPrefix(arena, &loaded, plan, half, 0, io, &cpu_pool, policy, .f32);
+    var short = try LlamaRunner.initPrefix(
+        arena,
+        &loaded,
+        plan,
+        half,
+        0,
+        io,
+        &cpu_pool,
+        policy,
+        .f32,
+    );
     try std.testing.expectEqual(half, short.n_layers);
     try std.testing.expectEqual(@as(usize, half), short.attn_q_w.len);
     try std.testing.expectEqual(@as(usize, half), short.ffn_down_w.len);

@@ -2,7 +2,8 @@
 //! with the GPU kernels in `kernels.zig`. The inference Runner then drives the
 //! GPU through the exact op signatures it already calls on the CPU. The CPU op
 //! API has no whole-row attention op, so this module exports its own
-//! `attentionSingle` for the per-op branch of the runners. The backing is hybrid. The heavy ops run on the GPU. The small or
+//! `attentionSingle` for the per-op branch of the runners. The backing is hybrid. The heavy ops run
+//! on the GPU. The small or
 //! fragmented ones stay on the CPU: the embedding lookup, the per-head RoPE, and
 //! the f32 norms. Their microsecond cost beats the fixed overhead of a dispatch.
 //!
@@ -38,7 +39,7 @@ comptime {
     }
 }
 
-// -- types ------------------------------------------------------------------
+// -- constants --------------------------------------------------------------
 
 pub const requires: op_requires.OpRequires = .{
     .arch = .any,
@@ -50,9 +51,12 @@ pub const requires: op_requires.OpRequires = .{
     .tolerance = .{ .relative = 2e-3 },
 };
 
+// -- types ------------------------------------------------------------------
+
 pub const InitError = vulkan_runner.Runner.InitError;
 
 // -- state ------------------------------------------------------------------
+
 //
 // These globals are deliberate. They hold the Runner that owns the GPU context
 // and the kernels, the VRAM weight cache, and the lazily built GdnDecode
@@ -72,7 +76,6 @@ pub const InitError = vulkan_runner.Runner.InitError;
 // nothing outside this file observes it. The contrast is the fused path in
 // `runtime/llama_fused.zig`. Its unit of work is a whole forward pass, owned by
 // one explicit LlamaFusedRunner value. A per-op function has no such natural owner.
-
 var g_runner: ?*vulkan_runner.Runner = null;
 var g_weight_cache: std.AutoHashMap(usize, kernels.Q80Weight) = undefined;
 var g_initialized: bool = false;
@@ -92,9 +95,9 @@ pub const linearF32Batch = naive.linearF32Batch;
 pub const ropeInplace = naive.ropeInplace;
 
 // -- lifecycle --------------------------------------------------------------
-
 pub fn initBackend(alloc: std.mem.Allocator, options: vulkan_ctx.Options) InitError!void {
     if (g_initialized) return;
+
     g_runner = try vulkan_runner.Runner.initWith(alloc, options);
     g_weight_cache = std.AutoHashMap(usize, kernels.Q80Weight).init(alloc);
     g_initialized = true;
@@ -102,12 +105,17 @@ pub fn initBackend(alloc: std.mem.Allocator, options: vulkan_ctx.Options) InitEr
 
 pub fn deinitBackend() void {
     if (!g_initialized) return;
+
     if (g_gdn) |*g| {
         g.deinit();
         g_gdn = null;
     }
+
     var it = g_weight_cache.valueIterator();
-    while (it.next()) |w| w.deinit();
+    while (it.next()) |w| {
+        w.deinit();
+    }
+
     g_weight_cache.deinit();
     g_runner.?.deinit();
     g_runner = null;
@@ -115,10 +123,10 @@ pub fn deinitBackend() void {
 }
 
 // -- gpu ops ----------------------------------------------------------------
-
 pub fn linearF32Q80(input: []const f32, weight: Tensor, out: []f32) void {
     std.debug.assert(weight.dtype == .q8_0);
     std.debug.assert(weight.n_dims == 2);
+
     const r = runner();
 
     // VRAM weight cache. The key is the pointer of the slice, so a weight that
@@ -129,7 +137,12 @@ pub fn linearF32Q80(input: []const f32, weight: Tensor, out: []f32) void {
     if (!gop.found_existing) {
         const in_features: usize = @intCast(weight.shape[0]);
         const out_features: usize = @intCast(weight.shape[1]);
-        gop.value_ptr.* = kernels.Q80Weight.init(&r.ctx, weight.data, in_features, out_features) catch |e|
+        gop.value_ptr.* = kernels.Q80Weight.init(
+            &r.ctx,
+            weight.data,
+            in_features,
+            out_features,
+        ) catch |e|
             std.debug.panic("ops_vulkan.wrap: Q80Weight.init failed: {t}", .{e});
     }
 
@@ -140,7 +153,13 @@ pub fn linearF32Q80(input: []const f32, weight: Tensor, out: []f32) void {
 /// Per-row batch over the GPU matvec: one dispatch per row, with no weight-reuse
 /// win beyond the VRAM cache it already has. The GPU batching of the engine
 /// lives in the fused multi-stream path, not in this per-op backend.
-pub fn linearF32Q80Batch(inputs: []const f32, weight: Tensor, outs: []f32, batch: usize, out_stride: usize) void {
+pub fn linearF32Q80Batch(
+    inputs: []const f32,
+    weight: Tensor,
+    outs: []f32,
+    batch: usize,
+    out_stride: usize,
+) void {
     naive.linearBatchPerRow(linearF32Q80, inputs, weight, outs, batch, out_stride);
 }
 
@@ -207,7 +226,25 @@ pub fn gdnStep(
         g_gdn = kernels.GdnDecode.init(&runner().ctx) catch |e|
             std.debug.panic("ops_vulkan.wrap: GdnDecode.init failed: {t}", .{e});
     }
-    g_gdn.?.run(n_k_heads, n_v_heads, head_dim, conv_kernel, qkv, z, alpha, beta_in, conv_w, ssm_a, dt_bias, ssm_norm, eps, state, conv_state, o_out) catch |e|
+
+    g_gdn.?.run(
+        n_k_heads,
+        n_v_heads,
+        head_dim,
+        conv_kernel,
+        qkv,
+        z,
+        alpha,
+        beta_in,
+        conv_w,
+        ssm_a,
+        dt_bias,
+        ssm_norm,
+        eps,
+        state,
+        conv_state,
+        o_out,
+    ) catch |e|
         std.debug.panic("ops_vulkan.wrap: gdnStep failed: {t}", .{e});
 }
 

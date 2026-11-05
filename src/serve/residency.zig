@@ -66,8 +66,6 @@ const ServeStats = struct {
     restore_ms: f64,
 };
 
-// -- api --------------------------------------------------------------------
-
 pub fn Residency(comptime SessionsT: type) type {
     return struct {
         const Self = @This();
@@ -76,7 +74,7 @@ pub fn Residency(comptime SessionsT: type) type {
         /// identity (no over-subscription).
         const can_evict = @hasDecl(Runner, "evictSlot");
         pub const can_clone = SessionsT.can_clone;
-        /// The prefix snapshot/restore surface rides the same runner hook the
+        /// The prefix snapshot/restore surface goes through the same runner hook the
         /// swap tier evicts with, so a pool that can evict can also seed a
         /// session from a cached prefix.
         pub const can_snapshot = can_evict;
@@ -119,15 +117,28 @@ pub fn Residency(comptime SessionsT: type) type {
         /// ledger budget of the boot's blob tier: zero refuses every eviction,
         /// and null enforces nothing. The boot logs the tier, so this init logs
         /// nothing.
-        pub fn init(arena: Allocator, gpa: Allocator, sessions: *SessionsT, n_logical: u32, blob_budget: ?u64) Allocator.Error!Self {
+        pub fn init(
+            arena: Allocator,
+            gpa: Allocator,
+            sessions: *SessionsT,
+            n_logical: u32,
+            blob_budget: ?u64,
+        ) Allocator.Error!Self {
             const n_physical = sessions.runner.n_slots;
             std.debug.assert(n_logical >= 1);
             std.debug.assert(n_logical <= limits.max_logical_sessions);
             if (comptime !can_evict) std.debug.assert(n_logical <= n_physical);
+
             const entries = try arena.alloc(Entry, n_logical);
-            for (entries) |*e| e.* = .{};
+            for (entries) |*e| {
+                e.* = .{};
+            }
+
             const phys_owner = try arena.alloc(?u32, n_physical);
-            for (phys_owner) |*o| o.* = null;
+            for (phys_owner) |*o| {
+                o.* = null;
+            }
+
             return .{
                 .gpa = gpa,
                 .sessions = sessions,
@@ -146,7 +157,10 @@ pub fn Residency(comptime SessionsT: type) type {
         /// Free every RAM blob. The ledger must drain to zero: a residue means
         /// a blob was charged without a matching credit.
         pub fn deinit(self: *Self) void {
-            for (self.entries) |*e| self.dropBlob(e);
+            for (self.entries) |*e| {
+                self.dropBlob(e);
+            }
+
             std.debug.assert(self.ram_used == 0);
         }
 
@@ -163,6 +177,7 @@ pub fn Residency(comptime SessionsT: type) type {
         /// means the same blob was credited twice.
         fn credit(self: *Self, bytes: u64) void {
             std.debug.assert(bytes <= self.ram_used);
+
             self.ram_used -= bytes;
         }
 
@@ -171,6 +186,7 @@ pub fn Residency(comptime SessionsT: type) type {
         /// slot instead.
         fn dropBlob(self: *Self, e: *Entry) void {
             if (e.blob.bytes.len == 0) return;
+
             self.credit(e.blob.bytes.len);
             self.gpa.free(e.blob.bytes);
             e.blob = .{};
@@ -182,8 +198,12 @@ pub fn Residency(comptime SessionsT: type) type {
         /// `init` caps at `limits.max_logical_sessions`.
         fn assertLedger(self: *const Self) void {
             if (comptime !std.debug.runtime_safety) return;
+
             var total: u64 = 0;
-            for (self.entries) |*e| total += e.blob.bytes.len;
+            for (self.entries) |*e| {
+                total += e.blob.bytes.len;
+            }
+
             std.debug.assert(total == self.ram_used);
             if (self.blob_budget) |budget| std.debug.assert(self.ram_used <= budget);
         }
@@ -194,12 +214,18 @@ pub fn Residency(comptime SessionsT: type) type {
         }
 
         fn freeLogical(self: *Self) ?u32 {
-            for (self.entries, 0..) |*e, i| if (!e.used) return @intCast(i);
+            for (self.entries, 0..) |*e, i| {
+                if (!e.used) return @intCast(i);
+            }
+
             return null;
         }
 
         fn freePhys(self: *const Self) ?u32 {
-            for (self.phys_owner, 0..) |o, i| if (o == null) return @intCast(i);
+            for (self.phys_owner, 0..) |o, i| {
+                if (o == null) return @intCast(i);
+            }
+
             return null;
         }
 
@@ -220,8 +246,11 @@ pub fn Residency(comptime SessionsT: type) type {
             for (self.entries, 0..) |*e, i| {
                 const phys = e.phys orelse continue;
                 if (indexOf(exclude, phys) != null) continue;
-                if (best == null or e.last_used < self.entries[best.?].last_used) best = @intCast(i);
+                if (best == null or e.last_used < self.entries[best.?].last_used) {
+                    best = @intCast(i);
+                }
             }
+
             return best;
         }
 
@@ -230,21 +259,27 @@ pub fn Residency(comptime SessionsT: type) type {
         /// both tell the caller to park the turn and retry next tick.
         pub fn ensureResident(self: *Self, id: u32, exclude: []const u32) !void {
             std.debug.assert(id < self.entries.len);
+
             const e = &self.entries[id];
             std.debug.assert(e.used);
             if (e.phys != null) {
                 e.last_used = self.bump();
                 return;
             }
+
             var slot = self.freePhys();
             if (slot == null) {
-                if (comptime !can_evict) unreachable; // n_logical <= n_physical guarantees a free slot
+                if (comptime !can_evict) {
+                    unreachable; // n_logical <= n_physical guarantees a free slot
+                }
+
                 const victim = self.lruVictim(exclude) orelse {
                     log.debug("admit: engine {d} blocked, all slots pinned", .{id});
                     return error.NoEvictableSlot;
                 };
                 slot = try self.evictEntry(victim);
             }
+
             try self.placeEntry(id, slot.?);
             self.assertLedger();
         }
@@ -269,20 +304,27 @@ pub fn Residency(comptime SessionsT: type) type {
                     // copy, so a refusal leaves the pool exactly as it was.
                     if (self.blob_budget) |budget| {
                         if (self.ram_used - held + need > budget) {
-                            log.debug("evict refused: engine {d} wants {d} ram bytes, {d} in use, budget {d}", .{ victim, need, self.ram_used, budget });
+                            log.debug(
+                                "evict refused: engine {d} wants {d} ram bytes, {d} in use, " ++
+                                    "budget {d}",
+                                .{ victim, need, self.ram_used, budget },
+                            );
                             return error.RamBudgetExceeded;
                         }
                     }
+
                     if (need != held) {
                         const resized = try self.gpa.realloc(e.blob.bytes, need);
                         self.credit(held);
                         e.blob.bytes = resized;
                         self.charge(need);
                     }
+
                     // A failed device copy leaves the blob bytes stale. The
                     // session keeps its slot on this path, so VRAM stays the
                     // authoritative copy and the stale blob must go.
                     errdefer self.dropBlob(e);
+
                     const t0 = core_log.now();
                     try self.sessions.runner.evictSlot(s, n_rows, e.blob.bytes);
                     const t1 = core_log.now();
@@ -293,6 +335,7 @@ pub fn Residency(comptime SessionsT: type) type {
                     e.ever_resident = true;
                 }
             }
+
             e.saved = self.sessions.table[s]; // capture bookkeeping
             log.debug("swap-out: engine {d} slot {d} pos {d}", .{ victim, s, n_rows });
             self.phys_owner[s] = null;
@@ -306,15 +349,24 @@ pub fn Residency(comptime SessionsT: type) type {
         /// recurrent state (a fresh session reusing a vacated slot).
         fn placeEntry(self: *Self, id: u32, s: u32) !void {
             std.debug.assert(self.phys_owner[s] == null);
+
             const e = &self.entries[id];
             self.sessions.table[s] = e.saved;
-            if (e.ever_resident)
-                log.debug("swap-in: engine {d} slot {d} pos {d}", .{ id, s, e.saved.pos })
-            else
+            if (e.ever_resident) {
+                log.debug("swap-in: engine {d} slot {d} pos {d}", .{ id, s, e.saved.pos });
+            } else {
                 log.debug("place: engine {d} slot {d} (fresh)", .{ id, s });
+            }
+
             if (comptime can_evict) {
                 if (e.ever_resident) {
-                    std.debug.assert(e.blob.bytes.len == @as(usize, @intCast(self.sessions.runner.evictSlotBytesFor(e.blob.n_rows))));
+                    std.debug.assert(
+                        e.blob.bytes.len == @as(
+                            usize,
+                            @intCast(self.sessions.runner.evictSlotBytesFor(e.blob.n_rows)),
+                        ),
+                    );
+
                     // The blob is the only copy until the restore lands, so a
                     // failed restore must keep it. After a successful one VRAM
                     // is authoritative, and a retained blob makes the steady
@@ -330,8 +382,11 @@ pub fn Residency(comptime SessionsT: type) type {
                     self.sessions.runner.resetSlotState(s);
                 }
             } else if (comptime @hasDecl(Runner, "resetSlotState")) {
-                if (!e.ever_resident) self.sessions.runner.resetSlotState(s);
+                if (!e.ever_resident) {
+                    self.sessions.runner.resetSlotState(s);
+                }
             }
+
             self.phys_owner[s] = id;
             e.phys = s;
             e.last_used = self.bump();
@@ -343,7 +398,10 @@ pub fn Residency(comptime SessionsT: type) type {
         pub fn logBlobs(self: *const Self) void {
             for (self.entries, 0..) |*e, id| {
                 if (!e.used or e.blob.bytes.len == 0) continue;
-                log.debug("ram blob: engine {d}, {d} rows, {d} KiB", .{ id, e.blob.n_rows, e.blob.bytes.len / 1024 });
+                log.debug(
+                    "ram blob: engine {d}, {d} rows, {d} KiB",
+                    .{ id, e.blob.n_rows, e.blob.bytes.len / 1024 },
+                );
             }
         }
 
@@ -354,6 +412,7 @@ pub fn Residency(comptime SessionsT: type) type {
         pub fn create(self: *Self, seed: u64, params: sampler.Params) error{NoFreeSession}!u32 {
             std.debug.assert(params.temperature >= 0);
             std.debug.assert(params.top_p > 0);
+
             const id = self.freeLogical() orelse return error.NoFreeSession;
             self.entries[id] = .{
                 .used = true,
@@ -373,6 +432,7 @@ pub fn Residency(comptime SessionsT: type) type {
         /// its own seed/sampling. Both sides end resident.
         pub fn clone(self: *Self, source: u32, seed: u64, params: sampler.Params) !u32 {
             if (comptime !can_clone) @compileError("runner cannot clone slot state");
+
             std.debug.assert(source < self.entries.len);
             std.debug.assert(self.entries[source].used);
             try self.ensureResident(source, &.{});
@@ -382,6 +442,7 @@ pub fn Residency(comptime SessionsT: type) type {
             // A residency refusal must not keep the claim. Otherwise a client
             // that retries a refused clone spends a logical session per try.
             errdefer self.entries[id] = .{};
+
             try self.ensureResident(id, &.{src_phys});
             const dst_phys = self.entries[id].phys.?;
             const src = self.sessions.table[src_phys];
@@ -420,6 +481,7 @@ pub fn Residency(comptime SessionsT: type) type {
         /// `blob` stays caller-owned, so the RAM ledger never sees it.
         pub fn restorePrefix(self: *Self, id: u32, n_rows: u32, blob: []const u8) !void {
             if (comptime !can_snapshot) @compileError("runner cannot snapshot slot state");
+
             std.debug.assert(id < self.entries.len);
             std.debug.assert(self.entries[id].used);
             // A restore writes rows 0..n_rows and lifts `pos` off zero, so a
@@ -435,13 +497,21 @@ pub fn Residency(comptime SessionsT: type) type {
         /// refusal semantics match `restorePrefix`: any failure leaves the
         /// session cold at position zero, so the caller degrades to a cold
         /// prefill.
-        pub fn restoreReady(self: *Self, id: u32, n_rows: u32, blob: []const u8, logits: []const f32) !u32 {
+        pub fn restoreReady(
+            self: *Self,
+            id: u32,
+            n_rows: u32,
+            blob: []const u8,
+            logits: []const f32,
+        ) !u32 {
             if (comptime !can_snapshot) @compileError("runner cannot snapshot slot state");
+
             std.debug.assert(id < self.entries.len);
             std.debug.assert(self.entries[id].used);
             std.debug.assert(self.liveOrSaved(id).pos == 0);
             try self.ensureResident(id, &.{});
             defer self.assertLedger();
+
             return self.sessions.restoreReady(self.entries[id].phys.?, n_rows, blob, logits);
         }
 
@@ -450,6 +520,7 @@ pub fn Residency(comptime SessionsT: type) type {
         /// resident.
         pub fn copyFinalLogits(self: *Self, id: u32, out: []f32) void {
             std.debug.assert(id < self.entries.len);
+
             const e = &self.entries[id];
             std.debug.assert(e.used);
             std.debug.assert(e.phys != null);
@@ -463,6 +534,7 @@ pub fn Residency(comptime SessionsT: type) type {
         /// for nothing.
         pub fn snapshotPrefix(self: *Self, id: u32, n_rows: u32, out: []u8) !void {
             if (comptime !can_snapshot) @compileError("runner cannot snapshot slot state");
+
             std.debug.assert(id < self.entries.len);
             const e = &self.entries[id];
             std.debug.assert(e.used);
@@ -475,12 +547,14 @@ pub fn Residency(comptime SessionsT: type) type {
         /// later charge.
         pub fn destroy(self: *Self, id: u32) void {
             std.debug.assert(id < self.entries.len);
+
             const e = &self.entries[id];
             std.debug.assert(e.used);
             if (e.phys) |s| {
                 self.sessions.table[s].state = .free;
                 self.phys_owner[s] = null;
             }
+
             self.dropBlob(e);
             std.debug.assert(e.blob.bytes.len == 0);
             e.* = .{};
@@ -492,8 +566,11 @@ pub fn Residency(comptime SessionsT: type) type {
         pub fn stats(self: *const Self) ServeStats {
             var resident: u32 = 0;
             for (self.entries) |*e| {
-                if (e.phys != null) resident += 1;
+                if (e.phys != null) {
+                    resident += 1;
+                }
             }
+
             return .{
                 .slots_resident = resident,
                 .n_physical = @intCast(self.phys_owner.len),
@@ -544,6 +621,7 @@ pub fn Residency(comptime SessionsT: type) type {
         /// evicted.
         fn liveOrSaved(self: *Self, id: u32) *session.Session {
             std.debug.assert(id < self.entries.len);
+
             const e = &self.entries[id];
             std.debug.assert(e.used);
             return if (e.phys) |s| &self.sessions.table[s] else &e.saved;
@@ -552,6 +630,7 @@ pub fn Residency(comptime SessionsT: type) type {
         pub fn feed(self: *Self, id: u32, tokens: []const u32, final: bool) !?u32 {
             try self.ensureResident(id, &.{});
             defer self.assertLedger();
+
             return self.sessions.feed(self.entries[id].phys.?, tokens, final);
         }
 
@@ -559,10 +638,16 @@ pub fn Residency(comptime SessionsT: type) type {
             var phys_buf: [max_phys]u32 = undefined;
             const phys = try self.residentPhys(ids, &phys_buf, null);
             defer self.assertLedger();
+
             return self.sessions.decodeBatch(phys, tokens_out);
         }
 
-        pub fn advance(self: *Self, feed_chunk: ?FeedChunk, ids: []const u32, tokens_out: []u32) !?u32 {
+        pub fn advance(
+            self: *Self,
+            feed_chunk: ?FeedChunk,
+            ids: []const u32,
+            tokens_out: []u32,
+        ) !?u32 {
             var phys_buf: [max_phys]u32 = undefined;
             // This tick steps the feed session and the decode rows together, so
             // they must be co-resident. Pin the feed session's current slot
@@ -573,9 +658,15 @@ pub fn Residency(comptime SessionsT: type) type {
             var chunk: ?FeedChunk = null;
             if (feed_chunk) |fc| {
                 try self.ensureResident(fc.id, decode_phys);
-                chunk = .{ .id = self.entries[fc.id].phys.?, .tokens = fc.tokens, .final = fc.final };
+                chunk = .{
+                    .id = self.entries[fc.id].phys.?,
+                    .tokens = fc.tokens,
+                    .final = fc.final,
+                };
             }
+
             defer self.assertLedger();
+
             return self.sessions.advance(chunk, decode_phys, tokens_out);
         }
 
@@ -585,6 +676,7 @@ pub fn Residency(comptime SessionsT: type) type {
         /// of `out` (physical ids, same order as `ids`).
         fn residentPhys(self: *Self, ids: []const u32, out: []u32, pin: ?u32) ![]u32 {
             std.debug.assert(ids.len <= out.len);
+
             var exclude: [max_phys + 1]u32 = undefined;
             for (ids, 0..) |id, i| {
                 @memcpy(exclude[0..i], out[0..i]); // already-placed batch members
@@ -593,9 +685,11 @@ pub fn Residency(comptime SessionsT: type) type {
                     exclude[n] = p;
                     n += 1;
                 }
+
                 try self.ensureResident(id, exclude[0..n]);
                 out[i] = self.entries[id].phys.?;
             }
+
             return out[0..ids.len];
         }
 
@@ -613,11 +707,15 @@ fn msBetween(t0: std.Io.Timestamp, t1: std.Io.Timestamp) f64 {
 }
 
 fn indexOf(haystack: []const u32, needle: u32) ?usize {
-    for (haystack, 0..) |h, i| if (h == needle) return i;
+    for (haystack, 0..) |h, i| {
+        if (h == needle) return i;
+    }
+
     return null;
 }
 
 // -- tests ------------------------------------------------------------------
+
 //
 // The tests cover three surfaces against one recording fake. The surfaces are
 // the residency FSM with its LRU, the RAM byte ledger, and the prefix snapshot
@@ -637,7 +735,6 @@ fn indexOf(haystack: []const u32, needle: u32) ?usize {
 // caller-owned, so it must never enter the RAM ledger. A restored prefix must
 // also be indistinguishable from rows the session fed itself, and the swap
 // round trip is the sharpest witness for that.
-
 const test_fakes = @import("../runtime/test_fakes.zig");
 const test_vocab = test_fakes.vocab;
 const fake_row_bytes: usize = @sizeOf(u32);
@@ -660,6 +757,7 @@ const FakeRunner = struct {
         @memset(markers, 0);
         return .{ .n_slots = n_slots, .logits = logits, .markers = markers };
     }
+
     fn deinitFake(self: *FakeRunner, gpa: Allocator) void {
         gpa.free(self.logits);
         gpa.free(self.markers);
@@ -669,20 +767,25 @@ const FakeRunner = struct {
         _ = self;
         return @as(u64, n_rows) * fake_row_bytes;
     }
+
     pub fn evictSlot(self: *FakeRunner, slot: u32, n_rows: u32, out: []u8) !void {
         std.debug.assert(n_rows >= 1);
         std.debug.assert(out.len == n_rows * fake_row_bytes);
+
         std.mem.writeInt(u32, out[0..4], self.markers[slot], .little);
         self.evicts += 1;
         self.last_evict_rows = n_rows;
     }
+
     pub fn restoreSlot(self: *FakeRunner, slot: u32, n_rows: u32, blob: []const u8) !void {
         std.debug.assert(n_rows >= 1);
         std.debug.assert(blob.len == n_rows * fake_row_bytes);
+
         self.markers[slot] = std.mem.readInt(u32, blob[0..4], .little);
         self.restores += 1;
         self.last_restore_rows = n_rows;
     }
+
     pub fn resetSlotState(self: *FakeRunner, slot: u32) void {
         self.markers[slot] = 0;
         self.resets += 1;
@@ -692,8 +795,14 @@ const FakeRunner = struct {
         return self.n_slots;
     }
 
-    pub fn stepBatch(self: *FakeRunner, rows: []const @import("../runtime/step_row.zig").StepRow) !void {
-        for (rows) |r| self.markers[r.slot] = r.token; // KV "becomes" the last token
+    pub fn stepBatch(
+        self: *FakeRunner,
+        rows: []const @import("../runtime/step_row.zig").StepRow,
+    ) !void {
+        for (rows) |r| {
+            self.markers[r.slot] = r.token; // KV "becomes" the last token
+        }
+
         test_fakes.writeCannedLogits(self.logits, rows);
     }
 };
@@ -704,14 +813,19 @@ const TestRes = Residency(Sessions(FakeRunner));
 /// The truth the incremental ledger must equal.
 fn blobSum(res: *const TestRes) u64 {
     var total: u64 = 0;
-    for (res.entries) |*e| total += e.blob.bytes.len;
+    for (res.entries) |*e| {
+        total += e.blob.bytes.len;
+    }
+
     return total;
 }
 
 fn expectLedger(res: *const TestRes, expected: u64) !void {
     try std.testing.expectEqual(expected, res.ram_used);
     try std.testing.expectEqual(expected, blobSum(res));
-    if (res.blob_budget) |budget| try std.testing.expect(res.ram_used <= budget);
+    if (res.blob_budget) |budget| {
+        try std.testing.expect(res.ram_used <= budget);
+    }
 }
 
 /// A two-row prefix blob carrying `marker`, the value the fake's KV holds after
@@ -733,6 +847,7 @@ const Fixture = struct {
     fn setUp(self: *Fixture, gpa: Allocator, n_slots: u32, n_logical: u32, budget: ?u64) !void {
         self.arena_state = std.heap.ArenaAllocator.init(gpa);
         errdefer self.arena_state.deinit();
+
         const arena = self.arena_state.allocator();
         self.fake = try FakeRunner.initFake(gpa, n_slots);
         self.pool = try Sessions(FakeRunner).init(arena, &self.fake);
@@ -750,10 +865,12 @@ test "residency: more logical sessions than physical slots, streams survive evic
     const gpa = std.testing.allocator;
     var arena_state = std.heap.ArenaAllocator.init(gpa);
     defer arena_state.deinit();
+
     const arena = arena_state.allocator();
 
     var fake = try FakeRunner.initFake(gpa, 2); // 2 physical slots
     defer fake.deinitFake(gpa);
+
     var pool = try Sessions(FakeRunner).init(arena, &fake);
     var res = try TestRes.init(arena, gpa, &pool, 4, null); // 4 logical sessions
     defer res.deinit();
@@ -764,6 +881,7 @@ test "residency: more logical sessions than physical slots, streams survive evic
         const first = (try res.feed(id.*, &.{@intCast(k)}, true)).?; // argmax(k+1)
         try std.testing.expectEqual(@as(u32, @intCast((k + 1) % test_vocab)), first);
     }
+
     // Only 2 of the 4 can be resident. At least the other 2 were evicted.
     try std.testing.expect(fake.evicts >= 2);
 
@@ -781,17 +899,21 @@ test "residency: more logical sessions than physical slots, streams survive evic
     const reused = try res.create(99, .{});
     _ = try res.feed(reused, &.{1}, true);
     res.destroy(reused);
-    for (ids[1..]) |id| res.destroy(id);
+    for (ids[1..]) |id| {
+        res.destroy(id);
+    }
 }
 
 test "residency: identity when physical >= logical (no eviction)" {
     const gpa = std.testing.allocator;
     var arena_state = std.heap.ArenaAllocator.init(gpa);
     defer arena_state.deinit();
+
     const arena = arena_state.allocator();
 
     var fake = try FakeRunner.initFake(gpa, 4);
     defer fake.deinitFake(gpa);
+
     var pool = try Sessions(FakeRunner).init(arena, &fake);
     var res = try TestRes.init(arena, gpa, &pool, 4, null); // logical == physical
     defer res.deinit();
@@ -812,6 +934,7 @@ test "residency: an overridden pending token survives an eviction and steps afte
     var fx: Fixture = undefined;
     try fx.setUp(gpa, 2, 3, null);
     defer fx.tearDown(gpa);
+
     const res = &fx.res;
 
     // `a` samples 1 and is then evicted by the third session, so its pending
@@ -849,6 +972,7 @@ test "residency ledger: the incremental count equals the blob sum across a trace
     var fx: Fixture = undefined;
     try fx.setUp(gpa, 2, 3, 64);
     defer fx.tearDown(gpa);
+
     const res = &fx.res;
 
     // Two sessions fill the two slots, and the third evicts the older of them.
@@ -886,6 +1010,7 @@ test "residency ledger: an over-budget eviction refuses and changes nothing" {
     var fx: Fixture = undefined;
     try fx.setUp(gpa, 2, 3, 1 * fake_row_bytes);
     defer fx.tearDown(gpa);
+
     const res = &fx.res;
 
     const a = try res.create(1, .{});
@@ -923,6 +1048,7 @@ test "residency ledger: a session with no committed rows evicts without a blob" 
     var fx: Fixture = undefined;
     try fx.setUp(gpa, 2, 3, null);
     defer fx.tearDown(gpa);
+
     const res = &fx.res;
 
     // Place three sessions without feeding any of them, so every `pos` is 0.
@@ -954,6 +1080,7 @@ test "residency ledger: eviction moves the committed rows only" {
     var fx: Fixture = undefined;
     try fx.setUp(gpa, 2, 3, null);
     defer fx.tearDown(gpa);
+
     const res = &fx.res;
 
     const a = try res.create(1, .{});
@@ -997,6 +1124,7 @@ test "residency ledger: a restore releases the blob, and the next eviction re-cr
     var fx: Fixture = undefined;
     try fx.setUp(gpa, 2, 3, null);
     defer fx.tearDown(gpa);
+
     const res = &fx.res;
 
     const a = try res.create(1, .{});
@@ -1040,6 +1168,7 @@ test "residency prefix: a restore places the session and charges nothing" {
     var fx: Fixture = undefined;
     try fx.setUp(gpa, 2, 3, null);
     defer fx.tearDown(gpa);
+
     const res = &fx.res;
 
     const a = try res.create(1, .{});
@@ -1061,6 +1190,7 @@ test "residency prefix: a restored session evicts and returns before its first f
     var fx: Fixture = undefined;
     try fx.setUp(gpa, 2, 3, null);
     defer fx.tearDown(gpa);
+
     const res = &fx.res;
 
     // `a` holds a two-row prefix and nothing else. Two more sessions then take
@@ -1100,6 +1230,7 @@ test "residency prefix: restoreReady places the session decoding-ready and charg
     var fx: Fixture = undefined;
     try fx.setUp(gpa, 2, 3, null);
     defer fx.tearDown(gpa);
+
     const res = &fx.res;
 
     const a = try res.create(1, .{});
@@ -1127,6 +1258,7 @@ test "residency prefix: a snapshot reads a resident slot and moves nothing" {
     var fx: Fixture = undefined;
     try fx.setUp(gpa, 2, 3, null);
     defer fx.tearDown(gpa);
+
     const res = &fx.res;
 
     const a = try res.create(1, .{});
@@ -1154,6 +1286,7 @@ test "residency prefix: an unfundable placement refuses and leaves a cold sessio
     var fx: Fixture = undefined;
     try fx.setUp(gpa, 2, 4, 1 * fake_row_bytes);
     defer fx.tearDown(gpa);
+
     const res = &fx.res;
 
     const a = try res.create(1, .{});
@@ -1214,7 +1347,10 @@ const NoSwapRunner = struct {
         return self.n_slots;
     }
 
-    pub fn stepBatch(self: *NoSwapRunner, rows: []const @import("../runtime/step_row.zig").StepRow) !void {
+    pub fn stepBatch(
+        self: *NoSwapRunner,
+        rows: []const @import("../runtime/step_row.zig").StepRow,
+    ) !void {
         test_fakes.writeCannedLogits(self.logits, rows);
     }
 };
@@ -1223,10 +1359,12 @@ test "residency: a runner without evictSlot is the identity pool" {
     const gpa = std.testing.allocator;
     var arena_state = std.heap.ArenaAllocator.init(gpa);
     defer arena_state.deinit();
+
     const arena = arena_state.allocator();
 
     const logits = try gpa.alloc(f32, 2 * test_vocab);
     defer gpa.free(logits);
+
     @memset(logits, 0);
     var fake: NoSwapRunner = .{ .n_slots = 2, .logits = logits };
     var pool = try Sessions(NoSwapRunner).init(arena, &fake);
@@ -1242,6 +1380,7 @@ test "residency: a runner without evictSlot is the identity pool" {
         const first = (try res.feed(id.*, &.{@intCast(k)}, true)).?; // argmax(k+1)
         try std.testing.expectEqual(@as(u32, @intCast((k + 1) % test_vocab)), first);
     }
+
     // Both stay resident, and one batched decode steps both chains.
     var out: [2]u32 = undefined;
     try res.decodeBatch(&ids, &out);
@@ -1266,12 +1405,23 @@ const ResidencyTrace = struct {
     /// The oracle id of each logical id, null for a free one.
     oracle_id: [trace_logical_max]?u32 = @splat(null),
 
-    fn setUp(self: *ResidencyTrace, gpa: Allocator, n_slots: u32, n_logical: u32, budget: ?u64) !void {
+    fn setUp(
+        self: *ResidencyTrace,
+        gpa: Allocator,
+        n_slots: u32,
+        n_logical: u32,
+        budget: ?u64,
+    ) !void {
         try self.fx.setUp(gpa, n_slots, n_logical, budget);
         errdefer self.fx.tearDown(gpa);
+
         self.oracle_fake = try FakeRunner.initFake(gpa, n_logical);
         errdefer self.oracle_fake.deinitFake(gpa);
-        self.oracle = try Sessions(FakeRunner).init(self.fx.arena_state.allocator(), &self.oracle_fake);
+
+        self.oracle = try Sessions(FakeRunner).init(
+            self.fx.arena_state.allocator(),
+            &self.oracle_fake,
+        );
         self.oracle_id = @splat(null);
     }
 
@@ -1294,7 +1444,10 @@ const ResidencyTrace = struct {
     fn expectAgree(self: *const ResidencyTrace) !void {
         const res = &self.fx.res;
         try std.testing.expectEqual(blobSum(res), res.ram_used);
-        if (res.blob_budget) |budget| try std.testing.expect(res.ram_used <= budget);
+        if (res.blob_budget) |budget| {
+            try std.testing.expect(res.ram_used <= budget);
+        }
+
         for (res.entries, 0..) |*e, i| {
             const id: u32 = @intCast(i);
             const twin = self.oracle_id[i] orelse {
@@ -1310,11 +1463,14 @@ const ResidencyTrace = struct {
             } else {
                 try std.testing.expectEqual(@as(usize, s.pos) * fake_row_bytes, e.blob.bytes.len);
             }
+
             try std.testing.expectEqual(o.state, s.state);
             try std.testing.expectEqual(o.pos, s.pos);
             try std.testing.expectEqual(o.token_pending, s.token_pending);
             try std.testing.expectEqual(o.rng.s, s.rng.s);
-            if (s.pos > 0) try std.testing.expectEqual(self.oracle_fake.markers[twin], self.marker(id));
+            if (s.pos > 0) {
+                try std.testing.expectEqual(self.oracle_fake.markers[twin], self.marker(id));
+            }
         }
     }
 };
@@ -1324,9 +1480,11 @@ fn liveIds(t: *const ResidencyTrace, want_ready: bool, out: *[trace_logical_max]
     for (t.oracle_id, 0..) |twin, i| {
         const o = twin orelse continue;
         if (want_ready and t.oracle.table[o].state != .ready) continue;
+
         out[n] = @intCast(i);
         n += 1;
     }
+
     return out[0..n];
 }
 
@@ -1345,10 +1503,15 @@ fn checkResidencyTrace(_: void, seed: u64) anyerror!void {
     const gpa = std.testing.allocator;
     const n_slots = 2 + r.uintLessThan(u32, 2);
     const n_logical = n_slots + 1 + r.uintLessThan(u32, trace_logical_max - n_slots);
-    const budget: ?u64 = if (r.boolean()) null else r.uintAtMost(u64, 24) * @as(u64, fake_row_bytes);
+    const budget: ?u64 = if (r.boolean()) null else r.uintAtMost(u64, 24) * @as(
+        u64,
+        fake_row_bytes,
+    );
+
     var t: ResidencyTrace = undefined;
     try t.setUp(gpa, n_slots, n_logical, budget);
     defer t.tearDown(gpa);
+
     const res = &t.fx.res;
 
     for (0..trace_steps) |_| {
@@ -1366,9 +1529,13 @@ fn checkResidencyTrace(_: void, seed: u64) anyerror!void {
             1 => {
                 const live = liveIds(&t, false, &ids_buf);
                 if (live.len == 0) continue;
+
                 const id = live[r.uintLessThan(usize, live.len)];
                 var tokens: [3]u32 = undefined;
-                for (&tokens) |*tk| tk.* = r.uintLessThan(u32, test_vocab);
+                for (&tokens) |*tk| {
+                    tk.* = r.uintLessThan(u32, test_vocab);
+                }
+
                 const fed = tokens[0 .. 1 + r.uintLessThan(usize, tokens.len)];
                 const final = r.boolean();
                 const got = res.feed(id, fed, final) catch |err| {
@@ -1381,14 +1548,21 @@ fn checkResidencyTrace(_: void, seed: u64) anyerror!void {
             2 => {
                 const ready = liveIds(&t, true, &ids_buf);
                 if (ready.len == 0) continue;
+
                 r.shuffle(u32, ready);
                 const ids = ready[0..@min(ready.len, 1 + r.uintLessThan(usize, n_slots))];
                 var twins: [trace_logical_max]u32 = undefined;
-                for (ids, twins[0..ids.len]) |id, *o| o.* = t.oracle_id[id].?;
+                for (ids, twins[0..ids.len]) |id, *o| {
+                    o.* = t.oracle_id[id].?;
+                }
+
                 var got: [trace_logical_max]u32 = undefined;
                 res.decodeBatch(ids, got[0..ids.len]) catch |err| {
                     if (refused(err, budget)) continue;
-                    try std.testing.expectError(err, t.oracle.decodeBatch(twins[0..ids.len], got[0..ids.len]));
+                    try std.testing.expectError(
+                        err,
+                        t.oracle.decodeBatch(twins[0..ids.len], got[0..ids.len]),
+                    );
                     continue;
                 };
                 var want: [trace_logical_max]u32 = undefined;
@@ -1405,18 +1579,32 @@ fn checkResidencyTrace(_: void, seed: u64) anyerror!void {
             else => {
                 const live = liveIds(&t, false, &ids_buf);
                 if (live.len == 0) continue;
+
                 const id = live[r.uintLessThan(usize, live.len)];
                 res.destroy(id);
                 t.oracle.destroy(t.oracle_id[id].?);
                 t.oracle_id[id] = null;
             },
         }
+
         try t.expectAgree();
     }
-    for (t.oracle_id, 0..) |twin, i| if (twin != null) res.destroy(@intCast(i));
+
+    for (t.oracle_id, 0..) |twin, i| {
+        if (twin != null) {
+            res.destroy(@intCast(i));
+        }
+    }
+
     try std.testing.expectEqual(@as(u64, 0), res.ram_used);
 }
 
 test "property: random residency traces keep the ledger, release each restored blob, and match a pool that never evicts" {
-    try prop.forAll(.{ .site = 0x2E51_DE4C, .cases = 400 }, {}, u64, prop.genSeed(void), checkResidencyTrace);
+    try prop.forAll(
+        .{ .site = 0x2E51_DE4C, .cases = 400 },
+        {},
+        u64,
+        prop.genSeed(void),
+        checkResidencyTrace,
+    );
 }

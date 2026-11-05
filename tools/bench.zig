@@ -34,14 +34,18 @@ pub fn main(init: std.process.Init) !void {
         ?*z.vulkan_runner.Runner
     else
         void;
+
     const runner: RunnerOpt = if (comptime build_options.use_vulkan)
         z.vulkan_runner.Runner.init(gpa) catch |e| brk: {
             std.debug.print("vulkan: skipped ({t})\n\n", .{e});
             break :brk null;
         }
     else {};
+
     defer if (comptime build_options.use_vulkan) {
-        if (runner) |r| r.deinit();
+        if (runner) |r| {
+            r.deinit();
+        }
     };
 
     // Color goes on for a terminal alone, so piped output stays free of ANSI
@@ -49,7 +53,10 @@ pub fn main(init: std.process.Init) !void {
     bu.setColor(std.Io.File.stderr().isTty(io) catch false);
 
     std.debug.print("zigferencer bench\n", .{});
-    std.debug.print("build target: {s} ({s})\n", .{ @tagName(builtin.cpu.arch), builtin.cpu.model.name });
+    std.debug.print(
+        "build target: {s} ({s})\n",
+        .{ @tagName(builtin.cpu.arch), builtin.cpu.model.name },
+    );
 
     // `zig build bench -- attn-kit` runs the attention kit grid alone, so a
     // kernel experiment skips the full table.

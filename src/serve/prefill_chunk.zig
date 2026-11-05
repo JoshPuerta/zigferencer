@@ -12,6 +12,11 @@ const std = @import("std");
 const limits = @import("../core/limits.zig");
 const prop = @import("../core/prop.zig");
 
+// -- constants --------------------------------------------------------------
+
+/// The CPU runners hold `limits.cpu_prefill_chunk` prompt rows per pass.
+pub const cpu_rule: Rule = .{ .derived = limits.cpu_prefill_chunk };
+
 // -- types ------------------------------------------------------------------
 
 pub const Rule = union(enum) {
@@ -26,9 +31,6 @@ pub const Rule = union(enum) {
 
 // -- api --------------------------------------------------------------------
 
-/// The CPU runners hold `limits.cpu_prefill_chunk` prompt rows per pass.
-pub const cpu_rule: Rule = .{ .derived = limits.cpu_prefill_chunk };
-
 /// Map the `--prefill-chunk` value to a rule. Unset selects `derived` with the
 /// row width of the runner. Zero selects `spare_rows`.
 pub fn fromFlag(flag: ?u32, width: u32) Rule {
@@ -41,10 +43,17 @@ pub fn fromFlag(flag: ?u32, width: u32) Rule {
 /// turn still owes. `n_decode` is the decode rows of the pass. `step_cap` is the
 /// most rows the runner takes in one pass. The result is zero only when decode
 /// rows fill the pass, and the caller then composes the pass without a chunk.
-pub fn chunk(rule: Rule, remaining: usize, n_decode: usize, max_batch: usize, step_cap: usize) usize {
+pub fn chunk(
+    rule: Rule,
+    remaining: usize,
+    n_decode: usize,
+    max_batch: usize,
+    step_cap: usize,
+) usize {
     std.debug.assert(remaining >= 1);
     std.debug.assert(n_decode <= max_batch);
     std.debug.assert(n_decode <= step_cap);
+
     const room = step_cap - n_decode;
     const spare = @max(1, max_batch - n_decode);
     const budget: usize = switch (rule) {
@@ -52,13 +61,16 @@ pub fn chunk(rule: Rule, remaining: usize, n_decode: usize, max_batch: usize, st
         .fixed => |n| n,
         .derived => |width| blk: {
             std.debug.assert(width >= 1);
+
             break :blk if (n_decode == 0) width else @min(spare, width);
         },
     };
+
     const result = @min(remaining, @min(room, budget));
     std.debug.assert(result <= remaining);
     std.debug.assert(result + n_decode <= step_cap);
     if (room >= 1) std.debug.assert(result >= 1);
+
     return result;
 }
 
@@ -72,12 +84,20 @@ pub fn stepRows(rule: Rule, slots: u32, batch: u32) u32 {
         .fixed => |n| n,
         .derived => |width| width,
     };
+
     return @max(slots, @max(batch + 1, batch + prompt_rows));
 }
 
 // -- tests ------------------------------------------------------------------
 
-const ChunkCase = struct { rule: Rule, remaining: usize, n_decode: usize, max_batch: usize, step_cap: usize, want: usize };
+const ChunkCase = struct {
+    rule: Rule,
+    remaining: usize,
+    n_decode: usize,
+    max_batch: usize,
+    step_cap: usize,
+    want: usize,
+};
 
 test "chunk: decode rows narrow the chunk to the spare rows, and a full pass takes none" {
     const derived: Rule = .{ .derived = 64 };
@@ -94,7 +114,10 @@ test "chunk: decode rows narrow the chunk to the spare rows, and a full pass tak
         .{ .rule = .{ .fixed = 4 }, .remaining = 5, .n_decode = 6, .max_batch = 6, .step_cap = 6, .want = 0 },
     };
     for (cases) |c| {
-        try std.testing.expectEqual(c.want, chunk(c.rule, c.remaining, c.n_decode, c.max_batch, c.step_cap));
+        try std.testing.expectEqual(
+            c.want,
+            chunk(c.rule, c.remaining, c.n_decode, c.max_batch, c.step_cap),
+        );
     }
 }
 
@@ -151,15 +174,19 @@ fn checkTile(_: void, c: TileCase) anyerror!void {
             .spare_rows => try std.testing.expect(k <= @max(1, c.batch - d)),
             .fixed => |f| try std.testing.expect(k <= f),
         }
+
         fed += k;
     }
+
     try std.testing.expectEqual(c.n, fed);
     try std.testing.expect(steps <= c.n);
-    if (c.all_idle) switch (c.rule) {
-        .derived => |w| try std.testing.expectEqual((c.n + w - 1) / w, steps),
-        .spare_rows => try std.testing.expectEqual((c.n + c.batch - 1) / c.batch, steps),
-        .fixed => |f| try std.testing.expectEqual((c.n + f - 1) / f, steps),
-    };
+    if (c.all_idle) {
+        switch (c.rule) {
+            .derived => |w| try std.testing.expectEqual((c.n + w - 1) / w, steps),
+            .spare_rows => try std.testing.expectEqual((c.n + c.batch - 1) / c.batch, steps),
+            .fixed => |f| try std.testing.expectEqual((c.n + f - 1) / f, steps),
+        }
+    }
 }
 
 test "property: the chunks of one prompt tile it in order under any decode sequence" {

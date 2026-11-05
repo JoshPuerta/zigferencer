@@ -29,7 +29,7 @@ const std = @import("std");
 const builtin = @import("builtin");
 const z = @import("zigferencer");
 
-// -- types ------------------------------------------------------------------
+// -- constants --------------------------------------------------------------
 
 const probed_ops = .{
     // Backend-specialized: the kernels that simd and simd_pf hand-write. The
@@ -70,16 +70,7 @@ const probed_ops = .{
 ///   ##SIMD-PROBE## arch=x86_64 cpu=znver3 available=avx2,fma absent=avx512f
 const caps_marker = capsLine();
 
-// -- api --------------------------------------------------------------------
-
-pub fn main() void {
-    // Every probed op reaches the assembly as a standalone symbol, and the
-    // capability marker stays in it. The body runs none of them.
-    inline for (probed_ops) |op_ptr| std.mem.doNotOptimizeAway(op_ptr);
-    std.mem.doNotOptimizeAway(caps_marker.ptr);
-}
-
-// -- helpers ----------------------------------------------------------------
+// -- types ------------------------------------------------------------------
 
 /// The arguments of one part kernel call. A wrapper takes them as one value,
 /// so each concrete instance stays one line.
@@ -100,10 +91,28 @@ fn PartArgs(comptime E: type) type {
     };
 }
 
+// -- api --------------------------------------------------------------------
+
+pub fn main() void {
+    // Every probed op reaches the assembly as a standalone symbol, and the
+    // capability marker stays in it. The body runs none of them.
+    inline for (probed_ops) |op_ptr| {
+        std.mem.doNotOptimizeAway(op_ptr);
+    }
+
+    std.mem.doNotOptimizeAway(caps_marker.ptr);
+}
+
+// -- helpers ----------------------------------------------------------------
+
 /// Inline the part kernel of `Kernels` into the calling wrapper, so the body
 /// lands under the name of the wrapper.
 inline fn partCall(comptime Kernels: type, comptime E: type, a: PartArgs(E)) void {
-    @call(.always_inline, Kernels.attentionPartTyped, .{ E, a.q, a.h_lo, a.h_hi, a.n_heads, a.head_dim, a.k_cache, a.v_cache, a.n_kv_heads, a.t_lo, a.t_hi, a.recs, a.rec_stride });
+    @call(
+        .always_inline,
+        Kernels.attentionPartTyped,
+        .{ E, a.q, a.h_lo, a.h_hi, a.n_heads, a.head_dim, a.k_cache, a.v_cache, a.n_kv_heads, a.t_lo, a.t_hi, a.recs, a.rec_stride },
+    );
 }
 
 fn attentionPartF32(a: PartArgs(f32)) void {
@@ -136,10 +145,21 @@ fn capsLine() []const u8 {
     // The list holds the flags of the build architecture alone, so an x86 report
     // never lists NEON as absent. `absent` is the headroom the kernels leave.
     const names = switch (builtin.cpu.arch) {
-        .x86, .x86_64 => .{ "sse2", "sse4_2", "avx", "avx2", "fma", "f16c", "avx512f", "avx512vnni", "avx_vnni" },
+        .x86, .x86_64 => .{
+            "sse2",
+            "sse4_2",
+            "avx",
+            "avx2",
+            "fma",
+            "f16c",
+            "avx512f",
+            "avx512vnni",
+            "avx_vnni",
+        },
         .aarch64, .aarch64_be => .{ "neon", "dotprod", "fp16", "sve" },
         else => .{},
     };
+
     var available: []const u8 = "";
     var absent: []const u8 = "";
     inline for (names) |n| {
@@ -149,6 +169,7 @@ fn capsLine() []const u8 {
             absent = absent ++ (if (absent.len == 0) "" else ",") ++ n;
         }
     }
+
     return "##SIMD-PROBE## arch=" ++ @tagName(builtin.cpu.arch) ++
         " cpu=" ++ builtin.cpu.model.name ++
         " available=" ++ available ++ " absent=" ++ absent;

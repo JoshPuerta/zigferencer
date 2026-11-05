@@ -10,8 +10,8 @@
 //! across a CPU runner and a hybrid runner. The two walks together write the
 //! whole-model framing, and "one blob carries the whole-model framing"
 //! witnesses it three ways. The host half is byte-equal to the half of the CPU
-//! runner, because the prefix seam runs the same ops over the same weights. A
-//! CPU blob rides the H2D walk of the hybrid in and its D2H walk out byte for
+//! runner, because the prefix boundary runs the same ops over the same weights. A
+//! CPU blob goes through the H2D walk of the hybrid in and its D2H walk out byte for
 //! byte. The transport therefore places and recovers every region. A greedy
 //! decode over the restored rows then continues on the path of the CPU runner,
 //! so the regions sit where attention expects them.
@@ -99,7 +99,14 @@ fn initHybridAt(
     const card = loaded.card;
     const n_layers: u32 = card.n_layers;
     std.debug.assert(gpu_layers <= n_layers);
-    const caps = try llama_fused.LlamaFusedRunner.kvCaps(gpa, loaded, limits.contextCeiling(loaded.card.context_length, null), ctxp.deviceLocalAvailableBytes(), n_slots, .f32);
+    const caps = try llama_fused.LlamaFusedRunner.kvCaps(
+        gpa,
+        loaded,
+        limits.contextCeiling(loaded.card.context_length, null),
+        ctxp.deviceLocalAvailableBytes(),
+        n_slots,
+        .f32,
+    );
     const kv_costs = z.kv_cost.llamaCostVector(card, .f32);
     var table: [limits.max_layers]u64 = undefined;
     const plan = kv_budget.placementPlan(
@@ -116,7 +123,16 @@ fn initHybridAt(
         .{ .ram_split = .{ .blobs = 0, .prefix = 0 }, .residency = true },
         gpu_layers,
     ) catch return error.SkipZigTest;
-    return LlamaHybridRunner.init(gpa, ctxp, loaded, plan, io, thread_pool, cpu_cfg, .f32) catch |e| switch (e) {
+    return LlamaHybridRunner.init(
+        gpa,
+        ctxp,
+        loaded,
+        plan,
+        io,
+        thread_pool,
+        cpu_cfg,
+        .f32,
+    ) catch |e| switch (e) {
         error.VramBudgetExceeded => return error.SkipZigTest,
         else => return e,
     };
@@ -147,13 +163,30 @@ fn initFused(
     ctxp: *const vulkan_ctx.Context,
     loaded: *const loader.Loaded,
 ) !*llama_fused.LlamaFusedRunner {
-    const caps = try llama_fused.LlamaFusedRunner.kvCaps(gpa, loaded, limits.contextCeiling(loaded.card.context_length, null), ctxp.deviceLocalAvailableBytes(), n_slots, .f32);
-    const plan = kv_budget.kvPlan(caps, llama_fused.LlamaFusedRunner.kvCostModel(loaded.card, .f32), .{
-        .window = window,
-        .slots = n_slots,
-        .batch = n_slots,
-    }) catch return error.SkipZigTest;
-    return llama_fused.LlamaFusedRunner.initFromLoaded(gpa, ctxp, loaded, plan, .f32) catch |e| switch (e) {
+    const caps = try llama_fused.LlamaFusedRunner.kvCaps(
+        gpa,
+        loaded,
+        limits.contextCeiling(loaded.card.context_length, null),
+        ctxp.deviceLocalAvailableBytes(),
+        n_slots,
+        .f32,
+    );
+    const plan = kv_budget.kvPlan(
+        caps,
+        llama_fused.LlamaFusedRunner.kvCostModel(loaded.card, .f32),
+        .{
+            .window = window,
+            .slots = n_slots,
+            .batch = n_slots,
+        },
+    ) catch return error.SkipZigTest;
+    return llama_fused.LlamaFusedRunner.initFromLoaded(
+        gpa,
+        ctxp,
+        loaded,
+        plan,
+        .f32,
+    ) catch |e| switch (e) {
         error.VramBudgetExceeded => return error.SkipZigTest,
         else => return e,
     };
@@ -168,8 +201,11 @@ fn hostBlobBytes(cpu: *const LlamaRunner, hybrid: *const LlamaHybridRunner, n_ro
 fn argmaxOf(logits: []const f32) usize {
     var best: usize = 0;
     for (logits[1..], 1..) |v, i| {
-        if (v > logits[best]) best = i;
+        if (v > logits[best]) {
+            best = i;
+        }
     }
+
     return best;
 }
 
@@ -180,9 +216,11 @@ test "llama hybrid swap: the blob is split-independent" {
     var thread_pool: tp.Pool = undefined;
     try tp.startPool(&thread_pool, io, cpu_cfg);
     defer thread_pool.deinit();
+
     const gpa = std.testing.allocator;
     var arena_state = std.heap.ArenaAllocator.init(gpa);
     defer arena_state.deinit();
+
     const arena = arena_state.allocator();
     const fixture = try z.test_fixtures.path(arena, "SmolLM2-135M-Instruct-Q8_0");
 
@@ -191,15 +229,28 @@ test "llama hybrid swap: the blob is split-independent" {
 
     const ctxp = try initCtx(arena);
     defer ctxp.deinit();
+
     const hybrid = try initHybrid(gpa, ctxp, &loaded, io, &thread_pool);
     defer hybrid.deinit();
 
-    const cpu = try LlamaRunner.init(arena, &loaded, kv_budget.pinned(n_slots, window), 0, io, &thread_pool, cpu_cfg, .f32);
+    const cpu = try LlamaRunner.init(
+        arena,
+        &loaded,
+        kv_budget.pinned(n_slots, window),
+        0,
+        io,
+        &thread_pool,
+        cpu_cfg,
+        .f32,
+    );
 
     // The residency tier sizes a RAM blob before it knows which runner holds
     // the slot, so the two figures must agree at every row count.
     for ([_]u32{ 1, 2, window }) |n_rows| {
-        try std.testing.expectEqual(cpu.evictSlotBytesFor(n_rows), hybrid.evictSlotBytesFor(n_rows));
+        try std.testing.expectEqual(
+            cpu.evictSlotBytesFor(n_rows),
+            hybrid.evictSlotBytesFor(n_rows),
+        );
     }
 }
 
@@ -208,23 +259,36 @@ test "llama hybrid swap: one blob carries the whole-model framing" {
     var thread_pool: tp.Pool = undefined;
     try tp.startPool(&thread_pool, io, cpu_cfg);
     defer thread_pool.deinit();
+
     const gpa = std.testing.allocator;
     var arena_state = std.heap.ArenaAllocator.init(gpa);
     defer arena_state.deinit();
+
     const arena = arena_state.allocator();
     const fixture = try z.test_fixtures.path(arena, "SmolLM2-135M-Instruct-Q8_0");
 
     var loaded = try loader.load(io, arena, fixture);
     defer loaded.close();
+
     var v = try vocab_mod.buildFromParsed(arena, loaded.parsed);
     const ids = try bpe.encodeAlloc(&v, arena, prompts[0], true);
 
     const ctxp = try initCtx(arena);
     defer ctxp.deinit();
+
     const hybrid = try initHybrid(gpa, ctxp, &loaded, io, &thread_pool);
     defer hybrid.deinit();
 
-    var cpu = try LlamaRunner.init(arena, &loaded, kv_budget.pinned(n_slots, window), 0, io, &thread_pool, cpu_cfg, .f32);
+    var cpu = try LlamaRunner.init(
+        arena,
+        &loaded,
+        kv_budget.pinned(n_slots, window),
+        0,
+        io,
+        &thread_pool,
+        cpu_cfg,
+        .f32,
+    );
 
     // Four positions cover one KV write and three KV reads on each tier. Each
     // runner takes its own entry point, so the blobs come out of the two code
@@ -245,7 +309,7 @@ test "llama hybrid swap: one blob carries the whole-model framing" {
 
     const host_bytes = hostBlobBytes(&cpu, hybrid, n_rows);
     // The host half holds layers [0..k). Both runners run these layers through
-    // the same CPU ops over the same weights, so the prefix seam carries them.
+    // the same CPU ops over the same weights, so the prefix boundary carries them.
     try std.testing.expectEqualSlices(u8, cpu_blob[0..host_bytes], hybrid_blob[0..host_bytes]);
 
     // The transport check: the CPU blob goes in through the H2D walk of the
@@ -266,7 +330,10 @@ test "llama hybrid swap: one blob carries the whole-model framing" {
     while (pos < n_rows + 3) : (pos += 1) {
         const cpu_logits = try cpu.step(ids[0], pos);
         try hybrid.stepBatch(&.{.{ .slot = 0, .token = ids[0], .pos = pos, .want_logits = true }});
-        try std.testing.expectEqual(argmaxOf(cpu_logits), argmaxOf(hybrid.logits[0..cpu_logits.len]));
+        try std.testing.expectEqual(
+            argmaxOf(cpu_logits),
+            argmaxOf(hybrid.logits[0..cpu_logits.len]),
+        );
     }
 }
 
@@ -275,39 +342,58 @@ test "llama hybrid swap: a restored slot decodes as if it never left" {
     var thread_pool: tp.Pool = undefined;
     try tp.startPool(&thread_pool, io, cpu_cfg);
     defer thread_pool.deinit();
+
     const gpa = std.testing.allocator;
     var arena_state = std.heap.ArenaAllocator.init(gpa);
     defer arena_state.deinit();
+
     const arena = arena_state.allocator();
     const fixture = try z.test_fixtures.path(arena, "SmolLM2-135M-Instruct-Q8_0");
 
     var loaded = try loader.load(io, arena, fixture);
     defer loaded.close();
+
     var v = try vocab_mod.buildFromParsed(arena, loaded.parsed);
     var prompt_ids: [prompts.len][]const u32 = undefined;
-    for (prompts, 0..) |p, i| prompt_ids[i] = try bpe.encodeAlloc(&v, arena, p, true);
+    for (prompts, 0..) |p, i| {
+        prompt_ids[i] = try bpe.encodeAlloc(&v, arena, p, true);
+    }
 
     // The reference: both prompts on one two-slot CPU runner, decoded together.
     var reference: [prompts.len][n_tokens]u32 = undefined;
     {
-        var cpu = try LlamaRunner.init(arena, &loaded, kv_budget.pinned(n_slots, window), 0, io, &thread_pool, cpu_cfg, .f32);
+        var cpu = try LlamaRunner.init(
+            arena,
+            &loaded,
+            kv_budget.pinned(n_slots, window),
+            0,
+            io,
+            &thread_pool,
+            cpu_cfg,
+            .f32,
+        );
         var cpu_pool = try Sessions(LlamaRunner).init(arena, &cpu);
         var cpu_ids: [prompts.len]u32 = undefined;
         for (prompt_ids, 0..) |ids, p| {
             cpu_ids[p] = try cpu_pool.create(0, .{});
             reference[p][0] = (try cpu_pool.feed(cpu_ids[p], ids, true)).?;
         }
+
         for (1..n_tokens) |k| {
             var out: [prompts.len]u32 = undefined;
             try cpu_pool.decodeBatch(&cpu_ids, &out);
-            for (0..prompts.len) |p| reference[p][k] = out[p];
+            for (0..prompts.len) |p| {
+                reference[p][k] = out[p];
+            }
         }
     }
 
     const ctxp = try initCtx(arena);
     defer ctxp.deinit();
+
     const hybrid = try initHybrid(gpa, ctxp, &loaded, io, &thread_pool);
     defer hybrid.deinit();
+
     var pool = try Sessions(LlamaHybridRunner).init(arena, hybrid);
 
     var sids: [prompts.len]u32 = undefined;
@@ -332,7 +418,9 @@ test "llama hybrid swap: a restored slot decodes as if it never left" {
         try hybrid.restoreSlot(1, n_rows, blob);
         var out: [prompts.len]u32 = undefined;
         try pool.decodeBatch(&sids, &out);
-        for (0..prompts.len) |p| try std.testing.expectEqual(reference[p][k], out[p]);
+        for (0..prompts.len) |p| {
+            try std.testing.expectEqual(reference[p][k], out[p]);
+        }
     }
 }
 
@@ -341,21 +429,26 @@ test "llama hybrid swap: a fork decodes beside its source" {
     var thread_pool: tp.Pool = undefined;
     try tp.startPool(&thread_pool, io, cpu_cfg);
     defer thread_pool.deinit();
+
     const gpa = std.testing.allocator;
     var arena_state = std.heap.ArenaAllocator.init(gpa);
     defer arena_state.deinit();
+
     const arena = arena_state.allocator();
     const fixture = try z.test_fixtures.path(arena, "SmolLM2-135M-Instruct-Q8_0");
 
     var loaded = try loader.load(io, arena, fixture);
     defer loaded.close();
+
     var v = try vocab_mod.buildFromParsed(arena, loaded.parsed);
     const ids = try bpe.encodeAlloc(&v, arena, prompts[0], true);
 
     const ctxp = try initCtx(arena);
     defer ctxp.deinit();
+
     const hybrid = try initHybrid(gpa, ctxp, &loaded, io, &thread_pool);
     defer hybrid.deinit();
+
     var pool = try Sessions(LlamaHybridRunner).init(arena, hybrid);
 
     const source = try pool.create(0, .{});
@@ -377,14 +470,17 @@ test "llama hybrid dispatch: split 0 decodes the stream of the fused runner" {
     var thread_pool: tp.Pool = undefined;
     try tp.startPool(&thread_pool, io, cpu_cfg);
     defer thread_pool.deinit();
+
     const gpa = std.testing.allocator;
     var arena_state = std.heap.ArenaAllocator.init(gpa);
     defer arena_state.deinit();
+
     const arena = arena_state.allocator();
     const fixture = try z.test_fixtures.path(arena, "SmolLM2-135M-Instruct-Q8_0");
 
     var loaded = try loader.load(io, arena, fixture);
     defer loaded.close();
+
     var v = try vocab_mod.buildFromParsed(arena, loaded.parsed);
     const ids = try bpe.encodeAlloc(&v, arena, prompts[0], true);
 
@@ -396,6 +492,7 @@ test "llama hybrid dispatch: split 0 decodes the stream of the fused runner" {
     // over the whole split ladder. This case proves the one end of it here.
     const hybrid = try initHybridAt(gpa, ctxp, &loaded, io, &thread_pool, loaded.card.n_layers);
     defer hybrid.deinit();
+
     try std.testing.expectEqual(@as(u32, 0), hybrid.split);
 
     const fused = try initFused(gpa, ctxp, &loaded);
@@ -457,7 +554,9 @@ test "llama hybrid provenance: the tag names the placement" {
         prompt_cache.backendFingerprint(model_fp, "cpu:kv=f16"),
     };
     for (fps, 0..) |a, i| {
-        for (fps[i + 1 ..]) |b| try std.testing.expect(a != b);
+        for (fps[i + 1 ..]) |b| {
+            try std.testing.expect(a != b);
+        }
     }
 }
 
@@ -466,6 +565,7 @@ test "llama hybrid provenance: a foreign placement is another namespace" {
     const io = std.testing.io;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
+
     var dirbuf: [128]u8 = undefined;
     const dir = try std.fmt.bufPrint(&dirbuf, ".zig-cache/tmp/{s}/hybrid", .{&tmp.sub_path});
 
@@ -473,11 +573,20 @@ test "llama hybrid provenance: a foreign placement is another namespace" {
     var buf_theirs: [LlamaHybridRunner.backend_tag_buf_len]u8 = undefined;
     var buf_half: [LlamaHybridRunner.backend_tag_buf_len]u8 = undefined;
     const model_fp = prompt_cache.modelFingerprint("smollm2-135m", 145_000_000);
-    const mine = prompt_cache.backendFingerprint(model_fp, LlamaHybridRunner.backendTag(&buf_mine, 15, .q8_0, .f32));
-    const theirs = prompt_cache.backendFingerprint(model_fp, LlamaHybridRunner.backendTag(&buf_theirs, 16, .q8_0, .f32));
+    const mine = prompt_cache.backendFingerprint(
+        model_fp,
+        LlamaHybridRunner.backendTag(&buf_mine, 15, .q8_0, .f32),
+    );
+    const theirs = prompt_cache.backendFingerprint(
+        model_fp,
+        LlamaHybridRunner.backendTag(&buf_theirs, 16, .q8_0, .f32),
+    );
     // The same placement at the other KV dtype. Its rows are half as wide, so a
     // blob that crosses the dtype lands the wrong bytes in every region.
-    const half = prompt_cache.backendFingerprint(model_fp, LlamaHybridRunner.backendTag(&buf_half, 15, .q8_0, .f16));
+    const half = prompt_cache.backendFingerprint(
+        model_fp,
+        LlamaHybridRunner.backendTag(&buf_half, 15, .q8_0, .f16),
+    );
 
     const seq = [_]u32{ 1, 2, 3, 4 };
     const blob = [_]u8{7} ** 64;
@@ -485,8 +594,18 @@ test "llama hybrid provenance: a foreign placement is another namespace" {
     {
         var cache = prompt_cache.PromptCache.init(gpa, 1 << 20);
         defer cache.deinit();
+
         try cache.enableDisk(io, dir, 1 << 20, mine);
-        try std.testing.expect(try cache.admit(prompt_cache.prefixKey(mine, &seq), &seq, &blob, &logits, 100_000_000, 1_000_000));
+        try std.testing.expect(
+            try cache.admit(
+                prompt_cache.prefixKey(mine, &seq),
+                &seq,
+                &blob,
+                &logits,
+                100_000_000,
+                1_000_000,
+            ),
+        );
         try std.testing.expect(cache.last_admit_disk);
     }
 
@@ -496,8 +615,18 @@ test "llama hybrid provenance: a foreign placement is another namespace" {
     {
         var cache = prompt_cache.PromptCache.init(gpa, 1 << 20);
         defer cache.deinit();
+
         try cache.enableDisk(io, dir, 1 << 20, half);
-        try std.testing.expect(try cache.admit(prompt_cache.prefixKey(half, &seq), &seq, blob[0 .. blob.len / 2], &logits, 100_000_000, 1_000_000));
+        try std.testing.expect(
+            try cache.admit(
+                prompt_cache.prefixKey(half, &seq),
+                &seq,
+                blob[0 .. blob.len / 2],
+                &logits,
+                100_000_000,
+                1_000_000,
+            ),
+        );
         try std.testing.expect(cache.last_admit_disk);
     }
 
@@ -505,6 +634,7 @@ test "llama hybrid provenance: a foreign placement is another namespace" {
     // fingerprint every file there carries is not its own.
     var other = prompt_cache.PromptCache.init(gpa, 1 << 20);
     defer other.deinit();
+
     try other.enableDisk(io, dir, 1 << 20, theirs);
     other.loadDiskIndex();
     try std.testing.expectEqual(@as(usize, 0), other.diskIndexLen());
@@ -514,14 +644,16 @@ test "llama hybrid provenance: a foreign placement is another namespace" {
     // two, because the f16 sibling beside it is another namespace.
     var same = prompt_cache.PromptCache.init(gpa, 1 << 20);
     defer same.deinit();
+
     try same.enableDisk(io, dir, 1 << 20, mine);
     same.loadDiskIndex();
     try std.testing.expectEqual(@as(usize, 1), same.diskIndexLen());
 
     // The dtype refusal runs both ways. f16 indexes its own entry alone, so
-    // neither dtype can read the rows of the other on either leg of the swap.
+    // neither dtype can read the rows of the other in either direction of the swap.
     var same_half = prompt_cache.PromptCache.init(gpa, 1 << 20);
     defer same_half.deinit();
+
     try same_half.enableDisk(io, dir, 1 << 20, half);
     same_half.loadDiskIndex();
     try std.testing.expectEqual(@as(usize, 1), same_half.diskIndexLen());

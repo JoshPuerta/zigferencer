@@ -62,8 +62,8 @@ json_number() { grep -oE "\"$1\":[-0-9.eE]+" | head -1 | cut -d: -f2; }
 [ -n "${ZIGFERENCER_MODELS_DIR:-}" ] ||
     echo "warning: ZIGFERENCER_MODELS_DIR is unset. The run falls back to ./models" >&2
 
-echo "==> build -Druntime=vulkan -Dops-backend=vulkan_fused${ATTN:+ -Dattn-kernel=$ATTN} -Doptimize=ReleaseFast"
-"$ZIG" build -Druntime=vulkan -Dops-backend=vulkan_fused ${ATTN:+-Dattn-kernel=$ATTN} -Doptimize=ReleaseFast
+echo "==> build install dev -Druntime=vulkan -Dops-backend=vulkan_fused${ATTN:+ -Dattn-kernel=$ATTN} -Doptimize=ReleaseFast"
+"$ZIG" build install dev -Druntime=vulkan -Dops-backend=vulkan_fused ${ATTN:+-Dattn-kernel=$ATTN} -Doptimize=ReleaseFast
 
 printf '\ndecode: %s tokens/run   prefill lengths: %s\n' "$DECODE" "${LENS[*]}"
 

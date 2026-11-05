@@ -15,7 +15,7 @@ const std = @import("std");
 const limits = @import("../core/limits.zig");
 const StepRow = @import("step_row.zig").StepRow;
 
-// -- api --------------------------------------------------------------------
+// -- constants --------------------------------------------------------------
 
 /// The KV window of every test that sizes a window from a real model. A test
 /// never takes the default rule, which reads the model cost and the free VRAM.
@@ -34,12 +34,17 @@ comptime {
 /// Vocabulary size of every canned-logits fake.
 pub const vocab: usize = 8;
 
+// -- api --------------------------------------------------------------------
+
 /// The compact want-logits write the shipped runners perform: only the suffix
 /// of `want_logits` rows lands, at `logits[0..]`, where `Sessions.advance`
 /// reads it. Row j of that suffix gets a one-hot row at `(token + 1) % vocab`.
 pub fn writeCannedLogits(logits: []f32, rows: []const StepRow) void {
     var first: usize = rows.len;
-    while (first > 0 and rows[first - 1].want_logits) first -= 1;
+    while (first > 0 and rows[first - 1].want_logits) {
+        first -= 1;
+    }
+
     std.debug.assert(logits.len >= (rows.len - first) * vocab);
     for (rows[first..], 0..) |r, j| {
         const row = logits[j * vocab ..][0..vocab];

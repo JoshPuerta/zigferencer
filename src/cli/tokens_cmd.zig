@@ -1,16 +1,12 @@
-//! `zigferencer tokens <pub_name> --prompt "..."`: print the encoder's token ids
-//! for a prompt as `[id, id, ...]`, the format of llama.cpp's `llama-tokenize
-//! --ids`. The correctness model treats llama.cpp as the external oracle
-//! (docs/architecture.md), and tokenization is the first place the two stacks can
-//! diverge. This surface makes the comparison one command per side, with no
-//! debugger.
+//! `zigferencer-dev tokens <pub_name> --prompt "..."`: print the token ids of a prompt as
+//! `[id, id, ...]`, the format of `llama-tokenize --ids`, so the two tokenizers diff in one
+//! command.
 
 const std = @import("std");
 const Io = std.Io;
 
 const cli = @import("command.zig");
 const args = @import("args.zig");
-const style = @import("style.zig");
 const select = @import("select.zig");
 const registry = @import("../core/registry.zig");
 const loader = @import("../io/gguf/loader.zig");
@@ -29,7 +25,8 @@ const Flags = struct {
     pub const positional = "pub_name";
     pub const help: args.Help = .{
         .usage = "zigferencer-dev tokens <pub_name> [flags]",
-        .about = "Print the token ids of a prompt. The output matches `llama-tokenize --ids`\nfor side-by-side diffing.\n",
+        .about = "Print the token ids of a prompt. The output matches `llama-tokenize " ++
+            "--ids`\nfor side-by-side diffing.\n",
     };
     pub const docs = .{
         .prompt = args.Doc{ .text = "text to tokenize" },
@@ -41,33 +38,35 @@ const Flags = struct {
 
 pub fn run(ctx: cli.Context) !void {
     const flags = try args.parseInto(Flags, ctx) orelse return;
-    const prompt = flags.prompt;
-    const chat = flags.chat;
-    const pub_name = flags.pub_name;
 
-    const model = try select.model(ctx, pub_name);
+    const model = try select.model(ctx, flags.pub_name);
     const path = try registry.resolveLoadPath(ctx.arena, ctx.io, ctx.models_root, model.*);
+
     // Tokenizing reads only the header KVs, so the load skips the page prefault.
     var loaded = try loader.loadWith(ctx.io, ctx.arena, path, .{ .prefault = false });
     defer loaded.close();
 
     var v = try vocab_mod.buildFromParsed(ctx.arena, loaded.parsed);
-    const text = if (chat)
-        try chat_mod.wrapAlloc(ctx.arena, model.chat_template_kind, prompt)
+    const text = if (flags.chat)
+        try chat_mod.wrapAlloc(ctx.arena, model.chat_template_kind, flags.prompt)
     else
-        prompt;
+        flags.prompt;
+
     const ids = try bpe.encodeAlloc(&v, ctx.arena, text, true);
 
-    var buf: [4096]u8 = undefined;
-    var fw: Io.File.Writer = .initStreaming(.stdout(), ctx.io, &buf);
-    const w = &fw.interface;
+    var stdout_buffer: [cli.stdout_buffer_bytes]u8 = undefined;
+    var stdout_writer: Io.File.Writer = .initStreaming(.stdout(), ctx.io, &stdout_buffer);
+    const w = &stdout_writer.interface;
+
     try w.writeAll("[");
     for (ids, 0..) |id, i| {
-        if (i > 0) try w.writeAll(", ");
+        if (i > 0) {
+            try w.writeAll(", ");
+        }
+
         try w.print("{d}", .{id});
     }
+
     try w.writeAll("]\n");
     try w.flush();
 }
-
-// -- helpers ----------------------------------------------------------------

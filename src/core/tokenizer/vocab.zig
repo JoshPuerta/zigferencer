@@ -12,6 +12,45 @@ const std = @import("std");
 const Allocator = std.mem.Allocator;
 const parser = @import("../../io/gguf/parser.zig");
 
+// -- constants --------------------------------------------------------------
+
+/// GGUF `tokenizer.ggml.token_type` values of the added tokens that the
+/// encoder matches whole. Type 1 is a normal token.
+const token_type_control: i32 = 3;
+
+const token_type_user_defined: i32 = 4;
+
+/// Fixed bijection: byte 0..255 -> GPT-2 byte-level codepoint and its UTF-8 bytes.
+/// Pair-validation: asserts exactly 68 escape codepoints, which is what the
+/// GPT-2 byte-to-unicode algorithm produces.
+const gpt2_byte_table: [256]ByteEntry = blk: {
+    @setEvalBranchQuota(10_000);
+    var t: [256]ByteEntry = undefined;
+    var unmapped: u21 = 0;
+    var b: u32 = 0;
+    while (b < 256) : (b += 1) {
+        const printable = (b >= 33 and b <= 126) or (b >= 161 and b <= 172) or
+            (b >= 174 and b <= 255);
+        const cp: u21 = if (printable) @intCast(b) else escape: {
+            const c = 256 + unmapped;
+            unmapped += 1;
+            break :escape c;
+        };
+
+        var buf: [4]u8 = .{ 0, 0, 0, 0 };
+        const n = std.unicode.utf8Encode(cp, &buf) catch unreachable;
+        t[b] = .{ .cp = cp, .bytes = buf, .len = n };
+    }
+
+    if (unmapped != 68) @compileError("GPT-2 byte map must produce exactly 68 escape codepoints");
+
+    break :blk t;
+};
+
+/// Sentinel for `Vocab.byte_to_id` slots whose GPT-2 char does not exist in the
+/// vocab. `bpe.encodeAlloc` returns `error.UntokenizableByte` if encountered.
+pub const no_token: u32 = std.math.maxInt(u32);
+
 // -- types ------------------------------------------------------------------
 
 pub const Error = error{
@@ -25,11 +64,6 @@ pub const Special = struct {
     id: u32,
     bytes: []const u8,
 };
-
-/// GGUF `tokenizer.ggml.token_type` values of the added tokens that the
-/// encoder matches whole. Type 1 is a normal token.
-const token_type_control: i32 = 3;
-const token_type_user_defined: i32 = 4;
 
 /// Pre-tokenization regime, from `tokenizer.ggml.pre`, mirroring llama.cpp's
 /// per-family regexes. `.default` BPE-merges the whole inter-special span as one
@@ -82,34 +116,7 @@ const ByteEntry = struct {
     len: u3,
 };
 
-/// Fixed bijection: byte 0..255 -> GPT-2 byte-level codepoint and its UTF-8 bytes.
-/// Pair-validation: asserts exactly 68 escape codepoints, which is what the
-/// GPT-2 byte-to-unicode algorithm produces.
-const gpt2_byte_table: [256]ByteEntry = blk: {
-    @setEvalBranchQuota(10_000);
-    var t: [256]ByteEntry = undefined;
-    var unmapped: u21 = 0;
-    var b: u32 = 0;
-    while (b < 256) : (b += 1) {
-        const printable = (b >= 33 and b <= 126) or (b >= 161 and b <= 172) or (b >= 174 and b <= 255);
-        const cp: u21 = if (printable) @intCast(b) else escape: {
-            const c = 256 + unmapped;
-            unmapped += 1;
-            break :escape c;
-        };
-        var buf: [4]u8 = .{ 0, 0, 0, 0 };
-        const n = std.unicode.utf8Encode(cp, &buf) catch unreachable;
-        t[b] = .{ .cp = cp, .bytes = buf, .len = n };
-    }
-    if (unmapped != 68) @compileError("GPT-2 byte map must produce exactly 68 escape codepoints");
-    break :blk t;
-};
-
 // -- api --------------------------------------------------------------------
-
-/// Sentinel for `Vocab.byte_to_id` slots whose GPT-2 char does not exist in the
-/// vocab. `bpe.encodeAlloc` returns `error.UntokenizableByte` if encountered.
-pub const no_token: u32 = std.math.maxInt(u32);
 
 /// Pack a (left, right) token-id pair into a u64 hashmap key.
 pub fn pairKey(left: u32, right: u32) u64 {
@@ -147,7 +154,9 @@ pub fn buildFromParsed(arena: Allocator, p: parser.Parsed) Error!Vocab {
     for (tokens, 0..) |t, i| {
         // `putNoClobber` faults on a duplicate token, which is a GGUF defect.
         // The loader tolerates the rare duplicate by keeping the *first* id.
-        if (!string_to_id.contains(t)) try string_to_id.put(t, @intCast(i));
+        if (!string_to_id.contains(t)) {
+            try string_to_id.put(t, @intCast(i));
+        }
     }
 
     // 2. Special-flag list, local to this build. Step 5 turns it into
@@ -155,7 +164,9 @@ pub fn buildFromParsed(arena: Allocator, p: parser.Parsed) Error!Vocab {
     //    tokenizer matches user-defined added tokens such as `<think>` as
     //    specials, so each one encodes to one id.
     const is_special = try arena.alloc(bool, tokens.len);
-    for (token_types, is_special) |tt, *b| b.* = (tt == token_type_control or tt == token_type_user_defined);
+    for (token_types, is_special) |tt, *b| {
+        b.* = (tt == token_type_control or tt == token_type_user_defined);
+    }
 
     // 3. Walk merges in order, and record rank + the merged id.
     var merge_rank = std.AutoHashMap(u64, u32).init(arena);
@@ -173,6 +184,7 @@ pub fn buildFromParsed(arena: Allocator, p: parser.Parsed) Error!Vocab {
 
         const total = left_str.len + right_str.len;
         if (total > key_buf.len) return error.TokenStringTooLong;
+
         @memcpy(key_buf[0..left_str.len], left_str);
         @memcpy(key_buf[left_str.len..total], right_str);
         const merged_id = string_to_id.get(key_buf[0..total]) orelse return error.InvalidMerge;
@@ -199,9 +211,12 @@ pub fn buildFromParsed(arena: Allocator, p: parser.Parsed) Error!Vocab {
 
     // 5. specials_sorted (longest first).
     var n_specials: usize = 0;
-    for (is_special) |s| if (s) {
-        n_specials += 1;
-    };
+    for (is_special) |s| {
+        if (s) {
+            n_specials += 1;
+        }
+    }
+
     const specials = try arena.alloc(Special, n_specials);
     var k: usize = 0;
     for (tokens, is_special, 0..) |t, sp, i| {
@@ -210,6 +225,7 @@ pub fn buildFromParsed(arena: Allocator, p: parser.Parsed) Error!Vocab {
             k += 1;
         }
     }
+
     std.sort.pdq(Special, specials, {}, lenDescLessThan);
 
     std.debug.assert(bos < tokens.len);
@@ -260,6 +276,7 @@ fn preType(p: parser.Parsed) PreType {
     for (table) |e| {
         if (std.mem.eql(u8, pre, e.name)) return e.t;
     }
+
     return .default;
 }
 
@@ -271,6 +288,7 @@ fn lookupKv(p: parser.Parsed, key: []const u8) ?*const parser.Value {
     for (p.kvs) |*kv| {
         if (std.mem.eql(u8, kv.key, key)) return &kv.value;
     }
+
     return null;
 }
 

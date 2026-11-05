@@ -31,8 +31,19 @@ const n_tokens = n_decode + 1;
 
 /// Build the plan for the fused runner: `n_slots` streams at the multi-slot
 /// test window, and no device budget.
-fn fusedPlan(gpa: std.mem.Allocator, loaded: *const loader.Loaded, n_slots: u32) !z.kv_budget.KvPlan {
-    const caps = try LlamaFusedRunner.kvCaps(gpa, loaded, limits.contextCeiling(loaded.card.context_length, null), 0, n_slots, .f32);
+fn fusedPlan(
+    gpa: std.mem.Allocator,
+    loaded: *const loader.Loaded,
+    n_slots: u32,
+) !z.kv_budget.KvPlan {
+    const caps = try LlamaFusedRunner.kvCaps(
+        gpa,
+        loaded,
+        limits.contextCeiling(loaded.card.context_length, null),
+        0,
+        n_slots,
+        .f32,
+    );
     return z.kv_budget.kvPlan(caps, LlamaFusedRunner.kvCostModel(loaded.card, .f32), .{
         .window = @min(loaded.card.context_length, z.test_fakes.test_serve_window),
         .slots = n_slots,
@@ -47,17 +58,21 @@ test "llama GPU batched decode matches the CPU reference streams (greedy, exact)
     const gpa = std.testing.allocator;
     var arena_state = std.heap.ArenaAllocator.init(gpa);
     defer arena_state.deinit();
+
     const arena = arena_state.allocator();
     const fixture = try z.test_fixtures.path(arena, "SmolLM2-135M-Instruct-Q8_0");
 
     var loaded = try loader.load(io, arena, fixture);
     defer loaded.close();
+
     var v = try vocab_mod.buildFromParsed(arena, loaded.parsed);
     var prompt_ids: [prompts.len][]const u32 = undefined;
-    for (prompts, 0..) |p, i| prompt_ids[i] = try bpe.encodeAlloc(&v, arena, p, true);
+    for (prompts, 0..) |p, i| {
+        prompt_ids[i] = try bpe.encodeAlloc(&v, arena, p, true);
+    }
 
     // The CPU reference runs each prompt alone. The CPU ops of this build are
-    // the naive oracle, and greedy tokens hold across backends.
+    // the naive reference, and greedy tokens hold across backends.
     var reference: [prompts.len][n_tokens]u32 = undefined;
     {
         const max_seq = @min(loaded.card.context_length, z.test_fakes.test_window);
@@ -65,7 +80,17 @@ test "llama GPU batched decode matches the CPU reference streams (greedy, exact)
             var cpu_pool: tp.Pool = undefined;
             try tp.startPool(&cpu_pool, io, tp.policy());
             defer cpu_pool.deinit();
-            var runner = try LlamaRunner.init(arena, &loaded, z.kv_budget.pinned(1, max_seq), 0, io, &cpu_pool, tp.policy(), .f32);
+
+            var runner = try LlamaRunner.init(
+                arena,
+                &loaded,
+                z.kv_budget.pinned(1, max_seq),
+                0,
+                io,
+                &cpu_pool,
+                tp.policy(),
+                .f32,
+            );
             var pool = try Sessions(LlamaRunner).init(arena, &runner);
             const sid = try pool.create(0, .{});
             reference[p][0] = (try pool.feed(sid, ids, true)).?;
@@ -81,7 +106,14 @@ test "llama GPU batched decode matches the CPU reference streams (greedy, exact)
     const ctxp = try arena.create(z.vulkan_ctx.Context);
     ctxp.* = z.vulkan_ctx.Context.init(arena, .{}) catch return error.SkipZigTest;
     defer ctxp.deinit();
-    const fused = try LlamaFusedRunner.initFromLoaded(gpa, ctxp, &loaded, try fusedPlan(gpa, &loaded, prompts.len + 1), .f32);
+
+    const fused = try LlamaFusedRunner.initFromLoaded(
+        gpa,
+        ctxp,
+        &loaded,
+        try fusedPlan(gpa, &loaded, prompts.len + 1),
+        .f32,
+    );
     defer fused.deinit();
 
     var pool = try Sessions(LlamaFusedRunner).init(arena, fused);
@@ -91,10 +123,13 @@ test "llama GPU batched decode matches the CPU reference streams (greedy, exact)
         sids[p] = try pool.create(0, .{});
         got[p][0] = (try pool.feed(sids[p], ids, true)).?;
     }
+
     for (1..n_tokens) |k| {
         var out: [prompts.len]u32 = undefined;
         try pool.decodeBatch(&sids, &out);
-        for (0..prompts.len) |p| got[p][k] = out[p];
+        for (0..prompts.len) |p| {
+            got[p][k] = out[p];
+        }
     }
 
     for (reference, got) |ref, g| {
@@ -126,14 +161,18 @@ test "llama GPU composed advance: a multi-row prefill chunk riding a decode row 
     const gpa = std.testing.allocator;
     var arena_state = std.heap.ArenaAllocator.init(gpa);
     defer arena_state.deinit();
+
     const arena = arena_state.allocator();
     const fixture = try z.test_fixtures.path(arena, "SmolLM2-135M-Instruct-Q8_0");
 
     var loaded = try loader.load(io, arena, fixture);
     defer loaded.close();
+
     var v = try vocab_mod.buildFromParsed(arena, loaded.parsed);
     var prompt_ids: [prompts.len][]const u32 = undefined;
-    for (prompts, 0..) |p, i| prompt_ids[i] = try bpe.encodeAlloc(&v, arena, p, true);
+    for (prompts, 0..) |p, i| {
+        prompt_ids[i] = try bpe.encodeAlloc(&v, arena, p, true);
+    }
 
     // The CPU solo references: the first decode token of the front session and
     // the first token of the late session.
@@ -144,7 +183,17 @@ test "llama GPU composed advance: a multi-row prefill chunk riding a decode row 
         var cpu_pool: tp.Pool = undefined;
         try tp.startPool(&cpu_pool, io, tp.policy());
         defer cpu_pool.deinit();
-        var r0 = try LlamaRunner.init(arena, &loaded, z.kv_budget.pinned(1, max_seq), 0, io, &cpu_pool, tp.policy(), .f32);
+
+        var r0 = try LlamaRunner.init(
+            arena,
+            &loaded,
+            z.kv_budget.pinned(1, max_seq),
+            0,
+            io,
+            &cpu_pool,
+            tp.policy(),
+            .f32,
+        );
         var p0 = try Sessions(LlamaRunner).init(arena, &r0);
         const s0 = try p0.create(0, .{});
         _ = (try p0.feed(s0, prompt_ids[0], true)).?;
@@ -152,7 +201,16 @@ test "llama GPU composed advance: a multi-row prefill chunk riding a decode row 
         try p0.decodeBatch(&.{s0}, &o0);
         ref_front1 = o0[0];
 
-        var r1 = try LlamaRunner.init(arena, &loaded, z.kv_budget.pinned(1, max_seq), 0, io, &cpu_pool, tp.policy(), .f32);
+        var r1 = try LlamaRunner.init(
+            arena,
+            &loaded,
+            z.kv_budget.pinned(1, max_seq),
+            0,
+            io,
+            &cpu_pool,
+            tp.policy(),
+            .f32,
+        );
         var p1 = try Sessions(LlamaRunner).init(arena, &r1);
         const s1 = try p1.create(0, .{});
         ref_late0 = (try p1.feed(s1, prompt_ids[1], true)).?;
@@ -161,7 +219,14 @@ test "llama GPU composed advance: a multi-row prefill chunk riding a decode row 
     const ctxp = try arena.create(z.vulkan_ctx.Context);
     ctxp.* = z.vulkan_ctx.Context.init(arena, .{}) catch return error.SkipZigTest;
     defer ctxp.deinit();
-    const fused = try LlamaFusedRunner.initFromLoaded(gpa, ctxp, &loaded, try fusedPlan(gpa, &loaded, prompts.len + 1), .f32);
+
+    const fused = try LlamaFusedRunner.initFromLoaded(
+        gpa,
+        ctxp,
+        &loaded,
+        try fusedPlan(gpa, &loaded, prompts.len + 1),
+        .f32,
+    );
     defer fused.deinit();
 
     var pool = try Sessions(LlamaFusedRunner).init(arena, fused);
@@ -172,7 +237,11 @@ test "llama GPU composed advance: a multi-row prefill chunk riding a decode row 
     // with the decode step of the front session.
     const late = try pool.create(0, .{});
     var out: [1]u32 = undefined;
-    const first_late = try pool.advance(.{ .id = late, .tokens = prompt_ids[1], .final = true }, &.{front}, &out);
+    const first_late = try pool.advance(
+        .{ .id = late, .tokens = prompt_ids[1], .final = true },
+        &.{front},
+        &out,
+    );
     try std.testing.expectEqual(ref_front1, out[0]);
     try std.testing.expectEqual(ref_late0, first_late.?);
 }
@@ -194,11 +263,13 @@ test "llama GPU prefix restore: a warm-restored prefix continues bit-exactly" {
     const gpa = std.testing.allocator;
     var arena_state = std.heap.ArenaAllocator.init(gpa);
     defer arena_state.deinit();
+
     const arena = arena_state.allocator();
     const fixture = try z.test_fixtures.path(arena, "SmolLM2-135M-Instruct-Q8_0");
 
     var loaded = try loader.load(io, arena, fixture);
     defer loaded.close();
+
     var v = try vocab_mod.buildFromParsed(arena, loaded.parsed);
     const ids = try bpe.encodeAlloc(&v, arena, prompts[0], true);
     std.debug.assert(ids.len >= 2); // the split needs a prefix row and a suffix row
@@ -207,8 +278,16 @@ test "llama GPU prefix restore: a warm-restored prefix continues bit-exactly" {
     const ctxp = try arena.create(z.vulkan_ctx.Context);
     ctxp.* = z.vulkan_ctx.Context.init(arena, .{}) catch return error.SkipZigTest;
     defer ctxp.deinit();
-    const fused = try LlamaFusedRunner.initFromLoaded(gpa, ctxp, &loaded, try fusedPlan(gpa, &loaded, 2), .f32);
+
+    const fused = try LlamaFusedRunner.initFromLoaded(
+        gpa,
+        ctxp,
+        &loaded,
+        try fusedPlan(gpa, &loaded, 2),
+        .f32,
+    );
     defer fused.deinit();
+
     var pool = try Sessions(LlamaFusedRunner).init(arena, fused);
 
     // Cold: feed the prefix without asking for logits, snapshot those rows,

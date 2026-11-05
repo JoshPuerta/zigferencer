@@ -1,112 +1,291 @@
-# GPU substrate: RDNA2 and Vulkan compute
+# The target GPU: AMD RDNA2
 
-This document gives the hardware and API facts under the GPU backend. The general
-data-parallel rules say that the work hierarchy and the memory traffic decide
-performance, not the kernel body. This document maps those rules onto the substrate the kernels run on. It gives the term map from the textbook to the Vulkan API and the two techniques that pay for inference kernels. It also gives the occupancy budget, the numbers of the reference card, and the bandwidth budget that sets the performance target.
+The GPU kernels of zigferencer target the AMD Radeon RX 6800 XT
+(Navi 21, `gfx1030`, RDNA2), through Vulkan compute. This page introduces the parts
+of that GPU that decide how fast a kernel runs. The header of each shader in `src/ops_vulkan/shaders/` and
+of `src/ops_vulkan/kernels.zig` holds the details. Another RDNA2 or RDNA3 card
+changes the numbers, but ideally not the method.
 
-Read this before you write or tune a shader.
+Take this as a condensed material from investigations while writting the kernels.
 
-## 1. Term map
+## 1. Words: CUDA, Vulkan, and AMD
 
-The reference textbook for GPU compute is *Programming Massively Parallel Processors*.
-Read it for the mental model, not for the syntax. The CUDA examples translate to AMD
-and Vulkan with a name swap. The hierarchy underneath is the same, and that hierarchy
-decides whether a kernel runs at peak.
+| CUDA | Vulkan (GLSL) | AMD hardware |
+| --- | --- | --- |
+| thread | invocation | lane |
+| warp (32 threads) | subgroup | wave: 32 lanes (wave32) or 64 lanes (wave64) |
+| block | workgroup | runs on one compute unit (CU) or one workgroup processor (WGP) |
+| grid | dispatch | |
+| shared memory | `shared` variables | LDS (local data share) |
+| SM (streaming multiprocessor) | | CU. RDNA pairs two CUs into one WGP |
+| constant memory | push constants, uniform buffers | |
 
-| CUDA | Vulkan / AMD |
-|---|---|
-| thread / warp / block / grid | invocation / subgroup / workgroup / dispatch |
-| shared memory | GLSL `shared`, which is the AMD LDS (Local Data Share) |
-| SM (streaming multiprocessor) | AMD CU (Compute Unit). RDNA pairs two CUs into a WGP (Workgroup Processor). |
-| warp size 32 | RDNA wave32, the compute default. Wave64 is the older GCN width, and the compiler can still select it. |
-| constant memory | Vulkan push constants and uniform buffers |
+## 2. The reference setup: WSL2 and Vulkan on D3D12
 
-## 2. The two techniques that pay for inference kernels
+The project set out to use one desktop card, an RX 6800 XT, from Linux under WSL2
+on Windows. On that setup the only Vulkan driver is Mesa Dozen. Dozen translates
+Vulkan to Direct3D 12, and the Windows AMD driver then runs the work. RADV needs a
+DRM device that WSL2 does not expose for AMD cards, and ROCm does not support RDNA2
+under WSL2.
 
-See PMPP chapters 4, 5, and 6.
+The tested software is Ubuntu 24.04 with Mesa 26.1 from the kisak PPA, which builds
+Dozen. `glslc` and the Vulkan loader come from the LunarG Vulkan SDK 1.4.313. The stock
+Mesa of Ubuntu 24.04 has no Dozen. The stock `glslc` 2023.8 and `libvulkan-dev`
+1.3.275 also build the GPU path, but their SPIR-V differs byte for byte from the SDK
+output.
 
-1. **Tiled matmul with LDS staging.** One workgroup computes one output tile. The
-   workgroup loads `tile_M x tile_K` of A and `tile_K x tile_N` of B from global
-   memory into LDS one time. Then every invocation in the workgroup reads from LDS.
-   This cuts global-memory traffic by a factor of `tile_K`.
-2. **Coalesced global loads.** Adjacent invocations in a wave must touch adjacent
-   global addresses. A pattern that strides across a wave wastes the cache line.
+This driver path sets most of the limits that the kernels and the planners respect:
 
-## 3. Occupancy budget
+| Limit of the setup | How the engine handles it |
+| --- | --- |
+| Vulkan 1.2, no 8-bit storage, no 8-bit integers in shaders | The engine splits Q8_0 into an f16 scale array and packed 8-bit words (section 9). |
+| 32 KiB of shared memory for each workgroup | The attention kernels fit their LDS into 32 KiB, and a compile-time assert checks it (section 10). |
+| A storage-buffer range of 128 MiB, the Vulkan minimum | The KV cache uses one region for each layer, a default window shrinks to fit, and `$ZIGFERENCER_VK_STORAGE_RANGE` states a checked range ([architecture.md](architecture.md), section 9). |
+| An allocation overhead that runs out of memory before the 16 GB card is full | The VRAM preflight keeps 1/8 of the free VRAM in reserve. A plan of more than about 12.5 GB is not safe. |
+| A device loss under memory pressure, which stays until the virtual machine restarts | Run one large GPU job at a time, with time between runs. `make gpu-flush` ends a process that stays. |
+| Windows stops a GPU submit that runs longer than its timeout (2 s by default) | A large-model prefill needs a longer `TdrDelay` in the Windows registry. |
+| A GPU timestamp counter that is not a stable clock across submits | The trace places each GPU record by its own host window ([profiling.md](profiling.md)). |
+| Host-visible memory at about 30 GB/s over the bus of the virtual machine | The weights, the KV, and the scratch live in device-local memory. |
+| No view of the shader ISA, the registers, or the occupancy, and no hardware counters | Tuning uses measured time only. |
 
-See PMPP chapter 5. Each CU runs N waves in flight. Two pressures cap N: the VGPRs
-of each wave, and the LDS bytes of each workgroup. Stay under both budgets to keep
-two or more waves resident. Resident waves hide memory latency.
+A native Linux driver such as RADV removes most of these limits. It reports 64 KiB
+of shared memory and the real storage range, and the vendor profilers work with it.
+The engine reads each limit from the driver at start, except the 32 KiB of shared
+memory. That bound is a constant in `core/limits.zig`, and every AMD driver allows
+at least 32 KiB.
 
-## 4. The reference card: RX 6800 XT, gfx1030, RDNA2
+## 3. The card in numbers
 
-The budgets in this document and the tile constants in the shaders are computed for
-this card. Another RDNA2 or RDNA3 card changes the numbers, not the method.
+| Part | RX 6800 XT |
+| --- | --- |
+| Compute units | 72 CUs in 36 WGPs. Each CU has two SIMD32 units. |
+| Layout | 4 shader engines with 2 shader arrays each. Each array has its own graphics L1. |
+| Clock | Boost clock up to 2250 MHz. |
+| Arithmetic peak | 20.7 TFLOPS at f32 (4608 lanes x 2 operations x 2.25 GHz), 41.5 TFLOPS at packed f16. |
+| VRAM | 16 GB of GDDR6 on a 256-bit bus at 16 Gbps: 512 GB/s. |
+| Infinity Cache | 128 MB between the L2 and the VRAM, about 2 TB/s at peak. |
+| L2 cache | 4 MB. |
+| Graphics L1 cache | 128 KB for each shader array. |
+| In each WGP | 128 KB of LDS, a 32 KB instruction cache, and a 16 KB scalar cache. |
+| In each CU | A 16 KB L0 vector cache. |
+| In each SIMD32 | A register file of 128 KB: 1024 vector registers (VGPRs) of 32 lanes. One wave can address up to 256 VGPRs. Up to 16 waves are resident. |
+| Integer dot products | 8-bit and 4-bit dot-product instructions, for example `V_DOT4_I32_I8`. |
 
-- 72 CUs and 36 WGPs. Each WGP is two CUs that share a scheduler and 128 KB L1.
-- 16 GB GDDR6 at about 512 GB/s peak.
-- 128 MB Infinity Cache (L3) as a bandwidth amplifier. It holds SmolLM2 entirely. It
-  holds about 12 percent of an 8B Q8_0 model.
-- 256 VGPRs for each wave. 64 KB LDS for each CU. 16 KB scalar L1 and 16 KB vector
-  L1 for each WGP. 4 MB L2.
-- Wave32 is the compute default, because RDNA breaks from the wave64 default of GCN.
-  The compiler can select wave64 for a high-occupancy or branchy kernel. The engine
-  pins wave32 on every compute pipeline through the subgroup-size-control extension.
-- A translation-layer Vulkan driver (Vulkan on D3D12) exposes Vulkan 1.2, 16-bit
-  storage, and fp16 arithmetic, but no 8-bit storage and no `shaderInt8`. The
-  kernels therefore pack four i8 quants into one `uint` and decode them with
-  `bitfieldExtract`. The same driver caps workgroup shared memory at 32 KiB, which
-  sizes the shared-memory rows of the attention kernels.
+## 4. Decode is a bandwidth problem
 
-## 5. Bandwidth budget
+The weights go to VRAM once, when the runner starts, and they stay there. The cost
+in this section is not that upload. A decode step reads every weight matrix once,
+from VRAM into the registers of the kernels. It uses each weight for one multiply and
+one add. The matrices are far larger than the caches, so the memory bus moves
+those bytes again for each token.
 
-A Q8_0 Llama-8B decode step streams about 8.5 GB of weights. At the GDDR6 peak of
-512 GB/s the ceiling is about 60 tokens per second. A sustained 60 to 70 percent of
-peak gives 35 to 40 tokens per second. The CPU `simd_pf` variant with four threads
-reaches about 5 tokens per second. The target is therefore a speedup of 7x to 8x
-before any kernel-level tuning, and the fused Llama-8B decode measures about 40
-tokens per second.
+A Q8_0 block stores 32 weights in 34 bytes, which is 1.0625 bytes for each weight.
+The bytes that one step reads, over the memory bandwidth, give the shortest possible
+step. The byte counts come from the tensors of
+the Q8_0 files:
 
-This is the performance budget of the GPU path. Optimize against the slowest
-resource, which here is memory bandwidth. Halving the weight bytes (Q4_0) is the
-one lever that moves the ceiling.
+| Model | Tensor bytes in the file | Bytes one decode step reads | Shortest step at 512 GB/s | Most tokens per second |
+| --- | --- | --- | --- | --- |
+| Qwen3.5-2B | 2.00 GB | 2.00 GB | 3.9 ms | 256 |
+| Llama-3.1-8B | 8.53 GB | 7.97 GB | 15.6 ms | 64 |
 
-## 6. Discipline on this substrate
+A step reads only one row of the embedding table. Llama-3.1-8B has a separate
+lm_head, so a step skips the rest of its 0.56 GB table. Qwen3.5-2B ties its lm_head
+to the embedding table, so its lm_head reads the whole table on each step. These
+limits leave out the KV reads, which grow with the context.
 
-The general schemas hold. Only the substrate changes.
+The roofline shows why. The card does 20.7 TFLOPS against 512 GB/s, so a kernel
+needs about 40 operations for each byte to use all its arithmetic. A decode
+matrix-vector product does 2 operations for each 1.0625 bytes, about 1.9 operations
+for each byte, more than 20 times too few. Its speed therefore depends only on how
+fast it reads memory. The Infinity Cache does not change this. It holds 1.7 % of
+the bytes of an 8B step and 6.7 % of the bytes of a 2B step. A stream that reads
+each byte once for each token gets almost no reuse from a cache.
 
-- **Control unit and datapath.** Vulkan command buffers and queues are the control
-  unit. Compute shaders are the datapath.
-- **Boundaries carry values.** Buffers, descriptor sets, and push constants are plain
-  values.
-- **A limit on everything.** The workgroup count and the LDS size are the loop
-  bounds. The host asserts every shape before it records a dispatch.
-- **Bit-exact where the order is preserved.** A kernel that keeps the CPU reduction order marks its accumulators `precise`. Then `glslc -O` cannot fuse a multiply and an add and change the token hash. A kernel that reorders a reduction declares a
-  measured relative tolerance on its Zig wrapper, never a guessed one.
+How the kernels use this:
 
-## 7. On portability
+- The matrix-vector kernels read the weights in coalesced loads and do little
+  else. On a Qwen3.5-9B decode the matrix time measured 18.7 ms against a floor of
+  18.6 ms (9.5 GB at 512 GB/s).
+- Fewer bytes for each weight raise the limit. A Q4_0 block stores 32 weights in 18
+  bytes, about half of Q8_0.
+- One submission for each step removes the host gaps between kernels (section 11).
+- The prefill kernels feed many rows through one read of the weights, so they move
+  toward the arithmetic limit (section 8).
 
-Vendor lock-in is a dependency, so the general advice is to prefer a portable layer.
-Vulkan compute is the portable layer for this project. SYCL, HIP, Kokkos, RAJA, and
-OpenMP target each need a C or C++ toolchain, and the zero-dependency rule rejects
-that toolchain. Do not read the general advice as a reason to migrate off Vulkan.
+## 5. Waves: wave32 and the pin
 
-## 8. References
+An RDNA SIMD unit runs a wave of 32 lanes natively. A wave64 instruction issues
+twice, once for each half of the wave. A driver can still compile a compute shader
+for wave64, and RADV, the Mesa driver, does so by default. The engine therefore pins every compute pipeline to a subgroup
+size of 32 through `VK_EXT_subgroup_size_control` (`kernels.zig`,
+`runtime/vulkan_ctx.zig`). On a SmolLM2 decode the pin cut the inter-token latency by
+31 % and its standard deviation by a factor of 4.
 
-- *Programming Massively Parallel Processors*, 4th edition, Kirk, Hwu, and Hajj. The
-  textbook.
-- **AMD RDNA2 Shader Instruction Set Architecture** (AMD, 2020). Ground truth for
-  what the compiler can emit. Read the chapters on memory operations and scheduling.
-- **AMD RDNA2 Performance Guide.** About 30 pages on the hardware-level knobs: wave
-  occupancy, LDS bank conflicts, and branch coherence.
-- **Mesa RADV**, `mesa/src/amd/`. Production Vulkan on AMD, with the kernels that
-  real engines hit. The RADV compiler-tuning posts from the Mesa team are short and
-  useful.
-- **LLVM AMDGPU backend**, `llvm/lib/Target/AMDGPU/`. Codegen intuition for what
-  `glslc -> SPIR-V -> LLVM-AMDGPU` produces.
-- **zinc**, <https://github.com/zolotukhin/zinc>. A Zig, Vulkan, and GLSL inference
-  engine, and the closest prior art for this path. Read its kernels before you start
-  a new shader.
-- **The matmul tutorial in the Vulkan-Samples repository.** A clean compute-only
-  Vulkan setup, and a good first reference.
-- **llama.cpp.** The f32 numerics oracle for this project.
+Every workgroup size is a multiple of 32, and each size has a reason:
+
+| Workgroup | Waves | Kernels | Why |
+| --- | --- | --- | --- |
+| 32 lanes | 1 | the decode matrix-vector kernels, the prefill batch kernels, the Gated-DeltaNet scan | All lanes are in one wave, so a barrier costs nothing and no wave waits for another. |
+| 64 lanes | 2 | attention, RoPE, the KV commit | Two resident waves hide the memory latency of the KV reads. |
+| 128 lanes | 4 | the Gated-DeltaNet decode step, convolution, and norm | One lane for each of the 128 dimensions of a head. |
+| 256 lanes | 8 | elementwise ops, norms, the prefill GEMM | For the elementwise ops, eight waves keep a WGP busy without so many registers that fewer waves fit. The GEMM is a 16 x 16 grid of lanes, one 4 x 4 output block for each lane. |
+
+## 6. Occupancy: registers and LDS
+
+A CU keeps several waves resident and switches to another wave while one waits for
+memory. This switch hides the memory latency. Two budgets limit how many waves fit:
+the vector registers (VGPRs) of each wave, and the LDS of each workgroup. A kernel
+that uses more of either keeps fewer waves resident.
+
+A SIMD32 has 1024 VGPRs, allocated in steps of 16, and holds at most 16 waves:
+
+| VGPRs for each wave (wave32) | 64 or fewer | 80 | 96 | 128 | 160 | 192 | 256 |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| Waves on one SIMD32 | 16 | 12 | 10 | 8 | 6 | 5 | 4 |
+
+The LDS decides next. A WGP has 128 KB of LDS. In CU mode each CU uses one half of
+64 KB, and one workgroup can take at most 64 KB.
+
+How the kernels use this:
+
+- The subgroup matrix-vector kernel stages its input vector in 16 KB of LDS, so four
+  workgroups still fit on one CU.
+- The prefill kernel `linear_q8_0_batch` works on a tile of 16 rows. A larger tile
+  needs more registers for each lane and fits fewer waves, and the achieved
+  bandwidth falls. A sweep on a 9B prefill measured 16 as the knee
+  (`limits.zig`).
+- Split attention runs up to 4 query heads in one workgroup. A sweep of 8, 4, and 2
+  picked 4: at 8, the LDS of one workgroup halves the workgroups that fit
+  (`limits.attn_split_queries`).
+- A per-lane array with an index that changes at run time goes to scratch memory,
+  which is slow. The Gated-DeltaNet scan therefore fixes its head size at 128 and
+  unrolls the loop, so every index is a constant.
+
+## 7. Coalescing: adjacent lanes, adjacent bytes
+
+A wave sends one memory request for each cache line that its lanes touch. When the
+32 lanes read 32 adjacent words, one request serves the whole wave. When each lane
+reads a different line, the wave sends 32 requests for the same work.
+
+How the kernels use this:
+
+- The elementwise kernels give lane `i` element `i`.
+- The decode matrix-vector kernel `linear_q8_0_reduce` gives one workgroup to each
+  output row. Lane `L` reads the quant blocks `L`, `L + 32`, `L + 64`, and so on, so
+  the lanes of the wave read adjacent blocks. Lane 0 then adds the 32 partial sums
+  in LDS.
+- Split attention loads K in 16-byte vectors, eight loads for each 128-byte line.
+- One counter-example stays on purpose. The resident decode attention gives each
+  lane its own K row, so the K reads do not coalesce across the wave. Its V pass
+  gives each lane one dimension, and those reads do coalesce.
+
+## 8. Reuse and tiling
+
+A tile stages data in LDS, so that many lanes read it from LDS and not from VRAM.
+A tile helps only when the same bytes feed more than one output.
+
+- **Decode.** A matrix-vector product uses each weight byte for one row only. There
+  is no reuse, so the decode kernels do not tile. They read the weights once.
+- **Prefill.** A chunk of rows multiplies the same weights. `linear_q8_0_batch`
+  holds an input tile of 16 rows in LDS. Each lane keeps the quant block of one
+  weight column in its registers and applies it to all 16 rows. Each weight byte
+  therefore serves 16 rows. `linear_q8_0_gemm` computes a 64 x 64 output tile. Both
+  inputs sit in 16 KB of LDS, and each lane keeps a 4 x 4 block of outputs in its
+  registers.
+- The Qwen3.5 fused runner selects the kernel by the row count of a step. One row
+  takes the matrix-vector kernel, fewer than 64 rows take the batch kernel, and 64
+  rows or more take the GEMM. On a 9B prefill the GEMM cut the matrix time from 564 ms to 379 ms.
+
+## 9. Quantized weights without 8-bit storage
+
+A Q8_0 block holds 32 signed 8-bit values and one f16 scale, 34 bytes in all. The
+driver class of the reference setup is Vulkan on D3D12. It exposes 16-bit storage
+and f16 arithmetic, but no 8-bit storage and no 8-bit integer type in shaders. At
+load the engine therefore splits the blocks of each weight into two arrays. One
+array holds the f16 scales, and one holds the 8-bit values (`kernels.zig`). A shader reads the 8-bit array
+as 32-bit words and takes each value out with `bitfieldExtract(int(word), (i & 3) *
+8, 8)`. A Q4_0 shader takes its two 4-bit values out of each byte with a shift and a
+mask.
+
+The split also helps the reads: each array is contiguous, so a wave reads the scales
+and the values with coalesced loads.
+
+RDNA2 also has 8-bit dot-product instructions. A native driver exposes them to
+SPIR-V through `VK_KHR_shader_integer_dot_product`. The kernels do not use them yet:
+they convert each value to f32 and multiply in f32.
+
+## 10. Driver limits
+
+The kernels respect these limits of the driver:
+
+- **Shared memory of one workgroup.** Vulkan on D3D12 and the AMD drivers allow
+  32 KiB. RADV allows 64 KiB. The kernels assume 32 KiB, and a compile-time assert
+  checks each layout against it (`core/limits.zig`).
+- **Storage-buffer range.** Some drivers report the minimum range of the Vulkan
+  specification, 128 MiB. The KV cache uses one region for each layer and
+  tensor, so the limit applies to one region and not to the whole cache.
+- **Two kinds of memory.** A shader reads device-local memory at about 500 GB/s. It
+  reads host-visible memory over the bus to the host at about 30 GB/s. The
+  weights, the KV, and the scratch therefore live in device-local memory, and uploads
+  pass through a host-visible staging buffer.
+
+## 11. One command buffer for each token
+
+A decode step of a small model has hundreds of ops. The per-op backend submits each
+op and waits for it.  The fused runners record the whole step instead:
+
+```
+  per-op:  [record op 1][submit][wait] [record op 2][submit][wait] ... hundreds of times
+  fused:   [record every dispatch, a barrier between dependent ones][submit][wait]
+```
+
+- The weights, the KV, and the scratch stay in VRAM, and each descriptor set is
+  bound once, when the runner starts.
+- A barrier sits between two dispatches only when the second reads what the first
+  wrote.
+- The decode ring (`runtime/decode_ring.zig`) holds two command buffers. While the
+  GPU runs step N, the host records the predicted step N + 1 into the other buffer.
+  When the prediction misses, the next step records its own buffer before it submits.
+
+## 12. Why Vulkan?
+
+Vulkan compute runs on AMD, NVIDIA, and Intel GPUs, and on other platforms through a
+translation layer, with no vendor toolkit. SYCL, HIP, Kokkos, RAJA, and OpenMP target
+each need a C or C++ toolchain. The CPU build has no dependency outside the Zig
+standard library, and the GPU build adds only the Vulkan bindings.
+
+## 13. References
+
+- Wen-mei W. Hwu, David B. Kirk, and Izzat El Hajj. *Programming Massively Parallel
+  Processors: A Hands-on Approach*, 4th edition. Elsevier, 2022. The textbook for
+  the hierarchy, tiling, coalescing, and reductions. Read it for the model, not for
+  the CUDA syntax.
+- AMD. *"RDNA 2" Instruction Set Architecture: Reference Guide*. 2020.
+  <https://docs.amd.com/v/u/en-US/rdna2-shader-instruction-set-architecture>. What
+  the hardware runs: waves, registers, LDS, and the dot-product instructions.
+- AMD. *RDNA Architecture* (white paper). 2019. <https://gpuopen.com/rdna/>. The
+  WGP, the cache hierarchy, and wave32.
+- Andrew Pomianowski. *AMD RDNA 2 Gaming Architecture*. Hot Chips 33, 2021.
+  <https://hc33.hotchips.org/assets/program/conference/day2/2021%20Hot%20Chips%20RDNA2%20Pomianowski%20Final%2020210820.pdf>.
+  The layout of Navi 21, the cache sizes and bandwidths, and the Infinity Cache.
+- AMD GPUOpen. *RDNA Performance Guide*. <https://gpuopen.com/learn/rdna-performance-guide/>.
+- AMD GPUOpen. *Occupancy explained*. <https://gpuopen.com/learn/occupancy-explained/>.
+  How registers and LDS limit the resident waves.
+- LLVM. *User Guide for AMDGPU Backend*. <https://llvm.org/docs/AMDGPUUsage.html>,
+  with the source in `llvm/lib/Target/AMDGPU`. The occupancy formulas and the
+  target features of `gfx1030`.
+- Mesa: RADV in `src/amd/vulkan` and its compiler ACO in `src/amd/compiler`.
+  <https://gitlab.freedesktop.org/mesa/mesa>. Production Vulkan on AMD, and the
+  source of each limit that RADV reports.
+- Khronos. The reference pages of `VK_EXT_subgroup_size_control` and
+  `VK_KHR_shader_integer_dot_product`. <https://docs.vulkan.org/refpages/latest/>.
+- vulkan.gpuinfo.org. The features and limits that each driver reports for a card.
+- llama.cpp, the Vulkan backend in `ggml/src/ggml-vulkan`.
+  <https://github.com/ggml-org/llama.cpp>. Prior art for the kernels, and the f32
+  reference for the numbers.
+- zinc. <https://github.com/zolotukhin/zinc>. A Zig inference engine on Vulkan and
+  Metal. Its README lists RDNA3 and RDNA4 for AMD.
+- Khronos Vulkan-Samples, `samples/api/compute_nbody`.
+  <https://github.com/KhronosGroup/Vulkan-Samples>. A small compute sample with
+  shared memory.

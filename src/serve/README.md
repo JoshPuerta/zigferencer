@@ -24,7 +24,7 @@ of [docs/architecture.md](../../docs/architecture.md) sets out.
 | `residency.zig` | The optional tiered KV pool. It maps logical sessions to VRAM slots or RAM blobs with an LRU clock and presents the same method surface `Sessions` does, so the scheduler only swaps its engine type. |
 | `prefix_manager.zig` | The serve prefix cache: its entries, its counters, its insert body, and the `--preload` boot warm-up. It keeps every engine call whose result only the cache consumes. |
 | `server.zig` | The binary transport adapter. It speaks ZMTP as a ROUTER, and `Server(E,C)` is `ServeEngine(E,C,BinaryAdapter)`. `BinaryAdapter` runs two tasks per connection, a reader and a writer. The writer is the single writer of the stream, and it sends the greeting and READY first. One ZMTP message carries one `protocol.zig` frame. The reader answers a peer PING through the out-queue. |
-| `client.zig` | The reference binary client behind the integration tests and `bench-serve`, and the file a port to another language copies. It speaks ZMTP as a DEALER, so a ZeroMQ binding in any language can replace it. Its methods are send-only or terminal-wait, as the client surface section sets out. `next` returns slices that borrow the payload buffer. |
+| `client.zig` | The reference binary client behind the integration tests and `bench-serve`, and the file a port to another language copies. It speaks ZMTP as a DEALER, so a ZMQ binding in any language can replace it. Its methods are send-only or terminal-wait, as the client surface section sets out. `next` returns slices that borrow the payload buffer. |
 | `openai/http_server.zig` | The OpenAI HTTP adapter. `HttpAdapter` runs one task per connection over `std.http.Server`, because request and response are half-duplex there. One task both drains the out-queue and writes the response. |
 | `openai/map.zig` | The pure datapath of the HTTP connector and its trust boundary. It parses and validates an untrusted body into a value, and it maps a rejection to an HTTP status. It routes each token of a turn to `reasoning_content` or `content`, and it splits streamed token bytes on UTF-8 boundaries for SSE. |
 | `openai/types.zig` | The OpenAI request and response structs. Every optional field has a default, so a minimal request parses, and the parse drops unknown fields, so a full client with tools still round-trips. Every sampling field has a named field, so no sampling value drops in silence. |
@@ -127,7 +127,7 @@ must size the disk for the sum of the active budgets.
   `--max-sessions`. A wire `shutdown` gets `forbidden` unless `--allow-shutdown`
   is set. Connection 0 never comes from the wire, so a request of the process
   owner always stops the server. `serve-openai` has no `--allow-shutdown` and no
-  share knob, because HTTP has no shutdown verb and holds one session per
+  share option, because HTTP has no shutdown verb and holds one session per
   connection. `tests/serve_integration_test.zig` checks the cap, the share, the
   sweep, and the refused shutdown from the wire.
 - **Session leases.** A lease keeps a session through a drop. The scheduler
@@ -308,7 +308,7 @@ detail that the client cut.
 
 ### A client in any language
 
-1. Create a DEALER socket with your ZeroMQ binding.
+1. Create a DEALER socket with your ZMQ binding.
 2. Connect it to `tcp://HOST:PORT` or to `ipc://PATH`. The `READY` line of `serve` gives the address.
 3. Send one message per request. The message is the 20-byte header of `protocol.zig` followed by the payload.
 4. Receive one message per reply. Decode the header, then the payload, with the same tables.

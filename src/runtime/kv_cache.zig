@@ -32,7 +32,7 @@ const dtype = @import("../core/dtype.zig");
 
 const log = std.log.scoped(.kv);
 
-// -- api --------------------------------------------------------------------
+// -- types ------------------------------------------------------------------
 
 pub const KvCache = struct {
     n_layers: u32,
@@ -102,6 +102,7 @@ pub const KvCache = struct {
     pub fn kSliceAs(self: *const KvCache, comptime E: type, layer: u32, pos: u32) []const E {
         std.debug.assert(layer < self.n_layers);
         std.debug.assert(pos < self.max_seq);
+
         return self.viewConst(E, self.kBase(layer), (@as(usize, pos) + 1) * self.per_step_elems);
     }
 
@@ -109,6 +110,7 @@ pub const KvCache = struct {
     pub fn vSliceAs(self: *const KvCache, comptime E: type, layer: u32, pos: u32) []const E {
         std.debug.assert(layer < self.n_layers);
         std.debug.assert(pos < self.max_seq);
+
         return self.viewConst(E, self.vBase(layer), (@as(usize, pos) + 1) * self.per_step_elems);
     }
 
@@ -117,6 +119,7 @@ pub const KvCache = struct {
     pub fn kDstAs(self: *KvCache, comptime E: type, layer: u32, pos: u32) []E {
         std.debug.assert(layer < self.n_layers);
         std.debug.assert(pos < self.max_seq);
+
         const off = self.kBase(layer) + @as(usize, pos) * self.per_step_elems;
         return self.viewMut(E, off, self.per_step_elems);
     }
@@ -125,6 +128,7 @@ pub const KvCache = struct {
     pub fn vDstAs(self: *KvCache, comptime E: type, layer: u32, pos: u32) []E {
         std.debug.assert(layer < self.n_layers);
         std.debug.assert(pos < self.max_seq);
+
         const off = self.vBase(layer) + @as(usize, pos) * self.per_step_elems;
         return self.viewMut(E, off, self.per_step_elems);
     }
@@ -157,24 +161,28 @@ pub const KvCache = struct {
     /// never name an element type.
     pub fn kRowsBytes(self: *const KvCache, layer: u32, n_rows: u32) []const u8 {
         std.debug.assert(layer < self.n_layers);
+
         return self.rangeConst(self.kBase(layer), n_rows);
     }
 
     /// Byte range of positions `0..n_rows` of one layer's V half.
     pub fn vRowsBytes(self: *const KvCache, layer: u32, n_rows: u32) []const u8 {
         std.debug.assert(layer < self.n_layers);
+
         return self.rangeConst(self.vBase(layer), n_rows);
     }
 
     /// Mutable byte range of positions `0..n_rows` of one layer's K half.
     pub fn kRowsBytesMut(self: *KvCache, layer: u32, n_rows: u32) []u8 {
         std.debug.assert(layer < self.n_layers);
+
         return self.rangeMut(self.kBase(layer), n_rows);
     }
 
     /// Mutable byte range of positions `0..n_rows` of one layer's V half.
     pub fn vRowsBytesMut(self: *KvCache, layer: u32, n_rows: u32) []u8 {
         std.debug.assert(layer < self.n_layers);
+
         return self.rangeMut(self.vBase(layer), n_rows);
     }
 
@@ -191,7 +199,9 @@ pub const KvCache = struct {
         std.debug.assert(self.n_layers == source.n_layers);
         std.debug.assert(self.kv_dtype == source.kv_dtype);
         std.debug.assert(n_pos <= self.max_seq);
+
         if (n_pos == 0) return;
+
         log.debug("clone: {d} positions across {d} layers", .{ n_pos, self.n_layers });
         var layer: u32 = 0;
         while (layer < self.n_layers) : (layer += 1) {
@@ -209,7 +219,10 @@ pub const KvCache = struct {
 
     fn vBase(self: *const KvCache, layer: u32) usize {
         // V-half starts after all K-layers.
-        return @as(usize, self.n_layers) * self.per_layer_elems + @as(usize, layer) * self.per_layer_elems;
+        return @as(
+            usize,
+            self.n_layers,
+        ) * self.per_layer_elems + @as(usize, layer) * self.per_layer_elems;
     }
 
     /// Bytes one stored element occupies: 4 at f32, 2 at f16. It comes from the
@@ -230,13 +243,19 @@ pub const KvCache = struct {
     fn rangeConst(self: *const KvCache, base: usize, n_rows: u32) []const u8 {
         std.debug.assert(n_rows >= 1);
         std.debug.assert(n_rows <= self.max_seq);
-        return self.storage[self.byteOff(base)..][0..self.byteOff(@as(usize, n_rows) * self.per_step_elems)];
+
+        return self.storage[self.byteOff(base)..][0..self.byteOff(
+            @as(usize, n_rows) * self.per_step_elems,
+        )];
     }
 
     fn rangeMut(self: *KvCache, base: usize, n_rows: u32) []u8 {
         std.debug.assert(n_rows >= 1);
         std.debug.assert(n_rows <= self.max_seq);
-        return self.storage[self.byteOff(base)..][0..self.byteOff(@as(usize, n_rows) * self.per_step_elems)];
+
+        return self.storage[self.byteOff(base)..][0..self.byteOff(
+            @as(usize, n_rows) * self.per_step_elems,
+        )];
     }
 
     /// The one tag check. Every typed view funnels through `viewConst` or
@@ -245,7 +264,12 @@ pub const KvCache = struct {
         std.debug.assert(self.kv_dtype == tagOf(E));
     }
 
-    fn viewConst(self: *const KvCache, comptime E: type, elem_off: usize, elem_len: usize) []const E {
+    fn viewConst(
+        self: *const KvCache,
+        comptime E: type,
+        elem_off: usize,
+        elem_len: usize,
+    ) []const E {
         self.assertTag(E);
         const bytes = self.storage[self.byteOff(elem_off)..][0..self.byteOff(elem_len)];
         return @alignCast(std.mem.bytesAsSlice(E, bytes));
@@ -274,6 +298,7 @@ test "KvCache shapes and slice math" {
     const gpa = std.testing.allocator;
     var arena_state = std.heap.ArenaAllocator.init(gpa);
     defer arena_state.deinit();
+
     const arena = arena_state.allocator();
 
     var c = try KvCache.init(arena, 2, 3, 4, 8, .f32);
@@ -282,7 +307,9 @@ test "KvCache shapes and slice math" {
     try std.testing.expectEqual(@as(usize, 384 * 4), c.storage.len);
 
     const k_dst = c.kDst(1, 2);
-    for (k_dst, 0..) |*x, i| x.* = @floatFromInt(i + 100);
+    for (k_dst, 0..) |*x, i| {
+        x.* = @floatFromInt(i + 100);
+    }
 
     const k_view = c.kSlice(1, 2);
     try std.testing.expectEqual(@as(usize, 3 * 12), k_view.len); // pos 0,1,2
@@ -296,6 +323,7 @@ test "KvCache at f16 halves the slab and round-trips a row" {
     const gpa = std.testing.allocator;
     var arena_state = std.heap.ArenaAllocator.init(gpa);
     defer arena_state.deinit();
+
     const arena = arena_state.allocator();
 
     var c = try KvCache.init(arena, 2, 3, 4, 8, .f16);
@@ -305,7 +333,9 @@ test "KvCache at f16 halves the slab and round-trips a row" {
 
     const k_dst = c.kDstAs(f16, 1, 2);
     try std.testing.expectEqual(@as(usize, 12), k_dst.len);
-    for (k_dst, 0..) |*x, i| x.* = @floatFromInt(i + 100);
+    for (k_dst, 0..) |*x, i| {
+        x.* = @floatFromInt(i + 100);
+    }
 
     const k_view = c.kSliceAs(f16, 1, 2);
     try std.testing.expectEqual(@as(usize, 3 * 12), k_view.len);
@@ -319,6 +349,7 @@ test "KvCache byte ranges price the rows at the storage dtype" {
     const gpa = std.testing.allocator;
     var arena_state = std.heap.ArenaAllocator.init(gpa);
     defer arena_state.deinit();
+
     const arena = arena_state.allocator();
 
     // The transport family sizes a blob from these ranges, so a range must
@@ -330,7 +361,10 @@ test "KvCache byte ranges price the rows at the storage dtype" {
     try std.testing.expectEqual(wide.kRowsBytes(1, 3).len, wide.vRowsBytes(1, 3).len);
 
     const bytes = narrow.kRowsBytesMut(1, 3);
-    for (bytes, 0..) |*b, i| b.* = @truncate(i + 1);
+    for (bytes, 0..) |*b, i| {
+        b.* = @truncate(i + 1);
+    }
+
     const rows = narrow.kSliceAs(f16, 1, 2);
     try std.testing.expectEqualSlices(u8, bytes, std.mem.sliceAsBytes(rows));
 }

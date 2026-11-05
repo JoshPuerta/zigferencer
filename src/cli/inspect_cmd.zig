@@ -1,8 +1,6 @@
-//! `zigferencer inspect <pub_name>`: mmap and parse a fetched GGUF, then
-//! pretty-print its `ModelCard` (arch, dims, RoPE, vocab, BOS and EOS), the weight
-//! inventory, and a chat-template preview. This is the fastest check after a
-//! download. It shows whether the loader accepts the file, and it shows the values
-//! the runner depends on.
+//! `zigferencer inspect <pub_name>`: mmap and parse a fetched GGUF, then print its
+//! `ModelCard`, the weight inventory, and a chat-template preview. It shows whether
+//! the loader accepts the file and which values the runner reads.
 
 const std = @import("std");
 const Io = std.Io;
@@ -50,7 +48,8 @@ const Flags = struct {
     pub const docs = .{
         .raw = args.Doc{
             .value = "PATH",
-            .text = "dump every raw KV + tensor straight from the parser, bypassing\nthe loader, for an architecture the loader does not accept",
+            .text = "dump every raw KV + tensor straight from the parser, bypassing\nthe " ++
+                "loader, for an architecture the loader does not accept",
         },
     };
 };
@@ -59,34 +58,46 @@ const Flags = struct {
 
 pub fn run(ctx: cli.Context) !void {
     const flags = try args.parseInto(Flags, ctx) orelse return;
-    const raw_path = flags.raw;
-    const pub_name = flags.pub_name;
 
-    // `inspect --raw <path>` dumps the raw GGUF metadata (every KV pair and every
-    // tensor) straight from the parser, and skips the loader's llama-specific
-    // extraction. It is the one way to look at an arch the loader does not accept,
-    // which is the first step in supporting a new model.
-    if (raw_path) |path| return dumpRaw(ctx, path);
+    // The raw dump skips the loader, so it can show an architecture the loader refuses.
+    if (flags.raw) |path| return dumpRaw(ctx, path);
 
-    // With no name, select.model prompts over the on-disk models on a TTY, and
-    // fails with a usage error otherwise. With a name, it resolves the name and
-    // prints the shared unknown-model error on a miss.
-    const model = try select.model(ctx, pub_name);
-
+    const model = try select.model(ctx, flags.pub_name);
     const path = try registry.resolveLoadPath(ctx.arena, ctx.io, ctx.models_root, model.*);
 
-    // inspect reads the card and the tensor descriptors, never the weight data, so
-    // the map stays lazy. Skipping the multi-GB prefault opens a large model at once.
+    // Inspect reads the card and the tensor descriptors, never the weights, so the map stays lazy.
     var loaded = try loader.loadWith(ctx.io, ctx.arena, path, .{ .prefault = false });
     defer loaded.close();
 
-    var out_buf: [8192]u8 = undefined;
-    var fw: Io.File.Writer = .initStreaming(.stdout(), ctx.io, &out_buf);
-    const w = &fw.interface;
+    var stdout_buffer: [cli.stdout_buffer_bytes]u8 = undefined;
+    var stdout_writer: Io.File.Writer = .initStreaming(.stdout(), ctx.io, &stdout_buffer);
+    const w = &stdout_writer.interface;
 
+    try printCard(w, model.pub_name, path, &loaded);
+    try w.writeAll("\n");
+
+    try printTensorStructure(w, ctx.arena, &loaded);
+    try w.writeAll("\n");
+
+    try printChatTemplate(w, loaded.card.chat_template);
+
+    try w.flush();
+}
+
+// -- helpers ----------------------------------------------------------------
+
+fn printCard(
+    w: *Io.Writer,
+    pub_name: []const u8,
+    path: []const u8,
+    loaded: *const loader.Loaded,
+) !void {
     const c = loaded.card;
-    try w.print("model:           {s}\n", .{model.pub_name});
-    if (c.name) |n| try w.print("name:            {s}\n", .{n});
+    try w.print("model:           {s}\n", .{pub_name});
+    if (c.name) |n| {
+        try w.print("name:            {s}\n", .{n});
+    }
+
     try w.print("file:            {s}\n", .{path});
     try w.print("file size:       {d} bytes\n", .{loaded.map.bytes().len});
     try w.writeAll("\n");
@@ -115,38 +126,37 @@ pub fn run(ctx: cli.Context) !void {
         try w.print("  full_attn_every: {d}  (full-attn layers: ", .{g.full_attention_interval});
         var li: u32 = 0;
         while (li < c.n_layers) : (li += 1) {
-            if (g.isFullAttention(li)) try w.print("{d} ", .{li});
+            if (g.isFullAttention(li)) {
+                try w.print("{d} ", .{li});
+            }
         }
+
         try w.writeAll(")\n");
     }
-    try w.writeAll("\n");
-
-    try printTensorStructure(w, ctx.arena, &loaded);
-    try w.writeAll("\n");
-
-    try w.print("chat template ({d} bytes):\n", .{c.chat_template.len});
-    if (c.chat_template.len == 0) {
-        try w.writeAll("  (none embedded)\n");
-    } else {
-        try w.writeAll(c.chat_template);
-        if (c.chat_template[c.chat_template.len - 1] != '\n') try w.writeAll("\n");
-    }
-
-    try w.flush();
 }
 
-// -- helpers ----------------------------------------------------------------
+fn printChatTemplate(w: *Io.Writer, template: []const u8) !void {
+    try w.print("chat template ({d} bytes):\n", .{template.len});
+    if (template.len == 0) {
+        try w.writeAll("  (none embedded)\n");
+        return;
+    }
+
+    try w.writeAll(template);
+    if (template[template.len - 1] != '\n') {
+        try w.writeAll("\n");
+    }
+}
 
 fn dumpRaw(ctx: cli.Context, path: []const u8) !void {
-    // The dump is metadata-only, like inspect proper. The lazy map skips the
-    // weight prefault.
     var map = try mmap.openReadOnlyLazy(ctx.io, path);
     defer map.close();
+
     const parsed = try parser.parse(ctx.arena, map.bytes());
 
-    var out_buf: [8192]u8 = undefined;
-    var fw: Io.File.Writer = .initStreaming(.stdout(), ctx.io, &out_buf);
-    const w = &fw.interface;
+    var stdout_buffer: [cli.stdout_buffer_bytes]u8 = undefined;
+    var stdout_writer: Io.File.Writer = .initStreaming(.stdout(), ctx.io, &stdout_buffer);
+    const w = &stdout_writer.interface;
 
     try w.print("file:            {s}\n", .{path});
     try w.print("file size:       {d} bytes\n", .{map.bytes().len});
@@ -166,11 +176,16 @@ fn dumpRaw(ctx: cli.Context, path: []const u8) !void {
         const type_name = std.enums.tagName(dtype.GgmlType, ti.dtype) orelse "unknown";
         try w.print("  {s:<44}  {s:<6}  [", .{ ti.name, type_name });
         for (ti.shape[0..ti.n_dims], 0..) |d, i| {
-            if (i > 0) try w.writeAll(", ");
+            if (i > 0) {
+                try w.writeAll(", ");
+            }
+
             try w.print("{d}", .{d});
         }
+
         try w.writeAll("]\n");
     }
+
     try w.flush();
 }
 
@@ -215,10 +230,17 @@ fn printArray(w: *std.Io.Writer, a: parser.Array) !void {
             if (n > 0) {
                 try w.writeAll(" {");
                 for (slice[0..n], 0..) |e, i| {
-                    if (i > 0) try w.writeAll(", ");
+                    if (i > 0) {
+                        try w.writeAll(", ");
+                    }
+
                     try w.print("{any}", .{e});
                 }
-                if (slice.len > n) try w.writeAll(", ...");
+
+                if (slice.len > n) {
+                    try w.writeAll(", ...");
+                }
+
                 try w.writeAll("}");
             }
         },
@@ -229,17 +251,15 @@ fn printArray(w: *std.Io.Writer, a: parser.Array) !void {
 /// Returns null for a model-level tensor such as `token_embd.weight`.
 fn parseBlock(name: []const u8) ?BlockRef {
     if (!std.mem.startsWith(u8, name, "blk.")) return null;
+
     const rest = name["blk.".len..];
     const dot = std.mem.indexOfScalar(u8, rest, '.') orelse return null;
     const layer = std.fmt.parseInt(u32, rest[0..dot], 10) catch return null;
     return .{ .layer = layer, .role = rest[dot + 1 ..] };
 }
 
-/// Print the full weight inventory: the non-layer tensors (embedding and head),
-/// then one entry per distinct layer type with the block indices it covers. Two
-/// layers share a type when their tensor roles match in order. Llama therefore
-/// collapses to one type, and Qwen3.5 separates its gated-deltanet blocks from its
-/// full-attention blocks. The flat per-tensor dump stays in `inspect --raw`.
+/// Print the non-layer tensors, then one entry per distinct layer type with the
+/// block indices it covers. Two layers share a type when their sorted tensor roles match.
 fn printTensorStructure(w: *std.Io.Writer, arena: Allocator, loaded: *const loader.Loaded) !void {
     const tensors = loaded.tensors;
     const n_layers: usize = loaded.card.n_layers;
@@ -251,34 +271,42 @@ fn printTensorStructure(w: *std.Io.Writer, arena: Allocator, loaded: *const load
     try w.writeAll("\npost-block weights (final norm + output head):\n");
     try printGlobals(w, tensors, false);
 
-    // Bucket each block's tensors by layer index, in GGUF role order.
+    // Bucket each block's tensors by layer index.
     const per_layer = try arena.alloc(std.ArrayList(RoleRef), n_layers);
-    for (per_layer) |*r| r.* = .empty;
-    for (tensors) |ref| {
-        const b = parseBlock(ref.name) orelse continue;
-        if (b.layer < n_layers) try per_layer[b.layer].append(arena, .{ .role = b.role, .tensor = ref.tensor });
+    for (per_layer) |*r| {
+        r.* = .empty;
     }
 
-    // Sort each layer's roles, so the signature and the printed order do not
-    // depend on GGUF tensor order. Some quantizers reorder the tensors of a few
-    // blocks, and that must not split one logical layer type into several.
-    for (per_layer) |*r| std.mem.sort(RoleRef, r.items, {}, roleLess);
+    for (tensors) |ref| {
+        const b = parseBlock(ref.name) orelse continue;
+        if (b.layer < n_layers) {
+            try per_layer[b.layer].append(arena, .{ .role = b.role, .tensor = ref.tensor });
+        }
+    }
 
-    // Equal role sets mean one layer type. The grouping keys on the signature and
-    // prints each group once, with the block indices it covers.
+    // Sorted roles keep a quantizer that reorders the tensors of a few blocks from splitting a
+    // layer type.
+    for (per_layer) |*r| {
+        std.mem.sort(RoleRef, r.items, {}, roleLess);
+    }
+
     const sigs = try arena.alloc([]const u8, n_layers);
-    for (0..n_layers) |i| sigs[i] = try signatureOf(arena, per_layer[i].items);
+    for (0..n_layers) |i| {
+        sigs[i] = try signatureOf(arena, per_layer[i].items);
+    }
 
     try w.writeAll("\nper-layer weights (grouped by layer type):\n");
     const done = try arena.alloc(bool, n_layers);
     @memset(done, false);
     for (0..n_layers) |i| {
         if (done[i]) continue;
+
         const roles = per_layer[i].items;
         if (roles.len == 0) {
             done[i] = true;
             continue;
         }
+
         var members: std.ArrayList(u32) = .empty;
         for (i..n_layers) |j| {
             if (!done[j] and std.mem.eql(u8, sigs[j], sigs[i])) {
@@ -286,6 +314,7 @@ fn printTensorStructure(w: *std.Io.Writer, arena: Allocator, loaded: *const load
                 done[j] = true;
             }
         }
+
         try w.print("\n  type: {d} weights x {d} layer{s} (blk ", .{
             roles.len,
             members.items.len,
@@ -293,7 +322,9 @@ fn printTensorStructure(w: *std.Io.Writer, arena: Allocator, loaded: *const load
         });
         try printIndexRanges(w, members.items);
         try w.writeAll("):\n");
-        for (roles) |rr| try printTensorRow(w, rr.role, rr.tensor);
+        for (roles) |rr| {
+            try printTensorRow(w, rr.role, rr.tensor);
+        }
     }
 }
 
@@ -303,12 +334,17 @@ fn printGlobals(w: *std.Io.Writer, tensors: []const loader.TensorRef, embedding:
     var n: usize = 0;
     for (tensors) |ref| {
         if (parseBlock(ref.name) != null) continue;
+
         const is_embd = std.mem.startsWith(u8, ref.name, "token_embd");
         if (is_embd != embedding) continue;
+
         try printTensorRow(w, ref.name, ref.tensor);
         n += 1;
     }
-    if (n == 0) try w.writeAll("  (none)\n");
+
+    if (n == 0) {
+        try w.writeAll("  (none)\n");
+    }
 }
 
 fn roleLess(_: void, a: RoleRef, b: RoleRef) bool {
@@ -321,6 +357,7 @@ fn signatureOf(arena: Allocator, roles: []const RoleRef) ![]const u8 {
         try sig.appendSlice(arena, rr.role);
         try sig.append(arena, '|');
     }
+
     return sig.items;
 }
 
@@ -335,9 +372,18 @@ fn printIndexRanges(w: *std.Io.Writer, idx: []const u32) !void {
             k += 1;
             end = idx[k];
         }
-        if (!first) try w.writeAll(",");
+
+        if (!first) {
+            try w.writeAll(",");
+        }
+
         first = false;
-        if (start == end) try w.print("{d}", .{start}) else try w.print("{d}-{d}", .{ start, end });
+        if (start == end) {
+            try w.print("{d}", .{start});
+        } else {
+            try w.print("{d}-{d}", .{ start, end });
+        }
+
         k += 1;
     }
 }
@@ -352,9 +398,13 @@ fn printTensorRow(w: *std.Io.Writer, label: []const u8, t: Tensor) !void {
 fn printShape(w: *std.Io.Writer, t: Tensor) !void {
     try w.writeAll("[");
     for (t.shape[0..t.n_dims], 0..) |d, i| {
-        if (i > 0) try w.writeAll(", ");
+        if (i > 0) {
+            try w.writeAll(", ");
+        }
+
         try w.print("{d}", .{d});
     }
+
     try w.writeAll("]");
 }
 

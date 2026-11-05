@@ -103,6 +103,7 @@ pub fn detectSimd() SimdFeatures {
         },
         else => {},
     }
+
     return s;
 }
 
@@ -120,20 +121,25 @@ pub fn readMemAvailable(io: Io) ?u64 {
 pub fn meminfoBytes(text: []const u8, field: []const u8) ?u64 {
     std.debug.assert(field.len >= 1);
     std.debug.assert(std.mem.indexOfScalar(u8, field, ':') == null);
+
     var lines = std.mem.splitScalar(u8, text, '\n');
     // The loop reads each line once, so the text length bounds it.
     while (lines.next()) |line| {
         if (!std.mem.startsWith(u8, line, field)) continue;
+
         const rest = line[field.len..];
         if (rest.len == 0 or rest[0] != ':') continue;
+
         var fields = std.mem.tokenizeAny(u8, rest[1..], " \t\r");
         const count = fields.next() orelse return null;
         const unit = fields.next() orelse return null;
         if (fields.next() != null) return null;
         if (!std.mem.eql(u8, unit, "kB")) return null;
+
         const n_kb = std.fmt.parseInt(u64, count, 10) catch return null;
         return std.math.mul(u64, n_kb, 1024) catch null;
     }
+
     return null;
 }
 
@@ -147,6 +153,7 @@ pub fn meminfoBytes(text: []const u8, field: []const u8) ?u64 {
 ///   - a native render node without a card0 vendor file.
 fn detectGpu(io: Io, arena: Allocator) Gpu {
     if (builtin.os.tag != .linux) return .{ .present = false, .label = "unknown (non-Linux)" };
+
     const cwd = Io.Dir.cwd();
 
     var vbuf: [32]u8 = undefined;
@@ -155,7 +162,10 @@ fn detectGpu(io: Io, arena: Allocator) Gpu {
     } else |_| {}
 
     if (exists(io, "/dev/dxg")) return .{ .present = true, .label = "WSL2 (paravirtual)" };
-    if (exists(io, "/dev/dri/renderD128")) return .{ .present = true, .label = "present (DRI render node)" };
+    if (exists(io, "/dev/dri/renderD128")) {
+        return .{ .present = true, .label = "present (DRI render node)" };
+    }
+
     return .{ .present = false, .label = "none detected" };
 }
 
@@ -164,6 +174,7 @@ fn vendorName(arena: Allocator, vendor: []const u8) []const u8 {
     if (std.mem.eql(u8, vendor, "0x10de")) return "NVIDIA";
     if (std.mem.eql(u8, vendor, "0x8086")) return "Intel";
     if (std.mem.eql(u8, vendor, "0x1414")) return "Microsoft (virtual)";
+
     return arena.dupe(u8, vendor) catch "unknown vendor";
 }
 
@@ -175,6 +186,7 @@ fn exists(io: Io, path: []const u8) bool {
 
 fn readCpuModel(io: Io, arena: Allocator) ?[]const u8 {
     if (builtin.os.tag != .linux) return null;
+
     var buf: [64 * 1024]u8 = undefined;
     const cwd = Io.Dir.cwd();
     const slice = cwd.readFile(io, "/proc/cpuinfo", &buf) catch return null;
@@ -212,6 +224,7 @@ test "detectSimd does not panic for the current target" {
 test "detectGpu runs without crashing on the test host" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
+
     _ = detectGpu(std.testing.io, arena.allocator());
 }
 
@@ -232,10 +245,19 @@ test "meminfoBytes: a fixed meminfo sample, a missing field, and malformed lines
     try std.testing.expectEqual(@as(?u64, null), meminfoBytes(sample, "SwapTotal"));
     // A line without a unit, with a wrong unit, or with no digits is malformed.
     try std.testing.expectEqual(@as(?u64, null), meminfoBytes(sample, "HugePages_Total"));
-    try std.testing.expectEqual(@as(?u64, null), meminfoBytes("MemAvailable: 12 MB\n", "MemAvailable"));
-    try std.testing.expectEqual(@as(?u64, null), meminfoBytes("MemAvailable: x1 kB\n", "MemAvailable"));
+    try std.testing.expectEqual(
+        @as(?u64, null),
+        meminfoBytes("MemAvailable: 12 MB\n", "MemAvailable"),
+    );
+    try std.testing.expectEqual(
+        @as(?u64, null),
+        meminfoBytes("MemAvailable: x1 kB\n", "MemAvailable"),
+    );
     try std.testing.expectEqual(@as(?u64, null), meminfoBytes("MemAvailable:\n", "MemAvailable"));
     // A count whose byte figure passes a `u64` gives null, not a wrapped value.
-    try std.testing.expectEqual(@as(?u64, null), meminfoBytes("MemAvailable: 18446744073709551615 kB", "MemAvailable"));
+    try std.testing.expectEqual(
+        @as(?u64, null),
+        meminfoBytes("MemAvailable: 18446744073709551615 kB", "MemAvailable"),
+    );
     try std.testing.expectEqual(@as(?u64, null), meminfoBytes("", "MemAvailable"));
 }

@@ -1,4 +1,4 @@
-//! Equivalence gate for the qwen prefix seam. A runner that
+//! Equivalence gate for the qwen prefix boundary. A runner that
 //! `initPrefix` builds at `k` runs layers `[0..k)` exactly as the
 //! whole-model runner runs them. Both runners use the same weights, the same
 //! KV rows and the same GDN slabs.
@@ -11,7 +11,7 @@
 //!
 //! The blob check is the load-bearing one for the composed runner. The snapshot
 //! walks layers in model order. The whole blob of the prefix must therefore
-//! equal the leading span of the blob of the whole model. That is the seam
+//! equal the leading span of the blob of the whole model. That is the boundary
 //! offset the hybrid needs, stated as a test.
 //!
 //! The Qwen3.5-2B fixture and the SmolLM2 fixture of the one non-qwen case come
@@ -96,11 +96,13 @@ test "qwen initPrefix reproduces the whole-model layers, KV, and GDN state" {
     const gpa = std.testing.allocator;
     var arena_state = std.heap.ArenaAllocator.init(gpa);
     defer arena_state.deinit();
+
     const arena = arena_state.allocator();
     const fixture = try z.test_fixtures.path(arena, "Qwen3.5-2B-Q8_0");
 
     var loaded = try loader.load(io, arena, fixture);
     defer loaded.close();
+
     const n_layers = loaded.card.n_layers;
 
     for (splits) |k| {
@@ -124,7 +126,12 @@ test "qwen initPrefix reproduces the whole-model layers, KV, and GDN state" {
         try std.testing.expectEqual(@as(usize, k), prefix.layers.len);
 
         for (tokens, 0..) |token, pos| {
-            const row: StepRow = .{ .slot = 0, .token = token, .pos = @intCast(pos), .want_logits = false };
+            const row: StepRow = .{
+                .slot = 0,
+                .token = token,
+                .pos = @intCast(pos),
+                .want_logits = false,
+            };
             try driveRow(&full, k, row);
             try driveRow(&prefix, k, row);
             try std.testing.expectEqualSlices(u8, residual(&full), residual(&prefix));
@@ -134,11 +141,15 @@ test "qwen initPrefix reproduces the whole-model layers, KV, and GDN state" {
         // slices on both sides, so the comparison spans every layer kind.
         for (0..k) |li| {
             try std.testing.expectEqualSlices(f32, full.gdn_state[li], prefix.gdn_state[li]);
-            try std.testing.expectEqualSlices(f32, full.gdn_conv_state[li], prefix.gdn_conv_state[li]);
+            try std.testing.expectEqualSlices(
+                f32,
+                full.gdn_conv_state[li],
+                prefix.gdn_conv_state[li],
+            );
         }
 
         // The whole snapshot of the prefix is the leading span of the snapshot
-        // of the whole model, which is the seam offset the hybrid needs.
+        // of the whole model, which is the boundary offset the hybrid needs.
         const n_rows: u32 = tokens.len;
         const prefix_bytes: usize = @intCast(prefix.evictSlotBytesFor(n_rows));
         const full_bytes: usize = @intCast(full.evictSlotBytesFor(n_rows));
@@ -161,11 +172,13 @@ test "qwen prefix shapes: KV height, GDN slabs, and the compacted kv_slot" {
     const gpa = std.testing.allocator;
     var arena_state = std.heap.ArenaAllocator.init(gpa);
     defer arena_state.deinit();
+
     const arena = arena_state.allocator();
     const fixture = try z.test_fixtures.path(arena, "Qwen3.5-2B-Q8_0");
 
     var loaded = try loader.load(io, arena, fixture);
     defer loaded.close();
+
     const g = loaded.card.gdn orelse return error.SkipZigTest;
     // The counts below hold for the interval-4 layout. A fixture at another
     // interval needs its own counts, so the assert states the assumption.
@@ -181,25 +194,37 @@ test "qwen prefix shapes: KV height, GDN slabs, and the compacted kv_slot" {
     try std.testing.expectEqual(@as(usize, n_slots) * k, prefix.gdn_conv_state.len);
 
     var n_gdn: usize = 0;
-    for (0..k) |li| switch (prefix.layers[li].kind) {
-        .gdn => {
-            n_gdn += 1;
-            for (0..n_slots) |s| {
-                try std.testing.expectEqual(prefix.gdn_dims.stateLen(), prefix.gdn_state[s * k + li].len);
-                try std.testing.expectEqual(prefix.gdn_dims.convStateLen(), prefix.gdn_conv_state[s * k + li].len);
-            }
-        },
-        .full => |w| {
-            // Layer 3 is the only full-attention layer in the range, and it
-            // takes the only index in the cache.
-            try std.testing.expectEqual(@as(usize, 3), li);
-            try std.testing.expectEqual(@as(u32, 0), w.kv_slot);
-            for (0..n_slots) |s| {
-                try std.testing.expectEqual(@as(usize, 0), prefix.gdn_state[s * k + li].len);
-                try std.testing.expectEqual(@as(usize, 0), prefix.gdn_conv_state[s * k + li].len);
-            }
-        },
-    };
+    for (0..k) |li| {
+        switch (prefix.layers[li].kind) {
+            .gdn => {
+                n_gdn += 1;
+                for (0..n_slots) |s| {
+                    try std.testing.expectEqual(
+                        prefix.gdn_dims.stateLen(),
+                        prefix.gdn_state[s * k + li].len,
+                    );
+                    try std.testing.expectEqual(
+                        prefix.gdn_dims.convStateLen(),
+                        prefix.gdn_conv_state[s * k + li].len,
+                    );
+                }
+            },
+            .full => |w| {
+                // Layer 3 is the only full-attention layer in the range, and it
+                // takes the only index in the cache.
+                try std.testing.expectEqual(@as(usize, 3), li);
+                try std.testing.expectEqual(@as(u32, 0), w.kv_slot);
+                for (0..n_slots) |s| {
+                    try std.testing.expectEqual(@as(usize, 0), prefix.gdn_state[s * k + li].len);
+                    try std.testing.expectEqual(
+                        @as(usize, 0),
+                        prefix.gdn_conv_state[s * k + li].len,
+                    );
+                }
+            },
+        }
+    }
+
     try std.testing.expectEqual(@as(usize, 5), n_gdn);
 }
 
@@ -212,6 +237,7 @@ test "qwen prefix below the attention interval holds no KV and still steps" {
     const gpa = std.testing.allocator;
     var arena_state = std.heap.ArenaAllocator.init(gpa);
     defer arena_state.deinit();
+
     const arena = arena_state.allocator();
     const fixture = try z.test_fixtures.path(arena, "Qwen3.5-2B-Q8_0");
 
@@ -224,15 +250,23 @@ test "qwen prefix below the attention interval holds no KV and still steps" {
     const k: u32 = 3;
     var prefix = try prefixRunner(arena, io, &cpu_pool, &loaded, k, 2, .f32);
     try std.testing.expectEqual(@as(usize, 0), prefix.kv_slots.len);
-    for (0..k) |li| try std.testing.expect(std.meta.activeTag(prefix.layers[li].kind) == .gdn);
+    for (0..k) |li| {
+        try std.testing.expect(std.meta.activeTag(prefix.layers[li].kind) == .gdn);
+    }
 
     for (tokens, 0..) |token, pos| {
-        try driveRow(&prefix, k, .{ .slot = 0, .token = token, .pos = @intCast(pos), .want_logits = false });
+        try driveRow(
+            &prefix,
+            k,
+            .{ .slot = 0, .token = token, .pos = @intCast(pos), .want_logits = false },
+        );
     }
 
     // The blob is pure GDN state, so its size does not move with the position
     // count, and it round-trips.
-    const per_gdn: u64 = (prefix.gdn_dims.stateLen() + prefix.gdn_dims.convStateLen()) * @sizeOf(f32);
+    const per_gdn: u64 = (prefix.gdn_dims.stateLen() + prefix.gdn_dims.convStateLen()) * @sizeOf(
+        f32,
+    );
     try std.testing.expectEqual(@as(u64, k) * per_gdn, prefix.evictSlotBytesFor(1));
     try std.testing.expectEqual(@as(u64, k) * per_gdn, prefix.evictSlotBytesFor(tokens.len));
     const first = try arena.alloc(u8, @intCast(prefix.evictSlotBytesFor(1)));
@@ -247,7 +281,11 @@ test "qwen prefix below the attention interval holds no KV and still steps" {
     prefix.cloneSlotState(0, 1, 1);
     for (0..k) |li| {
         try std.testing.expectEqualSlices(f32, prefix.gdn_state[li], prefix.gdn_state[k + li]);
-        try std.testing.expectEqualSlices(f32, prefix.gdn_conv_state[li], prefix.gdn_conv_state[k + li]);
+        try std.testing.expectEqualSlices(
+            f32,
+            prefix.gdn_conv_state[li],
+            prefix.gdn_conv_state[k + li],
+        );
     }
 }
 
@@ -260,6 +298,7 @@ test "qwen prefix resetSlotState zeroes its own slot's slabs only" {
     const gpa = std.testing.allocator;
     var arena_state = std.heap.ArenaAllocator.init(gpa);
     defer arena_state.deinit();
+
     const arena = arena_state.allocator();
     const fixture = try z.test_fixtures.path(arena, "Qwen3.5-2B-Q8_0");
 
@@ -270,7 +309,11 @@ test "qwen prefix resetSlotState zeroes its own slot's slabs only" {
     const n_slots: u32 = 2;
     var prefix = try prefixRunner(arena, io, &cpu_pool, &loaded, k, n_slots, .f32);
     for (0..n_slots) |s| {
-        try driveRow(&prefix, k, .{ .slot = @intCast(s), .token = tokens[0], .pos = 0, .want_logits = false });
+        try driveRow(
+            &prefix,
+            k,
+            .{ .slot = @intCast(s), .token = tokens[0], .pos = 0, .want_logits = false },
+        );
     }
 
     // Keep the slabs of slot 1 before the scrub, so the comparison after the
@@ -280,10 +323,14 @@ test "qwen prefix resetSlotState zeroes its own slot's slabs only" {
         keep[li] = try arena.alloc(f32, prefix.gdn_state[k + li].len);
         @memcpy(keep[li], prefix.gdn_state[k + li]);
     }
+
     var live: usize = 0;
     for (0..k) |li| {
-        if (!std.mem.allEqual(f32, prefix.gdn_state[li], 0)) live += 1;
+        if (!std.mem.allEqual(f32, prefix.gdn_state[li], 0)) {
+            live += 1;
+        }
     }
+
     try std.testing.expectEqual(@as(usize, 5), live); // every GDN layer ran
 
     prefix.resetSlotState(0);
@@ -292,6 +339,7 @@ test "qwen prefix resetSlotState zeroes its own slot's slabs only" {
         try std.testing.expect(std.mem.allEqual(f32, prefix.gdn_conv_state[li], 0));
         try std.testing.expectEqualSlices(f32, keep[li], prefix.gdn_state[k + li]);
     }
+
     try std.testing.expect(!std.mem.allEqual(f32, prefix.gdn_state[k + 0], 0));
 }
 
@@ -304,6 +352,7 @@ test "qwen prefix init reports an allocation failure and leaves nothing behind" 
     const gpa = std.testing.allocator;
     var load_arena = std.heap.ArenaAllocator.init(gpa);
     defer load_arena.deinit();
+
     const fixture = try z.test_fixtures.path(load_arena.allocator(), "Qwen3.5-2B-Q8_0");
     var loaded = try loader.load(io, load_arena.allocator(), fixture);
     defer loaded.close();
@@ -317,6 +366,7 @@ test "qwen prefix init reports an allocation failure and leaves nothing behind" 
         var failing = std.testing.FailingAllocator.init(gpa, .{ .fail_index = fail_index });
         var runner_arena = std.heap.ArenaAllocator.init(failing.allocator());
         defer runner_arena.deinit();
+
         try std.testing.expectError(error.OutOfMemory, prefixRunner(
             runner_arena.allocator(),
             io,
@@ -338,12 +388,17 @@ test "qwen prefix init refuses a non-qwen model before it sizes anything" {
     const gpa = std.testing.allocator;
     var arena_state = std.heap.ArenaAllocator.init(gpa);
     defer arena_state.deinit();
+
     const arena = arena_state.allocator();
     const fixture = try z.test_fixtures.path(arena, "SmolLM2-135M-Instruct-Q8_0");
 
     var loaded = try loader.load(io, arena, fixture);
     defer loaded.close();
+
     // The arch gate stays ahead of the range asserts, so a llama card reaches a
     // typed error and never the layer walk.
-    try std.testing.expectError(error.NotQwen, prefixRunner(arena, io, &cpu_pool, &loaded, 1, 1, .f32));
+    try std.testing.expectError(
+        error.NotQwen,
+        prefixRunner(arena, io, &cpu_pool, &loaded, 1, 1, .f32),
+    );
 }

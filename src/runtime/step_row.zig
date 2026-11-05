@@ -45,25 +45,34 @@ pub fn validateRows(
     max_seq: u32,
 ) error{ PositionOutOfRange, TooManyRows }!u32 {
     std.debug.assert(rows.len >= 1);
+
     if (rows.len > rows_max) return error.TooManyRows;
+
     var seen_logits = false;
     var n_logits: u32 = 0;
     for (rows, 0..) |r, i| {
         std.debug.assert(r.slot < slot_count);
+
         if (r.pos >= max_seq) return error.PositionOutOfRange;
+
         if (i > 0 and rows[i - 1].slot == r.slot) {
             // Consecutive ascending positions: the chunked-prefill shape.
             std.debug.assert(rows[i - 1].pos + 1 == r.pos);
         } else if (i > 0) {
             // A slot's rows are adjacent. It must not reappear later.
-            for (rows[0 .. i - 1]) |prev| std.debug.assert(prev.slot != r.slot);
+            for (rows[0 .. i - 1]) |prev| {
+                std.debug.assert(prev.slot != r.slot);
+            }
         }
+
         if (seen_logits) std.debug.assert(r.want_logits);
+
         if (r.want_logits) {
             seen_logits = true;
             n_logits += 1;
         }
     }
+
     return n_logits;
 }
 
@@ -73,7 +82,10 @@ pub fn validateRows(
 /// costliest matmul in the model.
 pub fn wantLogitsFirst(rows: []const StepRow) u32 {
     var first: u32 = @intCast(rows.len);
-    while (first > 0 and rows[first - 1].want_logits) first -= 1;
+    while (first > 0 and rows[first - 1].want_logits) {
+        first -= 1;
+    }
+
     return first;
 }
 

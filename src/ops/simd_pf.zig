@@ -29,14 +29,11 @@ const op_requires = @import("../core/op_requires.zig");
 const Tensor = @import("../core/tensor.zig").Tensor;
 const f16BitsToF32 = naive.f16BitsToF32;
 
-// -- types ------------------------------------------------------------------
+// -- constants --------------------------------------------------------------
 
 const lanes = 8;
-const Vec = @Vector(lanes, f32);
-const VecI8 = @Vector(lanes, i8);
-const mr = 4;
 
-// -- api --------------------------------------------------------------------
+const mr = 4;
 
 /// Every AVX2 target also carries F16C. Without F16C the f16 widening stays
 /// correct and runs scalar, so the requirement does not list it.
@@ -46,17 +43,27 @@ pub const requires: op_requires.OpRequires = .{
     .needs_fma = true,
 };
 
+pub const rmsnorm = naive.rmsnorm;
+pub const swiglu = naive.swiglu;
+
+// -- types ------------------------------------------------------------------
+
+const Vec = @Vector(lanes, f32);
+const VecI8 = @Vector(lanes, i8);
+
+// -- api --------------------------------------------------------------------
+
 pub const dequantQ80 = naive.dequantQ80;
 pub const embedLookup = naive.embedLookup;
 pub const linearF32 = naive.linearF32;
 pub const linearF32Batch = naive.linearF32Batch;
-pub const rmsnorm = naive.rmsnorm;
-pub const swiglu = naive.swiglu;
+
 pub const residualAdd = naive.residualAdd;
 pub const ropeInplace = naive.ropeInplace;
 pub const attentionPartTyped = attention_simd.prefetched.attentionPartTyped;
 pub const attentionMerge = attention_simd.prefetched.attentionMerge;
 pub const attentionRowTyped = attention_simd.prefetched.attentionRowTyped;
+
 // The q4 CPU path exists for completeness, so it reuses the naive scalar
 // dequant-and-dot. The runner still parallelizes it across rows.
 pub const linearF32Q40 = naive.linearF32Q40;
@@ -74,10 +81,17 @@ pub fn linearF32Q80(input: []const f32, weight: Tensor, out: []f32) void {
 /// and writes `outs[b * out_stride ..]`, the same rule as `naive.linearF32Batch`.
 /// The prefetch fires only on a group's last batch row. That keeps one
 /// group-pass of lookahead, the same distance the B=1 kernel keeps.
-pub fn linearF32Q80Batch(inputs: []const f32, weight: Tensor, outs: []f32, batch: usize, out_stride: usize) void {
+pub fn linearF32Q80Batch(
+    inputs: []const f32,
+    weight: Tensor,
+    outs: []f32,
+    batch: usize,
+    out_stride: usize,
+) void {
     std.debug.assert(weight.dtype == .q8_0);
     std.debug.assert(weight.n_dims == 2);
     std.debug.assert(batch > 0);
+
     const in_features: usize = @intCast(weight.shape[0]);
     const out_features: usize = @intCast(weight.shape[1]);
     std.debug.assert(inputs.len == batch * in_features);
@@ -97,13 +111,23 @@ pub fn linearF32Q80Batch(inputs: []const f32, weight: Tensor, outs: []f32, batch
         // next group, so it skips the prefetch.
         const has_next = j + 2 * mr <= out_features;
         const pf_offs: [mr]usize = .{
-            (j + mr + 0) * row_bytes, (j + mr + 1) * row_bytes, (j + mr + 2) * row_bytes, (j + mr + 3) * row_bytes,
+            (j + mr + 0) * row_bytes,
+            (j + mr + 1) * row_bytes,
+            (j + mr + 2) * row_bytes,
+            (j + mr + 3) * row_bytes,
         };
 
         var b: usize = 0;
         while (b < batch) : (b += 1) {
             const input = inputs[b * in_features ..][0..in_features];
-            const sums = groupPass(input, weight.data, row_offs, pf_offs, has_next and b + 1 == batch, n_blocks);
+            const sums = groupPass(
+                input,
+                weight.data,
+                row_offs,
+                pf_offs,
+                has_next and b + 1 == batch,
+                n_blocks,
+            );
             outs[b * out_stride + j + 0] = sums[0];
             outs[b * out_stride + j + 1] = sums[1];
             outs[b * out_stride + j + 2] = sums[2];
@@ -123,7 +147,9 @@ pub fn linearF32Q80Batch(inputs: []const f32, weight: Tensor, outs: []f32, batch
     if (std.debug.runtime_safety) {
         var b: usize = 0;
         while (b < batch) : (b += 1) {
-            for (outs[b * out_stride ..][0..out_features]) |x| std.debug.assert(std.math.isFinite(x));
+            for (outs[b * out_stride ..][0..out_features]) |x| {
+                std.debug.assert(std.math.isFinite(x));
+            }
         }
     }
 }
@@ -152,26 +178,62 @@ inline fn groupPass(
         const blk_off_in_row = blk * 34;
 
         if (do_prefetch) {
-            @prefetch(&data[pf_offs[0] + blk_off_in_row], .{ .rw = .read, .locality = 0, .cache = .data });
-            @prefetch(&data[pf_offs[1] + blk_off_in_row], .{ .rw = .read, .locality = 0, .cache = .data });
-            @prefetch(&data[pf_offs[2] + blk_off_in_row], .{ .rw = .read, .locality = 0, .cache = .data });
-            @prefetch(&data[pf_offs[3] + blk_off_in_row], .{ .rw = .read, .locality = 0, .cache = .data });
+            @prefetch(
+                &data[pf_offs[0] + blk_off_in_row],
+                .{ .rw = .read, .locality = 0, .cache = .data },
+            );
+            @prefetch(
+                &data[pf_offs[1] + blk_off_in_row],
+                .{ .rw = .read, .locality = 0, .cache = .data },
+            );
+            @prefetch(
+                &data[pf_offs[2] + blk_off_in_row],
+                .{ .rw = .read, .locality = 0, .cache = .data },
+            );
+            @prefetch(
+                &data[pf_offs[3] + blk_off_in_row],
+                .{ .rw = .read, .locality = 0, .cache = .data },
+            );
         }
 
-        const s0v: Vec = @splat(f16BitsToF32(std.mem.readInt(u16, data[row_offs[0] + blk_off_in_row ..][0..2], .little)));
-        const s1v: Vec = @splat(f16BitsToF32(std.mem.readInt(u16, data[row_offs[1] + blk_off_in_row ..][0..2], .little)));
-        const s2v: Vec = @splat(f16BitsToF32(std.mem.readInt(u16, data[row_offs[2] + blk_off_in_row ..][0..2], .little)));
-        const s3v: Vec = @splat(f16BitsToF32(std.mem.readInt(u16, data[row_offs[3] + blk_off_in_row ..][0..2], .little)));
+        const s0v: Vec = @splat(
+            f16BitsToF32(
+                std.mem.readInt(u16, data[row_offs[0] + blk_off_in_row ..][0..2], .little),
+            ),
+        );
+        const s1v: Vec = @splat(
+            f16BitsToF32(
+                std.mem.readInt(u16, data[row_offs[1] + blk_off_in_row ..][0..2], .little),
+            ),
+        );
+        const s2v: Vec = @splat(
+            f16BitsToF32(
+                std.mem.readInt(u16, data[row_offs[2] + blk_off_in_row ..][0..2], .little),
+            ),
+        );
+        const s3v: Vec = @splat(
+            f16BitsToF32(
+                std.mem.readInt(u16, data[row_offs[3] + blk_off_in_row ..][0..2], .little),
+            ),
+        );
 
         const in_base = blk * 32;
 
         inline for (0..4) |q| {
             const in_v: Vec = input[in_base + q * lanes ..][0..lanes].*;
 
-            const w0_arr: [lanes]i8 = @bitCast(data[row_offs[0] + blk_off_in_row + 2 + q * lanes ..][0..lanes].*);
-            const w1_arr: [lanes]i8 = @bitCast(data[row_offs[1] + blk_off_in_row + 2 + q * lanes ..][0..lanes].*);
-            const w2_arr: [lanes]i8 = @bitCast(data[row_offs[2] + blk_off_in_row + 2 + q * lanes ..][0..lanes].*);
-            const w3_arr: [lanes]i8 = @bitCast(data[row_offs[3] + blk_off_in_row + 2 + q * lanes ..][0..lanes].*);
+            const w0_arr: [lanes]i8 = @bitCast(
+                data[row_offs[0] + blk_off_in_row + 2 + q * lanes ..][0..lanes].*,
+            );
+            const w1_arr: [lanes]i8 = @bitCast(
+                data[row_offs[1] + blk_off_in_row + 2 + q * lanes ..][0..lanes].*,
+            );
+            const w2_arr: [lanes]i8 = @bitCast(
+                data[row_offs[2] + blk_off_in_row + 2 + q * lanes ..][0..lanes].*,
+            );
+            const w3_arr: [lanes]i8 = @bitCast(
+                data[row_offs[3] + blk_off_in_row + 2 + q * lanes ..][0..lanes].*,
+            );
 
             const w0v: Vec = s0v * @as(Vec, @floatFromInt(@as(VecI8, w0_arr)));
             const w1v: Vec = s1v * @as(Vec, @floatFromInt(@as(VecI8, w1_arr)));
@@ -206,6 +268,7 @@ inline fn rowPass(input: []const f32, data: []const u8, row_off: usize, n_blocks
             acc += w_v * in_v;
         }
     }
+
     return @reduce(.Add, acc);
 }
 
@@ -234,14 +297,20 @@ fn roundtripCheck(in_features: usize, out_features: usize) !void {
 
     const input = try gpa.alignedAlloc(f32, .of(f32), in_features);
     defer gpa.free(input);
+
     const w_data = try gpa.alignedAlloc(u8, .@"32", out_features * row_bytes);
     defer gpa.free(w_data);
+
     const out_naive = try gpa.alloc(f32, out_features);
     defer gpa.free(out_naive);
+
     const out_pf = try gpa.alloc(f32, out_features);
     defer gpa.free(out_pf);
 
-    for (input, 0..) |*x, i| x.* = @sin(@as(f32, @floatFromInt(i)) * 0.01);
+    for (input, 0..) |*x, i| {
+        x.* = @sin(@as(f32, @floatFromInt(i)) * 0.01);
+    }
+
     fillTestWeight(w_data, in_features, out_features, row_bytes);
     const w: Tensor = .{
         .dtype = .q8_0,
@@ -254,7 +323,9 @@ fn roundtripCheck(in_features: usize, out_features: usize) !void {
     naive.linearF32Q80(input, w, out_naive);
     linearF32Q80(input, w, out_pf);
 
-    for (out_naive, out_pf) |n, s| try std.testing.expectApproxEqRel(n, s, 1e-3);
+    for (out_naive, out_pf) |n, s| {
+        try std.testing.expectApproxEqRel(n, s, 1e-3);
+    }
 }
 
 test "simd_pf linearF32Q80 matches naive (out%4 == 0)" {
@@ -275,14 +346,20 @@ test "simd_pf linearF32Q80Batch is bit-identical to per-row linearF32Q80" {
 
     const inputs = try gpa.alignedAlloc(f32, .of(f32), batch * in_features);
     defer gpa.free(inputs);
+
     const w_data = try gpa.alignedAlloc(u8, .@"32", out_features * row_bytes);
     defer gpa.free(w_data);
+
     const outs = try gpa.alloc(f32, (batch - 1) * out_stride + out_features);
     defer gpa.free(outs);
+
     const out_single = try gpa.alloc(f32, out_features);
     defer gpa.free(out_single);
 
-    for (inputs, 0..) |*x, i| x.* = @sin(@as(f32, @floatFromInt(i)) * 0.013);
+    for (inputs, 0..) |*x, i| {
+        x.* = @sin(@as(f32, @floatFromInt(i)) * 0.013);
+    }
+
     fillTestWeight(w_data, in_features, out_features, row_bytes);
     const w: Tensor = .{
         .dtype = .q8_0,

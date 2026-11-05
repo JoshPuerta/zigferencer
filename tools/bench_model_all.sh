@@ -5,16 +5,16 @@
 #
 # The cross-backend tokens_hash is the determinism gate. Greedy sampling is
 # deterministic, so every eligible backend must produce the same tokens. The
-# SIMD attention differs from the naive oracle in bits, inside a declared
+# SIMD attention differs from the naive reference in bits, inside a declared
 # tolerance, and the gate relies on the tokens to tolerate that difference. So
 # a mismatch alone does not prove a kernel bug. Check the kernel tolerance
-# tests first. The TTFT and ITL per backend ride along as a coarse speed view.
+# tests first. The TTFT and ITL per backend join the report as a coarse speed view.
 #
 # Usage: tools/bench_model_all.sh [model] [prompt] [decode] [runs] [--chat]
 # Env:   ZIG   the zig 0.16 binary (default: zig on PATH)
 #        GPU=1 adds the per-op vulkan backend to the ladder. It needs glslc and
 #              libvulkan-dev, and it runs every backend at f32 KV, because the
-#              per-op arm frames its KV at f32 alone.
+#              per-op backend frames its KV at f32 alone.
 #
 # Dependencies: coreutils and awk alone. The bench binary emits --json as one
 # line of a known shape, which grep and awk parse here. A JSON library, and
@@ -96,6 +96,6 @@ if [ "$n_distinct" -eq 1 ]; then
 else
     printf 'cross-backend determinism: DIVERGED  (%d distinct hashes across %d backends)\n' \
         "$n_distinct" "${#hashes[@]}"
-    echo '  -> an ops/* kernel disagrees with the naive oracle. Investigate it.'
+    echo '  -> an ops/* kernel disagrees with the naive reference. Investigate it.'
     exit 1
 fi

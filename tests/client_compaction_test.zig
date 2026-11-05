@@ -91,15 +91,22 @@ const Chat = struct {
             while (next < c.t.count()) {
                 const end = ct.frameEnd(c.t, next, c.t.count());
                 var pairs: [limits.max_append_pairs]protocol.Pair = undefined;
-                for (next..end, 0..) |i, j| pairs[j] = c.t.pair(@intCast(i));
+                for (next..end, 0..) |i, j| {
+                    pairs[j] = c.t.pair(@intCast(i));
+                }
+
                 const a = c.client.append(c.session.id, pairs[0 .. end - next]) catch |err| {
                     if (err != error.ServerError) return err;
+
                     const e = c.client.last_error.?;
                     try std.testing.expectEqual(protocol.ErrorCode.turn_too_long, e.code);
                     const tl = ct.parseTooLong(e.detail()).?;
                     ct.learnRefusal(c.t, next, end, tl.tokens);
                     const before = p.kept;
-                    p = ct.plan(c.t, .{ .window = max_seq, .reserve = r, .system_rows = c.system_rows });
+                    p = ct.plan(
+                        c.t,
+                        .{ .window = max_seq, .reserve = r, .system_rows = c.system_rows },
+                    );
                     try std.testing.expect(p.kept < before);
                     c.t.dropOldest(p.dropped);
                     c.refits += 1;
@@ -108,13 +115,19 @@ const Chat = struct {
                 c.session.kv_pos = ct.learnAppended(c.t, next, c.session.kv_pos, a.positions());
                 next = end;
             }
+
             break;
         }
+
         if (c.verbose) {
-            std.debug.print("compaction {t}: kept {d}, reserve {d}, estimate {d}, kv_pos {d}/{d}\n", .{
-                path, p.kept, r, p.estimate, c.session.kv_pos, max_seq,
-            });
+            std.debug.print(
+                "compaction {t}: kept {d}, reserve {d}, estimate {d}, kv_pos {d}/{d}\n",
+                .{
+                    path, p.kept, r, p.estimate, c.session.kv_pos, max_seq,
+                },
+            );
         }
+
         try std.testing.expect(c.session.kv_pos <= p.estimate);
         try std.testing.expect(c.session.kv_pos + r <= max_seq);
         c.counts.getPtr(path).* += 1;
@@ -133,26 +146,52 @@ const Chat = struct {
             const done = c.client.collectTurn(ids, text) catch |err| {
                 _ = c.t.abandon();
                 if (err != error.ServerError or retried) return err;
+
                 const e = c.client.last_error.?;
                 try std.testing.expectEqual(protocol.ErrorCode.turn_too_long, e.code);
                 const tl = ct.parseTooLong(e.detail()).?;
                 try std.testing.expectEqual(ct.TooLong.Kind.turn, tl.kind);
-                switch (ct.retryPlan(c.system_rows, max_seq, ct.reserveFor(max_seq, c.t.longest_cost), tl.tokens)) {
+                switch (ct.retryPlan(
+                    c.system_rows,
+                    max_seq,
+                    ct.reserveFor(max_seq, c.t.longest_cost),
+                    tl.tokens,
+                )) {
                     .refuse => return error.RetryRefused,
                     .retry => |r| refusal_kept = (try c.compact(.refusal, r)).kept,
                 }
+
                 retried = true;
                 continue;
             };
             try std.testing.expect(done.text_len == done.text_total);
-            if (done.text_len > 0) c.t.appendReply(text[0..done.text_len]);
-            const rec_cost = ct.liveCost(done.kv_pos - c.session.kv_pos, done.finish_reason, done.gen_tokens);
+            if (done.text_len > 0) {
+                c.t.appendReply(text[0..done.text_len]);
+            }
+
+            const rec_cost = ct.liveCost(
+                done.kv_pos - c.session.kv_pos,
+                done.finish_reason,
+                done.gen_tokens,
+            );
             const rec = c.t.finish(rec_cost);
             try std.testing.expect(!rec.barrier);
             c.session.kv_pos = done.kv_pos;
-            if (c.verbose) std.debug.print("turn: cost {d}, kv_pos {d}/{d}, {t}\n", .{ rec_cost, done.kv_pos, max_seq, done.finish_reason });
-            if (retried and refusal_kept > 0) c.resent_after_kept += 1;
-            if (done.finish_reason == .context_full) _ = try c.compact(.context_full, ct.reserveFor(max_seq, c.t.longest_cost));
+            if (c.verbose) {
+                std.debug.print(
+                    "turn: cost {d}, kv_pos {d}/{d}, {t}\n",
+                    .{ rec_cost, done.kv_pos, max_seq, done.finish_reason },
+                );
+            }
+
+            if (retried and refusal_kept > 0) {
+                c.resent_after_kept += 1;
+            }
+
+            if (done.finish_reason == .context_full) {
+                _ = try c.compact(.context_full, ct.reserveFor(max_seq, c.t.longest_cost));
+            }
+
             return;
         }
     }
@@ -167,8 +206,10 @@ const Setup = struct {
     fn boot(s: *Setup, gpa: std.mem.Allocator) !void {
         s.h = try Harness.boot(gpa, std.testing.io, .tcp, opts);
         errdefer s.h.deinit();
+
         s.client = try s.h.connect();
         errdefer s.client.deinit();
+
         const info = try s.client.hello();
         try std.testing.expectEqual(max_seq, info.max_seq);
         const session = try s.client.openSessionInfo(system_prompt, protocol.Sampling.greedy);
@@ -198,16 +239,25 @@ test "a conversation that outgrows its window continues after compaction" {
     var s: Setup = undefined;
     try s.boot(gpa);
     defer s.deinit(gpa);
+
     var ids: [max_seq]u32 = undefined;
     var text: [4096]u8 = undefined;
 
     const hits_before = s.h.server.sched.prefix.hits;
-    for (steps) |step| try s.chat.turn(step, &ids, &text);
+    for (steps) |step| {
+        try s.chat.turn(step, &ids, &text);
+    }
 
     const chat = &s.chat;
     const full = chat.counts.get(.context_full);
     const refusal = chat.counts.get(.refusal);
-    if (chat.verbose) std.debug.print("compactions: context_full {d}, refusal {d}, refusal kept {d}\n", .{ full, refusal, chat.kept.get(.refusal) });
+    if (chat.verbose) {
+        std.debug.print(
+            "compactions: context_full {d}, refusal {d}, refusal kept {d}\n",
+            .{ full, refusal, chat.kept.get(.refusal) },
+        );
+    }
+
     try std.testing.expect(full >= 1);
     try std.testing.expect(refusal >= 1);
     try std.testing.expect(full + refusal >= 3);
@@ -226,9 +276,12 @@ test "an estimate that undercounts a kept pair refits the cycle with the learned
     var s: Setup = undefined;
     try s.boot(gpa);
     defer s.deinit(gpa);
+
     var ids: [max_seq]u32 = undefined;
     var text: [4096]u8 = undefined;
-    for (steps[0..2]) |step| try s.chat.turn(step, &ids, &text);
+    for (steps[0..2]) |step| {
+        try s.chat.turn(step, &ids, &text);
+    }
 
     // A planted turn with a cost of one position. Its prompt alone holds far
     // more tokens than the window, so the plan keeps it and the server
