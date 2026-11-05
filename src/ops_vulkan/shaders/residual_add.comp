@@ -1,18 +1,21 @@
-// Residual add in place: dst[i] = dst[i] + x[i] for i in 0..n. It is the residual
-// connection that wraps the attention block and the FFN block of every
-// transformer layer. Binding 1 is read-write, so the same buffer is both the
-// accumulator of the residual stream and the destination.
+// residual_add: dst[i] += x[i], the residual connection of a transformer layer.
 //
-//   binding 0  readonly  f32 x[n]
-//   binding 1  readwrite f32 dst[n]
-//   push       uint n
+// What
+//   The connection wraps the attention block and the FFN block of every layer. Binding 1 is
+//   read-write, so one buffer is both the accumulator and the destination.
 //
-// Lane i owns element i. local_size_x = 256 is 8 RDNA2 wave32 waves, and the
-// dispatch is ceil(n / 256) workgroups. n is a model hidden dim, 576 to 4096
-// across the bench models, so only a few workgroups run.
+// Hardware
+//   Lane i owns element i. 256 lanes are 8 wave32 waves, and the grid is (ceil(n / 256), 1, 1).
+//   n is a model hidden dim, 576 to 4096 across the bench models, so few workgroups run.
 //
-// Bit-exact against the CPU reference: the kernel does one IEEE-754 add per
-// element, with no reduction order and no FMA candidate.
+// Numerics
+//   Bit-exact: the kernel does one IEEE-754 add per element, with no reduction order and no FMA
+//   candidate.
+//
+// Bindings
+//   0     readonly   f32  x[n]
+//   1     readwrite  f32  dst[n]
+//   push  uint n
 
 #version 450
 
@@ -35,5 +38,6 @@ layout(push_constant) uniform Params {
 void main() {
     uint i = gl_GlobalInvocationID.x;
     if (i >= params.n) return;
+
     dst_buf.data[i] = dst_buf.data[i] + x_buf.data[i];
 }

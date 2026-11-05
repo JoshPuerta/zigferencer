@@ -597,7 +597,7 @@ test "llama hybrid provenance: a foreign placement is another namespace" {
 
         try cache.enableDisk(io, dir, 1 << 20, mine);
         try std.testing.expect(
-            try cache.admit(
+            cache.admit(
                 prompt_cache.prefixKey(mine, &seq),
                 &seq,
                 &blob,
@@ -618,7 +618,7 @@ test "llama hybrid provenance: a foreign placement is another namespace" {
 
         try cache.enableDisk(io, dir, 1 << 20, half);
         try std.testing.expect(
-            try cache.admit(
+            cache.admit(
                 prompt_cache.prefixKey(half, &seq),
                 &seq,
                 blob[0 .. blob.len / 2],

@@ -76,7 +76,7 @@ fn driveRow(runner: *QwenRunner, k: u32, row: StepRow) !void {
     z.ops.embedLookup(runner.embed.*, row.token, d, runner.x[0..d]);
     var layer: u32 = 0;
     while (layer < k) : (layer += 1) {
-        try runner.layerForward(layer, &.{row});
+        runner.layerForward(layer, &.{row});
     }
 }
 

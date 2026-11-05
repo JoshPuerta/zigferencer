@@ -1,22 +1,24 @@
-// Elementwise add over a 1D f32 buffer: out[i] = a[i] + b[i]. It is the
-// proof-of-life kernel of the Vulkan backend. One dispatch exercises the whole
-// compute stack: instance, device, queue, descriptor set, pipeline, and command
-// buffer. Every other kernel builds on those primitives, so a failure here
-// points at the stack and not at the math.
+// vec_add: out[i] = a[i] + b[i], the proof-of-life kernel of the Vulkan backend.
 //
-// Lane i owns element i. local_size_x = 256 gives 8 RDNA2 wave32 waves per
-// workgroup, and the dispatch is ceil(n / 256) workgroups. Eight waves keep a WGP
-// busy and hide memory latency without pinning so many registers that occupancy
-// drops. The other per-element kernels (residual_add, swiglu, sigmoid_gate) share
-// that trade-off.
+// What
+//   One dispatch exercises the whole compute stack: instance, device, queue, descriptor set,
+//   pipeline, and command buffer. Every other kernel builds on those primitives, so a failure
+//   here points at the stack and not at the math.
 //
-//   binding 0  readonly  f32 a[n]
-//   binding 1  readonly  f32 b[n]
-//   binding 2  writeonly f32 out[n]
-//   push       uint n    (element count, bounds the loop)
+// Hardware
+//   Lane i owns element i. 256 lanes are 8 wave32 waves, and the grid is (ceil(n / 256), 1, 1).
+//   Eight waves keep a WGP busy and hide memory latency without pinning so many registers that
+//   occupancy drops. `residual_add`, `swiglu`, and `sigmoid_gate` share that trade-off.
 //
-// Bit-exact against the CPU reference: the kernel does one IEEE-754 add per
-// element, so there is no reduction order and no accumulator to drift.
+// Numerics
+//   Bit-exact: the kernel does one IEEE-754 add per element, so it has no reduction order and no
+//   accumulator to drift.
+//
+// Bindings
+//   0     readonly   f32  a[n]
+//   1     readonly   f32  b[n]
+//   2     writeonly  f32  out[n]
+//   push  uint n, the element count
 
 #version 450
 
@@ -43,5 +45,6 @@ layout(push_constant) uniform Params {
 void main() {
     uint i = gl_GlobalInvocationID.x;
     if (i >= params.n) return;
+
     o.data[i] = a.data[i] + b.data[i];
 }

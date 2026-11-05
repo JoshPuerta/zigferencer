@@ -74,7 +74,7 @@ This document explains how zigferencer works, from the build to a served token.
 | `zigferencer` | `src/main.zig` | `zig-out/bin/` | The release binary: `list`, `fetch`, `inspect`, `info`, `run`, `serve`, `serve-openai`, and `client`. |
 | `zigferencer-dev` | `src/dev_main.zig` | `zig-out/bin/` | The release commands, plus the developer commands: the model benchmarks, `gpu-selftest`, `tokens`, and `serve-demo`. |
 | `zigferencer-bench` | `tools/bench.zig` | not installed | The op micro-benchmarks. `zig build bench` builds and runs it. |
-| `zigferencer-simd-probe` | `tools/simd_probe.zig` | `zig-out/` | The assembly of each op, for the `make simd-*` targets. `zig build simd-probe` installs only the `.s` file. |
+| `zigferencer-simd-probe` | `tools/simd_probe.zig` | `zig-out/` | The assembly of each op, for `make simd-report`. `zig build simd-probe` installs only the `.s` file. |
 | test binaries | `src/main.zig`, `tests/*_test.zig` | `zig-out/test/` | The unit tests, and one binary for each integration test. Only `test-install` installs one. |
 | SPIR-V blobs | `src/ops_vulkan/shaders/*.comp` | inside the binary | The GPU kernels. Only a GPU build compiles them. |
 
@@ -113,7 +113,8 @@ Two build options decide which code computes the model:
 They are two options because a GPU binary also runs CPU kernels. A hybrid runs its
 first layers on the CPU, and a GPU build can also run the CPU placement. A GPU build
 resolves a CPU backend next to its GPU backend: `simd_pf` where the target
-supports it, otherwise `naive`. A GPU backend needs `-Druntime=vulkan`. Any other pair is legal.
+supports it, otherwise `naive`. A GPU backend selects `-Druntime=vulkan` when the flag is
+absent, and it refuses `-Druntime=cpu`. Any other pair is legal.
 
 | Build command | Runtime | GPU kernels | CPU kernels |
 | --- | --- | --- | --- |
@@ -161,18 +162,17 @@ buffers read the same` value.
 
 ### The Makefile
 
-The `Makefile` is a convenience over `zig build`. `make help` lists the targets in
-groups: build and quality, debugging, benchmarks, SIMD inspection, profiling,
-inference, models and host, GPU, and misc. Some rules hold for every target:
+The `Makefile` is a small layer over `zig build`, and `make help` lists the targets.
+[../tools/README.md](../tools/README.md) holds the rule for a new target.
 
-- `BACKEND=` maps to the two build options. `vulkan` and `vulkan_fused` add
-  `-Druntime=vulkan`. An empty value or `auto` gives `-Dops-backend=auto`.
-- `make build` and `make debug` build Debug. `make test` builds ReleaseSafe. Every
-  target that runs a model builds with `OPT`, which is `ReleaseFast` by default.
-- A target that builds a binary installs both executables in one `zig build
-  install dev` call. The test, check, and op benchmark targets build only what their
-  step needs. A target for a developer command runs `zigferencer-dev`.
-- When `MODEL=` is unset and stdin is a terminal, a target asks for a model.
+- `BACKEND=` sets `-Dops-backend`. A GPU backend selects `-Druntime=vulkan` by itself.
+- `OPT`, `ReleaseFast` by default, sets the optimize mode of `build`, `run`, `bench`, and
+  `simd-report`. `make test` builds ReleaseSafe, and `make debug` builds Debug with LLVM.
+- `ARGS=` holds the words after the binary or the script name. `FLAGS=` holds more `zig build`
+  flags.
+- `make build` and `make run` install both executables in one `zig build install dev` call.
+  `make run` runs `zigferencer-dev`, which holds every command.
+- `make ci` runs the CPU part of CI. `make ci-gpu` compiles every GPU path and runs none.
 
 ## 3. From a prompt to text
 
@@ -278,7 +278,7 @@ the lessons from digital design in VHDL I had many years ago.
 | [`src/runtime/`](../src/runtime/README.md) | The runners and their state. | `llama_runner.zig`, `qwen_runner.zig`, `llama_fused.zig`, `qwen_fused.zig`, `llama_hybrid.zig`, `qwen_hybrid.zig`, `session.zig`, `sampler.zig`, `parallel.zig` |
 | [`src/serve/`](../src/serve/README.md) | The server. | `scheduler.zig`, `engine.zig`, `protocol.zig`, `server.zig`, `openai/`, `residency.zig`, `prefix_manager.zig` |
 | [`tests/`](../tests/README.md) | The integration tests against real model files. | `snapshot_smollm2_test.zig`, the `*_equivalence_test.zig` files |
-| [`tools/`](../tools/README.md) | The op micro-benchmarks, the checkers, the sweeps, and the profiler driver. | `bench.zig`, `bench_model_all.sh`, `profile.sh` |
+| [`tools/`](../tools/README.md) | The op micro-benchmarks, the gates, and the profiler driver. | `bench.zig`, `gate.sh`, `profile.sh` |
 
 ## 6. The core data types
 
@@ -475,8 +475,8 @@ A dispatch takes no lock and allocates nothing.
 The result of a unit does not depend on the thread that runs it. A matrix row is one
 kernel call. An attention part writes its own record, and the caller adds the parts
 in order. A value head writes only its own state. The token hash therefore holds
-across thread counts, floors, spin budgets, and claim orders. A thread sweep
-(`tools/bench_threads_sweep.sh`) is also a determinism check.
+across thread counts, floors, spin budgets, and claim orders. `tools/gate.sh threads`
+checks the thread counts.
 
 ## 9. Memory
 
@@ -1016,10 +1016,9 @@ backends the greedy tokens are equal. Section 11 names the tests that check it.
   inputs.
 - **The token hash.** `bench-model` prints an FNV-1a hash of the generated token
   ids. Equal hashes across thread counts check determinism. Equal hashes across
-  backends and placements check that the paths agree. `tools/bench_model_all.sh`
-  gates the CPU backends, `tools/bench_llama_hybrid_gate.sh` gates the CPU runner,
-  the fused runner, and three hybrid splits, and `tools/bench_deep_gate.sh` gates a
-  deep prompt.
+  backends and placements check that the paths agree. `tools/gate.sh` holds the gates as
+  tables. `backends` covers the CPU backends, `threads` the thread counts, `hybrid` the CPU
+  runner, the fused runner, and three hybrid splits, and `deep` a deep prompt.
 - **The snapshot test** (`tests/snapshot_smollm2_test.zig`) pins the first greedy
   tokens of a fixed prompt on a real model file. A fault anywhere in the stack fails
   it.
@@ -1203,11 +1202,10 @@ acceptorTask -> HttpAdapter.onAccept                       serve/openai/http_ser
   and run no kernel.
 - **Stay under the preflight.** A plan that passes the 7/8 preflight can still lose
   the device near the limit under a translation-layer driver. After a device loss,
-  end the process. `make gpu-flush` ends a process that stays.
+  end the process. `pkill -x 'zigferencer|zigferencer-dev'` ends a process that stays.
 - **Logs.** `$ZIGFERENCER_LOG` sets the log level with no rebuild: `off`, `err`,
   `warn`, `info` (the default), `debug`, or a level for each scope, such as
-  `info,runner=debug`. `src/core/log.zig` holds the grammar. `make` passes `LOG=`
-  through.
+  `info,runner=debug`. `src/core/log.zig` holds the grammar.
 - **Files.** `$ZIGFERENCER_MODELS_DIR` moves the model store, and `fetch`
   downloads into it. The default is `models/`. `$ZIGFERENCER_CACHE_DIR` moves the
   disk tier of the prefix cache. The default is `.prompt_cache`.

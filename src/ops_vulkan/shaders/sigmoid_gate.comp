@@ -1,19 +1,22 @@
-// Output gate of the Qwen3.5 full-attention block, in place:
+// sigmoid_gate: dst[i] *= sigmoid(gate[i]), the output gate of the Qwen3.5 full-attention block.
 //
-//   dst[i] = dst[i] * sigmoid(gate[i])
+// What
+//   The kernel scales the attention readout by the sigmoid of the gate half of the fused
+//   query|gate projection. That half is un-normed and un-roped, and the scaling runs before the
+//   output projection. This is output gating, and it differs from the silu(gate) * up of
+//   `swiglu.comp`, which gates the FFN.
 //
-// The kernel scales the attention readout by the sigmoid of the gate half of the
-// fused query|gate projection. That half is un-normed and un-roped, and the
-// scaling runs before the output projection. This is output gating, and it
-// differs from the silu(gate) * up of swiglu, which gates the FFN. Lane i owns
-// element i at local_size_x = 256.
+// Hardware
+//   Lane i owns element i. 256 lanes are 8 wave32 waves, and the grid is (ceil(n / 256), 1, 1).
 //
-//   binding 0  readwrite f32 dst[n]    (attention output, gated in place)
-//   binding 1  readonly  f32 gate[n]
-//   push       uint n
+// Numerics
+//   Tolerance: `SigmoidGate` declares `.relative = 1e-5`. The GPU `exp` does not round the same
+//   as the CPU reference. The kernel has no reduction, so no summation order applies.
 //
-// GPU `exp` does not round the same as the CPU reference, so the result is not
-// bit-exact. The Zig wrapper `SigmoidGate` declares `.relative = 1e-5`.
+// Bindings
+//   0     readwrite  f32  dst[n]   attention output, gated in place
+//   1     readonly   f32  gate[n]
+//   push  uint n
 
 #version 450
 
@@ -36,6 +39,7 @@ layout(push_constant) uniform Params {
 void main() {
     uint i = gl_GlobalInvocationID.x;
     if (i >= params.n) return;
+
     float g = gate_buf.data[i];
     dst_buf.data[i] = dst_buf.data[i] * (1.0 / (1.0 + exp(-g)));
 }

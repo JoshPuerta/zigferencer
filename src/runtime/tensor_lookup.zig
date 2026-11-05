@@ -91,6 +91,17 @@ pub fn headWeightBytes(refs: []const loader.TensorRef) u64 {
     return total;
 }
 
+/// The block index a tensor name carries, or null when the name names no block.
+/// `blk.13.attn_q.weight` yields 13.
+pub fn blockIndex(name: []const u8) ?u32 {
+    const prefix = "blk.";
+    if (!std.mem.startsWith(u8, name, prefix)) return null;
+
+    const rest = name[prefix.len..];
+    const dot = std.mem.indexOfScalar(u8, rest, '.') orelse return null;
+    return std.fmt.parseInt(u32, rest[0..dot], 10) catch null;
+}
+
 /// Reinterpret the bytes of an f32 tensor as `[]const f32`. The loader refuses
 /// a tensor whose start breaks the alignment of its element type, with
 /// `error.TensorDataUnaligned`. So the `@alignCast` holds for every loaded
@@ -102,17 +113,6 @@ pub fn fp32View(t: Tensor) []const f32 {
 }
 
 // -- helpers ----------------------------------------------------------------
-
-/// The block index a tensor name carries, or null when the name names no block.
-/// `blk.13.attn_q.weight` yields 13.
-fn blockIndex(name: []const u8) ?u32 {
-    const prefix = "blk.";
-    if (!std.mem.startsWith(u8, name, prefix)) return null;
-
-    const rest = name[prefix.len..];
-    const dot = std.mem.indexOfScalar(u8, rest, '.') orelse return null;
-    return std.fmt.parseInt(u32, rest[0..dot], 10) catch null;
-}
 
 // -- tests ------------------------------------------------------------------
 

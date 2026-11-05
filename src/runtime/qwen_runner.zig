@@ -259,6 +259,7 @@ pub const QwenRunner = struct {
         const g = c.gdn orelse return error.NotQwen;
         std.debug.assert(n_layers >= 1);
         std.debug.assert(n_layers <= c.n_layers);
+        try linear_dispatch.requireWeights(loaded.tensors, n_layers);
 
         const gd: gdn.Dims = .{
             .n_k_heads = g.group_count,
@@ -532,7 +533,7 @@ pub const QwenRunner = struct {
                 t_layer = core_log.now();
             }
 
-            try self.layerForward(li, rows);
+            self.layerForward(li, rows);
             if (live) {
                 log_layer.debug("layer {d} ({t}): {d} rows, {d:.2} ms", .{
                     li,
@@ -566,7 +567,7 @@ pub const QwenRunner = struct {
         const n_logits = rows.len - first;
         // Compact: want-logits rows land at logits[0..], so the buffer needs only
         // n_slots rows, not max_rows (Sessions.advance reads the same index).
-        try self.linearBatch(
+        self.linearBatch(
             self.x_norm[first * d .. rows.len * d],
             self.lm_head.*, // output.weight (9B) or tied embed (2B)
             self.logits[0..],
@@ -580,7 +581,7 @@ pub const QwenRunner = struct {
     /// mixer (GDN or full attention), then residual. The SwiGLU FFN follows,
     /// with batched projections. It is public so a composing runner can drive
     /// the layers itself.
-    pub fn layerForward(self: *QwenRunner, layer: u32, rows: []const StepRow) Error!void {
+    pub fn layerForward(self: *QwenRunner, layer: u32, rows: []const StepRow) void {
         const sp = span.beginHot(.layer_forward);
         defer sp.end();
 
@@ -604,8 +605,8 @@ pub const QwenRunner = struct {
 
         self.tEnd(t_an, .rmsnorm);
         switch (lw.kind) {
-            .gdn => |w| try self.gdnMixer(w, rows, layer),
-            .full => |w| try self.fullMixer(w, rows),
+            .gdn => |w| self.gdnMixer(w, rows, layer),
+            .full => |w| self.fullMixer(w, rows),
         }
 
         const t_res1 = self.tBegin();
@@ -627,8 +628,8 @@ pub const QwenRunner = struct {
         }
 
         self.tEnd(t_fn, .rmsnorm);
-        try self.linearBatch(self.x_norm[0 .. n * d], lw.ffn_gate.*, self.ffn_g, n, .gate_up_proj);
-        try self.linearBatch(self.x_norm[0 .. n * d], lw.ffn_up.*, self.ffn_u, n, .gate_up_proj);
+        self.linearBatch(self.x_norm[0 .. n * d], lw.ffn_gate.*, self.ffn_g, n, .gate_up_proj);
+        self.linearBatch(self.x_norm[0 .. n * d], lw.ffn_up.*, self.ffn_u, n, .gate_up_proj);
         const t_sg = self.tBegin();
         for (0..n) |i| {
             ops.swiglu(
@@ -639,7 +640,7 @@ pub const QwenRunner = struct {
         }
 
         self.tEnd(t_sg, .swiglu);
-        try self.linearBatch(self.ffn_g[0 .. n * fd], lw.ffn_down.*, self.mix_out, n, .down_proj);
+        self.linearBatch(self.ffn_g[0 .. n * fd], lw.ffn_down.*, self.mix_out, n, .down_proj);
         const t_res2 = self.tBegin();
         for (0..n) |i| {
             ops.residualAdd(self.mix_out[i * d ..][0..d], self.x[i * d ..][0..d]);
@@ -811,17 +812,17 @@ pub const QwenRunner = struct {
     /// hidden. Row order is time order for same-slot rows (validateRows), so
     /// the scan of each row sees exactly the state of its solo run. Inside a
     /// row, the value heads fan out on the pool.
-    fn gdnMixer(self: *QwenRunner, w: GdnWeights, rows: []const StepRow, li: usize) Error!void {
+    fn gdnMixer(self: *QwenRunner, w: GdnWeights, rows: []const StepRow, li: usize) void {
         const d = self.gdn_dims;
         const n = rows.len;
         const hidden = self.hidden;
         const cd = d.convDim();
         const vd = d.valueDim();
         const nv = d.n_v_heads;
-        try self.linearBatch(self.x_norm[0 .. n * hidden], w.qkv.*, self.qkv, n, .gdn_proj);
-        try self.linearBatch(self.x_norm[0 .. n * hidden], w.gate.*, self.z, n, .gdn_proj);
-        try self.linearBatch(self.x_norm[0 .. n * hidden], w.alpha.*, self.gdn_a, n, .gdn_proj);
-        try self.linearBatch(self.x_norm[0 .. n * hidden], w.beta.*, self.gdn_b, n, .gdn_proj);
+        self.linearBatch(self.x_norm[0 .. n * hidden], w.qkv.*, self.qkv, n, .gdn_proj);
+        self.linearBatch(self.x_norm[0 .. n * hidden], w.gate.*, self.z, n, .gdn_proj);
+        self.linearBatch(self.x_norm[0 .. n * hidden], w.alpha.*, self.gdn_a, n, .gdn_proj);
+        self.linearBatch(self.x_norm[0 .. n * hidden], w.beta.*, self.gdn_b, n, .gdn_proj);
 
         const t_step = self.tBegin();
         for (rows, 0..) |r, i| {
@@ -876,7 +877,7 @@ pub const QwenRunner = struct {
         }
 
         self.tEnd(t_step, .gdn_step);
-        try self.linearBatch(self.mix_o[0 .. n * vd], w.out.*, self.mix_out, n, .gdn_out);
+        self.linearBatch(self.mix_o[0 .. n * vd], w.out.*, self.mix_out, n, .gdn_out);
     }
 
     /// Full softmax attention. q/k/v run as batched passes. Then per row:
@@ -886,7 +887,7 @@ pub const QwenRunner = struct {
     /// construction, the same argument as `LlamaRunner.layerForward`. Then GQA
     /// attention plus a sigmoid output gate per row, and one batched output
     /// projection.
-    fn fullMixer(self: *QwenRunner, w: FullWeights, rows: []const StepRow) Error!void {
+    fn fullMixer(self: *QwenRunner, w: FullWeights, rows: []const StepRow) void {
         // The compaction invariant, consumer side: a full-attention layer
         // implies a cache, and its `kv_slot` addresses a layer inside that
         // cache. A prefix sizes the cache to its own range, so a model-global
@@ -899,9 +900,9 @@ pub const QwenRunner = struct {
         const hidden = self.hidden;
         const qd = self.n_heads * hd;
         const kvd = self.n_kv_heads * hd;
-        try self.linearBatch(self.x_norm[0 .. n * hidden], w.q.*, self.q_gate, n, .attn_proj);
-        try self.linearBatch(self.x_norm[0 .. n * hidden], w.k.*, self.k_buf, n, .attn_proj);
-        try self.linearBatch(self.x_norm[0 .. n * hidden], w.v.*, self.v_buf, n, .attn_proj);
+        self.linearBatch(self.x_norm[0 .. n * hidden], w.q.*, self.q_gate, n, .attn_proj);
+        self.linearBatch(self.x_norm[0 .. n * hidden], w.k.*, self.k_buf, n, .attn_proj);
+        self.linearBatch(self.x_norm[0 .. n * hidden], w.v.*, self.v_buf, n, .attn_proj);
 
         for (rows, 0..) |r, i| {
             const t_qk = self.tBegin();
@@ -1028,7 +1029,7 @@ pub const QwenRunner = struct {
             self.tEnd(t_gate, .attn_gate);
         }
 
-        try self.linearBatch(self.attn_out[0 .. n * qd], w.o.*, self.mix_out, n, .o_proj);
+        self.linearBatch(self.attn_out[0 .. n * qd], w.o.*, self.mix_out, n, .o_proj);
     }
 
     // -- matmul dispatch ----------------------------------------------------
@@ -1045,13 +1046,13 @@ pub const QwenRunner = struct {
         outs: []f32,
         batch: usize,
         cat: ProfileCat,
-    ) Error!void {
+    ) void {
         std.debug.assert(cat.isMatmul());
 
         const t0 = self.tBegin();
         defer self.tEnd(t0, cat);
 
-        return linear_dispatch.linearBatchDispatch(self.pool, self.policy, inputs, w, outs, batch);
+        linear_dispatch.linearBatchDispatch(self.pool, self.policy, inputs, w, outs, batch);
     }
 
     // -- timing -------------------------------------------------------------

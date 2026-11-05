@@ -243,7 +243,10 @@ fn readerLoop(engine: anytype, conn: anytype) void {
         const msg = protocol.decodeClientPayload(h.msg_type, payload) catch |e| {
             return fatalFrame(engine, conn, decodeErrorCode(e), @errorName(e));
         };
-        const req = toRequest(engine.gpa, conn.id, h, msg) catch return;
+        const req = toRequest(engine.gpa, conn.id, h, msg) catch |err| {
+            log.debug("conn {d}: request failed: {t}", .{ conn.id, err });
+            return;
+        };
         engine.submit(req) catch {
             engine_mod.freeRequestText(engine.gpa, req);
             return;

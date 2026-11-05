@@ -370,6 +370,13 @@ request opens its own session, so the session-open seed starts the sampling
 stream of the request, and the turn sends no reseed. The table lists what the
 front does with each request field.
 
+To try the front, start `zig-out/bin/zigferencer serve-openai MODEL --port 8080`, then send a request:
+
+```
+curl -N http://127.0.0.1:8080/v1/chat/completions -H 'Content-Type: application/json' \
+  -d '{"model":"MODEL","messages":[{"role":"user","content":"Hello"}],"stream":true}'
+```
+
 | Field | Rule |
 | --- | --- |
 | `messages`, `model`, `stream`, `max_tokens`, `max_completion_tokens`, `n` | honored. `n` above 1 gets a 400. A `model` that is not the served id gets a 404 |
@@ -402,7 +409,7 @@ that needs a fixed reply sends `temperature: 0` or a fixed `seed`. One seed,
 one build, and one request give one reply. Under the card defaults,
 `temperature: 0` still applies the card penalties, the vLLM rule, so the
 reply can differ from the pure greedy stream. `--sampling greedy`
-gives the pure greedy stream. `make bench-openai` uses it.
+gives the pure greedy stream.
 
 The buffered reply adds `usage.completion_tokens_details.reasoning_tokens`
 when the turn has think tokens.

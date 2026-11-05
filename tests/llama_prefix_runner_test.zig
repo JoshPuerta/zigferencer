@@ -36,7 +36,7 @@ fn driveRow(runner: *LlamaRunner, row: StepRow) !void {
     z.ops.embedLookup(runner.embed.*, row.token, d, runner.x[0..d]);
     var layer: u32 = 0;
     while (layer < runner.n_layers) : (layer += 1) {
-        try runner.layerForward(layer, &.{row});
+        runner.layerForward(layer, &.{row});
     }
 }
 

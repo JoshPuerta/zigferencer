@@ -1,28 +1,41 @@
-// In-place RoPE on one head_dim vector at position pos. For i in [0, rope_dim/2)
-// one lane rotates one pair by an angle built from freq_base, pos, i, and the
-// per-pair frequency factor. Dims at or past rope_dim stay untouched.
+// rope: in-place RoPE on one head_dim vector at position pos, one lane per rotated pair.
 //
-//   theta = freq_base^(-2i / rope_dim)
-//   angle = pos * theta / ff[i]
-//   (x[a], x[b]) = (x[a] cos - x[b] sin, x[a] sin + x[b] cos)
+// What
+//   The kernel rotates the leading rope_dim dims of x, and dims at or past rope_dim stay
+//   untouched. Only the benchmark calls it. The per-op path runs the CPU rope, and the fused
+//   runners use `rope_multi.comp`.
 //
-// Pairing follows the rope type of the architecture (the vocabulary of llama.cpp):
-//   style_norm = 1  adjacent pairs (x[2i], x[2i+1]), the llama family. The GGUF
-//                   conversion permutes the Q and K weights for this layout.
-//   style_norm = 0  half-split pairs (x[i], x[i+half]), the neox and qwen family.
-// The wrong style scrambles attention geometry at every position.
+// Math
+//   For pair i in 0 .. rope_dim / 2 - 1, with ff[i] the per-pair frequency factor:
 //
-//   binding 0  readwrite f32 x[]                 (rotated in place)
-//   binding 1  readonly  f32 ff[rope_dim/2]      (freq divisors, all ones = classic)
-//   push       uint pos, uint rope_dim, float freq_base, uint style_norm
+//     theta = freq_base^(-2i / rope_dim)
+//     angle = pos * theta / ff[i]
+//     (x[a], x[b]) = (x[a] cos - x[b] sin, x[a] sin + x[b] cos)
 //
-// Each lane rotates one pair, so the dispatch is ceil((rope_dim/2) / 64)
-// workgroups at local_size_x = 64. head_dim is 64 or 128 across the bench models,
-// so one head is one or two workgroups. That small size makes per-head RoPE
-// dispatch-overhead bound, which is why the `rope_multi` variant exists.
+//   Pairing follows the rope type of the architecture, in the vocabulary of llama.cpp:
 //
-// GPU `pow`, `cos`, and `sin` round differently from the CPU intrinsics, so the
-// result is not bit-exact. The Zig wrapper `Rope` declares `.relative = 5e-5`.
+//     style_norm = 1  a = 2i, b = 2i + 1      the llama family, adjacent pairs
+//     style_norm = 0  a = i, b = i + half     the neox and Qwen family, half = rope_dim / 2
+//
+//   The GGUF conversion permutes the Q and K weights for the adjacent layout. The wrong style
+//   scrambles attention geometry at every position.
+//
+// Hardware
+//   Lane i rotates pair i. 64 lanes are 2 wave32 waves, and the grid is
+//   (ceil((rope_dim / 2) / 64), 1, 1). A rope_dim of 64 or 128 takes one workgroup, and 256 takes
+//   two. That small size makes per-head RoPE dispatch-overhead bound, which is why the
+//   `rope_multi` variant exists. A lane past the last pair returns, and no barrier follows.
+//
+// Numerics
+//   Tolerance: `Rope` declares `.relative = 5e-5`. The GPU `pow`, `cos`, and `sin` round
+//   differently from the CPU intrinsics. The kernel has no reduction, so no summation order
+//   applies.
+//
+// Bindings
+//   0     readwrite  f32  x[head_dim]       rotated in place
+//   1     readonly   f32  ff[rope_dim / 2]  frequency divisors, all ones for classic RoPE
+//   push  uint pos, rope_dim, float freq_base, uint style_norm
+//   rope_dim must be even and at most the length of x.
 
 #version 450
 

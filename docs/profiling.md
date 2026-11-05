@@ -10,18 +10,17 @@ binary runs.
 
 | Tool | Needed for | Notes |
 | --- | --- | --- |
-| Linux, x86_64 | `make profile`, `tools/profile.sh` | A Linux virtual machine works. Some virtual-machine kernels refuse uprobes, so `calls` fails there. |
+| Linux, x86_64 | `make profile`, `tools/profile.sh` | A Linux virtual machine works. |
 | `perf` with libelf and DWARF support | every perf step | The `linux-tools` package of the distribution. A perf without libelf cannot name a Zig function. `PERF=` names another binary. |
 | The FlameGraph scripts and `perl` | the `.svg` files and `diff` | `git clone https://github.com/brendangregg/FlameGraph`, then put `flamegraph.pl` on `PATH` or set `FLAMEGRAPH=` to the clone. |
-| `python3`, and `addr2line`, `readelf`, and `nm` (binutils) | the report step and `calls` | `tools/profile_convert.py` uses only the Python standard library. |
-| `gawk` | `calls` | |
+| `python3` and `addr2line` (binutils) | the report step | `tools/profile_convert.py` uses only the Python standard library. |
 | A browser | the results | Open `.svg` files directly, `trace.json` in ui.perfetto.dev, and `samples.perf` in profiler.firefox.com or speedscope.app. |
 
 A command writes the trace of the engine to a JSON file when `$ZIGFERENCER_TRACE_OUT`
 names one.
 
-> Note: The `calls` and `offcpu` steps need root (`sudo`). Work to replace them is in
-> progress, so you can skip them for now.
+> Note: The `offcpu` step needs root (`sudo`). Work to replace it is in progress, so you
+> can skip it for now.
 
 ## Two kinds of evidence
 
@@ -96,14 +95,15 @@ Send the server some work during the 20 seconds, for example with
 
 ## The steps of `tools/profile.sh`
 
-`make profile` calls this script. Call it directly for a server or for one step.
+`make profile` calls `tools/profile.sh all`. Call the script directly for a server or for one
+step.
 
 | Step | What it writes |
 | --- | --- |
+| `all CMD...` | Builds the flavor, then runs `record`, `report`, and `index` on one new cell |
 | `record DIR -- CMD` | `perf.data`, and `trace.json` when `TRACE` is set |
 | `attach DIR PID SECONDS` | `perf.data`, and a copy of the trace file of the process when `TRACE` is set |
 | `report DIR` | `flame.svg`, `stacks.folded`, `callees.txt`, `callers.txt`, `lines.txt`, `samples.perf`, and `flame-gpu.svg` when the cell holds GPU records |
-| `calls DIR LIST -- CMD` | `calls.txt` (the call tree of each thread, in order), `calls.json`, `counts.txt`. `LIST` names the functions to trace, as in `tools/profile-calls/` |
 | `offcpu DIR PID SECONDS` | `flame-offcpu.svg` and `sched.txt`: where the threads wait, and for how long |
 | `diff A B OUT.svg` | a differential flame graph of two cells |
 | `index ROOT` | the index page of a profile root |
@@ -118,6 +118,7 @@ Send the server some work during the 20 seconds, for example with
 | `ZIGFERENCER_TRACE_SPANS=N` | the engine | The capacity of each trace ring. `limits.spans_per_thread_max` is the largest value. The engine refuses a value out of range at the start. |
 | `TRACE` | `tools/profile.sh` | Any value sets `ZIGFERENCER_TRACE_OUT=DIR/trace.json` for `record`, and copies the trace file for `attach`. |
 | `PERF`, `FLAMEGRAPH`, `FREQ`, `PYTHON` | `tools/profile.sh` | The perf binary, the FlameGraph directory, the sample rate, and the python3 of the converter. |
+| `BACKEND`, `FLAGS`, `FLAVOR`, `CELL`, `PROFILE_DIR`, `ZIG` | `tools/profile.sh all` | The ops backend, more `zig build` flags, the flavor, the cell name, the profile root, and the zig binary. |
 
 ## Read the results
 

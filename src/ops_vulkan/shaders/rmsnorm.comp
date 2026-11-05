@@ -1,27 +1,58 @@
-// Root-mean-square normalization over one row, the norm that wraps the attention
-// block and the FFN block of every layer both families run:
+// rmsnorm: y[i] = x[i] / sqrt(mean(x^2) + eps) * w[i], the root-mean-square norm of one row.
 //
-//   y[i] = x[i] / sqrt(mean(x^2) + eps) * w[i]   for i in 0..d
+// What
+//   The norm wraps the attention block and the FFN block of every layer both families run.
+//   One workgroup handles the whole vector. `rmsnorm_batch.comp` runs the same math per row.
 //
-//   binding 0  readonly  f32 x[d]
-//   binding 1  readonly  f32 w[d]
-//   binding 2  writeonly f32 y[d]
-//   push       uint d, float eps
+// Math
+//   Lane l sums the squares of its strided subset. A tree then folds the 256 partials:
 //
-// A single workgroup of 256 lanes handles the whole vector, which covers every
-// hidden dim the engine sees (576, 2048, 4096). The work is two cooperative
-// passes over d with an LDS reduction between them. Pass 1 strides each lane
-// across d by 256 to accumulate its own sum of squares, and the 256 partials then
-// tree-reduce to one in LDS. Every lane reads that total back and computes
-// inv_rms locally, because an LDS broadcast costs less than a subgroupBroadcast
-// or another barrier. Pass 2 strides the lanes across d again to write y.
+//     partial[l] = sum_{i < d, i % 256 = l} x[i]^2
+//     partial[l] = partial[l] + partial[l + k]    for l < k, with k = 128, 64, .. 1
+//     inv_rms    = 1 / sqrt(partial[0] / d + eps)
+//     y[i]       = x[i] * inv_rms * w[i]
 //
-// The tree-reduce sums in a different order than the sequential scalar sum of the
-// CPU reference, so the result is not bit-exact. The lane partial carries
-// `precise` so that `glslc -O` cannot fuse `sum_sq += v * v` into an fma, which
-// changes the rounding and widens the gap.
+//   A positive eps keeps the root above zero on an all-zero row.
 //
-// The Zig wrapper `Rmsnorm` declares `.relative = 5e-5`.
+// Schedule
+//   grid       (1, 1, 1)
+//   workgroup  256 lanes. The one workgroup owns the whole vector of d elements.
+//   lane       Lane l owns the elements i = l, l + 256, l + 512, and so on below d.
+//
+//     rung k = 128  partial[0 .. 127] += partial[128 .. 255]
+//     rung k = 64   partial[0 .. 63]  += partial[64 .. 127]
+//     ...
+//     rung k = 1    partial[0]        += partial[1]
+//
+//     pass 1  squares  each lane strides across d and writes its sum of squares to `partial`
+//     pass 2  tree     8 rungs, each followed by a barrier, fold `partial` into partial[0]
+//     pass 3  write    each lane reads the total, computes inv_rms, and strides to write y
+//
+// Memory
+//   The array holds one partial per lane. The driver limit is 32 KiB.
+//
+//     partial  [256] f32  1 KiB  sum of squares of each lane
+//
+// Hardware
+//   Waves: 256 lanes are 8 wave32 waves. The lanes stride, so one workgroup covers every hidden
+//   dim the engine sees (576, 2048, 4096).
+//   Tails: a lane with l >= d sums nothing, and it still reaches every barrier.
+//   Pass 1: the lanes of a wave read adjacent elements of x, so the loads coalesce.
+//   Pass 3: every lane reads the total back from LDS, because an LDS broadcast costs less than a
+//   subgroupBroadcast or another barrier.
+//
+// Numerics
+//   Tolerance: `Rmsnorm` declares `.relative = 5e-5`. The tree sums in a different order than the
+//   sequential sum of the CPU reference, so the result is not bit-exact. The lane partial carries
+//   `precise`, so the device compiler cannot fuse `sum_sq += v * v` into an fma. A fused add
+//   changes the rounding and widens the gap. A run keeps one order: i ascending in a lane, then
+//   the rungs from k = 128 to k = 1.
+//
+// Bindings
+//   0     readonly   f32  x[d]
+//   1     readonly   f32  w[d]
+//   2     writeonly  f32  y[d]
+//   push  uint d, float eps
 
 #version 450
 
@@ -59,9 +90,11 @@ void main() {
         precise float v = x_buf.data[i];
         sum_sq += v * v;
     }
+
     partial[local] = sum_sq;
     barrier();
 
+    // Pass 2: fold the partials into partial[0], one rung per power of two.
     if (local < 128u) partial[local] += partial[local + 128u];
     barrier();
     if (local < 64u) partial[local] += partial[local + 64u];
@@ -79,10 +112,10 @@ void main() {
     if (local < 1u) partial[local] += partial[local + 1u];
     barrier();
 
+    // Pass 3: every lane reads the total, computes `inv_rms`, and writes its elements of y.
     float total_sum_sq = partial[0];
     float inv_rms = 1.0 / sqrt(total_sum_sq / float(d) + params.eps);
 
-    // Pass 2: write y cooperatively.
     for (uint i = local; i < d; i += 256u) {
         y_buf.data[i] = x_buf.data[i] * inv_rms * w_buf.data[i];
     }

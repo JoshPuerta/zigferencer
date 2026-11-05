@@ -119,6 +119,18 @@ pub const Client = struct {
         WriteFailed,
     } || zmtp.Error;
 
+    /// A send fails only on the socket. `writer.err` holds the cause.
+    pub const SendError = Io.Writer.Error;
+
+    /// `error.TextTooLong` is a text past the bound of one `generate` frame.
+    pub const GenerateError = SendError || error{TextTooLong};
+
+    /// `error.ServerError` is a refusal, with the reason in `last_error`.
+    pub const CollectError = NextError || error{ ServerError, UnexpectedReply };
+
+    /// The errors of a call that sends one request and waits for its reply.
+    pub const ReplyError = SendError || CollectError;
+
     pub fn connectTcp(
         gpa: Allocator,
         io: Io,
@@ -243,7 +255,7 @@ pub const Client = struct {
     }
 
     /// Send one client message. This returns the request id the message carried.
-    pub fn send(self: *Client, msg: protocol.ClientMsg, session_id: u32) !u32 {
+    pub fn send(self: *Client, msg: protocol.ClientMsg, session_id: u32) SendError!u32 {
         const request_id = self.next_request_id;
         self.next_request_id += 1;
         const body = self.frame_buf[zmtp_head_bytes..];
@@ -322,7 +334,7 @@ pub const Client = struct {
         }
     };
 
-    pub fn hello(self: *Client) !HelloInfo {
+    pub fn hello(self: *Client) ReplyError!HelloInfo {
         _ = try self.send(.hello, 0);
         const ev = try self.next();
         if (self.recordErr(ev.msg)) return error.ServerError;
@@ -339,7 +351,7 @@ pub const Client = struct {
         uptime_ms: u64,
     };
 
-    pub fn stats(self: *Client) !Stats {
+    pub fn stats(self: *Client) ReplyError!Stats {
         _ = try self.send(.stats, 0);
         const ev = try self.next();
         if (self.recordErr(ev.msg)) return error.ServerError;
@@ -348,7 +360,7 @@ pub const Client = struct {
         return statsFrom(ev.msg.stats_ack);
     }
 
-    pub fn ping(self: *Client) !void {
+    pub fn ping(self: *Client) ReplyError!void {
         _ = try self.send(.ping, 0);
         const ev = try self.next();
         if (self.recordErr(ev.msg)) return error.ServerError;
@@ -360,7 +372,11 @@ pub const Client = struct {
 
     /// Opens a session (system prompt prefilled server-side). Returns its id.
     /// A refusal is `error.ServerError` with the reason in `last_error`.
-    pub fn openSession(self: *Client, system_prompt: []const u8, sampling: protocol.Sampling) !u32 {
+    pub fn openSession(
+        self: *Client,
+        system_prompt: []const u8,
+        sampling: protocol.Sampling,
+    ) ReplyError!u32 {
         return (try self.openSessionInfo(system_prompt, sampling)).id;
     }
 
@@ -369,7 +385,7 @@ pub const Client = struct {
         self: *Client,
         system_prompt: []const u8,
         sampling: protocol.Sampling,
-    ) !Opened {
+    ) ReplyError!Opened {
         _ = try self.send(
             .{ .session_open = .{ .sampling = sampling, .system_prompt = system_prompt } },
             0,
@@ -384,12 +400,20 @@ pub const Client = struct {
     /// Fork an open session server-side: shared system prompt + conversation
     /// so far, its own sampling and seed. Returns the new session's id. A
     /// refusal is `error.ServerError` with the reason in `last_error`.
-    pub fn cloneSession(self: *Client, source_id: u32, sampling: protocol.Sampling) !u32 {
+    pub fn cloneSession(
+        self: *Client,
+        source_id: u32,
+        sampling: protocol.Sampling,
+    ) ReplyError!u32 {
         return (try self.cloneSessionInfo(source_id, sampling)).id;
     }
 
     /// `cloneSession` with the `kv_pos` of `session_opened` too.
-    pub fn cloneSessionInfo(self: *Client, source_id: u32, sampling: protocol.Sampling) !Opened {
+    pub fn cloneSessionInfo(
+        self: *Client,
+        source_id: u32,
+        sampling: protocol.Sampling,
+    ) ReplyError!Opened {
         _ = try self.send(.{ .session_clone = .{ .sampling = sampling } }, source_id);
         const ev = try self.next();
         if (self.recordErr(ev.msg)) return error.ServerError;
@@ -401,7 +425,7 @@ pub const Client = struct {
     /// Close a session and wait for `session_closed`. The server closes a
     /// session mid-turn without a `done`. The frames it queued for that turn
     /// arrive first, and this call skips them.
-    pub fn closeSession(self: *Client, session_id: u32) !void {
+    pub fn closeSession(self: *Client, session_id: u32) ReplyError!void {
         _ = try self.send(.session_close, session_id);
         while (true) {
             const ev = try self.next();
@@ -423,7 +447,11 @@ pub const Client = struct {
     /// bytes of records. Returns the position after each pair. A refusal is
     /// `error.ServerError` with the reason in `last_error`. A `turn_too_long`
     /// refusal fed no pair.
-    pub fn append(self: *Client, session_id: u32, pairs: []const protocol.Pair) !protocol.Appended {
+    pub fn append(
+        self: *Client,
+        session_id: u32,
+        pairs: []const protocol.Pair,
+    ) ReplyError!protocol.Appended {
         const request_id = try self.sendAppend(session_id, pairs);
         const ev = try self.next();
         if (self.recordErr(ev.msg)) return error.ServerError;
@@ -435,7 +463,11 @@ pub const Client = struct {
 
     /// Send kept pairs and return the request id. The caller reads the
     /// `appended` or `err` reply through `next`. The bounds of `append` hold.
-    pub fn sendAppend(self: *Client, session_id: u32, pairs: []const protocol.Pair) !u32 {
+    pub fn sendAppend(
+        self: *Client,
+        session_id: u32,
+        pairs: []const protocol.Pair,
+    ) SendError!u32 {
         std.debug.assert(pairs.len >= 1);
         std.debug.assert(pairs.len <= limits.max_append_pairs);
         std.debug.assert(protocol.appendPairsBytes(pairs) <= protocol.append_pairs_bytes_max);
@@ -453,7 +485,7 @@ pub const Client = struct {
         text: []const u8,
         max_tokens: u32,
         sampling: ?protocol.Sampling,
-    ) !u32 {
+    ) GenerateError!u32 {
         return self.generateWith(
             session_id,
             text,
@@ -481,7 +513,12 @@ pub const Client = struct {
     /// `generate` with every per-turn field of the wire. A text past
     /// `protocol.generate_text_bytes_max` is `error.TextTooLong`, and no
     /// frame goes out.
-    pub fn generateWith(self: *Client, session_id: u32, text: []const u8, opts: TurnOptions) !u32 {
+    pub fn generateWith(
+        self: *Client,
+        session_id: u32,
+        text: []const u8,
+        opts: TurnOptions,
+    ) GenerateError!u32 {
         std.debug.assert(opts.max_tokens > 0);
 
         if (opts.think_budget) |b| std.debug.assert(b <= limits.max_model_ctx);
@@ -507,7 +544,7 @@ pub const Client = struct {
     /// the token to resume on a new connection. Each keep issues a new
     /// token, and the old one opens nothing. A refusal is
     /// `error.ServerError` with the reason in `last_error`.
-    pub fn keepSession(self: *Client, session_id: u32, ttl_ms: u32) !Kept {
+    pub fn keepSession(self: *Client, session_id: u32, ttl_ms: u32) ReplyError!Kept {
         const request_id = try self.send(.{ .session_keep = .{ .ttl_ms = ttl_ms } }, session_id);
         const ev = try self.replyTo(request_id);
         if (self.recordErr(ev.msg)) return error.ServerError;
@@ -525,7 +562,7 @@ pub const Client = struct {
     /// after a resume. A refusal is `error.ServerError` with the reason in
     /// `last_error`: `unknown_session` for an unknown, rotated, or expired
     /// token.
-    pub fn resumeSession(self: *Client, token: protocol.Token) !ResumedSession {
+    pub fn resumeSession(self: *Client, token: protocol.Token) ReplyError!ResumedSession {
         const request_id = try self.send(.{ .session_resume = .{ .token = token } }, 0);
         const ev = try self.replyTo(request_id);
         if (self.recordErr(ev.msg)) return error.ServerError;
@@ -553,7 +590,7 @@ pub const Client = struct {
     /// `generate`, unless the turn ends first. A cancel on an idle session
     /// produces no frame, so a turn of that session must be in flight. An
     /// unknown session produces an `err` frame under the returned request id.
-    pub fn cancel(self: *Client, session_id: u32) !u32 {
+    pub fn cancel(self: *Client, session_id: u32) SendError!u32 {
         return self.send(.cancel, session_id);
     }
 
@@ -581,7 +618,7 @@ pub const Client = struct {
     /// `n_tokens` and `text_total` are the true totals. Returns on `done`.
     /// The text of the end-of-sequence token is not copied once `hello` has
     /// run, and its id still lands in `ids_out`.
-    pub fn collectTurn(self: *Client, ids_out: []u32, text_out: []u8) !Turn {
+    pub fn collectTurn(self: *Client, ids_out: []u32, text_out: []u8) CollectError!Turn {
         return self.collectTurnWith(ids_out, text_out, NoTokenHook{});
     }
 
@@ -589,7 +626,12 @@ pub const Client = struct {
     /// channel, text)` runs once for each token frame, in order, the
     /// end-of-sequence frame included, so the caller decides what to do with
     /// it. The text borrows the payload buffer until the hook returns.
-    pub fn collectTurnWith(self: *Client, ids_out: []u32, text_out: []u8, on_token: anytype) !Turn {
+    pub fn collectTurnWith(
+        self: *Client,
+        ids_out: []u32,
+        text_out: []u8,
+        on_token: anytype,
+    ) CollectError!Turn {
         var n_tokens: usize = 0;
         var text_len: usize = 0;
         var text_total: usize = 0;
@@ -635,7 +677,7 @@ pub const Client = struct {
     /// Ask the server to exit. This waits for the ack. A server that does not
     /// allow a wire shutdown answers `err{forbidden}` under this request id,
     /// which becomes `error.ServerError` with the reason in `last_error`.
-    pub fn shutdown(self: *Client) !void {
+    pub fn shutdown(self: *Client) ReplyError!void {
         const request_id = try self.send(.shutdown, 0);
         while (true) {
             const ev = try self.next();
@@ -845,6 +887,23 @@ test "collectTurnWith: the hook sees every token frame in order, the end-of-sequ
     try std.testing.expectEqual(turn.text_len, turn.text_total);
     try std.testing.expectEqual(@as(u32, 5), turn.gen_tokens);
     try std.testing.expectEqual(@as(u32, 1), turn.reasoning_tokens);
+}
+
+test "the public methods name their error sets" {
+    const Row = struct { f: type, set: type };
+    const rows = [_]Row{
+        .{ .f = @TypeOf(Client.send), .set = Client.SendError },
+        .{ .f = @TypeOf(Client.cancel), .set = Client.SendError },
+        .{ .f = @TypeOf(Client.generate), .set = Client.GenerateError },
+        .{ .f = @TypeOf(Client.hello), .set = Client.ReplyError },
+        .{ .f = @TypeOf(Client.closeSession), .set = Client.ReplyError },
+        .{ .f = @TypeOf(Client.shutdown), .set = Client.ReplyError },
+        .{ .f = @TypeOf(Client.collectTurn), .set = Client.CollectError },
+    };
+    comptime for (rows) |row| {
+        const returned = @typeInfo(row.f).@"fn".return_type.?;
+        std.debug.assert(@typeInfo(returned).error_union.error_set == row.set);
+    };
 }
 
 test "generateWith: a text past the frame bound is refused before any frame goes out" {

@@ -1,22 +1,43 @@
-// RoPE over every head of one token in a single dispatch, indexed by
-// (head, pair). The rotation is the one in `rope.comp`, which holds the
-// style_norm pairing and the ff freq divisors. This variant exists to collapse
-// the per-head dispatch loop, tens of dispatches per layer, into one dispatch.
-// RoPE does little arithmetic, so dispatch overhead dominates its GPU cost, and
-// fusing the heads amortizes that overhead.
+// rope_multi: the rotation of `rope.comp` over every head of one token in one dispatch.
 //
-//   binding 0  readwrite f32 x[n_heads * head_dim]
-//   binding 1  readonly  f32 ff[rope_dim/2]
-//   push       uint pos, uint head_dim, uint rope_dim, float freq_base,
-//              uint style_norm
+// What
+//   This variant collapses the per-head dispatch loop, tens of dispatches per layer, into one
+//   dispatch. RoPE does little arithmetic, so dispatch overhead dominates its GPU cost, and fusing
+//   the heads amortizes that overhead. `rope.comp` holds the style_norm pairing and the `ff`
+//   frequency divisors.
 //
-// The dispatch grid is (ceil((rope_dim/2) / 64), n_heads, 1). gl_WorkGroupID.y is
-// the head and gl_GlobalInvocationID.x is the pair index inside the leading
-// rope_dim/2 dims of that head.
+// Math
+//   Pair i of head `head` takes the rotation of `rope.comp` at an offset:
 //
-// GPU `pow`, `cos`, and `sin` round differently from the CPU intrinsics, so the
-// result is not bit-exact. The Zig wrapper `RopeMulti` declares
-// `.relative = 1e-5`.
+//     base  = head * head_dim
+//     angle = pos * freq_base^(-2i / rope_dim) / ff[i]
+//     ia    = base + a, ib = base + b, with a and b from the pairing of `rope.comp`
+//     (x[ia], x[ib]) = (x[ia] cos - x[ib] sin, x[ia] sin + x[ib] cos)
+//
+// Schedule
+//   grid       (ceil((rope_dim / 2) / 64), n_heads, 1)
+//   workgroup  64 lanes. Workgroup (g, head) owns pair block g of one head.
+//   lane       Lane l owns pair i = g * 64 + l, which is gl_GlobalInvocationID.x.
+//
+//                 g = 0         g = 1
+//               +-------------+---------------+-----+
+//     head 0    | i = 0 .. 63 | i = 64 .. 127 | ... |
+//               +-------------+---------------+-----+
+//     head 1    | i = 0 .. 63 | i = 64 .. 127 | ... |
+//               +-------------+---------------+-----+
+//
+// Hardware
+//   Waves: 64 lanes are 2 wave32 waves. A lane past the last pair returns, and no barrier follows.
+//
+// Numerics
+//   Tolerance: `RopeMulti` declares `.relative = 1e-5`. The GPU `pow`, `cos`, and `sin` round
+//   differently from the CPU intrinsics. The kernel has no reduction, so no summation order
+//   applies.
+//
+// Bindings
+//   0     readwrite  f32  x[n_heads * head_dim]
+//   1     readonly   f32  ff[rope_dim / 2]
+//   push  uint pos, head_dim, rope_dim, float freq_base, uint style_norm
 
 #version 450
 

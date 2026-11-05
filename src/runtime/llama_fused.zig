@@ -51,6 +51,7 @@ const kv_index = @import("../core/kv_index.zig");
 const attn_split = @import("../core/attn_split.zig");
 const attn_record = @import("attn_record.zig");
 const step_row = @import("step_row.zig");
+const linear_dispatch = @import("linear_dispatch.zig");
 const tensor_lookup = @import("tensor_lookup.zig");
 const gpu_profile = @import("gpu_profile.zig");
 const core_log = @import("../core/log.zig");
@@ -333,6 +334,9 @@ pub const LlamaFusedRunner = struct {
 
     // -- weight discovery ---------------------------------------------------
 
+    /// What a lookup of the weights of a loaded model returns.
+    pub const FindError = Allocator.Error || error{ MissingTensor, UnsupportedWeightDtype };
+
     pub const InitError = error{
         OutOfMemory,
         NoSuitableMemoryType,
@@ -368,8 +372,9 @@ pub const LlamaFusedRunner = struct {
     pub fn handlesFromLoaded(
         gpa: Allocator,
         loaded: *const loader.Loaded,
-    ) (Allocator.Error || error{MissingTensor})!FoundWeights {
+    ) FindError!FoundWeights {
         const c = loaded.card;
+        try linear_dispatch.requireWeights(loaded.tensors, c.n_layers);
         const embed = findTensor(
             loaded.tensors,
             "token_embd.weight",
@@ -522,7 +527,7 @@ pub const LlamaFusedRunner = struct {
     pub fn weightsVramBytesFromLoaded(
         gpa: Allocator,
         loaded: *const loader.Loaded,
-    ) (Allocator.Error || error{MissingTensor})!u64 {
+    ) FindError!u64 {
         const found = try handlesFromLoaded(gpa, loaded);
         defer found.deinit(gpa);
 
@@ -551,7 +556,7 @@ pub const LlamaFusedRunner = struct {
         vram_free: u64,
         logit_rows: u32,
         kv_dtype: dtype.KvDtype,
-    ) (Allocator.Error || error{MissingTensor})!kv_budget.Caps {
+    ) FindError!kv_budget.Caps {
         std.debug.assert(ceiling >= 1);
         std.debug.assert(ceiling <= loaded.card.context_length);
 

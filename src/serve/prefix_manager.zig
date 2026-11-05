@@ -263,7 +263,7 @@ pub const PrefixManager = struct {
             logits = logits_buf;
         }
 
-        const admitted = cache.admit(key, tokens, buf, logits, prefill_ns, restore_ns) catch false;
+        const admitted = cache.admit(key, tokens, buf, logits, prefill_ns, restore_ns);
         if (admitted) {
             self.inserts += 1;
             if (cache.last_admit_disk) {

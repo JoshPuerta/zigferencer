@@ -1,49 +1,83 @@
-// Merge pass of decode attention for a deep row. It combines the partial
-// records that `attention_split.comp` wrote for one row into the attention
-// output of each query head:
+// attention_merge: the merge pass of attention, for a decode or prefill row past ATTN_SPLIT.
 //
-//   M   = max_j m_j
-//   w_j = exp(m_j - M)
-//   L   = sum_j l_j * w_j
-//   out = (sum_j a_j * w_j) / L
+// What
+//   The pass combines the partial records that `attention_split.comp` wrote for one row into the
+//   attention output of each query head. The records are f32 at either KV element type, so one
+//   variant serves both.
 //
-// The grid is (n_heads, ceil(head_dim / 64), 1). Workgroup (h, c) serves the
-// elements [c * 64, c * 64 + 64) of head h, one element per lane. So each
-// lane runs one chain over j, and a head of 256 elements fills four
-// workgroups.
+// Math
+//   Each record holds m_j, l_j, and the vector a_j of split j, for j in [0, n_splits):
 //
-// The workgroup computes the weights w_j in parallel, one exp per split, into
-// an LDS tile of W_TILE splits. Each chain then reads w_j from the tile. A
-// split count above W_TILE walks the tiles in ascending order, and every
-// chain keeps its accumulator across the tiles. So no host bound on the split
-// count reaches the LDS size.
+//     M   = max_j m_j
+//     w_j = exp(m_j - M)
+//     L   = sum_j l_j * w_j
+//     out = (sum_j a_j * w_j) / L
 //
-// The split order is the reproducibility rule. Every sum over the splits runs
-// in ascending j, in one lane, with a `precise` accumulator. Lane 0 of each
-// workgroup runs the L chain, and every workgroup of a head runs the same
-// chain on the same inputs. There is no atomic and no tree over j. So one
-// t_len gives one result bit for bit at any window, batch composition, and
-// slot, and a repeated run gives the same bytes. The max needs no order,
-// because max is exact. Each w_j is the `precise` exp of the same difference
-// that an inline exp in the chain takes, so the tile changes no bit.
+//   Every split holds at least one position, so each l_j is at least 1. The split with m_j = M
+//   adds l_j * exp(0), so L is at least 1 and the division never meets a zero.
 //
-// Every split holds at least one position, so each l_j is at least 1. The split
-// with m_j = M adds l_j * exp(0), so L is at least 1, and the division never
-// meets a zero.
+// Schedule
+//   grid       (n_heads, C, 1), with C = ceil(head_dim / 64)
+//   workgroup  64 lanes. Workgroup (h, c) serves elements [c * 64, c * 64 + 64) of head h.
+//   lane       Lane l owns output element d = c * 64 + l and runs one chain over j.
 //
-//   binding 0  readonly  f32 partials[rows * n_heads * max_splits * (head_dim + 2)]
-//   binding 1  writeonly f32 out[n_rows_total * n_heads * head_dim]
-//   push       uint n_heads, head_dim, t_len, scratch_row, max_splits, out_row
+//     n_splits = ceil(t_len / ATTN_SPLIT)
+//     t0, t_n  = first split and split count of the current tile, t_n <= W_TILE
+//     live     = d < head_dim
 //
-// The record of (scratch_row, h, j) has the layout that `attention_split.comp`
-// states: acc[head_dim], then m, then l. ATTN_SPLIT, the build define of the
-// split pass, gives n_splits = ceil(t_len / ATTN_SPLIT). The output row is
-// out_row. The records are f32 at either KV element type, so one variant serves
-// both.
+//                 h = 0     h = 1         h = n_heads - 1
+//               +---------+---------+-----+---------------+
+//     c = 0     | (0, 0)  | (1, 0)  | ... |               |   elements 0 .. 63
+//     c = 1     | (0, 1)  | (1, 1)  | ... |               |   elements 64 .. 127
+//       ...     |         |         | ... |               |
+//     c = C - 1 |         |         | ... |               |   the last chunk can be partial
+//               +---------+---------+-----+---------------+
 //
-// The merge sums the splits in another order than the CPU reference, so the
-// result is not bit-exact. The Zig wrapper `AttentionSplit` declares
-// `.relative = 1e-3` for both passes.
+//     pass 1  max      lane l folds m_j at splits l + 64 i, then each lane scans the 64 slots
+//     pass 2  tiles    lanes fill w_j, then lane 0 runs L and each live lane runs its element
+//     pass 3  output   lane 0 publishes L, then each live lane writes acc / L
+//
+//   A head of 256 elements fills four workgroups. A split count above W_TILE walks the tiles in
+//   ascending order, and every chain keeps its accumulator across the tiles.
+//
+// Memory
+//   LDS at W_TILE = 256. The driver limit is 32 KiB.
+//
+//     s_max    [64] f32       256 B   one partial of M per lane, [l]
+//     s_w      [W_TILE] f32   1 KiB   one weight per split of a tile, [k]
+//     s_big_l  f32            4 B     L, for every lane
+//
+//   One tile covers a row of 256 * ATTN_SPLIT positions. No host bound on the split count
+//   reaches the LDS size, because the tile bounds it.
+//
+// Hardware
+//   Waves: 64 lanes are two wave32 waves.
+//   Pass 1: adjacent lanes read records head_dim + 2 elements apart, so the loads do not coalesce.
+//   Pass 2: the workgroup computes each w_j once, one exp per split, in parallel into LDS. Each
+//   chain then reads w_j from the tile, so no chain repeats an exp. Adjacent lanes touch adjacent
+//   elements of one record, so the chain reads coalesce.
+//   Tails: a lane with d >= head_dim stays in the walk for the barriers, and it writes nothing.
+//
+// Numerics
+//   Tolerance: `AttentionSplit` declares `.relative = 1e-3` for both passes. The merge sums the
+//   splits in another order than the CPU reference.
+//   Every sum over the splits runs in ascending j, in one lane, with a `precise` accumulator.
+//   Every workgroup of a head runs the same L chain on the same inputs in lane 0. No atomic and no
+//   tree run over j. So one t_len gives one result bit for bit at any window, batch composition,
+//   and slot, and a repeated run gives the same bytes. Max is exact and needs no order. Each w_j
+//   is the `precise` exp of the difference that an inline exp takes, so the tile changes no bit.
+//
+// Bindings
+//   0     readonly   f32  partials[rows * n_heads * max_splits * (head_dim + 2)]
+//   1     writeonly  f32  out[n_rows_total * n_heads * head_dim]
+//   push  uint n_heads, head_dim, t_len, scratch_row, max_splits, out_row
+//
+//   Record (scratch_row, h, j) has the layout that `attention_split.comp` states: acc[head_dim],
+//   then m, then l. The output row is out_row. The host records a shader barrier between the
+//   split pass of a row and this pass, and it passes the scratch_row and max_splits of that pass.
+//
+// Defines
+//   ATTN_SPLIT  positions of one split, from `limits.attn_split_len`. It gives n_splits.
 
 #version 450
 
@@ -52,8 +86,7 @@
 #error "ATTN_SPLIT must come from the build (limits.attn_split_len)"
 #endif
 
-// Splits per weight tile. The tile takes 1 KiB of LDS, and one tile covers a
-// row of 256 * ATTN_SPLIT positions.
+// Splits per weight tile.
 #define W_TILE 256u
 
 layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
@@ -76,7 +109,6 @@ layout(push_constant) uniform Params {
     uint out_row;
 } params;
 
-// -- state ------------------------------------------------------------------
 shared float s_max[64];
 shared float s_w[W_TILE];
 shared float s_big_l;
@@ -85,8 +117,8 @@ shared float s_big_l;
 void main() {
     uint h = gl_WorkGroupID.x;
     uint local = gl_LocalInvocationID.x;
-    // The guard is uniform over the workgroup, so every barrier below stays
-    // in uniform control flow.
+
+    // The guard is uniform over the workgroup, so every barrier stays in uniform control flow.
     if (h >= params.n_heads) return;
 
     uint head_dim = params.head_dim;
@@ -96,19 +128,24 @@ void main() {
     uint n_splits = (params.t_len + uint(ATTN_SPLIT) - 1u) / uint(ATTN_SPLIT);
     uint base = (params.scratch_row * params.n_heads + h) * params.max_splits * rec;
 
+    // Pass 1: M = max_j m_j, a lane partial and one scan of the 64 slots.
     float lane_m = -3.402823466e+38;
     for (uint j = local; j < n_splits; j += 64u) {
         lane_m = max(lane_m, part_buf.data[base + j * rec + head_dim]);
     }
+
     s_max[local] = lane_m;
     barrier();
+
     float big_m = s_max[0];
     for (uint i = 1u; i < 64u; ++i) {
         big_m = max(big_m, s_max[i]);
     }
 
+    // Pass 2: L and the element chain of this lane, one tile of weights at a time.
     precise float big_l = 0.0;
     precise float acc = 0.0;
+
     for (uint t0 = 0u; t0 < n_splits; t0 += W_TILE) {
         uint t_n = min(W_TILE, n_splits - t0);
         for (uint k = local; k < t_n; k += 64u) {
@@ -116,21 +153,27 @@ void main() {
             s_w[k] = w;
         }
         barrier();
+
         if (local == 0u) {
             for (uint k = 0u; k < t_n; ++k) {
                 big_l += part_buf.data[base + (t0 + k) * rec + head_dim + 1u] * s_w[k];
             }
         }
+
         if (live) {
             for (uint k = 0u; k < t_n; ++k) {
                 acc += part_buf.data[base + (t0 + k) * rec + d] * s_w[k];
             }
         }
+
         // The next tile overwrites s_w, so every chain must finish this one.
         barrier();
     }
+
+    // Pass 3: lane 0 publishes L, then each live lane writes its element.
     if (local == 0u) s_big_l = big_l;
     barrier();
+
     float inv_l = 1.0 / s_big_l;
 
     if (live) {

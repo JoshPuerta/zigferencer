@@ -5,7 +5,7 @@
 //! A stable hash across runs proves the forward pass is deterministic. A stable
 //! hash across binaries built with different `-Dops-backend` values is the
 //! cross-backend gate, because a backend that changes the tokens changed the math.
-//! `tools/bench_model_all.sh` drives that loop.
+//! `tools/gate.sh` drives that loop.
 //!
 //! This file checks the flags, loads the model, and picks one path. Each path owns
 //! its runner: `bench_model_host.zig` (CPU and per-op Vulkan), `bench_model_fused.zig`
@@ -154,7 +154,7 @@ fn refuseCpuProfile(io: std.Io, opt: common.Options) !void {
     if (!core_log.hot) {
         return args.fail(
             io,
-            "--profile-cpu-decode requires a hot-trace build (OPT=Debug or TRACE=1)",
+            "--profile-cpu-decode requires a hot-trace build (Debug or -Dtrace=true)",
             .{},
         );
     }

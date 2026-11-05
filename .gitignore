@@ -12,7 +12,6 @@ models/
 .idea/
 .DS_Store
 
-# Runtime artifacts: prompt-cache snapshots, log capture, bench sweep output.
+# Runtime artifacts: prompt-cache snapshots, log capture.
 .prompt_cache/
 *.log
-/bench_threads.jsonl

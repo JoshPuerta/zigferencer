@@ -79,8 +79,7 @@ storage, and f16 arithmetic. The kernels require a subgroup size of 32.
 | Tool | Needed for |
 | --- | --- |
 | GNU make, bash | the `Makefile` and `tools/*.sh` |
-| `curl` | `make demo-openai` and `make bench-openai` |
-| `python3` | `tools/bench_sweep_report.py` and the profiler |
+| `python3` | the profiler |
 | `libzmq5` | the ZMQ interop test, which skips without the library |
 | `perf`, the FlameGraph scripts | `make profile`, see [`docs/profiling.md`](docs/profiling.md) |
 | `lldb` or `gdb` | `make debug`, see [`docs/debugging.md`](docs/debugging.md) |
@@ -92,30 +91,24 @@ Install the requirements above first. A `Makefile` wraps the common `zig build` 
 on `PATH`, run `make <target> ZIG=/path/to/zig`.
 
 ```bash
-make build                                   # Debug build, fastest CPU backend the host supports
-make test                                    # unit tests, integration tests, and the format check
-make fetch MODEL=SmolLM2-135M-Instruct-Q8_0  # download a registered model (SmolLM2 is the small test model)
-make run   MODEL=SmolLM2-135M-Instruct-Q8_0 PROMPT="Tell me a joke" N=64
-make serve MODEL=SmolLM2-135M-Instruct-Q8_0 SESSIONS=4
-make info                                    # host CPU, RAM, SIMD, and the backends this build can run
-make debug                                   # Debug build for lldb or gdb, see docs/debugging.md
-make help                                    # every target and option
+make build   # ReleaseFast, the fastest CPU backend the host supports
+make test    # unit tests, integration tests, and the format check
+make help    # every target and variable
+
+zig-out/bin/zigferencer fetch SmolLM2-135M-Instruct-Q8_0  # download the small test model
+zig-out/bin/zigferencer run SmolLM2-135M-Instruct-Q8_0 --prompt "Tell me a joke" --max-tokens 64
+zig-out/bin/zigferencer serve SmolLM2-135M-Instruct-Q8_0 --port 8000 --max-sessions 4
+zig-out/bin/zigferencer client --connect 127.0.0.1:8000   # or any ZMQ DEALER socket
+zig-out/bin/zigferencer info  # host CPU, RAM, SIMD, and the backends this build can run
 ```
 
-The Makefile is a convenience only. These raw commands do the same work:
+`make build BACKEND=vulkan_fused` builds the GPU binary, and `make debug` builds for lldb or gdb.
+The Makefile is a convenience only: it prints each `zig build` command before it runs it. A bare
+`zig build` makes a Debug binary, so do not measure it.
 
-```bash
-zig build -Doptimize=ReleaseFast
-./zig-out/bin/zigferencer run SmolLM2-135M-Instruct-Q8_0 --prompt "Hello" --max-tokens 32
-./zig-out/bin/zigferencer serve SmolLM2-135M-Instruct-Q8_0 --port 8000
-./zig-out/bin/zigferencer client --connect 127.0.0.1:8000    # or any ZMQ DEALER socket
-zig build -Druntime=vulkan -Dops-backend=vulkan_fused        # GPU build
-```
-
-`zig build --help` lists every build option. `zigferencer --help` lists the
-commands. The benchmarks, the kernel checks, and the demo are in a second
-executable, `zigferencer-dev`. `zig build dev` installs it next to the first.
-Every `make` target that builds a binary installs both.
+`zig build --help` lists every build option. `zigferencer --help` lists the commands. The
+benchmarks, the kernel checks, and the demo are in a second executable, `zigferencer-dev`.
+`make build` installs both.
 
 ## Performance
 

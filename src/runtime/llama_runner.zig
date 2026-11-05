@@ -217,6 +217,7 @@ pub const LlamaRunner = struct {
         const c = loaded.card;
         std.debug.assert(n_layers >= 1);
         std.debug.assert(n_layers <= c.n_layers);
+        try linear_dispatch.requireWeights(loaded.tensors, n_layers);
         const embed = try findTensor(loaded.tensors, "token_embd.weight");
         const output_norm = try findTensor(loaded.tensors, "output_norm.weight");
         const output = findOptional(loaded.tensors, "output.weight") orelse embed;
@@ -434,7 +435,7 @@ pub const LlamaRunner = struct {
                 t_layer = core_log.now();
             }
 
-            try self.layerForward(layer, rows);
+            self.layerForward(layer, rows);
             if (live) {
                 log_layer.debug(
                     "layer {d}: {d} rows, {d:.2} ms",
@@ -466,7 +467,7 @@ pub const LlamaRunner = struct {
         // their batch-row offset, so the buffer needs `n_slots` rows and not
         // `max_rows`. `Sessions.advance` reads them back at the same compact
         // index.
-        try self.linearBatch(
+        self.linearBatch(
             self.x_norm[first * d .. rows.len * d],
             self.output.*,
             self.logits[0..],
@@ -480,7 +481,7 @@ pub const LlamaRunner = struct {
     /// any row attends. Consecutive rows of one slot (chunked prefill) therefore
     /// see exactly their causal prefix, no more. It is public so a composing
     /// runner can drive the layers itself.
-    pub fn layerForward(self: *LlamaRunner, layer: u32, rows: []const StepRow) Error!void {
+    pub fn layerForward(self: *LlamaRunner, layer: u32, rows: []const StepRow) void {
         const sp = span.beginHot(.layer_forward);
         defer sp.end();
 
@@ -504,15 +505,15 @@ pub const LlamaRunner = struct {
         }
 
         self.tEnd(t_an, .rmsnorm);
-        try self.linearBatch(self.x_norm[0 .. n * d], self.attn_q_w[layer].*, self.q, n, .qkv_proj);
-        try self.linearBatch(
+        self.linearBatch(self.x_norm[0 .. n * d], self.attn_q_w[layer].*, self.q, n, .qkv_proj);
+        self.linearBatch(
             self.x_norm[0 .. n * d],
             self.attn_k_w[layer].*,
             self.k_scratch,
             n,
             .qkv_proj,
         );
-        try self.linearBatch(
+        self.linearBatch(
             self.x_norm[0 .. n * d],
             self.attn_v_w[layer].*,
             self.v_scratch,
@@ -639,7 +640,7 @@ pub const LlamaRunner = struct {
         self.tEnd(t_attn, .attention);
 
         // Project + residual.
-        try self.linearBatch(
+        self.linearBatch(
             self.attn_out[0 .. n * qd],
             self.attn_o_w[layer].*,
             self.x_norm,
@@ -665,14 +666,14 @@ pub const LlamaRunner = struct {
         }
 
         self.tEnd(t_fn, .rmsnorm);
-        try self.linearBatch(
+        self.linearBatch(
             self.x_norm[0 .. n * d],
             self.ffn_gate_w[layer].*,
             self.ffn_gate,
             n,
             .gate_up_proj,
         );
-        try self.linearBatch(
+        self.linearBatch(
             self.x_norm[0 .. n * d],
             self.ffn_up_w[layer].*,
             self.ffn_up,
@@ -690,7 +691,7 @@ pub const LlamaRunner = struct {
         }
 
         self.tEnd(t_sg, .swiglu);
-        try self.linearBatch(
+        self.linearBatch(
             self.ffn_gate[0 .. n * fd],
             self.ffn_down_w[layer].*,
             self.ffn_down,
@@ -796,13 +797,13 @@ pub const LlamaRunner = struct {
         outs: []f32,
         batch: usize,
         cat: ProfileCat,
-    ) Error!void {
+    ) void {
         std.debug.assert(cat.isMatmul());
 
         const t0 = r.tBegin();
         defer r.tEnd(t0, cat);
 
-        return linear_dispatch.linearBatchDispatch(r.pool, r.policy, inputs, w, outs, batch);
+        linear_dispatch.linearBatchDispatch(r.pool, r.policy, inputs, w, outs, batch);
     }
 };
 

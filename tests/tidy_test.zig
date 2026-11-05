@@ -14,6 +14,7 @@
 //! 5. A file keeps its sections in the order `constants`, `types`, `state`,
 //!    `api`, `helpers`, `tests`. A function in `api` is public, a function in
 //!    `helpers` is private, and neither section declares a type.
+//! 6. Every script keeps the rules that tools/README.md states and a program can check.
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
@@ -36,7 +37,7 @@ const print_allowed = [_][]const u8{ "core/prop.zig", "core/test_fixtures.zig" }
 
 // -- types ------------------------------------------------------------------
 
-const Rule = enum { sleep, debug_print, braces, width, section };
+const Rule = enum { sleep, debug_print, braces, width, section, script };
 
 /// The sections in file order. Every label under `tests` counts as `tests`.
 const Section = enum { constants, types, state, api, helpers, tests };
@@ -297,6 +298,40 @@ fn checkTree(gpa: Allocator, root: []const u8, whole_file_is_test: bool) !void {
     }
 }
 
+/// The script rules of `tools/README.md` that a program can check: the width of every line, the
+/// strict mode of a bash script, and the `main` of a Python script.
+fn scriptViolation(path: []const u8, source: []const u8) ?Violation {
+    var line_no: usize = 0;
+    var lines = std.mem.splitScalar(u8, source, '\n');
+    while (lines.next()) |line| {
+        line_no += 1;
+        if (line.len > line_columns_max) return .{ .rule = .width, .line = line_no };
+    }
+
+    const bash = std.mem.startsWith(u8, source, "#!/usr/bin/env bash\n");
+    if (bash and std.mem.indexOf(u8, source, "\nset -euo pipefail\n") == null) {
+        return .{ .rule = .script, .line = 1 };
+    }
+
+    const python = std.mem.endsWith(u8, path, ".py");
+    if (python and std.mem.indexOf(u8, source, "\ndef main(") == null) {
+        return .{ .rule = .script, .line = 1 };
+    }
+
+    return null;
+}
+
+fn checkScript(gpa: Allocator, dir: std.Io.Dir, path: []const u8) !void {
+    const io = std.testing.io;
+    const source = try dir.readFileAlloc(io, path, gpa, .limited(max_file_bytes));
+    defer gpa.free(source);
+
+    if (scriptViolation(path, source)) |v| {
+        std.debug.print("tidy: {s}:{d} breaks rule {s}\n", .{ path, v.line, @tagName(v.rule) });
+        return error.TidyViolation;
+    }
+}
+
 // -- tests ------------------------------------------------------------------
 
 test "the scanner finds each rule and ignores comments, words, and test blocks" {
@@ -375,4 +410,45 @@ test "every source file keeps the shape rules" {
 test "no test sleeps and no non-test code prints" {
     try checkTree(std.testing.allocator, "tests", true);
     try checkTree(std.testing.allocator, "src", false);
+}
+
+test "the script rules find a long line, a missing strict mode, and a missing main" {
+    const long = "x" ** (line_columns_max + 1);
+    const Case = struct { path: []const u8, src: []const u8, want: ?Rule };
+    const cases = [_]Case{
+        .{ .path = "Makefile", .src = long ++ "\n", .want = .width },
+        .{ .path = "a.sh", .src = "#!/usr/bin/env bash\nset -euo pipefail\n", .want = null },
+        .{ .path = "a.sh", .src = "#!/usr/bin/env bash\nset -e\n", .want = .script },
+        .{ .path = "common.sh", .src = "note() { :; }\n", .want = null },
+        .{ .path = "a.py", .src = "#!/usr/bin/env python3\n\ndef main() -> int:\n", .want = null },
+        .{ .path = "a.py", .src = "#!/usr/bin/env python3\nprint(1)\n", .want = .script },
+    };
+    for (cases, 0..) |c, i| {
+        errdefer std.debug.print("tidy script case {d}\n", .{i});
+
+        const got = scriptViolation(c.path, c.src);
+        try std.testing.expectEqual(c.want, if (got) |v| v.rule else null);
+    }
+}
+
+test "every script and the Makefile keep the script rules" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    const cwd = std.Io.Dir.cwd();
+
+    try checkScript(gpa, cwd, "Makefile");
+
+    var dir = try cwd.openDir(io, "tools", .{ .iterate = true });
+    defer dir.close(io);
+
+    var walker = try dir.walk(gpa);
+    defer walker.deinit();
+
+    while (try walker.next(io)) |entry| {
+        if (entry.kind != .file) continue;
+        if (std.mem.endsWith(u8, entry.path, ".zig")) continue;
+        if (std.mem.endsWith(u8, entry.path, ".md")) continue;
+
+        try checkScript(gpa, dir, entry.path);
+    }
 }

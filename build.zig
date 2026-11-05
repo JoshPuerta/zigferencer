@@ -171,9 +171,10 @@ const ops_backend_help = "Op kernel backend. 'auto' (default) picks the stronges
     "OpRequires the target satisfies. 'naive' = scalar f32 reference. 'simd' = @Vector(8) " ++
     "AVX2+FMA path. The build fails if the target lacks AVX2.";
 
-const runtime_help = "Dispatch runtime. 'cpu' (default) = the ops/ variants alone. 'vulkan' = " ++
+const runtime_help = "Dispatch runtime. 'cpu' = the ops/ variants alone. 'vulkan' = " ++
     "also compile src/ops_vulkan/shaders/*.comp to SPIR-V with glslc, link libvulkan, and pull " ++
-    "vulkan-zig as a build dependency. It needs glslc on PATH and libvulkan-dev installed.";
+    "vulkan-zig as a build dependency. It needs glslc on PATH and libvulkan-dev installed. " ++
+    "The default is 'vulkan' for a GPU ops backend, otherwise 'cpu'.";
 
 const attn_kernel_help = "GPU attention kernel set. 'split' (default) = the resident kernels " ++
     "inside one split and the split and merge passes past it. A CPU build ignores it.";
@@ -260,6 +261,7 @@ pub fn build(b: *std.Build) void {
 
     addBench(b, config, modules);
     addSimdProbe(b, config, modules);
+    addShaderLint(b, config);
 }
 
 // -- helpers: options -------------------------------------------------------
@@ -268,14 +270,20 @@ pub fn build(b: *std.Build) void {
 fn readConfig(b: *std.Build) Config {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
-    const requested_backend = b.option(OpsBackendOption, "ops-backend", ops_backend_help);
-    const runtime = b.option(RuntimeOption, "runtime", runtime_help) orelse .cpu;
+    const requested_backend =
+        b.option(OpsBackendOption, "ops-backend", ops_backend_help) orelse .auto;
+    const requested_runtime = b.option(RuntimeOption, "runtime", runtime_help);
+    // A GPU backend cannot run without the Vulkan runtime, so it selects the runtime by itself.
+    const runtime: RuntimeOption = requested_runtime orelse switch (requested_backend) {
+        .vulkan, .vulkan_fused => .vulkan,
+        else => .cpu,
+    };
 
     return .{
         .target = target,
         .optimize = optimize,
         .runtime = runtime,
-        .ops_backend = resolveOpsBackend(requested_backend orelse .auto, target, runtime),
+        .ops_backend = resolveOpsBackend(requested_backend, target, runtime),
         .attn_kernel = b.option(AttnKernelOption, "attn-kernel", attn_kernel_help) orelse .split,
         .vk_registry = b.option([]const u8, "vk-registry", vk_registry_help) orelse
             "/usr/share/vulkan/registry/vk.xml",
@@ -493,6 +501,19 @@ fn addTests(b: *std.Build, config: Config, modules: Modules) *Step {
     test_step.dependOn(&run_unit_tests.step);
     test_build_step.dependOn(&unit_tests.step);
     test_unit_step.dependOn(&run_unit_tests.step);
+
+    const lint_tests = b.addTest(.{
+        .name = "shader_lint",
+        .root_module = createLintModule(b, config.target, config.optimize),
+        .filters = config.test_filters,
+        .use_llvm = config.use_llvm,
+    });
+    binaries.append(b.allocator, lint_tests) catch @panic("OOM");
+
+    const run_lint_tests = addTestRun(b, lint_tests);
+    test_step.dependOn(&run_lint_tests.step);
+    test_build_step.dependOn(&lint_tests.step);
+    test_unit_step.dependOn(&run_lint_tests.step);
 
     requireListed(b, &all_integration_tests);
 
@@ -742,8 +763,20 @@ fn wireVulkan(b: *std.Build, exe_mod: *Module, vk_registry: []const u8) void {
 }
 
 fn addShaderImport(b: *std.Build, exe_mod: *Module, shader: Shader) void {
+    const import_name = b.fmt("{s}.spv", .{shader.name});
+    const spv = addGlslc(b, shader, false);
+    exe_mod.addAnonymousImport(import_name, .{ .root_source_file = spv });
+}
+
+/// Compile one shader row and return the blob. The release build passes `strict = false`, because
+/// a newer `glslc` can add a warning and the build must not depend on that. The lint passes true.
+fn addGlslc(b: *std.Build, shader: Shader, strict: bool) std.Build.LazyPath {
     // `--target-env=vulkan1.2` keeps the output within the version the target driver advertises.
     const glslc = b.addSystemCommand(&.{ "glslc", "--target-env=vulkan1.2", "-O" });
+    if (strict) {
+        glslc.addArg("-Werror");
+    }
+
     for (shader.defines) |define| {
         glslc.addArg(b.fmt("-D{s}", .{define}));
     }
@@ -752,7 +785,48 @@ fn addShaderImport(b: *std.Build, exe_mod: *Module, shader: Shader) void {
     glslc.addFileArg(b.path(b.fmt("src/ops_vulkan/shaders/{s}.comp", .{source})));
     glslc.addArg("-o");
 
-    const import_name = b.fmt("{s}.spv", .{shader.name});
-    const spv = glslc.addOutputFileArg(import_name);
-    exe_mod.addAnonymousImport(import_name, .{ .root_source_file = spv });
+    return glslc.addOutputFileArg(b.fmt("{s}.spv", .{shader.name}));
+}
+
+// -- helpers: shader lint ---------------------------------------------------
+
+fn createLintModule(
+    b: *std.Build,
+    target: std.Build.ResolvedTarget,
+    optimize: std.builtin.OptimizeMode,
+) *Module {
+    return b.createModule(.{
+        .root_source_file = b.path("tools/shader_lint.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+}
+
+/// `lint-shaders` runs the style rules of `tools/shader_lint.zig` and needs no Vulkan SDK. Under
+/// `-Druntime=vulkan` it also compiles each shader with `glslc -Werror` and checks the blob with
+/// `spirv-val`. The step names the shader directory and `kernels.zig` as inputs, so `--watch` runs
+/// it again on a save.
+fn addShaderLint(b: *std.Build, config: Config) void {
+    const lint_step = b.step(
+        "lint-shaders",
+        "Check the shader rules (with -Druntime=vulkan: also glslc -Werror and spirv-val)",
+    );
+    const lint_exe = b.addExecutable(.{
+        .name = "shader-lint",
+        .root_module = createLintModule(b, b.graph.host, .ReleaseSafe),
+    });
+
+    const run_lint = b.addRunArtifact(lint_exe);
+    run_lint.addDirectoryArg(b.path("src/ops_vulkan/shaders"));
+    run_lint.addFileArg(b.path("src/ops_vulkan/kernels.zig"));
+    run_lint.expectExitCode(0);
+    lint_step.dependOn(&run_lint.step);
+
+    if (config.runtime != .vulkan) return;
+
+    for (vulkan_shaders) |shader| {
+        const spirv_val = b.addSystemCommand(&.{ "spirv-val", "--target-env", "vulkan1.2" });
+        spirv_val.addFileArg(addGlslc(b, shader, true));
+        lint_step.dependOn(&spirv_val.step);
+    }
 }

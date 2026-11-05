@@ -310,7 +310,7 @@ pub const QwenHybridRunner = struct {
 
         var l: u32 = 0;
         while (l < self.split) : (l += 1) {
-            try self.prefix.layerForward(l, rows);
+            self.prefix.layerForward(l, rows);
         }
     }
 

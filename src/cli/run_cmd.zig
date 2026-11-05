@@ -457,7 +457,7 @@ fn runHybrid(
     log.info("initializing GPU: context + suffix weight upload to VRAM...", .{});
     const t_init = Io.Clock.Timestamp.now(ctx.io, .awake);
     var ledger_buffer: [kv_budget.placement_ledger_text_max]u8 = undefined;
-    log.info("{s}", .{kv_budget.formatLedger(placement, &ledger_buffer) catch unreachable});
+    log.info("{s}", .{kv_budget.formatLedger(placement, &ledger_buffer)});
 
     const hybrid = try Family.Hybrid.init(
         ctx.gpa,
@@ -524,7 +524,7 @@ fn logFusedInit(io: Io) Io.Clock.Timestamp {
 /// limit allows.
 fn logPlacement(placement: kv_budget.PlacementPlan) void {
     var buffer: [kv_budget.placement_text_max]u8 = undefined;
-    log.info("{s}", .{kv_budget.formatPlacement(placement, &buffer) catch unreachable});
+    log.info("{s}", .{kv_budget.formatPlacement(placement, &buffer)});
 }
 
 /// Log the op backends the engine can build, and mark the one in this binary.
@@ -637,7 +637,7 @@ fn admitPrompt(
     const save_ns = time.elapsedNs(s0, Io.Clock.Timestamp.now(ctx.io, .awake));
 
     const last_dup = try ctx.arena.dupe(f32, last_logits);
-    _ = try cache.admit(cache_key, ids, blob, last_dup, prefill_ns, save_ns);
+    _ = cache.admit(cache_key, ids, blob, last_dup, prefill_ns, save_ns);
     log.info("prompt-cache MISS: prefilled + cached (ram={} disk={})", .{
         cache.last_admit_ram, cache.last_admit_disk,
     });

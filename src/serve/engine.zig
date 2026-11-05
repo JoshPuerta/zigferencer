@@ -47,6 +47,10 @@ const log = std.log.scoped(.serve);
 pub const request_queue_capacity: usize = 64;
 pub const out_queue_capacity: usize = 256;
 
+/// The wait after an `accept` failure that a free resource ends. A pending client keeps
+/// `EMFILE` true, so a retry with no wait spins.
+const accept_backoff_ms: i64 = 100;
+
 const conn_free: u8 = 0;
 const conn_live: u8 = 1;
 const conn_reclaimable: u8 = 2;
@@ -66,6 +70,16 @@ const fin_teardown: u8 = 2;
 pub const Endpoint = union(enum) {
     tcp: struct { host: []const u8 = "127.0.0.1", port: u16 = 0 },
     unix: []const u8,
+};
+
+/// The answer of the acceptor to one failed `accept`.
+pub const AcceptAction = enum {
+    /// The task ends, because the listener cannot serve again.
+    stop,
+    /// The failure belongs to one client, so the next client is unaffected.
+    retry_now,
+    /// The failure belongs to the host, so an immediate retry fails again.
+    back_off,
 };
 
 /// `Engine` and `CodecT` are the scheduler's boundaries (see scheduler.zig).
@@ -348,7 +362,7 @@ pub fn ServeEngine(comptime Engine: type, comptime CodecT: type, comptime Adapte
 
         fn acceptorTask(self: *Self) void {
             while (true) {
-                var stream = self.listener.accept(self.io) catch return;
+                var stream = acceptNext(&self.listener, self.io) orelse return;
                 const conn = self.claimConnSlot() orelse {
                     Adapter.refuse(self.io, &stream);
                     continue;
@@ -387,6 +401,48 @@ pub fn ServeEngine(comptime Engine: type, comptime CodecT: type, comptime Adapte
 }
 
 // -- api --------------------------------------------------------------------
+
+/// Map one `accept` failure to an action. The switch names each error, so a new name in std
+/// fails the build. On Linux, `Unexpected` holds the pending network errors of accept(2),
+/// which a server must retry.
+pub fn acceptAction(err: net.Server.AcceptError) AcceptAction {
+    return switch (err) {
+        error.Canceled, error.SocketNotListening, error.WouldBlock => .stop,
+        error.ConnectionAborted, error.ProtocolFailure, error.BlockedByFirewall => .retry_now,
+        error.ProcessFdQuotaExceeded,
+        error.SystemFdQuotaExceeded,
+        error.SystemResources,
+        error.NetworkDown,
+        error.Unexpected,
+        => .back_off,
+    };
+}
+
+/// Block until a client connects. Null tells the acceptor task to end. The loop has no bound,
+/// because the listener lives as long as the engine. Teardown ends it through `error.Canceled`
+/// from `accept` or from the wait.
+pub fn acceptNext(listener: *net.Server, io: Io) ?net.Stream {
+    while (true) {
+        return listener.accept(io) catch |err| {
+            switch (acceptAction(err)) {
+                .stop => {
+                    if (err != error.Canceled) {
+                        log.err("accept: {t}, the listener stops", .{err});
+                    }
+
+                    return null;
+                },
+                .retry_now => log.debug("accept: {t}, retry", .{err}),
+                .back_off => {
+                    log.warn("accept: {t}, retry in {d} ms", .{ err, accept_backoff_ms });
+                    io.sleep(.fromMilliseconds(accept_backoff_ms), .awake) catch return null;
+                },
+            }
+
+            continue;
+        };
+    }
+}
 
 /// Free the gpa-owned text a `Request` carries. The reader duped it across the
 /// thread hop, and the scheduler frees it on the happy path. Generic over the

@@ -1,29 +1,56 @@
-// Batched RMSNorm: the normalization of `rmsnorm.comp` run independently on each
-// of the B rows of a (B, d) input. Batched prefill uses it to normalize many
-// token positions in one dispatch, which is why this variant sits next to the
-// single-row kernel.
+// rmsnorm_batch: the norm of `rmsnorm.comp` on each row of a (B, d) input, one workgroup per row.
 //
-//   y[b][i] = x[b][i] / sqrt(mean(x[b]^2) + eps) * w[i]
+// What
+//   Batched prefill uses this kernel to normalize many token positions in one dispatch, which is
+//   why this variant sits next to the single-row kernel.
 //
-//   binding 0  readonly  f32 x[B * d]
-//   binding 1  readonly  f32 w[d]        (one weight, shared by every row)
-//   binding 2  writeonly f32 y[B * d]
-//   push       uint d, float eps
+// Math
+//   Lane l of row b sums the squares of its strided subset. A tree then folds the 256 partials:
 //
-// The dispatch is (B, 1, 1) workgroups and gl_WorkGroupID.x selects the row. Each
-// workgroup reduces its own row in LDS at local_size_x = 256, exactly as the
-// decode kernel does. Per-row independence makes the batch parallel with no
-// cross-row sync, so prefill scales with the number of resident workgroups the
-// WGPs hold.
+//     lds_sum[l] = sum_{i < d, i % 256 = l} x[b][i]^2
+//     lds_sum[l] = lds_sum[l] + lds_sum[l + k]    for l < k, with k = 128, 64, .. 1
+//     inv_rms    = 1 / sqrt(lds_sum[0] / d + eps)
+//     y[b][i]    = x[b][i] * inv_rms * w[i]
 //
-// The tree-reduce sums in a different order than the sequential scalar sum of the
-// CPU reference, so the result is not bit-exact. The lane partial carries
-// `precise` so that `glslc -O` cannot fuse `my_sum += v * v` into an fma, which
-// changes the rounding and widens the gap. The decode kernel `rmsnorm.comp`
-// carries the same qualifier, so one row normalizes the same way through prefill
-// and through decode.
+//   A positive eps keeps the root above zero on an all-zero row.
 //
-// The Zig wrapper `RmsnormBatch` declares `.relative = 5e-5`.
+// Schedule
+//   grid       (B, 1, 1)
+//   workgroup  256 lanes. Workgroup b owns row b, at element offset b * d.
+//   lane       Lane l owns the elements i = l, l + 256, l + 512, and so on below d.
+//
+//     rung k = 128  lds_sum[0 .. 127] += lds_sum[128 .. 255]
+//     rung k = 64   lds_sum[0 .. 63]  += lds_sum[64 .. 127]
+//     ...
+//     rung k = 1    lds_sum[0]        += lds_sum[1]
+//
+//     pass 1  squares  each lane strides across its row and writes its sum of squares to LDS
+//     pass 2  tree     8 rungs of one loop, each with a barrier, fold `lds_sum` into lds_sum[0]
+//     pass 3  write    each lane reads the total, computes inv_rms, and strides to write y
+//
+// Memory
+//   The array holds one partial per lane. The driver limit is 32 KiB.
+//
+//     lds_sum  [256] f32  1 KiB  sum of squares of each lane
+//
+// Hardware
+//   Waves: 256 lanes are 8 wave32 waves, and each workgroup reduces its own row in LDS.
+//   Occupancy: the rows are independent, so the batch needs no cross-row sync. Prefill scales with
+//   the number of resident workgroups the WGPs hold.
+//   Tails: a lane with l >= d sums nothing, and it still reaches every barrier.
+//
+// Numerics
+//   Tolerance: `RmsnormBatch` declares `.relative = 5e-5`. The tree sums in a different order than
+//   the sequential sum of the CPU reference, so the result is not bit-exact. The lane partial
+//   carries `precise`, so the device compiler cannot fuse `my_sum += v * v` into an fma. A fused
+//   add changes the rounding and widens the gap. `rmsnorm.comp` carries the same qualifier, so
+//   one row normalizes the same way through prefill and through decode.
+//
+// Bindings
+//   0     readonly   f32  x[B * d]
+//   1     readonly   f32  w[d]      one weight, shared by every row
+//   2     writeonly  f32  y[B * d]
+//   push  uint d, float eps
 
 #version 450
 
@@ -63,14 +90,17 @@ void main() {
         precise float v = x_buf.data[row_off + i];
         my_sum += v * v;
     }
+
     lds_sum[local] = my_sum;
     barrier();
 
+    // Pass 2: fold the partials into lds_sum[0], one rung per power of two.
     for (uint stride = 128u; stride > 0u; stride >>= 1) {
         if (local < stride) lds_sum[local] += lds_sum[local + stride];
         barrier();
     }
 
+    // Pass 3: every lane reads the total, computes `inv_rms`, and writes its elements of y.
     float mean_sq = lds_sum[0] / float(d);
     float inv_rms = 1.0 / sqrt(mean_sq + params.eps);
 

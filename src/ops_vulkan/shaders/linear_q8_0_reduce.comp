@@ -1,41 +1,67 @@
-// Q8_0 matvec with the same result shape as `linear_q8_0.comp` and a different
-// work assignment. The bit-exact variant gives one INVOCATION per output j. This
-// one gives one WORKGROUP per output j, with 32 lanes that sum the row
-// cooperatively and an LDS reduction at the end. That is 32 times more workgroups
-// for the same n and 32 times less work per lane. It wins exactly when n is small
-// enough that the per-invocation variant has too few workgroups to keep the WGPs
-// busy.
+// linear_q8_0_reduce: the Q8_0 decode matvec, one workgroup per output and an LDS reduction.
 //
-//   out[j] = sum over the (k/32) weight blocks of  input[blk] . weight[j][blk]
+// What
+//   This kernel has the result shape of `linear_q8_0.comp` and a different work assignment. That
+//   kernel gives one invocation to an output j. This one gives one workgroup to an output j, with
+//   32 lanes that sum the row together. That is 32 times more workgroups for the same n and 32
+//   times less work per lane. It wins when n is small enough that the per-invocation kernel has
+//   too few workgroups to keep the WGPs busy.
 //
-//   lane L sums blocks L, L+32, L+64, ...     (strided, so the loads coalesce)
-//         \____________ 32 lane partials ____________/
-//                                |
-//                      LDS + barrier, lane 0 sums  ->  out[j]
+// Math
+//   Here input[blk] is the 32 elements at blk * 32, and blk runs over the k / 32 blocks:
 //
-// The strided assignment is deliberate. Adjacent lanes read adjacent weight
-// blocks, so the global loads coalesce into full cache lines across the wave
-// instead of each lane stranding its own line.
+//     partial[L] = sum_{blk % 32 = L} input[blk] . dequant(weight[j][blk])
+//     out[j]     = sum_{L in 0..31} partial[L]
 //
-//   binding 0  readonly  f32  input[k]                 (layout as linear_q8_0)
-//   binding 1  readonly  f16  scales[(k/32) * n]
-//   binding 2  readonly  uint quants_packed[(k/4) * n]
-//   binding 3  writeonly f32  out[n]
-//   push       uint k, uint n
+//   Each block belongs to exactly one lane, so the partials cover the row once.
 //
-// local_size_x = 32 is one RDNA2 wave32. Every lane of a workgroup is a lane of
-// the same wave, so there is no cross-wave synchronization, and the closing
-// `barrier()` that the GLSL spec needs maps to a no-op on the hardware. The LDS
-// reduction is a sequential lane-0 sum of 32 partials. A log-N tree saves little
-// at 32 elements, and the sequential form keeps the per-output summation order
-// deterministic across runs. That order differs from the scalar CPU reference,
-// but it is stable, which the hash gate needs.
+// Schedule
+//   grid       (n, 1, 1)
+//   workgroup  32 lanes. One workgroup owns one output j = gl_WorkGroupID.x.
+//   lane       Lane L owns the weight blocks L, L + 32, L + 64, ... of row j.
 //
-// Block partials accumulate in lane order and lane 0 then sums them. f32 add is
-// not associative, so the output drifts from the CPU reference even under
-// `precise`. The Zig wrapper `LinearQ80Reduce` declares `.relative = 2e-4`. The
-// bench prints the variants side by side, and the tolerance column shows which
-// one drifts and by how much.
+//     lane L sums blocks L, L+32, L+64, ...     (strided, so a wave reads one run)
+//           \____________ 32 lane partials ____________/
+//                                  |
+//                        LDS + barrier, lane 0 sums  ->  out[j]
+//
+//     pass 1  sum     each lane sums its strided blocks and stores the partial to LDS
+//     pass 2  reduce  lane 0 sums the 32 partials and writes out[j]
+//
+// Memory
+//   LDS at 32 lanes. The driver limit is 32 KiB.
+//
+//     lds_partials  [32] f32  128 B  one partial per lane
+//
+// Hardware
+//   Waves: local_size_x = 32 is one wave32 wave. Every lane of a workgroup is a lane of the same
+//   wave, so there is no cross-wave synchronization. The closing `barrier()` that the GLSL spec
+//   needs maps to a no-op on the hardware.
+//   Pass 1: the strided assignment is deliberate. Adjacent lanes own adjacent weight blocks, so a
+//   wave reads one contiguous run of each buffer. The lanes sit 32 bytes apart in the quants, so
+//   those loads can share a line, and 128 bytes apart in the input.
+//   Pass 2: the reduction is a sequential lane-0 sum of 32 partials. A log-N tree saves little at
+//   32 elements.
+//   Tails: the grid holds j < n. A workgroup past n still stores a zero partial and reaches the
+//   barrier, so every lane leaves through the same barrier.
+//
+// Numerics
+//   Tolerance: `LinearQ80Reduce` declares `.relative = 2e-4`. f32 add is not associative, so the
+//   output drifts from the CPU reference even under `precise`. No `precise` marks the inner chain,
+//   so the device compiler can fuse `in_v * scale * q + partial` into an FMA, about 33% fewer
+//   cycles per inner element. The reduce in lane 0 is the irreducible source of the error, and the
+//   measured relative error stays well under 2e-4. A lane adds blk and i ascending, and lane 0 adds
+//   L ascending. This order differs from the CPU reference, but it is stable, which the hash gate
+//   needs. The bench prints the variants side by side, so its tolerance column shows the drift.
+//
+// Bindings
+//   0     readonly   f32   input[k]
+//   1     readonly   f16   scales[(k / 32) * n]
+//   2     readonly   uint  quants_packed[(k / 4) * n]
+//   3     writeonly  f32   out[n]
+//   push  uint k, uint n
+//
+//   The buffer layouts match `linear_q8_0.comp`.
 
 #version 450
 #extension GL_EXT_shader_16bit_storage : require
@@ -74,21 +100,19 @@ void main() {
     if (j >= params.n) {
         lds_partials[local] = 0.0;
         barrier();
+
         return;
     }
 
     uint blocks_per_row = params.k / 32u;
     uint words_per_row = params.k / 4u;
 
-    // No `precise` on the inner chain: the compiler fuses
-    // `in * scale * q + partial` into a hardware FMA, about 33% fewer
-    // cycles per inner element. The cross-lane reduce in lane 0 below
-    // is the irreducible source of the error against the CPU reference,
-    // and the measured relative error stays well under 2e-4.
+    // Pass 1: sum the strided blocks of this lane.
     float partial = 0.0;
     for (uint blk = local; blk < blocks_per_row; blk += 32u) {
         float scale = float(scales_buf.data[j * blocks_per_row + blk]);
         uint word_base = j * words_per_row + blk * 8u;
+
         for (uint i = 0u; i < 32u; ++i) {
             float in_v = input_buf.data[blk * 32u + i];
             uint word = quants_buf.data[word_base + (i >> 2)];
@@ -100,9 +124,13 @@ void main() {
     lds_partials[local] = partial;
     barrier();
 
+    // Pass 2: lane 0 sums the partials in lane order.
     if (local == 0u) {
         precise float sum = 0.0;
-        for (uint i = 0u; i < 32u; ++i) sum += lds_partials[i];
+        for (uint i = 0u; i < 32u; ++i) {
+            sum += lds_partials[i];
+        }
+
         out_buf.data[j] = sum;
     }
 }

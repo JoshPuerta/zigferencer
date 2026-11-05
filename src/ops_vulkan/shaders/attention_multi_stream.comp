@@ -1,55 +1,102 @@
-// Multi-stream lockstep attention for decode. Each of the B rows is an
-// independent concurrent stream, which is a separate conversation. All streams
-// sit at the same step position t_len - 1, and each one reads its own K/V slice
-// out of a shared cache. This variant is the mirror image of the prefill batched
-// attention: there the rows share one K/V cache and differ by causal t_len, and
-// here the rows have the SAME t_len and INDEPENDENT K/V slices. A batched step
-// uses this kernel to amortize the weight-matmul bandwidth across N concurrent
-// decoders, because the matmuls then load each weight once and feed all N
-// streams.
+// attention_multi_stream: lockstep attention for decode, one K and V slab per stream.
 //
-// The bound K-cache view holds N_STREAMS contiguous
-// (max_seq, n_kv_heads, head_dim) slabs for one layer. Row b reads slab b at the
-// offset stream_stride_elems = max_seq * n_kv_heads * head_dim. V uses the same
-// layout and the same indexing.
+// What
+//   Each of the B rows is an independent stream, a separate conversation, at step t_len - 1. This
+//   variant mirrors `attention_batch.comp`. There the rows share one K and V cache and differ by
+//   causal t_len. Here the rows share t_len and read independent K and V slabs. A batched step
+//   uses this kernel to amortize the weight-matmul bandwidth across N concurrent decoders, because
+//   the matmuls then load each weight once and feed all N streams.
 //
-//   binding 0  readonly  f32     q[n_rows_total * n_heads * head_dim]
-//   binding 1  readonly  KV_ELEM k_cache[N_STREAMS * max_seq * n_kv_heads * head_dim]
-//   binding 2  readonly  KV_ELEM v_cache[same shape]
-//   binding 3  writeonly f32     out[n_rows_total * n_heads * head_dim]
-//   push       uint n_heads, n_kv_heads, head_dim, t_len, stream_stride_elems,
-//              uint q_row_base, kv_stream_base
+// Math
+//   Row y of the grid reads q row `row` and K and V slab `stream`. Over t in [0, t_len), with
+//   scale = 1 / sqrt(head_dim):
 //
-// The dispatch grid is (n_heads, B, 1). The q and out row is q_row_base +
-// gl_WorkGroupID.y and the K/V slab is kv_stream_base + gl_WorkGroupID.y. The two
-// bases are decoupled. A caller whose rows carry arbitrary (slot, position) pairs
-// therefore records one single-row dispatch per row, each with its own t_len.
-// Such a caller is batched decode over independent serve sessions, or several
-// consecutive rows of ONE serve session during chunked prefill. Lockstep callers
-// keep one dispatch, with both bases 0 and B rows.
+//     s_t            = (q[row, h] . k[stream, t, kv_h]) * scale
+//     m              = max_t s_t                      `vec_max`
+//     e_t            = exp(s_t - m)
+//     L              = sum_t e_t                      `vec_sum`
+//     p_t            = e_t / L                        the softmax of s
+//     out[row, h, d] = sum_t p_t * v[stream, t, kv_h, d]
 //
-// KV_ELEM is the KV cache element type. `build.zig` compiles this one source
-// twice, once with -DKV_F16, so the two variants cannot drift apart. Only the
-// storage type moves. The loads widen to `float` at the read, the scores LDS
-// stays `shared float`, the accumulators stay `precise float`, the push constants
-// keep their layout, and the element indexing is unchanged, because the element
-// count of a row does not depend on the width of an element.
+//   The shift by m makes the largest e_t 1, so L is at least 1 and the division meets no zero.
 //
-// ATTN_SPLIT sizes the LDS scores buffer, as in `attention.comp`. The host
-// dispatches the kernel only for a row of at most ATTN_SPLIT positions. A
-// deeper row takes the split pass and the merge pass, as in `attention.comp`.
+// Schedule
+//   grid       (n_heads, B, 1)
+//   workgroup  64 lanes. Workgroup (h, y) serves head h of one row and one slab.
+//   lane       Each pass assigns the lanes in its own way, as the pass table shows.
 //
-// The LDS tree-reductions sum in a different order than the CPU reference, so the
-// result is not bit-exact. The Zig wrapper `AttentionMultiStream` declares
-// `.relative = 1e-3`.
+//     row    = q_row_base + y
+//     stream = kv_stream_base + y
+//     kv_h   = h / (n_heads / n_kv_heads)
+//
+//                h = 0     h = 1         h = n_heads - 1
+//             +---------+---------+-----+---------------+
+//     y = 0   | (0, 0)  | (1, 0)  | ... |               |   row q_row_base, slab kv_stream_base
+//     y = 1   | (0, 1)  | (1, 1)  | ... |               |   the next row, the next slab
+//       ...   |         |         | ... |               |
+//     y = B-1 |         |         | ... |               |   slab kv_stream_base + B - 1
+//             +---------+---------+-----+---------------+
+//
+//   Passes 2 and 3 run a tree: in step k = 32 .. 1, each lane l < k folds slot l + k into slot l.
+//
+//     pass 1  scores     lane l computes s_t at positions l + 64 i
+//     pass 2  max        lane l folds positions l + 64 i into slot l, then the tree runs
+//     pass 3  sum        lane l turns s_t into e_t and folds it into slot l, then the tree runs
+//     pass 4  normalize  lane l turns e_t into p_t at positions l + 64 i
+//     pass 5  V sums     lane l owns elements l + 64 i and walks every position
+//
+// Memory
+//   LDS at ATTN_SPLIT = 256. The driver limit is 32 KiB.
+//
+//     scores      [ATTN_SPLIT] f32   1 KiB   one score per position, [t]
+//     reduce_lds  [64] f32           256 B   one tree slot per lane, [l]
+//
+//   The kernel holds every score of a row in LDS, so the host dispatches it only for a row of at
+//   most ATTN_SPLIT positions. A deeper row takes the split pass and the merge pass.
+//
+// Hardware
+//   Waves: 64 lanes are two wave32 waves, the occupancy point of decode attention.
+//   Pass 1: K loads do not coalesce across the wave, because each lane walks its own row.
+//   Passes 2 to 4: LDS only, plus the exp of pass 3.
+//   Pass 5: adjacent lanes touch adjacent addresses of one V row, so those reads coalesce.
+//
+// Numerics
+//   Tolerance: `AttentionMultiStream` declares `.relative = 1e-3`. The LDS sum tree reorders the
+//   softmax sum against the CPU reference, and the GPU exp rounds differently.
+//   `precise` chains run in ascending d for a score and ascending t for a V sum, and each tree
+//   folds fixed slot pairs, so a repeated run gives the same bytes.
+//
+// Bindings
+//   0     readonly   f32      q[n_rows_total * n_heads * head_dim]
+//   1     readonly   KV_ELEM  k_cache[N_STREAMS * max_seq * n_kv_heads * head_dim]
+//   2     readonly   KV_ELEM  v_cache[N_STREAMS * max_seq * n_kv_heads * head_dim]
+//   3     writeonly  f32      out[n_rows_total * n_heads * head_dim]
+//   push  uint n_heads, n_kv_heads, head_dim, t_len, stream_stride_elems, q_row_base,
+//         kv_stream_base
+//
+//   The views hold N_STREAMS contiguous (max_seq, n_kv_heads, head_dim) slabs of one layer. Slab s
+//   starts at s * stream_stride_elems, and stream_stride_elems = max_seq * n_kv_heads * head_dim.
+//   The two bases are decoupled. A caller whose rows carry arbitrary (slot, position) pairs
+//   records one single-row dispatch per row, each with its own t_len. Such a caller is batched
+//   decode over independent serve sessions, or several consecutive rows of one serve session in
+//   chunked prefill. Lockstep callers keep one dispatch of B rows with both bases 0.
+//   The host asserts 1 <= t_len <= ATTN_SPLIT and that n_kv_heads divides n_heads. It also asserts
+//   t_len * n_kv_heads * head_dim <= stream_stride_elems, so no row reads into the next slab.
+//
+// Defines
+//   ATTN_SPLIT  LDS score row, from `limits.attn_split_len`. It is the deepest resident row.
+//   KV_F16      set for the f16 blob. The rows hold packed halves, the bytes that the commit wrote.
+//               Only the K and V storage type moves, and the loads widen to float at the read.
+//               `scores` stays `shared float`, the accumulators stay `precise float`, and the push
+//               constants keep their layout. The element indexing stays, as the element count of a
+//               row does not depend on the element width. `build.zig` compiles this one source
+//               twice, so the two variants cannot drift apart.
 
 #version 450
 
 // -- configuration ----------------------------------------------------------
 #ifdef KV_F16
-// f16 rows read as packed halves. A 32-bit word load plus the core unpack keeps
-// 16-bit storage access out of the hot loop, and word w holds elements 2w and
-// 2w+1 of the same bytes the commit wrote.
+// Word w holds elements 2w and 2w + 1, so a word load keeps 16-bit access out of the hot loop.
 #define KV_ELEM uint
 #define KV_LOAD(buf, e) unpackHalf2x16(buf.data[(e) >> 1])[(e) & 1]
 #else
@@ -99,6 +146,7 @@ void main() {
     uint row = params.q_row_base + gl_WorkGroupID.y;
     uint stream = params.kv_stream_base + gl_WorkGroupID.y;
     uint local = gl_LocalInvocationID.x;
+
     if (h >= params.n_heads) return;
 
     uint head_dim = params.head_dim;
@@ -109,45 +157,66 @@ void main() {
     uint kv_base = stream * params.stream_stride_elems;
     float scale = 1.0 / sqrt(float(head_dim));
 
-    // Pass 1: scores[t] = dot(q_stream_h, k_cache[stream, t, kv_h]) * scale.
+    // Pass 1: s_t = (q[row, h] . k[stream, t, kv_h]) * scale.
     for (uint t = local; t < t_max; t += 64u) {
         uint k_off = kv_base + t * params.n_kv_heads * head_dim + kv_h * head_dim;
         precise float s = 0.0;
+
         for (uint d = 0u; d < head_dim; ++d) {
             s += q_buf.data[q_off + d] * KV_LOAD(k_buf, k_off + d);
         }
+
         scores[t] = s * scale;
     }
     barrier();
 
-    // Pass 2: softmax (max-stable). The same tree-reduce as decode attention.
+    // Pass 2: m = max_t s_t, a lane partial and an LDS tree.
     float my_max = -3.402823466e+38;
     for (uint t = local; t < t_max; t += 64u) {
-        if (scores[t] > my_max) my_max = scores[t];
+        if (scores[t] > my_max) {
+            my_max = scores[t];
+        }
     }
+
     reduce_lds[local] = my_max;
     barrier();
-    if (local < 32u && reduce_lds[local + 32u] > reduce_lds[local]) reduce_lds[local] = reduce_lds[local + 32u];
+    if (local < 32u && reduce_lds[local + 32u] > reduce_lds[local]) {
+        reduce_lds[local] = reduce_lds[local + 32u];
+    }
     barrier();
-    if (local < 16u && reduce_lds[local + 16u] > reduce_lds[local]) reduce_lds[local] = reduce_lds[local + 16u];
+    if (local < 16u && reduce_lds[local + 16u] > reduce_lds[local]) {
+        reduce_lds[local] = reduce_lds[local + 16u];
+    }
     barrier();
-    if (local < 8u && reduce_lds[local + 8u] > reduce_lds[local]) reduce_lds[local] = reduce_lds[local + 8u];
+    if (local < 8u && reduce_lds[local + 8u] > reduce_lds[local]) {
+        reduce_lds[local] = reduce_lds[local + 8u];
+    }
     barrier();
-    if (local < 4u && reduce_lds[local + 4u] > reduce_lds[local]) reduce_lds[local] = reduce_lds[local + 4u];
+    if (local < 4u && reduce_lds[local + 4u] > reduce_lds[local]) {
+        reduce_lds[local] = reduce_lds[local + 4u];
+    }
     barrier();
-    if (local < 2u && reduce_lds[local + 2u] > reduce_lds[local]) reduce_lds[local] = reduce_lds[local + 2u];
+    if (local < 2u && reduce_lds[local + 2u] > reduce_lds[local]) {
+        reduce_lds[local] = reduce_lds[local + 2u];
+    }
     barrier();
-    if (local < 1u && reduce_lds[local + 1u] > reduce_lds[local]) reduce_lds[local] = reduce_lds[local + 1u];
+    if (local < 1u && reduce_lds[local + 1u] > reduce_lds[local]) {
+        reduce_lds[local] = reduce_lds[local + 1u];
+    }
     barrier();
+
+    // Every lane reads slot 0 before pass 3 writes the tree slots.
     float vec_max = reduce_lds[0];
     barrier();
 
+    // Pass 3: e_t = exp(s_t - m) in `scores`, then L = sum_t e_t, a lane partial and an LDS tree.
     float my_sum = 0.0;
     for (uint t = local; t < t_max; t += 64u) {
         float e = exp(scores[t] - vec_max);
         scores[t] = e;
         my_sum += e;
     }
+
     reduce_lds[local] = my_sum;
     barrier();
     if (local < 32u) reduce_lds[local] += reduce_lds[local + 32u];
@@ -162,22 +231,26 @@ void main() {
     barrier();
     if (local < 1u) reduce_lds[local] += reduce_lds[local + 1u];
     barrier();
+
     float vec_sum = reduce_lds[0];
     float inv_sum = 1.0 / vec_sum;
 
+    // Pass 4: p_t = e_t / L, in place in `scores`.
     for (uint t = local; t < t_max; t += 64u) {
         scores[t] *= inv_sum;
     }
     barrier();
 
-    // Pass 3: out[row, h, d] = sum_t scores[t] * v_cache[stream, t, kv_h, d].
+    // Pass 5: out[row, h, d] = sum_t p_t * v[stream, t, kv_h, d].
     uint out_off = (row * params.n_heads + h) * head_dim;
     for (uint d = local; d < head_dim; d += 64u) {
         precise float sum = 0.0;
+
         for (uint t = 0u; t < t_max; ++t) {
             uint v_off = kv_base + t * params.n_kv_heads * head_dim + kv_h * head_dim;
             sum += scores[t] * KV_LOAD(v_buf, v_off + d);
         }
+
         out_buf.data[out_off + d] = sum;
     }
 }

@@ -648,7 +648,7 @@ pub fn embedLookup(weight: Tensor, token_id: u32, dim: usize, dst: []f32) void {
             const row_start = @as(usize, token_id) * row_bytes;
             dequantQ41(weight.data[row_start..][0..row_bytes], dst[0..dim]);
         },
-        else => @panic("embedLookup: unsupported weight dtype"),
+        else => unreachable, // `requireWeights` refuses any other dtype at runner init
     }
 
     if (std.debug.runtime_safety) {

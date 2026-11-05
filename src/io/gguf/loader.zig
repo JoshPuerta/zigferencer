@@ -46,6 +46,10 @@ pub const Error = error{
     TensorDataUnaligned,
 } || parser.Error;
 
+/// What `load` and `loadWith` return: a refused file, or a failed map of the file.
+pub const LoadError = Error || Allocator.Error || Io.File.OpenError || Io.File.LengthError ||
+    Io.File.MemoryMap.CreateError;
+
 /// Architectures the engine understands. The GGUF `general.architecture`
 /// string is also the KV-key prefix (`llama.block_count`, `qwen35.ssm.*`).
 pub const Arch = enum { llama, qwen35 };
@@ -150,11 +154,16 @@ const Dim = struct { key: []const u8, value: u32 };
 
 // -- api --------------------------------------------------------------------
 
-pub fn load(io: Io, arena: Allocator, path: []const u8) !Loaded {
+pub fn load(io: Io, arena: Allocator, path: []const u8) LoadError!Loaded {
     return loadWith(io, arena, path, .{});
 }
 
-pub fn loadWith(io: Io, arena: Allocator, path: []const u8, opts: LoadOptions) !Loaded {
+pub fn loadWith(
+    io: Io,
+    arena: Allocator,
+    path: []const u8,
+    opts: LoadOptions,
+) LoadError!Loaded {
     const sp = span.begin(.model_load);
     defer sp.end();
 
@@ -218,7 +227,7 @@ pub fn loadWith(io: Io, arena: Allocator, path: []const u8, opts: LoadOptions) !
         pk(&kb, arch_str, ".rope.dimension_count"),
         head_dim_explicit,
     );
-    const rope_freq_base = lookupF32(parsed, pk(&kb, arch_str, ".rope.freq_base")) catch 10000.0;
+    const rope_freq_base = try lookupF32Or(parsed, pk(&kb, arch_str, ".rope.freq_base"), 10000.0);
     const rms_norm_eps = try lookupF32(
         parsed,
         pk(&kb, arch_str, ".attention.layer_norm_rms_epsilon"),
@@ -639,6 +648,15 @@ fn lookupF32(p: parser.Parsed, key: []const u8) Error!f32 {
     };
 }
 
+/// The value of an optional key. Only an absent key takes `default`, so a
+/// key of the wrong type fails and does not fall back in silence.
+fn lookupF32Or(p: parser.Parsed, key: []const u8, default: f32) Error!f32 {
+    return lookupF32(p, key) catch |err| switch (err) {
+        error.MissingKey => default,
+        else => err,
+    };
+}
+
 fn lookupStringArray(p: parser.Parsed, key: []const u8) Error![]const []const u8 {
     const v = lookupKv(p, key) orelse return error.MissingKey;
     return switch (v.*) {
@@ -679,6 +697,37 @@ test "zeroDim: the first zero card dimension or GDN parameter, else null" {
             try std.testing.expect(got == null);
         }
     }
+}
+
+test "load and loadWith name their error set" {
+    const returnedSet = struct {
+        fn of(comptime f: type) type {
+            return @typeInfo(@typeInfo(f).@"fn".return_type.?).error_union.error_set;
+        }
+    }.of;
+    comptime std.debug.assert(returnedSet(@TypeOf(load)) == LoadError);
+    comptime std.debug.assert(returnedSet(@TypeOf(loadWith)) == LoadError);
+}
+
+test "lookupF32Or: an absent key takes the default, and a wrong type refuses" {
+    const key = "llama.rope.freq_base";
+    const parsedFrom = struct {
+        fn of(kvs: []const parser.Kv) parser.Parsed {
+            return .{
+                .header = undefined,
+                .kvs = kvs,
+                .tensors = &.{},
+                .data_offset = 0,
+                .alignment = 1,
+            };
+        }
+    }.of;
+    const absent = parsedFrom(&.{});
+    const value = parsedFrom(&.{.{ .key = key, .value = .{ .f32_val = 2.5 } }});
+    const wrong = parsedFrom(&.{.{ .key = key, .value = .{ .string = "2.5" } }});
+    try std.testing.expectEqual(7.0, try lookupF32Or(absent, key, 7.0));
+    try std.testing.expectEqual(2.5, try lookupF32Or(value, key, 7.0));
+    try std.testing.expectError(error.WrongKeyType, lookupF32Or(wrong, key, 7.0));
 }
 
 test "ropeScalingSupported: the engine loads only the scaling it applies" {

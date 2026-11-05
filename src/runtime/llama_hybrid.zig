@@ -1174,7 +1174,7 @@ pub const LlamaHybridRunner = struct {
 
             var l: u32 = 0;
             while (l < self.split) : (l += 1) {
-                try p.layerForward(l, rows);
+                p.layerForward(l, rows);
             }
 
             @memcpy(x_host, p.x[0 .. rows.len * d]);

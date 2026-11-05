@@ -1,26 +1,47 @@
-// RoPE over every head of B token rows in a single dispatch. The rotation is the
-// one in `rope.comp`, extended over a batch dimension. This variant exists so
-// that the whole RoPE of a prefill chunk is one dispatch instead of B of them.
+// rope_multi_batch: the rotation of `rope.comp` over every head of B token rows in one dispatch.
 //
-// The absolute position of row bi is start_pos + bi * pos_stride, so the push
-// constant `pos_stride` switches the kernel between callers. It is 1 for prefill,
-// where row bi is token start_pos + bi. It is 0 for lockstep decode, where every
-// row shares start_pos. `row_base` offsets the buffer row a dispatch touches
-// without moving the position math. A caller with arbitrary per-row positions,
-// such as batched decode over independent serve sessions, therefore records one
-// single-row dispatch per row: row_base = i, B = 1, start_pos = pos_i.
+// What
+//   This variant makes the whole RoPE of a prefill chunk one dispatch instead of B of them. A
+//   caller with arbitrary per-row positions, such as batched decode over independent serve
+//   sessions, records one single-row dispatch per row: row_base = i, B = 1, start_pos = pos_i.
 //
-//   binding 0  readwrite f32 x[n_rows_total * n_heads * head_dim]
-//   binding 1  readonly  f32 ff[rope_dim/2]
-//   push       uint start_pos, head_dim, rope_dim, float freq_base,
-//              uint n_heads, uint pos_stride, uint style_norm, uint row_base
+// Math
+//   Pair i of head `head` at row bi takes the rotation of `rope.comp` at an offset:
 //
-// The dispatch grid is (ceil((rope_dim/2) / 64), n_heads, B). gl_WorkGroupID.y is
-// the head and gl_WorkGroupID.z is the batch row.
+//     pos   = start_pos + bi * pos_stride
+//     base  = ((row_base + bi) * n_heads + head) * head_dim
+//     angle = pos * freq_base^(-2i / rope_dim) / ff[i]
+//     ia    = base + a, ib = base + b, with a and b from the pairing of `rope.comp`
+//     (x[ia], x[ib]) = (x[ia] cos - x[ib] sin, x[ia] sin + x[ib] cos)
 //
-// GPU `pow`, `cos`, and `sin` round differently from the CPU intrinsics, so the
-// result is not bit-exact. The Zig wrapper `RopeMultiBatch` declares
-// `.relative = 1e-5`.
+// Schedule
+//   grid       (ceil((rope_dim / 2) / 64), n_heads, B)
+//   workgroup  64 lanes. Workgroup (g, head, bi) owns pair block g of one head of one row.
+//   lane       Lane l owns pair i = g * 64 + l, which is gl_GlobalInvocationID.x.
+//
+//                 g = 0         g = 1
+//               +-------------+---------------+-----+
+//     head 0    | i = 0 .. 63 | i = 64 .. 127 | ... |  one slab of the grid per row bi
+//               +-------------+---------------+-----+
+//     head 1    | i = 0 .. 63 | i = 64 .. 127 | ... |
+//               +-------------+---------------+-----+
+//
+// Hardware
+//   Waves: 64 lanes are 2 wave32 waves. A lane past the last pair returns, and no barrier follows.
+//
+// Numerics
+//   Tolerance: `RopeMultiBatch` declares `.relative = 1e-5`. The GPU `pow`, `cos`, and `sin` round
+//   differently from the CPU intrinsics. The kernel has no reduction, so no summation order
+//   applies.
+//
+// Bindings
+//   0     readwrite  f32  x[n_rows_total * n_heads * head_dim]
+//   1     readonly   f32  ff[rope_dim / 2]
+//   push  uint start_pos, head_dim, rope_dim, float freq_base, uint n_heads, pos_stride,
+//         style_norm, row_base
+//   pos_stride is 1 for prefill, where row bi is token start_pos + bi. It is 0 for lockstep decode
+//   and for one row per dispatch, where every row shares start_pos. row_base is the first buffer
+//   row of this dispatch, and it does not move the position math.
 
 #version 450
 
@@ -41,12 +62,9 @@ layout(push_constant) uniform Params {
     uint rope_dim;
     float freq_base;
     uint n_heads;
-    // 1 for prefill, where the position of row bi is start_pos + bi.
-    // 0 for lockstep or one row per dispatch, where the position is start_pos.
-    uint pos_stride;
+    uint pos_stride;  // 1 for prefill, 0 for lockstep decode or one row per dispatch
     uint style_norm;
-    // First buffer row this dispatch touches. Positions stay relative to bi.
-    uint row_base;
+    uint row_base;    // first buffer row of this dispatch
 } params;
 
 // -- main -------------------------------------------------------------------

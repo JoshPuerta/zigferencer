@@ -1,69 +1,104 @@
-// Batched causal attention for the resident rows of a prefill chunk. Each
-// workgroup handles one (batch row bi, head h) output. Query q[bi, h] attends
-// to the cached positions 0..start_pos+bi inclusive. The causal mask is
-// implicit, because a row reads only up through its own position
-// start_pos + bi. This variant scores the resident rows of a chunk in one
-// dispatch instead of one decode step per token. The per-(bi, h) work is the
-// work of `attention.comp`, and this kernel adds only the batch index.
+// attention_batch: causal attention for the resident rows of a prefill chunk.
 //
-//   binding 0  readonly  f32     q[B * n_heads * head_dim]
-//   binding 1  readonly  KV_ELEM k_cache[max_seq * n_kv_heads * head_dim]
-//   binding 2  readonly  KV_ELEM v_cache[max_seq * n_kv_heads * head_dim]
-//   binding 3  writeonly f32     out[B * n_heads * head_dim]
-//   push       uint n_heads, n_kv_heads, head_dim, start_pos, b_count
+// What
+//   The kernel scores the resident rows of a chunk in one dispatch, in place of one decode step
+//   per token. Each workgroup handles one (bi, h) output, and its math is the math of
+//   `attention.comp` over a causal row. A deeper prefill row takes `attention_split.comp` and
+//   `attention_merge.comp`, as a decode row does, so a row past ATTN_SPLIT gets the bytes of the
+//   decode row of the same depth.
 //
-// The dispatch grid is (n_heads, B, 1) at local_size_x = 64, which is two RDNA2
-// wave32 waves per workgroup and the same occupancy point as decode attention:
+// Math
+//   Query q[bi, h] attends to the cached positions t in [0, t_max), with t_max = start_pos + bi + 1
+//   and scale = 1 / sqrt(head_dim). The causal mask is implicit, because the row reads only up
+//   through its own position start_pos + bi.
 //
-//   gl_WorkGroupID.x = h, the head.  gl_WorkGroupID.y = bi, the batch row.
+//     s_t           = (q[bi, h] . k[t, kv_h]) * scale
+//     m             = max_t s_t                      `vec_max`
+//     e_t           = exp(s_t - m)
+//     L             = sum_t e_t                      `vec_sum`
+//     p_t           = e_t / L                        the softmax of s
+//     out[bi, h, d] = sum_t p_t * v[t, kv_h, d]
 //
-//               h = 0     h = 1         h = n_heads-1
-//            +---------+---------+-----+-------------+
-//   bi = 0   |  (0,0)  |  (1,0)  | ... |             |   t_max = start_pos + 1
-//   bi = 1   |  (0,1)  |  (1,1)  | ... |             |   t_max = start_pos + 2
-//   ...      |         |         | ... |             |
-//   bi = B-1 |         |         | ... |             |   t_max = start_pos + B
-//            +---------+---------+-----+-------------+
+//   The shift by m makes the largest e_t 1, so L is at least 1 and the division meets no zero.
 //
-// Workgroup (h, bi) reads the k_cache and v_cache rows 0..t_max-1 of kv head
-// kv_h = h / (n_heads / n_kv_heads). All B rows share the one k_cache and
-// v_cache, so the batch is free parallelism. It gives more resident workgroups
-// with no extra memory traffic per row beyond its own causal extent.
+// Schedule
+//   grid       (n_heads, B, 1), with B = b_count
+//   workgroup  64 lanes. Workgroup (h, bi) serves head h of batch row bi.
+//   lane       Each pass assigns the lanes in its own way, as the pass table shows.
 //
-// KV_ELEM is the KV cache element type. `build.zig` compiles this one source
-// twice, once with -DKV_F16, so the two variants cannot drift apart. Only the
-// storage type moves. The loads widen to `float` at the read, the scores LDS
-// stays `shared float`, the accumulators stay `precise float`, the push constants
-// keep their layout, and the element indexing is unchanged, because the element
-// count of a row does not depend on the width of an element.
+//     kv_h = h / (n_heads / n_kv_heads)
 //
-// ATTN_SPLIT, a build define fed from `limits.attn_split_len`, sizes the LDS
-// scores row: 1 KiB at 256. The kernel holds every score of a row in LDS, so
-// the host dispatches it only while start_pos + B stays at or below
-// ATTN_SPLIT, and `AttentionBatch.recordInto` asserts that bound. A deeper
-// prefill row takes `attention_split.comp` and `attention_merge.comp`, as a
-// decode row does, so a row past ATTN_SPLIT gets the bytes of the decode row
-// of the same depth.
+//                 h = 0     h = 1         h = n_heads - 1
+//              +---------+---------+-----+---------------+
+//     bi = 0   | (0, 0)  | (1, 0)  | ... |               |   t_max = start_pos + 1
+//     bi = 1   | (0, 1)  | (1, 1)  | ... |               |   t_max = start_pos + 2
+//       ...    |         |         | ... |               |
+//     bi = B-1 |         |         | ... |               |   t_max = start_pos + B
+//              +---------+---------+-----+---------------+
 //
-// The LDS tree-reductions sum in a different order than the CPU reference, so the
-// result is not bit-exact. The Zig wrapper `AttentionBatch` declares
-// `.relative = 1e-3`.
-
+//   Passes 2 and 3 fold 64 lane partials to 1 with an LDS tree. In step k = 32, 16, 8, 4, 2, 1,
+//   each lane l < k folds slot l + k into slot l, then a barrier ends the step.
+//
+//     pass 1  scores     lane l computes s_t at positions l + 64 i, one element pair per step
+//     pass 2  max        lane l folds positions l + 64 i into slot l, then the tree runs
+//     pass 3  sum        lane l turns s_t into e_t and folds it into slot l, then the tree runs
+//     pass 4  normalize  lane l turns e_t into p_t at positions l + 64 i
+//     pass 5  V sums     f32: lane l owns elements l + 64 i. f16: it owns pairs at 2 l + 128 i.
+//
+// Memory
+//   LDS at ATTN_SPLIT = 256. The driver limit is 32 KiB.
+//
+//     scores      [ATTN_SPLIT] f32   1 KiB   one score per position, [t]
+//     reduce_lds  [64] f32           256 B   one tree slot per lane, [l]
+//
+//   The kernel holds every score of a row in LDS, so the host dispatches it only while
+//   start_pos + B stays at or below ATTN_SPLIT.
+//
+// Hardware
+//   Waves: 64 lanes are two wave32 waves, the occupancy point of decode attention. All B rows
+//   share one K and one V cache, so the batch is free parallelism. It gives more resident
+//   workgroups with no extra memory traffic per row beyond its own causal extent.
+//   Pass 1: K loads do not coalesce across the wave, because each lane walks its own row. At f16
+//   a pair load costs one unpack per element pair and not one per element.
+//   Passes 2 to 4: LDS only, plus the exp of pass 3.
+//   Pass 5: adjacent lanes touch adjacent addresses of one V row. At f16 one word load feeds the
+//   two chains of a pair.
+//
+// Numerics
+//   Tolerance: `AttentionBatch` declares `.relative = 1e-3`. The LDS sum tree reorders the
+//   softmax sum against the CPU reference, and the GPU exp rounds differently.
+//   A pair load adds its two products in ascending element order, so its bits match the
+//   one-element loop. In pass 5 at f16, each output still takes one add per position over t
+//   ascending, so its bits match the one-element loop too. Each tree folds fixed slot pairs, so a
+//   repeated run gives the same bytes.
+//
+// Bindings
+//   0     readonly   f32      q[B * n_heads * head_dim]
+//   1     readonly   KV_ELEM  k_cache[max_seq * n_kv_heads * head_dim]
+//   2     readonly   KV_ELEM  v_cache[max_seq * n_kv_heads * head_dim]
+//   3     writeonly  f32      out[B * n_heads * head_dim]
+//   push  uint n_heads, n_kv_heads, head_dim, start_pos, b_count
+//
+//   `AttentionBatch.recordInto` asserts start_pos + B <= ATTN_SPLIT and that n_kv_heads divides
+//   n_heads. It also asserts that head_dim is even, because pass 1 reads an adjacent element pair
+//   per step. Every row starts at a multiple of head_dim, so `KV_LOAD2` gets an even element.
+//
+// Defines
+//   KV_LOAD2    reads the pair at an even element. Pass 5 selects its walk by element type.
+//   ATTN_SPLIT  LDS score row, from `limits.attn_split_len`. It is the deepest resident row.
+//   KV_F16      set for the f16 blob. The rows hold packed halves, the bytes that the commit wrote.
+//               Only the K and V storage type moves, and the loads widen to float at the read.
+//               `scores` stays `shared float`, the accumulators stay `precise float`, and the push
+//               constants keep their layout. The element indexing stays, as the element count of a
+//               row does not depend on the element width. `build.zig` compiles this one source
+//               twice, so the two variants cannot drift apart.
 
 #version 450
 
 // -- configuration ----------------------------------------------------------
-// Both arms define both loads, so the body below selects a load by the access
-// shape it wants and never by the element type. `KV_LOAD2` reads the adjacent
-// element pair at `e2`, which must be even. The row offsets guarantee that:
-// every row starts at a multiple of head_dim, and rope needs an even head_dim.
-// The host dispatch asserts the evenness. A pair load adds the two products in
-// ascending element order, so its result bits match the one-element loop.
+// `KV_LOAD2` reads the adjacent element pair at `e2`, which must be even.
 #ifdef KV_F16
-// f16 rows read as packed halves. A 32-bit word load plus the core unpack keeps
-// 16-bit storage access out of the hot loop, and word w holds elements 2w and
-// 2w+1 of the same bytes the commit wrote. A pair load therefore costs one
-// unpack per element pair and not one per element.
+// Word w holds elements 2w and 2w + 1, so a word load keeps 16-bit access out of the hot loop.
 #define KV_ELEM uint
 #define KV_LOAD(buf, e) unpackHalf2x16(buf.data[(e) >> 1])[(e) & 1u]
 #define KV_LOAD2(buf, e2) unpackHalf2x16(buf.data[(e2) >> 1])
@@ -112,61 +147,83 @@ void main() {
     uint h = gl_WorkGroupID.x;
     uint bi = gl_WorkGroupID.y;
     uint local = gl_LocalInvocationID.x;
+
     if (h >= params.n_heads || bi >= params.b_count) return;
 
     uint head_dim = params.head_dim;
-    // Causal: this query attends to positions 0..t_max-1.
     uint t_max = params.start_pos + bi + 1u;
-    // The host dispatches no row past ATTN_SPLIT. The exit is
-    // workgroup-uniform, and it keeps the LDS writes inside the row for any
-    // grid.
+
+    // The host dispatches no row past ATTN_SPLIT. The exit is uniform over the workgroup, and it
+    // keeps the LDS writes inside the row for any grid.
     if (t_max > uint(ATTN_SPLIT)) return;
+
     uint group_size = params.n_heads / params.n_kv_heads;
     uint kv_h = h / group_size;
     uint q_off = (bi * params.n_heads + h) * head_dim;
     float scale = 1.0 / sqrt(float(head_dim));
 
-    // Pass 1: scores[t] = dot(q_bi_h, k_cache[t, kv_h]) * scale.
+    // Pass 1: s_t = (q[bi, h] . k[t, kv_h]) * scale.
     for (uint t = local; t < t_max; t += 64u) {
         uint k_off = t * params.n_kv_heads * head_dim + kv_h * head_dim;
         precise float s = 0.0;
+
         for (uint d = 0u; d < head_dim; d += 2u) {
             vec2 kv = KV_LOAD2(k_buf, k_off + d);
             s += q_buf.data[q_off + d] * kv.x;
             s += q_buf.data[q_off + d + 1u] * kv.y;
         }
+
         scores[t] = s * scale;
     }
     barrier();
 
-    // Pass 2: softmax (max-stable). Tree-reduce the max, then the sum.
+    // Pass 2: m = max_t s_t, a lane partial and an LDS tree.
     float my_max = -3.402823466e+38;
     for (uint t = local; t < t_max; t += 64u) {
-        if (scores[t] > my_max) my_max = scores[t];
+        if (scores[t] > my_max) {
+            my_max = scores[t];
+        }
     }
+
     reduce_lds[local] = my_max;
     barrier();
-    if (local < 32u && reduce_lds[local + 32u] > reduce_lds[local]) reduce_lds[local] = reduce_lds[local + 32u];
+    if (local < 32u && reduce_lds[local + 32u] > reduce_lds[local]) {
+        reduce_lds[local] = reduce_lds[local + 32u];
+    }
     barrier();
-    if (local < 16u && reduce_lds[local + 16u] > reduce_lds[local]) reduce_lds[local] = reduce_lds[local + 16u];
+    if (local < 16u && reduce_lds[local + 16u] > reduce_lds[local]) {
+        reduce_lds[local] = reduce_lds[local + 16u];
+    }
     barrier();
-    if (local < 8u && reduce_lds[local + 8u] > reduce_lds[local]) reduce_lds[local] = reduce_lds[local + 8u];
+    if (local < 8u && reduce_lds[local + 8u] > reduce_lds[local]) {
+        reduce_lds[local] = reduce_lds[local + 8u];
+    }
     barrier();
-    if (local < 4u && reduce_lds[local + 4u] > reduce_lds[local]) reduce_lds[local] = reduce_lds[local + 4u];
+    if (local < 4u && reduce_lds[local + 4u] > reduce_lds[local]) {
+        reduce_lds[local] = reduce_lds[local + 4u];
+    }
     barrier();
-    if (local < 2u && reduce_lds[local + 2u] > reduce_lds[local]) reduce_lds[local] = reduce_lds[local + 2u];
+    if (local < 2u && reduce_lds[local + 2u] > reduce_lds[local]) {
+        reduce_lds[local] = reduce_lds[local + 2u];
+    }
     barrier();
-    if (local < 1u && reduce_lds[local + 1u] > reduce_lds[local]) reduce_lds[local] = reduce_lds[local + 1u];
+    if (local < 1u && reduce_lds[local + 1u] > reduce_lds[local]) {
+        reduce_lds[local] = reduce_lds[local + 1u];
+    }
     barrier();
+
+    // Every lane reads slot 0 before pass 3 writes the tree slots.
     float vec_max = reduce_lds[0];
     barrier();
 
+    // Pass 3: e_t = exp(s_t - m) in `scores`, then L = sum_t e_t, a lane partial and an LDS tree.
     float my_sum = 0.0;
     for (uint t = local; t < t_max; t += 64u) {
         float e = exp(scores[t] - vec_max);
         scores[t] = e;
         my_sum += e;
     }
+
     reduce_lds[local] = my_sum;
     barrier();
     if (local < 32u) reduce_lds[local] += reduce_lds[local + 32u];
@@ -181,39 +238,43 @@ void main() {
     barrier();
     if (local < 1u) reduce_lds[local] += reduce_lds[local + 1u];
     barrier();
+
     float vec_sum = reduce_lds[0];
     float inv_sum = 1.0 / vec_sum;
 
+    // Pass 4: p_t = e_t / L, in place in `scores`.
     for (uint t = local; t < t_max; t += 64u) {
         scores[t] *= inv_sum;
     }
     barrier();
 
-    // Pass 3: out[bi, h, d] = sum_t scores[t] * v_cache[t, kv_h, d].
+    // Pass 5: out[bi, h, d] = sum_t p_t * v[t, kv_h, d].
     uint out_off = (bi * params.n_heads + h) * head_dim;
 #ifdef KV_F16
-    // One lane owns the adjacent output pair (d, d+1), so one unpack feeds
-    // both running sums. Each output still accumulates over t ascending, one
-    // add per position, so its bits match the one-element loop.
+    // One lane owns the adjacent output pair (d, d + 1), so one unpack feeds both chains.
     for (uint d = local * 2u; d < head_dim; d += 128u) {
         precise float sum_x = 0.0;
         precise float sum_y = 0.0;
+
         for (uint t = 0u; t < t_max; ++t) {
             uint v_off = t * params.n_kv_heads * head_dim + kv_h * head_dim;
             vec2 vv = KV_LOAD2(v_buf, v_off + d);
             sum_x += scores[t] * vv.x;
             sum_y += scores[t] * vv.y;
         }
+
         out_buf.data[out_off + d] = sum_x;
         out_buf.data[out_off + d + 1u] = sum_y;
     }
 #else
     for (uint d = local; d < head_dim; d += 64u) {
         precise float sum = 0.0;
+
         for (uint t = 0u; t < t_max; ++t) {
             uint v_off = t * params.n_kv_heads * head_dim + kv_h * head_dim;
             sum += scores[t] * KV_LOAD(v_buf, v_off + d);
         }
+
         out_buf.data[out_off + d] = sum;
     }
 #endif

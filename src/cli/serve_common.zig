@@ -1229,7 +1229,7 @@ fn serveHybrid(
     std.debug.assert(plan.split < n_layers);
 
     var ledger_buffer: [kv_budget.placement_ledger_text_max]u8 = undefined;
-    log.info("{s}", .{kv_budget.formatLedger(plan, &ledger_buffer) catch unreachable});
+    log.info("{s}", .{kv_budget.formatLedger(plan, &ledger_buffer)});
 
     const hybrid = try Family.Hybrid.init(
         ctx.gpa,
@@ -1497,7 +1497,7 @@ fn logPlaced(p: device_arm.Placed, n_layers: u32) void {
 
     if (p.split) |s| {
         var span_buffer: [kv_budget.placement_text_max]u8 = undefined;
-        log.info("{s}", .{kv_budget.formatPlacement(s, &span_buffer) catch unreachable});
+        log.info("{s}", .{kv_budget.formatPlacement(s, &span_buffer)});
         if (p.pin == null) {
             logAutoSplit(s.split, n_layers);
         }

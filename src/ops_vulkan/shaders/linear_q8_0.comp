@@ -1,40 +1,37 @@
-// Q8_0 matrix-vector, the correctness-gate kernel:
+// linear_q8_0: out[j] = sum_p input[p] * dequant(weight[j][p]), the bit-exact Q8_0 matvec.
 //
-//   out[j] = sum over p in 0..k of  input[p] * dequant(weight[j][p])
+// What
+//   This is the correctness-gate kernel, written for bit-exactness and not for speed. It validates
+//   the GPU stack against the token-hash gate, with the same matvec as `linearF32Q80` in
+//   ops/naive.zig. One invocation computes one output j, with no intra-row reduction, no LDS
+//   tiling, and no subgroup op. The faster variants, which stage the input in LDS, reduce across
+//   the subgroup, or block the GEMM in registers, are the sibling `linear_q8_0_*` shaders.
 //
-// The weight is Q8_0, so every 32 elements share one f16 scale and 32 i8 quants.
-// It is stored row-major as [out_features, in_features], the same shape and the
-// same matvec as ops/naive.zig linearF32Q80.
+// Hardware
+//   Waves: the workgroup is 32 lanes, one wave32 wave with every lane active and no fragmentation.
+//   The grid is (ceil(n / 32), 1, 1). The out_features of Llama, 4k to 128k, give enough waves to
+//   keep the WGPs fed even at this thread-per-row pattern with no data sharing.
 //
-// This variant is written for bit-exactness, not speed. It validates the whole
-// GPU stack against the token-hash gate before any faster matmul exists. One
-// invocation computes one output j, with no intra-row reduction, no LDS tiling,
-// and no subgroup op. It runs the exact scalar loop of the CPU kernel,
-// block-major and element-minor. Vulkan mandates f32 as IEEE-754 single with
-// unfused mul and add unless `precise` forces otherwise, so the two sides
-// multiply and add in the same order.
+// Numerics
+//   Bit-exact: the kernel runs the scalar loop of `linearF32Q80`, block-major and element-minor,
+//   sum += (input[blk * 32 + i] * scale) * float(q), as three separate IEEE-754 f32 ops. `glslc -O`
+//   emits no FMA, and the device compiler is the part that can fuse a multiply and an add.
+//   `precise` adds the NoContraction decoration, which forbids that fusion. A fused GPU result
+//   drifts by 1 to 4 ULP per term. With `precise`, every intermediate keeps its own rounding step
+//   and matches the CPU bit for bit, because the two sides multiply and add in the same order.
 //
-// The workgroup is 32 lanes, one RDNA2 wave32 with every lane active and no
-// fragmentation, and ceil(n / 32) workgroups dispatch. The out_features of Llama,
-// 4k to 50k, give enough waves to keep the WGPs fed even at this thread-per-row
-// pattern with no data sharing. The faster variants, which stage the input in
-// LDS, reduce across the subgroup, or block the GEMM in registers, are the
-// sibling `linear_q8_0_*` shaders.
+// Bindings
+//   0     readonly   f32   input[k]                    input vector
+//   1     readonly   f16   scales[(k / 32) * n]        block scales, j-major
+//   2     readonly   uint  quants_packed[(k / 4) * n]  i8 quants, 4 per uint
+//   3     writeonly  f32   out[n]                      output vector
+//   push  uint k, uint n
 //
-//   binding 0  readonly  f32  input[k]                 input vector
-//   binding 1  readonly  f16  scales[(k/32) * n]       block scales, j-major
-//   binding 2  readonly  uint quants_packed[(k/4) * n] i8 quants, packed 4 per uint
-//   binding 3  writeonly f32  out[n]                   output vector
-//   push       uint k  (input dim, a multiple of 32), uint n  (output dim)
-//
-// The quants pack 4 per uint rather than as int8_t because the target driver
-// exposes no 8-bit storage and no shaderInt8. The host packs 4 i8 quants per uint
-// (little-endian) and the shader decodes with `bitfieldExtract(int, offset, 8)`,
-// which sign-extends to int32. That is the value the Zig expression
-// `@as(i8, @bitCast(byte))` produces on the CPU side.
-//
-// Bit-exact against the CPU reference: the reduction order is the same and every
-// accumulator is `precise`.
+//   k is the input dim, a multiple of 32, and n is the output dim. The weight is Q8_0, row-major
+//   [n][k]: every 32 elements share one f16 scale and 32 i8 quants. The target driver exposes no
+//   8-bit storage and no shaderInt8, so the shader reads the i8 bytes as little-endian uint words.
+//   `bitfieldExtract(int, offset, 8)` sign-extends to int32. That is the value of
+//   `@as(i8, @bitCast(byte))` on the CPU side.
 
 #version 450
 #extension GL_EXT_shader_16bit_storage : require
@@ -70,32 +67,23 @@ void main() {
     if (j >= params.n) return;
 
     uint blocks_per_row = params.k / 32u;
-    uint words_per_row = params.k / 4u; // 4 i8 per u32
+    uint words_per_row = params.k / 4u;  // 4 i8 per u32
 
-    // `precise` blocks the GLSL and SPIR-V optimizer from fusing
-    // (mul, mul, add) into an fma. The CPU kernel computes
-    // `sum += (in * scale) * float(q)` as three separate IEEE-754 f32
-    // ops. Without `precise`, glslc -O emits an FMA and the GPU result
-    // drifts by 1 to 4 ULP per term. With `precise`, every intermediate
-    // keeps its own rounding step and matches the CPU bit for bit.
     precise float sum = 0.0;
 
-    // The reduction order matches ops/naive.zig linear_f32_q8_0:
-    //   for blk in 0..blocks_per_row:
-    //     for i in 0..32:
-    //       sum += input[blk*32 + i] * float(scale) * float(quant)
     for (uint blk = 0u; blk < blocks_per_row; ++blk) {
         precise float scale = float(scales_buf.data[j * blocks_per_row + blk]);
-        // 32 quants per block = 8 u32 words per block.
-        uint word_base = j * words_per_row + blk * 8u;
+        uint word_base = j * words_per_row + blk * 8u;  // 8 u32 words hold the 32 quants
+
         for (uint i = 0u; i < 32u; ++i) {
             precise float in_v = input_buf.data[blk * 32u + i];
             uint word = quants_buf.data[word_base + (i >> 2)];
-            int q = bitfieldExtract(int(word), int((i & 3u) * 8u), 8); // sign-extended i8
+            int q = bitfieldExtract(int(word), int((i & 3u) * 8u), 8);  // sign-extended i8
             precise float in_scale = in_v * scale;
             precise float term = in_scale * float(q);
             sum += term;
         }
     }
+
     out_buf.data[j] = sum;
 }

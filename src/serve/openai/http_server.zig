@@ -202,7 +202,10 @@ fn HttpTasks(comptime Eng: type) type {
             var server = http.Server.init(&sr.interface, &sw.interface);
             while (true) {
                 var request = server.receiveHead() catch return;
-                handleRequest(engine, c, &request) catch return;
+                handleRequest(engine, c, &request) catch |err| {
+                    log.debug("conn {d}: request failed: {t}", .{ c.id, err });
+                    return;
+                };
             }
         }
 

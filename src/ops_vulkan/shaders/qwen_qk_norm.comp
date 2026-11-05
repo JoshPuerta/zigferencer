@@ -1,30 +1,53 @@
-// Per-head RMSNorm of the Qwen3.5 full-attention Q and K, fused with the
-// de-interleave of the query|gate projection. The fusion is why this variant
-// exists: a separate de-interleave pass reads and writes the whole projection
-// again. It mirrors fullMixer in `runtime/qwen_runner.zig`.
+// qwen_qk_norm: the per-head RMSNorm of Qwen3.5 full-attention Q and K, with the gate split.
 //
-//   out[h][d] = in[h][d] / sqrt(mean(in[h]^2) + eps) * norm_w[d]
+// What
+//   The kernel fuses the norm with the de-interleave of the query|gate projection. The fusion is
+//   why this variant exists: a separate de-interleave pass reads and writes the whole projection
+//   again. It mirrors `fullMixer` in runtime/qwen_runner.zig.
 //
-// One workgroup handles one head and each lane owns one head-dim index. head_dim
-// is 256, exactly local_size_x, so the mapping is one lane per dimension with no
-// striding. q is the first head_dim of each [q_h | gate_h] pair, so in_stride is
-// 2*head_dim and the gate reads from gate_off. k is contiguous, so in_stride is
-// head_dim and there is no gate.
+// Math
+//   For head h and head index d, with inbase = in_off + h * in_stride:
 //
-//   binding 0  readonly  f32 in[n_heads * in_stride]      q|gate interleaved, or k
-//   binding 1  readonly  f32 norm_w[head_dim]             q_norm / k_norm weight
-//   binding 2  writeonly f32 out[n_heads * head_dim]      normed q (or k)
-//   binding 3  writeonly f32 gate_out[n_heads * head_dim] raw gate half, if write_gate
-//   push       uint head_dim, in_stride, gate_off, write_gate, float eps,
-//              uint in_off, out_off    (in_off/out_off: prefill token t, else 0)
+//     out_buf[h, d]  = v_d * inversesqrt(sum_i v_i^2 / head_dim + eps) * norm_w[d]
+//     gate_buf[h, d] = in_buf[inbase + gate_off + d], only when write_gate is 1
 //
-// Unlike the other LDS reductions here, every lane re-sums the squared head over
-// shared memory in sequence rather than tree-reducing. That is redundant work,
-// chosen so the summation order matches the CPU rmsnorm. The result then stays as
-// close to bit-exact as `inversesqrt` allows.
+//   v_i is in_buf[inbase + i]. A positive eps keeps the argument above zero on an all-zero head.
 //
-// The Zig wrapper `QwenQkNorm` declares no tolerance. The token-hash gates cover
-// this kernel.
+// Schedule
+//   grid       (n_heads, 1, 1)
+//   workgroup  256 lanes. Workgroup h owns head h.
+//   lane       Lane d owns head index d. head_dim equals local_size_x, so no lane strides.
+//
+//     q, in_stride = 2 * D  | q_0 | gate_0 | q_1 | gate_1 | ...     gate_off = D
+//     k, in_stride = D      | k_0 | k_1 | ...                       no gate
+//
+//     pass 1  stage  each lane copies its gate element if asked, then writes v * v to `sq`
+//     pass 2  norm   each lane sums `sq` with i ascending, then writes its output element
+//
+// Memory
+//   The array holds one square per lane. The driver limit is 32 KiB.
+//
+//     sq  [256] f32  1 KiB  squared elements of this head
+//
+// Hardware
+//   Waves: 256 lanes are 8 wave32 waves, one lane per head index.
+//   Pass 1: the lanes of a wave read adjacent elements of in_buf, so the loads coalesce.
+//   Pass 2: every lane runs the same 256-term sum over LDS, redundant work chosen in place of a
+//   tree reduce so that the order holds.
+//
+// Numerics
+//   Hash gate: `QwenQkNorm` declares no tolerance. The token-hash gates cover this kernel. Every
+//   lane re-sums the squared head with i ascending, so the summation order matches the CPU
+//   rmsnorm. The result then stays as close to bit-exact as `inversesqrt` allows.
+//
+// Bindings
+//   0     readonly   f32  in_buf[n_heads * in_stride]   q|gate interleaved, or k
+//   1     readonly   f32  norm_w[head_dim]              q_norm or k_norm weight
+//   2     writeonly  f32  out_buf[n_heads * head_dim]   normed q or k
+//   3     writeonly  f32  gate_buf[n_heads * head_dim]  raw gate half, if write_gate is 1
+//   push  uint head_dim, in_stride, gate_off, write_gate, float eps, uint in_off, out_off
+//   head_dim must be 256. in_off and out_off are the element offsets of prefill token t, and
+//   decode passes 0 for both.
 
 #version 450
 
@@ -38,12 +61,12 @@ layout(std430, set = 0, binding = 3) writeonly buffer B3 { float gate_buf[]; };
 
 layout(push_constant) uniform Params {
     uint  head_dim;
-    uint  in_stride;   // per-head stride in `in`: 2*head_dim (q|gate) or head_dim (k)
+    uint  in_stride;   // per-head stride in `in_buf`: 2 * head_dim (q|gate) or head_dim (k)
     uint  gate_off;    // offset of the gate half within the pair (head_dim for q)
     uint  write_gate;  // 1 to also write gate_buf, 0 otherwise
     float eps;
-    uint  in_off;      // batched-row base into `in`   (prefill token t; decode 0)
-    uint  out_off;     // batched-row base into out/gate (prefill token t; decode 0)
+    uint  in_off;      // batched-row base into `in_buf`, 0 in decode
+    uint  out_off;     // batched-row base into `out_buf` and `gate_buf`, 0 in decode
 } p;
 
 shared float sq[256];
@@ -56,13 +79,21 @@ void main() {
     uint inbase = p.in_off + h * p.in_stride;
     uint outbase = p.out_off + h * D;
 
+    // Pass 1: copy the gate element if the caller asks, then stage the square in LDS.
     float v = in_buf[inbase + d];
-    if (p.write_gate != 0u) gate_buf[outbase + d] = in_buf[inbase + p.gate_off + d];
+    if (p.write_gate != 0u) {
+        gate_buf[outbase + d] = in_buf[inbase + p.gate_off + d];
+    }
 
     sq[d] = v * v;
     barrier();
+
+    // Pass 2: sum the squares with `i` ascending, then write this output element.
     float ss = 0.0;
-    for (uint i = 0u; i < D; i++) ss += sq[i];
+    for (uint i = 0u; i < D; i++) {
+        ss += sq[i];
+    }
+
     float inv = inversesqrt(ss / float(D) + p.eps);
     out_buf[outbase + d] = v * inv * norm_w[d];
 }

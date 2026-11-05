@@ -25,6 +25,7 @@ const z = @import("zigferencer");
 const protocol = z.serve_protocol;
 const Client = z.serve_client.Client;
 const event = z.serve_event;
+const serve_engine = z.serve_engine;
 const harness = @import("serve_harness.zig");
 const Harness = harness.Harness;
 const Stream = harness.Stream;
@@ -153,7 +154,118 @@ fn expectTurnTooLong(client: *Client, request_id: u32, tokens: usize, room: u32)
     try std.testing.expectEqualStrings(want, ev.msg.err.detail);
 }
 
+/// An `Io` whose `accept` plays a list of failures, and whose wait returns at once, so a test
+/// proves the retry without a clock. The list lives in file state, because the vtable functions
+/// receive only the userdata of the real `Io`.
+const AcceptScript = struct {
+    const AcceptError = std.Io.net.Server.AcceptError;
+
+    var failures: []const AcceptError = &.{};
+    var accepts = std.atomic.Value(u32).init(0);
+    var waits = std.atomic.Value(u32).init(0);
+    var wait_result: std.Io.Cancelable!void = {};
+    var vtable: std.Io.VTable = undefined;
+
+    fn start(script: []const AcceptError) std.Io {
+        // A back-off warns by design. The runner resets this level for each test.
+        std.testing.log_level = .err;
+        failures = script;
+        accepts.store(0, .release);
+        waits.store(0, .release);
+        wait_result = {};
+        vtable = std.testing.io.vtable.*;
+        vtable.netAccept = netAccept;
+        vtable.sleep = skipWait;
+        return .{ .userdata = std.testing.io.userdata, .vtable = &vtable };
+    }
+
+    fn netAccept(
+        userdata: ?*anyopaque,
+        server: std.Io.net.Socket.Handle,
+        options: std.Io.net.Server.AcceptOptions,
+    ) AcceptError!std.Io.net.Socket {
+        const at = accepts.fetchAdd(1, .acq_rel);
+        if (at < failures.len) return failures[at];
+
+        return std.testing.io.vtable.netAccept(userdata, server, options);
+    }
+
+    fn skipWait(userdata: ?*anyopaque, timeout: std.Io.Timeout) std.Io.Cancelable!void {
+        _ = userdata;
+        _ = timeout;
+        _ = waits.fetchAdd(1, .acq_rel);
+        return wait_result;
+    }
+};
+
+/// A listener for `acceptNext` when the script ends in a failure, so no real socket is read.
+fn unusedListener() std.Io.net.Server {
+    var server: std.Io.net.Server = undefined;
+    server.options = {};
+    return server;
+}
+
 // -- tests ------------------------------------------------------------------
+
+test "acceptAction: every error name has its action" {
+    const Row = struct { err: AcceptScript.AcceptError, want: serve_engine.AcceptAction };
+    const rows = [_]Row{
+        .{ .err = error.Canceled, .want = .stop },
+        .{ .err = error.SocketNotListening, .want = .stop },
+        .{ .err = error.WouldBlock, .want = .stop },
+        .{ .err = error.ConnectionAborted, .want = .retry_now },
+        .{ .err = error.ProtocolFailure, .want = .retry_now },
+        .{ .err = error.BlockedByFirewall, .want = .retry_now },
+        .{ .err = error.ProcessFdQuotaExceeded, .want = .back_off },
+        .{ .err = error.SystemFdQuotaExceeded, .want = .back_off },
+        .{ .err = error.SystemResources, .want = .back_off },
+        .{ .err = error.NetworkDown, .want = .back_off },
+        .{ .err = error.Unexpected, .want = .back_off },
+    };
+    // A new error name in std fails this count, so the table stays complete.
+    const names = @typeInfo(AcceptScript.AcceptError).error_set.?;
+    try std.testing.expectEqual(names.len, rows.len);
+    for (rows) |row| {
+        try std.testing.expectEqual(row.want, serve_engine.acceptAction(row.err));
+    }
+}
+
+test "acceptNext outlives each failure and waits only on a host failure" {
+    const io = AcceptScript.start(&.{
+        error.ConnectionAborted,
+        error.ProcessFdQuotaExceeded,
+        error.ProtocolFailure,
+        error.SystemResources,
+        error.Canceled,
+    });
+    var listener = unusedListener();
+    try std.testing.expectEqual(null, serve_engine.acceptNext(&listener, io));
+    try std.testing.expectEqual(5, AcceptScript.accepts.load(.acquire));
+    try std.testing.expectEqual(2, AcceptScript.waits.load(.acquire));
+}
+
+test "acceptNext ends on a cancel of the wait" {
+    const io = AcceptScript.start(&.{ error.SystemResources, error.ConnectionAborted });
+    AcceptScript.wait_result = error.Canceled;
+    var listener = unusedListener();
+    try std.testing.expectEqual(null, serve_engine.acceptNext(&listener, io));
+    try std.testing.expectEqual(1, AcceptScript.accepts.load(.acquire));
+}
+
+test "a client connects after accept failures, and a turn runs" {
+    const gpa = std.testing.allocator;
+    const io = AcceptScript.start(&.{ error.ConnectionAborted, error.ProcessFdQuotaExceeded });
+    var server = try Harness.boot(gpa, io, .tcp, .{});
+    defer server.deinit();
+
+    var client = try server.connect();
+    defer client.deinit();
+
+    const stream = try oneTurn(&client, try openGreedy(&client), prompts[0]);
+    try std.testing.expect(stream.n > 0);
+    server.stop(&client);
+    try std.testing.expectEqual(1, AcceptScript.waits.load(.acquire));
+}
 
 test "interleaved sessions match their solo reference streams over the wire" {
     var h = try Harness.boot(std.testing.allocator, std.testing.io, .tcp, .{});

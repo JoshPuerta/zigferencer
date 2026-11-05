@@ -110,3 +110,49 @@ like this one to the `launch.json` file of your workspace:
 ```
 
 Run `make debug` before you start the configuration.
+
+## Shader rules in an editor
+
+Run `zig build lint-shaders` to check the shader rules of `tools/shader_lint.zig`. Add
+`-Druntime=vulkan` to also run `glslc -Werror` and `spirv-val` on each shader. The first step needs
+no Vulkan SDK. A finding has the form `path:line:column: error: rule: message`, which is the form of
+a `glslc` diagnostic. A run with no finding prints nothing.
+
+VS Code shows these findings with no extension. Add a task like this one to the `tasks.json` file
+of your workspace. Run it from the Terminal menu, and read the Problems panel:
+
+```json
+{
+  "label": "shaders: lint",
+  "type": "shell",
+  "command": "zig",
+  "args": ["build", "lint-shaders", "-Druntime=vulkan"],
+  "group": "build",
+  "presentation": { "reveal": "silent", "clear": true },
+  "problemMatcher": {
+    "owner": "shaders",
+    "source": "shaders",
+    "fileLocation": ["autoDetect", "${workspaceFolder}"],
+    "pattern": {
+      "regexp": "^(.*\\.comp):(\\d+):(\\d+):\\s+(error|warning):\\s+(.*)$",
+      "file": 1, "line": 2, "column": 3, "severity": 4, "message": 5
+    }
+  }
+}
+```
+
+To check on each save, run `zig build lint-shaders --watch --summary all --color off` as a
+background task. Set `isBackground` to true, and add a `background` block to the matcher:
+
+```json
+"background": {
+  "activeOnStart": true,
+  "beginsPattern": "^(lint-shaders$|Build Summary)",
+  "endsPattern": "^lint-shaders (success|cached|failure|transitive failure)"
+}
+```
+
+The flag `--color off` removes the progress escape codes from the output. The flag
+`--summary all` prints two lines for a clean cycle, so the Problems panel clears a fixed finding at
+once. A watch holds the build lock while it runs, so call plain `zig` and not a wrapper that shares
+the lock with other builds.

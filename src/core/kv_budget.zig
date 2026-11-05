@@ -1347,30 +1347,32 @@ pub fn formatRamRefusal(buf: []u8, r: RamRefusal) []const u8 {
 /// `placement: 0..24 host, 24..32 resident (gpu 8/32 layers)`. A degenerate
 /// placement drops the empty span. This function writes into the caller's
 /// buffer, so the planner stays free of allocation and of I/O.
-pub fn formatPlacement(plan: PlacementPlan, buf: []u8) std.fmt.BufPrintError![]const u8 {
+pub fn formatPlacement(plan: PlacementPlan, buf: []u8) []const u8 {
+    std.debug.assert(buf.len >= placement_text_max);
     std.debug.assert(plan.split <= plan.n_layers);
 
     const gpu = plan.n_layers - plan.split;
-    if (plan.split == 0) {
-        return std.fmt.bufPrint(
+    const text = if (plan.split == 0)
+        std.fmt.bufPrint(
             buf,
             "placement: 0..{d} resident (gpu {d}/{d} layers)",
             .{ plan.n_layers, gpu, plan.n_layers },
-        );
-    }
-    if (plan.split == plan.n_layers) {
-        return std.fmt.bufPrint(
+        )
+    else if (plan.split == plan.n_layers)
+        std.fmt.bufPrint(
             buf,
             "placement: 0..{d} host (gpu {d}/{d} layers)",
             .{ plan.n_layers, gpu, plan.n_layers },
+        )
+    else
+        std.fmt.bufPrint(
+            buf,
+            "placement: 0..{d} host, {d}..{d} resident (gpu {d}/{d} layers)",
+            .{ plan.split, plan.split, plan.n_layers, gpu, plan.n_layers },
         );
-    }
 
-    return std.fmt.bufPrint(
-        buf,
-        "placement: 0..{d} host, {d}..{d} resident (gpu {d}/{d} layers)",
-        .{ plan.split, plan.split, plan.n_layers, gpu, plan.n_layers },
-    );
+    // The buffer holds the widest span form, so the write cannot fail.
+    return text catch unreachable;
 }
 
 /// Write the placement in ledger form, for example
@@ -1379,9 +1381,13 @@ pub fn formatPlacement(plan: PlacementPlan, buf: []u8) std.fmt.BufPrintError![]c
 /// The span form names which layers sit where, and this form names what they
 /// cost. This function writes into the caller's buffer, so the planner stays
 /// free of allocation and of I/O.
-pub fn formatLedger(plan: PlacementPlan, buf: []u8) std.fmt.BufPrintError![]const u8 {
+pub fn formatLedger(plan: PlacementPlan, buf: []u8) []const u8 {
+    std.debug.assert(buf.len >= placement_ledger_text_max);
+
     const mib = 1024 * 1024;
-    const head = try std.fmt.bufPrint(buf, ledger_frame, .{
+    var w: std.Io.Writer = .fixed(buf);
+    // The buffer holds the widest ledger, so no write can fail.
+    w.print(ledger_frame, .{
         plan.n_slots,
         plan.window,
         plan.weight_resident / mib,
@@ -1390,17 +1396,15 @@ pub fn formatLedger(plan: PlacementPlan, buf: []u8) std.fmt.BufPrintError![]cons
         plan.ram.blobs / mib,
         plan.ram.prefix / mib,
         plan.ram.swap_stages / mib,
-    });
-    const tail = if (plan.ram_usable) |ram_usable|
-        try std.fmt.bufPrint(
-            buf[head.len..],
-            ledger_ram_checked,
-            .{ plan.ram.spend() / mib, ram_usable / mib },
-        )
-    else
-        try std.fmt.bufPrint(buf[head.len..], ledger_ram_unchecked, .{plan.ram.spend() / mib});
+    }) catch unreachable;
+    if (plan.ram_usable) |ram_usable| {
+        const args = .{ plan.ram.spend() / mib, ram_usable / mib };
+        w.print(ledger_ram_checked, args) catch unreachable;
+    } else {
+        w.print(ledger_ram_unchecked, .{plan.ram.spend() / mib}) catch unreachable;
+    }
 
-    return buf[0 .. head.len + tail.len];
+    return w.buffered();
 }
 
 /// Write the refusal of a KV plan that the free VRAM cannot hold. One text
@@ -3757,21 +3761,21 @@ test "formatPlacement: the three span forms" {
     };
     try std.testing.expectEqualStrings(
         "placement: 0..24 host, 24..32 resident (gpu 8/32 layers)",
-        try formatPlacement(mixed, &buf),
+        formatPlacement(mixed, &buf),
     );
 
     var whole = mixed;
     whole.split = 0;
     try std.testing.expectEqualStrings(
         "placement: 0..32 resident (gpu 32/32 layers)",
-        try formatPlacement(whole, &buf),
+        formatPlacement(whole, &buf),
     );
 
     var host = mixed;
     host.split = 32;
     try std.testing.expectEqualStrings(
         "placement: 0..32 host (gpu 0/32 layers)",
-        try formatPlacement(host, &buf),
+        formatPlacement(host, &buf),
     );
 
     // The widest span the layer limit allows still fits the stated ceiling.
@@ -3780,7 +3784,7 @@ test "formatPlacement: the three span forms" {
     widest.split = limits.max_layers / 2;
     try std.testing.expectEqualStrings(
         "placement: 0..32 host, 32..64 resident (gpu 32/64 layers)",
-        try formatPlacement(widest, &buf),
+        formatPlacement(widest, &buf),
     );
 }
 
@@ -4170,7 +4174,7 @@ test "formatLedger: the widest ledger" {
         "ledger: 2 slots x 512 window | gpu 3 MiB weights + 5 MiB kv" ++
             " | host 7 MiB kv + 11 MiB blobs + 13 MiB prefix + 17 MiB stages | ram 48 MiB, " ++
             "not checked",
-        try formatLedger(round, &buf),
+        formatLedger(round, &buf),
     );
     var checked = round;
     checked.ram_usable = 1792 * mib;
@@ -4178,7 +4182,7 @@ test "formatLedger: the widest ledger" {
         "ledger: 2 slots x 512 window | gpu 3 MiB weights + 5 MiB kv" ++
             " | host 7 MiB kv + 11 MiB blobs + 13 MiB prefix + 17 MiB stages | ram 48 of " ++
             "1792 MiB usable",
-        try formatLedger(checked, &buf),
+        formatLedger(checked, &buf),
     );
 
     // The widest figure every field can carry still fits the stated ceiling,
@@ -4197,10 +4201,10 @@ test "formatLedger: the widest ledger" {
         .n_slots = std.math.maxInt(u32),
         .window = std.math.maxInt(u32),
     };
-    _ = try formatLedger(widest, &buf);
+    _ = formatLedger(widest, &buf);
     var widest_unchecked = widest;
     widest_unchecked.ram_usable = null;
-    _ = try formatLedger(widest_unchecked, &buf);
+    _ = formatLedger(widest_unchecked, &buf);
 }
 
 test "formatVramRefusal: the three families" {

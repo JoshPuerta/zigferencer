@@ -1,13 +1,7 @@
 #!/usr/bin/env python3
 """Convert `perf script` text from tools/profile.sh into views of a run.
 
-calls RAW PROBES OUTDIR
-    RAW holds uprobe hits: an entry event `zf:fN` and a return event
-    `zf:fN_ret` per call. PROBES maps each `fN` to its full symbol name.
-    The entry and the return of one call happen on one thread, and calls on
-    one thread nest, so a stack per thread pairs them. Writes calls.txt (the
-    call tree of each thread in time order), calls.json (Chrome trace events
-    for ui.perfetto.dev), and counts.txt (calls and time per function).
+Commands:
 
 offcpu RAW PID OUT
     RAW holds `sched:sched_switch` events of every CPU, each with the stack of
@@ -20,8 +14,7 @@ fold RAW DSO FILE OUT
     expands into its inline chain, read from the DWARF records through one
     batched addr2line call. A caller frame holds a return address, which can
     lie in the next inlined scope, so the lookup uses the return address minus
-    one.
-    Writes folded stacks, root first, weighted by the sample period.
+    one. Writes folded stacks, root first, weighted by the sample period.
 
 tree FOLDED CALLEES CALLERS
     FOLDED holds one stack per line, root first, then a weight. The first
@@ -34,23 +27,55 @@ tree FOLDED CALLEES CALLERS
 It uses the Python standard library alone.
 """
 
-import json
+import argparse
 import os
 import re
 import subprocess
 import sys
 from collections import Counter, defaultdict
+from typing import Iterator, NamedTuple, Optional
 
-HEADER = re.compile(r"^\s*(?P<comm>.*?)\s+(?:(?P<pid>\d+)/)?(?P<tid>\d+)\s+(?P<sec>\d+)\.(?P<frac>\d+):\s+(?:(?P<period>\d+)\s+)?(?P<event>\S+):(?:\s+(?P<rest>.*))?$")
+HEADER = re.compile(
+    r"^\s*(?P<comm>.*?)\s+(?:(?P<pid>\d+)/)?(?P<tid>\d+)\s+"
+    r"(?P<sec>\d+)\.(?P<frac>\d+):\s+(?:(?P<period>\d+)\s+)?"
+    r"(?P<event>\S+):(?:\s+(?P<rest>.*))?$"
+)
 FRAME = re.compile(r"^\s+(?P<ip>[0-9a-f]+)\s+(?P<sym>.+?)(?:\s+\((?P<dso>[^()]*)\))?$")
+SYMOFF = re.compile(r"\+0x[0-9a-f]+$")
+THREAD_ID = re.compile(r"-[?\d]+/\d+$")
+TREE_CUT = 0.005
+
+# perf prints a switch in one of two forms: the raw tracepoint fields, or the
+# libtraceevent form `prev_comm:prev_pid [prio] STATE ==> next_comm:next_pid [prio]`.
+SWITCH_FIELDS = re.compile(
+    r"prev_comm=(?P<prev_comm>.*?) prev_pid=(?P<prev>\d+) .*?prev_state=(?P<state>\S+) "
+    r"==> next_comm=.*? next_pid=(?P<next>\d+)"
+)
+SWITCH_PRETTY = re.compile(
+    r"^(?P<prev_comm>.+):(?P<prev>\d+) \[-?\d+\] (?P<state>\S+) ==> .+:(?P<next>\d+) \[-?\d+\]$"
+)
 
 
-def parse(path):
-    """Yield (comm, pid, tid, ns, event, rest, frames, period) per sample.
+class Frame(NamedTuple):
+    ip: int
+    sym: str
+    dso: str
 
-    Frames are (ip, symbol, dso) and run leaf first.
-    """
-    sample = None
+
+class Sample(NamedTuple):
+    comm: str
+    pid: Optional[int]
+    tid: int
+    ns: int
+    event: str
+    rest: str
+    frames: list[Frame]  # leaf first
+    period: int
+
+
+def parse(path: str) -> Iterator[Sample]:
+    """Yield one Sample per sample of the `perf script` text in PATH."""
+    sample: Optional[Sample] = None
     with open(path, encoding="utf-8", errors="replace") as f:
         for line in f:
             line = line.rstrip("\n")
@@ -62,108 +87,53 @@ def parse(path):
             if sample is not None and line[:1] in (" ", "\t"):
                 m = FRAME.match(line)
                 if m:
-                    sample[6].append((int(m.group("ip"), 16), m.group("sym"), m.group("dso") or ""))
+                    ip = int(m.group("ip"), 16)
+                    sample.frames.append(Frame(ip, m.group("sym"), m.group("dso") or ""))
                     continue
             m = HEADER.match(line)
             if not m:
                 continue
             if sample:
                 yield sample
-            ns = int(m.group("sec")) * 1_000_000_000 + int(m.group("frac").ljust(9, "0")[:9])
-            pid = int(m.group("pid")) if m.group("pid") else None
-            period = int(m.group("period")) if m.group("period") else 1
-            sample = (m.group("comm"), pid, int(m.group("tid")), ns, m.group("event"), m.group("rest") or "", [], period)
+            frac = m.group("frac").ljust(9, "0")[:9]
+            sample = Sample(
+                comm=m.group("comm"),
+                pid=int(m.group("pid")) if m.group("pid") else None,
+                tid=int(m.group("tid")),
+                ns=int(m.group("sec")) * 1_000_000_000 + int(frac),
+                event=m.group("event"),
+                rest=m.group("rest") or "",
+                frames=[],
+                period=int(m.group("period")) if m.group("period") else 1,
+            )
     if sample:
         yield sample
 
 
-def calls(raw, probes, outdir):
-    names = {}
-    with open(probes, encoding="utf-8") as f:
-        for line in f:
-            parts = line.rstrip("\n").split(" ", 2)
-            if len(parts) == 3:
-                names[parts[1]] = parts[2]
-
-    open_calls = defaultdict(list)  # tid -> [(event, start_ns, depth, stack)]
-    finished = []  # (start_ns, tid, depth, name, dur_ns, caller_stack)
-    events = []
-    thread_names = {}
-    unmatched = 0
-    t0 = None
-    for comm, _pid, tid, ns, event, _rest, frames, _period in parse(raw):
-        frames = [sym for _ip, sym, _dso in frames]
-        t0 = ns if t0 is None else min(t0, ns)
-        thread_names.setdefault(tid, comm)
-        probe = event.split(":")[-1]
-        if probe.endswith("_ret"):
-            base = probe[: -len("_ret")]
-            stack = open_calls[tid]
-            while stack and stack[-1][0] != base:
-                stack.pop()
-                unmatched += 1
-            if not stack:
-                unmatched += 1
-                continue
-            _, start, depth, callers = stack.pop()
-            name = names.get(base, base)
-            finished.append((start, tid, depth, name, ns - start, callers))
-            events.append({"name": name, "ph": "X", "ts": start / 1000.0, "dur": (ns - start) / 1000.0, "pid": 1, "tid": tid})
-        else:
-            stack = open_calls[tid]
-            stack.append((probe, ns, len(stack), frames[1:6]))
-    for stack in open_calls.values():
-        unmatched += len(stack)
-
-    finished.sort(key=lambda c: (c[1], c[0], c[2]))
-    with open(f"{outdir}/calls.txt", "w", encoding="utf-8") as out:
-        out.write(f"# one line per call, per thread, in time order. Indentation is the nesting of probed calls.\n")
-        out.write(f"# columns: start (ms from the first event), duration (us), call. Unmatched entries or returns: {unmatched}.\n")
-        current = None
-        for start, tid, depth, name, dur, callers in finished:
-            if tid != current:
-                current = tid
-                out.write(f"\n## thread {tid} {thread_names.get(tid, '')}\n")
-            line = f"{(start - t0) / 1e6:12.3f} {dur / 1e3:12.1f}  {'  ' * depth}{name}"
-            if depth == 0 and callers:
-                line += "   <- " + " <- ".join(callers[:3])
-            out.write(line + "\n")
-
-    for tid, comm in thread_names.items():
-        events.append({"name": "thread_name", "ph": "M", "pid": 1, "tid": tid, "args": {"name": f"{comm} {tid}"}})
-    with open(f"{outdir}/calls.json", "w", encoding="utf-8") as out:
-        json.dump({"traceEvents": events, "displayTimeUnit": "ns", "otherData": {"unmatched": unmatched}}, out)
-
-    totals = defaultdict(lambda: [0, 0, 0])  # name -> [count, total_ns, max_ns]
-    for _start, _tid, _depth, name, dur, _callers in finished:
-        t = totals[name]
-        t[0] += 1
-        t[1] += dur
-        t[2] = max(t[2], dur)
-    with open(f"{outdir}/counts.txt", "w", encoding="utf-8") as out:
-        out.write(f"{'calls':>10} {'total ms':>12} {'mean us':>10} {'max us':>10}  function (inclusive time)\n")
-        for name, (count, total, longest) in sorted(totals.items(), key=lambda kv: -kv[1][1]):
-            out.write(f"{count:>10} {total / 1e6:>12.3f} {total / count / 1e3:>10.1f} {longest / 1e3:>10.1f}  {name}\n")
-
-
-SYMOFF = re.compile(r"\+0x[0-9a-f]+$")
-
-
-def inline_chains(binary, addresses):
+def inline_chains(binary: str, addresses: set[int]) -> dict[int, list[str]]:
     """Map each address to its inline chain, innermost function first."""
-    chains = {}
+    chains: dict[int, list[str]] = {}
     if not addresses:
         return chains
     text = "\n".join(f"0x{a:x}" for a in sorted(addresses)) + "\n"
     try:
-        out = subprocess.run(["addr2line", "-e", binary, "-f", "-i", "-a"], input=text, capture_output=True, text=True, check=True).stdout
+        out = subprocess.run(
+            ["addr2line", "-e", binary, "-f", "-i", "-a"],
+            input=text,
+            capture_output=True,
+            text=True,
+            check=True,
+        ).stdout
     except FileNotFoundError:
         sys.exit("error: addr2line is not on PATH. Install binutils.")
     except subprocess.CalledProcessError as err:
         sys.stderr.write(err.stderr or "")
-        sys.exit(f"error: addr2line failed on {binary} with exit code {err.returncode}. "
-                 "Check that the cell keeps the binary under symfs/ and that the binary has DWARF records.")
-    current = None
+        sys.exit(
+            f"error: addr2line failed on {binary} with exit code {err.returncode}. "
+            "Check that the cell keeps the binary under symfs/ "
+            "and that the binary has DWARF records."
+        )
+    current: Optional[int] = None
     expect_name = True
     for line in out.splitlines():
         if line.startswith("0x") and expect_name:
@@ -180,46 +150,44 @@ def inline_chains(binary, addresses):
     return chains
 
 
-def fold(raw, dso_name, binary, out_path):
+def fold(raw: str, dso_name: str, binary: str, out_path: str) -> None:
     # One pass sums the period of each distinct stack, so memory grows with
     # the distinct stacks, not with the samples.
-    stacks = Counter()
-    for comm, pid, tid, _ns, _event, _rest, frames, period in parse(raw):
-        stacks[(comm, pid, tid, tuple(frames))] += period
-    wanted = set()
-    for (_comm, _pid, _tid, frames) in stacks:
-        for depth, (ip, _sym, dso) in enumerate(frames):
-            if dso == dso_name:
-                wanted.add(ip if depth == 0 else ip - 1)
+    stacks: Counter[tuple[str, Optional[int], int, tuple[Frame, ...]]] = Counter()
+    for s in parse(raw):
+        stacks[(s.comm, s.pid, s.tid, tuple(s.frames))] += s.period
+    wanted: set[int] = set()
+    for _comm, _pid, _tid, frames in stacks:
+        for depth, frame in enumerate(frames):
+            if frame.dso == dso_name:
+                wanted.add(frame.ip if depth == 0 else frame.ip - 1)
     chains = inline_chains(binary, wanted)
-    folded = defaultdict(int)
+    folded: dict[str, int] = defaultdict(int)
     for (comm, pid, tid, frames), period in stacks.items():
         path = [f"{comm}-{pid if pid is not None else '?'}/{tid}"]
         for depth in range(len(frames) - 1, -1, -1):
-            ip, sym, dso = frames[depth]
-            names = chains.get(ip if depth == 0 else ip - 1, []) if dso == dso_name else []
+            frame = frames[depth]
+            names: list[str] = []
+            if frame.dso == dso_name:
+                names = chains.get(frame.ip if depth == 0 else frame.ip - 1, [])
             names = [n for n in names if n != "??"]
             if names:
                 path.extend(reversed(names))
-            elif sym == "[unknown]" and dso:
-                path.append(f"[{os.path.basename(dso)}]")
+            elif frame.sym == "[unknown]" and frame.dso:
+                path.append(f"[{os.path.basename(frame.dso)}]")
             else:
-                path.append(SYMOFF.sub("", sym))
+                path.append(SYMOFF.sub("", frame.sym))
         folded[";".join(path)] += period
     with open(out_path, "w", encoding="utf-8") as out:
         for key, weight in sorted(folded.items()):
             out.write(f"{key} {weight}\n")
 
 
-THREAD_ID = re.compile(r"-[?\d]+/\d+$")
-TREE_CUT = 0.005
-
-
-def new_node():
+def new_node() -> dict:
     return {"total": 0, "self": 0, "kids": {}}
 
 
-def add_path(root, frames, weight):
+def add_path(root: dict, frames: list[str], weight: int) -> None:
     node = root
     node["total"] += weight
     for frame in frames:
@@ -228,7 +196,7 @@ def add_path(root, frames, weight):
     node["self"] += weight
 
 
-def write_tree(out, node, grand, depth, show_self):
+def write_tree(out, node: dict, grand: int, depth: int, show_self: bool) -> None:
     for name, kid in sorted(node["kids"].items(), key=lambda kv: -kv[1]["total"]):
         if kid["total"] < grand * TREE_CUT:
             continue
@@ -239,9 +207,10 @@ def write_tree(out, node, grand, depth, show_self):
         write_tree(out, kid, grand, depth + 1, show_self)
 
 
-def tree(folded, callees_path, callers_path):
+def tree(folded: str, callees_path: str, callers_path: str) -> None:
     down = new_node()
-    leaf_paths = defaultdict(lambda: defaultdict(int))  # frame -> reversed caller path -> weight
+    # frame -> reversed caller path -> weight
+    leaf_paths: dict[str, dict[tuple[str, ...], int]] = defaultdict(lambda: defaultdict(int))
     with open(folded, encoding="utf-8", errors="replace") as f:
         for line in f:
             stack, _, weight = line.rstrip("\n").rpartition(" ")
@@ -253,62 +222,79 @@ def tree(folded, callees_path, callers_path):
             leaf_paths[frames[-1]][tuple(reversed(frames[:-1]))] += int(weight)
     grand = down["total"] or 1
     with open(callees_path, "w", encoding="utf-8") as out:
-        out.write("# The call tree from the thread roots down. Columns: inclusive share, self share, frame.\n")
-        out.write(f"# Total weight {grand} (ns of CPU samples). Branches under {100 * TREE_CUT}% are dropped.\n")
+        out.write(
+            "# The call tree from the thread roots down. "
+            "Columns: inclusive share, self share, frame.\n"
+        )
+        out.write(
+            f"# Total weight {grand} (ns of CPU samples). "
+            f"Branches under {100 * TREE_CUT}% are dropped.\n"
+        )
         write_tree(out, down, grand, 0, True)
     with open(callers_path, "w", encoding="utf-8") as out:
-        out.write("# One tree per hot frame, by self share, upward through its callers. Column: share of the total.\n")
+        out.write(
+            "# One tree per hot frame, by self share, upward through its callers. "
+            "Column: share of the total.\n"
+        )
         for leaf, paths in sorted(leaf_paths.items(), key=lambda kv: -sum(kv[1].values())):
             own = sum(paths.values())
             if own < grand * TREE_CUT:
                 continue
             up = new_node()
             for path, weight in paths.items():
-                add_path(up, path, weight)
+                add_path(up, list(path), weight)
             out.write(f"\n{100.0 * own / grand:6.2f}%  {leaf}\n")
             write_tree(out, up, grand, 1, False)
 
 
-# perf prints a switch in one of two forms: the raw tracepoint fields, or the
-# libtraceevent form `prev_comm:prev_pid [prio] STATE ==> next_comm:next_pid [prio]`.
-SWITCH_FIELDS = re.compile(r"prev_comm=(?P<prev_comm>.*?) prev_pid=(?P<prev>\d+) .*?prev_state=(?P<state>\S+) ==> next_comm=.*? next_pid=(?P<next>\d+)")
-SWITCH_PRETTY = re.compile(r"^(?P<prev_comm>.+):(?P<prev>\d+) \[-?\d+\] (?P<state>\S+) ==> .+:(?P<next>\d+) \[-?\d+\]$")
-
-
-def offcpu(raw, pid, out_path):
+def offcpu(raw: str, pid: str, out_path: str) -> None:
     target = int(pid)
-    pending = {}  # tid -> (ns, folded stack)
-    folded = defaultdict(int)
-    for _comm, sample_pid, _tid, ns, _event, rest, frames, _period in parse(raw):
-        frames = [sym for _ip, sym, _dso in frames]
-        m = SWITCH_FIELDS.search(rest) or SWITCH_PRETTY.match(rest.strip())
+    pending: dict[int, tuple[int, str]] = {}  # tid -> (ns, folded stack)
+    folded: dict[str, int] = defaultdict(int)
+    for s in parse(raw):
+        syms = [f.sym for f in s.frames]
+        m = SWITCH_FIELDS.search(s.rest) or SWITCH_PRETTY.match(s.rest.strip())
         if not m:
             continue
         nxt = int(m.group("next"))
         if nxt in pending:
             start, key = pending.pop(nxt)
-            folded[key] += (ns - start) // 1000
-        if sample_pid == target:
-            stack = ";".join([m.group("prev_comm")] + list(reversed(frames)) + [f"[{m.group('state')}]"])
-            pending[int(m.group("prev"))] = (ns, stack.replace(" ", "_"))
+            folded[key] += (s.ns - start) // 1000
+        if s.pid == target:
+            state = f"[{m.group('state')}]"
+            stack = ";".join([m.group("prev_comm"), *reversed(syms), state])
+            pending[int(m.group("prev"))] = (s.ns, stack.replace(" ", "_"))
     with open(out_path, "w", encoding="utf-8") as out:
         for key, us in sorted(folded.items()):
             if us > 0:
                 out.write(f"{key} {us}\n")
 
 
-def main(argv):
-    if len(argv) == 5 and argv[1] == "calls":
-        calls(argv[2], argv[3], argv[4])
-    elif len(argv) == 6 and argv[1] == "fold":
-        fold(argv[2], argv[3], argv[4], argv[5])
-    elif len(argv) == 5 and argv[1] == "tree":
-        tree(argv[2], argv[3], argv[4])
-    elif len(argv) == 5 and argv[1] == "offcpu":
-        offcpu(argv[2], argv[3], argv[4])
+def main() -> int:
+    ap = argparse.ArgumentParser(description=__doc__.split("\n", 1)[0])
+    sub = ap.add_subparsers(dest="command", required=True)
+    p = sub.add_parser("fold", help="fold CPU samples into stacks with inlined frames")
+    p.add_argument("raw")
+    p.add_argument("dso")
+    p.add_argument("file")
+    p.add_argument("out")
+    p = sub.add_parser("tree", help="write the callee and the caller trees")
+    p.add_argument("folded")
+    p.add_argument("callees")
+    p.add_argument("callers")
+    p = sub.add_parser("offcpu", help="fold the wait time of one process")
+    p.add_argument("raw")
+    p.add_argument("pid")
+    p.add_argument("out")
+    args = ap.parse_args()
+    if args.command == "fold":
+        fold(args.raw, args.dso, args.file, args.out)
+    elif args.command == "tree":
+        tree(args.folded, args.callees, args.callers)
     else:
-        sys.exit("usage: profile_convert.py calls RAW PROBES OUTDIR | fold RAW DSO FILE OUT | tree FOLDED CALLEES CALLERS | offcpu RAW PID OUT")
+        offcpu(args.raw, args.pid, args.out)
+    return 0
 
 
 if __name__ == "__main__":
-    main(sys.argv)
+    sys.exit(main())

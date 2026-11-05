@@ -1,20 +1,54 @@
-// Gated RMSNorm for the chunked GDN prefill of Qwen3.5. It runs after
-// `gdn_chunk_scan.comp`, which writes the raw readout of every column. The norm
-// couples all D columns of one value head, and the scan splits a head across
-// workgroups, so the norm needs its own dispatch.
+// gdn_chunk_norm: the gated RMSNorm of the chunked Qwen3.5 GDN prefill, in place on the readout.
 //
-// One workgroup runs per (value head, token) at local_size_x = D (128), with lane
-// j as the value-dim index. gl_WorkGroupID.x is the value head and
-// gl_WorkGroupID.y is the token. Every lane sums the squares in ascending jj, the
-// order of the sequential path, and scales its own element in place.
+// What
+//   The kernel runs after `gdn_chunk_scan.comp`, which writes the raw readout of every column.
+//   The norm couples all D columns of one value head, and the scan splits a head across
+//   workgroups, so the norm needs its own dispatch.
 //
-// The pipeline uses the descriptor set layout of the scan, so the caller binds
-// one set for both dispatches.
+// Math
+//   For value head vh at token t, with o the raw readout row:
 //
-//   7  ssm_norm[D]         readonly  gated-RMSNorm weight
-//   8  z[T*value_dim]      readonly  output-gate projection
-//   10 o_out[T*value_dim]  in/out    raw readout in, normed and gated readout out
+//     o_j = o_j * inversesqrt(sum_{jj<D} o_jj^2 / D + eps) * ssm_norm_j * silu(z_j)
+//
+//   A positive eps keeps the `inversesqrt` argument above zero on an all-zero row.
+//
+// Schedule
+//   grid       (n_v, T, 1)
+//   workgroup  128 lanes. Workgroup (vh, t) owns the readout row of one head and token.
+//   lane       Lane j owns element t * value_dim + vh * D + j of o_out and z.
+//
+//                 vh = 0   vh = 1         vh = n_v-1
+//               +--------+--------+-----+--------+
+//     t = 0     | (0, 0) | (1, 0) | ... |        |
+//               +--------+--------+-----+--------+
+//     t = 1     | (0, 1) | (1, 1) | ... |        |
+//               +--------+--------+-----+--------+
+//
+//     pass 1  stage  each lane copies its raw element to `osh`
+//     pass 2  norm   each lane sums `osh` with jj ascending, then writes its element in place
+//
+// Memory
+//   The array holds 128 elements, the head width. The driver limit is 32 KiB.
+//
+//     osh  [128] f32  512 B  raw readout row of this (head, token)
+//
+// Hardware
+//   Waves: 128 lanes are 4 wave32 waves, one lane per head index. A barrier waits for all four.
+//   Pass 1: the lanes of a wave read adjacent elements of o_out, so the loads coalesce.
+//   Pass 2: every lane runs the same 128-term sum over LDS, redundant work that holds the order.
+//
+// Numerics
+//   Tolerance: `GdnChunkParallel` declares `.relative = 1e-4`. The GPU `exp` and `inversesqrt`
+//   differ from the CPU intrinsics. Every lane sums the squares with jj ascending, the order of
+//   the sequential path.
+//
+// Bindings
+//   7     readonly   f32  ssm_norm[D]           gated-RMSNorm weight
+//   8     readonly   f32  z[T * value_dim]      output-gate projection
+//   10    readwrite  f32  o_out[T * value_dim]  raw readout in, normed and gated readout out
 //   push  uint D, n_k, n_v, n_tokens, float eps
+//   The pipeline uses the descriptor set layout of the scan, so the caller binds one set for
+//   both dispatches. T = n_tokens and value_dim = n_v * D.
 
 #version 450
 
@@ -33,10 +67,10 @@ layout(push_constant) uniform Params {
     float eps;
 } p;
 
-shared float osh[128];            // the raw readout row of this (head, token)
+shared float osh[128];  // the raw readout row of this (head, token)
 
 // -- helpers ----------------------------------------------------------------
-float silu(float x)     { return x / (1.0 + exp(-x)); }
+float silu(float x) { return x / (1.0 + exp(-x)); }
 
 // -- main -------------------------------------------------------------------
 void main() {
@@ -47,11 +81,17 @@ void main() {
     uint value_dim = p.n_v * D;
     uint idx = t * value_dim + vh * D + j;
 
+    // Pass 1: stage the raw readout row in LDS.
     float orj = o_out[idx];
     osh[j] = orj;
     barrier();
+
+    // Pass 2: sum the squares with `jj` ascending, then scale this element in place.
     float sso = 0.0;
-    for (uint jj = 0u; jj < D; jj++) sso += osh[jj] * osh[jj];
+    for (uint jj = 0u; jj < D; jj++) {
+        sso += osh[jj] * osh[jj];
+    }
+
     float inv = inversesqrt(sso / float(D) + p.eps);
     float zr = z[idx];
     o_out[idx] = orj * inv * ssm_norm[j] * silu(zr);

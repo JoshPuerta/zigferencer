@@ -65,6 +65,7 @@ pub const serve_event = @import("serve/event.zig");
 pub const serve_residency = @import("serve/residency.zig");
 const serve_scheduler = @import("serve/scheduler.zig");
 pub const serve_prefill_chunk = @import("serve/prefill_chunk.zig");
+pub const serve_engine = @import("serve/engine.zig");
 pub const serve_server = @import("serve/server.zig");
 pub const serve_client = @import("serve/client.zig");
 pub const serve_openai_http = @import("serve/openai/http_server.zig");
@@ -200,13 +201,15 @@ fn isUserError(err: anyerror) bool {
         error.NotAGguf,
         // The loader already logged the file, the tensor, and the dtype tag it
         // cannot frame.
-        error.UnsupportedTensorDtype,
+        loader.LoadError.UnsupportedTensorDtype,
+        // The runner init already logged the tensor and the dtype no kernel reads.
+        error.UnsupportedWeightDtype,
         // The loader already logged the file and the tensor whose shape or range it refused.
-        error.BadTensorShape,
-        error.TensorSizeOverflow,
-        error.NotEnoughBytes,
+        loader.LoadError.BadTensorShape,
+        loader.LoadError.TensorSizeOverflow,
+        loader.LoadError.NotEnoughBytes,
         // The loader already logged the file and the RoPE scaling type.
-        error.UnsupportedRopeScaling,
+        loader.LoadError.UnsupportedRopeScaling,
         // backend/arch refusals: the handler names the build that works.
         error.UnsupportedServeBackend,
         error.UnsupportedArchForBackend,
@@ -318,6 +321,7 @@ test {
     _ = sampler;
     _ = @import("runtime/generate.zig");
     _ = tensor_lookup;
+    _ = @import("runtime/linear_dispatch.zig");
     _ = parallel;
     _ = pool;
     _ = hwinfo;

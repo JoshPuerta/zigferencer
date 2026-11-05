@@ -138,7 +138,7 @@ pub fn buildFromParsed(arena: Allocator, p: parser.Parsed) Error!Vocab {
     const token_types = try lookupI32Array(p, "tokenizer.ggml.token_type");
     // BOS id is optional: ChatML models (Qwen3.5) set add_bos_token=false and
     // can omit it. Whether the encoder prepends it is the model's call (addBos).
-    const bos = lookupU32(p, "tokenizer.ggml.bos_token_id") catch 0;
+    const bos = try lookupU32Or(p, "tokenizer.ggml.bos_token_id", 0);
     const eos = try lookupU32(p, "tokenizer.ggml.eos_token_id");
     const add_bos = addBos(p);
     const pre = preType(p);
@@ -334,10 +334,19 @@ fn lookupU32(p: parser.Parsed, key: []const u8) Error!u32 {
     const v = lookupKv(p, key) orelse return error.MissingTokenizerKey;
     return switch (v.*) {
         .u32_val => |u| u,
-        .u64_val => |u| @intCast(u),
-        .i32_val => |i| @intCast(i),
-        .i64_val => |i| @intCast(i),
+        .u64_val => |u| std.math.cast(u32, u) orelse error.WrongTokenizerKeyType,
+        .i32_val => |i| std.math.cast(u32, i) orelse error.WrongTokenizerKeyType,
+        .i64_val => |i| std.math.cast(u32, i) orelse error.WrongTokenizerKeyType,
         else => error.WrongTokenizerKeyType,
+    };
+}
+
+/// The value of an optional key. Only an absent key takes `default`, so a key of the wrong
+/// type fails and does not fall back in silence.
+fn lookupU32Or(p: parser.Parsed, key: []const u8, default: u32) Error!u32 {
+    return lookupU32(p, key) catch |err| switch (err) {
+        error.MissingTokenizerKey => default,
+        else => err,
     };
 }
 
@@ -350,6 +359,39 @@ fn parsedWithKvs(kvs: []const parser.Kv) parser.Parsed {
 test "pairKey packs left/right into u64" {
     try std.testing.expectEqual(@as(u64, (1 << 32) | 2), pairKey(1, 2));
     try std.testing.expectEqual(@as(u64, (0xFF << 32) | 0xAB), pairKey(0xFF, 0xAB));
+}
+
+test "buildFromParsed: an absent BOS key takes 0, and a BOS key of the wrong type refuses" {
+    var arena_state: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena_state.deinit();
+
+    const arena = arena_state.allocator();
+    const tokens = [_][]const u8{ "a", "b" };
+    const types = [_]i32{ 1, 1 };
+    const required = [_]parser.Kv{
+        .{ .key = "tokenizer.ggml.tokens", .value = .{ .array = .{ .strings = &tokens } } },
+        .{ .key = "tokenizer.ggml.merges", .value = .{ .array = .{ .strings = &.{} } } },
+        .{ .key = "tokenizer.ggml.token_type", .value = .{ .array = .{ .i32s = &types } } },
+        .{ .key = "tokenizer.ggml.eos_token_id", .value = .{ .u32_val = 1 } },
+    };
+    const vocab = try buildFromParsed(arena, parsedWithKvs(&required));
+    try std.testing.expectEqual(0, vocab.bos_id);
+
+    const wrong_type = required ++ [_]parser.Kv{
+        .{ .key = "tokenizer.ggml.bos_token_id", .value = .{ .string = "1" } },
+    };
+    try std.testing.expectError(
+        error.WrongTokenizerKeyType,
+        buildFromParsed(arena, parsedWithKvs(&wrong_type)),
+    );
+
+    const negative = required ++ [_]parser.Kv{
+        .{ .key = "tokenizer.ggml.bos_token_id", .value = .{ .i32_val = -1 } },
+    };
+    try std.testing.expectError(
+        error.WrongTokenizerKeyType,
+        buildFromParsed(arena, parsedWithKvs(&negative)),
+    );
 }
 
 test "addBos: llama3-family pre defaults true, an explicit key wins, else false" {

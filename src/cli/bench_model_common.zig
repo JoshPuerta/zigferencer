@@ -105,7 +105,7 @@ pub const Options = struct {
         .chat = args.Doc{ .group = "common", .text = "apply the chat template of the model" },
         .json = args.Doc{
             .group = "common",
-            .text = "machine-readable output (tools/bench_model_all.sh).\nEach run adds " ++
+            .text = "machine-readable output (tools/gate.sh).\nEach run adds " ++
                 "itl_by_depth, the mean ITL per 512 KV positions",
         },
         .prompt_tokens = args.Doc{
@@ -122,7 +122,7 @@ pub const Options = struct {
                 "only). Needs a --gpu-layers count",
         },
         .profile_cpu_decode = args.Doc{
-            .group = "profiling (cpu, hot-trace build only: OPT=Debug or TRACE=1)",
+            .group = "profiling (cpu, hot-trace build only: Debug or -Dtrace=true)",
             .text = "per-op CPU decode timer. Print the parallel and serial shares, exit",
         },
         .profile_prefill = args.Doc{

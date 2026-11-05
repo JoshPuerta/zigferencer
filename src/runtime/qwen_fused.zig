@@ -42,6 +42,7 @@ const attn_split = @import("../core/attn_split.zig");
 const attn_record = @import("attn_record.zig");
 const time = @import("../core/time.zig");
 const step_row = @import("step_row.zig");
+const linear_dispatch = @import("linear_dispatch.zig");
 const tensor_lookup = @import("tensor_lookup.zig");
 const gpu_profile = @import("gpu_profile.zig");
 const core_log = @import("../core/log.zig");
@@ -548,6 +549,7 @@ pub const QwenFusedRunner = struct {
 
         const g = c.gdn orelse return error.NotQwen;
         const refs = loaded.tensors;
+        try linear_dispatch.requireWeights(refs, c.n_layers);
         // Slots bound breadth (resident conversations), streams bound width
         // (rows per tick), and a row owns a slot.
         std.debug.assert(plan.n_slots >= 1);

@@ -1,26 +1,66 @@
-// Conv1d, SiLU, and L2-norm frontend for the chunked GDN prefill of Qwen3.5. It
-// pairs with `gdn_chunk_scan.comp`, which consumes what this kernel writes, and
-// it mirrors the conv and L2-norm front of ops/gdn.zig step().
+// gdn_chunk_conv: the conv1d, SiLU, and L2-norm frontend of the chunked Qwen3.5 GDN prefill.
 //
-// One workgroup runs per KEY head at local_size_x = D (128), with lane j as the
-// head-dim index. Each workgroup steps over the T chunk tokens in order, because
-// the causal conv ring carries token t into token t+1. Each (key head, lane) owns
-// disjoint conv channels: the q and k of key head ki, plus the v of every value
-// head vh = ki + vk*n_k. Advancing conv_state therefore has no cross-workgroup
-// race. The kernel writes the normed and scaled q_n and k_n of this key head and
-// the convolved v_conv of its value heads.
+// What
+//   The kernel runs first in a chunk. It mirrors the conv and L2-norm front of `step` in
+//   ops/gdn.zig. It writes the normed and scaled q_n and k_n of each key head and the convolved
+//   v_conv of each value head. `gdn_chunk_scan.comp` consumes all three.
 //
-//   0 qkv[T*convDim]            readonly  [q(key_dim)|k(key_dim)|v(value_dim)] per token
-//   1 conv_w[K*convDim]         readonly  depthwise conv weights, w[c*K + tap]
-//   2 conv_state[(K-1)*convDim] in/out    conv ring, [t*convDim + c], t=0 oldest
-//   3 q_n[T*key_dim]            writeonly normed and 1/sqrt(D)-scaled q
-//   4 k_n[T*key_dim]            writeonly normed k
-//   5 v_conv[T*value_dim]       writeonly convolved v
+// Math
+//   Channel c holds a ring of its K - 1 last inputs, with ring[0, c] the oldest:
+//
+//     y_c = silu(sum_{tap<K-1} conv_w[c * K + tap] ring[tap, c] + conv_w[c * K + K-1] x_c)
+//
+//   The ring then shifts by one, and x_c enters at ring[K-2, c]. For key head ki at token t:
+//
+//     q_n[t] = q * inversesqrt(q . q + eps) * inversesqrt(D)
+//     k_n[t] = k * inversesqrt(k . k + eps)
+//
+//   A positive eps keeps each `inversesqrt` argument above zero on an all-zero head.
+//
+// Schedule
+//   grid       (n_k, 1, 1)
+//   workgroup  128 lanes. Workgroup ki owns key head ki and every vh = ki + vk * n_k.
+//   lane       Lane j owns head index j of q, k, and each v.
+//
+//                  j = 0      j = 1            j = 127
+//                +----------+----------+-----+----------+
+//     ki = 0     | lane 0   | lane 1   | ... | lane 127 |  workgroup 0
+//                +----------+----------+-----+----------+
+//     ki = 1     | lane 0   | lane 1   | ... | lane 127 |  workgroup 1
+//                +----------+----------+-----+----------+
+//
+//   Lane j of workgroup ki owns channel ki * D + j of q, key_dim + ki * D + j of k, and
+//   2 * key_dim + vh * D + j of each v. The channels of two lanes are disjoint, so `conv_state`
+//   advances with no race. The ring carries token t into token t + 1, so the tokens run in order:
+//
+//     pass 1  conv  each lane convolves its channels, writes v_conv, and stages q and k in LDS
+//     pass 2  norm  each lane sums q . q and k . k over LDS, then writes q_n and k_n
+//
+// Memory
+//   The arrays hold 128 elements, the head width, and take 1 KiB. The driver limit is 32 KiB.
+//
+//     qsh, ksh  [128] f32 each  512 B each  conv output of the key head at one token
+//
+// Hardware
+//   Waves: 128 lanes are 4 wave32 waves, one lane per head index. A barrier waits for all four.
+//   Pass 1: the lanes of a wave read and write adjacent channels of `conv_state`, so those
+//   accesses coalesce. The `conv_w` reads of adjacent lanes sit K floats apart.
+//   Pass 2: a barrier ends each token, so the next token does not overwrite a row in use.
+//
+// Numerics
+//   Tolerance: `GdnChunkParallel` declares `.relative = 1e-4`. The GPU `exp` and `inversesqrt`
+//   differ from the CPU intrinsics. Each lane sums over LDS with i ascending, the CPU order.
+//
+// Bindings
+//   0     readonly   f32  qkv[T * convDim]             q | k | v of each token
+//   1     readonly   f32  conv_w[K * convDim]          depthwise conv weights, [c * K + tap]
+//   2     readwrite  f32  conv_state[(K-1) * convDim]  conv ring, [t * convDim + c], t = 0 oldest
+//   3     writeonly  f32  q_n[T * key_dim]             normed and 1 / sqrt(D) scaled q
+//   4     writeonly  f32  k_n[T * key_dim]             normed k
+//   5     writeonly  f32  v_conv[T * value_dim]        convolved v
 //   push  uint D, n_k, n_v, K, n_tokens, float eps
-//
-// The GPU `exp` and `inversesqrt` differ from the CPU intrinsics, so the result
-// is not bit-exact. The Zig wrapper `GdnChunkParallel` declares
-// `.relative = 1e-4`.
+//   T = n_tokens, key_dim = n_k * D, value_dim = n_v * D, and convDim = 2 * key_dim + value_dim.
+//   D must be 128, and n_v must be a multiple of n_k.
 
 #version 450
 
@@ -49,15 +89,20 @@ shared float ksh[128];
 // -- helpers ----------------------------------------------------------------
 float silu(float x) { return x / (1.0 + exp(-x)); }
 
-// Causal depthwise conv (K taps) and SiLU for channel c at batched row qkv_off.
-// It advances conv_state[:,c], one ring that carries across the tokens of the
-// chunk.
+// Causal conv of K taps and SiLU for channel c at batched row `qkv_off`. It advances the ring of
+// channel c, and the ring carries across the tokens of the chunk.
 float conv_silu(uint c, uint qkv_off, uint K, uint convDim) {
     float xin = qkv[qkv_off + c];
     float acc = 0.0;
-    for (uint t = 0u; t + 1u < K; t++) acc += conv_w[c * K + t] * conv_state[t * convDim + c];
+    for (uint t = 0u; t + 1u < K; t++) {
+        acc += conv_w[c * K + t] * conv_state[t * convDim + c];
+    }
+
     acc += conv_w[c * K + (K - 1u)] * xin;
-    for (uint t = 0u; t + 2u < K; t++) conv_state[t * convDim + c] = conv_state[(t + 1u) * convDim + c];
+    for (uint t = 0u; t + 2u < K; t++) {
+        conv_state[t * convDim + c] = conv_state[(t + 1u) * convDim + c];
+    }
+
     conv_state[(K - 2u) * convDim + c] = xin;
     return silu(acc);
 }
@@ -80,21 +125,30 @@ void main() {
 
     for (uint t = 0u; t < T; t++) {
         uint qkv_off = t * convDim;
+
+        // Pass 1: conv and SiLU of the q and k of this key head and the v of its value heads.
         float qv = conv_silu(ki * D + j, qkv_off, K, convDim);
         float kv = conv_silu(key_dim + ki * D + j, qkv_off, K, convDim);
         for (uint vk = 0u; vk < v_per_k; vk++) {
             uint vh = ki + vk * nk;
-            v_conv[t * value_dim + vh * D + j] = conv_silu(2u * key_dim + vh * D + j, qkv_off, K, convDim);
+            v_conv[t * value_dim + vh * D + j] =
+                conv_silu(2u * key_dim + vh * D + j, qkv_off, K, convDim);
         }
 
         qsh[j] = qv;
         ksh[j] = kv;
         barrier();
+
+        // Pass 2: L2-norm q and k over the key head, and scale q by 1/sqrt(D).
         float ssq = 0.0;
         float ssk = 0.0;
-        for (uint i = 0u; i < D; i++) { ssq += qsh[i] * qsh[i]; ssk += ksh[i] * ksh[i]; }
+        for (uint i = 0u; i < D; i++) {
+            ssq += qsh[i] * qsh[i];
+            ssk += ksh[i] * ksh[i];
+        }
+
         q_n[t * key_dim + ki * D + j] = qsh[j] * inversesqrt(ssq + eps) * q_scale;
         k_n[t * key_dim + ki * D + j] = ksh[j] * inversesqrt(ssk + eps);
-        barrier(); // before next token overwrites qsh/ksh
+        barrier();  // every lane is done with `qsh` and `ksh` before the next token overwrites them
     }
 }

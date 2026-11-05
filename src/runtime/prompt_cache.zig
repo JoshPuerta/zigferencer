@@ -430,8 +430,9 @@ pub const PromptCache = struct {
     /// `worthwhile` limit. RAM gates on `restore_ns`, the measured symmetric
     /// save. Disk, when enabled, gates on a higher bar that adds the estimated
     /// read-back of this blob at the observed disk bandwidth. This function
-    /// copies the transient buffers of the caller. It returns true when the
-    /// snapshot reached at least one tier.
+    /// copies the transient buffers of the caller. Both tiers are optional, so a
+    /// failure in one logs a line and the other still runs. It returns true
+    /// when the snapshot reached at least one tier.
     pub fn admit(
         self: *PromptCache,
         key: u64,
@@ -440,19 +441,11 @@ pub const PromptCache = struct {
         last_logits: []const f32,
         prefill_ns: u64,
         restore_ns: u64,
-    ) !bool {
+    ) bool {
         self.last_admit_ram = false;
         self.last_admit_disk = false;
         if (worthwhile(prefill_ns, restore_ns)) {
-            self.insertEntry(.{
-                .key = key,
-                .tokens = try self.gpa.dupe(u32, tokens),
-                .n = @intCast(tokens.len),
-                .blob = try self.gpa.dupe(u8, blob),
-                .last_logits = try self.gpa.dupe(f32, last_logits),
-                .last_used = 0, // set by insertEntry
-            }) catch {};
-            self.last_admit_ram = true;
+            self.last_admit_ram = self.admitRam(key, tokens, blob, last_logits);
         }
 
         if (self.dir != null) {
@@ -476,6 +469,49 @@ pub const PromptCache = struct {
         }
 
         return self.last_admit_ram or self.last_admit_disk;
+    }
+
+    /// Copy a snapshot into the RAM tier. It returns true when the tier holds the entry.
+    fn admitRam(
+        self: *PromptCache,
+        key: u64,
+        tokens: []const u32,
+        blob: []const u8,
+        last_logits: []const f32,
+    ) bool {
+        const entry = self.copyEntry(key, tokens, blob, last_logits) catch |err| {
+            log.debug("ram admit: {x:0>16}, copy failed: {t}", .{ key, err });
+            return false;
+        };
+        self.insertEntry(entry) catch |err| {
+            log.debug("ram admit: {x:0>16}, insert failed: {t}", .{ key, err });
+            return false;
+        };
+        return true;
+    }
+
+    fn copyEntry(
+        self: *PromptCache,
+        key: u64,
+        tokens: []const u32,
+        blob: []const u8,
+        last_logits: []const f32,
+    ) Allocator.Error!Entry {
+        const e_tokens = try self.gpa.dupe(u32, tokens);
+        errdefer self.gpa.free(e_tokens);
+
+        const e_blob = try self.gpa.dupe(u8, blob);
+        errdefer self.gpa.free(e_blob);
+
+        const e_logits = try self.gpa.dupe(f32, last_logits);
+        return .{
+            .key = key,
+            .tokens = e_tokens,
+            .n = @intCast(tokens.len),
+            .blob = e_blob,
+            .last_logits = e_logits,
+            .last_used = 0, // set by insertEntry
+        };
     }
 
     /// Insert an already-owned Entry into the RAM tier, evicting LRU to stay
@@ -610,7 +646,7 @@ pub const PromptCache = struct {
         const tok_bytes = std.mem.sliceAsBytes(tokens);
         const log_bytes = std.mem.sliceAsBytes(last_logits);
         const total = @sizeOf(DiskHeader) + tok_bytes.len + log_bytes.len + blob.len;
-        try self.diskEvictToFit(total);
+        self.diskEvictToFit(total);
 
         var h = std.hash.Fnv1a_64.init();
         h.update(tok_bytes);
@@ -714,7 +750,7 @@ pub const PromptCache = struct {
     /// never deleted, which lets many models, backends, and processes share one
     /// cache directory. Best-effort: a directory error stops the eviction, and
     /// a per-file IO error skips that file.
-    fn diskEvictToFit(self: *PromptCache, need: usize) !void {
+    fn diskEvictToFit(self: *PromptCache, need: usize) void {
         const io = self.io orelse return;
         var scan = self.scanOwnNamespace(io) orelse return;
         // Each pass deletes exactly one own file, so the own-file count of the
@@ -924,20 +960,20 @@ test "PromptCache: disk pressure evicts the oldest file of the same namespace" {
     // Prefill seconds against restore milliseconds clears both admission bars
     // at any plausible disk bandwidth.
     try std.testing.expect(
-        try cache.admit(prefixKey(fp, &t1), &t1, &blob, &logits, 10_000_000_000, 1_000_000),
+        cache.admit(prefixKey(fp, &t1), &t1, &blob, &logits, 10_000_000_000, 1_000_000),
     );
     try std.testing.expect(cache.last_admit_disk);
     try testSetMtime(io, dir, prefixKey(fp, &t1), 1_000_000_000);
 
     try std.testing.expect(
-        try cache.admit(prefixKey(fp, &t2), &t2, &blob, &logits, 10_000_000_000, 1_000_000),
+        cache.admit(prefixKey(fp, &t2), &t2, &blob, &logits, 10_000_000_000, 1_000_000),
     );
     try std.testing.expect(cache.last_admit_disk);
     try testSetMtime(io, dir, prefixKey(fp, &t2), 2_000_000_000);
 
     // Two files already fill the budget, so the third forces one eviction.
     try std.testing.expect(
-        try cache.admit(prefixKey(fp, &t3), &t3, &blob, &logits, 10_000_000_000, 1_000_000),
+        cache.admit(prefixKey(fp, &t3), &t3, &blob, &logits, 10_000_000_000, 1_000_000),
     );
     try std.testing.expect(cache.last_admit_disk);
     try testSetMtime(io, dir, prefixKey(fp, &t3), 3_000_000_000);
@@ -989,13 +1025,13 @@ test "PromptCache: disk eviction never counts or deletes a foreign namespace" {
     // B lays down two files, both older than anything A writes. A blind policy
     // that summed the directory evicts these first.
     try std.testing.expect(
-        try b.admit(prefixKey(fp_b, &t1), &t1, &blob, &logits, 10_000_000_000, 1_000_000),
+        b.admit(prefixKey(fp_b, &t1), &t1, &blob, &logits, 10_000_000_000, 1_000_000),
     );
     try std.testing.expect(b.last_admit_disk);
     try testSetMtime(io, dir, prefixKey(fp_b, &t1), 1_000_000_000);
     b.disk_budget = 1 << 20; // hold both B files while A takes the pressure
     try std.testing.expect(
-        try b.admit(prefixKey(fp_b, &t2), &t2, &blob, &logits, 10_000_000_000, 1_000_000),
+        b.admit(prefixKey(fp_b, &t2), &t2, &blob, &logits, 10_000_000_000, 1_000_000),
     );
     try std.testing.expect(b.last_admit_disk);
     try testSetMtime(io, dir, prefixKey(fp_b, &t2), 2_000_000_000);
@@ -1009,7 +1045,7 @@ test "PromptCache: disk eviction never counts or deletes a foreign namespace" {
     };
     const a_tokens = [_][]const u32{ &t1, &t2, &t3, &t4 };
     for (a_keys, a_tokens, 0..) |k, toks, i| {
-        try std.testing.expect(try a.admit(k, toks, &blob, &logits, 10_000_000_000, 1_000_000));
+        try std.testing.expect(a.admit(k, toks, &blob, &logits, 10_000_000_000, 1_000_000));
         try std.testing.expect(a.last_admit_disk);
         try testSetMtime(io, dir, k, @as(i96, @intCast(3 + i)) * 1_000_000_000);
     }
@@ -1027,7 +1063,7 @@ test "PromptCache: disk eviction never counts or deletes a foreign namespace" {
     try testSetMtime(io, dir, a_keys[3], 500_000_000);
     b.disk_budget = budget;
     try std.testing.expect(
-        try b.admit(prefixKey(fp_b, &t3), &t3, &blob, &logits, 10_000_000_000, 1_000_000),
+        b.admit(prefixKey(fp_b, &t3), &t3, &blob, &logits, 10_000_000_000, 1_000_000),
     );
     try std.testing.expect(b.last_admit_disk);
     try testSetMtime(io, dir, prefixKey(fp_b, &t3), 9_000_000_000);
@@ -1079,8 +1115,8 @@ test "PromptCache: admit, hit, collision-miss, LRU eviction" {
     const kc = prefixKey(fp, &tc);
 
     // Admit a and b (cost: prefill >> restore).
-    try std.testing.expect(try cache.admit(ka, &ta, &blob, &logits, 100_000_000, 1_000_000));
-    try std.testing.expect(try cache.admit(kb, &tb, &blob, &logits, 100_000_000, 1_000_000));
+    try std.testing.expect(cache.admit(ka, &ta, &blob, &logits, 100_000_000, 1_000_000));
+    try std.testing.expect(cache.admit(kb, &tb, &blob, &logits, 100_000_000, 1_000_000));
 
     // Hit a (also bumps it as most-recently-used).
     try std.testing.expect(cache.lookup(ka, &ta) != null);
@@ -1089,7 +1125,7 @@ test "PromptCache: admit, hit, collision-miss, LRU eviction" {
     try std.testing.expect(cache.lookup(ka, &tb) == null);
 
     // Admitting c evicts the LRU (b, since a was just hit).
-    try std.testing.expect(try cache.admit(kc, &tc, &blob, &logits, 100_000_000, 1_000_000));
+    try std.testing.expect(cache.admit(kc, &tc, &blob, &logits, 100_000_000, 1_000_000));
     try std.testing.expect(cache.lookup(kb, &tb) == null); // evicted
     try std.testing.expect(cache.lookup(ka, &ta) != null); // kept
     try std.testing.expect(cache.lookup(kc, &tc) != null); // newest
@@ -1097,8 +1133,91 @@ test "PromptCache: admit, hit, collision-miss, LRU eviction" {
     // Not worthwhile -> not admitted, cache unchanged.
     const td = [_]u32{ 10, 11, 12 };
     try std.testing.expect(
-        !try cache.admit(prefixKey(fp, &td), &td, &blob, &logits, 1_000_000, 1_000_000),
+        !cache.admit(prefixKey(fp, &td), &td, &blob, &logits, 1_000_000, 1_000_000),
     );
+}
+
+/// An allocator that fails one allocation, so the allocations after it succeed. The
+/// `FailingAllocator` of std fails each allocation after its index.
+const FailOnce = struct {
+    left: usize,
+
+    const vtable: Allocator.VTable = .{
+        .alloc = alloc,
+        .resize = Allocator.noResize,
+        .remap = Allocator.noRemap,
+        .free = free,
+    };
+
+    fn allocator(self: *FailOnce) Allocator {
+        return .{ .ptr = self, .vtable = &vtable };
+    }
+
+    fn alloc(ctx: *anyopaque, len: usize, a: std.mem.Alignment, ra: usize) ?[*]u8 {
+        const self: *FailOnce = @ptrCast(@alignCast(ctx));
+        const fail = self.left == 0;
+        self.left -%= 1;
+        if (fail) return null;
+
+        return std.testing.allocator.rawAlloc(len, a, ra);
+    }
+
+    fn free(ctx: *anyopaque, memory: []u8, a: std.mem.Alignment, ra: usize) void {
+        _ = ctx;
+        std.testing.allocator.rawFree(memory, a, ra);
+    }
+};
+
+test "PromptCache: admit under OOM leaks nothing and reports what the RAM tier holds" {
+    const fp = modelFingerprint("m", 1);
+    const blob = [_]u8{7} ** 256;
+    const logits = [_]f32{ 0, 1 };
+    const tokens = [_]u32{ 1, 2, 3 };
+    const key = prefixKey(fp, &tokens);
+    // An admission makes four allocations: tokens, blob, logits, and the entry list.
+    const allocations = 4;
+    for (0..allocations + 1) |fail_index| {
+        var failing: std.testing.FailingAllocator = .init(
+            std.testing.allocator,
+            .{ .fail_index = fail_index },
+        );
+        var cache = PromptCache.init(failing.allocator(), 1 << 20);
+        defer cache.deinit();
+
+        const admitted = cache.admit(key, &tokens, &blob, &logits, 100_000_000, 1_000_000);
+        try std.testing.expectEqual(fail_index == allocations, admitted);
+        try std.testing.expectEqual(admitted, cache.last_admit_ram);
+        try std.testing.expectEqual(@intFromBool(admitted), cache.entries.items.len);
+        try std.testing.expectEqual(admitted, cache.lookup(key, &tokens) != null);
+    }
+}
+
+test "PromptCache: a RAM tier out of memory leaves the disk tier its turn" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var dirbuf: [128]u8 = undefined;
+    const dir = try std.fmt.bufPrint(&dirbuf, ".zig-cache/tmp/{s}/pc", .{&tmp.sub_path});
+
+    const fp = modelFingerprint("m", 1);
+    const blob = [_]u8{7} ** 256;
+    const logits = [_]f32{ 0, 1 };
+    const tokens = [_]u32{ 1, 2, 3 };
+    const key = prefixKey(fp, &tokens);
+    // The RAM tier takes the first four allocations of an admission.
+    for (0..4) |fail_at| {
+        var once: FailOnce = .{ .left = std.math.maxInt(usize) };
+        var cache = PromptCache.init(once.allocator(), 1 << 20);
+        defer cache.deinit();
+
+        try cache.enableDisk(io, dir, 1 << 20, fp);
+        once.left = fail_at;
+        const admitted = cache.admit(key, &tokens, &blob, &logits, 10_000_000_000, 1_000_000);
+        try std.testing.expect(admitted);
+        try std.testing.expect(!cache.last_admit_ram);
+        try std.testing.expect(cache.last_admit_disk);
+    }
 }
 
 test "PromptCache: longest-prefix match" {
@@ -1115,7 +1234,7 @@ test "PromptCache: longest-prefix match" {
     const b2 = 2; // prefix [1,2]
     const b4 = 4; // prefix [1,2,3,4]
     try std.testing.expect(
-        try cache.admit(
+        cache.admit(
             prefixKey(fp, seq[0..b2]),
             seq[0..b2],
             &blob,
@@ -1125,7 +1244,7 @@ test "PromptCache: longest-prefix match" {
         ),
     );
     try std.testing.expect(
-        try cache.admit(
+        cache.admit(
             prefixKey(fp, seq[0..b4]),
             seq[0..b4],
             &blob,
@@ -1170,7 +1289,7 @@ test "PromptCache: best-prefix match without caller boundaries" {
     // The same two saved prefixes, but the caller passes no boundary list.
     const seq = [_]u32{ 1, 2, 3, 4, 5, 6 };
     try std.testing.expect(
-        try cache.admit(
+        cache.admit(
             prefixKey(fp, seq[0..2]),
             seq[0..2],
             &blob,
@@ -1180,7 +1299,7 @@ test "PromptCache: best-prefix match without caller boundaries" {
         ),
     );
     try std.testing.expect(
-        try cache.admit(
+        cache.admit(
             prefixKey(fp, seq[0..4]),
             seq[0..4],
             &blob,
@@ -1221,16 +1340,16 @@ test "PromptCache: best-prefix hit counts as a use" {
     const tb = [_]u32{ 4, 5, 6 };
     const tc = [_]u32{ 7, 8, 9 };
     try std.testing.expect(
-        try cache.admit(prefixKey(fp, &ta), &ta, &blob, &logits, 100_000_000, 1_000_000),
+        cache.admit(prefixKey(fp, &ta), &ta, &blob, &logits, 100_000_000, 1_000_000),
     );
     try std.testing.expect(
-        try cache.admit(prefixKey(fp, &tb), &tb, &blob, &logits, 100_000_000, 1_000_000),
+        cache.admit(prefixKey(fp, &tb), &tb, &blob, &logits, 100_000_000, 1_000_000),
     );
 
     // The prefix hit bumps a, so admitting c evicts b instead.
     try std.testing.expect(cache.lookupBestPrefix(&ta) != null);
     try std.testing.expect(
-        try cache.admit(prefixKey(fp, &tc), &tc, &blob, &logits, 100_000_000, 1_000_000),
+        cache.admit(prefixKey(fp, &tc), &tc, &blob, &logits, 100_000_000, 1_000_000),
     );
     try std.testing.expect(cache.lookup(prefixKey(fp, &tb), &tb) == null); // evicted
     try std.testing.expect(cache.lookup(prefixKey(fp, &ta), &ta) != null); // kept
@@ -1257,7 +1376,7 @@ test "PromptCache: the disk index survives a new instance and promotes on best-p
 
         try cache.enableDisk(io, dir, 1 << 20, fp);
         try std.testing.expect(
-            try cache.admit(
+            cache.admit(
                 prefixKey(fp, seq[0..4]),
                 seq[0..4],
                 &blob,
@@ -1313,7 +1432,7 @@ test "PromptCache: admit and find an entry that carries no logits" {
     // empty slice must round-trip.
     const t = [_]u32{ 1, 2, 3 };
     try std.testing.expect(
-        try cache.admit(prefixKey(fp, &t), &t, &blob, &[_]f32{}, 100_000_000, 1_000_000),
+        cache.admit(prefixKey(fp, &t), &t, &blob, &[_]f32{}, 100_000_000, 1_000_000),
     );
     const hit = cache.lookupBestPrefix(&t) orelse return error.TestUnexpectedNull;
     try std.testing.expectEqual(@as(u32, 3), hit.n);
@@ -1355,7 +1474,7 @@ fn checkPromptCache(_: void, seed: u64) anyerror!void {
                 const b = blob[0..r.uintAtMost(usize, blob.len)];
                 const l = logits[0..r.uintAtMost(usize, logits.len)];
                 try std.testing.expect(
-                    try cache.admit(prefixKey(fp, tokens), tokens, b, l, 100_000_000, 1_000_000),
+                    cache.admit(prefixKey(fp, tokens), tokens, b, l, 100_000_000, 1_000_000),
                 );
                 model.insert(tokens, tokens.len * @sizeOf(u32) + b.len + l.len * @sizeOf(f32));
             },

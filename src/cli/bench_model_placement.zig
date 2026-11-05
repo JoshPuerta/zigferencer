@@ -145,10 +145,10 @@ fn resolveSplit(b: *const Bench, ctxp: *vulkan_ctx_mod.Context) !device_arm.Hybr
     serve_common.logSessionWindow(hybrid.window);
 
     var span_buffer: [kv_budget.placement_text_max]u8 = undefined;
-    log.info("{s}", .{kv_budget.formatPlacement(plan, &span_buffer) catch unreachable});
+    log.info("{s}", .{kv_budget.formatPlacement(plan, &span_buffer)});
 
     var ledger_buffer: [kv_budget.placement_ledger_text_max]u8 = undefined;
-    log.info("{s}", .{kv_budget.formatLedger(plan, &ledger_buffer) catch unreachable});
+    log.info("{s}", .{kv_budget.formatLedger(plan, &ledger_buffer)});
 
     return hybrid;
 }

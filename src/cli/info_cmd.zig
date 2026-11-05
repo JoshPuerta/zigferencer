@@ -142,7 +142,7 @@ fn printBuild(w: *Io.Writer, p: style.Palette) !void {
         try w.print("  hot traces:      {s}compiled (-Dtrace){s}\n", .{ p.green, p.reset });
     } else {
         try w.print(
-            "  hot traces:      {s}off (release, OPT=Debug or TRACE=1 to compile){s}\n",
+            "  hot traces:      {s}off (release, Debug or -Dtrace=true to compile){s}\n",
             .{ p.dim, p.reset },
         );
     }
