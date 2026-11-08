@@ -1,10 +1,21 @@
-//! Executable entry point: `main` passes control to `entry` with the release
-//! command table. `src/dev/dev_main.zig` calls `entry` with the dev table. The file
-//! also re-exports the sub-modules of the engine, so an integration test under
-//! `tests/` can `@import("zigferencer")` rather than cross a module root with a
-//! relative path, which Zig forbids. The `test {}` block pulls in every module
-//! that `main` has no production caller for, such as the non-default ops
-//! variants, so their tests run under `zig build test`.
+//! Executable entry point. `main` passes control to `entry` with the release command table.
+//! `src/dev/dev_main.zig` calls `entry` with the dev table.
+//!
+//! Comptime. `entry` takes the dispatch function at comptime, so both executables share one body.
+//!
+//! Re-exports. The file re-exports the sub-modules of the engine. An integration test under
+//! `tests/` then imports `zigferencer` and needs no relative path across a module root, which Zig
+//! forbids.
+//!
+//! A CPU build compiles no Vulkan module, so each alias is an empty namespace.
+//! The context, the kernels, and the per-op runner follow `use_vulkan`. The fused and the hybrid
+//! runners follow `use_vulkan_fused_ops`, the flag every construction site gates on. The
+//! `test {}` block and the integration-test lists of `build.zig` hold the same two levels.
+//!
+//! User errors. A handled user error has a handler that already printed a message. `entry`
+//! exits non-zero and drops the return trace. Any other error keeps its trace.
+//!
+//! Tests. The `test {}` block pulls in every module without a production caller.
 
 const std = @import("std");
 const File = std.Io.File;
@@ -16,20 +27,12 @@ pub const span = @import("core/span.zig");
 
 // -- constants --------------------------------------------------------------
 
-/// Route `std.log` through the stderr handler that the environment gates. The
-/// comptime ceiling is `debug` in every build, so the flow traces always compile
-/// in and the runtime ceiling is the only gate ($ZIGFERENCER_LOG, default
-/// `info`). A release binary is verbose on demand, with no rebuild. The gate
-/// costs almost nothing, because a flow trace sits at a boundary and never
-/// inside a per-element loop. A hot-path trace sits behind the comptime
-/// `log.hot` gate (`-Dtrace`). See `core/log.zig`.
+/// Route `std.log` through the gated stderr handler.
 pub const std_options: std.Options = .{
     .logFn = log.logFn,
     .log_level = .debug,
 };
 
-// The re-exports let an integration test under `tests/` reach into the engine
-// without a `../src/...` path import, which Zig forbids across module roots.
 pub const loader = @import("io/gguf/loader.zig");
 pub const parser = @import("io/gguf/parser.zig");
 pub const registry = @import("core/registry.zig");
@@ -70,7 +73,7 @@ pub const serve_protocol = @import("serve/protocol.zig");
 pub const serve_zmtp = @import("serve/zmtp.zig");
 pub const serve_event = @import("serve/event.zig");
 pub const serve_residency = @import("serve/residency.zig");
-const serve_scheduler = @import("serve/scheduler.zig");
+pub const serve_scheduler = @import("serve/scheduler.zig");
 pub const serve_prefill_chunk = @import("serve/prefill_chunk.zig");
 pub const serve_engine = @import("serve/engine.zig");
 pub const serve_server = @import("serve/server.zig");
@@ -83,14 +86,6 @@ pub const codec_parts = @import("cli/boot/codec_parts.zig");
 pub const ops_simd = @import("ops/simd.zig");
 pub const ops_simd_pf = @import("ops/simd_pf.zig");
 
-// The compiler builds the Vulkan modules only under `-Druntime=vulkan`. In a CPU
-// build each alias below is an empty namespace, and the compiler never reads the
-// source file. A CPU build therefore needs no vulkan-zig dependency and no
-// libvulkan link. The aliases sit at two levels. The context, the kernels, and
-// the per-op runner follow `use_vulkan`, because a per-op GPU build drives them.
-// The fused and the hybrid runners follow `use_vulkan_fused_ops`, the flag every
-// construction site gates on. The `test {}` block below and the integration-test
-// lists of `build.zig` hold the same two levels.
 pub const vulkan_ctx = if (build_options.use_vulkan)
     @import("runtime/vulkan_ctx.zig")
 else
@@ -137,9 +132,8 @@ pub fn main(init: std.process.Init) !void {
     return entry(init, cli.command.dispatchRelease);
 }
 
-/// Set the log gate and the trace recorder from the environment, then pass control to
-/// `dispatch`. Both executables share this body. It owns the stdout writer of every command, so
-/// it can read the cause of a failed write.
+/// Set the log checks and the trace recorder from the environment, then run `dispatch`.
+/// Both executables share this body. It owns the stdout writer, so it can read a write failure.
 pub fn entry(
     init: std.process.Init,
     comptime dispatch: fn (std.process.Init, *File.Writer) anyerror!void,
@@ -147,11 +141,11 @@ pub fn entry(
     var stdout_buffer: [cli.context.stdout_buffer_bytes]u8 = undefined;
     var stdout: File.Writer = .initStreaming(.stdout(), init.io, &stdout_buffer);
 
-    // The top-level help runs before the log and trace setup, so a bad trace variable cannot hide
-    // it.
+    // Run the top-level help before the trace setup, so a bad trace variable cannot hide it.
     const argv = try init.minimal.args.toSlice(init.arena.allocator());
     if (argv.len > 1 and cli.command.isHelpWord(argv[1])) return dispatch(init, &stdout);
 
+    // Set the log checks and the trace recorder.
     log.setFromEnv(init.environ_map.get("ZIGFERENCER_LOG"));
     const trace_spans = init.environ_map.get(limits.trace_spans_env);
     span.setFromEnv(init.io, .{
@@ -165,19 +159,14 @@ pub fn entry(
     };
     defer span.finish();
 
+    // Run the command, and map each failure to an exit.
     dispatch(init, &stdout) catch |err| {
-        // A handled user error is one of bad arguments, an unknown model, or no
-        // model picked. Its handler already printed a readable message to
-        // stderr, so `main` exits non-zero and drops the developer return-trace,
-        // which is noise for a usage mistake. An unexpected error (a bug, OOM, a
-        // parse failure) falls through with its trace intact, and that is where
-        // the trace earns its keep.
         if (isUserError(err)) {
             span.finish();
             std.process.exit(1);
         }
 
-        // A reader that closes the pipe ends the output on purpose, as `head` does.
+        // A reader that closes the pipe ends the output on purpose.
         if (stdoutCause(err, &stdout)) |cause| {
             if (cause != error.BrokenPipe) {
                 printStdoutFailure(init.io, cause);
@@ -193,20 +182,18 @@ pub fn entry(
 
 // -- helpers ----------------------------------------------------------------
 
-// A failed write has nowhere useful to go, as in the dispatcher refusals.
 fn printBadTraceSpans(io: std.Io, text: []const u8) void {
     var buf: [256]u8 = undefined;
     var fw: std.Io.File.Writer = .initStreaming(.stderr(), io, &buf);
     const w = &fw.interface;
     w.print(
-        "error: " ++ limits.trace_spans_env ++ " must be a ring capacity in 1..{d}. The " ++
-            "value is '{s}'\n",
+        "error: " ++ limits.trace_spans_env ++ " must be a ring capacity in 1..{d}. " ++
+            "The value is '{s}'\n",
         .{ limits.spans_per_thread_max, text },
     ) catch return;
     w.flush() catch {};
 }
 
-// A failed write has nowhere useful to go, as in the dispatcher refusals.
 fn printStdoutFailure(io: std.Io, cause: File.Writer.Error) void {
     var buf: [128]u8 = undefined;
     var fw: File.Writer = .initStreaming(.stderr(), io, &buf);
@@ -221,10 +208,8 @@ fn stdoutCause(err: anyerror, stdout: *const File.Writer) ?File.Writer.Error {
     return stdout.err;
 }
 
-/// The errors whose handler already explained itself to the user, so `main` can
-/// exit cleanly without a stack trace. Every error the list omits counts as
-/// unexpected and keeps its trace. A new usage error belongs here. An internal
-/// failure does not.
+/// The errors whose handler already explained itself to the user. A new usage error belongs here.
+/// An internal failure does not.
 fn isUserError(err: anyerror) bool {
     return switch (err) {
         error.UsageError,
@@ -232,63 +217,44 @@ fn isUserError(err: anyerror) bool {
         error.UnknownSubcommand,
         error.NoModelsPresent,
         error.BadHfPath,
-        // Download failures: io/gguf already logged the HTTP status and what was
-        // wrong with the body. The trace adds nothing a user can act on.
+        // Download failures: io/gguf logged the HTTP status and the body fault.
         error.HttpStatusNotOk,
         error.UnexpectedEncoding,
         error.DownloadTruncated,
         error.NotAGguf,
-        // The loader already logged the file, the tensor, and the dtype tag it
-        // cannot frame.
+        // Load failures: the loader logged the file and the tensor.
         loader.LoadError.UnsupportedTensorDtype,
-        // The runner init already logged the tensor and the dtype no kernel reads.
+        // The runner init logged the tensor and the dtype no kernel reads.
         error.UnsupportedWeightDtype,
-        // The loader already logged the file and the tensor whose shape or range it refused.
         loader.LoadError.BadTensorShape,
         loader.LoadError.TensorSizeOverflow,
         loader.LoadError.NotEnoughBytes,
-        // The loader already logged the file and the RoPE scaling type.
         loader.LoadError.UnsupportedRopeScaling,
-        // backend/arch refusals: the handler names the build that works.
+        // Backend and architecture refusals.
         error.UnsupportedServeBackend,
         error.UnsupportedArchForBackend,
         error.RequiresVulkan,
-        // prompt problems: the handler logged the count and the limit.
+        // Prompt problems.
         error.EmptyPrompt,
         error.PromptTooLong,
-        // The GPU runner refused a config that does not fit VRAM. The preflight
-        // already logged the required-vs-available bytes and what to reduce.
+        // Budget and device-limit refusals.
         error.VramBudgetExceeded,
-        // The KV budget cannot host one decode row. The handler already named
-        // the budget, the row count, and the per-slot price that refused it.
         error.KvVramBudgetTooSmall,
-        // A serve arm whose host spend passes the usable RAM. The handler
-        // already named every tier, the RAM figures, and the fit.
         error.HostRamBudgetTooSmall,
-        // An unset --kv-ram whose blob need the usable RAM cannot fund. The
-        // handler already named the need, the RAM left, and both fits.
         error.BlobRamBudgetTooSmall,
-        // A named window past the model ceiling. The handler already named the
-        // window and the ceiling.
         error.WindowExceedsCeiling,
-        // A KV region passes a device limit. The guard already named the
-        // limit, the byte count, and the widest window that fits.
         error.KvRegionPastDeviceLimit,
-        // The split attention records pass a device limit. The guard already
-        // named the limit and both counts.
         error.AttentionScratchPastDeviceLimit,
-        // The model head_dim breaks a rule of the GPU split attention. The
-        // guard already named the head_dim and both rules.
         error.AttentionHeadDimUnsupported,
-        // The model GDN state size breaks the rule of the GPU prefill scan.
-        // The guard already named both sizes.
         error.GdnHeadDimUnsupported,
-        // A malformed storage-range override. The dispatcher already named the
-        // variable, its range, and the value.
+        error.GdnHeadsUnsupported,
+        error.QwenHeadDimUnsupported,
+        // Configuration refusals.
         error.InvalidStorageRange,
-        // A GPU profile refusal: the profile logged the timestamp bits and the period.
+        error.InvalidSoftwareDevice,
+        // The profile logged the timestamp bits and the period.
         error.TimestampsUnsupported,
-        // The client already printed a note for each of these.
+        // Client errors.
         error.WindowOutOfRange,
         error.ReserveOutOfRange,
         error.ThinkingUnsupported,
@@ -303,13 +269,10 @@ fn isUserError(err: anyerror) bool {
 
 // -- tests ------------------------------------------------------------------
 
-// The tests under `tests/` reach the test support module through the root.
 pub const test_fakes = @import("runtime/test_fakes.zig");
 pub const test_fixtures = @import("core/test_fixtures.zig");
 pub const prop = @import("core/prop.zig");
 
-// The block pulls every module without a production caller into the test
-// binary, so its `test "..."` blocks run under `zig build test`.
 test {
     _ = dtype;
     _ = tensor;
@@ -333,11 +296,7 @@ test {
     _ = test_fixtures;
     _ = vocab;
     _ = chat;
-    // A command body is analyzed only where it is named. `main` names
-    // `dispatchRelease`, and a test binary has no `main`. This line names it, so
-    // every arm of every release command compiles under `test-build`. That
-    // includes the placement arms, whose device code no other reference reaches.
-    // `dev_main.zig` holds the same line for the developer commands.
+    // A test binary has no `main`, so name `dispatchRelease` here..
     _ = &cli.command.dispatchRelease;
     // CLI sub-modules whose tests belong under `zig build test`.
     _ = @import("cli/info/arch_matrix.zig");
@@ -357,7 +316,7 @@ test {
     _ = @import("cli/fetch_cmd.zig");
     _ = @import("cli/inspect_cmd.zig");
     _ = @import("cli/prompt.zig");
-    _ = @import("cli/boot/boot_facts.zig");
+    _ = @import("cli/boot/boot_resources.zig");
     _ = @import("cli/boot/boot_lines.zig");
     _ = @import("cli/boot/codec_parts.zig");
     _ = @import("cli/boot/serve_boot.zig");
@@ -387,10 +346,7 @@ test {
     _ = ops_simd_pf;
     _ = @import("ops/attention_simd.zig");
     if (build_options.use_vulkan) {
-        // A function body is analyzed where its ADDRESS is taken. A discarded
-        // value (`_ = f;`) resolves the signature and leaves the body alone, so
-        // every reference below takes `&`. The streaming ring has no production
-        // caller, so these references alone get its bodies analyzed.
+        // Take the address of each method, because `_ = f;` leaves the body unanalyzed.
         _ = &ops_vulkan.StreamRing.init;
         _ = &ops_vulkan.StreamRing.acquire;
         _ = &ops_vulkan.StreamRing.submit;
@@ -402,14 +358,10 @@ test {
 
     if (build_options.use_vulkan_fused_ops) {
         _ = llama_fused;
-        // The qwen fused runner's tests are device-free (cost vectors, range
-        // algebra, scratch arithmetic) and run nowhere without this pull.
+        // The qwen fused tests are device-free and run only through this pull.
         _ = qwen_fused;
-        // Same for the qwen hybrid's blob-framing and tag anchors.
         _ = qwen_hybrid;
-        // Each method below reaches production through a comptime branch or a
-        // generic instantiation, so the `&` references hold the bodies analyzed
-        // whichever arms a fused build instantiates.
+        // These methods reach production only through comptime branches, so take their addresses.
         _ = &qwen_hybrid.QwenHybridRunner.logitRowsMax;
         _ = &llama_fused.LlamaFusedRunner.initFromLoaded;
     }

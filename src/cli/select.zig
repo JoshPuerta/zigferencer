@@ -33,8 +33,7 @@ const name_pad_max = 64;
 
 // -- types ------------------------------------------------------------------
 
-/// The windows of one picker row, in positions: the model ceiling and the two
-/// default windows at the registry KV dtype.
+/// The windows of one picker row, in positions: the model ceiling and the two default windows.
 const Windows = struct {
     ceiling: u32,
     run: u32,
@@ -68,6 +67,7 @@ pub fn model(ctx: context.Context, maybe_name: ?[]const u8) !*const registry.Mod
 /// The no-argument picker for fetch: return the chosen `pub_name`, or null when the user aborts.
 /// Enter has no default, so one keystroke cannot start a multi-GB download.
 pub fn fetchPick(ctx: context.Context) !?[]const u8 {
+    // Print the menu of every registry model.
     const p = style.Palette.init(ctx.color_err);
     const models = registry.all();
 
@@ -95,6 +95,7 @@ pub fn fetchPick(ctx: context.Context) !?[]const u8 {
     );
     try w.flush();
 
+    // Read the choice.
     const idx = prompt.chooseIndex(ctx.io, models.len, null) orelse return null;
     return models[idx].pub_name;
 }
@@ -118,6 +119,7 @@ pub fn printModelsDir(w: *std.Io.Writer, p: style.Palette, models_root: []const 
 /// Present the on-disk models on stderr and return the chosen one. `locate` spans the same roots as
 /// a load command, so the picker offers a model exactly when a load can open it.
 fn pickPresent(ctx: context.Context) !*const registry.Model {
+    // Collect the models on disk with their windows.
     const p = style.Palette.init(ctx.color_err);
     const models = registry.all();
     const present = try ctx.arena.alloc(*const registry.Model, models.len);
@@ -135,6 +137,7 @@ fn pickPresent(ctx: context.Context) !*const registry.Model {
         n += 1;
     }
 
+    // Print the menu, or refuse when no model is on disk.
     var stderr_buffer: [picker_buffer_bytes]u8 = undefined;
     var stderr_writer: Io.File.Writer = .initStreaming(.stderr(), ctx.io, &stderr_buffer);
     const w = &stderr_writer.interface;
@@ -142,8 +145,8 @@ fn pickPresent(ctx: context.Context) !*const registry.Model {
     try printModelsDir(w, p, ctx.models_root);
     if (n == 0) {
         try w.print(
-            "{s}[-]{s} no models on disk yet. Download one with '{s}zigferencer fetch " ++
-                "<name>{s}'.\n",
+            "{s}[-]{s} no models on disk yet. " ++
+                "Download one with '{s}zigferencer fetch <name>{s}'.\n",
             .{
                 p.dim, p.reset, p.bold, p.reset,
             },
@@ -154,6 +157,7 @@ fn pickPresent(ctx: context.Context) !*const registry.Model {
 
     try printMenu(w, p, present[0..n], windows[0..n], name_w);
 
+    // Read the choice.
     const idx = prompt.chooseIndex(ctx.io, n, 0) orelse {
         w.print("{s}[-]{s} no selection. Aborted\n", .{ p.dim, p.reset }) catch {};
         w.flush() catch {};
@@ -169,9 +173,11 @@ fn printMenu(
     windows: []const ?Windows,
     name_w: usize,
 ) !void {
+    // Print the heading.
     try w.print(
-        "{s}select a model{s}  {s}(in positions: ctx = model ceiling, run and serve = " ++
-            "default windows from {d} and {d} MiB of KV per session){s}\n",
+        "{s}select a model{s}  {s}(in positions: " ++
+            "ctx = model ceiling, run and serve = default windows from {d} " ++
+            "and {d} MiB of KV per session){s}\n",
         .{
             p.bold,
             p.reset,
@@ -181,10 +187,13 @@ fn printMenu(
             p.reset,
         },
     );
+
+    // List one row per model.
     for (present, windows, 1..) |m, win, label| {
+        const gap = padding(name_w - m.pub_name.len);
         try w.print(
             "  {s}[+]{s} {s}{d:>2}{s}  {s}{s}  ",
-            .{ p.green, p.reset, p.bold, label, p.reset, m.pub_name, padding(name_w - m.pub_name.len) },
+            .{ p.green, p.reset, p.bold, label, p.reset, m.pub_name, gap },
         );
         if (win) |x| {
             try w.print(
@@ -196,6 +205,7 @@ fn printMenu(
         }
     }
 
+    // Print the prompt.
     try w.print(
         "{s}[>]{s} choose [1-{d}] {s}(Enter = 1){s}: ",
         .{ p.bold, p.reset, present.len, p.dim, p.reset },

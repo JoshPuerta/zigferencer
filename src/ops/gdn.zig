@@ -74,7 +74,7 @@ const max_head_dim: usize = 128;
 pub const Dims = struct {
     /// GDN key/query heads (= ssm.group_count: 16 on both 2B and 9B).
     n_k_heads: usize,
-    /// GDN value heads (= ssm.time_step_rank: 16 on the 2B, 32 on the 9B). See "Head mapping".
+    /// GDN value heads (= ssm.time_step_rank: 16 on the 2B, 32 on the 9B).
     n_v_heads: usize,
     /// Per-head state dim d (= ssm.state_size, 128). Key and value head dims are equal.
     head_dim: usize,
@@ -134,7 +134,7 @@ pub const Heads = struct {
 
 // -- api --------------------------------------------------------------------
 
-/// Chunk-parallel gated delta-rule scan for ONE value head. See "Chunked form" in the header.
+/// Chunk-parallel gated delta-rule scan for ONE value head.
 /// `s` is [d*d] in and out. `q`, `k` and `v` are [T*d], with q normed and scaled and k normed.
 /// `decay` and `beta` are [T]. `o` is [T*d]. The scratch is O(T*d), so keep it off the hot loop.
 pub fn chunkScan(
@@ -330,7 +330,7 @@ pub fn stepPrologue(
     const q = qkv[0..key_dim];
     const k = qkv[key_dim .. 2 * key_dim];
 
-    // L2-normalize q and k per KEY head, then scale q. See "Scale" in the header.
+    // L2-normalize q and k per KEY head, then scale q.
     const q_scale = 1.0 / @sqrt(@as(f32, @floatFromInt(dim)));
     var kh: usize = 0;
     while (kh < d.n_k_heads) : (kh += 1) {
@@ -373,7 +373,7 @@ pub fn stepHeads(d: Dims, heads: Heads, h_lo: usize, h_hi: usize) void {
     const k = heads.qkv[key_dim .. 2 * key_dim];
     const v = heads.qkv[2 * key_dim .. 2 * key_dim + value_dim];
 
-    // Run the recurrence and the gated norm per VALUE head. See "Head mapping" in the header.
+    // Run the recurrence and the gated norm per VALUE head.
     var vh: usize = h_lo;
     while (vh < h_hi) : (vh += 1) {
         const ki = vh % d.n_k_heads;
@@ -431,7 +431,7 @@ fn l2normInplace(x: []f32, eps: f32) void {
 }
 
 /// Causal depthwise conv1d over all `convDim` channels of `qkv`, then SiLU, in place.
-/// It advances `conv_state` by one step. See "Layout" in the header.
+/// It advances `conv_state` by one step.
 fn convStepSilu(d: Dims, conv_w: []const f32, conv_state: []f32, qkv: []f32) void {
     const k = d.conv_kernel;
     const cdim = d.convDim();

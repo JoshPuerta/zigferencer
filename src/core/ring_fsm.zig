@@ -1,6 +1,8 @@
 //! The slot state machine of the double-buffered host-to-device upload ring in
 //! `ops_vulkan/stream_ring.zig`, checked at compile time here.
 //!
+//! Comptime. Tests run at comptime, so drift in the transition table fails the build.
+//!
 //! Role. This file holds the control table alone: no Vulkan, no allocation, no I/O. The GPU type
 //! mirrors this table, and the anchor trace below replays step for step in it.
 //!

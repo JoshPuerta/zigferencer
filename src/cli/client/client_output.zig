@@ -1,5 +1,13 @@
-//! What the client prints: the turn summary, the compaction notes, and the shades of a
-//! reply. The values here format themselves, so a test reads each line with no server.
+//! What the client prints: the turn summary, the compaction notes, and the shades of a reply. The
+//! values here format themselves, so a test reads each line with no server.
+//!
+//! Comptime. `note` and `dim` take the format at comptime, so the compiler checks its arguments.
+//!
+//! Streams. Model text and command replies go to stdout. Prompts, diagnostics, and summaries go
+//! to stderr.
+//!
+//! Shades. The server marks the think tags on the channel of each token event, so the client needs
+//! no tag text. A tag prints nothing. Think text never enters the transcript.
 
 const std = @import("std");
 const Io = std.Io;
@@ -18,38 +26,36 @@ const client_history = @import("client_history.zig");
 
 const preview_bytes = 60;
 
-/// The UTF-8 tail that waits for the next token. A codepoint holds at most 4
-/// bytes, so the tail holds at most 3.
+/// The UTF-8 tail that waits for the next token. A codepoint holds at most 4 bytes.
 pub const codepoint_tail_max = 3;
 
 const window_fmt = "window: {d}/{d} positions used";
 pub const session_open_fmt = "session {d} open";
 
 pub const no_session_note = "no session is open, quitting";
-const context_full_note = "The window is full. The client compacts the conversation into a " ++
-    "new session.";
+const context_full_note =
+    "The window is full. The client compacts the conversation into a new session.";
 const evicted_fmt = "The transcript drops its {d} oldest turns to stay inside {d} bytes of text.";
-const barrier_fmt = "The turn does not fit {d} bytes of transcript text. The client drops " ++
-    "it and {d} older turns.";
+const barrier_fmt = "The turn does not fit {d} bytes of transcript text. " ++
+    "The client drops it and {d} older turns.";
 const abandoned_fmt = "The failed turn already dropped the {d} oldest turns from the transcript.";
-pub const retry_fmt = "The turn of {d} tokens does not fit the {d} positions left. The client " ++
-    "compacts and sends it once more.";
+pub const retry_fmt = "The turn of {d} tokens does not fit the {d} positions left. " ++
+    "The client compacts and sends it once more.";
 const refuse_fmt = "The prompt of {d} tokens does not fit beside the {d} system rows in the " ++
     "window of {d} positions.";
-pub const refit_fmt = "The kept pairs of {d} tokens do not fit the {d} positions left. The " ++
-    "client learns the cost and compacts again.";
+pub const refit_fmt = "The kept pairs of {d} tokens do not fit the {d} positions left. " ++
+    "The client learns the cost and compacts again.";
 pub const reopen_note = "The append failed. The client opens the session once more.";
-pub const append_lost_note = "The append failed again. The client clears the transcript and " ++
-    "keeps the system prompt only.";
-pub const refit_stuck_note = "The refusal does not lower the kept pairs. The client clears the " ++
-    "transcript and keeps the system prompt only.";
-pub const compact_empty_note = "The transcript holds no turns, so a compaction has " ++
-    "nothing to keep.";
+pub const append_lost_note = "The append failed again. " ++
+    "The client clears the transcript and keeps the system prompt only.";
+pub const refit_stuck_note = "The refusal does not lower the kept pairs. " ++
+    "The client clears the transcript and keeps the system prompt only.";
+pub const compact_empty_note = "The transcript holds no turns, " ++
+    "so a compaction has nothing to keep.";
 
 // -- types ------------------------------------------------------------------
 
-/// The line that ends each turn. Only `max_seq` comes from `hello`, and the
-/// other fields come from the server's `done`.
+/// The line that ends each turn. Only `max_seq` comes from `hello`. The rest comes from `done`.
 const Summary = struct {
     finish_reason: protocol.FinishReason,
     gen_tokens: u32,
@@ -58,6 +64,19 @@ const Summary = struct {
     max_seq: u32,
     prefill_ms: f32,
     decode_ms: f32,
+
+    /// The summary of a finished turn. `end` is a `done` frame or a `Client.Turn`.
+    fn of(end: anytype, max_seq: u32) Summary {
+        return .{
+            .finish_reason = end.finish_reason,
+            .gen_tokens = end.gen_tokens,
+            .reasoning_tokens = end.reasoning_tokens,
+            .kv_pos = end.kv_pos,
+            .max_seq = max_seq,
+            .prefill_ms = end.prefill_ms,
+            .decode_ms = end.decode_ms,
+        };
+    }
 
     pub fn format(s: Summary, w: *Io.Writer) Io.Writer.Error!void {
         try w.print(
@@ -79,7 +98,6 @@ const Summary = struct {
 pub const Shade = enum { reply, think, tag };
 
 /// The think block of one turn, read from the channel of each token event.
-/// The server marks the tags, so the client needs no tag text.
 pub const ThinkView = struct {
     /// The shade after the last event, for the bytes a turn end flushes.
     last: Shade = .reply,
@@ -101,13 +119,11 @@ pub const ThinkView = struct {
     }
 };
 
-/// The shades of a blocking reply, the token hook of `collectTurnWith`. The
-/// hook counts the text bytes as the copy does, so each offset matches the
-/// collected text.
+/// The shades of a blocking reply, the token hook of `collectTurnWith`. The hook counts the text
+/// bytes as the copy does, so each offset matches the collected text.
 pub const ReplyShades = struct {
     eos_id: u32,
-    /// A set bit marks a byte of a think block, tags included. The bit length
-    /// is the size of the text buffer.
+    /// A set bit marks a byte of a think block, tags included. One bit per text buffer byte.
     dim: std.DynamicBitSetUnmanaged,
     /// A set bit marks a byte of a think tag, which prints nothing.
     tag: std.DynamicBitSetUnmanaged,
@@ -129,8 +145,8 @@ pub const ReplyShades = struct {
         s.* = .{ .eos_id = s.eos_id, .dim = s.dim, .tag = s.tag };
     }
 
-    /// The copy skips the text of the end-of-sequence token, so the count
-    /// skips it too. A byte past the text buffer has no shade to keep.
+    /// The copy skips the text of the end-of-sequence token, so the count skips it too. A byte
+    /// past the text buffer has no shade to keep.
     pub fn onToken(
         s: *ReplyShades,
         token_id: u32,
@@ -149,8 +165,8 @@ pub const ReplyShades = struct {
         s.total += text.len;
     }
 
-    /// Print each run of one shade in `text`, the kept prefix of the reply,
-    /// between its color and a reset. A tag run prints nothing.
+    /// Print each run of one shade in `text`, the kept prefix of the reply, between its color and
+    /// a reset.
     pub fn write(
         s: *const ReplyShades,
         w: *Io.Writer,
@@ -161,6 +177,7 @@ pub const ReplyShades = struct {
         std.debug.assert(text.len <= s.dim.bit_length);
 
         var start: usize = 0;
+
         // Each pass prints one run. The loop ends at the kept length.
         while (start < text.len) {
             const end = s.runEnd(start, text.len);
@@ -176,13 +193,13 @@ pub const ReplyShades = struct {
         }
     }
 
-    /// Record each reply run of `text` in the transcript. Think text never
-    /// enters it.
+    /// Record each reply run of `text` in the transcript.
     pub fn record(s: *const ReplyShades, t: *Transcript, text: []const u8) void {
         std.debug.assert(text.len <= s.total);
         std.debug.assert(text.len <= s.dim.bit_length);
 
         var start: usize = 0;
+
         // Each pass takes one run. The loop ends at the kept length.
         while (start < text.len) {
             const end = s.runEnd(start, text.len);
@@ -228,8 +245,7 @@ const Cut = struct {
 
 const Cuts = struct { ids: ?Cut, text: ?Cut };
 
-/// The estimate comes from the plan, and `kv_pos` is the cost that the server
-/// measured.
+/// The estimate comes from the plan, and `kv_pos` is the cost that the server measured.
 pub const Compacted = struct {
     kept: u32,
     total: u32,
@@ -273,8 +289,8 @@ const HistoryHead = struct {
         std.debug.assert(h.keeps <= h.turns);
 
         try w.print(
-            "transcript: {d} turns, {d} positions, reserve {d}, window {d}. A compaction " ++
-                "keeps {d}.",
+            "transcript: {d} turns, {d} positions, reserve {d}, window {d}. " ++
+                "A compaction keeps {d}.",
             .{
                 h.turns, h.positions, h.reserve, h.window, h.keeps,
             },
@@ -282,7 +298,7 @@ const HistoryHead = struct {
     }
 };
 
-/// One turn of `/history`. A star marks a turn that a compaction keeps now.
+/// One turn of `/history`. A star marks a turn that the next compaction keeps.
 const HistoryLine = struct {
     kept: bool,
     number: u32,
@@ -298,8 +314,7 @@ const HistoryLine = struct {
     }
 };
 
-/// Both output streams with their palettes. Model text and command replies go
-/// to stdout. Prompts, diagnostics, and summaries go to stderr.
+/// Both output streams with their palettes.
 pub const Out = struct {
     o: *Io.Writer,
     e: *Io.Writer,
@@ -369,6 +384,42 @@ pub const Out = struct {
         try out.note(refuse_fmt, .{ q, h.system_rows, h.window });
     }
 
+    /// Step `cycle` after a failed append frame of turns `from..to`. A refused frame teaches its
+    /// cost, so the plan keeps fewer pairs. Any other failure opens the session once more, and a
+    /// second one clears the transcript. The caller reopens in every case.
+    pub fn frameFailed(
+        out: Out,
+        h: *client_history.History,
+        cycle: *client_history.Cycle,
+        le: ?Client.LastError,
+        from: u32,
+        to: u32,
+    ) !void {
+        if (client_history.tooLong(le, .turn)) |tl| {
+            try out.note(refit_fmt, .{ tl.tokens, tl.room });
+            cycle.refits += 1;
+            const limit = h.budget(cycle.reserve);
+            switch (transcript_mod.refit(h.t, limit, from, to, tl.tokens, cycle.plan.kept)) {
+                .plan => |p| cycle.plan = p,
+                .stuck => {
+                    try out.dim(refit_stuck_note, .{});
+                    h.keepNothing(cycle);
+                },
+            }
+
+            return;
+        }
+
+        try out.serverError(le);
+        if (!cycle.reopened) {
+            cycle.reopened = true;
+            return out.note(reopen_note, .{});
+        }
+
+        try out.note(append_lost_note, .{});
+        h.keepNothing(cycle);
+    }
+
     pub fn history(out: Out, h: *const client_history.History) !void {
         const t = h.t;
         const n = t.count();
@@ -401,9 +452,9 @@ pub const Out = struct {
         try out.o.flush();
     }
 
-    pub fn finish(out: Out, s: Summary) !void {
-        try out.dim("{f}", .{s});
-        if (finishNote(s.finish_reason)) |note_text| {
+    pub fn finish(out: Out, end: anytype, max_seq: u32) !void {
+        try out.dim("{f}", .{Summary.of(end, max_seq)});
+        if (finishNote(end.finish_reason)) |note_text| {
             try out.note("{s}", .{note_text});
         }
     }
@@ -431,8 +482,8 @@ pub fn shadeColor(p: style.Palette, shade: Shade) []const u8 {
     };
 }
 
-/// `collectTurn` fills each buffer as far as it fits and reports the true
-/// totals, so a total above the kept count is a cut.
+/// `collectTurn` fills each buffer as far as it fits and reports the true totals, so a total over
+/// the kept count is a cut.
 pub fn turnCuts(turn: Client.Turn, ids_cap: usize) Cuts {
     std.debug.assert(turn.text_len <= turn.text_total);
 
@@ -449,9 +500,8 @@ pub fn turnCuts(turn: Client.Turn, ids_cap: usize) Cuts {
     return .{ .ids = ids, .text = text };
 }
 
-/// The length of the longest prefix of `bytes` that ends on a UTF-8 codepoint
-/// boundary. An invalid lead byte counts as complete, so the output never
-/// stalls on bad bytes.
+/// The length of the longest prefix of `bytes` that ends on a UTF-8 codepoint boundary. An invalid
+/// lead byte counts as complete, so the output never stalls on bad bytes.
 pub fn completePrefixLen(bytes: []const u8) usize {
     const back_max = @min(bytes.len, codepoint_tail_max);
     var i: usize = 1;
@@ -469,8 +519,7 @@ pub fn completePrefixLen(bytes: []const u8) usize {
 
 // -- helpers: text ----------------------------------------------------------
 
-/// The bytes of a prompt that a history line shows. The cut ends on a
-/// codepoint boundary.
+/// The bytes of a prompt that a history line shows. The cut ends on a codepoint boundary.
 fn previewLen(prompt_text: []const u8) usize {
     if (prompt_text.len <= preview_bytes) return prompt_text.len;
 
@@ -492,6 +541,7 @@ fn finishNote(reason: protocol.FinishReason) ?[]const u8 {
 test "completePrefixLen on ASCII and on cut codepoints" {
     try std.testing.expectEqual(@as(usize, 0), completePrefixLen(""));
     try std.testing.expectEqual(@as(usize, 5), completePrefixLen("hello"));
+
     // "é" is C3 A9, "€" is E2 82 AC, and U+1F600 is F0 9F 98 80.
     try std.testing.expectEqual(@as(usize, 1), completePrefixLen("a\xc3"));
     try std.testing.expectEqual(@as(usize, 1), completePrefixLen("a\xe2\x82"));
@@ -513,6 +563,7 @@ test "completePrefixLen ends on a boundary at every split" {
 }
 
 test "the summary line and its note for each finish reason" {
+    // Vary one summary for each finish reason.
     const Case = struct { s: Summary, line: []const u8, note: ?[]const u8 };
     const base: Summary = .{
         .finish_reason = .eos,
@@ -533,13 +584,24 @@ test "the summary line and its note for each finish reason" {
     full.kv_pos = 512;
     var cancelled = base;
     cancelled.finish_reason = .cancelled;
+    // Name the line that each summary prints.
+    const times = "prefill_ms=12.5 decode_ms=800.0";
+    const line_base = "finish_reason=eos gen_tokens=40 reasoning_tokens=0 kv_pos=52/512 " ++ times;
+    const line_capped = "finish_reason=max_tokens gen_tokens=40 reasoning_tokens=39 " ++
+        "kv_pos=52/512 " ++ times;
+    const line_full = "finish_reason=context_full gen_tokens=460 reasoning_tokens=300 " ++
+        "kv_pos=512/512 " ++ times;
+    const line_cancelled = "finish_reason=cancelled gen_tokens=40 reasoning_tokens=0 " ++
+        "kv_pos=52/512 " ++ times;
+    // Pair each summary with its line and its note.
     const cases = [_]Case{
-        .{ .s = base, .line = "finish_reason=eos gen_tokens=40 reasoning_tokens=0 kv_pos=52/512 prefill_ms=12.5 decode_ms=800.0", .note = null },
-        .{ .s = capped, .line = "finish_reason=max_tokens gen_tokens=40 reasoning_tokens=39 kv_pos=52/512 prefill_ms=12.5 decode_ms=800.0", .note = null },
-        .{ .s = full, .line = "finish_reason=context_full gen_tokens=460 reasoning_tokens=300 kv_pos=512/512 prefill_ms=12.5 decode_ms=800.0", .note = context_full_note },
-        .{ .s = cancelled, .line = "finish_reason=cancelled gen_tokens=40 reasoning_tokens=0 kv_pos=52/512 prefill_ms=12.5 decode_ms=800.0", .note = null },
+        .{ .s = base, .line = line_base, .note = null },
+        .{ .s = capped, .line = line_capped, .note = null },
+        .{ .s = full, .line = line_full, .note = context_full_note },
+        .{ .s = cancelled, .line = line_cancelled, .note = null },
     };
     comptime std.debug.assert(cases.len == std.enums.values(protocol.FinishReason).len);
+
     for (cases) |case| {
         try std.testing.expectFmt(case.line, "{f}", .{case.s});
         const got = finishNote(case.s.finish_reason);
@@ -585,6 +647,57 @@ test "turnCuts reports each cut with both numbers" {
 }
 
 /// Visible marks in place of the escape codes, so a test can read the shades.
+fn refusal(tokens: u32, room: u32) Client.LastError {
+    var e: Client.LastError = .{
+        .code = .turn_too_long,
+        .len = 0,
+        .truncated = false,
+        .buf = undefined,
+    };
+    const detail = std.fmt.bufPrint(&e.buf, protocol.turn_too_long_fmt, .{ tokens, room }) catch
+        unreachable;
+    e.len = @intCast(detail.len);
+    return e;
+}
+
+test "frameFailed: a refusal drops pairs, a repeat clears, and another failure reopens once" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+
+    var buf: [1024]u8 = undefined;
+    var w: std.Io.Writer = .fixed(&buf);
+    const out: Out = .{ .o = &w, .e = &w, .po = .{}, .pe = .{} };
+
+    var h: client_history.History = try .init(arena_state.allocator(), 10, 64, 8);
+    for (0..3) |_| {
+        h.t.begin("q");
+        _ = h.t.finish(10);
+    }
+
+    var cycle: client_history.Cycle = .{ .plan = h.shrink(8), .total = 3, .reserve = 8 };
+    try std.testing.expectEqual(@as(u32, 3), cycle.plan.kept);
+
+    // A count past the room teaches a cost, so the plan drops the oldest pair.
+    try out.frameFailed(&h, &cycle, refusal(55, 40), 0, 3);
+    try std.testing.expectEqual(@as(u32, 1), cycle.refits);
+    try std.testing.expectEqual(@as(u32, 2), cycle.plan.kept);
+    try std.testing.expectEqual(@as(u32, 2), h.t.count());
+
+    // A count inside the estimates teaches nothing, so the cycle keeps the system prompt only.
+    try out.frameFailed(&h, &cycle, refusal(1, 40), 0, 2);
+    try std.testing.expectEqual(@as(u32, 0), cycle.plan.kept);
+    try std.testing.expectEqual(@as(u32, 0), h.t.count());
+
+    // Another failure reopens once, and the second one clears.
+    h.t.begin("q");
+    _ = h.t.finish(10);
+    try out.frameFailed(&h, &cycle, null, 0, 1);
+    try std.testing.expect(cycle.reopened);
+    try std.testing.expectEqual(@as(u32, 1), h.t.count());
+    try out.frameFailed(&h, &cycle, null, 0, 1);
+    try std.testing.expectEqual(@as(u32, 0), h.t.count());
+}
+
 const test_palette: style.Palette = .{ .reset = ")", .dim = "D(", .green = "G(" };
 
 fn expectShades(shades: *const ReplyShades, text: []const u8, want: []const u8) !void {
@@ -597,8 +710,8 @@ fn expectShades(shades: *const ReplyShades, text: []const u8, want: []const u8) 
 /// One token event of a test turn.
 const Piece = struct { text: []const u8, channel: protocol.Channel = .content };
 
-/// Feeds each piece to the hook under its own id, then the end-of-sequence
-/// frame, as `collectTurnWith` calls it.
+/// Feeds each piece to the hook under its own id, then the end-of-sequence frame, as
+/// `collectTurnWith` calls it.
 fn feed(shades: *ReplyShades, pieces: []const Piece) void {
     for (pieces, 0..) |p, i| {
         shades.onToken(@intCast(10 + i), p.channel, p.text);
@@ -665,6 +778,7 @@ test "ReplyShades: a reply with no block prints one run and counts zero" {
     defer arena_state.deinit();
 
     var shades: ReplyShades = try .init(arena_state.allocator(), 64, 7);
+
     // Tag text on the content channel is plain text.
     feed(&shades, &.{ .{ .text = "a" }, .{ .text = "<think>" }, .{ .text = "b" } });
     try expectShades(&shades, "a<think>b", "G(a<think>b)");
@@ -675,6 +789,7 @@ test "ReplyShades: a cut keeps the shades of the kept bytes, and a reset starts 
     defer arena_state.deinit();
 
     var shades: ReplyShades = try .init(arena_state.allocator(), 8, 7);
+
     // The copy keeps "<think>" and stops at "abc", which does not fit.
     feed(&shades, &.{
         .{ .text = "<think>", .channel = .open_tag },
@@ -730,8 +845,9 @@ test "a history line cuts its prompt at the preview bound on a codepoint boundar
         .positions = 9,
         .prompt = exact,
     }});
-    // The euro sign E2 82 AC starts one byte before the bound, so the cut keeps
-    // the bytes before it.
+
+    // The euro sign E2 82 AC starts one byte before the bound, so the cut keeps the bytes before
+    // it.
     const long = "y" ** (preview_bytes - 1) ++ "\xe2\x82\xac tail";
     try std.testing.expectEqual(@as(usize, preview_bytes - 1), previewLen(long));
     try std.testing.expectFmt(

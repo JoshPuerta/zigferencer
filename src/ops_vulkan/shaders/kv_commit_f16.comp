@@ -4,8 +4,8 @@
 //   The runner writes K and V to two contiguous f32 scratch buffers, then scatters them into the
 //   cache with a copy list. This kernel narrows the scratch between those steps. It never sees
 //   the cache layout, and the scatter stays a plain copy list of halved regions. The rejected form
-//   converts at the scatter. Its (slot, position) table reaches 264 rows, past the 128-byte
-//   push-constant guarantee, so it needs a row-descriptor buffer or one dispatch per row.
+//   converts at the scatter. Its (slot, position) table does not fit the 128-byte push-constant
+//   guarantee, so it needs a row-descriptor buffer or one dispatch per row.
 //
 // Hardware
 //   Lane i touches element i of all four buffers, so every load and every store coalesces across

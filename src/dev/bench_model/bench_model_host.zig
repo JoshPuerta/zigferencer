@@ -1,5 +1,7 @@
 //! The host path of `bench-model`: the CPU backends and the per-op Vulkan backend.
 //! Each run builds a fresh runner, which starts the KV cache at zero.
+//!
+//! Comptime. Generic over the model family. Build options pick the per-op Vulkan paths.
 
 const std = @import("std");
 const zigferencer = @import("zigferencer");
@@ -28,6 +30,7 @@ const RunResult = common.RunResult;
 pub fn bench(comptime Family: type, b: *const Bench) !void {
     const ctx = b.ctx;
 
+    // Refuse a family that the per-op Vulkan backend cannot run.
     if (comptime per_op_build and !Family.per_op_bench) {
         common.writeStderr(
             ctx.io,
@@ -37,23 +40,21 @@ pub fn bench(comptime Family: type, b: *const Bench) !void {
         return error.UnsupportedArchForBackend;
     }
 
-    // One pool serves every CPU op of the command.
+    // Start the pool. One pool serves every CPU op of the command.
     var pool: Pool = undefined;
     try parallel.initPool(&pool, ctx.io, b.policy);
     defer pool.deinit();
 
-    // The per-op backend holds one process-wide runner and weight cache, so the
-    // weights upload once across every run.
+    // Start the per-op backend. It holds one runner and weight cache, so weights upload once.
     if (comptime per_op_build) {
-        try vulkan_ops_wrap.initBackend(ctx.arena, .{
-            .storage_range_override = ctx.vk_storage_range,
-        });
+        try vulkan_ops_wrap.initBackend(ctx.arena, ctx.vk_options);
     }
 
     defer if (comptime per_op_build) {
         vulkan_ops_wrap.deinitBackend();
     };
 
+    // Log the placement and encode the prompt.
     const max_seq = b.resolved.window.base;
     boot_lines.logSessionWindow(b.resolved.window);
     try logHostRam(b);
@@ -61,12 +62,14 @@ pub fn bench(comptime Family: type, b: *const Bench) !void {
     const v = try vocab_mod.buildFromParsed(ctx.arena, b.loaded.parsed);
     const prompt_ids = try exec.promptIds(b, &v, max_seq);
 
+    // Hand a CPU profile run to its own path.
     if (comptime core_log.hot) {
         if (b.opt.profile_cpu_decode) {
             return profile.bench(Family, b, &pool, prompt_ids, max_seq);
         }
     }
 
+    // Run the series on a fresh runner per run.
     const turn: exec.Turn = .{
         .vocab = &v,
         .prompt_ids = prompt_ids,
@@ -99,19 +102,19 @@ pub fn bench(comptime Family: type, b: *const Bench) !void {
 fn logHostRam(b: *const Bench) !void {
     const io = b.ctx.io;
     const resolved = b.resolved;
-    const facts: resolve_mod.Facts = .{ .ram_free = b.boot.ramFree(io) };
+    const resources: resolve_mod.Resources = .{ .ram_free = b.boot.ramFree(io) };
 
     const host = resolved.cpu orelse
-        resolve_mod.cpuArm(
+        resolve_mod.hostPlacement(
             .bench,
             b.boot.input,
             b.loaded.card,
             b.kvDtype(),
             resolved.window,
-            facts,
+            resources,
         );
     switch (host) {
-        .ok => |placed| boot_lines.logRamQuote(placed.quote, false),
+        .ok => |layer_choice| boot_lines.logRamQuote(layer_choice.quote, false),
         .refused => |r| return boot_lines.refuse(io, b.model.pub_name, r),
     }
 }

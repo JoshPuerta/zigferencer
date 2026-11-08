@@ -1,6 +1,8 @@
 //! The batch row every runner steps, and the row rule they all hold. The file carries no weights
 //! and no state, so a runner of either family can depend on it without depending on another runner.
 //!
+//! Comptime. `chunkedPrefill` reads a runner declaration at comptime, so no runner needs a flag.
+//!
 //! Row rule. Rows that share a slot are adjacent and ascend by exactly one position. The
 //! `want_logits` rows form a suffix of the batch, so their hidden states are contiguous. The
 //! lm_head then runs as one batched projection, and prompt rows skip it. A batch row sees exactly

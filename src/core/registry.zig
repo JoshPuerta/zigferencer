@@ -1,6 +1,8 @@
 //! Hand-curated table of models the engine knows by short name. It is the canonical list of the
 //! models the engine is verified against.
 //!
+//! Comptime. Asserts keep every sampling card inside the `limits` ranges.
+//!
 //! Entries. Each entry carries the on-disk path, the HF resolve URL, the chat-template family the
 //! model expects, the KV dtype it is verified at, and a lower context ceiling where the file cannot
 //! support its declared context. `fetch <pub_name>` and the run, inspect, and bench commands
@@ -15,7 +17,7 @@
 //! KV defaults. An f16 default means outputs are byte identical to f32 and the reference hashes do
 //! not move. Llama-3.1-8B Q8_0: latency at parity or ahead, double the serve residency, and 1.78x
 //! swap. Qwen 2B: byte identical across backends and dtypes at depth, fused prefill 7 % ahead,
-//! every other arm at parity, and blobs shrink to 0.64x because the GDN state stays f32. Qwen 9B:
+//! every other path at parity, and blobs shrink to 0.64x because the GDN state stays f32. Qwen 9B:
 //! the 2B shape at four times the scale, with about 110 slots in free VRAM where f32 fits about 88.
 
 const std = @import("std");
@@ -45,12 +47,10 @@ const models = [_]Model{
         .file_name = "Meta-Llama-3.1-8B-Instruct-Q8_0.gguf",
         .download_url = "https://huggingface.co/bartowski/Meta-Llama-3.1-8B-Instruct-GGUF/resolve/main/Meta-Llama-3.1-8B-Instruct-Q8_0.gguf",
         .chat_template_kind = .llama3,
-        // See "KV defaults" in the header.
         .kv_dtype_default = .f16,
     },
-    // Q4_0 variants halve the weight stream of the memory-bound decode. For Llama-3.1-8B, bartowski
-    // ships only the ARM-repacked Q4_0_4_4, _4_8, and _8_8 (incompatible layout), so the entry uses
-    // the plain Q4_0 of QuantFactory.
+    // Q4_0 halves the weight stream of the decode. Bartowski ships only ARM-repacked Q4_0 for
+    // Llama-3.1-8B (incompatible layout), so that entry uses the plain Q4_0 of QuantFactory.
     .{
         .pub_name = "SmolLM2-135M-Instruct-Q4_0",
         .local_path = "bartowski_SmolLM2-135M-Instruct-GGUF",
@@ -64,9 +64,8 @@ const models = [_]Model{
         .file_name = "Meta-Llama-3.1-8B-Instruct.Q4_0.gguf",
         .download_url = "https://huggingface.co/QuantFactory/Meta-Llama-3.1-8B-Instruct-GGUF/resolve/main/Meta-Llama-3.1-8B-Instruct.Q4_0.gguf",
         .chat_template_kind = .llama3,
-        // The file declares 131072 positions but carries no llama3 RoPE
-        // factors, so positions past the original 8192 context are outside
-        // its training.
+        // The file declares 131072 positions but carries no llama3 RoPE factors, so positions
+        // past the original 8192 context are outside its training.
         .context_limit = 8192,
     },
     // Qwen3.5 hybrid models. The 2B is the correctness target, the 9B the measurement target.
@@ -78,7 +77,6 @@ const models = [_]Model{
         .download_url = "https://huggingface.co/lmstudio-community/Qwen3.5-2B-GGUF/resolve/main/Qwen3.5-2B-Q8_0.gguf",
         // The model file's template thinks only when enable_thinking is true.
         .chat_template_kind = .{ .chatml_qwen = .off },
-        // See "KV defaults" in the header.
         .kv_dtype_default = .f16,
         // The card values for text tasks, from
         // https://huggingface.co/Qwen/Qwen3.5-2B/raw/main/README.md.
@@ -108,7 +106,6 @@ const models = [_]Model{
         .download_url = "https://huggingface.co/lmstudio-community/Qwen3.5-9B-GGUF/resolve/main/Qwen3.5-9B-Q8_0.gguf",
         // The model file's template thinks unless enable_thinking is false.
         .chat_template_kind = .{ .chatml_qwen = .on },
-        // See "KV defaults" in the header.
         .kv_dtype_default = .f16,
         // The card values for general tasks, from
         // https://huggingface.co/Qwen/Qwen3.5-9B/raw/main/README.md.
@@ -152,7 +149,7 @@ comptime {
     }
 }
 
-/// Environment variable that names the secondary models store. See "Models store" in the header.
+/// Environment variable that names the secondary models store.
 pub const models_dir_env = "ZIGFERENCER_MODELS_DIR";
 
 pub const default_models_root = "models";

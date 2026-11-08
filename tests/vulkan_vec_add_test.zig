@@ -9,8 +9,8 @@
 //! nothing.
 //!
 //! Skips. The test returns `error.SkipZigTest` when no Vulkan device is reachable. That covers a
-//! host with no driver, and the llvmpipe software device that `pickPhysicalDevice` rejects by
-//! design.
+//! host with no driver, and the llvmpipe software device that `pickPhysicalDevice` rejects unless
+//! `limits.software_device_env` names it.
 
 const std = @import("std");
 const zigferencer = @import("zigferencer");

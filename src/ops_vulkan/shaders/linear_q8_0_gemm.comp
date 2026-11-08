@@ -47,7 +47,7 @@
 // Hardware
 //   Waves: 256 lanes are 8 wave32 waves.
 //   Occupancy: the batch kernel runs one wave per workgroup, so its per-lane registers cap the
-//   resident waves. It runs at 13% to 21% of FP32 peak, and its bandwidth falls as B_TILE grows.
+//   resident waves. Its bandwidth falls as B_TILE grows.
 //   Here workgroup reuse and per-lane registers are separate: the tile grows in LDS, and a lane
 //   holds only a micro-tile. Register pressure stays about constant while the reuse grows.
 //   Passes 1 and 2: the kernel expects a wave to hold 32 lanes of adjacent tid. Such a wave loads

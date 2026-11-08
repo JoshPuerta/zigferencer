@@ -3,6 +3,9 @@
 //! buffer, submits it, waits for the queue, copies the logits, and runs an
 //! argmax. The command times four questions apart:
 //!
+//! Comptime. Generic over the model family and the runner. The fused build option picks the GPU
+//! path.
+//!
 //!   record  how long does the record pass take with the profiler off?
 //!   resub   what is the step floor when the buffer records once and replays?
 //!   sync    what does one submit and wait cost for an empty buffer, with a
@@ -24,7 +27,7 @@ const context = zigferencer.cli.context;
 const args = zigferencer.cli.args;
 const style = zigferencer.cli.style;
 const select = zigferencer.cli.select;
-const boot_facts = zigferencer.cli.boot_facts;
+const boot_resources = zigferencer.cli.boot_resources;
 const registry = zigferencer.registry;
 const loader = zigferencer.loader;
 const limits = zigferencer.limits;
@@ -54,7 +57,7 @@ const warm_reps: u32 = 3;
 
 // -- types ------------------------------------------------------------------
 
-const Mode = enum { m3, m4, m5, gap, all };
+const Mode = enum { record, resubmit, sync, gap, all };
 
 /// What every mode of one bench reads.
 const Bench = if (build_options.use_vulkan_fused_ops) struct {
@@ -82,12 +85,12 @@ const Opt = struct {
         .about = "Split one decode step into its host steps.\n",
         .footer =
         \\modes:
-        \\  m3   record cost of one decode command buffer, no submit
-        \\  m4   resubmit floor: record once, submit and wait many times
-        \\  m5   sync floor: empty buffer, queue wait against fence wait
-        \\  gap  GPU idle gap between decode steps, from device timestamps
+        \\  record    cost of recording one decode command buffer, no submit
+        \\  resubmit  floor of a resubmit: record once, submit and wait many times
+        \\  sync      floor of a wait: empty buffer, queue wait against fence wait
+        \\  gap       GPU idle gap between decode steps, from device timestamps
         \\
-        \\Modes m4 and gap change the KV row and the recurrent state. Their output is
+        \\Modes resubmit and gap change the KV row and the recurrent state. Their output is
         \\not meaningful, so read the times only.
         \\On a driver whose timestamp counter pauses while the GPU idles, the gap
         \\reads low.
@@ -97,8 +100,8 @@ const Opt = struct {
     pub const docs = .{
         .pos = args.Doc{ .text = "KV depth to prefill before timing, at least 1" },
         .reps = args.Doc{
-            .text = "timed repetitions per mode, 1..1024. The depth plus\nreps plus 4 " ++
-                "positions must fit the model ceiling",
+            .text = "timed repetitions per mode, 1..1024. The depth plus\n" ++
+                "reps plus 4 positions must fit the model ceiling",
         },
         .mode = args.Doc{ .text = "the host step to time, or all of them (see modes below)" },
         .kv_dtype = args.Doc{ .text = "KV element type", .default = "the model's registered one" },
@@ -123,8 +126,8 @@ pub fn run(ctx: context.Context) !void {
     if (comptime build_options.use_vulkan_fused_ops) return runFused(ctx, opt.pub_name, opt);
 
     log.err(
-        "bench-decode-host times the fused-GPU decode step. Build -Druntime=vulkan " ++
-            "-Dops-backend=vulkan_fused",
+        "bench-decode-host times the fused-GPU decode step. " ++
+            "Build -Druntime=vulkan -Dops-backend=vulkan_fused",
         .{},
     );
     return error.UnsupportedServeBackend;
@@ -150,6 +153,7 @@ pub fn gapNs(end_prev: u64, start_next: u64, period_ns: f64) error{StampsOutOfOr
 // -- helpers ----------------------------------------------------------------
 
 fn runFused(ctx: context.Context, pub_name: ?[]const u8, opt: Opt) !void {
+    // Load the model and check that the window fits.
     const model = try select.model(ctx, pub_name);
     const path = try registry.resolveLoadPath(ctx.arena, ctx.io, ctx.models_root, model.*);
 
@@ -167,10 +171,9 @@ fn runFused(ctx: context.Context, pub_name: ?[]const u8, opt: Opt) !void {
         );
     }
 
+    // Open the device and pick the family.
     const ctxp = try ctx.arena.create(vulkan_ctx_mod.Context);
-    ctxp.* = try vulkan_ctx_mod.Context.init(ctx.arena, .{
-        .storage_range_override = ctx.vk_storage_range,
-    });
+    ctxp.* = try vulkan_ctx_mod.Context.init(ctx.arena, ctx.vk_options);
     defer ctxp.deinit();
 
     const bench: Bench = .{
@@ -193,9 +196,9 @@ fn runFused(ctx: context.Context, pub_name: ?[]const u8, opt: Opt) !void {
 fn benchFamily(comptime Family: type, b: *const Bench) !void {
     const ctx = b.ctx;
     const card = b.loaded.card;
-    const kv_dtype = boot_facts.kvDtypeFor(b.opt.kv_dtype, b.model);
+    const kv_dtype = boot_resources.kvDtypeFor(b.opt.kv_dtype, b.model);
 
-    const vram_free = boot_facts.vramFigure(b.ctxp);
+    const vram_free = boot_resources.vramFigure(b.ctxp);
     const caps = try Family.kvCaps(ctx.gpa, b.loaded, b.ceiling, vram_free, 1, kv_dtype);
     const cost = Family.Fused.kvCostModel(card, kv_dtype);
     const plan = try kv_budget.kvPlan(caps, cost, .{ .window = b.window, .slots = 1, .batch = 1 });
@@ -214,6 +217,7 @@ fn benchOne(comptime RunnerT: type, runner: *RunnerT, b: *const Bench) !void {
     const w = b.w;
     std.debug.assert(runner.max_seq >= b.window);
 
+    // Print the header.
     const header = "model:    {s}   pos: {d}   reps: {d}   window: {d} tok   " ++
         "timestamp period: {d:.1} ns\n";
     try w.print(header, .{
@@ -225,8 +229,7 @@ fn benchOne(comptime RunnerT: type, runner: *RunnerT, b: *const Bench) !void {
     });
     try w.flush();
 
-    // Prefill with the normal batched path. The tokens are synthetic, because
-    // every timing here is data independent.
+    // Prefill to depth `--pos`. The tokens are synthetic, because every timing is data independent.
     var last_logits: []f32 = undefined;
     var pos: u32 = 0;
     while (pos < opt.pos) {
@@ -243,11 +246,12 @@ fn benchOne(comptime RunnerT: type, runner: *RunnerT, b: *const Bench) !void {
     std.debug.assert(pos == opt.pos);
     const first_token = sampler.greedy(last_logits);
 
-    if (opt.mode == .m5 or opt.mode == .all) {
+    // Run the selected modes.
+    if (opt.mode == .sync or opt.mode == .all) {
         try syncFloor(ctxp, ctx.io, opt.reps, w);
     }
 
-    if (opt.mode == .m3 or opt.mode == .all) {
+    if (opt.mode == .record or opt.mode == .all) {
         try recordCost(RunnerT, runner, ctx.io, opt, w);
     }
 
@@ -255,7 +259,7 @@ fn benchOne(comptime RunnerT: type, runner: *RunnerT, b: *const Bench) !void {
         try gapProbe(RunnerT, runner, ctx.io, opt, first_token, w);
     }
 
-    if (opt.mode == .m4 or opt.mode == .all) {
+    if (opt.mode == .resubmit or opt.mode == .all) {
         try resubmit(RunnerT, runner, ctx.io, opt, w);
     }
 
@@ -276,7 +280,7 @@ fn recordCost(comptime RunnerT: type, runner: *RunnerT, io: Io, opt: Opt, w: *Io
     }
 
     try w.print(
-        "\nm3 record cost (profiler off, no submit, n={d}, pos={d})\n",
+        "\nrecord cost (profiler off, no submit, n={d}, pos={d})\n",
         .{ opt.reps, opt.pos },
     );
     try printStat(w, "record", stat);
@@ -297,18 +301,19 @@ fn resubmit(comptime RunnerT: type, runner: *RunnerT, io: Io, opt: Opt, w: *Io.W
     }
 
     try w.print(
-        "\nm4 resubmit floor (one recording, submit + queue wait, n={d}, pos={d})\n",
+        "\nresubmit floor (one recording, submit + queue wait, n={d}, pos={d})\n",
         .{ opt.reps, opt.pos },
     );
     try w.writeAll(
-        "  the output of these steps is not meaningful: every replay rewrites the KV row " ++
-            "and the recurrent state\n",
+        "  the output of these steps is not meaningful: " ++
+            "every replay rewrites the KV row and the recurrent state\n",
     );
     try printStat(w, "submit+wait", stat);
 }
 
 /// An empty command buffer submitted `reps` times, once per wait style.
 fn syncFloor(ctxp: *vulkan_ctx_mod.Context, io: Io, reps: u32, w: *Io.Writer) !void {
+    // Record the empty buffer and make the fence.
     const vkd = ctxp.vkd;
     const cb = try kernels.allocateOnePrimaryCmdBuffer(ctxp);
     defer vkd.freeCommandBuffers(ctxp.device, ctxp.command_pool, &[_]vk.CommandBuffer{cb});
@@ -323,6 +328,7 @@ fn syncFloor(ctxp: *vulkan_ctx_mod.Context, io: Io, reps: u32, w: *Io.Writer) !v
     const submits = [_]vk.SubmitInfo{.{ .command_buffer_count = 1, .p_command_buffers = &cmds }};
     const fences = [_]vk.Fence{fence};
 
+    // Time the queue-idle wait.
     var idle: step_stats.Stat = .{};
     for (0..warm_reps + reps) |i| {
         const t0 = Io.Clock.Timestamp.now(io, .awake);
@@ -333,6 +339,7 @@ fn syncFloor(ctxp: *vulkan_ctx_mod.Context, io: Io, reps: u32, w: *Io.Writer) !v
         }
     }
 
+    // Time the fence wait.
     var fenced: step_stats.Stat = .{};
     for (0..warm_reps + reps) |i| {
         const t0 = Io.Clock.Timestamp.now(io, .awake);
@@ -345,7 +352,7 @@ fn syncFloor(ctxp: *vulkan_ctx_mod.Context, io: Io, reps: u32, w: *Io.Writer) !v
         }
     }
 
-    try w.print("\nm5 sync floor (empty command buffer, n={d})\n", .{reps});
+    try w.print("\nsync floor (empty command buffer, n={d})\n", .{reps});
     try printStat(w, "queue wait", idle);
     try printStat(w, "fence wait", fenced);
 }
@@ -360,6 +367,7 @@ fn gapProbe(
     first_token: u32,
     w: *Io.Writer,
 ) !void {
+    // Warm the decode path.
     var id = first_token;
     var pos = opt.pos;
     for (0..warm_reps) |_| {
@@ -367,8 +375,7 @@ fn gapProbe(
         pos += 1;
     }
 
-    // The decode ring writes the start and end stamps at `submit` and above.
-    // A process at `off` raises the ring for the timed steps only.
+    // Raise the ring for the timed steps. It writes the start and end stamps at `submit` and above.
     const level = runner.decode.level();
 
     if (level == .off) {
@@ -377,6 +384,7 @@ fn gapProbe(
 
     defer if (level == .off) runner.setDecodeLevel(.off) catch unreachable;
 
+    // Run the timed steps and keep the stamps of each.
     runner.host = .{};
     var ticks: [2 * reps_max]u64 = undefined;
     var period: f64 = 0;
@@ -397,6 +405,7 @@ fn gapProbe(
     ) / 1e6;
     std.debug.assert(pos <= runner.max_seq);
 
+    // Turn the stamps into gaps.
     var gap: step_stats.Stat = .{};
     var busy: step_stats.Stat = .{};
     for (0..opt.reps) |i| {
@@ -406,6 +415,7 @@ fn gapProbe(
         }
     }
 
+    // Print the gap, the busy time, and the host steps.
     try w.print(
         "\ngap: GPU idle between steps (n={d} steps, {d} gaps, pos={d}..{d}, argmax included)\n",
         .{ opt.reps, gap.count, opt.pos + warm_reps, pos - 1 },

@@ -1,5 +1,7 @@
-//! The attention checks of `gpu-selftest`: the single-pass kernels and the kit of the split
-//! kernels, against the CPU attention reference.
+//! The attention checks of `gpu-selftest`: the single-pass kernels and the split kernel set,
+//! against the CPU attention reference.
+//!
+//! Comptime. Generic over the element type, so the f32 and f16 checks share one body.
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
@@ -31,7 +33,7 @@ const needle_score: f32 = 9;
 const sentinel_bits: u32 = 0x7FC0_0BAD;
 
 /// The Qwen3.5-2B head geometry, then the SmolLM2 one.
-const kit_shapes = [_]KitShape{
+const case_shapes = [_]CaseShape{
     .{ .n_heads = 8, .n_kv_heads = 2, .head_dim = 256 },
     .{ .n_heads = 9, .n_kv_heads = 3, .head_dim = 64 },
 };
@@ -42,32 +44,32 @@ const DescriptorBufferInfo = @typeInfo(
     @typeInfo(@TypeOf(kernels.updateStorageBindings)).@"fn".params[2].type.?,
 ).pointer.child;
 
-const KitShape = struct { n_heads: u32, n_kv_heads: u32, head_dim: u32 };
+const CaseShape = struct { n_heads: u32, n_kv_heads: u32, head_dim: u32 };
 
-const KitKind = enum { decode, prefill };
+const CaseKind = enum { decode, prefill };
 
 /// Query rows `[start_pos, start_pos + b)` of one stream. A decode case has
 /// `b` = 1 and `start_pos` = `t_len - 1`.
-const KitCase = struct {
-    kind: KitKind,
+const Case = struct {
+    kind: CaseKind,
     start_pos: u32,
     b: u32,
 
     /// One position past the deepest row holds the second needle key.
-    fn positions(self: KitCase) u32 {
+    fn positions(self: Case) u32 {
         return self.start_pos + self.b + 1;
     }
 };
 
-/// The host inputs of one kit case and the CPU reference output.
-fn KitInputs(comptime T: type) type {
+/// The host inputs of one case and the CPU reference output.
+fn CaseInputs(comptime T: type) type {
     return struct { q: []f32, k: []T, v: []T, out_cpu: []f32 };
 }
 
-/// The pipelines of the attention kit at one KV element type, as a runner
+/// The pipelines of the attention kernel set at one KV element type, as a runner
 /// holds them, with the sets and host buffers one case binds. `single` is
 /// borrowed from the caller.
-const KitRig = struct {
+const Rig = struct {
     ctx: *const vulkan_ctx.Context,
     single: *kernels.Attention,
     multi: kernels.AttentionMultiStream,
@@ -82,7 +84,8 @@ const KitRig = struct {
     scratch: kernels.HostBuffer,
     out: kernels.HostBuffer,
 
-    fn init(ctx: *const vulkan_ctx.Context, single: *kernels.Attention) !KitRig {
+    fn init(ctx: *const vulkan_ctx.Context, single: *kernels.Attention) !Rig {
+        // Build the kernels.
         var multi = try kernels.AttentionMultiStream.initKv(ctx, single.kv);
         errdefer multi.deinit();
 
@@ -92,6 +95,7 @@ const KitRig = struct {
         var batch = try kernels.AttentionBatch.initKv(ctx, single.kv);
         errdefer batch.deinit();
 
+        // Build the one-shot descriptor sets.
         const batch_set = try kernels.OneShot.init(ctx, batch.pipeline.set_layout, 4);
         errdefer batch_set.deinit(ctx);
 
@@ -107,6 +111,8 @@ const KitRig = struct {
             passes.merge.set_layout,
             kernels.AttentionSplit.merge_bindings,
         );
+
+        // Assemble the rig.
         return .{
             .ctx = ctx,
             .single = single,
@@ -124,7 +130,7 @@ const KitRig = struct {
         };
     }
 
-    fn deinit(self: *KitRig) void {
+    fn deinit(self: *Rig) void {
         self.out.deinit();
         self.scratch.deinit();
         self.v.deinit();
@@ -141,14 +147,12 @@ const KitRig = struct {
 
 // -- api --------------------------------------------------------------------
 
-/// Check the decode attention at Qwen3.5 dims (8 q-heads, 2 kv-heads, head_dim
-/// 256, GQA 4:1) against the CPU `naive.attentionRowTyped`, at both KV element types.
-/// A split case also runs twice and fails unless the two outputs match byte for
-/// byte, because the merge order is fixed. It then checks the attention kit of the build.
+/// Check decode attention at Qwen3.5 dims (8 q-heads, 2 kv-heads, head_dim 256) at both KV types.
+/// A split case runs twice and fails unless both outputs match byte for byte, because the merge
+/// order is fixed. Then check the attention kernel set of the build.
 pub fn attnCheck(ctx: context.Context) !void {
-    // 7 is the small smoke shape. `split_len` is the deepest row of the resident
-    // kernel, and one more is the first split row. `cpu_tile` ends the CPU
-    // reference on a full tile, and one more adds a tile of one position.
+    // Depths: a small smoke shape, the resident limit and the first split row, then the CPU tile
+    // edge and one past it.
     const split_len = limits.attn_split_len;
     const cpu_tile = limits.attn_cpu_tile;
     const t_cases = [_]u32{
@@ -162,11 +166,9 @@ pub fn attnCheck(ctx: context.Context) !void {
         32768,
     };
 
+    // Open the device and the two single-pass kernels.
     var ctxp = try ctx.arena.create(vulkan_ctx.Context);
-    ctxp.* = try vulkan_ctx.Context.init(
-        ctx.arena,
-        .{ .storage_range_override = ctx.vk_storage_range },
-    );
+    ctxp.* = try vulkan_ctx.Context.init(ctx.arena, ctx.vk_options);
     defer ctxp.deinit();
 
     var attn_f32 = try kernels.Attention.initKv(ctxp, .f32);
@@ -175,6 +177,7 @@ pub fn attnCheck(ctx: context.Context) !void {
     var attn_f16 = try kernels.Attention.initKv(ctxp, .f16);
     defer attn_f16.deinit();
 
+    // Check the single-pass kernels at every depth.
     const w = &ctx.stdout.interface;
 
     var total_fails: usize = 0;
@@ -183,14 +186,15 @@ pub fn attnCheck(ctx: context.Context) !void {
         total_fails += try attnCheckCase(f16, ctx.gpa, &attn_f16, w, t_len);
     }
 
-    var rig_f32 = try KitRig.init(ctxp, &attn_f32);
+    // Check the attention kernel set.
+    var rig_f32 = try Rig.init(ctxp, &attn_f32);
     defer rig_f32.deinit();
 
-    var rig_f16 = try KitRig.init(ctxp, &attn_f16);
+    var rig_f16 = try Rig.init(ctxp, &attn_f16);
     defer rig_f16.deinit();
 
-    total_fails += try attnKitCases(f32, ctx.gpa, &rig_f32, w);
-    total_fails += try attnKitCases(f16, ctx.gpa, &rig_f16, w);
+    total_fails += try attnCases(f32, ctx.gpa, &rig_f32, w);
+    total_fails += try attnCases(f16, ctx.gpa, &rig_f16, w);
     try w.print("RESULT: {s}\n", .{if (total_fails == 0) "PASS" else "FAIL"});
     try w.flush();
     if (total_fails != 0) return error.BitCheckFailed;
@@ -212,7 +216,7 @@ fn attnCheckCase(
     const n_kv_heads: u32 = 2;
     const head_dim: u32 = 256;
 
-    // Each case frees its buffers, so the deepest case alone sets the peak.
+    // Build the inputs. Each case frees its buffers, so the deepest case alone sets the peak.
     var case_arena: std.heap.ArenaAllocator = .init(gpa);
     defer case_arena.deinit();
 
@@ -227,6 +231,7 @@ fn attnCheckCase(
     gpu_selftest_common.fillTyped(T, r, k_cache, 1.0);
     gpu_selftest_common.fillTyped(T, r, v_cache, 1.0);
 
+    // Run the CPU reference and the GPU kernel.
     const out_cpu = try a.alloc(f32, n_heads * head_dim);
     const parts = try a.alloc(f32, attn_cpu.partialLen(n_heads, head_dim));
     naive.attentionRowTyped(
@@ -245,6 +250,7 @@ fn attnCheckCase(
     const out_gpu = try a.alloc(f32, n_heads * head_dim);
     try attn.runTyped(T, q, k_cache, v_cache, n_heads, n_kv_heads, head_dim, t_len, out_gpu);
 
+    // Compare, and rerun a split case to check the bytes.
     const split = attn_split.usesSplit(t_len);
     try w.print(
         "Attention GPU vs CPU (kv={s}, n_heads={d}, n_kv={d}, head_dim={d}, t_len={d}, {s})\n",
@@ -273,24 +279,21 @@ fn attnCheckCase(
     return fails;
 }
 
-/// Check the attention kit of the build against the CPU reference with two
-/// kinds of plan: a decode row through `attn_record.record`, and a prefill chunk
-/// through `attn_record.recordPrefill`. The decode depths hold the last
-/// resident row and two split rows. The prefill chunks straddle `split_len`
-/// and sit deep in the split range. Each case fails when its maximum relative
-/// error exceeds the tolerance that the kit declares.
-fn attnKitCases(comptime T: type, gpa: Allocator, rig: *KitRig, w: *std.Io.Writer) !usize {
+/// Check the attention kernel set against the CPU reference: decode rows through
+/// `attn_record.record` and prefill chunks through `attn_record.recordPrefill`, around and past
+/// `split_len`. A case fails when its maximum relative error exceeds the declared tolerance.
+fn attnCases(comptime T: type, gpa: Allocator, rig: *Rig, w: *std.Io.Writer) !usize {
     const split_len = limits.attn_split_len;
     const decode_t = [_]u32{ split_len - 1, split_len + 1, 4 * split_len + 3 };
-    const prefill = [_]KitCase{
+    const prefill = [_]Case{
         .{ .kind = .prefill, .start_pos = split_len - 3, .b = 7 },
         .{ .kind = .prefill, .start_pos = 4 * split_len + 1, .b = 5 },
     };
 
     var fails: usize = 0;
-    for (kit_shapes) |shape| {
+    for (case_shapes) |shape| {
         for (decode_t) |t_len| {
-            fails += try attnKitCase(
+            fails += try attnCase(
                 T,
                 gpa,
                 rig,
@@ -301,23 +304,24 @@ fn attnKitCases(comptime T: type, gpa: Allocator, rig: *KitRig, w: *std.Io.Write
         }
 
         for (prefill) |c| {
-            fails += try attnKitCase(T, gpa, rig, w, shape, c);
+            fails += try attnCase(T, gpa, rig, w, shape, c);
         }
     }
 
     return fails;
 }
 
-/// One kit case at KV element type `T`. It returns 1 when the maximum
-/// relative error of any output row exceeds the kit tolerance, else 0.
-fn attnKitCase(
+/// One case at KV element type `T`. It returns 1 when the maximum
+/// relative error of any output row exceeds the declared tolerance, else 0.
+fn attnCase(
     comptime T: type,
     gpa: Allocator,
-    rig: *KitRig,
+    rig: *Rig,
     w: *std.Io.Writer,
-    shape: KitShape,
-    c: KitCase,
+    shape: CaseShape,
+    c: Case,
 ) !usize {
+    // Check the shape and open a case arena.
     const positions = c.positions();
     std.debug.assert(shape.n_heads % shape.n_kv_heads == 0);
     std.debug.assert(shape.n_heads / shape.n_kv_heads <= limits.attn_max_group);
@@ -329,7 +333,8 @@ fn attnKitCase(
 
     const a = case_arena.allocator();
 
-    const in = try kitInputs(T, a, shape, c);
+    // Plan the case, bind the buffers, and run it.
+    const in = try caseInputs(T, a, shape, c);
 
     const scratch = attn_split.Scratch.init(shape.n_heads, shape.head_dim, positions);
     const plan = switch (c.kind) {
@@ -340,20 +345,19 @@ fn attnKitCase(
     plan.assertValid();
     std.debug.assert(plan.resident_count + plan.split_count == c.b);
 
-    const binding = try kitBind(T, rig, shape, c, in, scratch);
-    try kitSubmit(rig, c, &plan, binding);
+    const binding = try bindCase(T, rig, shape, c, in, scratch);
+    try submitCase(rig, c, &plan, binding);
 
+    // Compare against the reference and print the verdict.
     const max_rel = maxRelStrict(in.out_cpu, rig.out.sliceTyped(f32, in.out_cpu.len));
-    const ok = op_requires.toleranceSatisfied(kernels.AttnKit.tolerance, max_rel, false);
+    const ok = op_requires.toleranceSatisfied(kernels.AttnKernels.tolerance, max_rel, false);
     const verdict = if (ok) "ok" else "FAIL";
     switch (c.kind) {
         .decode => try w.print(
             "Attention kernel set (kv={s}, shape={d}/{d}/{d}, decode, t_len={d}, {s}): " ++
                 "max_rel={e:.3} {s}\n",
             .{
-                @typeName(
-                    T,
-                ),
+                @typeName(T),
                 shape.n_heads,
                 shape.n_kv_heads,
                 shape.head_dim,
@@ -367,9 +371,7 @@ fn attnKitCase(
             "Attention kernel set (kv={s}, shape={d}/{d}/{d}, prefill, start_pos={d}, " ++
                 "b={d}, {d} resident + {d} split): max_rel={e:.3} {s}\n",
             .{
-                @typeName(
-                    T,
-                ),
+                @typeName(T),
                 shape.n_heads,
                 shape.n_kv_heads,
                 shape.head_dim,
@@ -387,7 +389,8 @@ fn attnKitCase(
 }
 
 /// Build the random keys, values, and queries of a case, and the CPU reference rows.
-fn kitInputs(comptime T: type, a: Allocator, shape: KitShape, c: KitCase) !KitInputs(T) {
+fn caseInputs(comptime T: type, a: Allocator, shape: CaseShape, c: Case) !CaseInputs(T) {
+    // Draw the keys, then the values.
     const row_elems: usize = @as(usize, shape.n_heads) * shape.head_dim;
     const kv_row: usize = @as(usize, shape.n_kv_heads) * shape.head_dim;
     const positions = c.positions();
@@ -404,6 +407,7 @@ fn kitInputs(comptime T: type, a: Allocator, shape: KitShape, c: KitCase) !KitIn
         x.* = 0.5 + r.float(f32);
     }
 
+    // Round the keys and values to `T`.
     const k = try a.alloc(T, k_f32.len);
     const v = try a.alloc(T, v_f32.len);
     for (k, k_f32) |*d, x| {
@@ -414,6 +418,7 @@ fn kitInputs(comptime T: type, a: Allocator, shape: KitShape, c: KitCase) !KitIn
         d.* = @floatCast(x);
     }
 
+    // Build the queries and the CPU reference rows.
     const q = try a.alloc(f32, c.b * row_elems);
     fillNeedleRows(r, q, k_f32, shape, c);
 
@@ -442,14 +447,15 @@ fn kitInputs(comptime T: type, a: Allocator, shape: KitShape, c: KitCase) !KitIn
 }
 
 /// Upload the inputs of a case, point the descriptor sets at the buffers, and return the binding.
-fn kitBind(
+fn bindCase(
     comptime T: type,
-    rig: *KitRig,
-    shape: KitShape,
-    c: KitCase,
-    in: KitInputs(T),
+    rig: *Rig,
+    shape: CaseShape,
+    c: Case,
+    in: CaseInputs(T),
     scratch: attn_split.Scratch,
-) !kernels.AttnKit.Binding {
+) !kernels.AttnKernels.Binding {
+    // Upload the inputs and size the output and scratch buffers.
     const q_bytes = try uploadSlice(f32, &rig.q, in.q);
     const kv_bytes = try uploadSlice(T, &rig.k, in.k);
     _ = try uploadSlice(T, &rig.v, in.v);
@@ -459,6 +465,7 @@ fn kitBind(
     @memset(rig.out.sliceTyped(u32, in.out_cpu.len), sentinel_bits);
     try rig.scratch.ensure(scratch.totalBytes());
 
+    // Describe the buffers.
     const q_info: DescriptorBufferInfo = .{ .buffer = rig.q.buffer, .offset = 0, .range = q_bytes };
     const k_info: DescriptorBufferInfo = .{
         .buffer = rig.k.buffer,
@@ -483,6 +490,7 @@ fn kitBind(
     kernels.AttentionSplit.assertKBinding(k_info);
     kernels.AttentionSplit.assertVBinding(v_info);
 
+    // Point the descriptor sets at the buffers.
     const resident_set = switch (c.kind) {
         .decode => rig.single.oneshot.desc_set,
         .prefill => rig.batch_set.desc_set,
@@ -496,6 +504,7 @@ fn kitBind(
     );
     kernels.updateStorageBindings(rig.ctx, rig.merge_set.desc_set, &.{ scratch_info, out_info });
 
+    // Return the binding.
     return .{
         .shape = .{
             .n_heads = shape.n_heads,
@@ -514,13 +523,13 @@ fn kitBind(
 }
 
 /// Record the plan of a case into one command buffer, submit it, and wait.
-fn kitSubmit(
-    rig: *KitRig,
-    c: KitCase,
+fn submitCase(
+    rig: *Rig,
+    c: Case,
     plan: *const attn_split.AttnPlan,
-    binding: kernels.AttnKit.Binding,
+    binding: kernels.AttnKernels.Binding,
 ) !void {
-    const kit: kernels.AttnKit = .{
+    const attn_kernels: kernels.AttnKernels = .{
         .single = rig.single,
         .multi = &rig.multi,
         .passes = &rig.passes,
@@ -530,8 +539,15 @@ fn kitSubmit(
     try rig.ctx.vkd.resetCommandBuffer(cb, .{});
     try rig.ctx.vkd.beginCommandBuffer(cb, &.{ .flags = .{ .one_time_submit_bit = true } });
     switch (c.kind) {
-        .decode => attn_record.record(kernels.AttnKit, kit, cb, plan, binding),
-        .prefill => attn_record.recordPrefill(kernels.AttnKit, kit, cb, plan, binding, c.start_pos),
+        .decode => attn_record.record(kernels.AttnKernels, attn_kernels, cb, plan, binding),
+        .prefill => attn_record.recordPrefill(
+            kernels.AttnKernels,
+            attn_kernels,
+            cb,
+            plan,
+            binding,
+            c.start_pos,
+        ),
     }
 
     try rig.ctx.vkd.endCommandBuffer(cb);
@@ -547,7 +563,7 @@ fn kitSubmit(
 
 /// Give each query row a needle: a score near `needle_score` at its last
 /// causal position and at the position after it, for every head.
-fn fillNeedleRows(r: std.Random, q: []f32, k: []const f32, shape: KitShape, c: KitCase) void {
+fn fillNeedleRows(r: std.Random, q: []f32, k: []const f32, shape: CaseShape, c: Case) void {
     const head_dim: usize = shape.head_dim;
     const row_elems = @as(usize, shape.n_heads) * head_dim;
     const kv_row = @as(usize, shape.n_kv_heads) * head_dim;

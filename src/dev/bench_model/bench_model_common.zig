@@ -1,5 +1,7 @@
 //! The values the files of `bench-model` pass to each other, and their leaf
 //! helpers.
+//!
+//! Comptime. An assert pins the depth buckets to divide the model context evenly.
 
 const std = @import("std");
 const zigferencer = @import("zigferencer");
@@ -16,7 +18,7 @@ const parallel = zigferencer.parallel;
 const args = zigferencer.cli.args;
 const context = zigferencer.cli.context;
 const flags_mod = zigferencer.cli.flag_groups;
-const boot_facts = zigferencer.cli.boot_facts;
+const boot_resources = zigferencer.cli.boot_resources;
 
 pub const writeStderr = args.writeStderr;
 
@@ -34,7 +36,7 @@ pub const Bench = struct {
     opt: Options,
     model: *const registry.Model,
     loaded: *const loader.Loaded,
-    boot: *const boot_facts.DeviceBoot,
+    boot: *const boot_resources.DeviceBoot,
     resolved: *const resolve_mod.Resolved,
     policy: parallel.Policy,
 
@@ -43,10 +45,8 @@ pub const Bench = struct {
     }
 };
 
-/// The bench-model flag set. `bench_model_cmd` parses it once and hands the
-/// executors one value, which separates what the caller asked for from how the
-/// run happens. The field defaults are the flag defaults, and the help states
-/// them.
+/// The `bench-model` flag set. `bench_model_cmd` parses it once. The field defaults are the flag
+/// defaults.
 pub const Options = struct {
     pub_name: ?[]const u8 = null,
     prompt: []const u8 = "Hello",
@@ -56,23 +56,15 @@ pub const Options = struct {
     json: bool = false,
     /// Synthesize exactly N prompt tokens instead of tokenizing `prompt`.
     prompt_tokens: ?u32 = null,
-    /// Force exactly max_tokens steps per run. Throughput depends only on token
-    /// counts, so this gives a clean, model-agnostic ITL even when greedy
-    /// decoding degenerates to early EOS.
+    /// Force exactly max_tokens steps per run, so ITL stays clean when greedy decoding hits EOS.
     ignore_eos: bool = false,
     /// The bench takes no thinking option, so the engine thinking stays `auto`.
     engine: flags_mod.EngineFlags = .{},
-    /// With a --gpu-layers count: construct the hybrid even at a degenerate
-    /// split (0 or all layers).
+    /// With a --gpu-layers count: build the hybrid even at a degenerate split (0 or all layers).
     force_hybrid: bool = false,
-    /// CPU backends only, llama and qwen35: prefill the prompt unprofiled, then
-    /// decode `max_tokens` steps with the per-op CPU timer
-    /// (`cpu_profile.CpuProfile`) installed, print the ns + %-of-step breakdown
-    /// and the parallel and serial shares, exit. The timer compiles into a
-    /// hot-trace build only, so every other build refuses the flag.
+    /// CPU backends only: print the per-op decode breakdown (`bench_model_profile`), then exit.
     profile_cpu_decode: bool = false,
-    /// qwen35 fused only: one timestamped prefill (or decode step), print the
-    /// per-stage GPU breakdown, exit.
+    /// qwen35 fused only: print the per-stage GPU breakdown of one step, then exit.
     profile_prefill: bool = false,
     profile_decode: bool = false,
 
@@ -81,8 +73,8 @@ pub const Options = struct {
     pub const omit: []const []const u8 = &.{ "thinking", "thinking_budget" };
     pub const help: args.Help = .{
         .usage = "zigferencer-dev bench-model <pub_name> [flags]",
-        .about = "Run the full forward pass repeatedly. Report TTFT, ITL, and a " ++
-            "token-stream hash.\n",
+        .about = "Run the full forward pass repeatedly. " ++
+            "Report TTFT, ITL, and a token-stream hash.\n",
         .footer =
         \\examples:
         \\  zigferencer-dev bench-model SmolLM2-135M-Instruct-Q8_0 --runs 5
@@ -106,8 +98,8 @@ pub const Options = struct {
         .chat = args.Doc{ .group = "common", .text = "apply the chat template of the model" },
         .json = args.Doc{
             .group = "common",
-            .text = "machine-readable output (tools/gate.sh).\nEach run adds " ++
-                "itl_by_depth, the mean ITL per 512 KV positions",
+            .text = "machine-readable output (tools/gate.sh).\n" ++
+                "Each run adds itl_by_depth, the mean ITL per 512 KV positions",
         },
         .prompt_tokens = args.Doc{
             .group = "prompt shape",
@@ -136,15 +128,13 @@ pub const Options = struct {
         },
         .gpu_layers = args.Doc{
             .group = "gpu (fused-GPU build only)",
-            .text = "pin N GPU layers, bench the hybrid split runner.\nauto puts the most " ++
-                "layers on the GPU that the free VRAM funds",
+            .text = "pin N GPU layers, bench the hybrid split runner.\n" ++
+                "auto puts the most layers on the GPU that the free VRAM funds",
         },
     };
 };
 
-/// The KV shape a run executed under, carried to the report. Zero slots means
-/// the path planned no device KV (CPU and pinned runners), and the report then
-/// prints nothing.
+/// The KV shape a run executed under. Zero slots means no device KV plan, and the report skips it.
 pub const PlanInfo = struct {
     n_slots: u32 = 0,
     window: u32 = 0,
@@ -217,6 +207,8 @@ pub const DepthCurve = struct {
 pub const RunResult = struct {
     ttft_ms: f64,
     itl_ms: f64,
+    /// Generated tokens over the whole turn, prefill included.
+    tok_s: f64 = 0,
     tokens_hash: u64,
     tokens_generated: u32,
     itl_by_depth: []const DepthBucket,
@@ -245,8 +237,8 @@ pub fn requireSequenceFits(
     var fw: Io.File.Writer = .initStreaming(.stderr(), io, &buf);
 
     fw.interface.print(
-        "error: prompt {d} + decode {d} tokens passes the {d}-token window. Lower " ++
-            "--prompt-tokens or --max-tokens\n",
+        "error: prompt {d} + decode {d} tokens passes the {d}-token window. " ++
+            "Lower --prompt-tokens or --max-tokens\n",
         .{
             prompt_len, decode_len, max_seq,
         },

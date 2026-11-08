@@ -1,4 +1,7 @@
 //! The `--no-stream` mode: one blocking loop with no tasks, for piped input.
+//!
+//! Errors. A server error ends one step, and the loop prints it and reads the next line. Any other
+//! error ends the chat.
 
 const std = @import("std");
 const Io = std.Io;
@@ -37,23 +40,26 @@ const Blocking = struct {
     shades: *client_output.ReplyShades,
 };
 
-/// A failed append frame of turns `from..to`, with the numbers of a
-/// `turn_too_long` refusal when it was one.
-const AppendFailure = struct { from: u32, to: u32, too_long: ?transcript_mod.TooLong };
+/// A failed append frame of turns `from..to`.
+const AppendFailure = struct { from: u32, to: u32 };
 
 // -- api --------------------------------------------------------------------
 
 pub fn runBlocking(ctx: context.Context, st: client_startup.Startup) !void {
     const out = st.out;
     const client = st.client;
+
+    // Allocate the reply buffers once, for every turn of the chat.
     const ids = try ctx.arena.alloc(u32, st.info.max_seq);
     const text = try ctx.arena.alloc(u8, text_bytes_max);
     var shades: client_output.ReplyShades = try .init(ctx.arena, text.len, st.info.eos_id);
 
+    // Read stdin through a buffer of one line.
     var buf: [client_input.line_bytes_max]u8 = undefined;
     var reader = Io.File.stdin().readerStreaming(ctx.io, &buf);
     const r = &reader.interface;
 
+    // Gather the values that each step reads.
     var b: Blocking = .{
         .out = out,
         .opts = st.opts,
@@ -92,6 +98,7 @@ pub fn runBlocking(ctx: context.Context, st: client_startup.Startup) !void {
     try out.e.writeAll("\n");
     try out.e.flush();
 
+    // Close the session. A server error here does not fail the chat.
     client.closeSession(b.session.id) catch |err| {
         if (err != error.ServerError) return err;
         try out.serverError(client.last_error);
@@ -135,8 +142,8 @@ fn blockingStep(b: *Blocking, cmd: client_input.Command) !void {
     }
 }
 
-/// One typed prompt. A refusal that a compaction can answer runs the prompt
-/// once more, so the loop runs at most two passes.
+/// One typed prompt. A refusal that a compaction can answer runs the prompt once more, so the
+/// loop runs at most two passes.
 fn blockingTurn(b: *Blocking, prompt_text: []const u8) !void {
     const t = b.hist.t;
     var retried = false;
@@ -173,22 +180,24 @@ fn blockingTurn(b: *Blocking, prompt_text: []const u8) !void {
     }
 }
 
-/// A turn that filled the window compacts at once, so the next prompt finds
-/// room.
+/// A turn that filled the window compacts at once, so the next prompt finds room.
 fn blockingRecord(b: *Blocking, turn: Client.Turn) !void {
     const out = b.out;
     const t = b.hist.t;
     std.debug.assert(b.shades.total == turn.text_total);
 
+    // Move the session to the position of the server.
     const before = b.session.kv_pos;
     std.debug.assert(turn.kv_pos >= before);
     b.session.kv_pos = turn.kv_pos;
 
+    // Print the kept text with its shades.
     const kept = b.text[0..turn.text_len];
     try b.shades.write(out.o, out.po, kept);
     try out.o.writeAll("\n");
     try out.o.flush();
 
+    // Report each buffer that cut the reply.
     const cuts = client_output.turnCuts(turn, b.ids.len);
     if (cuts.ids) |cut| {
         try out.note("{f}", .{cut});
@@ -198,24 +207,17 @@ fn blockingRecord(b: *Blocking, turn: Client.Turn) !void {
         try out.note("{f}", .{cut});
     }
 
-    b.shades.record(t, kept);
     // A cut reply is not whole, so the transcript must not keep it as one.
+    b.shades.record(t, kept);
     if (cuts.text != null) {
         t.markCut();
     }
 
+    // Commit the turn and print its summary.
     const rec = t.finish(
         transcript_mod.liveCost(turn.kv_pos - before, turn.finish_reason, turn.gen_tokens),
     );
-    try out.finish(.{
-        .finish_reason = turn.finish_reason,
-        .gen_tokens = turn.gen_tokens,
-        .reasoning_tokens = turn.reasoning_tokens,
-        .kv_pos = turn.kv_pos,
-        .max_seq = b.info.max_seq,
-        .prefill_ms = turn.prefill_ms,
-        .decode_ms = turn.decode_ms,
-    });
+    try out.finish(turn, b.info.max_seq);
     try out.recorded(rec);
 
     if (turn.finish_reason == .context_full) {
@@ -223,13 +225,15 @@ fn blockingRecord(b: *Blocking, turn: Client.Turn) !void {
     }
 }
 
-/// One compaction cycle in the blocking mode. Each pass opens one session, so
-/// the loop runs at most `total + 3` passes.
+/// One compaction cycle in the blocking mode. Each pass opens one session, so the loop runs at
+/// most `total + 3` passes.
 fn blockingCompact(b: *Blocking, reserve: u32) !void {
     std.debug.assert(reserve <= b.hist.window);
 
     const out = b.out;
     const client = b.client;
+
+    // Plan the cycle. The turns that it drops leave the transcript at once.
     const total = b.hist.t.count();
     var cycle: client_history.Cycle = .{
         .plan = b.hist.shrink(reserve),
@@ -238,53 +242,26 @@ fn blockingCompact(b: *Blocking, reserve: u32) !void {
     };
 
     while (true) {
+        // Replace the session with one that holds only the system prompt.
         try client.closeSession(b.session.id);
         b.session = client.openSessionInfo(b.opts.system, b.sampling) catch |err|
             return sessionLost(out, client, err);
         b.hist.system_rows = b.session.kv_pos;
 
+        // Send the kept pairs. When every pair is in, the cycle ends.
         const failure = try blockingAppend(b) orelse
             return out.dim(
                 "{f}",
                 .{client_output.Compacted.of(&cycle, b.session.kv_pos, b.hist.window)},
             );
 
-        if (failure.too_long) |tl| {
-            try out.note(client_output.refit_fmt, .{ tl.tokens, tl.room });
-            cycle.refits += 1;
-            switch (transcript_mod.refit(
-                b.hist.t,
-                b.hist.budget(reserve),
-                failure.from,
-                failure.to,
-                tl.tokens,
-                cycle.plan.kept,
-            )) {
-                .plan => |p| cycle.plan = p,
-                .stuck => {
-                    try out.dim(client_output.refit_stuck_note, .{});
-                    b.hist.keepNothing(&cycle);
-                },
-            }
-
-            continue;
-        }
-
-        try out.serverError(client.last_error);
-        if (!cycle.reopened) {
-            cycle.reopened = true;
-            try out.note(client_output.reopen_note, .{});
-            continue;
-        }
-
-        try out.note(client_output.append_lost_note, .{});
-        b.hist.keepNothing(&cycle);
+        // Step the cycle. The next pass opens a new session.
+        try out.frameFailed(b.hist, &cycle, client.last_error, failure.from, failure.to);
     }
 }
 
-/// Append every kept pair in frames. Each pass sends one frame of at least
-/// one pair, so the loop runs at most `count` times. Null means every pair
-/// is in.
+/// Append every kept pair in frames. Each pass sends at least one pair, so the loop runs at most
+/// `count` times. Null means every pair is in.
 fn blockingAppend(b: *Blocking) !?AppendFailure {
     const t = b.hist.t;
     var next: u32 = 0;
@@ -294,11 +271,7 @@ fn blockingAppend(b: *Blocking) !?AppendFailure {
         const f = b.hist.frame(next, &buf);
         const a = b.client.append(b.session.id, f.pairs) catch |err| {
             if (err != error.ServerError) return err;
-            return .{
-                .from = next,
-                .to = f.end,
-                .too_long = client_history.tooLong(b.client.last_error, .turn),
-            };
+            return .{ .from = next, .to = f.end };
         };
         b.session.kv_pos = transcript_mod.learnAppended(t, next, b.session.kv_pos, a.positions());
         next = f.end;

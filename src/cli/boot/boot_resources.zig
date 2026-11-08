@@ -1,5 +1,11 @@
 //! What a boot measures. `run`, `serve`, and the benches read the host and the device once
-//! through these functions, and hand the facts to `engine/resolve`.
+//! through these functions, and hand the resources to `engine/resolve`.
+//!
+//! Comptime. A build option picks the fused placement, and `measureFused` is generic over the
+//! family.
+//!
+//! Logged gaps. A missing figure logs one line, so a skipped guard stays visible. The RAM line
+//! prints once per boot through `DeviceBoot.ram`. The heap-size line prints once per process.
 
 const std = @import("std");
 const Io = std.Io;
@@ -22,26 +28,27 @@ const vulkan_ctx_mod = if (fused_build) @import("../../runtime/vulkan_ctx.zig") 
 
 const log = std.log.scoped(.serve);
 const fused_build = build_options.use_vulkan_fused_ops;
-const device_arm = resolve_mod.device_arm;
+const device_placement = resolve_mod.device_placement;
 
 const boot_lines = @import("boot_lines.zig");
 
 // -- types ------------------------------------------------------------------
 
-/// The outcome of a device attempt. `.all_host` hands the boot and its host arm
-/// back to the caller, because an auto split can fund no GPU layer.
-pub const Placed = union(enum) { done, all_host: resolve_mod.Result(resolve_mod.CpuArm) };
+/// The outcome of a device attempt. `.all_host` hands the host placement back, because an auto
+/// split can fund no GPU layer.
+pub const DeviceAttempt = union(enum) {
+    done,
+    all_host: resolve_mod.Result(resolve_mod.HostPlacement),
+};
 
-/// What a device boot resolves on: the flags, the registry entry, the card,
-/// and the weight census the boot measured after the load.
+/// What a device boot resolves on: the flags, the registry entry, the card, and the weight census.
 pub const DeviceBoot = struct {
     kind: resolve_mod.Kind,
     input: resolve_mod.Input,
     entry: resolve_mod.Entry,
     card: loader.ModelCard,
-    model: resolve_mod.ModelFacts,
-    /// A boot that read the RAM figure before the device passes it on, so the
-    /// "RAM check is off" line prints once.
+    model: resolve_mod.ModelNeeds,
+    /// The RAM figure of an earlier read.
     ram: RamFigure = .unread,
 
     pub const RamFigure = union(enum) { unread, read: ?u64 };
@@ -53,24 +60,23 @@ pub const DeviceBoot = struct {
         };
     }
 
-    /// Measure the device of `ctxp` once and resolve the device arm. The
-    /// decisions before the device already passed, so only a device refusal
+    /// Measure the device of `ctxp` once and resolve the device placement. Only a device refusal
     /// can follow.
-    pub fn resolveOn(self: *const DeviceBoot, io: Io, ctxp: anytype) !resolve_mod.DeviceArm {
-        const facts: resolve_mod.Facts = .{
+    pub fn resolveOn(self: *const DeviceBoot, io: Io, ctxp: anytype) !resolve_mod.DevicePlacement {
+        const resources: resolve_mod.Resources = .{
             .ram_free = self.ramFree(io),
             .model = self.model,
             .device = .{ .vram = vramFigure(ctxp), .buffer_limits = ctxp.buffer_limits },
         };
-        return switch (resolve_mod.resolve(self.kind, self.input, self.entry, self.card, facts)) {
+        const result = resolve_mod.resolve(self.kind, self.input, self.entry, self.card, resources);
+        return switch (result) {
             .ok => |r| r.device.?,
             .refused => |r| boot_lines.refuse(io, self.entry.pub_name, r),
         };
     }
 };
 
-/// A boot after the load: what `resolve` states, and the value a device context
-/// resolves on later.
+/// A boot after the load: what `resolve` states, and the value that a device context resolves on.
 pub const LoadedBoot = struct {
     values: resolve_mod.Resolved,
     device: DeviceBoot,
@@ -85,7 +91,7 @@ var heap_fallback_logged = false;
 
 pub const baseWindow = resolve_mod.baseWindow;
 
-/// Measure the loaded model and resolve the boot on the facts that need no device.
+/// Measure the loaded model and resolve the boot on the resources that need no device.
 pub fn resolveLoaded(
     ctx: context.Context,
     kind: resolve_mod.Kind,
@@ -93,10 +99,10 @@ pub fn resolveLoaded(
     entry: resolve_mod.Entry,
     loaded: *const loader.Loaded,
 ) !LoadedBoot {
-    const model_facts = try modelFacts(ctx.gpa, loaded);
+    const model_needs = try modelNeeds(ctx.gpa, loaded);
     const ram_free = hostRamFree(ctx.io);
-    const facts: resolve_mod.Facts = .{ .ram_free = ram_free, .model = model_facts };
-    const values = switch (resolve_mod.resolve(kind, input, entry, loaded.card, facts)) {
+    const resources: resolve_mod.Resources = .{ .ram_free = ram_free, .model = model_needs };
+    const values = switch (resolve_mod.resolve(kind, input, entry, loaded.card, resources)) {
         .ok => |r| r,
         .refused => |r| return boot_lines.refuse(ctx.io, entry.pub_name, r),
     };
@@ -108,13 +114,13 @@ pub fn resolveLoaded(
             .input = input,
             .entry = entry,
             .card = loaded.card,
-            .model = model_facts,
+            .model = model_needs,
             .ram = .{ .read = ram_free },
         },
     };
 }
 
-/// The registry facts `resolve` reads.
+/// The registry values `resolve` reads.
 pub fn entryOf(model: *const registry.Model) resolve_mod.Entry {
     return .{
         .pub_name = model.pub_name,
@@ -124,33 +130,29 @@ pub fn entryOf(model: *const registry.Model) resolve_mod.Entry {
     };
 }
 
-/// A new device context at a stable arena address. The kernels capture that
-/// address, so a runner goes down before the context.
+/// A new device context at a stable arena address. The kernels capture it, so a runner goes down
+/// before the context.
 pub fn openDevice(ctx: context.Context) !*vulkan_ctx_mod.Context {
     const ctxp = try ctx.arena.create(vulkan_ctx_mod.Context);
-    ctxp.* = try vulkan_ctx_mod.Context.init(ctx.arena, .{
-        .storage_range_override = ctx.vk_storage_range,
-    });
+    ctxp.* = try vulkan_ctx_mod.Context.init(ctx.arena, ctx.vk_options);
     return ctxp;
 }
 
-/// The fused arm of a one-stream boot that names no split, resolved on the
-/// context.
-pub fn fusedOn(io: Io, boot: *const DeviceBoot, ctxp: anytype) !device_arm.Fused {
+/// The fused placement of a one-stream boot that names no split, resolved on the context.
+pub fn fusedOn(io: Io, boot: *const DeviceBoot, ctxp: anytype) !device_placement.Fused {
     const dev = try boot.resolveOn(io, ctxp);
-    std.debug.assert(dev.placed == null);
-    return switch (dev.arm) {
+    std.debug.assert(dev.layer_choice == null);
+    return switch (dev.placement) {
         .ok => |a| a.fused,
         .refused => |r| boot_lines.refuse(io, boot.entry.pub_name, r),
     };
 }
 
-/// The weight census of one model and the reservations its fused runner
-/// makes, each from the function the runner calls. A build without the fused
-/// ops measures the census only.
-pub fn modelFacts(gpa: std.mem.Allocator, loaded: *const loader.Loaded) !resolve_mod.ModelFacts {
+/// The weight census of one model and the reservations of its fused runner. A build without the
+/// fused ops measures the census only.
+pub fn modelNeeds(gpa: std.mem.Allocator, loaded: *const loader.Loaded) !resolve_mod.ModelNeeds {
     const card = loaded.card;
-    var m: resolve_mod.ModelFacts = .{
+    var m: resolve_mod.ModelNeeds = .{
         .n_layers = card.n_layers,
         .layer_weights = @splat(0),
         .head_weights = tensor_lookup.headWeightBytes(loaded.tensors),
@@ -166,8 +168,7 @@ pub fn modelFacts(gpa: std.mem.Allocator, loaded: *const loader.Loaded) !resolve
     return m;
 }
 
-/// `MemAvailable` at boot: the free RAM every RAM quote checks against. A silent
-/// skip hides a missing guard, so a platform without the figure logs one line.
+/// `MemAvailable` at boot: the free RAM that every RAM quote checks against.
 pub fn hostRamFree(io: Io) ?u64 {
     const free = hwinfo.readMemAvailable(io);
     if (free == null) {
@@ -178,15 +179,14 @@ pub fn hostRamFree(io: Io) ?u64 {
     return free;
 }
 
-/// The KV dtype one process frames every row at. Every command calls this before
-/// it plans, prices, or touches a device, so no preflight equality assert can meet
-/// a half-applied dtype.
+/// The KV dtype that one process frames every row at. Call it before any plan, price, or device,
+/// so no preflight assert meets a half-applied dtype.
 pub fn kvDtypeFor(flag: ?dtype.KvDtype, model: *const registry.Model) dtype.KvDtype {
     return flag orelse model.kv_dtype_default;
 }
 
-/// The threading policy of one command: the host defaults, then the flags. A
-/// command whose placement runs no CPU op gets a pool of one thread.
+/// The threading policy of one command: the host defaults, then the flags. A placement with no CPU
+/// op gets a pool of one thread.
 pub fn resolvePolicy(
     io: Io,
     flags: parallel.Flags,
@@ -209,9 +209,8 @@ pub fn resolvePolicy(
     return resolved.policy;
 }
 
-/// The one VRAM figure every device arm plans against: the live budget of
-/// `VK_EXT_memory_budget`. The heap size overstates what a shared device has free,
-/// so a driver without the extension logs one line per process.
+/// The one VRAM figure that every device placement plans against: the live budget of
+/// `VK_EXT_memory_budget`. The heap size overstates what a shared device has free.
 pub fn vramFigure(ctxp: anytype) u64 {
     if (ctxp.deviceLocalBudget() == null and !heap_fallback_logged) {
         heap_fallback_logged = true;
@@ -224,13 +223,12 @@ pub fn vramFigure(ctxp: anytype) u64 {
 
 // -- helpers ----------------------------------------------------------------
 
-/// Measure the fused runner of `Family`. The runner caps and the resolve caps read
-/// one set of figures, so the plan and the preflight cannot drift apart.
+/// Measure the fused runner of `Family`. The runner caps and the resolve caps must agree.
 fn measureFused(
     comptime Family: type,
     gpa: std.mem.Allocator,
     loaded: *const loader.Loaded,
-    m: *resolve_mod.ModelFacts,
+    m: *resolve_mod.ModelNeeds,
 ) !void {
     const card = loaded.card;
     m.weights = try Family.fusedWeightBytes(gpa, loaded);
@@ -261,8 +259,8 @@ test "baseWindow: a named window must lie in 1..ceiling, and no flag takes the s
 }
 
 test "baseWindow: a ceiling below the session budget window is the default window" {
-    // Qwen3.5-2B at f16 prices 12288 bytes per position, so the serve budget
-    // alone buys 10752 positions. A ceiling of 4096 binds first.
+    // Qwen3.5-2B at f16 costs 12288 bytes per position, so the budget buys 10752 positions.
+    // A ceiling of 4096 binds first.
     const cost: kv_budget.KvCostModel = .{ .kv_bytes_per_token = 12_288 };
     try std.testing.expectEqual(
         @as(u32, 10_752),

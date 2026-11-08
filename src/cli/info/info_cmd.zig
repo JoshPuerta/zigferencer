@@ -1,6 +1,8 @@
-//! `zigferencer info`: print the host hardware card, the build options, the
-//! threading defaults, and the architecture support matrix. A Vulkan build also
-//! prints the storage-buffer limits of the device, because they bound the KV window.
+//! `zigferencer info`: print the host hardware card, the build options, the threading defaults, and
+//! the architecture support matrix. A Vulkan build also prints the storage-buffer limits of the
+//! device, because they bound the KV window.
+//!
+//! Comptime. A build option decides whether the storage-buffer limits print.
 
 const std = @import("std");
 const Io = std.Io;
@@ -35,7 +37,7 @@ const all_backends = [_]BackendEntry{
 
 const BackendEntry = struct {
     name: []const u8,
-    // Null marks a GPU backend. `note` then replaces the arch and SIMD fields.
+    /// Null marks a GPU backend. `note` then replaces the arch and SIMD fields.
     req: ?op_requires.OpRequires = null,
     note: []const u8 = "",
 };
@@ -61,6 +63,7 @@ const Flags = struct {
 pub fn run(ctx: context.Context) !void {
     _ = try args.parseInto(Flags, ctx) orelse return;
 
+    // Print each section of the card.
     const card = hwinfo.detect(ctx.io, ctx.arena);
     const p = style.Palette.init(ctx.color);
 
@@ -101,7 +104,7 @@ fn printHost(w: *Io.Writer, p: style.Palette, card: hwinfo.HwCard) !void {
     try w.print("  gpu:       {s}{s}{s}\n", .{ gpu_c, card.gpu.label, p.reset });
 }
 
-/// The build identity is the two build options -Druntime and -Dops-backend.
+/// Print the build identity: the options `-Druntime` and `-Dops-backend`, and the trace level.
 fn printBuild(w: *Io.Writer, p: style.Palette) !void {
     try w.print("\n{s}Build (this binary):{s}\n", .{ p.bold, p.reset });
     try w.print("  optimize:        {s}\n", .{@tagName(builtin.mode)});
@@ -126,13 +129,13 @@ fn printBuild(w: *Io.Writer, p: style.Palette) !void {
     }
 
     try w.print(
-        "  {s}($ZIGFERENCER_LOG=debug. Scopes: serve serve_openai serve_demo run runner kv " ++
-            "gpu gguf{s}\n",
+        "  {s}($ZIGFERENCER_LOG=debug. Scopes: " ++
+            "serve serve_openai serve_demo run runner kv gpu gguf{s}\n",
         .{ p.dim, p.reset },
     );
     try w.print(
-        "  {s} fetch parallel cache bench_swap bench_serve + hot: layer dispatch token, see " ++
-            "core/log.zig){s}\n",
+        "  {s} fetch parallel cache bench_swap bench_serve + hot: " ++
+            "layer dispatch token, see core/log.zig){s}\n",
         .{ p.dim, p.reset },
     );
 
@@ -184,15 +187,11 @@ fn printThreading(ctx: context.Context, w: *Io.Writer, p: style.Palette) !void {
     );
 }
 
-/// Print the storage-buffer limits of the device a Vulkan command opens, and
-/// the range the buffer checks read. A host with no usable device prints the
-/// open error and keeps the rest of the card.
+/// Print the storage-buffer limits of the device and the range that the buffer checks read. A host
+/// with no usable device prints the open error and keeps the rest of the card.
 fn printBufferLimits(ctx: context.Context, w: *std.Io.Writer, p: style.Palette) !void {
     try w.print("\n{s}GPU buffer limits:{s}\n", .{ p.bold, p.reset });
-    var vc = vulkan_ctx.Context.init(
-        ctx.arena,
-        .{ .storage_range_override = ctx.vk_storage_range },
-    ) catch |err| {
+    var vc = vulkan_ctx.Context.init(ctx.arena, ctx.vk_options) catch |err| {
         try w.print("  {s}no device context ({t}){s}\n", .{ p.dim, err, p.reset });
         return;
     };
@@ -206,7 +205,7 @@ fn printBufferLimits(ctx: context.Context, w: *std.Io.Writer, p: style.Palette) 
     try w.print("  reported storage range: {d} bytes\n", .{vc.reported_storage_range});
     try w.print("  allocation size:        {d} bytes\n", .{lim.allocation_size});
     try w.print("  offset alignment:       {d} bytes\n", .{lim.offset_alignment});
-    if (ctx.vk_storage_range != null) {
+    if (ctx.vk_options.storage_range_override != null) {
         try w.print(
             "  storage-buffer range {s}{d}{s} bytes (reported {d}, set by " ++
                 "" ++ limits.storage_range_env ++ ")\n",
@@ -222,8 +221,7 @@ fn printBufferLimits(ctx: context.Context, w: *std.Io.Writer, p: style.Palette) 
     );
 }
 
-/// Print only the build target's ISA flags. The other ISA's flags are always off
-/// and add noise, such as neon and sve on an x86 build.
+/// Print only the ISA flags of the build target, because the other ISA is always off.
 fn printSimd(w: *std.Io.Writer, p: style.Palette, s: hwinfo.SimdFeatures) !void {
     try w.print("\n{s}SIMD (build target):{s}\n", .{ p.bold, p.reset });
     switch (builtin.cpu.arch) {

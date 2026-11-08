@@ -2,6 +2,8 @@
 //! oracle, the input fillers, and the checks that the scalar and the vector kernel tests and the
 //! control unit test run. Test code imports this file, and no production path reaches it.
 //!
+//! Comptime. `E` and `Kernels` make the checks generic, so f32 and f16 share one body.
+//!
 //! Kernels. A check takes the kernels as a namespace that declares `attentionPartTyped`,
 //! `attentionMerge`, and `attentionRowTyped`, the shape of an ops backend. So one reference and
 //! one tolerance hold every CPU backend.
@@ -44,7 +46,6 @@ pub const Lead = enum { none, ramp, sink, large };
 // -- api --------------------------------------------------------------------
 
 /// Fill one test row with random values, then shape the heads that have a lead.
-/// See "Leads" in the header.
 pub fn fillAttention(
     comptime E: type,
     r: std.Random,
@@ -353,11 +354,14 @@ fn attentionRefF64(
     scores: []f64,
     out: []f64,
 ) void {
+    // Set the head grouping and the scale.
     const group_size = n_heads / n_kv_heads;
     const scale = 1.0 / @sqrt(@as(f64, @floatFromInt(head_dim)));
     for (0..n_heads) |h| {
         const kv_h = h / group_size;
         const q_h = q[h * head_dim ..][0..head_dim];
+
+        // Score each position.
         for (scores[0..t_len], 0..) |*s, t| {
             const k_row = k_cache[(t * n_kv_heads + kv_h) * head_dim ..][0..head_dim];
             var dot: f64 = 0;
@@ -368,6 +372,7 @@ fn attentionRefF64(
             s.* = dot * scale;
         }
 
+        // Softmax the scores.
         var m = scores[0];
         for (scores[1..t_len]) |s| {
             m = @max(m, s);
@@ -379,6 +384,7 @@ fn attentionRefF64(
             sum += s.*;
         }
 
+        // Sum the values by weight.
         const out_h = out[h * head_dim ..][0..head_dim];
         @memset(out_h, 0);
         for (scores[0..t_len], 0..) |e, t| {
@@ -406,12 +412,15 @@ fn attentionRowScalarOracle(
     scratch: []f32,
     out: []f32,
 ) void {
+    // Set the head grouping and the scale.
     const group_size = n_heads / n_kv_heads;
     const scale: f32 = 1.0 / @sqrt(@as(f32, @floatFromInt(head_dim)));
     var h: usize = 0;
     while (h < n_heads) : (h += 1) {
         const kv_h = h / group_size;
         const q_off = h * head_dim;
+
+        // Score each position.
         var t: usize = 0;
         while (t < t_len) : (t += 1) {
             const k_off = t * n_kv_heads * head_dim + kv_h * head_dim;
@@ -424,6 +433,7 @@ fn attentionRowScalarOracle(
             scratch[t] = s * scale;
         }
 
+        // Softmax, then sum the values by weight.
         softmaxInplace(scratch[0..t_len]);
         const out_off = h * head_dim;
         var d: usize = 0;

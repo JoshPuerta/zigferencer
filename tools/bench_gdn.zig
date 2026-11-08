@@ -4,6 +4,8 @@
 //! its reference row runs on every build. The GPU rows for `GdnDecode` (one token) and
 //! `GdnChunkParallel` (a whole chunk of prefill) run under vulkan.
 //!
+//! Comptime. `build_options.use_vulkan` gates the GPU code, so a CPU build never reads it.
+//!
 //! Not covered. The Qwen full-attention helpers that exist only as `recordInto` (QkNorm and the
 //! batched rmsnorm, rope, and attention) go into the fused command buffer, so no section here
 //! runs them standalone. `bench-model <qwen> --profile-prefill` and `--profile-decode` price
@@ -64,12 +66,15 @@ const GdnInputs = struct {
 
     /// Allocate from `arena` and fill with the deterministic pattern.
     fn init(arena: std.mem.Allocator, tokens: usize, cf: Cfg) !GdnInputs {
+        // Size the buffers from the config.
         const key_dim = @as(usize, cf.n_k) * head_dim;
         const value_dim = @as(usize, cf.n_v) * head_dim;
         const conv_dim = 2 * key_dim + value_dim;
         const state_len = value_dim * head_dim;
         const conv_state_len = @as(usize, conv_kernel - 1) * conv_dim;
         const n_v: usize = cf.n_v;
+
+        // Allocate the buffers.
         const self: GdnInputs = .{
             .dims = .{
                 .n_k_heads = cf.n_k,
@@ -95,6 +100,8 @@ const GdnInputs = struct {
             .state0 = try arena.alloc(f32, state_len),
             .conv0 = try arena.alloc(f32, conv_state_len),
         };
+
+        // Fill the buffers with test patterns.
         fillGdn(
             self.qkv,
             self.zg,
@@ -246,10 +253,13 @@ fn gdnDecodeGpuRow(
     inputs: *const GdnInputs,
     ref: GdnRef,
 ) !void {
+    // Build the GPU kernel and its output.
     var kern = try zigferencer.ops_vulkan.GdnDecode.init(&runner.ctx);
     defer kern.deinit();
 
     const g_o = try arena.alloc(f32, inputs.value_dim);
+
+    // Wrap the GPU call as a bench case.
     const Gpu = struct {
         k: *zigferencer.ops_vulkan.GdnDecode,
         inputs: *const GdnInputs,
@@ -281,6 +291,8 @@ fn gdnDecodeGpuRow(
             );
         }
     };
+
+    // Run the GPU row against the reference.
     const tol: op_requires.Tolerance = .{ .relative = 5e-3 };
     try gpuRow(io, ref.scale, ref.label, "vk_gdn", ref.work, tol, ref.out, ref.hash, g_o, Gpu{
         .k = &kern,
@@ -359,6 +371,7 @@ fn fillGdn(
     state0: []f32,
     conv0: []f32,
 ) void {
+    // Fill the projections with smooth waves.
     for (qkv, 0..) |*v, i| {
         v.* = @sin(@as(f32, @floatFromInt(i)) * 0.011);
     }
@@ -379,6 +392,7 @@ fn fillGdn(
         v.* = @sin(@as(f32, @floatFromInt(i)) * 0.02) * 0.5;
     }
 
+    // Fill the decay and the norm parameters.
     for (ssm_a) |*v| {
         v.* = -1.0; // -exp(A_log): negative decay
     }
@@ -391,6 +405,7 @@ fn fillGdn(
         v.* = @sin(@as(f32, @floatFromInt(i))) * 0.2 + 1.0;
     }
 
+    // Fill the recurrent and conv states.
     for (state0, 0..) |*v, i| {
         v.* = @sin(@as(f32, @floatFromInt(i)) * 0.005) * 0.1;
     }

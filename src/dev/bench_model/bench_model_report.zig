@@ -1,5 +1,8 @@
 //! Output formatting for the bench-model command: the result values of `bench_model_common` as the
 //! human table and the single-line JSON. The module is pure and keeps no state.
+//!
+//! Comptime. `statsOfField` takes the result field at compile time, so one body covers every
+//! statistic.
 
 const std = @import("std");
 const zigferencer = @import("zigferencer");
@@ -29,6 +32,7 @@ pub fn printTable(
     results: []const RunResult,
     policy: parallel.Policy,
 ) !void {
+    // Print the run header.
     try w.print("model:    {s}\n", .{model_name});
     try w.print("backend:  {s}\n", .{build_options.ops_backend});
     try w.print(
@@ -39,6 +43,7 @@ pub fn printTable(
     try printPlan(w, results[0].plan);
     try w.print("decode:   {d} tokens, {d} run(s)\n", .{ decode_len, results.len });
 
+    // Print one row per run.
     try w.writeAll("\n");
     try w.print(
         "{s:>4}  {s:>10}  {s:>10}  {s:>10}  {s}\n",
@@ -51,8 +56,10 @@ pub fn printTable(
         );
     }
 
+    // Print the spread across the runs.
     const ts = statsOfField(results, .ttft_ms);
     const is = statsOfField(results, .itl_ms);
+    const rs = statsOfField(results, .tok_s);
     try w.writeAll("\n");
     try w.print(
         "ttft_ms:  mean={d:.3}  stddev={d:.3}  min={d:.3}  max={d:.3}\n",
@@ -62,9 +69,14 @@ pub fn printTable(
         "itl_ms:   mean={d:.3}  stddev={d:.3}  min={d:.3}  max={d:.3}\n",
         .{ is.mean, is.stddev, is.min, is.max },
     );
+    try w.print(
+        "tok_s:    mean={d:.3}  stddev={d:.3}  min={d:.3}  max={d:.3}  " ++
+            "(whole turn, with prefill)\n",
+        .{ rs.mean, rs.stddev, rs.min, rs.max },
+    );
     try printHostSteps(w, results);
 
-    // Every run of one binary must produce the same hash.
+    // Check that every run of one binary produced the same hash.
     var all_match: bool = true;
     for (results[1..]) |r| {
         if (r.tokens_hash != results[0].tokens_hash) {
@@ -90,8 +102,10 @@ pub fn printJson(
 ) !void {
     std.debug.assert(results.len > 0);
 
+    // Open the object with the run parameters.
     try w.print(
-        "{{\"model\":\"{s}\",\"backend\":\"{s}\",\"threads\":{d},\"min_parallel_flops\":{d},\"prompt_tokens\":{d},\"decode_len\":{d},\"runs\":[",
+        \\{{"model":"{s}","backend":"{s}","threads":{d},"min_parallel_flops":{d},"prompt_tokens":{d},"decode_len":{d},"runs":[
+    ,
         .{
             model_name,
             build_options.ops_backend,
@@ -101,23 +115,24 @@ pub fn printJson(
             decode_len,
         },
     );
+    // Write one member per run.
     for (results, 0..) |r, i| {
         if (i > 0) {
             try w.writeAll(",");
         }
 
         try w.print(
-            "{{\"ttft_ms\":{d:.3},\"itl_ms\":{d:.3},\"tokens_generated\":{d},\"tokens_hash\":\"0x{x:0>16}\",",
+            "{{\"ttft_ms\":{d:.3},\"itl_ms\":{d:.3},\"tok_s\":{d:.3}," ++
+                "\"tokens_generated\":{d},\"tokens_hash\":\"0x{x:0>16}\",",
             .{
-                r.ttft_ms, r.itl_ms, r.tokens_generated, r.tokens_hash,
+                r.ttft_ms, r.itl_ms, r.tok_s, r.tokens_generated, r.tokens_hash,
             },
         );
         try printDepthJson(w, r.itl_by_depth);
         try w.writeAll("}");
     }
 
-    // The key is always present, so a consumer reads one shape. All zeros mean no device KV plan.
-    // Every run used one plan, so the first result holds it.
+    // Close with the KV plan, which all runs share. The key is always present, and zeros mean none.
     const plan = results[0].plan;
     try w.print(
         "],\"kv_plan\":{{\"n_slots\":{d},\"window\":{d},\"kv_mib\":{d},\"kv_dtype\":\"{t}\"}}}}\n",

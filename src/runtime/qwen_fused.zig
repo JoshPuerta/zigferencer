@@ -1,8 +1,10 @@
 //! `QwenFusedRunner` records the whole Qwen3.5 hybrid forward of one token into one Vulkan command
-//! buffer and submits it once. See "Recording" in `llama_fused.zig`. Weights stage to VRAM once at
+//! buffer and submits it once. Weights stage to VRAM once at
 //! init, and activations stay in VRAM end to end. The kernel set and the tensor layout come from
 //! the CPU `QwenRunner`. The GPU kernels GdnDecode, Attention@256, QwenQkNorm, and SigmoidGate are
 //! tolerance-checked (see `ops/gdn.zig`).
+//!
+//! Comptime. `core_log.hot` removes the trace code from builds without hot tracing.
 //!
 //! Entry shapes. `step` advances one token on slot 0, the CLI decode. `prefillBatch` runs one
 //! sequence chunk on slot 0 through the chunk-parallel GDN kernels. `stepBatch` advances a bounded
@@ -33,7 +35,7 @@
 //! sets serve decode and prefill, because the batch kernels read [b, dim] through a `b` push.
 //! `buf_logits` alone holds `logit_rows_max` rows: the decode width plus the final prefill row of a
 //! composed tick. The split record box ignores the layer range, so a suffix at any split allocates
-//! what the whole model prices. See "Scratch pricing" in `llama_fused.zig`.
+//! what the whole model prices.
 //!
 //! Matmul kernels. All three Q8_0 matmul kernels share the 4-storage-buffer descriptor layout, so
 //! the pre-bound sets work with any of them. The row count `b` alone picks the kernel:
@@ -73,8 +75,8 @@
 //! the cold token hash.
 //!
 //! Stages. Every save reads back through `kv_readback_stage`, and every restore uploads out of
-//! `snap_stage`. See "KV swap stages" in `llama_fused.zig`. A readback resource serves as a copy
-//! destination only on the target driver. So the stage choice is a correctness fact.
+//! `snap_stage`. A readback resource serves as a copy
+//! destination only on the target driver. So the stage choice decides correctness.
 //!
 //! Tests. Every test here is device-free arithmetic. The hardware gates are the equivalence tests
 //! in `tests/`.
@@ -96,6 +98,7 @@ const attn_record = @import("attn_record.zig");
 const time = @import("../core/time.zig");
 const step_row = @import("step_row.zig");
 const linear_dispatch = @import("linear_dispatch.zig");
+const qwen_gpu_guard = @import("qwen_gpu_guard.zig");
 const tensor_lookup = @import("tensor_lookup.zig");
 const gpu_profile = @import("gpu_profile.zig");
 const core_log = @import("../core/log.zig");
@@ -222,7 +225,7 @@ pub const QwenFusedRunner = struct {
     rope_dim: u32,
     rope_base: f32,
     per_step: u32, // n_kv_heads * head_dim
-    /// The element of every full-attention KV row. See "KV dtype" in the header.
+    /// The element of every full-attention KV row.
     kv_dtype: dtype.KvDtype,
 
     embed: *const Tensor, // CPU embed lookup (tied lm_head also staged below)
@@ -276,7 +279,7 @@ pub const QwenFusedRunner = struct {
     buf_gate: kernels.DeviceBuffer,
     buf_k: kernels.DeviceBuffer,
     buf_v: kernels.DeviceBuffer,
-    /// The narrowed commit scratch. See "KV commit" in the header.
+    /// The narrowed commit scratch.
     buf_k_kv: kernels.DeviceBuffer,
     buf_v_kv: kernels.DeviceBuffer,
     buf_attn_out: kernels.DeviceBuffer,
@@ -305,9 +308,9 @@ pub const QwenFusedRunner = struct {
     stage_in: kernels.HostBuffer,
     stage_out: kernels.HostBuffer,
     snap_stage: kernels.HostBuffer, // host-visible upload stage (H2D restores)
-    /// The stage of every device-to-host copy. See "Stages" in the header.
+    /// The stage of every device-to-host copy.
     kv_readback_stage: kernels.HostBuffer,
-    /// The chunk one staged copy moves. See "Stages" in the header.
+    /// The chunk one staged copy moves.
     swap_chunk_bytes: u64,
     /// Row i of a `stepBatch` call sits at `logits[i * vocab ..]`. `step` and `prefillBatch` return
     /// row 0.
@@ -345,7 +348,7 @@ pub const QwenFusedRunner = struct {
     }
 
     /// The KV index of the full-attention layer at absolute index `li`, in a range that starts at
-    /// `from`. See "Layer range" in the header.
+    /// `from`.
     fn kvSlotInRange(g: loader.GdnParams, from: u32, li: u32) u32 {
         std.debug.assert(from <= li);
         std.debug.assert(g.isFullAttention(li));
@@ -354,7 +357,7 @@ pub const QwenFusedRunner = struct {
     }
 
     /// What one KV slot costs at `kv_dtype`. The planner states the price, so the CLI reads the
-    /// same figure before a runner exists. See "KV dtype" in the header.
+    /// same figure before a runner exists.
     pub fn kvCostModel(card: loader.ModelCard, kv_dtype: dtype.KvDtype) kv_budget.KvCostModel {
         std.debug.assert(card.gdn != null);
 
@@ -406,8 +409,7 @@ pub const QwenFusedRunner = struct {
     pub const prefill_rows_max: u32 = 128;
 
     /// The device bytes of the activation scratch. It must match the `initSuffix` allocation list.
-    /// A card without GDN metadata never builds this runner, so it prices nothing. See "Scratch" in
-    /// the header.
+    /// A card without GDN metadata never builds this runner, so it prices nothing.
     pub fn scratchVramBytes(card: loader.ModelCard, kv_dtype: dtype.KvDtype) u64 {
         const g = card.gdn orelse return 0;
         const key_dim: u64 = @as(u64, g.group_count) * g.state_size;
@@ -426,7 +428,7 @@ pub const QwenFusedRunner = struct {
     }
 
     /// The split attention records of this model. The pricing and the allocation read this one
-    /// value. See "Scratch" in the header.
+    /// value.
     fn attnSplitScratch(card: loader.ModelCard) attn_split.Scratch {
         return attn_split.Scratch.init(card.n_heads, card.head_dim, card.context_length);
     }
@@ -503,8 +505,7 @@ pub const QwenFusedRunner = struct {
     }
 
     /// Build a runner of layers `[first..n_layers)`, with weights, KV, GDN state, and sets sized to
-    /// match. Every init path ends here, so one body sizes and frames every buffer. See "Layer
-    /// range" in the header.
+    /// match. Every init path ends here, so one body sizes and frames every buffer.
     pub fn initSuffix(
         gpa: Allocator,
         ctx: *const vulkan_ctx.Context,
@@ -520,6 +521,7 @@ pub const QwenFusedRunner = struct {
         const g = c.gdn orelse return error.NotQwen;
         const refs = loaded.tensors;
         try linear_dispatch.requireWeights(refs, c.n_layers);
+        try qwen_gpu_guard.requireShape(c);
 
         // Slots bound breadth, streams bound width, and a row owns a slot.
         std.debug.assert(plan.n_slots >= 1);
@@ -750,7 +752,7 @@ pub const QwenFusedRunner = struct {
 
         self.prefill_batch_max = prefill_rows_max;
 
-        // Allocate the activation scratch. See "Scratch" in the header.
+        // Allocate the activation scratch.
         const F = @sizeOf(f32);
         const pb: u64 = self.prefill_batch_max;
         self.buf_x = try devBuf(ctx, pb * self.hidden * F);
@@ -1247,7 +1249,7 @@ pub const QwenFusedRunner = struct {
                     },
                 );
 
-                // Chunked prefill: conv front (6) and scan (11). See "Prefill" in the header.
+                // Chunked prefill: conv front (6) and scan (11).
                 w.set_gdn_conv = try self.mkSet(
                     self.k_gdn_chunk.pipeline_conv.set_layout,
                     &.{
@@ -1342,14 +1344,14 @@ pub const QwenFusedRunner = struct {
         return self.kv_dtype.rowBytes(self.per_step);
     }
 
-    /// The two buffers a KV commit copy reads. See "KV commit" in the header.
+    /// The two buffers a KV commit copy reads.
     fn kvCommitSrc(self: *const QwenFusedRunner) struct { k: vk.Buffer, v: vk.Buffer } {
         if (self.kv_dtype == .f32) return .{ .k = self.buf_k.buffer, .v = self.buf_v.buffer };
         return .{ .k = self.buf_k_kv.buffer, .v = self.buf_v_kv.buffer };
     }
 
     /// Record the narrowing of the `rows` committed rows of one layer, plus the barrier to the copy
-    /// that follows. At f32 no dispatch runs. See "KV commit" in the header.
+    /// that follows. At f32 no dispatch runs.
     fn recordKvCommit(self: *QwenFusedRunner, cb: vk.CommandBuffer, rows: u32) void {
         std.debug.assert(rows >= 1);
         std.debug.assert(rows <= self.prefill_batch_max);
@@ -1365,8 +1367,8 @@ pub const QwenFusedRunner = struct {
         barrierShaderToTransfer(self.ctx.vkd, cb);
     }
 
-    /// The attention kit over the attention pipelines of the runner.
-    fn attnKit(self: *QwenFusedRunner) kernels.AttnKit {
+    /// The attention kernel set over the attention pipelines of the runner.
+    fn attnKernels(self: *QwenFusedRunner) kernels.AttnKernels {
         return .{
             .single = &self.k_attn,
             .multi = &self.k_attn_multi,
@@ -1386,7 +1388,7 @@ pub const QwenFusedRunner = struct {
     }
 
     // -- step ---------------------------------------------------------------
-    // Each entry shape has a token form and a hidden form. See "Entry shapes" in the header.
+    // Each entry shape has a token form and a hidden form.
 
     /// One decode step of `token_id` on slot 0. Returns the logits row, valid until the next call.
     pub fn step(self: *QwenFusedRunner, token_id: u32, pos: u32) ![]f32 {
@@ -1451,7 +1453,6 @@ pub const QwenFusedRunner = struct {
     }
 
     /// Max rows one `stepBatch` accepts: `prefill_batch_max`, past `n_slots` and `logit_rows_max`.
-    /// See "Batch step" in the header.
     pub fn maxStepRows(self: *const QwenFusedRunner) u32 {
         return self.prefill_batch_max;
     }
@@ -1463,10 +1464,9 @@ pub const QwenFusedRunner = struct {
     }
 
     /// Advance a batch of rows, each a (slot, token, pos) over an independent KV and GDN-state
-    /// slot. Logits land compactly at `logits[0..]`. See "Batch step" and "Compact logits" in the
-    /// header.
+    /// slot. Logits land compactly at `logits[0..]`.
     pub fn stepBatch(self: *QwenFusedRunner, rows: []const StepRow) !void {
-        // `n_logits` can be 0. See "Compact logits" in the header.
+        // `n_logits` can be 0.
         const n_logits = try step_row.validateRows(
             rows,
             self.n_slots,
@@ -1545,8 +1545,7 @@ pub const QwenFusedRunner = struct {
     /// 64-row tile, so it amortizes its weight reads only once `b` fills that height.
     const gemm_min_batch: u32 = 64;
 
-    /// Record one matmul over `b` rows. `b` alone picks the kernel. See "Matmul kernels" in the
-    /// header.
+    /// Record one matmul over `b` rows. `b` alone picks the kernel.
     fn recordBatchMatmul(
         self: *QwenFusedRunner,
         cb: vk.CommandBuffer,
@@ -1574,7 +1573,7 @@ pub const QwenFusedRunner = struct {
     }
 
     /// Run a batched prefill of `tokens` from `start_pos` in one submit. Returns the logits of the
-    /// last token. `tokens.len` must be at most `prefill_batch_max`. See "Prefill" in the header.
+    /// last token. `tokens.len` must be at most `prefill_batch_max`.
     pub fn prefillBatch(self: *QwenFusedRunner, tokens: []const u32, start_pos: u32) ![]f32 {
         const b: u32 = @intCast(tokens.len);
         std.debug.assert(b >= 1 and b <= self.prefill_batch_max);
@@ -1720,7 +1719,7 @@ pub const QwenFusedRunner = struct {
                     self.prof.mark(cb, .matmul_gdn_in);
 
                     // Run the chunked GDN chain. It shares `w.state` and `w.conv_state` with the
-                    // decode `k_gdn`, so it leaves both as decode expects. See "Prefill".
+                    // decode `k_gdn`, so it leaves both as decode expects.
                     self.k_gdn_chunk.recordConv(
                         cb,
                         w.set_gdn_conv,
@@ -1842,7 +1841,7 @@ pub const QwenFusedRunner = struct {
                     std.debug.assert(@as(u64, start_pos) + b <= self.kv.layout.window);
                     const k_row = self.kv.rowAt(w.kv_slot, .k, 0, start_pos);
                     const v_row = self.kv.rowAt(w.kv_slot, .v, 0, start_pos);
-                    // Narrow the rows. See "KV commit" in the header.
+                    // Narrow the rows.
                     self.recordKvCommit(cb, b);
                     const src = self.kvCommitSrc();
                     copyDeviceToDevice(
@@ -1868,12 +1867,19 @@ pub const QwenFusedRunner = struct {
 
                     // Attend. The resident prefix runs the batch kernel on slot 0. A row past one
                     // split reads the whole-region set, so its bytes match a decode row.
-                    attn_record.recordPrefill(kernels.AttnKit, self.attnKit(), cb, &prefill_plan, .{
-                        .shape = prefill_shape,
-                        .resident = .{ .batch = w.set_attention },
-                        .split = w.set_attention_split,
-                        .merge = self.set_attention_merge,
-                    }, start_pos);
+                    attn_record.recordPrefill(
+                        kernels.AttnKernels,
+                        self.attnKernels(),
+                        cb,
+                        &prefill_plan,
+                        .{
+                            .shape = prefill_shape,
+                            .resident = .{ .batch = w.set_attention },
+                            .split = w.set_attention_split,
+                            .merge = self.set_attention_merge,
+                        },
+                        start_pos,
+                    );
                     barrierShader(vkd, cb);
                     self.prof.mark(cb, .attn);
 
@@ -2148,8 +2154,7 @@ pub const QwenFusedRunner = struct {
                     barrierShader(vkd, cb);
                     self.prof.mark(cb, .rope);
 
-                    // Narrow the rows. Every row lands before any row attends. See "KV commit" in
-                    // the header.
+                    // Narrow the rows. Every row lands before any row attends.
                     self.recordKvCommit(cb, n);
                     const src = self.kvCommitSrc();
 
@@ -2186,7 +2191,7 @@ pub const QwenFusedRunner = struct {
                     self.prof.mark(cb, .copy);
 
                     // Attend at the (slot, pos) of each row.
-                    attn_record.record(kernels.AttnKit, self.attnKit(), cb, &attn_plan, .{
+                    attn_record.record(kernels.AttnKernels, self.attnKernels(), cb, &attn_plan, .{
                         .shape = attn_shape,
                         .resident = .{ .multi = w.set_attention_multi },
                         .split = w.set_attention_split,
@@ -2484,7 +2489,7 @@ pub const QwenFusedRunner = struct {
                     std.debug.assert(pos < self.kv.layout.window);
                     const k_row = self.kv.rowAt(w.kv_slot, .k, 0, pos);
                     const v_row = self.kv.rowAt(w.kv_slot, .v, 0, pos);
-                    // Narrow the row. See "KV commit" in the header.
+                    // Narrow the row.
                     self.recordKvCommit(cb, 1);
                     const src = self.kvCommitSrc();
                     copyDeviceToDevice(vkd, cb, src.k, 0, k_row.buffer, k_row.offset, kv_row);
@@ -2494,7 +2499,7 @@ pub const QwenFusedRunner = struct {
 
                     // Attend. A row past one split reads slot 0 through the whole-region set, so it
                     // takes the split shader of a batch row.
-                    attn_record.record(kernels.AttnKit, self.attnKit(), cb, &attn_plan, .{
+                    attn_record.record(kernels.AttnKernels, self.attnKernels(), cb, &attn_plan, .{
                         .shape = attn_shape,
                         .resident = .{ .single = w.set_attention },
                         .split = w.set_attention_split,
@@ -2819,7 +2824,6 @@ pub const QwenFusedRunner = struct {
     }
 
     // -- prompt-cache snapshot and restore ----------------------------------
-    // See "Snapshots and eviction" in the header.
 
     /// Bytes a snapshot at `n` tokens occupies. Per full layer, K[0..n]+V[0..n]
     /// (each `n` rows of `kvRowBytes`). Per GDN layer, `state` and
@@ -2850,7 +2854,7 @@ pub const QwenFusedRunner = struct {
         stage: vk.Buffer,
         out: []kernels.Copy,
     ) usize {
-        // The direction fixes the legal stage. See "Stages" in the header.
+        // The direction fixes the legal stage.
         std.debug.assert(to_host == (stage == self.kv_readback_stage.buffer));
         std.debug.assert(slot < self.kv.layout.n_slots);
         std.debug.assert(n <= self.kv.layout.window);
@@ -2922,7 +2926,6 @@ pub const QwenFusedRunner = struct {
     }
 
     /// Move the state of `slot` over its first `n` positions through the stage of the direction.
-    /// See "Stages" in the header.
     fn stageCopies(self: *QwenFusedRunner, slot: u32, n: u32, side: kernels.StageSide) !void {
         self.invalidateDecode();
         const stage = switch (side) {
@@ -2942,7 +2945,6 @@ pub const QwenFusedRunner = struct {
     }
 
     // -- tiered kv ----------------------------------------------------------
-    // See "Snapshots and eviction" in the header.
 
     /// Bytes one slot's state occupies in a host blob at `n_rows` committed
     /// positions (KV over `n_rows` + every GDN layer's state + conv).
@@ -3321,8 +3323,8 @@ test "qwen kv cost: the dtype prices the token and never the fixed state" {
     const card = testCard();
     const c32 = QwenFusedRunner.kvCostModel(card, .f32);
     const c16 = QwenFusedRunner.kvCostModel(card, .f16);
-    // The planner stays monotone in cost under three facts. The fixed state is equal across dtypes.
-    // The token price is no larger. The token price is at least one byte.
+    // The planner stays monotone in cost under three conditions. The fixed state is equal across
+    // dtypes. The token price is no larger. The token price is at least one byte.
     try std.testing.expectEqual(c32.fixed_state_bytes_per_slot, c16.fixed_state_bytes_per_slot);
     try std.testing.expectEqual(c32.kv_bytes_per_token, 2 * c16.kv_bytes_per_token);
     try std.testing.expect(c16.kv_bytes_per_token >= 1);

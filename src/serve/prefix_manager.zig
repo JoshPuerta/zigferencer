@@ -8,7 +8,7 @@
 //! `acceptToken`). This module keeps every engine call whose result only the cache consumes
 //! (`snapshotBytesFor`, `snapshotPrefix`, and `copyFinalLogits` travel with the insert body).
 //!
-//! Generic shape. `PrefixManager` is a plain struct and not a generic over the engine. So the
+//! Comptime. `PrefixManager` is a plain struct and not a generic over the engine. So the
 //! scheduler's `can_snapshot` keeps its single definition on the type that owns the Engine
 //! boundary. `insert` takes `engine: anytype`, and only a `comptime can_snapshot`-guarded call
 //! site instantiates it. So this module also compiles for an engine that cannot snapshot.
@@ -69,7 +69,7 @@ pub const CacheConfig = struct {
     preload: []const []const u8 = &.{},
 };
 
-/// One cache entry offered to a restore. See "Lifetime" in the header.
+/// One cache entry offered to a restore.
 const Hit = struct {
     n: u32,
     blob: []const u8,
@@ -80,7 +80,7 @@ const Hit = struct {
 /// `rows` restores a prefix, and the suffix still needs the engine.
 pub const Restore = union(enum) { miss, ready: Hit, rows: Hit };
 
-/// The slot facts an insert reads, stated as a value because the scheduler owns the slot.
+/// The slot values an insert reads, stated as a value because the scheduler owns the slot.
 const Candidate = struct {
     engine_id: u32,
     proto_id: u32,
@@ -179,7 +179,7 @@ pub const PrefixManager = struct {
         }
     }
 
-    /// The longest cached prefix this turn can restore. See "Restore" in the header.
+    /// The longest cached prefix this turn can restore.
     pub fn planRestore(self: *PrefixManager, tokens: []const u32, opening: bool) Restore {
         std.debug.assert(self.cache != null);
 
@@ -209,7 +209,7 @@ pub const PrefixManager = struct {
     }
 
     /// Offer a completed position-zero prefix to the cache. It runs before the turn frees its
-    /// tokens. An allocation or snapshot failure skips the insert. See "Insert" in the header.
+    /// tokens. An allocation or snapshot failure skips the insert.
     pub fn insert(self: *PrefixManager, engine: anytype, c: Candidate) void {
         const cache = if (self.cache) |*p| p else return;
         const tokens = c.tokens;
@@ -233,7 +233,7 @@ pub const PrefixManager = struct {
         };
         const restore_ns = nsBetween(t_copy, Io.Clock.Timestamp.now(self.io, .awake));
 
-        // Copy the final logits of a generate turn. See "Insert" in the header.
+        // Copy the final logits of a generate turn.
         var logits: []const f32 = &[_]f32{};
         const logits_buf: []f32 = if (c.opening) &.{} else self.gpa.alloc(
             f32,
@@ -263,7 +263,6 @@ pub const PrefixManager = struct {
     }
 
     /// Warm the prefix cache from `texts`. A refusal logs one line and the boot proceeds.
-    /// See "Preload" in the header.
     pub fn preload(
         self: *PrefixManager,
         sched: anytype,

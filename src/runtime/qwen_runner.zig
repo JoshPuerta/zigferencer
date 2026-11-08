@@ -3,6 +3,8 @@
 //! Every 4th layer is full softmax attention with QK-norm and output gating. FFN is SwiGLU, and
 //! the embeddings are tied (lm_head = token_embd).
 //!
+//! Comptime. `core_log.hot` removes the trace code, and `use_vulkan_ops` picks the Vulkan kernels.
+//!
 //! Role. This file is the Control Unit. It holds the per-slot GDN recurrent state, the
 //! full-attention KV caches, and the shared scratch. The numerical ops (`ops.*`, `gdn.*`) are pure
 //! datapath. This file is also the coherence reference, validated before any GPU kernel.
@@ -240,7 +242,7 @@ pub const QwenRunner = struct {
     }
 
     /// A prefix runner executes layers `[0..n_layers)` with weights, KV, and GDN state sized to
-    /// match. The hybrid runner composes through it. See "Prefix ranges" in the header.
+    /// match. The hybrid runner composes through it.
     pub fn initPrefix(
         arena: Allocator,
         loaded: *const loader.Loaded,
@@ -695,7 +697,7 @@ pub const QwenRunner = struct {
         for (self.layers) |*layer| {
             switch (layer.kind) {
                 .full => total += @as(u64, 2) * n_rows * row_bytes,
-                // The GDN state keeps f32 under every KV dtype. See "KV commit" above.
+                // The GDN state keeps f32 under every KV dtype.
                 .gdn => total += (@as(
                     u64,
                     self.gdn_dims.stateLen(),
@@ -717,7 +719,7 @@ pub const QwenRunner = struct {
         var off: usize = 0;
         for (self.layers, 0..) |*layer, li| {
             switch (layer.kind) {
-                // The cache binding lives in this arm, because a runner without a
+                // The cache binding lives in this prong, because a runner without a
                 // full-attention layer has no slot vector to index.
                 .full => |*w| {
                     const kv = &self.kv_slots[slot];
@@ -756,7 +758,7 @@ pub const QwenRunner = struct {
         var off: usize = 0;
         for (self.layers, 0..) |*layer, li| {
             switch (layer.kind) {
-                // The cache binding lives in this arm, because a runner without a
+                // The cache binding lives in this prong, because a runner without a
                 // full-attention layer has no slot vector to index.
                 .full => |*w| {
                     const kv = &self.kv_slots[slot];
@@ -864,7 +866,7 @@ pub const QwenRunner = struct {
     /// Full softmax attention with a sigmoid output gate. It writes the K/V of every row before any
     /// row attends, so causality holds as in `LlamaRunner.layerForward`.
     fn fullMixer(self: *QwenRunner, w: FullWeights, rows: []const StepRow) void {
-        // A prefix sizes the cache to its own range. See "Prefix ranges" in the header.
+        // A prefix sizes the cache to its own range.
         std.debug.assert(self.kv_slots.len == self.n_slots);
         std.debug.assert(w.kv_slot < self.kv_slots[0].n_layers);
 
@@ -909,7 +911,7 @@ pub const QwenRunner = struct {
 
             self.tEnd(t_qk, .qk_norm_rope);
             const t_kv = self.tBegin();
-            // The one conversion boundary. See "KV commit" in the header.
+            // The one conversion boundary.
             switch (self.kv_dtype) {
                 .f32 => {
                     @memcpy(
@@ -941,7 +943,7 @@ pub const QwenRunner = struct {
             const t_attn = self.tBegin();
             const t_len: usize = @intCast(r.pos + 1);
             if (comptime build_options.use_vulkan_ops) {
-                // Flag resolution refuses every dtype but f32 on this build arm,
+                // Flag resolution refuses every dtype but f32 on this build,
                 // because `wrap.attentionSingle` uploads the slab as f32.
                 std.debug.assert(self.kv_dtype == .f32);
 
@@ -1052,8 +1054,9 @@ const test_fakes = @import("test_fakes.zig");
 const test_fixtures = @import("../core/test_fixtures.zig");
 
 test {
-    // The shared timer module has no other test reference.
+    // The shared timer module and the GPU load gate have no other test reference in a CPU build.
     _ = cpu_profile;
+    _ = @import("qwen_gpu_guard.zig");
 }
 
 test "cpu profile: the qwen categories partition one decode step" {

@@ -1,13 +1,15 @@
 //! The model families. One row per architecture holds the runner of each
-//! placement and the few facts that differ between families. A command turns
+//! placement and the few values that differ between families. A command turns
 //! the architecture into a row once, and stays generic below that point:
 //!
 //!     switch (loaded.card.arch) {
 //!         inline else => |arch| return bench(family.Of(arch), ...),
 //!     }
 //!
-//! `Of` names every architecture, so a new one fails the build here until its
-//! row exists. No command needs an edit after that.
+//! No command needs an edit after that.
+//!
+//! Comptime. `Of` returns the row of an architecture, so a new architecture fails the build until
+//! its row exists.
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
@@ -114,7 +116,7 @@ const Qwen = struct {
     pub const fused_warmup = false;
 
     /// The hybrid refuses a degenerate split, because the whole model on one
-    /// placement is a whole-model runner.
+    /// tier is a whole-model runner.
     pub const forced_split = false;
 
     pub const fused_min_slots = 1;

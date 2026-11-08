@@ -1,27 +1,30 @@
 //! `LlamaHybridRunner` splits one Llama forward pass across both executors. The CPU runs the layer
-//! prefix `[0..split)` over the mmap-backed weights and a host KV cache. The GPU runs the suffix
-//! `[split..n_layers)`, the final norm, and the lm_head, on uploaded weights and a suffix-sized KV
-//! store. The budget planner picks `split` so the suffix fits the device budget.
+//! prefix `[0..host_layers)` over the mmap-backed weights and a host KV cache. The GPU runs the
+//! suffix `[host_layers..n_layers)`, the final norm, and the lm_head, on uploaded weights and a
+//! suffix-sized KV store. The budget planner picks `host_layers` so the suffix fits the device
+//! budget.
+//!
+//! Comptime. A build gate refuses non-Vulkan builds, and `core_log.hot` removes the trace code
+//! from builds without hot tracing.
 //!
 //! Crossing. The residual stream crosses the host-device boundary once per call. The prefix leaves
 //! its activations in `stage_in`, and the recorded command buffer starts with that upload.
 //!
 //! Parity. This runner records its own GPU layer bodies. They stay dispatch-identical to the fused
-//! runner's at `split == 0`, so the cross-runner token gate compares like against like. The upload,
-//! binding, and recording helpers repeat the ones in `llama_fused.zig`. Each file keeps its own
-//! copy, so a change to one never moves the dispatches the other records.
+//! runner's at `host_layers == 0`, so the cross-runner token gate compares like against like. The
+//! upload, binding, and recording helpers repeat the ones in `llama_fused.zig`. Each file keeps its
+//! own copy, so a change to one never moves the dispatches the other records.
 //!
 //! KV layout. The device KV holds one region per suffix layer and tensor, each
-//! `[slot][max_seq][per_step_elems]` of `kv_dtype`. Suffix layer j holds model layer `split + j`.
-//! At `n_suffix == 0` the whole KV lives in the host prefix, and the store is null.
+//! `[slot][max_seq][per_step_elems]` of `kv_dtype`. Suffix layer j holds model layer `host_layers +
+//! j`. At `n_suffix == 0` the whole KV lives in the host prefix, and the store is null.
 //!
 //! Prefill. A chunk of at most `prefill_batch_max` rows runs batched through the prefix, crosses
 //! once, and runs batched through the suffix. A whole-prompt CPU prefix needs prompt-length
 //! activation storage, which is unbounded. A prefill row past one split reads the whole-region set
 //! of slot 0, so its bytes match a decode row.
 //!
-//! KV commit. `k_kv_commit` runs one dispatch per suffix layer per entry point. See "KV commit" in
-//! `llama_fused.zig` for the rule.
+//! KV commit. `k_kv_commit` runs one dispatch per suffix layer per entry point.
 //!
 //! Plan checks. `init` asserts that every priced component equals the named field of the plan. The
 //! planner priced layers by a `blk.{d}.*` name scan (`tensor_lookup.layerWeightBytes`), and `init`
@@ -36,7 +39,7 @@
 //! layer). So a blob holds the same bytes a single-tier runner writes. Attention reads only
 //! positions below `pos`, so a prefix of `n_rows` rows is the whole live state.
 //!
-//! KV swap stages. See "KV swap stages" in `llama_fused.zig` for the rule. The first swap allocates
+//! KV swap stages. The first swap allocates
 //! the stages, so a bench that never evicts pays nothing. `last_swap_split` lets a bench aggregate
 //! the DMA and the mapped-staging memcpy without parsing logs. It reports the device half alone,
 //! because the host half is a plain memcpy inside the prefix LlamaRunner.
@@ -91,8 +94,8 @@ pub const LlamaHybridRunner = struct {
     ctx: *const vulkan_ctx.Context,
 
     // Model dimensions
-    split: u32, // host layers [0..split)
-    n_suffix: u32, // GPU layers [split..n_layers)
+    host_layers: u32,
+    n_suffix: u32, // GPU layers [host_layers..n_layers)
     n_layers: u32, // model total
     n_heads: u32,
     n_kv_heads: u32,
@@ -105,11 +108,12 @@ pub const LlamaHybridRunner = struct {
     rope_dim: u32,
     rope_freq_base: f32,
     per_step_elems: u32, // n_kv_heads * head_dim
-    /// The element type of every KV row, on both tiers. `kv.layout` places every device row.
+    /// The element type of every KV row, on both tiers. `kv.layout` lays out every device row.
     kv_dtype: dtype.KvDtype,
 
     // Host prefix: a k-layer CPU runner over the mmap weights and a host KV of the prefix layers.
-    // Null at `split == 0`. This runner owns its arena, so deinit reclaims the prefix in one call.
+    // Null at `host_layers == 0`. This runner owns its arena, so deinit reclaims the prefix in one
+    // call.
     prefix: ?llama_runner.LlamaRunner,
     prefix_arena: std.heap.ArenaAllocator,
 
@@ -133,7 +137,7 @@ pub const LlamaHybridRunner = struct {
     k_attention_split: kernels.AttentionSplit,
     /// The record box of the split rows in flight, sized at the declared context.
     attn_scratch: attn_split.Scratch,
-    /// Narrows the commit scratch, only at a non-f32 `kv_dtype`. See "KV commit" in the header.
+    /// Narrows the commit scratch, only at a non-f32 `kv_dtype`.
     k_kv_commit: ?kernels.KvCommitF16,
     /// The one narrowing set: the f32 scratch in, the narrowed scratch out.
     set_kv_commit: vk.DescriptorSet,
@@ -159,7 +163,7 @@ pub const LlamaHybridRunner = struct {
     arena_small: kernels.VramArena,
     arena_quants: kernels.VramArena,
 
-    // Suffix weight views, index j = model layer `split + j`.
+    // Suffix weight views, index j = model layer `host_layers + j`.
     attn_norm_w: []vk.DescriptorBufferInfo,
     ffn_norm_w: []vk.DescriptorBufferInfo,
     output_norm_w: vk.DescriptorBufferInfo,
@@ -201,7 +205,7 @@ pub const LlamaHybridRunner = struct {
 
     prefill_batch_max: u32,
     n_slots: u32,
-    /// Suffix KV, null at `n_suffix == 0`. See "KV layout" in the header.
+    /// Suffix KV, null at `n_suffix == 0`.
     kv: ?kernels.KvStore,
     logit_rows_max: u32,
     logits: []f32,
@@ -220,7 +224,7 @@ pub const LlamaHybridRunner = struct {
     /// Staging for the device half of a KV swap: one chunk of the suffix rows a call moves.
     kv_swap_stage: kernels.HostBuffer,
 
-    /// Device-to-host staging. See "KV swap stages" in the header.
+    /// Device-to-host staging.
     kv_readback_stage: kernels.HostBuffer,
 
     /// True when the plan priced both swap stages. Otherwise this runner must never grow them.
@@ -246,7 +250,7 @@ pub const LlamaHybridRunner = struct {
         vk.DeviceWrapper.AllocateDescriptorSetsError ||
         vk.DeviceWrapper.AllocateCommandBuffersError;
 
-    /// The literal frame of a placement tag. The bound and the format share it.
+    /// The literal frame of a provenance tag. The bound and the format share it.
     const tag_prefix = "vulkan_hybrid:k=";
 
     /// Bytes of the widest tag: the literal frame, the widest u32 split, the separator, the longest
@@ -290,7 +294,7 @@ pub const LlamaHybridRunner = struct {
         gpa: Allocator,
         ctx: *const vulkan_ctx.Context,
         loaded: *const loader.Loaded,
-        plan: kv_budget.PlacementPlan,
+        plan: kv_budget.LayerSplit,
         io: std.Io,
         pool: *Pool,
         policy: parallel.Policy,
@@ -299,7 +303,7 @@ pub const LlamaHybridRunner = struct {
         // Check the plan, and read the weight handles.
         const card = loaded.card;
         std.debug.assert(plan.n_layers == card.n_layers);
-        std.debug.assert(plan.split <= plan.n_layers);
+        std.debug.assert(plan.host_layers <= plan.n_layers);
         std.debug.assert(plan.n_slots >= 1);
         std.debug.assert(plan.n_slots <= limits.max_batch);
 
@@ -313,7 +317,7 @@ pub const LlamaHybridRunner = struct {
         errdefer gpa.destroy(self);
 
         // Read the model dimensions.
-        const split: u32 = plan.split;
+        const split: u32 = plan.host_layers;
         const n_layers: u32 = card.n_layers;
         const n_suffix: u32 = n_layers - split;
         const hidden_dim: u32 = @intCast(card.embedding_length);
@@ -350,7 +354,7 @@ pub const LlamaHybridRunner = struct {
         std.debug.assert(attn_split.splitCount(max_seq) <= attn_scratch.max_splits);
         try ctx.guardAttnSplitScratch(attn_scratch);
 
-        // Assert that the plan prices what `init` allocates. See "Plan checks" in the header.
+        // Assert that the plan prices what `init` allocates.
         const stage_one: u64 = swapBytes(kv_dtype, n_suffix, max_seq, per_step_elems);
         {
             var suffix_bytes: u64 = 0;
@@ -440,7 +444,7 @@ pub const LlamaHybridRunner = struct {
         self.* = .{
             .gpa = gpa,
             .ctx = ctx,
-            .split = split,
+            .host_layers = split,
             .n_suffix = n_suffix,
             .n_layers = n_layers,
             .n_heads = n_heads,
@@ -647,10 +651,12 @@ pub const LlamaHybridRunner = struct {
             .storage_buffer_bit = true,
             .transfer_dst_bit = true,
         };
-        self.arena_small = try kernels.VramArena.init(ctx, gpa, arena_usage, 256 * 1024 * 1024);
+        const small_bytes = kernels.VramArena.seg_bytes_small;
+        self.arena_small = kernels.VramArena.init(ctx, gpa, arena_usage, small_bytes);
         errdefer self.arena_small.deinit();
 
-        self.arena_quants = try kernels.VramArena.init(ctx, gpa, arena_usage, 1024 * 1024 * 1024);
+        const quants_bytes = kernels.VramArena.seg_bytes_quants;
+        self.arena_quants = kernels.VramArena.init(ctx, gpa, arena_usage, quants_bytes);
         errdefer self.arena_quants.deinit();
 
         // Allocate the logits and the weight views.
@@ -961,7 +967,7 @@ pub const LlamaHybridRunner = struct {
     }
 
     /// The two buffers a commit copy list reads: the rope scratch at f32, and the narrowed scratch
-    /// of `recordKvCommit` otherwise. See "KV commit" in the header.
+    /// of `recordKvCommit` otherwise.
     fn kvCommitSrc(self: *const LlamaHybridRunner) struct { k: vk.Buffer, v: vk.Buffer } {
         if (self.kv_dtype == .f32) {
             return .{ .k = self.buf_k_scratch.buffer, .v = self.buf_v_scratch.buffer };
@@ -971,7 +977,7 @@ pub const LlamaHybridRunner = struct {
     }
 
     /// Record the narrowing of one suffix layer's `rows` committed rows, and the barrier to the
-    /// copy list. See "KV commit" in the header.
+    /// copy list.
     fn recordKvCommit(self: *LlamaHybridRunner, cb: vk.CommandBuffer, rows: u32) void {
         std.debug.assert(rows >= 1);
         std.debug.assert(rows <= self.prefill_batch_max);
@@ -1033,7 +1039,7 @@ pub const LlamaHybridRunner = struct {
     /// Bytes the host prefix layers take in that blob. The device half starts
     /// at exactly this offset.
     fn hostSwapBytes(self: *const LlamaHybridRunner, n_rows: u32) usize {
-        return @intCast(swapBytes(self.kv_dtype, self.split, n_rows, self.per_step_elems));
+        return @intCast(swapBytes(self.kv_dtype, self.host_layers, n_rows, self.per_step_elems));
     }
 
     /// Bytes the device suffix layers take in that blob.
@@ -1108,13 +1114,13 @@ pub const LlamaHybridRunner = struct {
         // Publish the split for a bench.
         self.last_swap_split = .{ .dma_ms = dma_ms, .memcpy_ms = memcpy_ms };
         log_kv.debug(
-            "evict slot {d}: {d} rows, {d:.0} MiB ({d} host + {d} gpu layers), {d:.0} ms " ++
-                "({d:.1} dma + {d:.1} memcpy)",
+            "evict slot {d}: {d} rows, {d:.0} MiB ({d} host + {d} gpu layers), " ++
+                "{d:.0} ms ({d:.1} dma + {d:.1} memcpy)",
             .{
                 slot,
                 n_rows,
                 @as(f64, @floatFromInt(bytes)) / (1024.0 * 1024.0),
-                self.split,
+                self.host_layers,
                 self.n_suffix,
                 core_log.msSince(t0),
                 dma_ms,
@@ -1172,13 +1178,13 @@ pub const LlamaHybridRunner = struct {
         // Publish the split for a bench.
         self.last_swap_split = .{ .dma_ms = dma_ms, .memcpy_ms = memcpy_ms };
         log_kv.debug(
-            "restore slot {d}: {d} rows, {d:.0} MiB ({d} host + {d} gpu layers), {d:.0} ms " ++
-                "({d:.1} dma + {d:.1} memcpy)",
+            "restore slot {d}: {d} rows, {d:.0} MiB ({d} host + {d} gpu layers), " ++
+                "{d:.0} ms ({d:.1} dma + {d:.1} memcpy)",
             .{
                 slot,
                 n_rows,
                 @as(f64, @floatFromInt(bytes)) / (1024.0 * 1024.0),
-                self.split,
+                self.host_layers,
                 self.n_suffix,
                 core_log.msSince(t0),
                 dma_ms,
@@ -1203,7 +1209,7 @@ pub const LlamaHybridRunner = struct {
             }
 
             var l: u32 = 0;
-            while (l < self.split) : (l += 1) {
+            while (l < self.host_layers) : (l += 1) {
                 p.layerForward(l, rows);
             }
 
@@ -1220,7 +1226,7 @@ pub const LlamaHybridRunner = struct {
     pub fn step(self: *LlamaHybridRunner, token_id: u32, pos: u32) ![]f32 {
         if (pos >= self.max_seq) return error.PositionOutOfRange;
 
-        log.debug("step: token {d} at pos {d} (split {d})", .{ token_id, pos, self.split });
+        log.debug("step: token {d} at pos {d} (split {d})", .{ token_id, pos, self.host_layers });
         const row = [_]step_row.StepRow{
             .{ .slot = 0, .token = token_id, .pos = pos, .want_logits = true },
         };
@@ -1273,7 +1279,7 @@ pub const LlamaHybridRunner = struct {
         const n: u32 = @intCast(rows.len);
         log.debug(
             "step_batch: {d} rows, slot {d} pos {d}..{d} (split {d})",
-            .{ n, rows[0].slot, rows[0].pos, rows[n - 1].pos, self.split },
+            .{ n, rows[0].slot, rows[0].pos, rows[n - 1].pos, self.host_layers },
         );
         try self.hostPrefix(rows);
 
@@ -1294,7 +1300,7 @@ pub const LlamaHybridRunner = struct {
         const b: u32 = @intCast(tokens.len);
         log.debug(
             "prefill: {d} tokens at start_pos {d} (split {d})",
-            .{ b, start_pos, self.split },
+            .{ b, start_pos, self.host_layers },
         );
 
         // `init` sets `prefill_batch_max` to this bound, so the bound must fit the stack array.
@@ -1384,8 +1390,8 @@ pub const LlamaHybridRunner = struct {
         }
     }
 
-    /// The attention kit over the attention pipelines of the runner.
-    fn attnKit(self: *LlamaHybridRunner) kernels.AttnKit {
+    /// The attention kernel set over the attention pipelines of the runner.
+    fn attnKernels(self: *LlamaHybridRunner) kernels.AttnKernels {
         return .{
             .single = &self.k_attention,
             .multi = &self.k_attention_multi,
@@ -1430,7 +1436,10 @@ pub const LlamaHybridRunner = struct {
         var j: u32 = 0;
         while (j < self.n_suffix) : (j += 1) {
             if (comptime core_log.hot) {
-                log_dispatch.debug("record suffix layer {d} (model {d})", .{ j, self.split + j });
+                log_dispatch.debug(
+                    "record suffix layer {d} (model {d})",
+                    .{ j, self.host_layers + j },
+                );
             }
 
             // Attention block. Normalize x into x_norm.
@@ -1494,7 +1503,7 @@ pub const LlamaHybridRunner = struct {
             prof.mark(cb, .copy);
 
             // A row past one split takes the split shader, through the whole-region set of slot 0.
-            attn_record.record(kernels.AttnKit, self.attnKit(), cb, &attn_plan, .{
+            attn_record.record(kernels.AttnKernels, self.attnKernels(), cb, &attn_plan, .{
                 .shape = self.attnShape(self.deviceKv().layout.streamStrideElems()),
                 .resident = .{ .single = self.set_attention[j] },
                 .split = self.set_attention_split[j],
@@ -1595,7 +1604,10 @@ pub const LlamaHybridRunner = struct {
         var j: u32 = 0;
         while (j < self.n_suffix) : (j += 1) {
             if (comptime core_log.hot) {
-                log_dispatch.debug("record suffix layer {d} (model {d})", .{ j, self.split + j });
+                log_dispatch.debug(
+                    "record suffix layer {d} (model {d})",
+                    .{ j, self.host_layers + j },
+                );
             }
 
             // Attention block. Normalize each row of x.
@@ -1695,7 +1707,7 @@ pub const LlamaHybridRunner = struct {
 
             // The attention_multi shader reads `k_buf[slot * stream_stride +
             // offset in the slot]`, and each descriptor binds one whole region.
-            attn_record.record(kernels.AttnKit, self.attnKit(), cb, &attn_plan, .{
+            attn_record.record(kernels.AttnKernels, self.attnKernels(), cb, &attn_plan, .{
                 .shape = self.attnShape(self.deviceKv().layout.streamStrideElems()),
                 .resident = .{ .multi = self.set_attention_multi[j] },
                 .split = self.set_attention_split[j],
@@ -1854,7 +1866,10 @@ pub const LlamaHybridRunner = struct {
         var j: u32 = 0;
         while (j < self.n_suffix) : (j += 1) {
             if (comptime core_log.hot) {
-                log_dispatch.debug("record suffix layer {d} (model {d})", .{ j, self.split + j });
+                log_dispatch.debug(
+                    "record suffix layer {d} (model {d})",
+                    .{ j, self.host_layers + j },
+                );
             }
 
             // Attention block. Normalize each row of x.
@@ -1927,7 +1942,7 @@ pub const LlamaHybridRunner = struct {
 
             // The resident prefix runs the batch kernel on the slot-0 set. The stride read stays
             // inside the loop, because an all-host split holds no device KV.
-            attn_record.recordPrefill(kernels.AttnKit, self.attnKit(), cb, &prefill_plan, .{
+            attn_record.recordPrefill(kernels.AttnKernels, self.attnKernels(), cb, &prefill_plan, .{
                 .shape = self.attnShape(self.deviceKv().layout.streamStrideElems()),
                 .resident = .{ .batch = self.set_attention[j] },
                 .split = self.set_attention_split[j],

@@ -3,9 +3,9 @@
 // What
 //   The decode kernel `linear_q8_0_reduce.comp` streams the whole weight from VRAM once per token.
 //   This kernel streams it once per B_TILE batch rows, and so amortizes the weight bandwidth across
-//   the batch. A 411-token Llama-8B prefill at B = 1 makes 411 forward passes, each with one whole
-//   weight read. This kernel takes ceil(411 / 16) = 26 weight reads for the same tokens, which is
-//   the time-to-first-token win it targets.
+//   the batch. A b-token prefill at B = 1 makes b forward passes, each with one whole weight read.
+//   This kernel takes ceil(b / B_TILE) weight reads for the same tokens, which is the
+//   time-to-first-token win it targets.
 //
 // Math
 //   C[B, N] = A[B, K] @ dequant(W[N, K])^T, with A and C in f32:
@@ -47,17 +47,17 @@
 //   point, because a b-token prefill then streams the weights only ceil(b / B_TILE) times.
 //
 // Hardware
-//   Occupancy: registers set the knee in B_TILE, not compute. This is a single-wave workgroup at
-//   about 40 registers per lane, so resident waves are capped, and achieved bandwidth falls as
-//   B_TILE grows. B_TILE = 16 is the knee measured on a 9B prefill, and 32 gains nothing. A better
-//   result needs the multi-wave register-blocked GEMM, which is `linear_q8_0_gemm.comp`.
+//   Occupancy: registers set the knee in B_TILE, not compute. This is a single-wave workgroup
+//   that holds many registers per lane, so resident waves are capped, and achieved bandwidth falls
+//   as B_TILE grows. B_TILE = 16 sits at that knee. A better result needs the multi-wave
+//   register-blocked GEMM, which is `linear_q8_0_gemm.comp`.
 //   Pass 1: lanes read adjacent K elements of one row, so the input loads coalesce.
 //   Pass 2: each lane reads the 32 contiguous quant bytes of its own block. Adjacent lanes sit k
 //   bytes apart, so these loads coalesce inside a lane and not across the wave. The scales[n][blk]
 //   loads stride blocks_per_row * 2 bytes across lanes. They do not coalesce, but they are
 //   L2-resident at these sizes.
-//   Pass 3: all 32 lanes read the same `lds_input[bi * K_TILE + i]`, a 1-cycle LDS broadcast with
-//   no bank conflict and no L1 transaction. The K-outer, B-inner loop runs about 8% slower.
+//   Pass 3: all 32 lanes read the same `lds_input[bi * K_TILE + i]`, an LDS broadcast with no bank
+//   conflict and no L1 transaction. The K-outer, B-inner loop runs slower.
 //   Tails: a `return` past n skips the LDS load and the barrier, and it corrupts the outputs when
 //   n % N_TILE != 0. The 2B GDN alpha and beta matmuls hit that case at n = n_v = 16. So
 //   `lane_active` gates the weight read, the accumulate, and the store, and b < B gates a row.

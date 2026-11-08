@@ -71,7 +71,6 @@ pub const attentionPartTyped = attention_simd.prefetched.attentionPartTyped;
 pub const attentionMerge = attention_simd.prefetched.attentionMerge;
 pub const attentionRowTyped = attention_simd.prefetched.attentionRowTyped;
 
-// See "Q4 and Q6_K" in the header.
 pub const linearF32Q40 = naive.linearF32Q40;
 pub const linearF32Q40Batch = naive.linearF32Q40Batch;
 pub const linearF32Q41 = naive.linearF32Q41;
@@ -257,7 +256,7 @@ inline fn groupPass(
     return .{ @reduce(.Add, acc0), @reduce(.Add, acc1), @reduce(.Add, acc2), @reduce(.Add, acc3) };
 }
 
-/// One tail row. See "Tail" in the header.
+/// One tail row.
 inline fn rowPass(input: []const f32, data: []const u8, row_off: usize, n_blocks: usize) f32 {
     var acc: Vec = @splat(0);
     var blk: usize = 0;

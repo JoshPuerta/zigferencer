@@ -68,10 +68,7 @@ const GdnOutputs = struct { o: []f32, state: []f32, conv: []f32 };
 /// sequential chunk path, and the chunked-parallel prefill, on one Context.
 pub fn gdnCheck(ctx: context.Context) !void {
     var ctxp = try ctx.arena.create(vulkan_ctx.Context);
-    ctxp.* = try vulkan_ctx.Context.init(
-        ctx.arena,
-        .{ .storage_range_override = ctx.vk_storage_range },
-    );
+    ctxp.* = try vulkan_ctx.Context.init(ctx.arena, ctx.vk_options);
     defer ctxp.deinit();
 
     var k = try kernels.GdnDecode.init(ctxp);
@@ -116,14 +113,14 @@ fn gdnChunkParallelCheckDims(
     n_v: u32,
     n_tokens: u32,
 ) !bool {
-    // Wide alpha (+/-3) gives softplus up to ~3, then g down to ~-8, then decay
-    // ~1e-4. The cumulative decay over a sub-chunk underflows in product space.
-    // The log-space scan must stay accurate in this regime. The sequential CPU
-    // step is safe, because it applies S *= decay one token at a time.
+    // Alpha of +/-3 gives decay near 1e-4, so the product over a sub-chunk underflows. The
+    // log-space scan must stay accurate, and the sequential CPU step stays safe.
     const seed = 0x9A5EED + @as(u64, n_v) * 31 + n_tokens;
     const in = try gdnInputs(ctx.arena, n_k, n_v, n_tokens, seed, 3.0);
     const cpu = try gdnCpuReference(ctx.arena, in);
     const gpu = try gdnOutputsFor(ctx.arena, in);
+
+    // Run the GPU kernel and compare.
     try kp.runChunkParallel(
         n_tokens,
         n_k,
@@ -227,6 +224,7 @@ fn gdnInputs(
     seed: u64,
     alpha_scale: f32,
 ) !GdnInputs {
+    // Allocate every buffer.
     const T: usize = n_tokens;
     const key_dim: usize = @as(usize, n_k) * gdn_head_dim;
     const value_dim: usize = @as(usize, n_v) * gdn_head_dim;
@@ -248,6 +246,7 @@ fn gdnInputs(
         .conv0 = try a.alloc(f32, @as(usize, gdn_conv_kernel - 1) * conv_dim),
     };
 
+    // Fill the buffers with seeded values.
     var prng = std.Random.DefaultPrng.init(seed);
     const r = prng.random();
     gpu_selftest_common.fillN(r, in.qkv, 1.0);

@@ -1,6 +1,18 @@
-//! The streaming mode: the main task takes one input at a time and steps `Chat`, so a
-//! `/cancel` typed while a turn streams reaches the server at once. This file holds the line,
-//! frame, and compaction transitions, and the steps after a reconnect.
+//! The streaming mode: the main task takes one input at a time and steps `Chat`, so a `/cancel`
+//! typed while a turn streams reaches the server at once. This file holds the line, frame, and
+//! compaction transitions, and the steps after a reconnect.
+//!
+//! Teardown. The queue closes first, so a producer blocked on a full queue returns. The hang-up
+//! then ends the socket task, and the cancel ends a stdin read.
+//!
+//! Leases. With resumption on, the client keeps each new session before the next turn, so a drop at
+//! any later point finds a lease. A lease exists only on an open session with no cycle in flight,
+//! so a resume reaches only the states that hold one.
+//!
+//! Drops. The replies due on the old connection never arrive. A resume continues the state before
+//! the drop, and only a turn that the server never ran goes out again. With no lease, the client
+//! opens a new session and appends the kept pairs, as a compaction does. That session lacks the
+//! turn in flight, so that turn goes out again.
 
 const std = @import("std");
 const Io = std.Io;
@@ -30,13 +42,14 @@ const Chat = client_chat.Chat;
 const queue_len = 32;
 
 const resumed_fmt = "Session {d} resumes at position {d} after {d} turns.";
-const no_lease_note = "The server holds no lease for the session. The client rebuilds it " ++
-    "from the transcript.";
-const rebuild_resend_note = "The new session does not hold the turn in flight. The client " ++
-    "sends it again.";
+const no_lease_note = "The server holds no lease for the session. " ++
+    "The client rebuilds it from the transcript.";
+const rebuild_resend_note = "The new session does not hold the turn in flight. " ++
+    "The client sends it again.";
 const never_ran_note = "The server did not run the turn in flight. The client sends it again.";
-const cut_reply_fmt = "The drop cut the reply. The server generated {d} {s} that the client " ++
-    "did not get. The model context holds the whole reply.";
+const cut_reply_fmt = "The drop cut the reply. " ++
+    "The server generated {d} {s} that the client did not get. " ++
+    "The model context holds the whole reply.";
 const inconsistent_fmt = "The resume summary does not match the {d} tokens that the client " ++
     "got. The client keeps its text.";
 const request_lost_note = "The request in flight at the drop is lost. Send it again.";
@@ -50,15 +63,16 @@ pub fn runStreaming(
     keep: client_startup.Keep,
 ) !void {
     const io = ctx.io;
+
+    // Create the queue that feeds the control unit.
     const buf = try ctx.arena.alloc(client_input.Input, queue_len);
     var queue: client_input.InputQueue = .init(buf);
 
-    // A reconnect awaits the old socket task and starts a new one, so the
-    // future is null between the two.
+    // A reconnect awaits the old socket task and starts a new one, so the future is null between
+    // the two.
     var socket_future: ?Io.Future(void) = try io.concurrent(socketTask, .{ io, st.client, &queue });
     var stdin_future: ?Io.Future(void) = null;
-    // The queue closes first, so a producer blocked on a full queue returns.
-    // The hang-up then ends the socket task, and the cancel ends a stdin read.
+
     defer {
         queue.close(io);
         st.client.hangUp();
@@ -71,8 +85,10 @@ pub fn runStreaming(
         }
     }
 
+    // Start the stdin task under that teardown.
     stdin_future = try io.concurrent(client_input.stdinTask, .{ io, &queue });
 
+    // Build the control unit in `idle`.
     var chat: Chat = .{
         .io = io,
         .client = st.client,
@@ -108,6 +124,7 @@ pub fn runStreaming(
         settleQuit(&chat);
     }
 
+    // Close what stays open, unless the chat lost its session.
     if (chat.lost_session) return error.SessionLost;
 
     closeAll(&chat);
@@ -115,8 +132,8 @@ pub fn runStreaming(
 
 // -- helpers: streaming loop ------------------------------------------------
 
-/// The connection dropped. Without a lease, or during a quit, the chat ends
-/// with an error. Else the chat reconnects and starts a new socket task.
+/// The connection dropped. With resumption off, or during a quit, the chat ends with an error.
+/// Else the chat reconnects and starts a new socket task.
 fn onDrop(
     c: *Chat,
     queue: *client_input.InputQueue,
@@ -126,8 +143,8 @@ fn onDrop(
     try c.out.note("connection closed: {t}", .{err});
     if (c.keep_ttl == 0 or c.quit_pending) return error.ConnectionClosed;
 
-    // The socket task puts `socket_closed` last and returns, so no frame of
-    // the old connection follows it.
+    // The socket task puts `socket_closed` last and returns, so no frame of the old connection
+    // follows it.
     socket_future.*.?.await(c.io);
     socket_future.* = null;
 
@@ -142,9 +159,8 @@ fn onDrop(
     try afterReconnect(c, prior, outcome);
 }
 
-/// A quit closes every session on purpose, so none waits out a lease. The
-/// closes go out before the hang-up on the same carrier, and the hang-up ends
-/// the chat whether they arrive or not.
+/// A quit closes every session on purpose, so none waits out a lease. The closes go out before
+/// the hang-up on the same carrier, and the hang-up ends the chat whether they arrive or not.
 fn closeAll(c: *Chat) void {
     std.debug.assert(c.state == .quitting);
 
@@ -161,13 +177,15 @@ fn closeAll(c: *Chat) void {
 
 fn socketTask(io: Io, client: *Client, queue: *client_input.InputQueue) void {
     span.nameThread("zf-client");
-    // Each pass reads one frame. The loop ends at the first read error, and
-    // the hang-up at teardown forces one.
+
+    // Each pass reads one frame. The loop ends at the first read error, and the hang-up at teardown
+    // forces one.
     while (true) {
         const ev = client.next() catch |err| {
             queue.putOne(io, .{ .socket_closed = err }) catch {};
             return;
         };
+
         // The span starts after the frame arrives, so it holds no idle wait.
         const sp = span.begin(.client_stream);
         defer sp.end();
@@ -226,8 +244,8 @@ fn idleLine(c: *Chat, cmd: client_input.Command) !void {
         .prompt => |text| {
             std.debug.assert(text.len < client_input.line_bytes_max);
 
-            @memcpy(c.prompt_buf[0..text.len], text);
-            c.prompt_len = @intCast(text.len);
+            @memcpy(c.prompt.buf[0..text.len], text);
+            c.prompt.len = @intCast(text.len);
             try sendPrompt(c, false);
         },
         .cancel => try c.out.note("no turn in flight", .{}),
@@ -266,37 +284,35 @@ fn streamingLine(c: *Chat, cmd: client_input.Command) !void {
 
 fn sendPrompt(c: *Chat, retried: bool) !void {
     std.debug.assert(c.session != null);
-    std.debug.assert(c.prompt_len > 0);
+    std.debug.assert(c.prompt.len > 0);
 
-    const text = c.prompt_buf[0..c.prompt_len];
+    const text = c.prompt.buf[0..c.prompt.len];
     c.hist.t.begin(text);
     const budget = client_history.turnBudget(c.opts.max_tokens, c.info.max_seq);
     c.pending_id = try c.client.generateWith(c.session.?.id, text, c.opts.turn(budget, c.sampling));
 
-    c.received = 0;
-    c.hold_len = 0;
-    c.think = .{};
-    c.retried = retried;
-    c.retry_waiting = false;
+    c.stream = .{};
+    c.prompt.retried = retried;
+    c.prompt.waiting = false;
     c.state = .streaming;
 }
 
 // -- helpers: compaction ----------------------------------------------------
 
-/// Start a compaction cycle. The replies step it in `onFrame` and `onErr`.
+/// Start a compaction cycle. The replies step it in `onFrame` and `onErr`. A rebuild starts one
+/// with no session, so `reopen` closes nothing.
 fn startCompaction(c: *Chat, reserve: u32, retry: bool) !void {
-    std.debug.assert(c.session != null);
     std.debug.assert(c.cycle == null);
     std.debug.assert(reserve <= c.hist.window);
 
     const total = c.hist.t.count();
     c.cycle = .{ .plan = c.hist.shrink(reserve), .total = total, .reserve = reserve };
-    c.retry_waiting = retry;
-    try reopen(c);
+    c.prompt.waiting = retry;
+    return reopen(c);
 }
 
-/// Close the open session and open one with the original system prompt. The
-/// cycle restarts at its first kept pair.
+/// Close the open session and open one with the original system prompt. The cycle restarts at its
+/// first kept pair.
 fn reopen(c: *Chat) !void {
     if (c.session) |s| {
         _ = try c.client.send(.session_close, s.id);
@@ -316,8 +332,7 @@ fn reopen(c: *Chat) !void {
     c.state = .opening;
 }
 
-/// Send the next append frame of the cycle, or end the cycle when every kept
-/// pair is in.
+/// Send the next append frame of the cycle, or end the cycle when every kept pair is in.
 fn continueCycle(c: *Chat) !void {
     const cy = &c.cycle.?;
     std.debug.assert(cy.next <= c.hist.t.count());
@@ -336,8 +351,8 @@ fn continueCycle(c: *Chat) !void {
     c.state = .appending;
 }
 
-/// The chat leaves a clone source for its fork. The source drops its lease,
-/// so a drop frees it, and the quit closes it.
+/// The chat leaves a clone source for its fork. The source drops its lease, so a drop frees it,
+/// and the quit closes it.
 fn leaveSource(c: *Chat, source_id: u32) !void {
     std.debug.assert(c.state == .opening);
     std.debug.assert(c.cycle == null);
@@ -354,8 +369,7 @@ fn leaveSource(c: *Chat, source_id: u32) !void {
     }
 }
 
-/// With resumption on, the client keeps the new session before the next turn,
-/// so a drop at any later point finds a lease.
+/// Ask for a lease on the new session.
 fn sessionReady(c: *Chat) !void {
     std.debug.assert(c.cycle == null);
     std.debug.assert(c.lease == null);
@@ -369,50 +383,10 @@ fn sessionReady(c: *Chat) !void {
     c.state = .keeping;
 }
 
-/// The session is ready, with or without a lease. A prompt that waits for a
-/// compaction goes out now.
+/// The session is ready, with or without a lease. A prompt that waits for a compaction goes out.
 fn afterKeep(c: *Chat) !void {
-    if (c.retry_waiting) return sendPrompt(c, true);
+    if (c.prompt.waiting) return sendPrompt(c, true);
     return enterIdle(c);
-}
-
-/// A refused frame teaches its cost, and the cycle restarts with a new plan
-/// that keeps fewer pairs. Any other failure opens the session once more,
-/// and a second one clears the transcript.
-fn appendRefused(c: *Chat, e: *const Client.LastError) !void {
-    const cy = &c.cycle.?;
-
-    if (client_history.tooLong(e.*, .turn)) |tl| {
-        try c.out.note(client_output.refit_fmt, .{ tl.tokens, tl.room });
-        cy.refits += 1;
-        switch (transcript_mod.refit(
-            c.hist.t,
-            c.hist.budget(cy.reserve),
-            cy.next,
-            cy.frame_end,
-            tl.tokens,
-            cy.plan.kept,
-        )) {
-            .plan => |p| cy.plan = p,
-            .stuck => {
-                try c.out.dim(client_output.refit_stuck_note, .{});
-                c.hist.keepNothing(cy);
-            },
-        }
-
-        return reopen(c);
-    }
-
-    try c.out.serverError(e.*);
-    if (!cy.reopened) {
-        cy.reopened = true;
-        try c.out.note(client_output.reopen_note, .{});
-        return reopen(c);
-    }
-
-    try c.out.note(client_output.append_lost_note, .{});
-    c.hist.keepNothing(cy);
-    return reopen(c);
 }
 
 // -- helpers: frames --------------------------------------------------------
@@ -448,13 +422,13 @@ fn onFrame(c: *Chat, ev: *const client_mod.OwnedEvent) !void {
 
 fn onToken(c: *Chat, t: *const @FieldType(Body, "token")) !void {
     if (transcript_mod.countsAsGenerated(t.channel)) {
-        c.received += 1;
+        c.stream.received += 1;
     }
 
     if (t.token_id == c.info.eos_id) return;
 
     const text = t.text[0..t.len];
-    const shade = c.think.step(t.channel);
+    const shade = c.stream.think.step(t.channel);
     if (shade == .reply) {
         c.hist.t.appendReply(text);
     }
@@ -474,15 +448,7 @@ fn onDone(c: *Chat, d: @FieldType(Body, "done")) !void {
     );
     c.session.?.kv_pos = d.kv_pos;
 
-    try c.out.finish(.{
-        .finish_reason = d.finish_reason,
-        .gen_tokens = d.gen_tokens,
-        .reasoning_tokens = d.reasoning_tokens,
-        .kv_pos = d.kv_pos,
-        .max_seq = c.info.max_seq,
-        .prefill_ms = d.prefill_ms,
-        .decode_ms = d.decode_ms,
-    });
+    try c.out.finish(d, c.info.max_seq);
     try c.out.recorded(rec);
 
     if (d.finish_reason == .context_full) {
@@ -501,8 +467,8 @@ fn onOpened(c: *Chat, session_id: u32, kv_pos: u32) !void {
     c.lease = null;
 
     if (c.cycle != null) {
-        // The original system prompt opens each cycle, so the open measures
-        // the system rows exactly.
+        // The original system prompt opens each cycle, so the open measures the system rows
+        // exactly.
         c.hist.system_rows = kv_pos;
         return continueCycle(c);
     }
@@ -533,55 +499,28 @@ fn onAppended(c: *Chat, a: *const protocol.Appended) !void {
 }
 
 fn onErr(c: *Chat, request_id: u32, e: *const Client.LastError) !void {
-    const mine = request_id == c.pending_id;
-
-    if (c.state == .streaming and mine) {
-        try endTurn(c);
-        try c.out.abandoned(c.hist.t.abandon());
-
-        const refusal = if (c.retried) null else client_history.tooLong(e.*, .turn);
-        if (refusal) |tl| {
-            switch (c.hist.retry(tl.tokens)) {
-                .retry => |r| {
-                    try c.out.note(client_output.retry_fmt, .{ tl.tokens, tl.room });
-                    return startCompaction(c, r, true);
-                },
-                .refuse => {
-                    try c.out.refused(e.*, c.session.?, c.hist, tl.tokens);
-                    return enterIdle(c);
-                },
-            }
+    if (request_id == c.pending_id) {
+        switch (c.state) {
+            .streaming => return turnFailed(c, e),
+            .appending => {
+                const cy = &c.cycle.?;
+                try c.out.frameFailed(c.hist, cy, e.*, cy.next, cy.frame_end);
+                return reopen(c);
+            },
+            .keeping => {
+                // The session lives on with no lease. A drop then rebuilds it.
+                try c.out.serverError(e.*);
+                return afterKeep(c);
+            },
+            .opening => return openFailed(c, e),
+            .idle, .reconnecting, .quitting => {},
         }
-
-        try c.out.turnRefused(e.*, c.session.?, c.info.max_seq);
-        return enterIdle(c);
     }
 
-    if (c.state == .appending and mine) return appendRefused(c, e);
-
-    if (c.state == .keeping and mine) {
-        // The session lives on with no lease. A drop then rebuilds it.
-        try c.out.serverError(e.*);
-        return afterKeep(c);
-    }
-
-    if (c.state == .opening and mine) {
-        c.cycle = null;
-        try c.out.serverError(e.*);
-        if (c.session != null) return enterIdle(c);
-
-        try c.out.note(client_output.no_session_note, .{});
-        c.lost_session = true;
-        c.state = .quitting;
-        return;
-    }
-
-    if (c.ping) |pg| {
-        if (pg.id == request_id) {
-            c.ping = null;
-        } else {
-            c.replies_due -|= 1;
-        }
+    // The error answers a ping or a due reply.
+    const answers_ping = if (c.ping) |pg| pg.id == request_id else false;
+    if (answers_ping) {
+        c.ping = null;
     } else {
         c.replies_due -|= 1;
     }
@@ -589,14 +528,49 @@ fn onErr(c: *Chat, request_id: u32, e: *const Client.LastError) !void {
     try c.out.serverError(e.*);
 }
 
+/// Close a refused turn. A compaction can answer the first refusal of a prompt.
+fn turnFailed(c: *Chat, e: *const Client.LastError) !void {
+    try endTurn(c);
+    try c.out.abandoned(c.hist.t.abandon());
+
+    const refusal = if (c.prompt.retried) null else client_history.tooLong(e.*, .turn);
+    if (refusal) |tl| {
+        switch (c.hist.retry(tl.tokens)) {
+            .retry => |r| {
+                try c.out.note(client_output.retry_fmt, .{ tl.tokens, tl.room });
+                return startCompaction(c, r, true);
+            },
+            .refuse => {
+                try c.out.refused(e.*, c.session.?, c.hist, tl.tokens);
+                return enterIdle(c);
+            },
+        }
+    }
+
+    try c.out.turnRefused(e.*, c.session.?, c.info.max_seq);
+    return enterIdle(c);
+}
+
+/// A failed open ends the cycle. With no session left, it ends the chat.
+fn openFailed(c: *Chat, e: *const Client.LastError) !void {
+    c.cycle = null;
+    try c.out.serverError(e.*);
+    if (c.session != null) return enterIdle(c);
+
+    try c.out.note(client_output.no_session_note, .{});
+    c.lost_session = true;
+    c.state = .quitting;
+}
+
 fn emitText(c: *Chat, text: []const u8, shade: client_output.Shade) !void {
     var buf: [client_output.codepoint_tail_max + limits.max_token_text_bytes]u8 = undefined;
-    std.debug.assert(c.hold_len <= client_output.codepoint_tail_max);
+    const s = &c.stream;
+    std.debug.assert(s.hold_len <= client_output.codepoint_tail_max);
     std.debug.assert(text.len <= limits.max_token_text_bytes);
 
-    @memcpy(buf[0..c.hold_len], c.hold[0..c.hold_len]);
-    @memcpy(buf[c.hold_len..][0..text.len], text);
-    const all = buf[0 .. c.hold_len + text.len];
+    @memcpy(buf[0..s.hold_len], s.hold[0..s.hold_len]);
+    @memcpy(buf[s.hold_len..][0..text.len], text);
+    const all = buf[0 .. s.hold_len + text.len];
     const n = client_output.completePrefixLen(all);
 
     const o = c.out.o;
@@ -604,29 +578,28 @@ fn emitText(c: *Chat, text: []const u8, shade: client_output.Shade) !void {
     try o.print("{s}{s}{s}", .{ color, all[0..n], c.out.po.reset });
     try o.flush();
 
-    c.hold_len = all.len - n;
-    @memcpy(c.hold[0..c.hold_len], all[n..]);
+    s.hold_len = all.len - n;
+    @memcpy(s.hold[0..s.hold_len], all[n..]);
 }
 
 fn endTurn(c: *Chat) !void {
     const o = c.out.o;
-    const color = client_output.shadeColor(c.out.po, c.think.last);
-    try o.print("{s}{s}{s}\n", .{ color, c.hold[0..c.hold_len], c.out.po.reset });
+    const s = &c.stream;
+    const color = client_output.shadeColor(c.out.po, s.think.last);
+    try o.print("{s}{s}{s}\n", .{ color, s.hold[0..s.hold_len], c.out.po.reset });
     try o.flush();
-    c.hold_len = 0;
+    s.hold_len = 0;
 }
 
 // -- helpers: reconnect -----------------------------------------------------
 
-/// The step out of `reconnecting`. A resume continues the state before the
-/// drop. No lease rebuilds the session.
+/// The step out of `reconnecting`.
 fn afterReconnect(c: *Chat, prior: client_chat.State, outcome: client_reconnect.Outcome) !void {
     std.debug.assert(c.state == .reconnecting);
     std.debug.assert(prior != .reconnecting);
     std.debug.assert(prior != .quitting);
 
-    // The replies due on the old connection never arrive. The clone sources
-    // held no lease, so the drop freed them.
+    // The clone sources held no lease, so the drop freed them.
     c.replies_due = 0;
     c.ping = null;
     c.sources_len = 0;
@@ -638,8 +611,7 @@ fn afterReconnect(c: *Chat, prior: client_chat.State, outcome: client_reconnect.
     }
 }
 
-/// A lease exists only on an open session with no cycle in flight, so a
-/// resume reaches only the states that hold one.
+/// Continue the state before the drop.
 fn resumeChat(c: *Chat, prior: client_chat.State, r: Client.ResumedSession) !void {
     std.debug.assert(c.session != null);
     std.debug.assert(c.cycle == null);
@@ -660,13 +632,12 @@ fn resumeChat(c: *Chat, prior: client_chat.State, r: Client.ResumedSession) !voi
     }
 }
 
-/// The turn in flight at the drop takes the verdict of `reconcile`. Only a
-/// turn that the server never ran goes out again.
+/// The turn in flight at the drop takes the verdict of `reconcile`.
 fn reconcileTurn(c: *Chat, before: u32, s: protocol.Resumed) !void {
     try endTurn(c);
 
     const verdict = transcript_mod.reconcile(
-        .{ .request_id = c.pending_id, .received = c.received },
+        .{ .request_id = c.pending_id, .received = c.stream.received },
         s.turns_done,
         s.last,
     );
@@ -674,21 +645,21 @@ fn reconcileTurn(c: *Chat, before: u32, s: protocol.Resumed) !void {
         .never_ran => {
             try c.out.abandoned(c.hist.t.abandon());
             try c.out.note(never_ran_note, .{});
-            return sendPrompt(c, c.retried);
+            return sendPrompt(c, c.prompt.retried);
         },
         .cut => |k| try c.out.note(cut_reply_fmt, .{ k, if (k == 1) "token" else "tokens" }),
-        .inconsistent => try c.out.note(inconsistent_fmt, .{c.received}),
+        .inconsistent => try c.out.note(inconsistent_fmt, .{c.stream.received}),
         .complete => {},
     }
 
-    // An inconsistent summary names no usable finish, so the turn counts as
-    // cut at the frames the client got.
+    // An inconsistent summary names no usable finish, so the turn counts as cut at the frames that
+    // the client got.
     const finish: protocol.FinishReason = if (verdict == .inconsistent)
         .cancelled
     else
         s.last.?.finish;
 
-    const gen_tokens = if (verdict == .inconsistent) c.received else s.last.?.gen_tokens;
+    const gen_tokens = if (verdict == .inconsistent) c.stream.received else s.last.?.gen_tokens;
     const rec = c.hist.t.finish(transcript_mod.liveCost(s.kv_pos -| before, finish, gen_tokens));
     try c.out.recorded(rec);
 
@@ -697,13 +668,12 @@ fn reconcileTurn(c: *Chat, before: u32, s: protocol.Resumed) !void {
     return enterIdle(c);
 }
 
-/// Open a new session and append the kept pairs, as a compaction does. The
-/// new session lacks the turn in flight, so that turn goes out again.
+/// Open a new session and append the kept pairs.
 fn rebuild(c: *Chat, prior: client_chat.State) !void {
     try c.out.note(no_lease_note, .{});
     c.lease = null;
 
-    var retry = c.retry_waiting;
+    var retry = c.prompt.waiting;
     if (prior == .streaming) {
         try endTurn(c);
         try c.out.abandoned(c.hist.t.abandon());
@@ -713,9 +683,5 @@ fn rebuild(c: *Chat, prior: client_chat.State) !void {
 
     c.session = null;
     c.cycle = null;
-    const reserve = c.hist.effectiveReserve();
-    const total = c.hist.t.count();
-    c.cycle = .{ .plan = c.hist.shrink(reserve), .total = total, .reserve = reserve };
-    c.retry_waiting = retry;
-    return reopen(c);
+    return startCompaction(c, c.hist.effectiveReserve(), retry);
 }

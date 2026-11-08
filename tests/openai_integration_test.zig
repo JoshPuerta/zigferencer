@@ -590,8 +590,8 @@ test "openai loopback: enable_thinking true without a thinking mode gets 400" {
     )).@"error";
     try std.testing.expectEqualStrings("invalid_request_error", e.type);
     try std.testing.expectEqualStrings(
-        "enable_thinking true does not apply to this model, because its chat template has " ++
-            "no thinking mode",
+        "enable_thinking true does not apply to this model, " ++
+            "because its chat template has no thinking mode",
         e.message,
     );
 

@@ -1,5 +1,8 @@
 //! The property driver. `forAll` generates `opts.cases` cases and checks each one.
 //!
+//! Comptime. `forAll` takes the case type, the generator, and the check at comptime, so each
+//! property gets typed code.
+//!
 //! Cases. Case i has size min(i, max_size), so the first failing case is a small
 //! one. Each case draws from its own generator, seeded from the call site, the
 //! test seed, and the case index. One case therefore replays alone.
@@ -42,8 +45,8 @@ pub fn forAll(
     const failure = firstFailure(opts, context, Case, gen, check) orelse return;
     const seed = std.testing.random_seed;
     std.debug.print(
-        "prop: case {d} size {d} returned {s} (seed 0x{x}, site 0x{x}). Rerun: zig build " ++
-            "test --seed 0x{x}\n",
+        "prop: case {d} size {d} returned {s} (seed 0x{x}, site 0x{x}). Rerun: " ++
+            "zig build test --seed 0x{x}\n",
         .{ failure.index, failure.size, @errorName(failure.err), seed, opts.site, seed },
     );
     return failure.err;

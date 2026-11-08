@@ -1,4 +1,12 @@
 //! The checks of the serve flags that need no model file, in the order a user reads them.
+//!
+//! Slots. `--max-sessions` is the logical conversation count. Only the fused-GPU build can evict
+//! idle sessions to RAM, so only it can over-subscribe the physical slots. With no flag, every
+//! session is resident, unless a `--kv-vram` budget lets the planner buy the count.
+//!
+//! Exclusions. `--kv-vram` states a budget, and `--vram-slots` states the count that the budget
+//! buys. The pair can disagree, so it is a mistake. The same holds for `--gpu-layers` with
+//! `--kv-vram`, because the layer split planner already prices a pinned suffix and its KV.
 
 const std = @import("std");
 const Io = std.Io;
@@ -22,8 +30,7 @@ const kib = 1024;
 
 // -- types ------------------------------------------------------------------
 
-/// The options of the binary wire that `serve-openai` does not take. Every other
-/// serve option is a field of `flag_groups.ServeFlags`.
+/// The options of the binary wire that `serve-openai` does not take.
 pub const Wire = struct {
     allow_shutdown: bool = false,
     /// In 1..max_sessions. Absent takes `max_sessions`.
@@ -63,6 +70,7 @@ pub fn checkFlags(
     serve: *const flags_mod.ServeFlags,
     wire: Wire,
 ) !CheckedFlags {
+    // Check each group of flags.
     const io = ctx.io;
 
     const sessions_per_connection = try checkSessions(io, serve, wire);
@@ -71,6 +79,7 @@ pub fn checkFlags(
     const slots = try checkSlots(io, serve, budgets);
     const batch = try checkBatch(io, serve, slots.structural);
 
+    // Check the ranges that stand alone.
     if ((serve.prefill_chunk orelse 0) > limits.max_prefill_chunk) {
         return args.fail(io, "--prefill-chunk must be in 0..{d}", .{limits.max_prefill_chunk});
     }
@@ -78,9 +87,8 @@ pub fn checkFlags(
         return args.fail(io, "--thinking-budget must be in 0..{d}", .{limits.max_model_ctx});
     }
 
-    // Never below the slot count: the scheduler's floor-1 prefill can put up to
-    // n_slots rows in a step even at prefill_chunk == 0. The `batch + 1` floor keeps
-    // the one-row prefill legal when a budget buys more slots than the decode width.
+    // Build the checked flags. The floor-1 prefill of the scheduler can put up to `n_slots` rows in
+    // a step, even at `prefill_chunk == 0`. The `batch + 1` floor keeps that row legal.
     const cpu_prefill = prefill_chunk.fromFlag(serve.prefill_chunk, limits.cpu_prefill_chunk);
     return .{
         .shape = .{
@@ -101,8 +109,7 @@ pub fn checkFlags(
 
 // -- helpers ----------------------------------------------------------------
 
-/// `--max-sessions` is the logical conversation count. Only the fused-GPU build can
-/// evict idle sessions to RAM, so only it can over-subscribe the physical slots.
+/// Check the session counts, and return the sessions per connection.
 fn checkSessions(io: Io, serve: *const flags_mod.ServeFlags, wire: Wire) !u16 {
     const session_cap: u16 = if (fused_build)
         @intCast(limits.max_logical_sessions)
@@ -137,8 +144,7 @@ fn checkSessions(io: Io, serve: *const flags_mod.ServeFlags, wire: Wire) !u16 {
 }
 
 fn checkBudgets(io: Io, serve: *const flags_mod.ServeFlags) !ByteBudgets {
-    // --kv-vram states a budget, and --vram-slots states the count that budget
-    // buys. Two flags for one decision can disagree, so the pair is a mistake.
+    // Refuse the exclusive pairs.
     if (serve.kv_vram != null and serve.vram_slots != null) {
         return args.fail(
             io,
@@ -150,6 +156,7 @@ fn checkBudgets(io: Io, serve: *const flags_mod.ServeFlags) !ByteBudgets {
         return args.fail(io, "--gpu-layers requires -Dops-backend=vulkan_fused", .{});
     }
 
+    // Convert each budget from MiB to bytes.
     const kv_vram: ?u64 = blk: {
         const value = serve.kv_vram orelse break :blk null;
         if (!fused_build) {
@@ -164,8 +171,6 @@ fn checkBudgets(io: Io, serve: *const flags_mod.ServeFlags) !ByteBudgets {
         break :blk mibBytes(value);
     };
 
-    // The placement planner already prices the pinned suffix and its KV against
-    // the device budget, so a second statement of it can only disagree.
     if (serve.engine.gpu_layers != null and kv_vram != null) {
         return args.fail(
             io,
@@ -194,9 +199,8 @@ fn mibBytes(value: u32) u64 {
     return @as(u64, value) << 20;
 }
 
-/// Read the `--preload` files before the model loads, so a bad path fails in
-/// milliseconds. An oversize or empty file fails too, because the operator asked
-/// for warmth and a silent skip is a correctness bug.
+/// Read the `--preload` files before the model loads, so a bad path fails fast. An oversize or
+/// empty file fails too, because the operator asked for warmth.
 fn readPreload(ctx: context.Context, serve: *const flags_mod.ServeFlags) ![]const []const u8 {
     const paths = serve.preload.slice();
     std.debug.assert(paths.len <= limits.serve_preload_max);
@@ -215,13 +219,13 @@ fn readPreload(ctx: context.Context, serve: *const flags_mod.ServeFlags) ![]cons
     return texts;
 }
 
-/// The requested slot count and the structural one. With no flag every session
-/// is resident, unless a `--kv-vram` budget lets the planner buy the count.
+/// The requested slot count and the structural one.
 fn checkSlots(
     io: Io,
     serve: *const flags_mod.ServeFlags,
     budgets: ByteBudgets,
 ) !SlotCounts {
+    // Check the requested count.
     const requested: ?u16 = blk: {
         const value = serve.vram_slots orelse break :blk null;
         if (!fused_build) {
@@ -239,6 +243,7 @@ fn checkSlots(
         break :blk @min(value, serve.max_sessions);
     };
 
+    // Derive the structural count.
     const structural: u16 = requested orelse blk: {
         if (budgets.kv_vram != null) {
             break :blk @intCast(@min(@as(u32, serve.max_sessions), limits.max_batch));
@@ -266,8 +271,7 @@ fn checkSlots(
     return .{ .requested = requested, .structural = structural };
 }
 
-/// The decode width: slots bound breadth, and `limits.max_batch` bounds the rows
-/// one tick advances.
+/// The decode width: slots bound breadth, and `limits.max_batch` bounds the rows of one tick.
 fn checkBatch(io: Io, serve: *const flags_mod.ServeFlags, structural_slots: u16) !u16 {
     const width_cap: u16 = @intCast(@min(@as(u32, structural_slots), limits.max_batch));
     if (serve.max_batch) |req| {
@@ -290,8 +294,8 @@ fn checkBatch(io: Io, serve: *const flags_mod.ServeFlags, structural_slots: u16)
     return batch;
 }
 
-/// The CPU arm holds every session resident, and its plan funds no blob. Fewer
-/// slots than sessions then park a turn with no eviction to free a slot.
+/// The CPU placement holds every session resident and funds no blob. Fewer slots than sessions park
+/// a turn with no eviction to free a slot.
 fn refuseCpuSlots(io: Io, n_slots: u16, max_sessions: u16) error{UsageError}!void {
     if (n_slots >= max_sessions) return;
     return args.fail(io, boot_lines.cpu_slots_fmt, .{ n_slots, max_sessions });

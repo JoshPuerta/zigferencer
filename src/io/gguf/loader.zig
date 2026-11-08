@@ -2,6 +2,9 @@
 //! the parser, and reads the architecture-specific KV keys. The card is the typed view of the
 //! metadata the engine needs. Each `TensorRef` holds a `Tensor` whose `data` slices into the map.
 //!
+//! Comptime. The refusal level is a comptime parameter, and an assert pins the load errors to
+//! `LoadError`.
+//!
 //! Validation in pairs. The parser asserts the byte-level form. This layer asserts semantic
 //! completeness: every architecture key resolves, the dtype and shape make sense, and the engine
 //! bounds in `limits.zig` hold. Neither side trusts the other.
@@ -138,7 +141,8 @@ pub const Loaded = struct {
 };
 
 pub const LoadOptions = struct {
-    /// Prefault all pages at map time. Turn it off for a metadata-only reader such as `inspect`.
+    /// Prefault all pages at map time, so the decode loop takes no page faults. Turn it off for
+    /// a metadata-only reader such as `inspect`.
     prefault: bool = true,
     /// Suppress the `loading...` and `loaded...` info logs, for a caller that reads many models.
     quiet: bool = false,
@@ -424,8 +428,8 @@ pub fn bindTensors(
         if (shape32[0] % block != 0) {
             refuse(
                 refusal_level,
-                "{s}: tensor {s} has a row of {d} elements, which is not a multiple of the " ++
-                    "{d}-element block of its dtype",
+                "{s}: tensor {s} has a row of {d} elements, " ++
+                    "which is not a multiple of the {d}-element block of its dtype",
                 .{
                     file, ti.name, shape32[0], block,
                 },
@@ -471,14 +475,14 @@ pub fn bindTensors(
             return error.NotEnoughBytes;
         }
 
-        // Check the address alignment of the view. See "Alignment" in the header.
+        // Check the address alignment of the view.
         const data = bytes[@intCast(start)..@intCast(end)];
         const need = elementAlign(ti.dtype);
         if (@intFromPtr(data.ptr) % need != 0) {
             refuse(
                 refusal_level,
-                "{s}: tensor {s} starts at byte {d}, which breaks the {d}-byte alignment of " ++
-                    "its dtype",
+                "{s}: tensor {s} starts at byte {d}, " ++
+                    "which breaks the {d}-byte alignment of its dtype",
                 .{ file, ti.name, start, need },
             );
             return error.TensorDataUnaligned;
@@ -523,7 +527,7 @@ pub fn ropeScalingSupported(scaling_type: ?[]const u8, has_rope_freqs: bool) boo
 
 // -- helpers ----------------------------------------------------------------
 
-/// Log one refusal at `level`. See "Refusals" in the header.
+/// Log one refusal at `level`.
 fn refuse(comptime level: std.log.Level, comptime format: []const u8, args: anytype) void {
     switch (level) {
         .err => log.err(format, args),
@@ -533,7 +537,7 @@ fn refuse(comptime level: std.log.Level, comptime format: []const u8, args: anyt
     }
 }
 
-/// The address alignment that a typed in-place view of `t` needs. See "Alignment" in the header.
+/// The address alignment that a typed in-place view of `t` needs.
 fn elementAlign(t: dtype.GgmlType) usize {
     std.debug.assert(dtype.hasBlockGeometry(t));
 
@@ -667,10 +671,11 @@ test "zeroDim: the first zero card dimension or GDN parameter, else null" {
     const Case = struct { dims: []const Dim, gdn: ?GdnParams, want: ?[]const u8 };
     var no_interval = gdn;
     no_interval.full_attention_interval = 0;
+    const zero_b = [_]Dim{ .{ .key = "a", .value = 1 }, .{ .key = "b", .value = 0 } };
     const cases = [_]Case{
         .{ .dims = &good, .gdn = null, .want = null },
         .{ .dims = &good, .gdn = gdn, .want = null },
-        .{ .dims = &.{ .{ .key = "a", .value = 1 }, .{ .key = "b", .value = 0 } }, .gdn = gdn, .want = "b" },
+        .{ .dims = &zero_b, .gdn = gdn, .want = "b" },
         .{ .dims = &good, .gdn = no_interval, .want = "full_attention_interval" },
     };
     for (cases) |c| {
@@ -778,17 +783,18 @@ fn checkBind(c: BindCase) !void {
 test "bindTensors: a descriptor binds inside the file at its row stride, or fails typed" {
     const max_u32: u64 = std.math.maxInt(u32);
     const max_u64: u64 = std.math.maxInt(u64);
+    const overflow = error.TensorSizeOverflow;
     const cases = [_]BindCase{
         .{ .shape = &.{ 4, 2 }, .stride = 16, .len = 32 },
         .{ .dtype = .q8_0, .shape = &.{ 32, 2 }, .offset_in_data = 2, .stride = 34, .len = 68 },
         .{ .dtype = .f16, .shape = &.{ 8, 3 }, .data_offset = 2, .stride = 16, .len = 48 },
         .{ .shape = &.{64}, .stride = 256, .len = 256 },
         // The element count fits 64 bits, and the byte size wraps to 0.
-        .{ .shape = &.{ 1 << 31, 1 << 31, 4 }, .want = error.TensorSizeOverflow },
-        .{ .shape = &.{ 1 << 31, 1 << 31, 3 }, .want = error.TensorSizeOverflow },
-        .{ .shape = &.{ max_u32, max_u32, max_u32 }, .want = error.TensorSizeOverflow },
-        .{ .shape = &.{4}, .data_offset = 16, .offset_in_data = max_u64 - 7, .want = error.TensorSizeOverflow },
-        .{ .shape = &.{4}, .offset_in_data = max_u64 - 7, .want = error.TensorSizeOverflow },
+        .{ .shape = &.{ 1 << 31, 1 << 31, 4 }, .want = overflow },
+        .{ .shape = &.{ 1 << 31, 1 << 31, 3 }, .want = overflow },
+        .{ .shape = &.{ max_u32, max_u32, max_u32 }, .want = overflow },
+        .{ .shape = &.{4}, .data_offset = 16, .offset_in_data = max_u64 - 7, .want = overflow },
+        .{ .shape = &.{4}, .offset_in_data = max_u64 - 7, .want = overflow },
         .{ .shape = &.{ 4, 0 }, .want = error.BadTensorShape },
         .{ .shape = &.{ max_u32 + 1, 1 }, .want = error.BadTensorShape },
         .{ .dtype = .q8_0, .shape = &.{ 48, 2 }, .want = error.BadTensorShape },
@@ -805,19 +811,21 @@ test "bindTensors: a descriptor binds inside the file at its row stride, or fail
     }
 }
 
-/// A random mutation of the parser sample: byte writes in the header, the kvs,
-/// and the tensor table, one 8-byte edge value, and one cut. `parse` then
-/// `bindTensors` gives a typed error, or tensors that each lie inside the
-/// bytes with a row stride that tiles the data and an aligned start.
+/// A random mutation of the parser sample: byte writes in the header, the kvs, and the tensor
+/// table, one 8-byte edge value, and one cut. `parse` then `bindTensors` gives a typed error,
+/// or tensors that lie inside the bytes with a row stride that tiles the data and an aligned start.
 fn checkParseBind(sample: *const parser.Sample, seed: u64) anyerror!void {
     var prng = std.Random.DefaultPrng.init(seed);
     const r = prng.random();
+
+    // Copy the sample and write random bytes.
     var bytes: [parser.sample_capacity]u8 align(16) = undefined;
     @memcpy(bytes[0..sample.len], sample.bytes[0..sample.len]);
     for (0..r.uintLessThan(usize, 4)) |_| {
         bytes[r.uintLessThan(usize, sample.table_end)] = r.int(u8);
     }
 
+    // Write one 8-byte edge value.
     if (r.boolean()) {
         const edges = [_]u64{
             0,
@@ -838,9 +846,11 @@ fn checkParseBind(sample: *const parser.Sample, seed: u64) anyerror!void {
         std.mem.writeInt(u64, bytes[at..][0..8], edges[r.uintLessThan(usize, edges.len)], .little);
     }
 
+    // Cut the file at a random length.
     const len = if (r.uintLessThan(u8, 4) == 0) r.uintAtMost(usize, sample.len) else sample.len;
     const file = bytes[0..len];
 
+    // Parse and bind in a bounded heap.
     var heap: [16 * 1024]u8 = undefined;
     var fba = std.heap.FixedBufferAllocator.init(&heap);
     const parsed = parser.parse(fba.allocator(), file) catch |err| {
@@ -851,6 +861,8 @@ fn checkParseBind(sample: *const parser.Sample, seed: u64) anyerror!void {
         try std.testing.expect(err != error.OutOfMemory);
         return;
     };
+
+    // Check that each tensor lies inside the file with a tiled stride.
     const lo = @intFromPtr(file.ptr);
     for (refs) |ref| {
         const t = ref.tensor;

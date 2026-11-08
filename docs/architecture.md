@@ -28,7 +28,8 @@ This document explains how zigferencer works, from the build to a served token.
 | backend | The set of kernels that the build selects (`-Dops-backend`). |
 | runtime | What the binary links and can drive: the CPU only, or the CPU and a Vulkan GPU (`-Druntime`). |
 | runner | The code that runs the forward pass of one model family on one placement. It owns all the state of that pass. |
-| placement | Where the layers run: on the CPU, on the GPU, or split between the two (a hybrid). |
+| placement | Where the layers of a model run: `fused` (all on the GPU), `hybrid` (a CPU prefix and a GPU suffix), or `cpu`. It says nothing about sessions. A session enters a VRAM slot and is then resident. |
+| layer split | The numbers of a hybrid placement (`LayerSplit`): the layer where the GPU part starts, and the cost of each side. An attention split is another idea: it divides one attention row across GPU workgroups. |
 | step | One call of a runner, `stepBatch(rows)`: one forward pass over a batch of rows. It runs every layer once for all its rows together, and it writes the KV of each row into the slot of that row. The serve layer puts rows of several sessions into one step: the decode rows of some, and a prompt chunk of another. |
 | row | One `(slot, token, position)` entry of a step, plus a flag that asks for logits. A row carries one token of one session through every layer, at the position that the row names. The rows of one slot are adjacent and ascend by one position, and only the rows that ask for logits reach the lm_head. |
 | prefill | The steps that feed the prompt into the model. Only the last prompt row needs logits. |
@@ -72,17 +73,57 @@ This document explains how zigferencer works, from the build to a served token.
 | Artifact | Root file | Where it goes | What it is |
 | --- | --- | --- | --- |
 | `zigferencer` | `src/main.zig` | `zig-out/bin/` | The release binary: `list`, `fetch`, `inspect`, `info`, `run`, `serve`, `serve-openai`, and `client`. |
-| `zigferencer-dev` | `src/dev/dev_main.zig` | `zig-out/bin/` | The release commands, plus the developer commands: the model benchmarks, `gpu-selftest`, `tokens`, and `serve-demo`. |
+| `zigferencer-dev` | `src/dev/dev_main.zig` | `zig-out/bin/` | The release commands, plus the developer commands: `bench-model`, `bench-serve`, `bench-swap`, `bench-decode-host`, `gpu-selftest`, `tokens`, and `serve-demo`. |
 | `zigferencer-bench` | `tools/bench.zig` | not installed | The op micro-benchmarks. `zig build bench` builds and runs it. |
 | `zigferencer-simd-probe` | `tools/simd_probe.zig` | `zig-out/` | The assembly of each op, for `make simd-report`. `zig build simd-probe` installs only the `.s` file. |
 | test binaries | `src/main.zig`, `tests/*_test.zig` | `zig-out/test/` | The unit tests, and one binary for each integration test. Only `test-install` installs one. |
 | SPIR-V blobs | `src/ops_vulkan/shaders/*.comp` | inside the binary | The GPU kernels. Only a GPU build compiles them. |
 
-Both executables build from one engine module, with the same target and the same
-optimize mode. The dev binary computes the same numbers as the release binary. 
-A plain `zig build` installs only the release binary. `zig build install
-dev` installs both. The release binary refuses a developer command, and its
-message names `zigferencer-dev`.
+A plain `zig build` installs only the release binary. `zig build install dev`
+installs both. The release binary refuses a developer command, and its message
+names `zigferencer-dev`.
+
+### Binaries
+
+`build.zig` makes two Zig modules, one for each binary, with the same target and
+the same optimize mode. The dev binary therefore computes the same numbers as the
+release binary.
+
+- The **release module** roots at `src/main.zig`. It holds the engine and the release
+  commands, and `src/main.zig` re-exports the engine modules under the package name.
+- The **dev module** roots at `src/dev/dev_main.zig`. It holds the developer commands.
+  The build gives it the release module as the import `zigferencer`.
+
+The release module has no import of the dev module. A relative import across two module
+roots puts one file into two modules, and Zig rejects it. So no file of the release
+binary can reach a file of `src/dev/`. The release binary knows the developer commands by name only (`command.dev_names`), to
+print a hint. A comptime check in `src/dev/dev_command.zig` fails the build when those names
+differ from the dev table.
+
+The layers inside the tree point one way:
+
+```
+  src/dev/  -->  zigferencer.cli  (src/cli.zig)  -->  src/cli/
+     |                                                   |
+     +----------------->  engine/, runtime/, serve/, io/, ops*/, core/  <--+
+```
+
+1. The engine (`engine/`, `runtime/`, `serve/`, `io/`, `ops/`, `ops_vulkan/`, `core/`)
+   reads no file of `src/cli/` or `src/dev/`.
+2. A building block of `src/cli/` (the flag parser, the boot steps, the styles) reads
+   no command file.
+3. A command reads no other command.
+4. No file outside `src/dev/` reads a file of `src/dev/`.
+
+**Extending commands**
+
+1. A release command takes `src/cli/NAME_cmd.zig`, or a directory with its name when it
+   needs more than one file. Add one row to `command.release` in `src/cli/command.zig`.
+2. A developer command takes `src/dev/NAME_cmd.zig`, or a directory. Add one row to the
+   table in `src/dev/dev_command.zig` and the name to `command.dev_names`. Add a file
+   that holds tests to the `test {}` block of `src/dev/dev_main.zig`.
+3. When a dev file needs an engine module that `src/main.zig` does not re-export, add one
+   `pub const` line there. When it needs a CLI building block, add one line to `src/cli.zig`.
 
 The main build steps:
 
@@ -91,11 +132,13 @@ The main build steps:
 | `zig build` | Builds and installs the release binary. |
 | `zig build dev` | Builds and installs the dev binary. |
 | `zig build check` | Type-checks both executables. It installs nothing. |
-| `zig build test` | Runs the unit tests, every integration test of this build, and the format check. |
+| `zig build test` | Runs the unit tests of both modules (`unit` and `dev_unit`), every integration test of this build, the format check, and the shader style rules. |
+| `zig build test-unit` | Runs the unit tests of both modules only. |
 | `zig build test-build` | Compiles every test and runs none. |
 | `zig build test-install -Dtest-bin=NAME` | Installs one test binary, so that a debugger can run it. |
 | `zig build bench` | Builds and runs the op micro-benchmarks. |
 | `zig build bench-build` | Compiles the benchmarks and runs none. |
+| `zig build lint-shaders` | Checks the style rules of the shaders (`tools/shader_lint.zig`). It needs no Vulkan SDK. With `-Druntime=vulkan` it also runs `glslc -Werror` and `spirv-val`. |
 
 ### Code paths
 
@@ -173,6 +216,8 @@ The `Makefile` is a small layer over `zig build`, and `make help` lists the targ
 - `make build` and `make run` install both executables in one `zig build install dev` call.
   `make run` runs `zigferencer-dev`, which holds every command.
 - `make ci` runs the CPU part of CI. `make ci-gpu` compiles every GPU path and runs none.
+- `make gate`, `make profile`, `make simd-report`, and `make debug-build` call the scripts of
+  `tools/`, and `ARGS=` carries their arguments.
 
 ## 3. From a prompt to text
 
@@ -243,6 +288,7 @@ parts that only matter when many conversations share one model:
 | `--max-connections`, `--sessions-per-connection`, `--allow-shutdown`, `--resume-ttl` | flag of `serve` (`--max-connections` also of `serve-openai`) | 10 |
 | `--thinking`, `--thinking-budget`, and the sampling fields | flag, and a field of each turn | 10 |
 | `$ZIGFERENCER_VK_STORAGE_RANGE` | environment variable | 9 |
+| `$ZIGFERENCER_VK_SOFTWARE` | environment variable | [debugging.md](debugging.md) |
 | `$ZIGFERENCER_LOG`, `$ZIGFERENCER_MODELS_DIR`, `$ZIGFERENCER_CACHE_DIR` | environment variable | 12 |
 | `$ZIGFERENCER_TRACE_OUT` and the other trace variables | environment variable | [profiling.md](profiling.md) |
 
@@ -265,13 +311,14 @@ host, calls the boot decisions, and builds the runners.
 Note: This is just an organizational metaphor I tried to respect in this repo. I tried to carry
 the lessons from digital design in VHDL I had many years ago.
 
-## 5. Where the code lives
+## 5. Code placement
 
 | Directory | What it holds | Files to start with |
 | --- | --- | --- |
+| [`src/`](../src/README.md) | The two root files. | `main.zig` (the entry of `zigferencer`, the re-exports, and the test list), `cli.zig` (the CLI building blocks that `src/dev/` can read) |
 | [`src/cli/`](../src/cli/README.md) | The commands: the command line in, one handler for each command. | `command.zig` (the command tables), `args.zig` (the flag parser), `run_cmd.zig`, `boot/serve_boot.zig` (builds the serve engine) |
 | [`src/dev/`](../src/dev/README.md) | The developer commands of `zigferencer-dev`. | `dev_command.zig` (the developer table), `bench_model/bench_model_cmd.zig`, `gpu_selftest/gpu_selftest_cmd.zig` |
-| [`src/engine/`](../src/engine/) | The boot decisions. | `resolve.zig`, `device_arm.zig` (the GPU fit), `family.zig` (the runners of each family) |
+| [`src/engine/`](../src/engine/) | The boot decisions. | `resolve.zig`, `device_placement.zig` (the GPU fit), `family.zig` (the runners of each family) |
 | [`src/core/`](../src/core/README.md) | The shared values and helpers. | `tensor.zig`, `dtype.zig`, `limits.zig` (every bound), `kv_budget.zig` (the plans), `registry.zig` (the model table), `tokenizer/` |
 | [`src/io/`](../src/io/README.md) | Files and the network. | `gguf/parser.zig`, `gguf/loader.zig`, `mmap.zig`, `download.zig` |
 | [`src/ops/`](../src/ops/README.md) | The CPU kernels. | `naive.zig` (the reference), `simd_pf.zig` (the default), `gdn.zig` |
@@ -279,7 +326,22 @@ the lessons from digital design in VHDL I had many years ago.
 | [`src/runtime/`](../src/runtime/README.md) | The runners and their state. | `llama_runner.zig`, `qwen_runner.zig`, `llama_fused.zig`, `qwen_fused.zig`, `llama_hybrid.zig`, `qwen_hybrid.zig`, `session.zig`, `sampler.zig`, `parallel.zig` |
 | [`src/serve/`](../src/serve/README.md) | The server. | `scheduler.zig`, `engine.zig`, `protocol.zig`, `server.zig`, `openai/`, `residency.zig`, `prefix_manager.zig` |
 | [`tests/`](../tests/README.md) | The integration tests against real model files. | `snapshot_smollm2_test.zig`, the `*_equivalence_test.zig` files |
-| [`tools/`](../tools/README.md) | The op micro-benchmarks, the gates, and the profiler driver. | `bench.zig`, `gate.sh`, `profile.sh` |
+| [`tools/`](../tools/README.md) | The op micro-benchmarks, the gates, the profiler driver, and the shader lint. | `bench.zig`, `gate.sh`, `profile.sh`, `shader_lint.zig` |
+
+### The surface between the CLI and the engine
+
+The CLI is one client of the engine. It owns what belongs to a process: the command line, the
+environment, stdout, the terminal, and the exit code. No engine file reads any of them, and no
+engine file imports `src/cli/`.
+
+| Step | CLI -> Engine | Engine -> CLI |
+| --- | --- | --- |
+| Parse | `EngineFlags` | |
+| Measure | | `Resources`, `ModelNeeds`, `DeviceCapacity`, filled by `cli/boot/boot_resources.zig` |
+| Decide | `Input`, `Entry`, `Resources` | `Resolved` or `Refusal` |
+| Build | `KvPlan`, `Policy`, `KvDtype`, `*Pool`, `*Loaded` | a runner of the family and the placement |
+| `run` | token ids and a sink | `Generated` |
+| `serve` | `scheduler.Config`, `Codec`, `*Residency` | `OutEvent` values, through the frontend |
 
 ## 6. The core data types
 
@@ -290,10 +352,10 @@ the lessons from digital design in VHDL I had many years ago.
 | `Vocab` | `core/tokenizer/vocab.zig` | The token, merge, and byte tables of the tokenizer. | Built once at load. The BPE tokenizer reads it, and nothing changes it after the load. |
 | `OpRequires` | `core/op_requires.zig` | What a backend needs from the target (architecture, SIMD level, FMA) and its tolerance against the reference. | Each op module declares one. `info` and the benchmarks read it. |
 | `EngineFlags` | `engine/flags.zig` | The flags that several commands share: the KV dtype, the window, the GPU layers, the threads, and the thinking mode. | The flag parser fills it. `resolve` reads it. |
-| `Facts` | `engine/resolve.zig` | What the host measured once: free RAM and, on a GPU build, the free VRAM and the device buffer limits. | The CLI measures it. `resolve` reads it. |
+| `Resources` | `engine/resolve.zig` | What the host measured once: free RAM and, on a GPU build, the free VRAM and the device buffer limits. | The CLI measures it. `resolve` reads it. |
 | `Resolved`, `Refusal` | `engine/resolve.zig` | The result of the boot decision: the window, the KV dtype, the placement, the plan, or the reason the boot stops. | `resolve` makes it as a pure function. The CLI builds the runner from it or prints the refusal. |
 | `KvPlan` | `core/kv_budget.zig` | The slot count, the window, and the bytes that each part reserves in VRAM and RAM. | The planner makes it. Every runner constructor reads it. |
-| `PlacementPlan` | `core/kv_budget.zig` | The layer split of a hybrid and the cost of each side. | The device decision makes it. A hybrid runner reads it, and `run` and `serve` print it. |
+| `LayerSplit` | `core/kv_budget.zig` | The layer split of a hybrid and the cost of each side. | The device decision makes it. A hybrid runner reads it, and `run` and `serve` print it. |
 | `Policy` | `runtime/parallel.zig` | The thread count, the fan-out floor, and the spin budget of the CPU pool. | Set from the host and the thread flags. The pool and every parallel op read it. |
 | `StepRow` | `runtime/step_row.zig` | One row of a step: the slot, the token, the position, and whether the row needs logits. | Sessions and the decode loop make it. Every runner step reads it. |
 | `Request`, `OutEvent` | `serve/event.zig` | A request from a client, and an event back to a client. | The front-end tasks make the requests, and the scheduler makes the events. |
@@ -344,6 +406,10 @@ On a fused GPU build, `--gpu-layers` selects the placement:
 
 A hybrid always keeps the final norm and the lm_head on the GPU, so the residual
 stream crosses from the host to the device once for each token.
+
+Every runner checks the weight type of each tensor when it starts. A tensor with a type
+that the kernels of the runner do not read stops the start with
+`error.UnsupportedWeightDtype`, before any forward pass runs.
 
 ### Steps and rows
 
@@ -758,7 +824,7 @@ Under memory pressure it can lose the device. More info on [gpu-rdna2.md](gpu-rd
 
 **Budgets for serve.** `--kv-vram MiB` gives the KV a VRAM budget, and the budget
 buys as many slots as it can at the window. `--vram-slots N` pins the slot count
-instead, and the window then follows from the budget. A `PlacementPlan` prices a
+instead, and the window then follows from the budget. A `LayerSplit` prices a
 hybrid: the CPU layers on one side and the GPU layers on the other. Each layer has
 its own price.
 
@@ -853,6 +919,12 @@ touches the runner: it turns wire bytes into `Request` values and `OutEvent` val
 back into wire bytes. The engine loop reads a few requests without a wait, handles
 each one, then runs one tick. It sleeps on the request queue only when the tick did
 no work and no request came in.
+
+A failed `accept` does not end the server. A failure that comes from a client, such as an
+aborted connection, retries at once. A failure from a lack of resources, such as file
+descriptors or memory, retries after a wait (`accept_backoff_ms`). Each retry logs one line.
+Only a cancel at shutdown or a closed listener stops the acceptor task (`acceptAction`
+in `serve/engine.zig`).
 
 The engine thread never waits for a client. When the event queue of a connection is
 full, the scheduler puts the event in the pending cell of that session. That session
@@ -998,7 +1070,7 @@ frontend takes them as `chat_template_kwargs.enable_thinking` and
 | `serve-openai` | release | The OpenAI frontend. |
 | `client` | release | A terminal chat over the binary frontend, with slash commands for cancel, clone, compact, and the others. |
 | `serve-demo` | dev | Starts a server and runs four acts: a streamed turn, follow-up turns, one session cloned and three sessions batched, and a warm open from the prefix cache. |
-| `bench-serve` | dev | Aggregate tokens per second and latency tails for each batch size. |
+| `bench-serve` | dev | Aggregate tokens per second with prefill, and latency tails, for each session count up to the most the model holds. |
 | `bench-swap` | dev | The time to move one session between VRAM and RAM (fused GPU build). |
 | `bench-decode-host` | dev | The host steps of one GPU decode step: record, submit, wait, and the GPU idle gap (fused GPU build). |
 
@@ -1049,12 +1121,12 @@ every frame ([profiling.md](profiling.md)).
 `zigferencer run SmolLM2-135M-Instruct-Q8_0 --prompt "Hi"` on a CPU build:
 
 ```
-main -> entry -> dispatchOver(argv)                        main.zig, cli/command.zig
+main -> entry(init, dispatchRelease) -> dispatchOver(argv)   main.zig, cli/command.zig
   run_cmd.run(ctx)                                         cli/run_cmd.zig
     args.parseInto(Flags), select.model(name)              cli/args.zig, cli/select.zig
     resolve.early(.run, flags, entry)                      engine/resolve.zig: refusals before the load
     loader.load(path)                                      io/gguf/loader.zig: mmap, parse, ModelCard, tensors
-    resolve.resolve(.run, flags, card, facts)              engine/resolve.zig: window, KvPlan, RAM quote
+    resolve.resolve(.run, flags, card, resources)          engine/resolve.zig: window, KvPlan, RAM quote
     parallel.initPool(policy)                              runtime/parallel.zig: the worker threads
     vocab.buildFromParsed, bpe.encodeAlloc(prompt)         core/tokenizer/: the prompt ids
     runHost
@@ -1090,10 +1162,11 @@ differ from the CPU tree:
 
 ```
 run_cmd.run(ctx)
-  resolve.resolve(.run, flags, card, facts)                no device facts yet, so no placement yet
+  resolve.resolve(.run, flags, card, resources)            no device capacity yet, so no placement yet
   runFused                                                 cli/run_cmd.zig
-    vulkan_ctx.Context.init                                runtime/vulkan_ctx.zig: instance, device, queue, limits
-    fusedOn(ctx) -> resolve.resolve with device facts      engine/device_arm.zig: region check, VRAM fit, plan
+    openDevice -> vulkan_ctx.Context.init                  runtime/vulkan_ctx.zig: instance, device, queue, limits
+    fusedOn(ctx) -> resolve.resolve with device capacity   cli/boot/boot_resources.zig, engine/device_placement.zig: region check, VRAM fit, plan
+  runFusedOn(ctx, fused, ...)                              cli/run_cmd.zig
     QwenFusedRunner.init(ctx, loaded, plan)                runtime/qwen_fused.zig
       the VRAM preflight, guardKvLayout
       the pipelines, the scratch buffers, the KvStore, the weight upload
@@ -1113,9 +1186,9 @@ the fused tree:
 
 ```
 run_cmd.run(ctx)                                           the pool gets workers again, for the CPU layers
-  runPlaced(pin = 12)                                      cli/run_cmd.zig
-    Context.init, resolveOn -> the device decision         engine/: placementPlan picks the split, then the runner
-    QwenHybridRunner.init(ctx, loaded, placement)          runtime/qwen_hybrid.zig
+  attemptDevice(pin = 12)                                  cli/run_cmd.zig
+    openDevice, DeviceBoot.resolveOn -> DevicePlacement    cli/boot/boot_resources.zig, engine/device_placement.zig: kv_budget.planLayerSplit picks the split
+    QwenHybridRunner.init(ctx, loaded, plan)               runtime/qwen_hybrid.zig
       QwenFusedRunner.initSuffix(first = split)            the GPU holds layers split .. n
       QwenRunner.initPrefix(split)                         the CPU holds layers 0 .. split
     hybrid.step(id, pos)
@@ -1134,7 +1207,7 @@ serve_cmd.run(ctx)                                         cli/serve_cmd.zig
     resolve.early, loader.load, resolve.resolve(.serve)    the window, the KV type, the chat kind
     parallel.initPool, the vocab, scheduler.Config
     the placement: fused | hybrid | CPU                    the build options and --gpu-layers
-      fused: Context.init, resolveOn -> the device decision  the serve rules of the plan
+      fused: Context.init, resolveOn -> DevicePlacement      the serve rules of the plan
              QwenFusedRunner.init
     launch(runner, sessions = 4)
       Sessions.init(runner)                                runtime/session.zig: the slot table, the row buffer
@@ -1143,13 +1216,13 @@ serve_cmd.run(ctx)                                         cli/serve_cmd.zig
         ServeEngine.init: listen, the request queue        serve/engine.zig
           Scheduler.init -> PrefixManager.init             serve/scheduler.zig, serve/prefix_manager.zig
           preloadPrefixes                                  --preload
-        printReady -> "READY tcp host:port"                cli/boot/serve_boot.zig
+        printReadyTcp -> "READY tcp host:port"             cli/boot/serve_boot.zig
         ServeEngine.run                                    the engine loop, on the main thread
           acceptorTask                                     a concurrent task
           loop: take requests -> scheduler.handle(req), then scheduler.tick
 ```
 
-### One turn on the binary front end
+### One turn on the binary frontend
 
 A client sends a `generate` frame:
 
@@ -1170,7 +1243,7 @@ engine thread, each tick: scheduler.tick -> runComposedStep
 writer task: take an event -> writeEvent -> protocol.encodeServerMsg -> a zmtp frame -> the socket
 ```
 
-### One request on the OpenAI front end
+### One request on the OpenAI frontend
 
 `POST /v1/chat/completions` with `"stream": true`, on `serve-openai`:
 
@@ -1181,7 +1254,7 @@ acceptorTask -> HttpAdapter.onAccept                       serve/openai/http_ser
     chat.wrapMessagesAlloc(messages) -> the prompt text    core/chat.zig
     openSession -> submit(.session_open), wait for session_opened
     streamChat -> runTurn -> submit(.generate)
-      the engine runs the turn as on the binary front end
+      the engine runs the turn as on the binary frontend
       each token event -> SseSink.onPiece -> one server-sent event
       done -> the last chunk, then "data: [DONE]"
     closeSession -> submit(.session_close)
@@ -1204,6 +1277,9 @@ acceptorTask -> HttpAdapter.onAccept                       serve/openai/http_ser
 - **Stay under the preflight.** A plan that passes the 7/8 preflight can still lose
   the device near the limit under a translation-layer driver. After a device loss,
   end the process. `pkill -x 'zigferencer|zigferencer-dev'` ends a process that stays.
+- **Output.** stdout carries the program output. A reader that closes the pipe, as `head`
+  does, ends the command with exit 1 and no message. A write that fails for another cause,
+  such as `/dev/full`, ends the command with exit 1 and one line that names the cause.
 - **Logs.** `$ZIGFERENCER_LOG` sets the log level with no rebuild: `off`, `err`,
   `warn`, `info` (the default), `debug`, or a level for each scope, such as
   `info,runner=debug`. `src/core/log.zig` holds the grammar.

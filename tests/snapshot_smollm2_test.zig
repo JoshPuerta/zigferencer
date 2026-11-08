@@ -1,6 +1,9 @@
 //! Snapshot gate: the first N greedy-decoded token ids from a fixed prompt against the real
 //! SmolLM2-135M-Instruct GGUFs (Q8_0 and Q4_0).
 //!
+//! Comptime. `checkSnapshot` takes the id count at comptime, so the expected array has a checked
+//! size.
+//!
 //! Anchor. The ids must match the snapshot exactly, because the snapshot is the determinism anchor
 //! of the suite. A regression in the GGUF parser, the tokenizer, any op, the KV cache, the
 //! scheduler or the sampler surfaces here.
@@ -130,7 +133,7 @@ test "SmolLM2-Q4_0 greedy first-8 IDs snapshot" {
 }
 
 test "SmolLM2-Q8_0 at kv f16: the slab halves and the blob round-trips" {
-    // Within one dtype the f16 CPU arm frames half the bytes, and its
+    // Within one dtype the f16 CPU placement frames half the bytes, and its
     // transport moves them byte for byte. Token equality across dtypes is not
     // the rule under test, so this test states no expected stream.
     const io = std.testing.io;

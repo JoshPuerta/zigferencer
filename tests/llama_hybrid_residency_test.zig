@@ -1,5 +1,5 @@
 //! Swap gate for the llama hybrid runner. The tiered KV swap must restore a conversation byte for
-//! byte, and the provenance tag must refuse a blob that another placement wrote.
+//! byte, and the provenance tag must refuse a blob that another split or dtype wrote.
 //!
 //! Two tiers. A hybrid slot lives in two tiers. The host prefix holds layers `[0..k)` and the
 //! device suffix holds layers `[k..L)`, so two walks write one blob. The state model proves that
@@ -13,7 +13,7 @@
 //!   1. The host half is byte-equal to the half of the CPU runner, because the prefix boundary runs
 //!      the same ops over the same weights.
 //!   2. A CPU blob goes through the H2D walk of the hybrid in and its D2H walk out byte for byte.
-//!      The transport therefore places and recovers every region. The shipped fingerprint forbids
+//!      The transport therefore writes and recovers every region. The shipped fingerprint forbids
 //!      this cross-executor restore, and the test does it on purpose, because only a foreign blob
 //!      proves that the walks address the whole-model framing and not merely each other.
 //!   3. A greedy decode over the restored rows continues on the path of the CPU runner, so the
@@ -23,7 +23,7 @@
 //! Bits. The device halves hold the same values in the same places, but not the same bits. The
 //! GPU-computed suffix KV differs from the CPU-computed suffix KV in the low mantissa, because the
 //! reduce kernel sums in a different order. Byte equality across executors is therefore not a
-//! guarantee this engine makes, and that fact is the reason the snapshot fingerprint folds the
+//! guarantee this engine makes, and that guarantee is the reason the snapshot fingerprint folds the
 //! split. A blob must not restore under an executor that did not write it.
 //!
 //! Mid split. Every runner here builds at a true mid split, except the split-0 case that pins the
@@ -109,7 +109,7 @@ fn initHybridAt(
     );
     const kv_costs = zigferencer.kv_cost.llamaCostVector(card, .f32);
     var table: [limits.max_layers]u64 = undefined;
-    const plan = kv_budget.placementPlan(
+    const plan = kv_budget.planLayerSplit(
         caps,
         tensor_lookup.layerWeightBytes(loaded.tensors, n_layers, &table),
         tensor_lookup.headWeightBytes(loaded.tensors),
@@ -151,8 +151,8 @@ fn initHybrid(
     const n_layers: u32 = loaded.card.n_layers;
     std.debug.assert(n_layers >= 2); // a mid split needs a layer on each side
     const hybrid = try initHybridAt(gpa, ctxp, loaded, io, thread_pool, n_layers / 2);
-    std.debug.assert(hybrid.split > 0);
-    std.debug.assert(hybrid.split < hybrid.n_layers);
+    std.debug.assert(hybrid.host_layers > 0);
+    std.debug.assert(hybrid.host_layers < hybrid.n_layers);
     return hybrid;
 }
 
@@ -195,7 +195,7 @@ fn initFused(
 /// Bytes the host prefix layers hold inside an `n_rows` blob, by one layer's
 /// share of the whole-model figure times the split.
 fn hostBlobBytes(cpu: *const LlamaRunner, hybrid: *const LlamaHybridRunner, n_rows: u32) usize {
-    return @intCast(cpu.evictSlotBytesFor(n_rows) / hybrid.n_layers * hybrid.split);
+    return @intCast(cpu.evictSlotBytesFor(n_rows) / hybrid.n_layers * hybrid.host_layers);
 }
 
 fn argmaxOf(logits: []const f32) usize {
@@ -477,7 +477,7 @@ test "llama hybrid dispatch: split 0 decodes the stream of the fused runner" {
     const hybrid = try initHybridAt(gpa, ctxp, &loaded, io, &thread_pool, loaded.card.n_layers);
     defer hybrid.deinit();
 
-    try std.testing.expectEqual(@as(u32, 0), hybrid.split);
+    try std.testing.expectEqual(@as(u32, 0), hybrid.host_layers);
 
     const fused = try initFused(gpa, ctxp, &loaded);
     defer fused.deinit();
@@ -501,7 +501,7 @@ test "llama hybrid dispatch: split 0 decodes the stream of the fused runner" {
     }
 }
 
-test "llama hybrid provenance: the tag names the placement" {
+test "llama hybrid provenance: the tag names the split, the quant, and the dtype" {
     var buf_15: [LlamaHybridRunner.backend_tag_buf_len]u8 = undefined;
     var buf_16: [LlamaHybridRunner.backend_tag_buf_len]u8 = undefined;
     var buf_q4: [LlamaHybridRunner.backend_tag_buf_len]u8 = undefined;
@@ -511,7 +511,7 @@ test "llama hybrid provenance: the tag names the placement" {
     const at_15_q4 = LlamaHybridRunner.backendTag(&buf_q4, 15, .q4_0, .f32);
     const at_15_f16 = LlamaHybridRunner.backendTag(&buf_f16, 15, .q8_0, .f16);
 
-    // The split, the quant and the KV dtype are the three parts of a placement,
+    // The split, the quant and the KV dtype are the three parts of a tag,
     // and each one alone must move the tag.
     try std.testing.expect(!std.mem.eql(u8, at_15, at_16));
     try std.testing.expect(!std.mem.eql(u8, at_15, at_15_q4));
@@ -522,7 +522,7 @@ test "llama hybrid provenance: the tag names the placement" {
     try std.testing.expectEqualStrings("vulkan_hybrid:k=15:q8_0", at_15);
     try std.testing.expectEqualStrings("vulkan_hybrid:k=15:q8_0:kv=f16", at_15_f16);
 
-    // The provenance of a snapshot is per placement. Every distinct tag must fold to a
+    // The provenance of a snapshot is per tag. Every distinct tag must fold to a
     // distinct namespace, and none can land on the namespace of a single-tier family.
     const model_fp = prompt_cache.modelFingerprint("smollm2-135m", 145_000_000);
     const fps = [_]u64{
@@ -542,7 +542,7 @@ test "llama hybrid provenance: the tag names the placement" {
     }
 }
 
-test "llama hybrid provenance: a foreign placement is another namespace" {
+test "llama hybrid provenance: a foreign tag is another namespace" {
     const gpa = std.testing.allocator;
     const io = std.testing.io;
     var tmp = std.testing.tmpDir(.{});
@@ -563,7 +563,7 @@ test "llama hybrid provenance: a foreign placement is another namespace" {
         model_fp,
         LlamaHybridRunner.backendTag(&buf_theirs, 16, .q8_0, .f32),
     );
-    // The same placement at the other KV dtype. A blob that crosses the dtype lands wrong bytes.
+    // The same split at the other KV dtype. A blob that crosses the dtype lands wrong bytes.
     const half = prompt_cache.backendFingerprint(
         model_fp,
         LlamaHybridRunner.backendTag(&buf_half, 15, .q8_0, .f16),

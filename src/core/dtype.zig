@@ -170,7 +170,7 @@ pub fn bytesPerBlock(t: GgmlType) usize {
         .q5_1 => 24,
         .q8_0 => 34,
         .q8_1 => 36,
-        // k-quant superblocks of 256 elements. See "Kernel coverage" in the header.
+        // k-quant superblocks of 256 elements.
         .q2_k => 84,
         .q3_k => 110,
         .q4_k => 144,

@@ -1,6 +1,9 @@
 //! Symbol-export probe for `tools/simd-report.sh`. This artifact gives each op kernel a
 //! standalone, named symbol.
 //!
+//! Comptime. `PartArgs` and `partCall` take the element type and the kernel set, so each probe
+//! symbol is one short wrapper.
+//!
 //! Why. In a release build the op kernels inline straight into the forward pass, so neither the
 //! binary nor its assembly keeps a per-op symbol to inspect. The probe takes the address of
 //! every op across all three CPU backends, and parks each address behind `doNotOptimizeAway`.
@@ -30,9 +33,8 @@ const zigferencer = @import("zigferencer");
 // -- constants --------------------------------------------------------------
 
 const probed_ops = .{
-    // Backend-specialized: the kernels that simd and simd_pf hand-write. The
-    // report keeps the variants of one kernel next to each other, so the widths
-    // compare at a glance.
+    // Backend-specialized: the kernels that simd and simd_pf hand-write. The report keeps the
+    // variants of one kernel together.
     &zigferencer.ops.linearF32Q80, // naive: scalar reference
     &zigferencer.ops_simd.linearF32Q80, // simd: @Vector(8)
     &zigferencer.ops_simd_pf.linearF32Q80, // simd_pf: register-blocked + prefetch

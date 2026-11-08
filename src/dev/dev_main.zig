@@ -18,7 +18,7 @@ pub fn main(init: std.process.Init) !void {
 // The block pulls the developer commands into the `dev_unit` test binary. A test of the
 // `zigferencer` module never runs here, so `unit` and `dev_unit` share no test.
 test {
-    // A command body is analyzed only where it is named, so this line makes every arm of every
+    // A command body is analyzed only where it is named, so this line makes every prong of every
     // developer command compile under `test-build`.
     _ = &dev_command.dispatch;
     _ = @import("bench_decode_host_cmd.zig");

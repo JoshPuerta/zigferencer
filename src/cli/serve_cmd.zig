@@ -1,7 +1,12 @@
-//! `zigferencer serve <pub_name>` is the binary frontend. It parses the flags and hands
-//! a `BinaryLauncher` to `serve_boot.buildAndServe`. A client can stop the server with
-//! `shutdown` only under `--allow-shutdown`, because a shared server must not stop on
-//! the request of one client. stdout holds only the READY line, which a spawner parses.
+//! `zigferencer serve <pub_name>` is the binary frontend. It parses the flags and hands a
+//! `BinaryLauncher` to `serve_boot.buildAndServe`.
+//!
+//! Comptime. The launcher is generic over the engine type, so every backend shares one body.
+//!
+//! Shutdown. A client can stop the server with `shutdown` only under `--allow-shutdown`, because a
+//! shared server must not stop on the request of one client.
+//!
+//! Output. stdout holds only the READY line, which a spawner parses.
 
 const std = @import("std");
 
@@ -20,8 +25,8 @@ const log = std.log.scoped(.serve);
 
 // -- types ------------------------------------------------------------------
 
-/// Builds the chat-aware codec and the framed `Server` over the shared engine,
-/// announces the bind, and runs until `shutdown`.
+/// Builds the chat-aware codec and the framed `Server` over the shared engine, announces the bind,
+/// and runs until `shutdown`.
 const BinaryLauncher = struct {
     transport: server_mod.Transport,
     socket_path: ?[]const u8,

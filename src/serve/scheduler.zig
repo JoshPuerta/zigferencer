@@ -2,6 +2,9 @@
 //! of the engine, advanced by one engine call per `tick`. All state lives here and in the engine.
 //! Frame encode and decode and the batched forward pass are the pure datapaths on either side.
 //!
+//! Comptime. Generic over the engine and the codec, so the prongs for snapshots and stats compile
+//! away on an engine that lacks them.
+//!
 //! Tick order. One tick runs four steps in order. It expires leases and retries parked emits. It
 //! finalizes stopped turns, which emits `done`. It then makes ONE composed engine call. That call
 //! takes every admissible decode row (round-robin up to `max_batch`) plus a prefill chunk of the
@@ -152,7 +155,7 @@ pub const Config = struct {
     prefill: prefill_chunk.Rule = .spare_rows,
     /// Live client connections, in 1..limits.max_connections. Only the engine reads it.
     max_connections: u32 = 8,
-    /// A wire client can stop the server with a `shutdown` request. See "Shutdown" in the header.
+    /// A wire client can stop the server with a `shutdown` request.
     allow_shutdown: bool = false,
     /// Lifetime must cover the scheduler's. Must be <= limits.max_model_name_bytes.
     model_name: []const u8,
@@ -162,7 +165,7 @@ pub const Config = struct {
     cache: prefix_manager.CacheConfig = .{},
     /// The think block of the model. The default holds no tags, so a turn never opens a block.
     think: Think = .{},
-    /// The sampling for a turn inside the think block. See "Card sampling" in the header.
+    /// The sampling for a turn inside the think block.
     recommended_think: protocol.Sampling = protocol.Sampling.greedy,
     /// The sampling for a turn outside the think block.
     recommended_plain: protocol.Sampling = protocol.Sampling.greedy,
@@ -234,7 +237,7 @@ const SlotState = enum { free, idle, prefill, decode };
 /// and an `append` of kept pairs sample nothing. They return the slot to idle with one reply.
 const PrefillKind = enum { turn, opening, append };
 
-/// The session table over `Engine` and `CodecT`. See "Engine boundary" in the header.
+/// The session table over `Engine` and `CodecT`.
 pub fn Scheduler(comptime Engine: type, comptime CodecT: type) type {
     return struct {
         const Self = @This();
@@ -345,7 +348,7 @@ pub fn Scheduler(comptime Engine: type, comptime CodecT: type) type {
         codec: *const CodecT,
         cfg: Config,
         slots: []Slot,
-        /// One id set per slot. See "Id sets" in the header.
+        /// One id set per slot.
         presence: []u64,
         context: []u64,
         set_words: usize,
@@ -602,7 +605,7 @@ pub fn Scheduler(comptime Engine: type, comptime CodecT: type) type {
 
         /// Stop the server: cancel every turn, log the stats, and acknowledge.
         fn handleShutdown(self: *Self, req: Request, sink: anytype) HandleResult {
-            // Connection 0 is the process owner. See "Shutdown" in the header.
+            // Connection 0 is the process owner.
             if (!self.cfg.allow_shutdown and req.conn != 0) {
                 self.refuseNoSession(req, sink, .forbidden, "shutdown not allowed");
                 return .ok;
@@ -996,10 +999,10 @@ pub fn Scheduler(comptime Engine: type, comptime CodecT: type) type {
             var i: u16 = 0;
             // One pass per pair. The decoder bounds the count.
             while (it.next()) |pair| : (i += 1) {
-                const place = turnPlace(slot.has_system_prompt, slot.turns_done + i);
+                const order = turnOrder(slot.has_system_prompt, slot.turns_done + i);
                 const toks = self.codec.pairTokens(
                     self.gpa,
-                    place,
+                    order,
                     pair.user,
                     pair.assistant,
                 ) catch |err| {
@@ -1140,7 +1143,7 @@ pub fn Scheduler(comptime Engine: type, comptime CodecT: type) type {
                 return;
             }
 
-            // A natural stop keeps its reason. See "Stop rules" in the header.
+            // A natural stop keeps its reason.
             if (slot.stop == null) {
                 log.info("stop: session {d} cancelled (decode state)", .{slot.proto_id});
                 slot.stop = .cancelled;
@@ -1643,7 +1646,7 @@ pub fn Scheduler(comptime Engine: type, comptime CodecT: type) type {
                     std.debug.assert(slot.stop == null);
                 }
 
-                // A natural stop keeps its reason. See "Stop rules" in the header.
+                // A natural stop keeps its reason.
                 if (slot.stop == null) {
                     slot.stop = .cancelled;
                 }
@@ -1741,7 +1744,7 @@ pub fn Scheduler(comptime Engine: type, comptime CodecT: type) type {
                 rows.engineIds(),
                 rows.tokensOut(),
             ) catch |err| {
-                // The tiers are over-subscribed: park this turn. See "Parked turns" in the header.
+                // The tiers are over-subscribed: park this turn.
                 if (isParkError(err)) {
                     // A failed call of decode rows alone needs no retry: it is the same call.
                     const f = feeding orelse return self.parkDecodeRows(rows.n);
@@ -1857,7 +1860,7 @@ pub fn Scheduler(comptime Engine: type, comptime CodecT: type) type {
         }
 
         /// The errors that park a turn. The CPU pool and the test fakes cannot return some of
-        /// them, so a compare with such an error is statically false and its arm compiles away.
+        /// them, so a compare with such an error is statically false and its prong compiles away.
         inline fn isParkError(err: anytype) bool {
             return err == error.NoEvictableSlot or err == error.RamBudgetExceeded;
         }
@@ -2090,7 +2093,7 @@ pub fn Scheduler(comptime Engine: type, comptime CodecT: type) type {
                 slot.t_turn_start = Io.Clock.Timestamp.now(self.io, .awake);
             }
 
-            // An append takes no prefix. See "Prefix cache" in the header.
+            // An append takes no prefix.
             if (kind == .append) return;
 
             if (comptime can_snapshot) {
@@ -2108,7 +2111,7 @@ pub fn Scheduler(comptime Engine: type, comptime CodecT: type) type {
         }
 
         /// Prefix-cache admission for a turn that starts at position zero: restore the prefix that
-        /// the manager offers and prefill only the suffix. See "Prefix cache" in the header.
+        /// the manager offers and prefill only the suffix.
         fn tryRestorePrefix(self: *Self, slot: *Slot, sink: anytype) void {
             if (!self.prefix.enabled()) return;
             if (self.engine.posOf(slot.engine_id) != 0) return;
@@ -2491,21 +2494,21 @@ pub fn slotSetBytes(vocab_size: u32) u64 {
 
 // -- helpers ----------------------------------------------------------------
 
-/// The place of a turn at index `turns_done`. The first turn of a session
+/// The order of a turn at index `turns_done`. The first turn of a session
 /// takes the first-turn wrap, after a system prompt or with BOS. Later turns
 /// continue. A kept pair takes the place of the turn that it replays.
-fn turnPlace(has_system_prompt: bool, turns_done: u32) chat.PairPlace {
+fn turnOrder(has_system_prompt: bool, turns_done: u32) chat.PairOrder {
     if (turns_done > 0) return .continuation;
     return if (has_system_prompt) .first_after_system else .open_first;
 }
 
 /// The wrap of a live turn at index `turns_done`.
 fn turnKind(has_system_prompt: bool, turns_done: u32) event.TurnKind {
-    return kindOfPlace(turnPlace(has_system_prompt, turns_done));
+    return kindOfOrder(turnOrder(has_system_prompt, turns_done));
 }
 
-fn kindOfPlace(place: chat.PairPlace) event.TurnKind {
-    return switch (place) {
+fn kindOfOrder(order: chat.PairOrder) event.TurnKind {
+    return switch (order) {
         .open_first => .open_first,
         .first_after_system => .first_after_system,
         .continuation => .continuation,
@@ -2605,7 +2608,7 @@ fn systemTooLongDetail(buf: *[detail_max]u8, tokens: usize, window: u32) []const
 // `NoSnapScheduler` is the other side of the `can_snapshot` gate. `Sessions(RunnerT).can_snapshot`
 // reads `@hasDecl(RunnerT, "evictSlot")`, so a runner without the swap surface compiles every
 // prefix-cache path away. `NoSnapRunner` is `TestRunner` minus that surface. Its test is the one
-// instantiation that analyzes the guarded arms.
+// instantiation that analyzes the guarded prongs.
 
 const Sessions = session_mod.Sessions;
 const Residency = @import("residency.zig").Residency;
@@ -2620,7 +2623,7 @@ const TestRunner = struct {
     logits: []f32,
     rows_log: [256]StepRow = undefined,
     rows_log_len: usize = 0,
-    // One marker per physical slot. See "Test fixtures" below.
+    // One marker per physical slot.
     markers: [limits.max_vram_slots]u32 = .{0} ** limits.max_vram_slots,
     evicts: u32 = 0,
     restores: u32 = 0,
@@ -2761,12 +2764,12 @@ const FakeCodec = struct {
     pub fn pairTokens(
         self: *const FakeCodec,
         gpa: Allocator,
-        place: chat.PairPlace,
+        order: chat.PairOrder,
         user: []const u8,
         assistant: []const u8,
     ) ![]u32 {
         if (self.kinds) |k| {
-            k.add(kindOfPlace(place));
+            k.add(kindOfOrder(order));
         }
 
         const ids = try gpa.alloc(u32, user.len + assistant.len);
@@ -5014,6 +5017,8 @@ test "context set: a budget-forced id counts, the echo does not" {
 fn checkContextRecount(_: void, seed: u64) anyerror!void {
     var prng = std.Random.DefaultPrng.init(seed);
     const r = prng.random();
+
+    // Open a session with a random system prompt.
     var fx = try Fixture.setUp(std.testing.allocator, 2, 64, null);
     defer fx.tearDown();
 
@@ -5031,6 +5036,8 @@ fn checkContextRecount(_: void, seed: u64) anyerror!void {
     }
 
     try std.testing.expectEqual(want, setWord(fx.sched.contextOf(slot)));
+
+    // Run random turns and recount the context after each.
     for (0..5) |_| {
         const from = fx.sink.n;
         const msg = text[0 .. 1 + r.uintLessThan(usize, text.len)];
@@ -5148,6 +5155,7 @@ fn checkLease(c: LeaseCase) !void {
     var fx = try leaseFixture(c.n_slots, c.share);
     defer fx.tearDown();
 
+    // Replay the steps and check each effect.
     for (c.steps) |step| {
         switch (step) {
             .open => |s| try std.testing.expectEqual(s.sid, try fx.openSession(s.conn, "")),
@@ -5172,6 +5180,8 @@ fn checkLease(c: LeaseCase) !void {
             .detach => |s| fx.sched.detachConn(s.conn, atMs(s.at)),
             .expire => |at| fx.sched.expireDetached(atMs(at)),
             .pin => |at| fx.sched.pinClock(atMs(at)),
+
+            // Resume a detached lease.
             .resumed => |s| {
                 const r = try fx.sched.resumeLease(
                     s.conn,
@@ -5200,6 +5210,8 @@ fn checkLease(c: LeaseCase) !void {
                     );
                 }
             },
+
+            // Check the routes, the views, and the counters.
             .route => |s| {
                 const want: ?*TestScheduler.Slot = if (s.slot) |i| &fx.sched.slots[i] else null;
                 try std.testing.expectEqual(want, fx.sched.slotByProto(s.sid, s.conn));
@@ -6016,9 +6028,15 @@ test "lease: a token that a slot already holds is refused in every build mode" {
 }
 
 /// `TestEngine` with a switch that refuses each create and clone, as a full pool or tiered KV can.
+/// Two more switches fail `advance`: one for a call that carries a prefill chunk, one for a call
+/// of decode rows alone.
 const RefusingEngine = struct {
     inner: TestEngine,
     refuse: bool = false,
+    fail_with_feed: ?AdvanceFail = null,
+    fail_decode_only: ?AdvanceFail = null,
+
+    const AdvanceFail = enum { park, other };
 
     pub const can_clone = true;
 
@@ -6071,6 +6089,14 @@ const RefusingEngine = struct {
         ids: []const u32,
         out: []u32,
     ) !?u32 {
+        const scripted = if (feed_chunk != null) self.fail_with_feed else self.fail_decode_only;
+        if (scripted) |fail| {
+            return switch (fail) {
+                .park => error.NoEvictableSlot,
+                .other => error.AdvanceBroken,
+            };
+        }
+
         return self.inner.advance(feed_chunk, ids, out);
     }
 };
@@ -6136,6 +6162,131 @@ const RefusingFixture = struct {
         } }, self.sink);
     }
 };
+
+/// Open one session on `fx` and run the open to its reply.
+fn parkOpen(fx: *RefusingFixture, conn: u32) !u32 {
+    try fx.open(conn);
+    while (fx.sched.tick(fx.sink) != .idle) {}
+
+    const ev = fx.sink.last().ev;
+    try std.testing.expectEqual(OutEvent.Body.session_opened, std.meta.activeTag(ev.body));
+    return ev.session_id;
+}
+
+fn parkGenerate(fx: *RefusingFixture, conn: u32, sid: u32, text: []const u8, max: u32) !void {
+    const dup = try std.testing.allocator.dupe(u8, text);
+    _ = fx.sched.handle(.{ .conn = conn, .request_id = 9, .session_id = sid, .body = .{
+        .generate = .{ .max_tokens = max, .sampling = null, .text = dup },
+    } }, fx.sink);
+}
+
+test "park: decode rows alone that the engine parks report no work and change nothing" {
+    var fx = try RefusingFixture.setUp(2);
+    defer fx.tearDown();
+
+    const sid = try parkOpen(&fx, 1);
+    try parkGenerate(&fx, 1, sid, "x", 4);
+    try std.testing.expectEqual(Tick.worked, fx.sched.tick(fx.sink)); // prefill and first token
+
+    const tokens_before = countTokens(fx.sink.seen(), sid);
+    const events_before = fx.sink.n;
+    const pos_before = fx.engine.posOf(0);
+    try std.testing.expect(tokens_before >= 1 and tokens_before < 4);
+
+    // The tiers refuse the decode call. Each tick parks and reports no work, so the engine loop
+    // sleeps and does not spin.
+    fx.engine.fail_decode_only = .park;
+    const parks_before = fx.sched.parks;
+    for (0..3) |_| {
+        try std.testing.expectEqual(Tick.idle, fx.sched.tick(fx.sink));
+    }
+
+    try std.testing.expectEqual(parks_before + 3, fx.sched.parks);
+    try std.testing.expectEqual(events_before, fx.sink.n);
+    try std.testing.expectEqual(pos_before, fx.engine.posOf(0));
+
+    // A later credit lets the same turn finish with the whole stream.
+    fx.engine.fail_decode_only = null;
+    var iters: u32 = 0;
+    while (fx.sched.tick(fx.sink) != .idle) {
+        iters += 1;
+        try std.testing.expect(iters <= 50);
+    }
+
+    const toks = tokenIds(fx.sink.seen(), sid);
+    try std.testing.expectEqualSlices(u32, &.{ 1, 2, 3, 4 }, toks[0..4]);
+}
+
+test "park: a parked prefill whose decode retry parks too reports no work" {
+    var fx = try RefusingFixture.setUp(2);
+    defer fx.tearDown();
+
+    const sa = try parkOpen(&fx, 1);
+    const sb = try parkOpen(&fx, 2);
+    try parkGenerate(&fx, 1, sa, "x", 6);
+    try std.testing.expectEqual(Tick.worked, fx.sched.tick(fx.sink)); // a decodes
+    try parkGenerate(&fx, 2, sb, "xxxx", 6); // b prefills beside a
+
+    const events_before = fx.sink.n;
+    const parks_before = fx.sched.parks;
+    fx.engine.fail_with_feed = .park;
+    fx.engine.fail_decode_only = .park;
+    try std.testing.expectEqual(Tick.idle, fx.sched.tick(fx.sink));
+
+    // Both calls were refused and both are counted. Nothing reached a stream.
+    try std.testing.expectEqual(parks_before + 2, fx.sched.parks);
+    try std.testing.expectEqual(events_before, fx.sink.n);
+
+    fx.engine.fail_with_feed = null;
+    fx.engine.fail_decode_only = null;
+    var iters: u32 = 0;
+    while (fx.sched.tick(fx.sink) != .idle) {
+        iters += 1;
+        try std.testing.expect(iters <= 100);
+    }
+
+    const toks_a = tokenIds(fx.sink.seen(), sa);
+    const toks_b = tokenIds(fx.sink.seen(), sb);
+    try std.testing.expectEqualSlices(u32, &.{ 1, 2, 3, 4, 5, 6 }, toks_a[0..6]);
+    try std.testing.expectEqualSlices(u32, &.{ 1, 2, 3, 4, 5, 6 }, toks_b[0..6]);
+}
+
+test "park: a parked prefill whose decode retry fails otherwise fails only the decode rows" {
+    var fx = try RefusingFixture.setUp(2);
+    defer fx.tearDown();
+
+    const sa = try parkOpen(&fx, 1);
+    const sb = try parkOpen(&fx, 2);
+    try parkGenerate(&fx, 1, sa, "x", 6);
+    try std.testing.expectEqual(Tick.worked, fx.sched.tick(fx.sink)); // a decodes
+    try parkGenerate(&fx, 2, sb, "xxxx", 6);
+
+    fx.engine.fail_with_feed = .park;
+    fx.engine.fail_decode_only = .other;
+    try std.testing.expectEqual(Tick.worked, fx.sched.tick(fx.sink));
+
+    // The decode row of a fails with an error event. The prefill of b stays parked.
+    const last = fx.sink.last();
+    try std.testing.expectEqual(sa, last.ev.session_id);
+    try std.testing.expectEqual(protocol.ErrorCode.internal, last.ev.body.err.code);
+
+    fx.engine.fail_with_feed = null;
+    fx.engine.fail_decode_only = null;
+    var iters: u32 = 0;
+    while (fx.sched.tick(fx.sink) != .idle) {
+        iters += 1;
+        try std.testing.expect(iters <= 100);
+    }
+
+    // The turn of b streams in full and carries no error.
+    const toks_b = tokenIds(fx.sink.seen(), sb);
+    try std.testing.expectEqualSlices(u32, &.{ 1, 2, 3, 4, 5, 6 }, toks_b[0..6]);
+    for (fx.sink.seen()) |e| {
+        if (e.ev.session_id == sb) {
+            try std.testing.expect(e.ev.body != .err);
+        }
+    }
+}
 
 test "lease: an open that the engine refuses after a yield reports the lost session" {
     var fx = try RefusingFixture.setUp(1);

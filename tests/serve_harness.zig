@@ -1,5 +1,8 @@
 //! The shared boot for the serve tests, not a test itself.
 //!
+//! Comptime. `HarnessFor` builds one harness type per runner, so each runner family shares one
+//! boot.
+//!
 //! Boot. A harness loads the SmolLM2 fixture, builds the CPU `LlamaRunner` and its session pool,
 //! and starts an in-process binary server. `QwenHarness` does the same with the CPU `QwenRunner`
 //! over the Qwen fixture.

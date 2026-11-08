@@ -3,6 +3,8 @@
 //! buffers, and the per-call row bookkeeping. Every numerical op it calls (`ops.*`) is pure and
 //! writes into a slice the runner owns.
 //!
+//! Comptime. `core_log.hot` removes the trace code, and `use_vulkan_ops` picks the Vulkan kernels.
+//!
 //! Backend. `-Dops-backend=naive|simd|simd_pf|vulkan|auto` binds the op backend at build time. The
 //! default `auto` picks the strongest eligible CPU variant. The runner imports the resolved
 //! variant module and calls it directly, so the hot path has no dispatch. The `vulkan` backend
@@ -578,7 +580,7 @@ pub const LlamaRunner = struct {
         for (rows, 0..) |r, i| {
             const t_len: usize = @intCast(r.pos + 1);
             if (comptime build_options.use_vulkan_ops) {
-                // Flag resolution refuses every dtype but f32 on this build arm,
+                // Flag resolution refuses every dtype but f32 on this build,
                 // because `wrap.attentionSingle` uploads the slab as f32.
                 std.debug.assert(self.kv_dtype == .f32);
 

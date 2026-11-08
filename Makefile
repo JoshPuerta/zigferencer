@@ -1,6 +1,6 @@
 # zigferencer: short names for the common flows, and the one entry for CI.
 #
-# `zig build` is the build system of record. A target here earns its place by one of three reasons:
+# `zig build` is the build system of record. A target is if:
 # it joins commands, it fixes a default that a bare `zig build` gets wrong (Debug in a measurement),
 # or it is the documented entry of a flow. make echoes each command before it runs, so you can copy
 # the exact `zig build` or `zigferencer` line. `make help` lists the targets and the variables.
@@ -27,7 +27,7 @@ FILTER  ?=
 
 DEV      := zig-out/bin/zigferencer-dev
 CROSS    := x86_64-windows-gnu x86_64-macos aarch64-macos
-GPU_ARMS := vulkan_fused vulkan simd
+GPU_BACKENDS := vulkan_fused vulkan simd
 TEST_RUN := --test-timeout 120s --summary all
 CONFIG    = $(strip -Dops-backend=$(BACKEND) $(FLAGS))
 
@@ -51,7 +51,7 @@ test: ## Run the unit and integration tests and the format check in ReleaseSafe
 fmt: ## Format the sources. zig fmt prints each file it changes
 	$(ZIG) fmt src tests tools build.zig build.zig.zon
 
-check-targets: ## Type-check the CPU arms: default, naive, Windows, and macOS
+check-targets: ## Type-check the CPU: default, naive, Windows, and macOS
 	$(ZIG) build check -Dops-backend=naive $(FLAGS)
 	for t in native $(CROSS); do $(ZIG) build check -Dtarget=$$t $(FLAGS); done
 
@@ -60,7 +60,7 @@ ci: check-targets test ## Run the CPU part of CI. It needs no GPU and no model f
 	$(ZIG) build test-unit bench-build simd-probe $(FLAGS) $(TEST_RUN)
 
 ci-gpu: ## Compile every GPU path and run none. It needs glslc and libvulkan-dev, not a GPU
-	for b in $(GPU_ARMS); do $(ZIG) build test-build bench-build install dev -Druntime=vulkan \
+	for b in $(GPU_BACKENDS); do $(ZIG) build test-build bench-build install dev -Druntime=vulkan \
 	  -Dops-backend=$$b --prefix zig-out/ci-gpu/$$b; done
 
 clean: ## Remove .zig-cache and zig-out

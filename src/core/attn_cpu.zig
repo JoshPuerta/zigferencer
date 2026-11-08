@@ -1,5 +1,7 @@
 //! The geometry of CPU attention. The module is pure: no allocation, no threads, and no I/O.
 //!
+//! Comptime. Asserts keep `tileCount` inside 32 bits and the test walk past one tile.
+//!
 //! Parts. A row of `t_len` positions splits into tiles of `limits.attn_cpu_tile` positions. The
 //! tiles group into `min(limits.attn_cpu_parts, tiles)` contiguous parts. Part `p` of `c` parts
 //! owns the tiles `[p * n / c, (p + 1) * n / c)` of the `n` tiles. The part count never passes the
@@ -189,7 +191,7 @@ fn nextTestLen(t_len: u32) u32 {
     return next;
 }
 
-test "tileCount and partCount: one tile up to T positions, one part per tile up to P tiles, then P parts" {
+test "tileCount and partCount: one tile per T positions, one part per tile, at most P parts" {
     try testing.expectEqual(@as(u32, 1), tileCount(1));
     try testing.expectEqual(@as(u32, 1), partCount(1));
     try testing.expectEqual(@as(u32, 1), tileCount(T));
@@ -204,7 +206,7 @@ test "tileCount and partCount: one tile up to T positions, one part per tile up 
     try testing.expectEqual(P, partCount(limits.max_model_ctx));
 }
 
-test "partRange: the parts of every walked row up to 40 tiles are non-empty, contiguous, and balanced, and they cover the row" {
+test "partRange: up to 40 tiles the parts are non-empty, balanced, and cover the row in order" {
     var tiles_seen = [_]bool{false} ** (test_tiles + 1);
     var t_len: u32 = 1;
     var prev_len: u32 = 0;
@@ -266,7 +268,7 @@ test "partRange: every position of a walked row lies in exactly one part" {
     }
 }
 
-test "recordOffset: every head, part, and element of a small box gets its own element below partialLen" {
+test "recordOffset: every element of a small box gets its own offset below partialLen" {
     var n_heads: u32 = 1;
     while (n_heads <= 3) : (n_heads += 1) {
         var head_dim: u32 = 1;
@@ -319,23 +321,26 @@ test "recordOffset: every head, part, and element of a small box gets its own el
 test "anchors: the tiles, the parts, and the records at T = 2048 and P = 16" {
     try testing.expectEqual(@as(u32, 2048), T);
     try testing.expectEqual(@as(u32, 16), P);
-    const Anchor = struct { t_len: u32, tiles: u32, parts: u32, first: Part, last: Part };
+    // The first part starts at 0, and the last part ends at `t_len`.
+    const Anchor = struct { t_len: u32, tiles: u32, parts: u32, first_hi: u32, last_lo: u32 };
     const anchors = [_]Anchor{
-        .{ .t_len = 1, .tiles = 1, .parts = 1, .first = .{ .t_lo = 0, .t_hi = 1 }, .last = .{ .t_lo = 0, .t_hi = 1 } },
-        .{ .t_len = 2048, .tiles = 1, .parts = 1, .first = .{ .t_lo = 0, .t_hi = 2048 }, .last = .{ .t_lo = 0, .t_hi = 2048 } },
-        .{ .t_len = 2049, .tiles = 2, .parts = 2, .first = .{ .t_lo = 0, .t_hi = 2048 }, .last = .{ .t_lo = 2048, .t_hi = 2049 } },
-        .{ .t_len = 4000, .tiles = 2, .parts = 2, .first = .{ .t_lo = 0, .t_hi = 2048 }, .last = .{ .t_lo = 2048, .t_hi = 4000 } },
-        .{ .t_len = 4032, .tiles = 2, .parts = 2, .first = .{ .t_lo = 0, .t_hi = 2048 }, .last = .{ .t_lo = 2048, .t_hi = 4032 } },
-        .{ .t_len = 8064, .tiles = 4, .parts = 4, .first = .{ .t_lo = 0, .t_hi = 2048 }, .last = .{ .t_lo = 6144, .t_hi = 8064 } },
+        .{ .t_len = 1, .tiles = 1, .parts = 1, .first_hi = 1, .last_lo = 0 },
+        .{ .t_len = 2048, .tiles = 1, .parts = 1, .first_hi = 2048, .last_lo = 0 },
+        .{ .t_len = 2049, .tiles = 2, .parts = 2, .first_hi = 2048, .last_lo = 2048 },
+        .{ .t_len = 4000, .tiles = 2, .parts = 2, .first_hi = 2048, .last_lo = 2048 },
+        .{ .t_len = 4032, .tiles = 2, .parts = 2, .first_hi = 2048, .last_lo = 2048 },
+        .{ .t_len = 8064, .tiles = 4, .parts = 4, .first_hi = 2048, .last_lo = 6144 },
         // Seventeen tiles over sixteen parts: the last part holds two tiles.
-        .{ .t_len = 32_769, .tiles = 17, .parts = 16, .first = .{ .t_lo = 0, .t_hi = 2048 }, .last = .{ .t_lo = 30_720, .t_hi = 32_769 } },
-        .{ .t_len = 262_144, .tiles = 128, .parts = 16, .first = .{ .t_lo = 0, .t_hi = 16_384 }, .last = .{ .t_lo = 245_760, .t_hi = 262_144 } },
+        .{ .t_len = 32_769, .tiles = 17, .parts = 16, .first_hi = 2048, .last_lo = 30_720 },
+        .{ .t_len = 262_144, .tiles = 128, .parts = 16, .first_hi = 16_384, .last_lo = 245_760 },
     };
     for (anchors) |a| {
         try testing.expectEqual(a.tiles, tileCount(a.t_len));
         try testing.expectEqual(a.parts, partCount(a.t_len));
-        try testing.expectEqual(a.first, partRange(a.t_len, 0));
-        try testing.expectEqual(a.last, partRange(a.t_len, a.parts - 1));
+        const first: Part = .{ .t_lo = 0, .t_hi = a.first_hi };
+        const last: Part = .{ .t_lo = a.last_lo, .t_hi = a.t_len };
+        try testing.expectEqual(first, partRange(a.t_len, 0));
+        try testing.expectEqual(last, partRange(a.t_len, a.parts - 1));
     }
 
     // Qwen3.5-2B: 8 query heads of 256.

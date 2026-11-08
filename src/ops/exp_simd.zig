@@ -51,7 +51,7 @@ pub const Vec = @Vector(lanes, f32);
 // -- api --------------------------------------------------------------------
 
 /// `exp(x)` in each lane, for `x <= 0`. No NaN arrives.
-/// The result is within `exp_ulp_tol` ulps of the f64 `exp`. See "Method" in the header.
+/// The result is within `exp_ulp_tol` ulps of the f64 `exp`.
 pub inline fn expNeg(x: Vec) Vec {
     const Int = @Vector(lanes, i32);
     const log2e: Vec = @splat(std.math.log2e);
@@ -158,7 +158,7 @@ test "vector exp: expNeg stays inside the ulp bound from the cut to 0" {
     try std.testing.expect(worst <= exp_ulp_tol);
 }
 
-test "vector exp: 0 and -0 give exactly 1, the cut stays normal, and every input under the cut gives 0" {
+test "vector exp: 0 and -0 give 1, the cut stays normal, and every input under the cut gives 0" {
     const cut_bits: u32 = @bitCast(exp_cut);
     const above: f32 = @bitCast(cut_bits - 1);
     const below: f32 = @bitCast(cut_bits + 1);

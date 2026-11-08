@@ -3,6 +3,9 @@
 //! frame head, and the commands of the NULL handshake and the heartbeat. ZMTP integers are
 //! big-endian, unlike the little-endian `protocol.zig` frames that the message frames carry.
 //!
+//! Comptime. `take` and `put` are generic over the integer type, and `paddedReady` sizes its
+//! buffer at compile time.
+//!
 //! Greeting. Each peer opens with 64 bytes:
 //!
 //!     off  len  field      rule
@@ -34,10 +37,10 @@
 //! Properties. Names compare without regard to letter case, and a decode skips an unknown
 //! property. A command with another name decodes to `.other`.
 //!
-//! Trust boundary. This module is pure. It imports no I/O and it allocates nothing. Decoded
-//! commands borrow their slices from the body, and the caller copies what it keeps. Every decode
-//! checks every length and returns a typed error. The socket is a trust boundary, so a decode
-//! never panics on input.
+//! Trust boundary. This module opens no socket and it allocates nothing. Its one read takes a
+//! reader from the caller. Decoded commands borrow their slices from the body, and the caller
+//! copies what it keeps. Every decode checks every length and returns a typed error. The socket is
+//! a trust boundary, so a decode never panics on input.
 
 const std = @import("std");
 const protocol = @import("protocol.zig");
@@ -78,7 +81,7 @@ const flag_long: u8 = 0x02;
 const flag_command: u8 = 0x04;
 const flags_reserved: u8 = 0xF8;
 const short_head_bytes: usize = 2;
-const long_head_bytes: usize = 9;
+pub const long_head_bytes: usize = 9;
 const short_size_max: u64 = std.math.maxInt(u8);
 
 const command_ready = "READY";
@@ -254,6 +257,16 @@ pub fn decodeFrameHead(bytes: []const u8) Error!FrameHead {
     if (head.command and head.more) return error.Malformed;
 
     return head;
+}
+
+/// Reads the flags byte, then the rest of the head that the flags announce.
+pub fn readFrameHead(r: *std.Io.Reader) (std.Io.Reader.Error || Error)!FrameHead {
+    var head: [long_head_bytes]u8 = undefined;
+    head[0] = try r.takeByte();
+    const n = headLen(head[0]);
+    std.debug.assert(n <= long_head_bytes);
+    try r.readSliceAll(head[1..n]);
+    return decodeFrameHead(head[0..n]);
 }
 
 /// Writes the head of a frame with a body of `size` bytes and returns the head length.
@@ -488,6 +501,22 @@ test "frame head round trip at the short and long boundaries" {
 
     const long_small = [_]u8{ flag_long, 0, 0, 0, 0, 0, 0, 0, 5 };
     try std.testing.expectEqual(@as(u64, 5), (try decodeFrameHead(&long_small)).size);
+}
+
+test "readFrameHead: the flags byte sets the head length, and a cut head is an error" {
+    const Case = struct { wire: []const u8, want: (std.Io.Reader.Error || Error)!u64 };
+    const cases = [_]Case{
+        .{ .wire = &.{ 0x00, 5 }, .want = 5 },
+        .{ .wire = &.{ flag_long, 0, 0, 0, 0, 0, 0, 1, 0 }, .want = 256 },
+        .{ .wire = &.{0x00}, .want = error.EndOfStream },
+        .{ .wire = &.{ flag_long, 0, 0 }, .want = error.EndOfStream },
+        .{ .wire = &.{ 0x80, 5 }, .want = error.Malformed },
+    };
+    for (cases) |c| {
+        var reader: std.Io.Reader = .fixed(c.wire);
+        const got = if (readFrameHead(&reader)) |head| head.size else |err| err;
+        try std.testing.expectEqual(c.want, got);
+    }
 }
 
 test "frame head guards: reserved bits, command with MORE, short buffer" {

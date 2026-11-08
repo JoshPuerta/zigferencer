@@ -1,13 +1,16 @@
 //! The transport-agnostic serve engine: one engine thread around the scheduler, a bounded request
 //! queue in, a bounded out-queue per connection, and the connection-slot lifecycle. It owns all
-//! serve-layer state and knows no wire format. A comptime `Adapter` supplies the per-connection
-//! task model: how many tasks a connection runs, and how they map wire bytes to and from the
+//! serve-layer state and knows no wire format. An `Adapter` supplies the per-connection task
+//! model: how many tasks a connection runs, and how they map wire bytes to and from the
 //! `Request` and `OutEvent` values. `serve/server.zig` is the binary adapter, and
 //! `serve/openai/http_server.zig` is the HTTP one. Both are thin maps onto this engine.
 //!
 //!     acceptor --accept--> Adapter.onAccept(conn) --decode--> request_queue
 //!                                                                  |
 //!     conn[i] task(s) <--encode-- out_queue[i] <--emit-- ENGINE LOOP (run)
+//!
+//! Comptime. Generic over the engine, the codec, and the adapter, so each transport builds its own
+//! engine type.
 //!
 //! Bounds. `Config.max_connections` live connections (at most `limits.max_connections`), one
 //! `request_queue_capacity` request queue, and one `out_queue_capacity` event queue per
@@ -56,7 +59,7 @@ const conn_free: u8 = 0;
 const conn_live: u8 = 1;
 const conn_reclaimable: u8 = 2;
 
-// The actor that closes the socket of a connection. See "Socket close" in the header.
+// The actor that closes the socket of a connection.
 const fin_live: u8 = 0;
 const fin_task: u8 = 1;
 const fin_teardown: u8 = 2;
@@ -298,7 +301,7 @@ pub fn ServeEngine(comptime Engine: type, comptime CodecT: type, comptime Adapte
         }
 
         /// Teardown claims the socket of a connection so it can shut it down to wake a blocked
-        /// task. Returns true only if the last task has not claimed it. See "Socket close".
+        /// task. Returns true only if the last task has not claimed it.
         pub fn claimStreamForTeardown(self: *Self, conn: *Conn) bool {
             _ = self;
             return conn.fin.cmpxchgStrong(fin_live, fin_teardown, .acq_rel, .acquire) == null;

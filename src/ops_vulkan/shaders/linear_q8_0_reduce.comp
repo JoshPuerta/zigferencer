@@ -48,9 +48,8 @@
 // Numerics
 //   Tolerance: `LinearQ80Reduce` declares `.relative = 2e-4`. f32 add is not associative, so the
 //   output drifts from the CPU reference even under `precise`. No `precise` marks the inner chain,
-//   so the device compiler can fuse `in_v * scale * q + partial` into an FMA, about 33% fewer
-//   cycles per inner element. The reduce in lane 0 is the irreducible source of the error, and the
-//   measured relative error stays well under 2e-4. A lane adds blk and i ascending, and lane 0 adds
+//   so the device compiler can fuse `in_v * scale * q + partial` into an FMA. The reduce in lane 0
+//   is the irreducible source of the error. A lane adds blk and i ascending, and lane 0 adds
 //   L ascending. This order differs from the CPU reference, but it is stable, which the hash gate
 //   needs. The bench prints the variants side by side, so its tolerance column shows the drift.
 //

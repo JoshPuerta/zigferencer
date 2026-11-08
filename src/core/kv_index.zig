@@ -1,6 +1,8 @@
 //! The index algebra of the device KV cache. The module is pure: no allocation, no device, and no
 //! I/O.
 //!
+//! Comptime. An assert pins the widest layout the bounds admit inside a `u64`.
+//!
 //! Regions. The cache holds one region per layer and tensor. Region `t * n_layers + layer` holds
 //! the rows of every slot in row-major order: slot, then position, then element.
 //!

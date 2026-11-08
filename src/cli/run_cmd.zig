@@ -1,7 +1,19 @@
-//! `zigferencer run <pub_name> --prompt "..." --max-tokens N`: the full pipeline.
-//! Load the model, build the vocab and the runner of its family, prefill the prompt,
-//! and stream the decoded text to stdout. Decoding is greedy, so the output is
-//! deterministic. `--chat` wraps the prompt with the chat template of the model.
+//! `zigferencer run <pub_name> --prompt "..." --max-tokens N`: the full pipeline. Load the model,
+//! build the vocab and the runner of its family, prefill the prompt, and stream the decoded text to
+//! stdout. Decoding is greedy, so the output is deterministic. `--chat` wraps the prompt with the
+//! chat template of the model.
+//!
+//! Comptime. `inline else` turns the architecture into a family row once, so the rest is generic.
+//!
+//! Placement. No `--gpu-layers` flag runs the whole-model fused path. A zero pin runs the CPU
+//! runner with no device context. A pin of one layer or more, or auto, prices a split. A split with
+//! no GPU layer comes back to the CPU runner.
+//!
+//! Prompt cache. `--prompt-cache` applies to the whole-model qwen35 fused path only. A scripted
+//! flag on another placement warns and runs without it.
+//!
+//! Prefill. A runner without `chunked_prefill` prefills token by token, which keeps the token
+//! hashes of the per-op GPU runners.
 
 const std = @import("std");
 const Io = std.Io;
@@ -12,7 +24,7 @@ const context = @import("context.zig");
 const args = @import("args.zig");
 const flags_mod = @import("flag_groups.zig");
 const select = @import("select.zig");
-const boot_facts = @import("boot/boot_facts.zig");
+const boot_resources = @import("boot/boot_resources.zig");
 const boot_lines = @import("boot/boot_lines.zig");
 const family = @import("../engine/family.zig");
 const resolve_mod = @import("../engine/resolve.zig");
@@ -42,7 +54,7 @@ const per_op_build = build_options.use_vulkan_ops;
 const vulkan_ops_wrap = if (per_op_build) @import("../ops_vulkan/wrap.zig") else void;
 const vulkan_ctx_mod = if (fused_build) @import("../runtime/vulkan_ctx.zig") else void;
 
-const device_arm = resolve_mod.device_arm;
+const device_placement = resolve_mod.device_placement;
 const PromptCache = prompt_cache_mod.PromptCache;
 
 // -- constants --------------------------------------------------------------
@@ -52,8 +64,7 @@ const legend_text_max = 128;
 
 // -- types ------------------------------------------------------------------
 
-/// The per-token effect of `run`: detokenize the id and stream the piece. This
-/// sink never prints EOS, because EOS is a boundary marker, not text.
+/// The per-token effect of `run`: detokenize the id and stream the piece. EOS is not text.
 const StreamSink = struct {
     out: *Io.Writer,
     v: *vocab_mod.Vocab,
@@ -74,8 +85,7 @@ const Flags = struct {
     prompt: []const u8 = "Hello",
     max_tokens: u32 = 32,
     chat: bool = false,
-    /// A hit restores the snapshot of the prompt and skips prefill. A miss keeps
-    /// the end-of-prompt boundary, on disk too, for a later process.
+    /// A hit skips prefill. A miss keeps the end-of-prompt snapshot, on disk too.
     prompt_cache: bool = false,
     engine: flags_mod.EngineFlags = .{},
 
@@ -99,8 +109,8 @@ const Flags = struct {
         .chat = args.Doc{ .text = "apply the chat template of the model" },
         .prompt_cache = args.Doc{
             .group = "gpu (fused-GPU build only)",
-            .text = "reuse a cached prompt to skip prefill. Persist on miss\n" ++
-                "(qwen35 fused. Cache dir $ZIGFERENCER_CACHE_DIR)",
+            .text = "reuse a cached prompt to skip prefill. Persist on miss\n(qwen35 fused. " ++
+                "Cache dir $ZIGFERENCER_CACHE_DIR)",
         },
         .thinking = args.Doc{
             .group = "thinking (qwen35)",
@@ -118,15 +128,14 @@ const Boot = struct {
     model: *const registry.Model,
     loaded: *const loader.Loaded,
     resolved: *const resolve_mod.Resolved,
-    device: boot_facts.DeviceBoot,
+    device: boot_resources.DeviceBoot,
 
     fn kvDtype(self: *const Boot) dtype.KvDtype {
         return self.resolved.early.kv_dtype;
     }
 };
 
-/// One turn: the boot, the prompt ids, and where the text goes. The ids carry the
-/// chat scaffolding, and `boot.flags.prompt` is the text the turn echoes.
+/// One turn: the boot, the prompt ids, and where the text goes. The ids carry the chat scaffolding.
 const Turn = struct {
     boot: *const Boot,
     pool: *Pool,
@@ -152,32 +161,32 @@ pub fn run(ctx: context.Context) !void {
         return args.fail(ctx.io, "--thinking requires --chat", .{});
     }
 
-    // The whole-model fused runner runs no CPU op, so its pool starts no
-    // workers. A pin of any layer count can run CPU layers.
+    // Resolve the thread policy. The whole-model fused runner starts no workers.
     const runs_cpu_ops = !fused_build or flags.engine.gpu_layers != null;
     const thread_flags = flags.engine.threads.policyFlags();
-    const policy = try boot_facts.resolvePolicy(ctx.io, thread_flags, runs_cpu_ops);
+    const policy = try boot_resources.resolvePolicy(ctx.io, thread_flags, runs_cpu_ops);
 
+    // Pick the model, and refuse what needs no file.
     const model = try select.model(ctx, flags.pub_name);
     const input: resolve_mod.Input = .{
         .engine = flags.engine,
         .prompt_cache = flags.prompt_cache,
     };
-    const entry = boot_facts.entryOf(model);
+    const entry = boot_resources.entryOf(model);
 
-    // Every refusal that needs no model file lands here, before the load.
     switch (resolve_mod.early(.run, input, entry)) {
         .ok => {},
         .refused => |r| return boot_lines.refuse(ctx.io, model.pub_name, r),
     }
 
+    // Load the file, and resolve again. A device placement needs its context to state the device.
     const path = try registry.resolveLoadPath(ctx.arena, ctx.io, ctx.models_root, model.*);
     var loaded = try loader.load(ctx.io, ctx.arena, path);
     defer loaded.close();
 
-    // A device arm resolves again once its context states the device.
-    const resolved = try boot_facts.resolveLoaded(ctx, .run, input, entry, &loaded);
+    const resolved = try boot_resources.resolveLoaded(ctx, .run, input, entry, &loaded);
 
+    // Hand the boot to the family of the architecture.
     const boot: Boot = .{
         .ctx = ctx,
         .flags = &flags,
@@ -195,9 +204,7 @@ pub fn run(ctx: context.Context) !void {
 
 // -- helpers: selection -----------------------------------------------------
 
-/// Tokenize the prompt, then pick the placement. No flag runs the whole-model fused
-/// path. A zero pin runs the CPU runner with no device context. A pin of one layer
-/// or more, or auto, prices a split, and a split with no GPU layer comes back here.
+/// Tokenize the prompt, then pick the placement.
 fn runFamily(comptime Family: type, b: *const Boot) !void {
     const ctx = b.ctx;
     const gpu_layers = b.flags.engine.gpu_layers;
@@ -205,11 +212,12 @@ fn runFamily(comptime Family: type, b: *const Boot) !void {
     logBackendLegend();
     warnPromptCache(Family, b.flags);
 
-    // One pool serves every CPU op of the command.
+    // Start the one pool that serves every CPU op.
     var pool: Pool = undefined;
     try parallel.initPool(&pool, ctx.io, b.policy);
     defer pool.deinit();
 
+    // Tokenize the prompt.
     var v = try vocab_mod.buildFromParsed(ctx.arena, b.loaded.parsed);
     const prompt_ids = try promptIds(b, &v);
 
@@ -223,15 +231,16 @@ fn runFamily(comptime Family: type, b: *const Boot) !void {
         .prompt_ids = prompt_ids,
     };
 
+    // Run the placement, and fall back to the host runner.
     var host = b.resolved.cpu;
     if (comptime fused_build) {
         const layers = gpu_layers orelse return runFused(Family, &turn);
         if (layers.isZeroCount()) {
             log.info("--gpu-layers 0: the {s} CPU runner decodes every layer", .{Family.name});
         } else {
-            switch (try runPlaced(Family, &turn, layers.pin())) {
+            switch (try attemptDevice(Family, &turn, layers.pin())) {
                 .done => return,
-                .all_host => |arm| host = arm,
+                .all_host => |placement| host = placement,
             }
         }
     }
@@ -239,8 +248,7 @@ fn runFamily(comptime Family: type, b: *const Boot) !void {
     return runHost(Family, &turn, host);
 }
 
-/// A scripted `--prompt-cache` on a build that ignores it must not look like it
-/// worked. A pin of one layer or more, or auto, warns once the split resolves.
+/// Warn when `--prompt-cache` has no effect, so a scripted flag does not look like it worked.
 fn warnPromptCache(comptime Family: type, flags: *const Flags) void {
     if (!flags.prompt_cache) return;
 
@@ -251,8 +259,7 @@ fn warnPromptCache(comptime Family: type, flags: *const Flags) void {
     }
 }
 
-/// The token ids of the turn. With `--chat` the text wraps with the template of
-/// the model in the resolved thinking mode.
+/// The token ids of the turn. With `--chat` the text wraps in the template of the model.
 fn promptIds(b: *const Boot, v: *vocab_mod.Vocab) ![]const u32 {
     const arena = b.ctx.arena;
     const prompt = b.flags.prompt;
@@ -273,18 +280,18 @@ fn promptIds(b: *const Boot, v: *vocab_mod.Vocab) ![]const u32 {
 
 // -- helpers: placements ----------------------------------------------------
 
-/// The CPU runner, over the mmap weights and the host KV slab. Every GPU arm
-/// returned before this, so the per-op backend starts its process-wide runner
-/// here, and the weight uploads stay up for the whole decode.
+/// The CPU runner, over the mmap weights and the host KV slab. The per-op backend starts its
+/// process-wide runner here, and its weight uploads stay up for the whole decode.
 fn runHost(
     comptime Family: type,
     t: *const Turn,
-    arm: ?resolve_mod.Result(resolve_mod.CpuArm),
+    placement: ?resolve_mod.Result(resolve_mod.HostPlacement),
 ) !void {
     const b = t.boot;
     const ctx = b.ctx;
     const window = b.resolved.window;
 
+    // Plan the KV and log the placement.
     const plan = if (comptime Family.run_logs_every_placement)
         logHostPlan(b)
     else
@@ -292,10 +299,9 @@ fn runHost(
 
     std.debug.assert(plan.window == window.base);
 
+    // Start the per-op backend, and quote the RAM.
     if (comptime per_op_build) {
-        try vulkan_ops_wrap.initBackend(ctx.arena, .{
-            .storage_range_override = ctx.vk_storage_range,
-        });
+        try vulkan_ops_wrap.initBackend(ctx.arena, ctx.vk_options);
     }
 
     defer if (comptime per_op_build) {
@@ -306,9 +312,9 @@ fn runHost(
         boot_lines.logSessionWindow(window);
     }
 
-    try hostQuote(b, arm);
+    try hostQuote(b, placement);
 
-    // One prompt chunk of slot 0 is the most rows a step holds.
+    // Build the runner. One prompt chunk of slot 0 is the most rows a step holds.
     const t_init = Io.Clock.Timestamp.now(ctx.io, .awake);
     var runner = try Family.Cpu.init(
         ctx.arena,
@@ -331,10 +337,10 @@ fn runFused(comptime Family: type, t: *const Turn) !void {
     const io = b.ctx.io;
 
     const t_init = logFusedInit(io);
-    const ctxp = try boot_facts.openDevice(b.ctx);
+    const ctxp = try boot_resources.openDevice(b.ctx);
     defer ctxp.deinit();
 
-    const f = try boot_facts.fusedOn(io, &b.device, ctxp);
+    const f = try boot_resources.fusedOn(io, &b.device, ctxp);
     return runFusedOn(Family, t, ctxp, f, t_init);
 }
 
@@ -343,7 +349,7 @@ fn runFusedOn(
     comptime Family: type,
     t: *const Turn,
     ctxp: *vulkan_ctx_mod.Context,
-    f: device_arm.Fused,
+    f: device_placement.Fused,
     t_init: Io.Clock.Timestamp,
 ) !void {
     const b = t.boot;
@@ -352,7 +358,7 @@ fn runFusedOn(
 
     _ = try boot_lines.logFused(ctx.io, b.model.pub_name, f, true, false, kv_dtype);
     if (f.report) |report| {
-        logPlacement(report);
+        logLayerSplit(report);
     }
 
     const runner = try Family.initFused(ctx.gpa, ctxp, b.loaded, f.plan, kv_dtype);
@@ -365,50 +371,50 @@ fn runFusedOn(
     return prefillAndStream(runner, t);
 }
 
-/// `--gpu-layers N > 0`, or auto at a null `pin`. Open the device and resolve the
-/// split on it, then run the runner the split selects. An auto split with no GPU
-/// layer releases the device and returns `.all_host` with the host arm.
-fn runPlaced(comptime Family: type, t: *const Turn, pin: ?u32) !boot_facts.Placed {
+/// `--gpu-layers N > 0`, or auto at a null `pin`. Resolve the split on the device, then run it.
+/// An auto split with no GPU layer releases the device and returns `.all_host`.
+fn attemptDevice(comptime Family: type, t: *const Turn, pin: ?u32) !boot_resources.DeviceAttempt {
     const b = t.boot;
     const ctx = b.ctx;
     const name = b.model.pub_name;
     const n_layers = b.loaded.card.n_layers;
 
+    // Open the device and resolve the split.
     try refusePastModel(ctx, pin, n_layers);
 
-    const ctxp = try boot_facts.openDevice(ctx);
+    const ctxp = try boot_resources.openDevice(ctx);
     defer ctxp.deinit();
 
     const dev = try b.device.resolveOn(ctx.io, ctxp);
-    const placed = dev.placed.?;
-    if (placed.clamp) |c| {
+    const layer_choice = dev.layer_choice.?;
+    if (layer_choice.clamp) |c| {
         boot_lines.logClamp(c);
     }
 
-    if (placed.split) |split| {
+    if (layer_choice.layer_split) |split| {
         if (comptime !Family.run_logs_every_placement) {
-            logPlacement(split);
+            logLayerSplit(split);
         }
 
         if (pin == null) {
-            boot_lines.logAutoSplit(split.split, n_layers);
+            boot_lines.logAutoSplit(split.host_layers, n_layers);
         }
     }
 
-    const arm = switch (dev.arm) {
-        .ok => |a| a,
+    // Run the placement that the split selects.
+    const placement = switch (dev.placement) {
+        .ok => |v| v,
         .refused => |r| return boot_lines.refuse(ctx.io, name, r),
     };
 
-    if (arm == .fused) {
+    if (placement == .fused) {
         // The split funds the whole model. The clamp logged, so it does not repeat.
         const t_init = logFusedInit(ctx.io);
-        try runFusedOn(Family, t, ctxp, arm.fused, t_init);
+        try runFusedOn(Family, t, ctxp, placement.fused, t_init);
         return .done;
     }
 
-    // The prompt cache keys on a whole-model fused snapshot, so a split blob
-    // restores the wrong bytes.
+    // The prompt cache keys on a whole-model fused snapshot, so a split blob restores wrong bytes.
     if (comptime Family.prompt_cache) {
         if (b.flags.prompt_cache) {
             log.warn("--prompt-cache applies to the whole-model qwen35 fused path. " ++
@@ -416,7 +422,7 @@ fn runPlaced(comptime Family: type, t: *const Turn, pin: ?u32) !boot_facts.Place
         }
     }
 
-    switch (arm) {
+    switch (placement) {
         .fused => unreachable,
         .cpu => |c| {
             log.info("--gpu-layers auto: the {s} CPU runner decodes every layer", .{Family.name});
@@ -429,13 +435,12 @@ fn runPlaced(comptime Family: type, t: *const Turn, pin: ?u32) !boot_facts.Place
     }
 }
 
-/// The hybrid runner at a resolved split. A placement prices its KV at the window
-/// the device limits leave, so the hybrid runs it unchanged.
+/// The hybrid runner at a resolved split. The placement already prices the KV at the window.
 fn runHybrid(
     comptime Family: type,
     t: *const Turn,
     ctxp: *vulkan_ctx_mod.Context,
-    h: device_arm.Hybrid,
+    h: device_placement.Hybrid,
 ) !void {
     const b = t.boot;
     const ctx = b.ctx;
@@ -445,23 +450,25 @@ fn runHybrid(
         .refused => |r| return boot_lines.refuse(ctx.io, b.model.pub_name, r),
     }
 
-    const placement = h.plan.?;
+    // Log the placement.
+    const layer_split = h.plan.?;
     if (comptime Family.run_logs_every_placement) {
-        logPlacement(placement);
+        logLayerSplit(layer_split);
     }
 
     boot_lines.logSessionWindow(h.window);
 
+    // Build the hybrid runner.
     log.info("initializing GPU: context + suffix weight upload to VRAM...", .{});
     const t_init = Io.Clock.Timestamp.now(ctx.io, .awake);
-    var ledger_buffer: [kv_budget.placement_ledger_text_max]u8 = undefined;
-    log.info("{s}", .{kv_budget.formatLedger(placement, &ledger_buffer)});
+    var ledger_buffer: [kv_budget.layer_split_ledger_text_max]u8 = undefined;
+    log.info("{s}", .{kv_budget.formatLedger(layer_split, &ledger_buffer)});
 
     const hybrid = try Family.Hybrid.init(
         ctx.gpa,
         ctxp,
         b.loaded,
-        placement,
+        layer_split,
         ctx.io,
         t.pool,
         b.policy,
@@ -474,37 +481,42 @@ fn runHybrid(
     return prefillAndStream(hybrid, t);
 }
 
-/// The placement line and the window line of the host plan, and the plan. The host
-/// holds no device budget, so the base window stands.
+/// Log the placement and the window of the host plan, and return the plan. The base window stands.
 fn logHostPlan(b: *const Boot) kv_budget.KvPlan {
     const window = b.resolved.window;
     const host = resolve_mod.runHost(b.loaded.card, b.device.model, b.kvDtype(), window);
-    logPlacement(host.report.?);
+    logLayerSplit(host.report.?);
     boot_lines.logSessionWindow(window);
     return host.plan;
 }
 
-/// The RAM quote line of the all-host arm, or its refusal. A per-op vulkan boot
-/// resolved a device arm, so it resolves the host arm here.
-fn hostQuote(b: *const Boot, arm: ?resolve_mod.Result(resolve_mod.CpuArm)) !void {
+/// Log the RAM quote of the all-host placement, or refuse. A per-op vulkan boot resolves the
+/// placement here.
+fn hostQuote(b: *const Boot, placement: ?resolve_mod.Result(resolve_mod.HostPlacement)) !void {
     const io = b.ctx.io;
     const boot = &b.device;
-    const facts: resolve_mod.Facts = .{ .ram_free = boot.ramFree(io), .model = boot.model };
+    const resources: resolve_mod.Resources = .{ .ram_free = boot.ramFree(io), .model = boot.model };
 
-    const result = arm orelse
-        resolve_mod.cpuArm(.run, boot.input, boot.card, b.kvDtype(), b.resolved.window, facts);
+    const result = placement orelse
+        resolve_mod.hostPlacement(
+            .run,
+            boot.input,
+            boot.card,
+            b.kvDtype(),
+            b.resolved.window,
+            resources,
+        );
     switch (result) {
-        .ok => |a| boot_lines.logRamQuote(a.quote, false),
+        .ok => |host| boot_lines.logRamQuote(host.quote, false),
         .refused => |r| return boot_lines.refuse(io, boot.entry.pub_name, r),
     }
 }
 
-/// A pin past the layer count of the model needs no device, so it refuses
-/// before the context opens.
+/// Refuse a pin past the layer count before the device opens.
 fn refusePastModel(ctx: context.Context, pin: ?u32, n_layers: u32) error{UsageError}!void {
     const n_gpu = pin orelse return;
 
-    // The zero pin took the CPU arm, so a pin here names a real GPU suffix.
+    // The zero pin took the CPU placement, so a pin here names a real GPU suffix.
     std.debug.assert(n_gpu >= 1);
     if (n_gpu > n_layers) {
         const fmt = "--gpu-layers {d} exceeds the model's {d} layers";
@@ -518,11 +530,10 @@ fn logFusedInit(io: Io) Io.Clock.Timestamp {
     return Io.Clock.Timestamp.now(io, .awake);
 }
 
-/// Log one placement in span form. The buffer holds the widest span the layer
-/// limit allows.
-fn logPlacement(placement: kv_budget.PlacementPlan) void {
-    var buffer: [kv_budget.placement_text_max]u8 = undefined;
-    log.info("{s}", .{kv_budget.formatPlacement(placement, &buffer)});
+/// Log one layer split in span form.
+fn logLayerSplit(split: kv_budget.LayerSplit) void {
+    var buffer: [kv_budget.layer_split_text_max]u8 = undefined;
+    log.info("{s}", .{kv_budget.formatLayerSplit(split, &buffer)});
 }
 
 /// Log the op backends the engine can build, and mark the one in this binary.
@@ -535,14 +546,13 @@ fn logBackendLegend() void {
         n += segment.len;
     }
 
-    log.info("backend:{s}  ([+] active. Rebuild: -Dops-backend=<name> " ++
-        "[+ -Druntime=vulkan for GPU])", .{buffer[0..n]});
+    log.info("backend:{s}  ([+] active. Rebuild: " ++
+        "-Dops-backend=<name> [+ -Druntime=vulkan for GPU])", .{buffer[0..n]});
 }
 
 // -- helpers: the turn ------------------------------------------------------
 
-/// Echo the prompt, prefill it, then decode. A runner without `chunked_prefill`
-/// prefills token by token, which keeps the token hashes of the per-op GPU runners.
+/// Echo the prompt, prefill it, then decode.
 fn prefillAndStream(runner: anytype, t: *const Turn) !void {
     const ids = t.prompt_ids;
     try echoPrompt(t, runner.max_seq);
@@ -559,20 +569,19 @@ fn prefillAndStream(runner: anytype, t: *const Turn) !void {
     return streamDecode(runner, t, prefilled, t_start);
 }
 
-/// `prefillAndStream` with the prompt cache interleaved. A hit restores the
-/// end-of-prompt snapshot and skips prefill. A miss prefills and keeps the snapshot,
-/// on disk too when the `worthwhile` gate of the cache clears.
+/// `prefillAndStream` with the prompt cache. A hit skips prefill. A miss prefills and keeps the
+/// snapshot, on disk too when the `worthwhile` gate of the cache clears.
 fn prefillCachedAndStream(runner: anytype, t: *const Turn) !void {
     const b = t.boot;
     const ctx = b.ctx;
     const ids = t.prompt_ids;
     try echoPrompt(t, runner.max_seq);
 
+    // Open the cache and its disk tier.
     var cache: ?PromptCache = null;
     var cache_key: u64 = 0;
     if (b.flags.prompt_cache) {
-        // The fused runner writes these blobs, so they live in the namespace that
-        // the fused arm of serve reads.
+        // The blobs share the namespace of the fused placement of serve.
         const fp = prompt_cache_mod.backendFingerprint(
             prompt_cache_mod.modelFingerprint(b.model.pub_name, b.loaded.map.bytes().len),
             "vulkan_fused",
@@ -590,6 +599,7 @@ fn prefillCachedAndStream(runner: anytype, t: *const Turn) !void {
 
     defer if (cache) |*c| c.deinit();
 
+    // Restore the snapshot on a hit.
     const t_start = Io.Clock.Timestamp.now(ctx.io, .awake);
     var prefilled: Prefilled = .{ .pos = 0, .last_logits = undefined };
     if (cache) |*c| {
@@ -602,6 +612,7 @@ fn prefillCachedAndStream(runner: anytype, t: *const Turn) !void {
         }
     }
 
+    // Prefill on a miss, and keep the snapshot.
     if (prefilled.pos == 0) {
         const t0 = Io.Clock.Timestamp.now(ctx.io, .awake);
         prefilled = try prefillChunks(runner, ids);
@@ -616,8 +627,7 @@ fn prefillCachedAndStream(runner: anytype, t: *const Turn) !void {
     return streamDecode(runner, t, prefilled, t_start);
 }
 
-/// Snapshot the prefilled prompt into the cache. `t0` starts the prefill the cache
-/// weighs the snapshot against.
+/// Snapshot the prefilled prompt into the cache. `t0` starts the prefill that the cache weighs.
 fn admitPrompt(
     runner: anytype,
     t: *const Turn,
@@ -633,7 +643,7 @@ fn admitPrompt(
     const prefill_ns = time.elapsedNs(t0, Io.Clock.Timestamp.now(ctx.io, .awake));
     const s0 = Io.Clock.Timestamp.now(ctx.io, .awake);
 
-    // The cache copies the snapshot on admit, so the buffer lives for this block only.
+    // The cache copies the snapshot on admit, so the buffer lives here only.
     const blob = try ctx.gpa.alloc(u8, runner.snapshotBytes(prompt_len));
     defer ctx.gpa.free(blob);
 
@@ -691,8 +701,8 @@ fn prefillTokens(runner: anytype, ids: []const u32) !Prefilled {
     return .{ .pos = pos, .last_logits = last_logits };
 }
 
-/// Decode greedily from the prefill, stream each piece, and log TTFT and ITL. The
-/// caller captures `t_start` before prefill, so TTFT holds the latency a reader feels.
+/// Decode greedily from the prefill, stream each piece, and log TTFT and ITL. The caller takes
+/// `t_start` before prefill.
 fn streamDecode(
     runner: anytype,
     t: *const Turn,

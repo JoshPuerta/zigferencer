@@ -1,20 +1,14 @@
-//! Command dispatch: argv to a command handler, the one entry point from `main.zig`.
-//! Each command is a `{ name, summary, handler }` row of a table. `zigferencer` dispatches
-//! `release`, and `zigferencer-dev` dispatches `release` plus the table of
-//! `src/dev/dev_command.zig`. The release binary names the dev commands only as strings, because
-//! its module holds no path to a dev file. The usage screen reads the same `summary`, so help and
-//! dispatch cannot drift.
+//! Command dispatch: argv to a command handler, the entry point from `main.zig`.
 //!
-//! Help-text dialect, the same in every `--help`. `args.helpBody` generates the flag lines:
-//!   - A `summary` is an imperative fragment of 55 characters or less.
-//!   - A `--help` prints `usage:`, one sentence, the flags in groups under short lowercase headers
-//!     (for example tuning, kv, gpu), then `examples:`.
-//!   - A default reads as a trailing `[default: X]`, never as inline prose.
-//!   - One qualifier per flag line.
-//!   - A backend caveat goes in a group header (`gpu (fused-GPU build only)`), not on a line.
-//!   - A shared option keeps one name and one wording, because
-//!     `flag_groups.EngineFlags` and `flag_groups.ServeFlags` declare it once.
-//!   - A flag that the build cannot honor stays listed, and the command rejects it at use.
+//! Comptime. The command tables are comptime parameters, and a check rejects a command name in
+//! both tables.
+//!
+//! Tables. Each command is a `{ name, summary, handler }` row. `zigferencer` dispatches `release`.
+//! `zigferencer-dev` dispatches `release` plus the table of `src/dev/dev_command.zig`. The usage
+//! screen reads the same `summary`, so help and dispatch cannot drift.
+//!
+//! Dev names. The release binary names the dev commands only as strings, because its module holds
+//! no path to a dev file. `dev_command.zig` checks that the strings match its table.
 
 const std = @import("std");
 const Io = std.Io;
@@ -54,18 +48,17 @@ const pad = " " ** 32;
 
 /// The commands of the release binary.
 pub const release = [_]Subcommand{
-    .{ .name = "list", .summary = "List registered models (and which are on disk)", .handler = list_cmd.run },
-    .{ .name = "fetch", .summary = "Download a model (registry name or HF path)", .handler = fetch_cmd.run },
-    .{ .name = "inspect", .summary = "Print a downloaded GGUF's metadata", .handler = inspect_cmd.run },
-    .{ .name = "run", .summary = "Generate text from a prompt (greedy)", .handler = run_cmd.run },
-    .{ .name = "serve", .summary = "Serve sessions over TCP/unix, batched decode", .handler = serve_cmd.run },
-    .{ .name = "serve-openai", .summary = "Serve an OpenAI-compatible HTTP API", .handler = serve_openai_cmd.run },
-    .{ .name = "client", .summary = "Chat with a running server over the binary wire", .handler = client_cmd.run },
-    .{ .name = "info", .summary = "Print the build, host card, and support matrix", .handler = info_cmd.run },
+    row("list", "List registered models (and which are on disk)", list_cmd.run),
+    row("fetch", "Download a model (registry name or HF path)", fetch_cmd.run),
+    row("inspect", "Print a downloaded GGUF's metadata", inspect_cmd.run),
+    row("run", "Generate text from a prompt (greedy)", run_cmd.run),
+    row("serve", "Serve sessions over TCP/unix, batched decode", serve_cmd.run),
+    row("serve-openai", "Serve an OpenAI-compatible HTTP API", serve_openai_cmd.run),
+    row("client", "Chat with a running server over the binary wire", client_cmd.run),
+    row("info", "Print the build, host card, and support matrix", info_cmd.run),
 };
 
-/// The dev command names as strings, for the hint of the release binary. This module cannot read
-/// the dev table, so the list repeats the names. `dev_command.zig` checks the two lists.
+/// The dev command names as strings, for the hint of the release binary.
 pub const dev_names = [_][]const u8{
     "bench-model",
     "bench-serve",
@@ -78,7 +71,7 @@ pub const dev_names = [_][]const u8{
 
 // -- types ------------------------------------------------------------------
 
-// The handlers hold different error sets, and one function-pointer table shares one return type.
+// The handlers hold different error sets, so one function-pointer table needs `anyerror`.
 pub const Handler = *const fn (context.Context) anyerror!void;
 
 pub const Subcommand = struct {
@@ -111,6 +104,7 @@ pub fn dispatchOver(
     comptime table: []const Subcommand,
     comptime binary_name: []const u8,
 ) !void {
+    // Read argv and the color choice.
     const arena = init.arena.allocator();
     const args = try init.minimal.args.toSlice(arena);
     std.debug.assert(args.len >= 1);
@@ -130,12 +124,17 @@ pub fn dispatchOver(
         return;
     }
 
+    // Resolve the environment that every handler reads.
     const models_root = registry.resolveRoot(init.environ_map.get(registry.models_dir_env));
     const cache_dir = prompt_cache.resolveCacheDir(
         init.environ_map.get(prompt_cache.cache_dir_env),
     );
-    const vk_storage_range = try resolveStorageRange(init);
+    const vk_options: limits.DeviceOptions = .{
+        .storage_range_override = try resolveStorageRange(init),
+        .software = try resolveSoftwareDevice(init),
+    };
 
+    // Run the handler that matches the name.
     const sub = args[1];
     for (table) |s| {
         if (std.mem.eql(u8, s.name, sub)) {
@@ -147,14 +146,15 @@ pub fn dispatchOver(
                 .stdout = stdout,
                 .models_root = models_root,
                 .cache_dir = cache_dir,
-                .vk_storage_range = vk_storage_range,
+                .vk_options = vk_options,
                 .color = color,
                 .color_err = color_err,
             });
         }
     }
 
-    // The dev binary holds every dev name, so only the release binary reaches the hint.
+    // Refuse the name. Only the release binary reaches the dev hint, because the dev table holds
+    // every dev name.
     for (dev_names) |name| {
         if (std.mem.eql(u8, name, sub)) {
             printDevCommand(init.io, sub);
@@ -168,6 +168,10 @@ pub fn dispatchOver(
 
 // -- helpers ----------------------------------------------------------------
 
+fn row(comptime name: []const u8, comptime summary: []const u8, handler: Handler) Subcommand {
+    return .{ .name = name, .summary = summary, .handler = handler };
+}
+
 fn resolveStorageRange(init: std.process.Init) !?u64 {
     const text = init.environ_map.get(limits.storage_range_env) orelse return null;
     return limits.parseStorageRange(text) catch |err| {
@@ -176,8 +180,15 @@ fn resolveStorageRange(init: std.process.Init) !?u64 {
     };
 }
 
-// The printers below discard a failed write, like `args.writeStderr`, because the error has
-// nowhere to go.
+fn resolveSoftwareDevice(init: std.process.Init) !bool {
+    const text = init.environ_map.get(limits.software_device_env) orelse return false;
+    return limits.parseSoftwareDevice(text) catch |err| {
+        printBadSoftwareDevice(init.io, text);
+        return err;
+    };
+}
+
+// The printers below discard a failed write, like `args.writeStderr`, because it has nowhere to go.
 fn printUsage(
     io: Io,
     file: Io.File,
@@ -225,14 +236,26 @@ fn nameWidth(comptime table: []const Subcommand) usize {
     return width;
 }
 
+fn printBadSoftwareDevice(io: Io, text: []const u8) void {
+    var stderr_buffer: [error_buffer_bytes]u8 = undefined;
+    var stderr_writer: Io.File.Writer = .initStreaming(.stderr(), io, &stderr_buffer);
+    const w = &stderr_writer.interface;
+
+    w.print(
+        "error: " ++ limits.software_device_env ++ " must be 1 or 0. The value is '{s}'\n",
+        .{text},
+    ) catch return;
+    w.flush() catch {};
+}
+
 fn printBadStorageRange(io: Io, text: []const u8) void {
     var stderr_buffer: [error_buffer_bytes]u8 = undefined;
     var stderr_writer: Io.File.Writer = .initStreaming(.stderr(), io, &stderr_buffer);
     const w = &stderr_writer.interface;
 
     w.print(
-        "error: " ++ limits.storage_range_env ++ " must be a byte count in 1..{d}. The " ++
-            "value is '{s}'\n",
+        "error: " ++ limits.storage_range_env ++ " must be a byte count in 1..{d}. " ++
+            "The value is '{s}'\n",
         .{ limits.storage_range_max, text },
     ) catch return;
     w.flush() catch {};

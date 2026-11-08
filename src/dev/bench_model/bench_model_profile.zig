@@ -3,6 +3,9 @@
 //! prints the breakdown to stderr, because it is a diagnostic and not a result.
 //! The timer compiles into a hot-trace build only. `cpu_profile.ProfileCat` is the
 //! one list of categories, so a new category reaches the table with no edit here.
+//!
+//! Comptime. Generic over the model family and the runner, so every CPU runner shares one timer
+//! body.
 
 const std = @import("std");
 const zigferencer = @import("zigferencer");
@@ -107,6 +110,7 @@ fn reportCpuProfile(
     prompt_len: usize,
     pos_end: u32,
 ) !void {
+    // Derive the serial share and the Amdahl ceiling.
     const model_name = b.model.pub_name;
     const backend = build_options.ops_backend;
     const policy = b.policy;
@@ -118,11 +122,10 @@ fn reportCpuProfile(
     const serial_ns = total - parallel_ns;
     const serial_frac = serial_ns / total;
     const n: f64 = @floatFromInt(@max(policy.n_threads, 1));
-    // The ideal-Amdahl ceiling treats every parallel row as perfectly
-    // parallel. The real ceiling is lower, because the matmuls are
-    // bandwidth-bound.
+    // The ceiling treats every parallel row as perfectly parallel. The matmuls are bandwidth-bound.
     const amdahl = 1.0 / (serial_frac + (1.0 - serial_frac) / n);
 
+    // Print the header lines.
     var stderr_buffer: [stderr_buffer_bytes]u8 = undefined;
     var stderr_writer: Io.File.Writer = .initStreaming(.stderr(), io, &stderr_buffer);
     const w = &stderr_writer.interface;
@@ -139,6 +142,7 @@ fn reportCpuProfile(
         "  {s:<14}{s:>12}{s:>12}{s:>8}  kind\n",
         .{ "category", "ns/step", "ms/step", "%step" },
     );
+    // Print one row per category.
     try w.writeAll("  " ++ "-" ** 54 ++ "\n");
     for (std.enums.values(ProfileCat)) |cat| {
         if (!cat.usedBy(p.family)) continue;
@@ -154,6 +158,7 @@ fn reportCpuProfile(
         });
     }
 
+    // Print the totals and the ceiling.
     try w.writeAll("  " ++ "-" ** 54 ++ "\n");
     try w.print(
         "  {s:<14}{d:>12.0}{d:>12.4}{d:>7.1}%\n",
@@ -164,8 +169,8 @@ fn reportCpuProfile(
         .{ 100.0 * (1.0 - serial_frac), 100.0 * serial_frac },
     );
     try w.print(
-        "  ideal-Amdahl ceiling @ {d} threads: {d:.2}x  (real lower: the matmuls are " ++
-            "bandwidth-bound)\n",
+        "  ideal-Amdahl ceiling @ {d} threads: {d:.2}x  (real lower: " ++
+            "the matmuls are bandwidth-bound)\n",
         .{ policy.n_threads, amdahl },
     );
     try w.flush();

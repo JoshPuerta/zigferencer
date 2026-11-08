@@ -4,6 +4,8 @@
 //! `naive`, the scalar reference. `runQ80` owns the variant table and the eligibility report
 //! that the decode matmul rows share.
 //!
+//! Comptime. `build_options.use_vulkan` gates the GPU code, so a CPU build never reads it.
+//!
 //! Cases. Three hidden-dim scales span the supported model families: 576 (SmolLM2), 2048
 //! (Llama-3.2-1B and Qwen3.5-2B), and 4096 (Llama-3.1-8B and Qwen3.5-9B). Each scale covers a
 //! square (attn_q), a wide-out rectangle (ffn_gate), a wide-in rectangle (ffn_down), and the

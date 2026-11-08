@@ -4,8 +4,8 @@
 //   This is the Q4_0 sibling of `linear_q8_0_reduce.comp`, with the same structure. Only the
 //   dequant changes, from 8-bit bytes to 4-bit nibbles, so the quants buffer is half the size.
 //   That halving is the whole point. Decode is memory-bandwidth-bound, because B = 1 streams the
-//   whole weight once per token. A bandwidth-bound matvec therefore runs close to twice as fast,
-//   and this kernel exists to measure that.
+//   whole weight once per token. A bandwidth-bound matvec therefore runs faster, and this kernel
+//   exists to measure by how much.
 //
 // Math
 //   Here input[blk] is the 32 elements at blk * 32, and blk runs over the k / 32 blocks:

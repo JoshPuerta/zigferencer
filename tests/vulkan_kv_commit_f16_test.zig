@@ -249,7 +249,7 @@ test "kv_commit_f16: a sweep straddles the workgroup boundary" {
 test "kv_commit_f16: overflow leaves the finite range" {
     const n = overflow_cases.len;
 
-    // This test observes and does not gate on equality. See "Overflow" in the header.
+    // This test observes and does not gate on equality.
     var k_src: [n]f32 = undefined;
     for (overflow_cases, 0..) |c, i| {
         k_src[i] = c.v;

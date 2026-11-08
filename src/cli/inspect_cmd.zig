@@ -1,6 +1,6 @@
-//! `zigferencer inspect <pub_name>`: mmap and parse a fetched GGUF, then print its
-//! `ModelCard`, the weight inventory, and a chat-template preview. It shows whether
-//! the loader accepts the file and which values the runner reads.
+//! `zigferencer inspect <pub_name>`: mmap and parse a fetched GGUF, then print its `ModelCard`, the
+//! weight inventory, and a chat-template preview. It shows whether the loader accepts the file and
+//! which values the runner reads.
 
 const std = @import("std");
 const Io = std.Io;
@@ -48,8 +48,8 @@ const Flags = struct {
     pub const docs = .{
         .raw = args.Doc{
             .value = "PATH",
-            .text = "dump every raw KV + tensor straight from the parser, bypassing\nthe " ++
-                "loader, for an architecture the loader does not accept",
+            .text = "dump every raw KV + tensor straight from the parser, bypassing\n" ++
+                "the loader, for an architecture the loader does not accept",
         },
     };
 };
@@ -90,6 +90,7 @@ fn printCard(
     path: []const u8,
     loaded: *const loader.Loaded,
 ) !void {
+    // Print the identity and the file.
     const c = loaded.card;
     try w.print("model:           {s}\n", .{pub_name});
     if (c.name) |n| {
@@ -100,6 +101,7 @@ fn printCard(
     try w.print("file size:       {d} bytes\n", .{loaded.map.bytes().len});
     try w.writeAll("\n");
 
+    // Print the dimensions.
     try w.print("architecture:    {s}\n", .{c.architecture});
     try w.print("layers:          {d}\n", .{c.n_layers});
     try w.print("heads:           {d}  (kv heads: {d})\n", .{ c.n_heads, c.n_kv_heads });
@@ -114,6 +116,7 @@ fn printCard(
     try w.print("bos id:          {d}\n", .{c.bos_token_id});
     try w.print("eos id:          {d}\n", .{c.eos_token_id});
 
+    // Print the Gated-DeltaNet shape of a qwen35 card.
     if (c.gdn) |g| {
         try w.writeAll("\ngated-deltanet (qwen35):\n");
         try w.print("  conv_kernel:     {d}\n", .{g.conv_kernel});
@@ -152,6 +155,7 @@ fn dumpRaw(ctx: context.Context, path: []const u8) !void {
 
     const parsed = try parser.parse(ctx.arena, map.bytes());
 
+    // Print the header.
     const w = &ctx.stdout.interface;
 
     try w.print("file:            {s}\n", .{path});
@@ -160,6 +164,7 @@ fn dumpRaw(ctx: context.Context, path: []const u8) !void {
     try w.print("kv count:        {d}\n", .{parsed.header.kv_count});
     try w.print("tensor count:    {d}\n", .{parsed.header.tensor_count});
 
+    // Print each KV.
     try w.writeAll("\n=== metadata (KV) ===\n");
     for (parsed.kvs) |kv| {
         try w.print("  {s} = ", .{kv.key});
@@ -167,6 +172,7 @@ fn dumpRaw(ctx: context.Context, path: []const u8) !void {
         try w.writeAll("\n");
     }
 
+    // Print each tensor.
     try w.writeAll("\n=== tensors ===\n");
     for (parsed.tensors) |ti| {
         const type_name = std.enums.tagName(dtype.GgmlType, ti.dtype) orelse "unknown";
@@ -185,8 +191,7 @@ fn dumpRaw(ctx: context.Context, path: []const u8) !void {
     try w.flush();
 }
 
-/// One-line preview of a parsed KV value. Big arrays (tokenizer vocab, merges)
-/// print their length only. Small numeric arrays print their elements.
+/// One-line preview of a parsed KV value. A big array prints its length and a few elements.
 fn printValue(w: *std.Io.Writer, v: parser.Value) !void {
     switch (v) {
         .u8_val => |x| try w.print("{d} (u8)", .{x}),
@@ -243,8 +248,8 @@ fn printArray(w: *std.Io.Writer, a: parser.Array) !void {
     }
 }
 
-/// Split a GGUF tensor name `blk.<n>.<role>` into its layer index and role.
-/// Returns null for a model-level tensor such as `token_embd.weight`.
+/// Split a GGUF tensor name `blk.<n>.<role>` into its layer index and role. A model-level tensor
+/// gives null.
 fn parseBlock(name: []const u8) ?BlockRef {
     if (!std.mem.startsWith(u8, name, "blk.")) return null;
 
@@ -254,12 +259,13 @@ fn parseBlock(name: []const u8) ?BlockRef {
     return .{ .layer = layer, .role = rest[dot + 1 ..] };
 }
 
-/// Print the non-layer tensors, then one entry per distinct layer type with the
-/// block indices it covers. Two layers share a type when their sorted tensor roles match.
+/// Print the non-layer tensors, then one entry per distinct layer type with its block indices.
+/// Two layers share a type when their sorted tensor roles match.
 fn printTensorStructure(w: *std.Io.Writer, arena: Allocator, loaded: *const loader.Loaded) !void {
     const tensors = loaded.tensors;
     const n_layers: usize = loaded.card.n_layers;
 
+    // Print the tensors outside the blocks.
     try w.print("tensors:         {d}\n", .{tensors.len});
 
     try w.writeAll("\npre-block weights (embedding):\n");
@@ -267,7 +273,7 @@ fn printTensorStructure(w: *std.Io.Writer, arena: Allocator, loaded: *const load
     try w.writeAll("\npost-block weights (final norm + output head):\n");
     try printGlobals(w, tensors, false);
 
-    // Bucket each block's tensors by layer index.
+    // Bucket each block's tensors by layer index, and sort the roles.
     const per_layer = try arena.alloc(std.ArrayList(RoleRef), n_layers);
     for (per_layer) |*r| {
         r.* = .empty;
@@ -280,17 +286,18 @@ fn printTensorStructure(w: *std.Io.Writer, arena: Allocator, loaded: *const load
         }
     }
 
-    // Sorted roles keep a quantizer that reorders the tensors of a few blocks from splitting a
-    // layer type.
+    // Sorted roles keep a quantizer that reorders a few blocks from splitting a layer type.
     for (per_layer) |*r| {
         std.mem.sort(RoleRef, r.items, {}, roleLess);
     }
 
+    // Sign each layer by its roles.
     const sigs = try arena.alloc([]const u8, n_layers);
     for (0..n_layers) |i| {
         sigs[i] = try signatureOf(arena, per_layer[i].items);
     }
 
+    // Print one entry per layer type.
     try w.writeAll("\nper-layer weights (grouped by layer type):\n");
     const done = try arena.alloc(bool, n_layers);
     @memset(done, false);
@@ -324,8 +331,7 @@ fn printTensorStructure(w: *std.Io.Writer, arena: Allocator, loaded: *const load
     }
 }
 
-/// Print the non-block tensors. `embedding` selects the input side
-/// (`token_embd*`) over the output side (everything else without a `blk.` prefix).
+/// Print the non-block tensors. `embedding` selects the input side (`token_embd*`) over the output.
 fn printGlobals(w: *std.Io.Writer, tensors: []const loader.TensorRef, embedding: bool) !void {
     var n: usize = 0;
     for (tensors) |ref| {

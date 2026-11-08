@@ -1,6 +1,8 @@
 //! The host hardware capabilities relevant to inference: arch and OS strings, CPU model, core
 //! count, total RAM, and a bool-per-feature SIMD card.
 //!
+//! Comptime. `detectSimd` reads only `builtin.cpu`, so it can evaluate at comptime.
+//!
 //! Role. The card is a boundary value, a plain struct with no hidden state. It feeds
 //! `op_requires.isMetByHost`, which `info` uses to label eligible backends, and `info` prints it.
 //!
@@ -16,7 +18,7 @@
 //!     cpuid runs.
 //!   - `/proc/cpuinfo` (Linux, best effort) for the CPU model name.
 //!   - `/proc/meminfo` (Linux) for total RAM, and for the available RAM that
-//!     the hybrid placement check reads.
+//!     the RAM quote reads.
 //!   - `std.Thread.getCpuCount` for online cores.
 
 const std = @import("std");
@@ -149,7 +151,7 @@ pub fn meminfoBytes(text: []const u8, field: []const u8) ?u64 {
 
 // -- helpers ----------------------------------------------------------------
 
-/// Detect a GPU from sysfs and devfs signals. See "GPU detection" in the header.
+/// Detect a GPU from sysfs and devfs signals.
 fn detectGpu(io: Io, arena: Allocator) Gpu {
     if (builtin.os.tag != .linux) return .{ .present = false, .label = "unknown (non-Linux)" };
 

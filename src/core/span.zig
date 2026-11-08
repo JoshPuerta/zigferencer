@@ -1,6 +1,9 @@
 //! The span recorder: a timeline of the engine boundaries for one process,
 //! written as Chrome Trace Event JSON for ui.perfetto.dev.
 //!
+//! Comptime. Asserts pin the sizes of `Span` and `GpuRecord`. `beginHot` accepts only hot names
+//! and compiles out without `-Dtrace`.
+//!
 //! Switches. `$ZIGFERENCER_TRACE_OUT=path` turns the recorder on at startup. A span site then reads
 //! the monotonic clock twice and pushes one `Span` into the ring of its thread. With the recorder
 //! off, a site costs one atomic load and one branch, and it touches no thread-local state.
@@ -39,16 +42,18 @@
 //! Clock. It is `.awake` (`CLOCK_MONOTONIC` on Linux), the clock of `perf record -k mono`, so a
 //! span file and a perf file share one time base. A GPU clock maps to that base only through the
 //! submit and wait points of each record. The device counter is not a stable clock across submits,
-//! so the writer places each record on its own host times (see `place`).
+//! so the writer maps each record to its own host times (see `hostInterval`).
 //!
-//! GPU placement. The true offset of a record, host time minus device time, lies at or below
+//! GPU clock. The true offset of a record, host time minus device time, lies at or below
 //! `host_wait - gpu_end` of that record. A device counter that pauses while the GPU idles only lets
 //! the host clock run ahead, so the offset never falls from one record to a later one. The bound of
 //! a later record therefore bounds this record too, and the minimum over the record and the records
-//! after it comes closest to the true offset. Records arrive in host order within a few places,
-//! because two threads can push in the reverse order of their waits. The forward window and the
-//! clamp absorb that inversion. A clamp moves the record inside `[host_submit, host_wait]` when a
-//! counter breaks that rule, and keeps its duration when it fits.
+//! after it comes closest to the true offset.
+//!
+//! Clamp. Records arrive in host order within a few positions, because two threads can push in
+//! the reverse order of their waits. The forward window and the clamp absorb that inversion. A
+//! clamp moves the record inside `[host_submit, host_wait]` when a counter breaks that rule, and
+//! keeps its duration when it fits.
 //!
 //! Device ticks. A stamp delta wraps at the valid bits of the queue, so `tickSpan` masks each
 //! delta. A masked delta above `mask / 2` is a step back of the counter, not a near-full wrap. It
@@ -202,14 +207,14 @@ pub const GpuRecord = struct {
 };
 
 /// Where one GPU record sits on the host clock, in nanoseconds.
-pub const Placement = struct {
+pub const HostInterval = struct {
     start_ns: i64,
     end_ns: i64,
     /// How far the clamp moved the record into its host window.
     clamp_ns: u64,
 };
 
-/// One fixed ring of spans, written by its owner thread alone. See "Storage" in the header.
+/// One fixed ring of spans, written by its owner thread alone.
 pub const Ring = struct {
     /// Empty until `Recorder.claim` allocates the ring for its thread.
     spans: []Span = &.{},
@@ -379,7 +384,7 @@ const Recorder = struct {
         return r;
     }
 
-    /// Stop the recorder and write the trace and the GPU folded file. See "Flush" in the header.
+    /// Stop the recorder and write the trace and the GPU folded file.
     fn flush(self: *Recorder) Flushed {
         if (self.flushed.cmpxchgStrong(.idle, .writing, .acq_rel, .acquire)) |state| {
             assert(state != .idle);
@@ -502,7 +507,7 @@ const FlushState = enum(u32) { idle, writing, done };
 /// How one `flush` call ended.
 const Flushed = enum { wrote, waited, timed_out };
 
-/// The ring of GPU records. See "GPU ring" in the header.
+/// The ring of GPU records.
 const GpuRing = struct {
     per: u32,
     block: std.atomic.Value(?[*]align(@alignOf(GpuRecord)) u8) = .init(null),
@@ -595,7 +600,7 @@ var on: std.atomic.Value(bool) = .init(false);
 /// The GPU timestamp level. `setFromEnv` sets it before any runner exists.
 var gpu_level: GpuLevel = .off;
 
-/// The process recorder. It is set before `on` turns on and never freed.
+/// The process recorder. It is set before `on` turns on and never freed, so it lives to exit.
 var recorder: ?*Recorder = null;
 
 threadlocal var tl_ring: ?*Ring = null;
@@ -688,8 +693,8 @@ pub fn finish() void {
     _ = r.flush();
 }
 
-/// Place record `i` of `records` on the host clock. See "GPU placement" in the header.
-pub fn place(records: []const GpuRecord, i: usize) Placement {
+/// Map record `i` of `records` on the host clock.
+pub fn hostInterval(records: []const GpuRecord, i: usize) HostInterval {
     assert(i < records.len);
 
     const lo = i;
@@ -707,7 +712,7 @@ pub fn place(records: []const GpuRecord, i: usize) Placement {
     assert(dur >= 0);
     const want = rec.gpuStartNs() + offset;
     const start = std.math.clamp(want, submit, wait - dur);
-    const p: Placement = .{
+    const p: HostInterval = .{
         .start_ns = start,
         .end_ns = start + dur,
         .clamp_ns = @abs(start - want),
@@ -718,7 +723,7 @@ pub fn place(records: []const GpuRecord, i: usize) Placement {
 }
 
 /// Read the start, the end, and the interval deltas of `ts`, the raw stamps of one command buffer
-/// in write order. See "Device ticks" in the header.
+/// in write order.
 pub fn tickSpan(ts: []const u64, mask: u64, deltas: ?[]u64) TickSpan {
     assert(ts.len >= 2);
     assert(mask != 0);
@@ -811,9 +816,9 @@ pub fn writeJson(
         );
     }
 
-    // Write each GPU record at its placement.
+    // Write each GPU record at its interval.
     for (gpu_records, 0..) |rec, i| {
-        const at = place(gpu_records, i);
+        const at = hostInterval(gpu_records, i);
         if (at.clamp_ns > 0) {
             clamps += 1;
         }
@@ -919,8 +924,8 @@ fn setup(gpa: std.mem.Allocator, io: std.Io, env: Env) error{InvalidTraceSpans}!
             gpu_level = level;
         } else {
             log.warn(
-                "ZIGFERENCER_TRACE_GPU={s} is not off, submit, or phases, so GPU timestamps " ++
-                    "stay off",
+                "ZIGFERENCER_TRACE_GPU={s} is not off, submit, or phases, " ++
+                    "so GPU timestamps stay off",
                 .{g},
             );
         }
@@ -934,8 +939,8 @@ fn setup(gpa: std.mem.Allocator, io: std.Io, env: Env) error{InvalidTraceSpans}!
     if (env.seconds) |text| {
         seconds = std.fmt.parseInt(u32, text, 10) catch blk: {
             log.warn(
-                "ZIGFERENCER_TRACE_SECONDS={s} is not a whole number of seconds, so the " ++
-                    "trace runs to exit",
+                "ZIGFERENCER_TRACE_SECONDS={s} is not a whole number of seconds, " ++
+                    "so the trace runs to exit",
                 .{text},
             );
             break :blk null;
@@ -1244,6 +1249,7 @@ const AnchorCase = struct {
 const jitter_max_ns: u64 = 2_000;
 
 fn genAnchor(_: void, random: std.Random, size: u32) AnchorCase {
+    // Pick the case size and the drift mode.
     var c: AnchorCase = .{
         .records = undefined,
         .true_start = undefined,
@@ -1255,6 +1261,8 @@ fn genAnchor(_: void, random: std.Random, size: u32) AnchorCase {
     const rate: i64 = @intCast(random.uintLessThan(u64, 60_000));
     var offset: i64 = @intCast(1_000_000_000 + random.uintLessThan(u64, 1_000_000));
     var gpu_t: u64 = 10_000_000 + random.uintLessThan(u64, 10_000);
+
+    // Generate each record from the drifting clock.
     for (c.records[0..c.n], 0..) |*r, i| {
         const change: i64 = switch (mode) {
             0 => rate,
@@ -1292,12 +1300,12 @@ fn genAnchor(_: void, random: std.Random, size: u32) AnchorCase {
 fn checkAnchor(_: void, c: AnchorCase) anyerror!void {
     const records = c.records[0..c.n];
     for (records, 0..) |rec, i| {
-        const p = place(records, i);
+        const p = hostInterval(records, i);
         // Every record sits inside its host window, at its device duration.
         try testing.expect(p.start_ns >= @as(i64, @intCast(rec.host_submit_ns)));
         try testing.expect(p.end_ns <= @as(i64, @intCast(rec.host_wait_ns)));
         try testing.expect(p.end_ns - p.start_ns == rec.gpuEndNs() - rec.gpuStartNs());
-        // With an offset that never falls, the placement is late by less than the wait jitter.
+        // With an offset that never falls, the interval is late by less than the wait jitter.
         if (c.monotone) {
             const err = p.start_ns - c.true_start[i];
             try testing.expect(err >= 0);

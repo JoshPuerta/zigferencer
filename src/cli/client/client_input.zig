@@ -1,5 +1,7 @@
 //! What the client reads: the stdin lines, the slash commands, and the queue that feeds the
 //! streaming control unit.
+//!
+//! Comptime. An assert keeps a prompt line inside one `generate` frame.
 
 const std = @import("std");
 const Io = std.Io;
@@ -33,8 +35,8 @@ pub const commands_text =
 
 comptime {
     std.debug.assert(line_bytes_max <= std.math.maxInt(u16));
-    // A prompt line fits one `generate` frame, so the client never builds an
-    // oversized frame.
+
+    // A prompt line fits one `generate` frame, so the client never builds an oversized frame.
     std.debug.assert(line_bytes_max <= protocol.generate_text_bytes_max);
 }
 
@@ -77,8 +79,8 @@ pub fn stdinTask(io: Io, queue: *InputQueue) void {
     var reader = Io.File.stdin().readerStreaming(io, &buf);
     const r = &reader.interface;
 
-    // Each pass reads one line. The loop ends at EOF, a read error, a cancel
-    // (seen as a read error), or a closed queue.
+    // Each pass reads one line. The loop ends at EOF, a read error, a cancel (seen as a read
+    // error), or a closed queue.
     while (true) {
         const maybe = r.takeDelimiter('\n') catch |err| switch (err) {
             error.StreamTooLong => {

@@ -3,6 +3,8 @@
 //! descriptor view. The ring knows nothing about weights, layers, or quantization. A segment is
 //! bytes, so any consumer that moves bytes device-ward can drive it.
 //!
+//! Comptime. A build gate stops the compiler when a non-Vulkan build includes this file.
+//!
 //! Fences. This is the only place in the engine that owns fences. Every other Vulkan path submits
 //! with a null fence and blocks on `queueWaitIdle`, so no other path tracks a submission. A ring
 //! cannot submit that way, because its whole point is to leave one upload outstanding. The ring
@@ -33,8 +35,8 @@ const kernels = @import("kernels.zig");
 comptime {
     if (!build_options.use_vulkan) {
         @compileError("ops_vulkan/stream_ring.zig was included in a non-vulkan build. " ++
-            "Either build with -Druntime=vulkan, or fix the caller to gate on " ++
-            "build_options.use_vulkan.");
+            "Either build with -Druntime=vulkan, " ++
+            "or fix the caller to gate on build_options.use_vulkan.");
     }
 }
 
@@ -251,7 +253,7 @@ pub const StreamRing = struct {
     }
 
     /// The uploaded bytes of `slot`, shaped for a descriptor write. The state assert keeps a
-    /// consumer from reading before the fence signals. See "Consumers" in the header.
+    /// consumer from reading before the fence signals.
     pub fn view(self: *const StreamRing, slot: Slot) vk.DescriptorBufferInfo {
         std.debug.assert(self.segment_capacity > 0);
         std.debug.assert(slot < depth);

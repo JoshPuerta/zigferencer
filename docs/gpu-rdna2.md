@@ -44,7 +44,7 @@ This driver path sets most of the limits that the kernels and the planners respe
 | An allocation overhead that runs out of memory before the 16 GB card is full | The VRAM preflight keeps 1/8 of the free VRAM in reserve. A plan of more than about 12.5 GB is not safe. |
 | A device loss under memory pressure, which stays until the virtual machine restarts | Run one large GPU job at a time, with time between runs. `pkill -x 'zigferencer\|zigferencer-dev'` ends a process that stays. |
 | Windows stops a GPU submit that runs longer than its timeout (2 s by default) | A large-model prefill needs a longer `TdrDelay` in the Windows registry. |
-| A GPU timestamp counter that is not a stable clock across submits | The trace places each GPU record by its own host window ([profiling.md](profiling.md)). |
+| A GPU timestamp counter that is not a stable clock across submits | The trace maps each GPU record by its own host window ([profiling.md](profiling.md)). |
 | Host-visible memory at about 30 GB/s over the bus of the virtual machine | The weights, the KV, and the scratch live in device-local memory. |
 | No view of the shader ISA, the registers, or the occupancy, and no hardware counters | Tuning uses measured time only. |
 

@@ -76,7 +76,7 @@ pub fn chunk(
 }
 
 /// The rows a runner needs for its row scratch, before the runner clamps the request to its own
-/// width. See "Scratch" in the header.
+/// width.
 pub fn stepRows(rule: Rule, slots: u32, batch: u32) u32 {
     const prompt_rows: u32 = switch (rule) {
         .spare_rows => 0,

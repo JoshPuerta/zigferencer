@@ -3,6 +3,9 @@
 //! the model weights (Q8_0 plus f32 norms). Init uploads the weights and binds the descriptor sets
 //! once.
 //!
+//! Comptime. A build gate refuses non-Vulkan builds, and `core_log.hot` removes the trace code
+//! from builds without hot tracing.
+//!
 //! KV cache. The cache is a `kernels.KvStore`: [K/V][n_layers] regions of
 //! [slot][max_seq][n_kv_heads*head_dim] of `kv_dtype`. `kv.layout` computes every host offset and
 //! stride. At one slot the bytes are the CPU `KvCache` layout. The single-sequence paths (`step`,
@@ -65,8 +68,7 @@
 //! adjacent and ascending, positions independent otherwise. Weight matmuls run batched. Rope and
 //! attention record single-row dispatches per row, for arbitrary per-row positions. The batch width
 //! can exceed the slot count, because a wide prefill chunk is one slot and many rows. `n_slots`
-//! bounds the slot indices, and `logit_rows_max` bounds the lm_head suffix. See "Compact logits" in
-//! `qwen_fused.zig` for that suffix.
+//! bounds the slot indices, and `logit_rows_max` bounds the lm_head suffix.
 //!
 //! Tiered KV. The serve residency layer (`serve/residency.zig`) spills idle sessions to RAM.
 //! Eviction copies the rows a session wrote, in every region, into a caller-owned blob. A restore
@@ -177,7 +179,7 @@ pub const LlamaFusedRunner = struct {
     embed: *const Tensor,
 
     // `quant` comes from the first attention weight at init. It picks the Q8_0 or the Q4_0 kernel
-    // at every record site. See "Kernel sets" in the header.
+    // at every record site.
     quant: WeightQuant,
     k_linear: kernels.LinearQ80Reduce,
     // Q4_0 decode matmul, used instead of k_linear when quant == .q4_0.
@@ -187,7 +189,7 @@ pub const LlamaFusedRunner = struct {
     k_residual: kernels.ResidualAdd,
     k_attention: kernels.Attention,
     k_rope_multi: kernels.RopeMulti,
-    /// Narrows the commit scratch, only at a non-f32 `kv_dtype`. See "KV commit" in the header.
+    /// Narrows the commit scratch, only at a non-f32 `kv_dtype`.
     k_kv_commit: ?kernels.KvCommitF16,
     /// The one narrowing set: the f32 scratch in, the narrowed scratch out.
     set_kv_commit: vk.DescriptorSet,
@@ -237,7 +239,7 @@ pub const LlamaFusedRunner = struct {
     // Host staging (for token-in / logits-out round trips)
     stage_in: kernels.HostBuffer,
     stage_out: kernels.HostBuffer,
-    // One stream copy per step lands the logits here. See "Logits readback" in the header.
+    // One stream copy per step lands the logits here.
     logits_heap: []f32,
 
     // Descriptor pool + per-call-site descriptor sets (all pre-bound at init)
@@ -267,14 +269,14 @@ pub const LlamaFusedRunner = struct {
     /// Physical KV slots, decoupled from the decode width. A KV budget buys breadth past
     /// `max_batch`.
     n_slots: u32,
-    /// The KV cache. See "KV cache" in the header.
+    /// The KV cache.
     kv: kernels.KvStore,
-    /// The most logits rows of one call. See "Logits readback" in the header.
+    /// The most logits rows of one call.
     logit_rows_max: u32,
-    /// Multi-stream attention kernel. See "Attention sets" in the header.
+    /// Multi-stream attention kernel.
     k_attention_multi: kernels.AttentionMultiStream,
     set_attention_multi: []vk.DescriptorSet, // [n_layers]
-    /// The split attention passes. See "Attention sets" in the header.
+    /// The split attention passes.
     k_attention_split: kernels.AttentionSplit,
     /// The record box of the split rows in flight, sized at the declared context.
     attn_scratch: attn_split.Scratch,
@@ -296,13 +298,13 @@ pub const LlamaFusedRunner = struct {
     // allocates it, so a run that never restores pays nothing.
     kv_swap_stage: kernels.HostBuffer,
 
-    /// Device-to-host staging. See "KV swap stages" in the header.
+    /// Device-to-host staging.
     kv_readback_stage: kernels.HostBuffer,
 
     /// Telemetry only: the DMA and memcpy split of the last evict or restore, for a bench.
     last_swap_split: kernels.SwapSplit,
 
-    /// The chunk of one staged copy. See "KV swap stages" in the header.
+    /// The chunk of one staged copy.
     swap_chunk_bytes: u64 = limits.swap_stage_chunk_bytes,
 
     /// The timestamps of `cmd_buffer`. The profile commands raise it to `phases` for one submit.
@@ -463,7 +465,7 @@ pub const LlamaFusedRunner = struct {
     pub const prefill_rows_max: u32 = 256;
 
     /// The device bytes of the activation scratch: the per-row buffers of `init`,
-    /// `prefill_rows_max` rows each. See "Scratch pricing" in the header.
+    /// `prefill_rows_max` rows each.
     pub fn scratchVramBytes(card: loader.ModelCard, kv_dtype: dtype.KvDtype) u64 {
         const q_dim: u64 = @as(u64, card.n_heads) * card.head_dim;
         const per_step: u64 = @as(u64, card.n_kv_heads) * card.head_dim;
@@ -476,7 +478,7 @@ pub const LlamaFusedRunner = struct {
         return f32_bytes + @as(u64, prefill_rows_max) * 2 * kv_dtype.rowBytes(@intCast(per_step));
     }
 
-    /// The split attention records of this model. See "Scratch pricing" in the header.
+    /// The split attention records of this model.
     pub fn attnSplitScratch(card: loader.ModelCard) attn_split.Scratch {
         return attn_split.Scratch.init(card.n_heads, card.head_dim, card.context_length);
     }
@@ -580,8 +582,7 @@ pub const LlamaFusedRunner = struct {
         const ffn_dim: u32 = @intCast(card.feed_forward_length);
         const vocab_size: u32 = @intCast(card.vocab_size);
 
-        // The window, the slot count, and the decode width arrive resolved. See "Plan sizes" in the
-        // header.
+        // The window, the slot count, and the decode width arrive resolved.
         const n_slots: u32 = plan.n_slots;
         const n_streams: u32 = plan.n_streams;
         const max_seq: u32 = plan.window;
@@ -856,15 +857,17 @@ pub const LlamaFusedRunner = struct {
             self.k_kv_commit = try kernels.KvCommitF16.init(ctx);
         }
 
-        // Reserve the weight arenas. See "Weight arenas" in the header.
+        // Reserve the weight arenas.
         const arena_usage: vk.BufferUsageFlags = .{
             .storage_buffer_bit = true,
             .transfer_dst_bit = true,
         };
-        self.arena_small = try kernels.VramArena.init(ctx, gpa, arena_usage, 256 * 1024 * 1024);
+        const small_bytes = kernels.VramArena.seg_bytes_small;
+        self.arena_small = kernels.VramArena.init(ctx, gpa, arena_usage, small_bytes);
         errdefer self.arena_small.deinit();
 
-        self.arena_quants = try kernels.VramArena.init(ctx, gpa, arena_usage, 1024 * 1024 * 1024);
+        const quants_bytes = kernels.VramArena.seg_bytes_quants;
+        self.arena_quants = kernels.VramArena.init(ctx, gpa, arena_usage, quants_bytes);
         errdefer self.arena_quants.deinit();
 
         // Allocate the logits and the weight views.
@@ -1170,7 +1173,7 @@ pub const LlamaFusedRunner = struct {
     }
 
     /// The two buffers a commit copy list reads: the rope scratch at f32, and the narrowed scratch
-    /// of `recordKvCommit` otherwise. See "KV commit" in the header.
+    /// of `recordKvCommit` otherwise.
     fn kvCommitSrc(self: *const LlamaFusedRunner) struct { k: vk.Buffer, v: vk.Buffer } {
         if (self.kv_dtype == .f32) {
             return .{ .k = self.buf_k_scratch.buffer, .v = self.buf_v_scratch.buffer };
@@ -1180,7 +1183,6 @@ pub const LlamaFusedRunner = struct {
     }
 
     /// Record the narrowing of one layer's `rows` committed rows, and the barrier to the copy list.
-    /// See "KV commit" in the header.
     fn recordKvCommit(self: *LlamaFusedRunner, cb: vk.CommandBuffer, rows: u32) void {
         std.debug.assert(rows >= 1);
         std.debug.assert(rows <= self.prefill_batch_max);
@@ -1347,7 +1349,7 @@ pub const LlamaFusedRunner = struct {
         try self.decode.step(key, key.next(self.max_seq), DecodeRec{ .runner = self }, &self.host);
         const t3 = core_log.now();
 
-        // Stream-copy stage_out into logits_heap once. See "Logits readback" in the header.
+        // Stream-copy stage_out into logits_heap once.
         @memcpy(self.logits_heap, self.stage_out.sliceTyped(f32, self.vocab_size));
         self.host.copy.add(step_stats.nsBetween(t3, core_log.now()));
         return self.logits_heap;
@@ -1393,7 +1395,7 @@ pub const LlamaFusedRunner = struct {
     }
 
     /// Record a batched (prefill or multi-stream) matmul with the kernel matching this model's
-    /// weight quant. B=1 takes the Reduce kernel. See "Matmul kernels" in `qwen_fused.zig`.
+    /// weight quant. B=1 takes the Reduce kernel.
     fn recordBatchMatmul(
         self: *LlamaFusedRunner,
         cb: vk.CommandBuffer,
@@ -1417,8 +1419,8 @@ pub const LlamaFusedRunner = struct {
         }
     }
 
-    /// The attention kit over the attention pipelines of the runner.
-    fn attnKit(self: *LlamaFusedRunner) kernels.AttnKit {
+    /// The attention kernel set over the attention pipelines of the runner.
+    fn attnKernels(self: *LlamaFusedRunner) kernels.AttnKernels {
         return .{
             .single = &self.k_attention,
             .multi = &self.k_attention_multi,
@@ -1544,7 +1546,7 @@ pub const LlamaFusedRunner = struct {
 
             // Run fused attention: (q, k_cache[layer], v_cache[layer], attn_out). A row past one
             // split takes the split shader, through the whole-region set of slot 0.
-            attn_record.record(kernels.AttnKit, self.attnKit(), cb, &attn_plan, .{
+            attn_record.record(kernels.AttnKernels, self.attnKernels(), cb, &attn_plan, .{
                 .shape = attn_shape,
                 .resident = .{ .single = self.set_attention[layer] },
                 .split = self.set_attention_split[layer],
@@ -1696,9 +1698,9 @@ pub const LlamaFusedRunner = struct {
     }
 
     /// Advance a batch of rows, each row a (slot, token, pos) triple over an independent KV slot of
-    /// every region. See "Batched step" in the header.
+    /// every region.
     pub fn stepBatch(self: *LlamaFusedRunner, rows: []const step_row.StepRow) !void {
-        // Validate the shared row rule. See "Batched step" in the header.
+        // Validate the shared row rule.
         const n_logits = try step_row.validateRows(
             rows,
             self.n_slots,
@@ -1747,7 +1749,7 @@ pub const LlamaFusedRunner = struct {
             );
         }
 
-        // Stream-copy stage_out into heap memory. See "Logits readback" in the header. The GPU
+        // Stream-copy stage_out into heap memory. The GPU
         // compacted the want_logits suffix to the front.
         const n_floats = @as(usize, n_logits) * self.vocab_size;
         @memcpy(self.logits[0..n_floats], self.stage_out.sliceTyped(f32, n_floats));
@@ -1921,7 +1923,7 @@ pub const LlamaFusedRunner = struct {
 
             // Attention: single-row dispatches per row, each with its own t_len and KV stream. The
             // copies above committed every row, so each row sees exactly its causal prefix.
-            attn_record.record(kernels.AttnKit, self.attnKit(), cb, &attn_plan, .{
+            attn_record.record(kernels.AttnKernels, self.attnKernels(), cb, &attn_plan, .{
                 .shape = attn_shape,
                 .resident = .{ .multi = self.set_attention_multi[layer] },
                 .split = self.set_attention_split[layer],
@@ -2003,8 +2005,7 @@ pub const LlamaFusedRunner = struct {
             return;
         }
 
-        // Run the final norm over all rows, then lm_head for the want_logits suffix. See "Batched
-        // step" in the header.
+        // Run the final norm over all rows, then lm_head for the want_logits suffix.
         self.k_rmsnorm_batch.recordInto(
             cb,
             self.set_rmsnorm_final,
@@ -2241,7 +2242,7 @@ pub const LlamaFusedRunner = struct {
 
             // Row i attends to [0, start_pos + i]. The resident prefix runs the batch kernel on
             // slot 0. A row past one split reads the whole-region set, as a decode row does.
-            attn_record.recordPrefill(kernels.AttnKit, self.attnKit(), cb, &prefill_plan, .{
+            attn_record.recordPrefill(kernels.AttnKernels, self.attnKernels(), cb, &prefill_plan, .{
                 .shape = prefill_shape,
                 .resident = .{ .batch = self.set_attention[layer] },
                 .split = self.set_attention_split[layer],

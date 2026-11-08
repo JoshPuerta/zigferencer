@@ -3,6 +3,8 @@
 //! against the per-token budget. The bench needs a fused-GPU build, because the swap
 //! is a VRAM to RAM transfer that no CPU engine has.
 //!
+//! Comptime. Generic over the model family and the runner. Build options pick the fused path.
+//!
 //! Two windows answer whether `s` is transfer or fixed overhead: `--budget` off takes
 //! the serve default of the model, and on takes the larger VK_EXT_memory_budget window.
 //! The change in `s` across the slot sizes is the transfer slope.
@@ -15,7 +17,7 @@ const build_options = @import("build_options");
 const context = zigferencer.cli.context;
 const args = zigferencer.cli.args;
 const select = zigferencer.cli.select;
-const boot_facts = zigferencer.cli.boot_facts;
+const boot_resources = zigferencer.cli.boot_resources;
 const boot_lines = zigferencer.cli.boot_lines;
 const family = zigferencer.family;
 const dtype = zigferencer.dtype;
@@ -171,6 +173,7 @@ pub fn run(ctx: context.Context) !void {
 // -- helpers ----------------------------------------------------------------
 
 fn runFused(ctx: context.Context, opt_in: Opt) !void {
+    // Load the model and resolve the KV type.
     const model = try select.model(ctx, opt_in.pub_name);
     const path = try registry.resolveLoadPath(ctx.arena, ctx.io, ctx.models_root, model.*);
     var loaded = try loader.load(ctx.io, ctx.arena, path);
@@ -179,9 +182,10 @@ fn runFused(ctx: context.Context, opt_in: Opt) !void {
     // The KV dtype resolves ahead of every price, plan, and device call, so a
     // refusal costs a GGUF map and nothing more.
     var opt = opt_in;
-    opt.resolved_kv_dtype = boot_facts.kvDtypeFor(opt.kv_dtype, model);
+    opt.resolved_kv_dtype = boot_resources.kvDtypeFor(opt.kv_dtype, model);
 
-    const ctxp = try boot_facts.openDevice(ctx);
+    // Open the device and pick the family.
+    const ctxp = try boot_resources.openDevice(ctx);
     defer ctxp.deinit();
 
     const bench: Bench = .{
@@ -236,8 +240,7 @@ fn benchOne(comptime Family: type, b: *const Bench) !void {
     const w = b.w;
     const pos = opt.pos;
 
-    // The plan fixes the window before the runner allocates, so the refusal of
-    // a depth the window cannot hold costs no VRAM.
+    // Plan the window first, so a refused depth costs no VRAM.
     const plan = try planFor(Family, b);
     const window = plan.window;
     const ticks = decodeTicks(opt.reps);
@@ -249,6 +252,7 @@ fn benchOne(comptime Family: type, b: *const Bench) !void {
         );
     }
 
+    // Print the header and build the runner.
     try w.print("model:    {s}   streams: {d}   pos: {d}   reps: {d}   window: {d} tok ({s})\n", .{
         b.model_name, opt.streams, pos, opt.reps, window, if (opt.budget) "budget" else "default",
     });
@@ -256,21 +260,19 @@ fn benchOne(comptime Family: type, b: *const Bench) !void {
     const runner = try Family.initFused(ctx.gpa, b.ctxp, b.loaded, plan, opt.resolved_kv_dtype);
     defer runner.deinit();
 
-    // The sweep sets the chunk before the first swap, because a stage only grows.
+    // Set the chunk before the first swap, because a stage only grows.
     runner.swap_chunk_bytes = @as(u64, opt.chunk_mib) << 20;
     std.debug.assert(runner.max_seq == window);
     std.debug.assert(pos >= 1);
     std.debug.assert(pos + ticks <= window);
 
-    // The full window sizes the VRAM slot, and the committed rows size the blob a
-    // swap moves.
+    // Size the slot by the full window, and the blob by the committed rows.
     const slot_bytes: usize = @intCast(runner.evictSlotBytesFor(window));
     const blob_bytes: usize = @intCast(runner.evictSlotBytesFor(pos));
     try printSizes(b, slot_bytes, blob_bytes);
     try printProbe(ctx.io, b.ctxp, "start", w);
 
-    // Every slot fills to depth `pos` with a dummy token, and the bench then
-    // measures a decode tick at that depth.
+    // Fill every slot to depth `pos` with a dummy token, then time a decode tick.
     var pool = try Sessions(Runner).init(ctx.arena, runner);
     const ids = try fillSlots(Runner, b, &pool);
     try printProbe(ctx.io, b.ctxp, "fill", w);
@@ -279,6 +281,7 @@ fn benchOne(comptime Family: type, b: *const Bench) !void {
     const t_batch = try timeDecode(Runner, ctx.io, &pool, ids, out, opt.reps);
     const t_one = try timeDecode(Runner, ctx.io, &pool, ids[0..1], out[0..1], opt.reps);
 
+    // Time the swaps and the host copy, and check the chunked copies.
     const blob = try ctx.arena.alloc(u8, blob_bytes);
     const blob2 = try ctx.arena.alloc(u8, blob_bytes);
     const swaps = try timeSwaps(Runner, b, runner, blob);
@@ -300,8 +303,8 @@ fn printSizes(b: *const Bench, slot_bytes: usize, blob_bytes: usize) !void {
     });
     if (b.ctxp.deviceLocalBudget()) |budget| {
         const free = budget.budget -| budget.usage;
-        try w.print("vram:     budget {d:.1} GiB, used {d:.1} GiB, free {d:.1} GiB " ++
-            "-> ~{d} slots fit\n", .{
+        try w.print("vram:     budget {d:.1} GiB, used {d:.1} GiB, " ++
+            "free {d:.1} GiB -> ~{d} slots fit\n", .{
             gib(budget.budget), gib(budget.usage), gib(free), free / @as(u64, slot_bytes),
         });
     } else {
@@ -338,11 +341,13 @@ fn timeSwaps(comptime Runner: type, b: *const Bench, runner: *Runner, blob: []u8
     const reps = b.opt.reps;
     const has_split = comptime hasSwapSplit(Runner);
 
+    // Warm the path.
     for (0..swap_warm_reps) |_| {
         try runner.evictSlot(0, pos, blob);
         try runner.restoreSlot(0, pos, blob);
     }
 
+    // Time each swap, with its parts where the runner splits them.
     const part_reps: u32 = if (has_split) reps else 0;
     const times: SwapTimes = .{
         .evict = try arena.alloc(f64, reps),
@@ -417,6 +422,7 @@ fn printReport(
     const w = b.w;
     const opt = b.opt;
 
+    // Reduce the samples.
     const e_med = median(swaps.evict);
     const e_p99 = pct(swaps.evict, 99);
     const r_med = median(swaps.restore);
@@ -424,25 +430,25 @@ fn printReport(
     const s = e_med + r_med;
     const t = decode.batch;
 
+    // Print the timings.
     try w.print("\ndecode t: batch={d}: {d:.2} ms    batch=1: {d:.2} ms\n", .{
         opt.streams, t, decode.one,
     });
     try w.print("evict :   {d:.2} ms (p99 {d:.2})\n", .{ e_med, e_p99 });
     try w.print("restore:  {d:.2} ms (p99 {d:.2})\n", .{ r_med, r_p99 });
     try w.print("host cpy: {d:.2} ms (the memcpy inside each)\n", .{median(copies)});
-    try w.print("chunked:  {d} chunks of {d} MiB, evict and restore equal one whole-blob " ++
-        "copy byte for byte\n", .{
+    try w.print("chunked:  {d} chunks of {d} MiB, " ++
+        "evict and restore equal one whole-blob copy byte for byte\n", .{
         kv_budget.ChunkWalk.count(blob_bytes, @as(u64, opt.chunk_mib) << 20), opt.chunk_mib,
     });
 
-    // The rate divides by the whole blob, which is what the parts move on the two
-    // fused runners. A hybrid must divide by the device half, because its parts
-    // stage only the suffix layers.
+    // The rate divides by the whole blob. A hybrid must divide by its device half instead.
     if (comptime hasSwapSplit(Runner)) {
         try printParts("e", swaps.evict_dma, swaps.evict_copy, blob_bytes, w);
         try printParts("r", swaps.restore_dma, swaps.restore_copy, blob_bytes, w);
     }
 
+    // Print the implied cost.
     try w.print("s = evict+restore = {d:.2} ms\n", .{s});
     try w.print("\nimplied:  swapped tick t+s = {d:.2} ms   ({d:.1}x a clean tick)\n", .{
         t + s, (t + s) / t,
@@ -613,11 +619,8 @@ fn gib(bytes: u64) f64 {
 // -- tests ------------------------------------------------------------------
 
 test "statusKib: reads the KiB count of the named line only" {
-    const text = "Name:\tzigferencer\n" ++
-        "VmPeak:\t  912345 kB\n" ++
-        "VmRSSX:\t       7 kB\n" ++
-        "VmRSS:\t  654321 kB\n" ++
-        "Threads:\t17\n";
+    const text = "Name:\tzigferencer\nVmPeak:\t  912345 kB\nVmRSSX:\t       7 kB\n" ++
+        "VmRSS:\t  654321 kB\nThreads:\t17\n";
     try std.testing.expectEqual(@as(?u64, 654321), statusKib(text, "VmRSS"));
     try std.testing.expectEqual(@as(?u64, 912345), statusKib(text, "VmPeak"));
     // A line without the kB unit, a missing key, and a key prefix all read as null.

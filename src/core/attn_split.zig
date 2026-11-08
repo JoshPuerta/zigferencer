@@ -1,6 +1,8 @@
 //! The geometry of split-depth GPU attention. The module is pure: no allocation, no device, and no
 //! I/O.
 //!
+//! Comptime. An assert keeps `splitCount` inside 32 bits.
+//!
 //! Splits. A decode or prefill row of `t_len` positions splits its walk into runs of
 //! S = `limits.attn_split_len` positions. Split `j` holds the positions
 //! `[j * S, min((j + 1) * S, t_len))`, so every position lands in one split and no split is empty.
@@ -19,7 +21,7 @@
 //! Planner. It turns the rows of one step into an `AttnPlan`: the resident rows, the split rows,
 //! and the record groups that share the scratch. A group takes its first row, then the next while
 //! (rows in group) * (largest splitCount in group) <= budget. The plan names no backend.
-//! `runtime/attn_record.zig` walks it through the attention kit of the build.
+//! `runtime/attn_record.zig` walks it through the attention kernel set of the build.
 
 const std = @import("std");
 const prop = @import("prop.zig");
@@ -259,10 +261,9 @@ pub fn headDimFits(head_dim: u32) bool {
     return head_dim >= 1 and fits_lds and whole_loads;
 }
 
-/// The workgroups of the GPU split pass that serve one GQA group of `group`
-/// query heads: `ceil(group / attn_split_queries)`. Workgroup c of the group
-/// serves the heads `[c * attn_split_queries, min((c + 1) *
-/// attn_split_queries, group))` of the group.
+/// The workgroups of the GPU split pass that serve one GQA group of `group` query heads:
+/// `ceil(group / attn_split_queries)`. Workgroup c serves the heads
+/// `[c * attn_split_queries, min((c + 1) * attn_split_queries, group))`.
 pub fn queryGroups(group: u32) u32 {
     assert(group >= 1);
 

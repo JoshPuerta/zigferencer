@@ -59,7 +59,7 @@ pub const OpRequires = struct {
     runtime: Runtime = .cpu,
     /// Minimum SIMD level. `.none` means scalar-OK.
     min_simd: SimdLevel = .none,
-    /// True when the variant uses FMA (x86) or fused multiply-add (arm).
+    /// True when the variant uses FMA (x86) or fused multiply-add (ARM).
     needs_fma: bool = false,
     /// Tolerance against `naive`. The default of 1e-3 relative error admits SIMD reordering and
     /// FMA, and it rejects sign swaps, row mis-indexing, and scale decode bugs.
@@ -68,10 +68,9 @@ pub const OpRequires = struct {
 
 // -- api --------------------------------------------------------------------
 
-/// Combine an observed max relative error and a hash-match bit against the
-/// variant's declared tolerance. Returns true only when the variant honors
-/// that tolerance. The bench prints both numbers either way, so a hash-equal
-/// variant under a `.relative` claim is visible as "tighter than promised."
+/// Check an observed max relative error and a hash-match bit against the declared tolerance.
+/// Returns true only when the variant honors it. The bench prints both numbers either way,
+/// so a hash-equal variant under a `.relative` claim reads as "tighter than promised."
 pub fn toleranceSatisfied(tol: Tolerance, max_rel_err: f32, hash_match: bool) bool {
     return switch (tol) {
         .bit_exact => hash_match,

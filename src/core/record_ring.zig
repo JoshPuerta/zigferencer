@@ -1,5 +1,7 @@
 //! The record ring of the decode step: two command buffers, each keyed by the step it holds.
 //!
+//! Comptime. `Slot` and `RecordRing` are generic over the key type.
+//!
 //! Role. While the GPU runs the submitted buffer, the runner records the predicted next step into
 //! the other buffer. The next step then submits that buffer with no record on its critical path.
 //! This file holds the control state alone: no Vulkan, no allocation, no I/O. The fused runners
@@ -47,7 +49,7 @@ pub const RecordOpts = struct {
 };
 
 /// The key of the decode record ring: everything a decode record reads that can change between
-/// two steps. See "Records" in the header.
+/// two steps.
 pub const DecodeKey = struct {
     pos: u32,
     opts: RecordOpts = .{},

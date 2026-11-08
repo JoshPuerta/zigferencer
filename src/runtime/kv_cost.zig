@@ -1,7 +1,7 @@
-//! The KV price of a model card, one entry per layer. The planner splits this vector at a
-//! placement, and the RAM quote prices every serve arm from it. It reads the card alone and touches
-//! no device. A CPU build prices the same figures as a fused-GPU build. Every caller reads the
-//! price here, so no runner states a second price.
+//! The KV price of a model card, one entry per layer. The layer split planner cuts this vector at
+//! the split, and the RAM quote prices every serve placement from it. It reads the card alone and
+//! touches no device. A CPU build prices the same figures as a fused-GPU build. Every caller reads
+//! the price here, so no runner states a second price.
 //!
 //! Layer kinds. A Llama layer holds the same KV and no recurrent state. A Qwen3.5 full-attention
 //! layer charges KV rows a token. A GDN layer holds one recurrent state and one conv ring a slot,

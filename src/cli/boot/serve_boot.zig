@@ -1,7 +1,21 @@
-//! The serve boot that `serve` and `serve-openai` share. `buildAndServe` checks the flags,
-//! loads the model, builds the runner of its family on the selected placement, wraps it in
-//! the tiered-KV residency, and hands it to a launcher: a value with a `serve(EngineT, ...)`
-//! method.
+//! The serve boot that `serve` and `serve-openai` share. `buildAndServe` checks the flags, loads
+//! the model, builds the runner of its family on the selected placement, wraps it in the tiered-KV
+//! residency, and hands it to a launcher: a value with a `serve(EngineT, ...)` method.
+//!
+//! Comptime. `inline else` turns the architecture into a family row once, so the rest is generic.
+//!
+//! Placement. `--gpu-layers 0` and an auto split that funds no GPU layer take the CPU runner, and
+//! only the first of them skips the device. Every other flag state opens the device, resolves the
+//! placement on it, and serves a fused or a hybrid placement. The context stays open until the
+//! launcher returns.
+//!
+//! Family tags. A tag qualifies the family name by the KV dtype. The f32 tag equals the family name
+//! byte for byte, so each namespace of an existing blob survives, and the disk tier never crosses
+//! dtypes. A blob never restores across a family, a split, or a dtype.
+//!
+//! Scheduler fit. `launch` fits the scheduler to the runner. The scheduler must never compose more
+//! rows than the row scratch of the runner holds. CPU runners size it to the request, and the
+//! fused-GPU runners fix it at `prefill_batch_max`.
 
 const std = @import("std");
 const Io = std.Io;
@@ -36,9 +50,9 @@ const vulkan_ctx_mod = if (fused_build) @import("../../runtime/vulkan_ctx.zig") 
 const log = std.log.scoped(.serve);
 const fused_build = build_options.use_vulkan_fused_ops;
 const BlobTier = kv_budget.BlobTier;
-const device_arm = resolve_mod.device_arm;
+const device_placement = resolve_mod.device_placement;
 
-const boot_facts = @import("boot_facts.zig");
+const boot_resources = @import("boot_resources.zig");
 const boot_lines = @import("boot_lines.zig");
 const codec_parts = @import("codec_parts.zig");
 const serve_checks = @import("serve_checks.zig");
@@ -49,20 +63,17 @@ const kib = 1024;
 
 const mib = 1024 * 1024;
 
-/// Bytes the widest single-tier family tag occupies: the longest family name and
-/// the widest KV dtype component.
+/// Bytes of the widest family tag: the longest family name and the widest KV dtype suffix.
 const family_tag_buf_len: usize = "vulkan_fused".len + dtype.kv_tag_suffix_max;
 
-/// Bytes of the one READY line.
-/// The refusal of a thinking budget that no turn can spend. It takes the budget
-/// and the window.
-const thinking_budget_past_window_fmt = "--thinking-budget {d} is at or past the window of " ++
-    "{d} positions, so it can never close the block. Use a smaller budget or a larger --max-seq";
+/// The refusal of a thinking budget that no turn can spend. It takes the budget and the window.
+const thinking_budget_past_window_fmt = "--thinking-budget {d} is at " ++
+    "or past the window of {d} positions, so it can never close the block. " ++
+    "Use a smaller budget or a larger --max-seq";
 
 // -- types ------------------------------------------------------------------
 
-/// The host bytes of the sampler state of one serve boot: two id sets per
-/// scheduler slot, and one sample scratch for the session pool.
+/// The host bytes of the sampler state: two id sets per scheduler slot and one sample scratch.
 const SamplerRam = struct {
     sessions: u32,
     per_slot: u64,
@@ -81,7 +92,7 @@ const ServeBoot = struct {
     model: *const registry.Model,
     loaded: *const loader.Loaded,
     resolved: *const resolve_mod.Resolved,
-    device: boot_facts.DeviceBoot,
+    device: boot_resources.DeviceBoot,
     pool: *Pool,
     policy: parallel.Policy,
     parts: codec_parts.CodecParts,
@@ -94,8 +105,7 @@ const ServeBoot = struct {
         return self.checked.shape.kv_ram_bytes != null;
     }
 
-    /// The fingerprint of the runner `tag` names, so a blob never restores across
-    /// a family, a split, or a dtype.
+    /// The fingerprint of the runner that `tag` names.
     fn fingerprint(self: *const ServeBoot, tag: []const u8) u64 {
         return familyFp(self.model, self.loaded, tag);
     }
@@ -119,8 +129,8 @@ const RunnerFit = struct {
 
 // -- api --------------------------------------------------------------------
 
-/// Load the model, build the engine of its family on the placement that the flags
-/// and the device select, and hand it to `launcher.serve`.
+/// Load the model, build the engine of its family on the selected placement, and hand it to
+/// `launcher.serve`.
 pub fn buildAndServe(
     ctx: context.Context,
     pub_name: ?[]const u8,
@@ -128,38 +138,39 @@ pub fn buildAndServe(
     wire: serve_checks.Wire,
     launcher: anytype,
 ) !void {
+    // Check the flags. The whole-model fused runner runs no CPU op, so it starts no workers.
     const checked = try serve_checks.checkFlags(ctx, serve, wire);
 
-    // The whole-model fused runner runs no CPU op, so its pool starts no workers.
-    // A pin of any layer count can run CPU layers.
     const runs_cpu_ops = !fused_build or serve.engine.gpu_layers != null;
-    const policy = try boot_facts.resolvePolicy(
+    const policy = try boot_resources.resolvePolicy(
         ctx.io,
         serve.engine.threads.policyFlags(),
         runs_cpu_ops,
     );
 
+    // Pick the model, and refuse what needs no file.
     const model = try select.model(ctx, pub_name);
     const input: resolve_mod.Input = .{ .engine = serve.engine, .serve = checked.shape };
-    const entry = boot_facts.entryOf(model);
+    const entry = boot_resources.entryOf(model);
 
-    // Every refusal that needs no model file lands here, before the load.
     switch (resolve_mod.early(.serve, input, entry)) {
         .ok => {},
         .refused => |r| return boot_lines.refuse(ctx.io, model.pub_name, r),
     }
 
+    // Load the file, and resolve what needs no device.
     const path = try registry.resolveLoadPath(ctx.arena, ctx.io, ctx.models_root, model.*);
     var loaded = try loader.load(ctx.io, ctx.arena, path);
     defer loaded.close();
 
-    const resolved = try boot_facts.resolveLoaded(ctx, .serve, input, entry, &loaded);
+    const resolved = try boot_resources.resolveLoaded(ctx, .serve, input, entry, &loaded);
 
-    // One pool serves every CPU op of the command.
+    // Start the one pool that serves every CPU op.
     var pool: Pool = undefined;
     try parallel.initPool(&pool, ctx.io, policy);
     defer pool.deinit();
 
+    // Build the codec parts and the think tags.
     var v = try vocab_mod.buildFromParsed(ctx.arena, loaded.parsed);
     const pieces = try codec_parts.buildPieces(ctx.arena, &v);
     const kind = resolved.values.early.chat_kind;
@@ -170,6 +181,7 @@ pub fn buildAndServe(
         thinking_budget,
     });
 
+    // Gather the boot, and build the scheduler config.
     const boot: ServeBoot = .{
         .ctx = ctx,
         .flags = serve,
@@ -188,13 +200,13 @@ pub fn buildAndServe(
     logSamplerRam(samplerRam(loaded.card.vocab_size, serve.max_sessions));
     boot_lines.logPrecision(&loaded, boot.kvDtype());
 
+    // Serve with the family of the architecture.
     switch (loaded.card.arch) {
         inline else => |arch| return serveFamily(family.Of(arch), &boot, sched_cfg, launcher),
     }
 }
 
-/// The one stdout line a frontend prints before its engine loop. The spawning
-/// process parses the transport and the address from it.
+/// The one stdout line that a frontend prints before its engine loop. A spawner parses it.
 pub fn printReadyTcp(w: *Io.Writer, addr: Io.net.IpAddress) !void {
     try printReady(w, "READY tcp {f}\n", .{addr});
 }
@@ -205,8 +217,8 @@ pub fn printReadyUnix(w: *Io.Writer, path: []const u8) !void {
 
 // -- helpers ----------------------------------------------------------------
 
-/// One scheduler config, built from the facts every placement shares. A placement
-/// sets the fields that depend on its runner, and `launch` asserts them.
+/// One scheduler config, built from the values that every placement shares. `launch` sets the
+/// fields that depend on the runner.
 fn schedulerConfig(
     b: *const ServeBoot,
     wire: serve_checks.Wire,
@@ -215,8 +227,7 @@ fn schedulerConfig(
     const checked = b.checked;
     const model = b.model;
 
-    // A tag without a device names the CPU runner. A fused boot starts in the
-    // fused namespace, and each placement names its own.
+    // A fused boot starts in the fused namespace, and each placement names its own tag.
     var tag_buffer: [family_tag_buf_len]u8 = undefined;
     const boot_family = if (fused_build) "vulkan_fused" else "cpu";
     const boot_tag = familyTag(&tag_buffer, boot_family, b.kvDtype());
@@ -243,8 +254,7 @@ fn schedulerConfig(
         .think = think,
     };
 
-    // `hello_ack` carries the card row of each think mode, so a client picks
-    // the row of the mode of each turn.
+    // `hello_ack` carries the card row of each think mode.
     if (registry.recommendedSampling(model.pub_name, true)) |r| {
         cfg.recommended_think = wireSampling(r);
     }
@@ -256,8 +266,7 @@ fn schedulerConfig(
     return cfg;
 }
 
-/// A card row as wire sampling. The card has no frequency penalty, so the
-/// wire field keeps its identity 0.
+/// A card row as wire sampling. The card has no frequency penalty, so that field stays 0.
 fn wireSampling(r: registry.Recommended) protocol.Sampling {
     return .{
         .temperature = r.temperature,
@@ -270,15 +279,14 @@ fn wireSampling(r: registry.Recommended) protocol.Sampling {
     };
 }
 
-/// Pick the placement of `Family`. `--gpu-layers 0` and an auto split that funds no
-/// GPU layer take the CPU runner, and only the first of them skips the device.
+/// Pick the placement of `Family`.
 fn serveFamily(
     comptime Family: type,
     b: *const ServeBoot,
     cfg: scheduler_mod.Config,
     launcher: anytype,
 ) !void {
-    var host_arm = b.resolved.cpu;
+    var host_placement = b.resolved.cpu;
     const cpu_pinned = if (b.flags.engine.gpu_layers) |g| g.isZeroCount() else false;
     if (cpu_pinned) {
         log.info("--gpu-layers 0: the {s} CPU runner decodes every layer", .{Family.name});
@@ -288,22 +296,23 @@ fn serveFamily(
         if (!cpu_pinned) {
             switch (try serveOnDevice(Family, b, cfg, launcher)) {
                 .done => return,
-                .all_host => |arm| host_arm = arm,
+                .all_host => |placement| host_placement = placement,
             }
         }
     }
 
-    return serveCpu(Family, b, host_arm.?, cfg, launcher);
+    return serveCpu(Family, b, host_placement.?, cfg, launcher);
 }
 
-/// Open the device, resolve the arm on it, and serve a fused or hybrid arm. The
-/// context stays open until the launcher returns, and `.all_host` releases it.
+/// Open the device, resolve the placement on it, and serve a fused or hybrid placement. `.all_host`
+/// releases the context.
 fn serveOnDevice(
     comptime Family: type,
     b: *const ServeBoot,
     cfg: scheduler_mod.Config,
     launcher: anytype,
-) !boot_facts.Placed {
+) !boot_resources.DeviceAttempt {
+    // Open the device.
     const ctx = b.ctx;
     const name = b.model.pub_name;
 
@@ -314,21 +323,23 @@ fn serveOnDevice(
         log.info("initializing GPU: context + suffix weight upload to VRAM...", .{});
     }
 
-    const ctxp = try boot_facts.openDevice(ctx);
+    const ctxp = try boot_resources.openDevice(ctx);
     defer ctxp.deinit();
 
+    // Resolve the placement on the device.
     const dev = try b.device.resolveOn(ctx.io, ctxp);
-    if (dev.placed) |placed| {
-        boot_lines.logPlaced(placed, b.loaded.card.n_layers);
+    if (dev.layer_choice) |layer_choice| {
+        boot_lines.logLayerChoice(layer_choice, b.loaded.card.n_layers);
     }
 
-    const arm = switch (dev.arm) {
-        .ok => |a| a,
+    const placement = switch (dev.placement) {
+        .ok => |v| v,
         .refused => |r| return boot_lines.refuse(ctx.io, name, r),
     };
 
+    // Serve the placement.
     const open: OpenDevice = .{ .ctxp = ctxp, .t_init = t_init };
-    switch (arm) {
+    switch (placement) {
         .cpu => |c| {
             log.info("--gpu-layers auto: the {s} CPU runner decodes every layer", .{Family.name});
             return .{ .all_host = c };
@@ -344,7 +355,7 @@ fn serveHybrid(
     comptime Family: type,
     b: *const ServeBoot,
     open: OpenDevice,
-    hybrid_arm: device_arm.Hybrid,
+    hybrid_placement: device_placement.Hybrid,
     cfg_in: scheduler_mod.Config,
     launcher: anytype,
 ) !void {
@@ -352,18 +363,20 @@ fn serveHybrid(
     const kv_dtype = b.kvDtype();
     const n_layers = b.loaded.card.n_layers;
 
-    const quote = switch (hybrid_arm.quote) {
+    // Quote the RAM, and check the split.
+    const quote = switch (hybrid_placement.quote) {
         .ok => |q| q,
         .refused => |r| return boot_lines.refuse(ctx.io, b.model.pub_name, r),
     };
 
     boot_lines.logRamQuote(quote, b.kvRamNamed());
 
-    const plan = hybrid_arm.plan.?;
-    std.debug.assert(plan.split > 0);
-    std.debug.assert(plan.split < n_layers);
+    const plan = hybrid_placement.plan.?;
+    std.debug.assert(plan.host_layers > 0);
+    std.debug.assert(plan.host_layers < n_layers);
 
-    var ledger_buffer: [kv_budget.placement_ledger_text_max]u8 = undefined;
+    // Build the hybrid runner.
+    var ledger_buffer: [kv_budget.layer_split_ledger_text_max]u8 = undefined;
     log.info("{s}", .{kv_budget.formatLedger(plan, &ledger_buffer)});
 
     const hybrid = try Family.Hybrid.init(
@@ -386,17 +399,17 @@ fn serveHybrid(
         plan.n_slots,
         b.checked.shape.batch,
         plan.window,
-        n_layers - plan.split,
+        n_layers - plan.host_layers,
         n_layers,
         plan.kv_vram / mib,
         plan.ram.host_kv / mib,
     });
 
-    // The tag names the family, the split, and the dtype.
+    // Name the family, the split, and the dtype in the cache fingerprint.
     var cfg = cfg_in;
     var tag_buffer: [Family.Hybrid.backend_tag_buf_len]u8 = undefined;
     cfg.cache.model_fp = b.fingerprint(
-        Family.hybridTag(&tag_buffer, hybrid, plan.split, kv_dtype),
+        Family.hybridTag(&tag_buffer, hybrid, plan.host_layers, kv_dtype),
     );
 
     const fit: RunnerFit = .{
@@ -412,7 +425,7 @@ fn serveFused(
     comptime Family: type,
     b: *const ServeBoot,
     open: OpenDevice,
-    f: device_arm.Fused,
+    f: device_placement.Fused,
     cfg: scheduler_mod.Config,
     launcher: anytype,
 ) !void {
@@ -451,7 +464,7 @@ fn serveFused(
 fn serveCpu(
     comptime Family: type,
     b: *const ServeBoot,
-    arm_result: resolve_mod.Result(resolve_mod.CpuArm),
+    placement_result: resolve_mod.Result(resolve_mod.HostPlacement),
     cfg_in: scheduler_mod.Config,
     launcher: anytype,
 ) !void {
@@ -459,18 +472,25 @@ fn serveCpu(
     const kv_dtype = b.kvDtype();
     const n_sessions = b.flags.max_sessions;
 
-    const arm = try cpuArmOf(ctx.io, b.model.pub_name, arm_result, b.kvRamNamed(), kv_dtype);
+    // Quote the CPU placement.
+    const placement = try logHostPlacement(
+        ctx.io,
+        b.model.pub_name,
+        placement_result,
+        b.kvRamNamed(),
+        kv_dtype,
+    );
     const t_init = Io.Clock.Timestamp.now(ctx.io, .awake);
-    const plan = arm.plan;
+    const plan = placement.plan;
 
-    // The CPU runner writes these blobs, so a fused build moves them out of the
-    // fused namespace that the boot fingerprint named.
+    // The CPU runner writes these blobs, so a fused build moves them out of the fused namespace.
     var cfg = cfg_in;
     if (comptime fused_build) {
         var tag_buffer: [family_tag_buf_len]u8 = undefined;
         cfg.cache.model_fp = b.fingerprint(familyTag(&tag_buffer, "cpu", kv_dtype));
     }
 
+    // Build the runner.
     var runner = try Family.Cpu.init(
         ctx.arena,
         b.loaded,
@@ -494,37 +514,36 @@ fn serveCpu(
         .window = plan.window,
         .prefill_width = limits.cpu_prefill_chunk,
         .prefix_ram_bytes = plan.ram.prefix,
-        .tier = arm.quote.tier,
+        .tier = placement.quote.tier,
     };
     return launch(Family.Cpu, b, &runner, fit, cfg, launcher);
 }
 
-/// The all-host serve arm with its boot lines: the prefix default, the plan,
-/// and the RAM quote.
-fn cpuArmOf(
+/// Log the boot lines of the all-host serve placement: the prefix default, the plan, and the RAM
+/// quote. A refusal stops the boot and logs no line.
+fn logHostPlacement(
     io: Io,
     name: []const u8,
-    result: resolve_mod.Result(resolve_mod.CpuArm),
+    result: resolve_mod.Result(resolve_mod.HostPlacement),
     kv_ram_named: bool,
     kv_dtype: dtype.KvDtype,
-) !resolve_mod.CpuArm {
-    const arm = switch (result) {
-        .ok => |a| a,
+) !resolve_mod.HostPlacement {
+    const placement = switch (result) {
+        .ok => |v| v,
         .refused => |r| return boot_lines.refuse(io, name, r),
     };
 
-    if (arm.prefix_default) {
+    if (placement.prefix_default) {
         boot_lines.logPrefixDefault();
     }
 
-    boot_lines.logPlan(arm.plan, kv_dtype);
-    boot_lines.logRamQuote(arm.quote, kv_ram_named);
-    return arm;
+    boot_lines.logPlan(placement.plan, kv_dtype);
+    boot_lines.logRamQuote(placement.quote, kv_ram_named);
+    return placement;
 }
 
-/// The common tail of every placement: fit the scheduler to the runner, wrap the
-/// session pool in the tiered-KV residency, and launch. Until `--vram-slots` makes
-/// slots scarcer than sessions, the residency holds every session resident.
+/// The common tail of every placement: fit the scheduler to the runner, wrap the session pool in
+/// the tiered-KV residency, and launch.
 fn launch(
     comptime RunnerT: type,
     b: *const ServeBoot,
@@ -533,6 +552,7 @@ fn launch(
     cfg_in: scheduler_mod.Config,
     launcher: anytype,
 ) !void {
+    // Fit the scheduler to the runner.
     const ctx = b.ctx;
     const cap = runner.maxStepRows();
     std.debug.assert(runner.max_seq == fit.window);
@@ -543,14 +563,15 @@ fn launch(
     cfg.cache.ram_bytes = fit.prefix_ram_bytes;
     std.debug.assert(cfg.max_seq >= 1);
 
-    // Every placement reaches this point with its final window, so one check covers
-    // them all. The cost is that a refused boot has uploaded the weights.
+    // Check the thinking budget here, where every placement has its final window. A refused boot
+    // has already uploaded the weights.
     if (!thinkingBudgetFits(cfg.think.budget, cfg.max_seq)) {
         return args.fail(ctx.io, thinking_budget_past_window_fmt, .{
             cfg.think.budget, cfg.max_seq,
         });
     }
 
+    // Wrap the sessions in the residency, and launch.
     const SessionsT = Sessions(RunnerT);
     const max_sessions = b.flags.max_sessions;
     var sessions = try SessionsT.init(ctx.arena, runner);
@@ -566,9 +587,8 @@ fn launch(
     return launcher.serve(Residency(SessionsT), ctx, &residency, b.parts, cfg);
 }
 
-/// Set the two scheduler fields that depend on the runner: the rule and the row
-/// cap of one step. The derived rule takes every row the runner holds, and an
-/// explicit chunk that overshoots the runner gets the note of `clampStepRows`.
+/// Set the two scheduler fields that depend on the runner: the prefill rule and the row cap of one
+/// step. The derived rule takes every row the runner holds.
 fn setStepShape(
     cfg: *scheduler_mod.Config,
     flag: ?u32,
@@ -583,9 +603,7 @@ fn setStepShape(
     };
 }
 
-/// The scheduler must never compose more rows than the row scratch of the runner
-/// holds. CPU runners size it to the request, and the fused-GPU runners fix it at
-/// `prefill_batch_max`.
+/// Clamp the requested rows to the row scratch of the runner, and log a cut.
 fn clampStepRows(requested: u32, runner_cap: u32) u32 {
     if (runner_cap < requested) {
         log.info("prefill chunk capped at {d} rows/pass by the GPU runner's buffers " ++
@@ -595,9 +613,8 @@ fn clampStepRows(requested: u32, runner_cap: u32) u32 {
     return @min(requested, runner_cap);
 }
 
-/// Whether a thinking budget can ever force the close inside a window. Zero is
-/// unbounded. The n-th think token lands at `p0 + n - 1`, the forced close needs
-/// one more step, and the prompt holds at least one position.
+/// Whether a thinking budget can force the close inside a window. Zero is unbounded. The n-th
+/// think token lands at `p0 + n - 1`, the forced close needs one more step, and `p0 >= 1`.
 fn thinkingBudgetFits(budget: u32, window: u32) bool {
     std.debug.assert(window >= 1);
     std.debug.assert(window <= limits.max_model_ctx);
@@ -605,8 +622,7 @@ fn thinkingBudgetFits(budget: u32, window: u32) bool {
     return budget == 0 or budget < window;
 }
 
-/// The weights identity of one runner family: the model fingerprint qualified by
-/// the family tag. The numeric provenance of a blob is per backend.
+/// The weights identity of one runner family: the model fingerprint qualified by the family tag.
 fn familyFp(model: *const registry.Model, loaded: *const loader.Loaded, tag: []const u8) u64 {
     return prompt_cache_mod.backendFingerprint(
         prompt_cache_mod.modelFingerprint(model.pub_name, loaded.map.bytes().len),
@@ -614,9 +630,7 @@ fn familyFp(model: *const registry.Model, loaded: *const loader.Loaded, tag: []c
     );
 }
 
-/// One family tag qualified by the KV dtype. The f32 tag is the family name byte
-/// for byte, so every namespace of an existing blob survives, and the disk tier
-/// never crosses dtypes.
+/// One family tag qualified by the KV dtype.
 fn familyTag(buf: []u8, family_name: []const u8, kv_dtype: dtype.KvDtype) []const u8 {
     std.debug.assert(buf.len >= family_name.len + dtype.kv_tag_suffix_max);
 
@@ -635,8 +649,7 @@ fn samplerRam(vocab_size: u32, sessions: u32) SamplerRam {
     };
 }
 
-/// The sampler state sits outside the KV quote, and its size follows the vocab,
-/// not the window.
+/// Log the sampler state, which sits outside the KV quote. Its size follows the vocab.
 fn logSamplerRam(s: SamplerRam) void {
     log.info("ram: sampler {d} KiB = {d} sessions x {d} KiB id sets + {d} KiB scratch", .{
         s.total() / kib, s.sessions, s.per_slot / kib, s.scratch / kib,
@@ -664,9 +677,8 @@ fn printReady(w: *Io.Writer, comptime fmt: []const u8, fmt_args: anytype) !void 
 // -- tests ------------------------------------------------------------------
 
 test "serve capacity: the resolved dtype prices the plan and the ledger" {
-    // Llama-3.1-8B: 32 layers stepping 8 KV heads x 128 head_dim. Every cost
-    // model in the tree is this one product, so the registry anchors 262144 and
-    // 131072 derive from the dtype geometry rather than from a literal.
+    // Llama-3.1-8B: 32 layers stepping 8 KV heads x 128 head_dim. The registry anchors 262144
+    // and 131072 derive from this geometry.
     const n_layers: u32 = 32;
     const per_step: u32 = 8 * 128;
     const wide: kv_budget.KvCostModel = .{
@@ -678,10 +690,8 @@ test "serve capacity: the resolved dtype prices the plan and the ledger" {
     try std.testing.expectEqual(@as(u64, 262_144), wide.kv_bytes_per_token);
     try std.testing.expectEqual(@as(u64, 131_072), half.kv_bytes_per_token);
 
-    // `--kv-vram 1G` at the serve default window. The flag states bytes, so
-    // the dtype spends them on breadth: half the price, twice the slots.
-    // The byte rule of Llama-8B at f32 gives the two default windows: 512 at the
-    // serve budget and 8192 at the run budget. The request names its window.
+    // `--kv-vram 1G` at the serve default window. Half the price buys twice the slots. Llama-8B
+    // at f32 has default windows of 512 (serve) and 8192 (run).
     const budget_caps: kv_budget.Caps = .{
         .vram_free = 0,
         .weights = 0,
@@ -697,13 +707,11 @@ test "serve capacity: the resolved dtype prices the plan and the ledger" {
     try std.testing.expectEqual(2 * wide_plan.n_slots, half_plan.n_slots);
     try std.testing.expectEqual(wide_plan.window, half_plan.window);
 
-    // `--gpu-layers 16` over the same shape, priced the way the hybrid arm above
-    // prices it: one uniform cost vector out of the same geometry. Half the
-    // element size halves every KV figure the ledger prints, and moves no other
-    // one. The split and the resident weights stay equal.
+    // `--gpu-layers 16` over the same shape, with one uniform cost vector. Half the element size
+    // halves every KV figure of the ledger and moves no other. The split and weights stay equal.
     const weights = [_]u64{250 * mib} ** n_layers;
     const head_bytes: u64 = 500 * mib;
-    // The placement planner reads neither default window.
+    // The layer split planner reads neither default window.
     const caps: kv_budget.Caps = .{
         .vram_free = 16 << 30,
         .weights = 0,
@@ -712,7 +720,7 @@ test "serve capacity: the resolved dtype prices the plan and the ledger" {
         .serve_default = limits.min_kv_window,
         .default_ceil = limits.min_kv_window,
     };
-    // A serve arm prices both stages, and the placement planner checks no RAM.
+    // A serve placement prices both stages, and the layer split planner checks no RAM.
     const serve_host: kv_budget.HostRequest = .{
         .ram_split = .{ .blobs = 0, .prefix = 0 },
         .residency = true,
@@ -725,9 +733,9 @@ test "serve capacity: the resolved dtype prices the plan and the ledger" {
         n_layers,
         @as(u64, 2) * dtype.KvDtype.f16.rowBytes(per_step),
     );
-    var ledger: [2]kv_budget.PlacementPlan = undefined;
+    var ledger: [2]kv_budget.LayerSplit = undefined;
     for (&ledger, [_]kv_budget.KvCostVector{ wide_costs, half_costs }) |*p, costs| {
-        p.* = try kv_budget.placementPlan(caps, &weights, head_bytes, .{
+        p.* = try kv_budget.planLayerSplit(caps, &weights, head_bytes, .{
             .n_slots = 4,
             .window = 512,
             .costs = costs,
@@ -742,7 +750,7 @@ test "serve capacity: the resolved dtype prices the plan and the ledger" {
     try std.testing.expectEqual(ledger[0].kv_vram / 2, ledger[1].kv_vram);
     try std.testing.expectEqual(ledger[0].ram.host_kv / 2, ledger[1].ram.host_kv);
     try std.testing.expectEqual(ledger[0].ram.swap_stages / 2, ledger[1].ram.swap_stages);
-    try std.testing.expectEqual(ledger[0].split, ledger[1].split);
+    try std.testing.expectEqual(ledger[0].host_layers, ledger[1].host_layers);
     try std.testing.expectEqual(ledger[0].weight_resident, ledger[1].weight_resident);
 }
 
@@ -758,9 +766,8 @@ test "thinkingBudgetFits: a budget must sit below the window, and zero is unboun
 }
 
 test "serve capacity: a qwen split prices each tier by the layers it holds" {
-    // The 2B geometry: 24 layers, every fourth one full attention. The serve arm
-    // builds this structure through `kv_cost.costVector` and hands it to the
-    // same planner, so the arithmetic below is the arm's.
+    // The 2B geometry: 24 layers, every fourth one full attention. The serve placement builds this
+    // structure through `kv_cost.costVector`.
     const n_layers: u32 = 24;
     var costs = kv_budget.KvCostVector.uniform(n_layers, 0);
     var i: u32 = 0;
@@ -774,7 +781,7 @@ test "serve capacity: a qwen split prices each tier by the layers it holds" {
 
     const weights = [_]u64{62 * mib} ** n_layers;
     const head_bytes: u64 = 540 * mib;
-    // The placement planner reads neither default window.
+    // The layer split planner reads neither default window.
     const caps: kv_budget.Caps = .{
         .vram_free = 16 << 30,
         .weights = 0,
@@ -783,29 +790,25 @@ test "serve capacity: a qwen split prices each tier by the layers it holds" {
         .serve_default = limits.min_kv_window,
         .default_ceil = limits.min_kv_window,
     };
-    // A serve arm prices both stages, and the placement planner checks no RAM.
+    // A serve placement prices both stages, and the layer split planner checks no RAM.
     const serve_host: kv_budget.HostRequest = .{
         .ram_split = .{ .blobs = 0, .prefix = 0 },
         .residency = true,
     };
     const kv: kv_budget.KvStructure = .{ .n_slots = 4, .window = 512, .costs = costs };
 
-    // Twelve GPU layers leave the split at 12. Each half then holds three
-    // attention layers and nine recurrent ones, so both ledgers read equal. A
-    // uniform price cannot produce that.
-    const plan = try kv_budget.placementPlan(caps, &weights, head_bytes, kv, serve_host, 12);
+    // Twelve GPU layers leave the split at 12. Each half holds three attention layers and nine
+    // recurrent ones, so both ledgers read equal. A uniform price cannot produce that.
+    const plan = try kv_budget.planLayerSplit(caps, &weights, head_bytes, kv, serve_host, 12);
     const half: u64 = @as(u64, kv.n_slots) * (@as(u64, kv.window) * 3 * 4_096 + 9 * 1_122_304);
-    try std.testing.expectEqual(@as(u32, 12), plan.split);
+    try std.testing.expectEqual(@as(u32, 12), plan.host_layers);
     try std.testing.expectEqual(half, plan.kv_vram);
     try std.testing.expectEqual(half, plan.ram.host_kv);
-    // The tied head goes with any non-zero suffix, so a split of one layer already
-    // pays it whole. That is the cliff the refusal message names.
-    const thin = try kv_budget.placementPlan(caps, &weights, head_bytes, kv, serve_host, 1);
+    // The tied head goes with any non-zero suffix, so a split of one layer pays it whole.
+    const thin = try kv_budget.planLayerSplit(caps, &weights, head_bytes, kv, serve_host, 1);
     try std.testing.expectEqual(@as(u64, 62 * mib) + head_bytes, thin.weight_resident);
-    // A prefix that holds no attention layer charges fixed slabs and no window
-    // price: layers 0, 1, and 2 are all recurrent on this stack. It is the
-    // boundary value where the host tier's KV height is zero.
-    const gdn_only = try kv_budget.placementPlan(
+    // Layers 0, 1, and 2 are all recurrent, so that prefix charges fixed slabs and no window price.
+    const gdn_only = try kv_budget.planLayerSplit(
         caps,
         &weights,
         head_bytes,
@@ -813,13 +816,13 @@ test "serve capacity: a qwen split prices each tier by the layers it holds" {
         serve_host,
         n_layers - 3,
     );
-    try std.testing.expectEqual(@as(u32, 3), gdn_only.split);
+    try std.testing.expectEqual(@as(u32, 3), gdn_only.host_layers);
     try std.testing.expectEqual(@as(u64, kv.n_slots) * 3 * 1_122_304, gdn_only.ram.host_kv);
 }
 
 test "samplerRam: the Qwen vocab prices two id sets per session and one scratch" {
-    // 248320 ids fill 3880 words, so a set takes 31040 bytes. The scratch
-    // holds one row and 3880 block sums of f32.
+    // 248320 ids fill 3880 words, so a set takes 31040 bytes. The scratch holds one row and 3880
+    // block sums of f32.
     const s = samplerRam(248320, 4);
     try std.testing.expectEqual(@as(u64, 2 * 31040), s.per_slot);
     try std.testing.expectEqual(@as(u64, (248320 + 3880) * 4), s.scratch);

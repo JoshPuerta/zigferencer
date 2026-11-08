@@ -1,5 +1,7 @@
 //! Compute-kernel wrappers for the Vulkan op backend, one struct per shader.
 //!
+//! Comptime. A build gate refuses non-Vulkan builds, and `T` picks the KV dtype of a typed view.
+//!
 //! Ownership. Each wrapper owns its shader module, descriptor set layout, pipeline layout, and
 //! compute pipeline, but not the buffers. A caller hands it data, and the wrapper records the
 //! dispatch. Each kernel struct declares its own `requires`, because the variants span more than
@@ -69,8 +71,8 @@ const log = std.log.scoped(.gpu);
 comptime {
     if (!build_options.use_vulkan) {
         @compileError("ops_vulkan/kernels.zig was included in a non-vulkan build. " ++
-            "Either build with -Druntime=vulkan, or fix the caller to gate on " ++
-            "build_options.use_vulkan.");
+            "Either build with -Druntime=vulkan, " ++
+            "or fix the caller to gate on build_options.use_vulkan.");
     }
 }
 
@@ -821,7 +823,7 @@ pub const Attention = struct {
     kv: dtype.KvDtype,
     /// The split path of `runTyped`, built for its first split row. The fused runners never build
     /// it.
-    split: ?SplitKit,
+    split: ?SplitState,
     buf_q: HostBuffer,
     buf_k: HostBuffer,
     buf_v: HostBuffer,
@@ -831,7 +833,6 @@ pub const Attention = struct {
     pub const requires: op_requires.OpRequires = .{
         .arch = .any,
         .runtime = .vulkan,
-        // See "Attention tolerance" in the header.
         .tolerance = .{ .relative = 1e-3 },
     };
 
@@ -845,7 +846,7 @@ pub const Attention = struct {
     /// The split path of `runTyped`: the two passes, and one pool with the
     /// split set and the merge set. The scratch of one row is `buf_scratch`.
     /// Both paths record into `oneshot.cmd_buffer`.
-    const SplitKit = struct {
+    const SplitState = struct {
         passes: AttentionSplit,
         pool: vk.DescriptorPool,
         split_set: vk.DescriptorSet,
@@ -855,7 +856,7 @@ pub const Attention = struct {
             vk.DeviceWrapper.CreateDescriptorPoolError ||
             vk.DeviceWrapper.AllocateDescriptorSetsError;
 
-        fn init(ctx: *const vulkan_ctx.Context, kv: dtype.KvDtype) BuildError!SplitKit {
+        fn init(ctx: *const vulkan_ctx.Context, kv: dtype.KvDtype) BuildError!SplitState {
             var passes = try AttentionSplit.initKv(ctx, kv);
             errdefer passes.deinit();
 
@@ -882,7 +883,7 @@ pub const Attention = struct {
             };
         }
 
-        fn deinit(self: *SplitKit, ctx: *const vulkan_ctx.Context) void {
+        fn deinit(self: *SplitState, ctx: *const vulkan_ctx.Context) void {
             // Destroying the pool frees the split set and the merge set.
             ctx.vkd.destroyDescriptorPool(ctx.device, self.pool, null);
             self.passes.deinit();
@@ -929,19 +930,19 @@ pub const Attention = struct {
         self.buf_v.deinit();
         self.buf_out.deinit();
         self.buf_scratch.deinit();
-        if (self.split) |*kit| {
-            kit.deinit(self.ctx);
+        if (self.split) |*state| {
+            state.deinit(self.ctx);
         }
 
         self.oneshot.deinit(self.ctx);
         self.pipeline.deinit(self.ctx);
     }
 
-    pub const RunError = ResidualAdd.RunError || SplitKit.BuildError;
+    pub const RunError = ResidualAdd.RunError || SplitState.BuildError;
 
     /// Record one fused-attention dispatch into a command buffer the caller owns. The caller binds
     /// the set (q, k_cache, v_cache, out) and keeps `t_len` within `limits.attn_split_len`. A
-    /// deeper row takes the split passes through the attention kit.
+    /// deeper row takes the split passes through the attention kernel set.
     pub fn recordInto(
         self: *Attention,
         cb: vk.CommandBuffer,
@@ -1041,7 +1042,7 @@ pub const Attention = struct {
         // Build the split passes at the first deep row.
         const deep = attn_split.usesSplit(t_len);
         if (deep and self.split == null) {
-            self.split = try SplitKit.init(self.ctx, self.kv);
+            self.split = try SplitState.init(self.ctx, self.kv);
         }
 
         // Size the bindings and stage the inputs.
@@ -1100,7 +1101,7 @@ pub const Attention = struct {
         };
 
         if (deep) {
-            const kit = &self.split.?;
+            const state = &self.split.?;
             const scratch_bytes: vk.DeviceSize = scratch.totalBytes();
             try self.buf_scratch.ensure(scratch_bytes);
             const scratch_info: vk.DescriptorBufferInfo = .{
@@ -1112,8 +1113,8 @@ pub const Attention = struct {
             AttentionSplit.assertVBinding(v_info);
             const split_infos = [_]vk.DescriptorBufferInfo{ q_info, k_info, v_info, scratch_info };
             const merge_infos = [_]vk.DescriptorBufferInfo{ scratch_info, out_info };
-            updateStorageBindings(self.ctx, kit.split_set, &split_infos);
-            updateStorageBindings(self.ctx, kit.merge_set, &merge_infos);
+            updateStorageBindings(self.ctx, state.split_set, &split_infos);
+            updateStorageBindings(self.ctx, state.merge_set, &merge_infos);
         } else {
             const buf_infos = [_]vk.DescriptorBufferInfo{ q_info, k_info, v_info, out_info };
             updateStorageBindings(self.ctx, self.oneshot.desc_set, &buf_infos);
@@ -1125,10 +1126,10 @@ pub const Attention = struct {
         const begin: vk.CommandBufferBeginInfo = .{ .flags = .{ .one_time_submit_bit = true } };
         try self.ctx.vkd.beginCommandBuffer(cb, &begin);
         if (deep) {
-            const kit = &self.split.?;
-            kit.passes.recordSplit(
+            const state = &self.split.?;
+            state.passes.recordSplit(
                 cb,
-                kit.split_set,
+                state.split_set,
                 n_heads,
                 n_kv_heads,
                 head_dim,
@@ -1155,9 +1156,9 @@ pub const Attention = struct {
                 null,
             );
 
-            kit.passes.recordMerge(
+            state.passes.recordMerge(
                 cb,
-                kit.merge_set,
+                state.merge_set,
                 n_heads,
                 head_dim,
                 t_len,
@@ -1434,8 +1435,9 @@ pub const AttentionSplit = struct {
     pub fn guardHeadDim(head_dim: u32) error{AttentionHeadDimUnsupported}!void {
         if (attn_split.headDimFits(head_dim)) return;
         log.err(
-            "The model head_dim is {d}. GPU attention takes a head_dim that is a multiple " ++
-                "of {d} and at most {d}. Run this model on a CPU build",
+            "The model head_dim is {d}. " ++
+                "GPU attention takes a head_dim that is a multiple of {d} and at most {d}. " ++
+                "Run this model on a CPU build",
             .{ head_dim, limits.attn_head_dim_granule, limits.attn_max_head_dim },
         );
         return error.AttentionHeadDimUnsupported;
@@ -1452,9 +1454,9 @@ pub const AttentionSplit = struct {
     }
 };
 
-/// The summation-order class of an attention kit. The byte tests (the split digests, and the
-/// equality of rows across paths) hold for one class only. A kit of another class runs the
-/// reference tests at its declared tolerance and the token gates.
+/// The summation-order class of an attention kernel set. The byte tests (the split digests, and
+/// the equality of rows across paths) hold for one class only. A kernel set of another class runs
+/// the reference tests at its declared tolerance and the token gates.
 pub const AttnOrderClass = enum {
     /// Splits and merge both run in ascending order, so a row gets the same bytes at every batch,
     /// slot, and record group.
@@ -1471,14 +1473,14 @@ pub const AttnShape = struct {
     max_splits: u32,
 };
 
-/// The attention kit of `-Dattn-kernel=split`: the resident kernels for a row inside one split, and
-/// `AttentionSplit` past it. The kit points at the pipelines of its runner and owns none, and
-/// `runtime/attn_record.zig` records a plan through it.
-pub const SplitAttnKit = struct {
+/// The attention kernel set of `-Dattn-kernel=split`: the resident kernels for a row inside one
+/// split, and `AttentionSplit` past it. It points at the pipelines of its runner and owns none,
+/// and `runtime/attn_record.zig` records a plan through it.
+pub const SplitAttnKernels = struct {
     single: *Attention,
     multi: *AttentionMultiStream,
     passes: *const AttentionSplit,
-    /// The resident kernel of a prefill chunk. A kit that records no prefill,
+    /// The resident kernel of a prefill chunk. A kernel set that records no prefill,
     /// as in the bench grid, leaves it null.
     batch: ?*AttentionBatch = null,
 
@@ -1509,7 +1511,7 @@ pub const SplitAttnKit = struct {
         std.debug.assert(std.meta.eql(AttentionBatch.requires.tolerance, tolerance));
     }
 
-    pub fn recordResident(self: SplitAttnKit, cb: Cmd, b: Binding, r: attn_split.PlanRow) void {
+    pub fn recordResident(self: SplitAttnKernels, cb: Cmd, b: Binding, r: attn_split.PlanRow) void {
         std.debug.assert(!attn_split.usesSplit(r.t_len));
 
         const s = b.shape;
@@ -1543,7 +1545,7 @@ pub const SplitAttnKit = struct {
     /// at the positions `start_pos` through `start_pos + count - 1` of the
     /// stream that the batch set binds.
     pub fn recordResidentRun(
-        self: SplitAttnKit,
+        self: SplitAttnKernels,
         cb: Cmd,
         b: Binding,
         start_pos: u32,
@@ -1562,7 +1564,7 @@ pub const SplitAttnKit = struct {
     }
 
     pub fn recordSplit(
-        self: SplitAttnKit,
+        self: SplitAttnKernels,
         cb: Cmd,
         b: Binding,
         r: attn_split.PlanRow,
@@ -1589,7 +1591,7 @@ pub const SplitAttnKit = struct {
     }
 
     pub fn recordMerge(
-        self: SplitAttnKit,
+        self: SplitAttnKernels,
         cb: Cmd,
         b: Binding,
         r: attn_split.PlanRow,
@@ -1614,7 +1616,7 @@ pub const SplitAttnKit = struct {
 
     /// A shader read or write waits for the shader writes before it, the
     /// barrier the runners record between two dependent dispatches.
-    pub fn recordBarrier(self: SplitAttnKit, cb: Cmd) void {
+    pub fn recordBarrier(self: SplitAttnKernels, cb: Cmd) void {
         const mb = [_]vk.MemoryBarrier{.{
             .src_access_mask = .{ .shader_write_bit = true },
             .dst_access_mask = .{ .shader_read_bit = true, .shader_write_bit = true },
@@ -1646,10 +1648,10 @@ pub const SplitAttnKit = struct {
     }
 };
 
-/// The attention kit that `-Dattn-kernel` selects. A new kit is one struct
-/// with the method set of `SplitAttnKit` and one entry in the build enum.
-pub const AttnKit = switch (build_options.attn_kernel) {
-    .split => SplitAttnKit,
+/// The attention kernel set that `-Dattn-kernel` selects. A new kernel set is one struct
+/// with the method set of `SplitAttnKernels` and one entry in the build enum.
+pub const AttnKernels = switch (build_options.attn_kernel) {
+    .split => SplitAttnKernels,
 };
 
 /// In-place RoPE rotation of one head_dim vector. `rope_dim` must be even and at most `x.len`. Only
@@ -1828,6 +1830,7 @@ pub const RopeMulti = struct {
         freq_base: f32,
         style: RopeStyle,
     ) void {
+        // Bind the pipeline and the descriptors.
         self.ctx.vkd.cmdBindPipeline(cb, .compute, self.pipeline.handle);
         const desc_sets = [_]vk.DescriptorSet{desc_set};
         self.ctx.vkd.cmdBindDescriptorSets(
@@ -1839,6 +1842,7 @@ pub const RopeMulti = struct {
             null,
         );
 
+        // Push the constants and dispatch.
         const pc: PushConsts = .{
             .pos = pos,
             .head_dim = head_dim,
@@ -2134,7 +2138,6 @@ pub const Swiglu = struct {
 
 /// A GPU-resident Q8_0 weight matrix: the f16 scales, the packed quants, and the dimensions. A
 /// caller builds it once from a CPU-side weight blob, and the matmul kernels read it many times.
-/// See "Resident weights" in the header.
 pub const Q80Weight = struct {
     ctx: *const vulkan_ctx.Context,
     /// Device-local view in the shape of a descriptor write, in an arena or in the buffers of
@@ -4158,10 +4161,12 @@ pub const GdnChunkParallel = struct {
         n_tokens: u32,
         eps: f32,
     ) void {
+        // Check the head counts.
         std.debug.assert(head_dim == limits.gdn_head_dim);
         std.debug.assert(n_k_heads >= 1);
         std.debug.assert(n_v_heads % n_k_heads == 0);
 
+        // Bind the pipeline and the descriptors.
         self.ctx.vkd.cmdBindPipeline(cb, .compute, self.pipeline_conv.handle);
         const sets = [_]vk.DescriptorSet{set};
         self.ctx.vkd.cmdBindDescriptorSets(
@@ -4173,6 +4178,7 @@ pub const GdnChunkParallel = struct {
             null,
         );
 
+        // Push the constants and dispatch.
         const push: ConvPush = .{
             .d = head_dim,
             .n_k = n_k_heads,
@@ -4448,7 +4454,7 @@ pub const GdnChunkParallel = struct {
 /// the fused runner is the only caller.
 pub const QwenQkNorm = struct {
     /// The `local_size_x` of `qwen_qk_norm.comp`. One lane owns one head index.
-    const head_lanes: u32 = 256;
+    const head_lanes: u32 = limits.qwen_qk_head_dim;
 
     ctx: *const vulkan_ctx.Context,
     pipeline: Pipeline,
@@ -4596,8 +4602,8 @@ pub const HostBuffer = struct {
         // A silent fallback hides the reason CPU access to this buffer is slow.
         if (!chosen.property_flags.host_cached_bit) {
             log.debug(
-                "host buffer: no host-cached memory type, so CPU access to this host buffer " ++
-                    "is uncached and slow",
+                "host buffer: no host-cached memory type, " ++
+                    "so CPU access to this host buffer is uncached and slow",
                 .{},
             );
         }
@@ -4897,7 +4903,7 @@ pub const KvStore = struct {
 };
 
 /// Device-local VRAM arena. It sub-allocates from a small number of large buffer and memory
-/// segments, and it never frees one allocation. See "VRAM arenas" in the header.
+/// segments, and it never frees one allocation.
 pub const VramArena = struct {
     ctx: *const vulkan_ctx.Context,
     gpa: std.mem.Allocator,
@@ -4916,7 +4922,12 @@ pub const VramArena = struct {
     /// A view of the arena, the shape that a descriptor update takes.
     pub const View = vk.DescriptorBufferInfo;
 
-    pub const InitError = std.mem.Allocator.Error;
+    /// The segment size of the f16 scale and f32 norm arena.
+    pub const seg_bytes_small: vk.DeviceSize = 256 * 1024 * 1024;
+
+    /// The segment size of the i8 quants arena. The largest Llama-8B Q8_0 quants weight is the
+    /// lm_head at about 525 MB, so 1 GB is a safe default.
+    pub const seg_bytes_quants: vk.DeviceSize = 1024 * 1024 * 1024;
 
     pub const AllocError = error{
         NoSuitableMemoryType,
@@ -4927,14 +4938,13 @@ pub const VramArena = struct {
         vk.DeviceWrapper.BindBufferMemoryError;
 
     /// `seg_capacity` is the default size of a new segment. Pick at least the largest single
-    /// allocation, or `alloc` grows a segment to fit, which fragments the arena. The largest
-    /// Llama-8B Q8_0 quants weight is the lm_head at about 525 MB, so 1 GB is a safe default.
+    /// allocation, or `alloc` grows a segment to fit, which fragments the arena.
     pub fn init(
         ctx: *const vulkan_ctx.Context,
         gpa: std.mem.Allocator,
         usage: vk.BufferUsageFlags,
         seg_capacity: vk.DeviceSize,
-    ) InitError!VramArena {
+    ) VramArena {
         return .{
             .ctx = ctx,
             .gpa = gpa,
@@ -5167,7 +5177,7 @@ var staging_submits: std.atomic.Value(u64) = .init(0);
 /// because every caller holds its context through a `*const` pointer.
 var staging_busy: std.atomic.Value(bool) = .init(false);
 
-/// The error of a failed wait. Every later submit returns it. See "One-shot submits" in the header.
+/// The error of a failed wait. Every later submit returns it.
 var staging_wait_error: ?SubmitError = null;
 
 // -- api --------------------------------------------------------------------
@@ -5179,7 +5189,7 @@ pub fn stagingSubmitCount() u64 {
 
 /// Submit one command buffer of work on the staging buffer of `ctx`, and block until the queue is
 /// idle. `recorder.record(cb)` records the work and returns a `Recorded`. On return the GPU has
-/// finished. See "One-shot submits" in the header.
+/// finished.
 pub fn submitOnce(
     ctx: *const vulkan_ctx.Context,
     label: SubmitLabel,
@@ -5262,8 +5272,9 @@ pub fn submitOnce(
 
     // The words allocate and free keep the field layout that log parsers
     // read. The reset time prints as allocate, and nothing is freed.
-    const line_fmt = "staging: submit {d} {t}: {d} copies, {d} KiB, {d:.1} ms " ++
-        "(allocate {d:.3}, record {d:.3}, submit {d:.3}, wait {d:.3}, free 0.000 ms)";
+    const line_fmt = "staging: submit {d} {t}: " ++
+        "{d} copies, {d} KiB, {d:.1} ms (allocate {d:.3}, record {d:.3}, submit {d:.3}, " ++
+        "wait {d:.3}, free 0.000 ms)";
     log.debug(
         line_fmt,
         .{
@@ -5289,7 +5300,7 @@ pub fn runStagingCopies(ctx: *const vulkan_ctx.Context, copies: []const Copy) Su
 
 /// Move one packed blob between the device and the host through `stage`, one chunk at a time.
 /// `full` lists the copies of the whole blob in blob order, with `stage` as the host buffer, as
-/// `KvStore.rowCopies` builds them. See "Staged swaps" in the header.
+/// `KvStore.rowCopies` builds them.
 pub fn walkStage(
     ctx: *const vulkan_ctx.Context,
     full: []const Copy,
@@ -5618,12 +5629,13 @@ fn createComputePipeline(
     shader_module: vk.ShaderModule,
     pipeline_layout: vk.PipelineLayout,
 ) !vk.Pipeline {
-    // Pin wave32. See docs/gpu-rdna2.md section 5.
+    // Pin wave32. Every workgroup size must be a multiple of 32. See docs/gpu-rdna2.md section 5.
+    // A software device holds fewer lanes, so the size stays with its driver.
     const required_size: vk.PipelineShaderStageRequiredSubgroupSizeCreateInfo = .{
         .required_subgroup_size = 32,
     };
     const stage: vk.PipelineShaderStageCreateInfo = .{
-        .p_next = @ptrCast(&required_size),
+        .p_next = if (ctx.software) null else @ptrCast(&required_size),
         .stage = .{ .compute_bit = true },
         .module = shader_module,
         .p_name = "main",

@@ -1,5 +1,21 @@
-//! The `reconnecting` state: the backoff, one attempt task per pass, and the resume. Stdin
-//! stays live, so `/quit` and the end of stdin end the wait at once.
+//! The `reconnecting` state: the backoff, one attempt task per pass, and the resume. Stdin stays
+//! live, so `/quit` and the end of stdin end the wait at once.
+//!
+//! Backoff. The client dials at most `reconnect_attempts_max` times. Each dial follows a wait that
+//! starts at the first delay and doubles up to the cap.
+//!
+//! Deadlines. A relay that accepts and never forwards answers never, so the greeting deadline ends
+//! that attempt. The server answers a resume only after the prefill in flight. A cold prefill of
+//! 32704 positions takes about 55 s on the fused GPU runner, so the resume deadline leaves twice
+//! that.
+//!
+//! Attempts. An attempt task works on copies, so it shares no state with the control unit. A cancel
+//! at the deadline ends a blocked read with an error, and the errdefer closes the connection. A
+//! client that a task returns is connected and greeted, and the control unit owns it.
+//!
+//! Tokens. A resume that fails on the carrier keeps the token, because the server can still hold
+//! it. A retryable refusal also keeps it, because the server rotates it only after a successful
+//! resume.
 
 const std = @import("std");
 const Io = std.Io;
@@ -19,27 +35,20 @@ const InputQueue = client_input.InputQueue;
 // -- constants --------------------------------------------------------------
 
 const reconnect_fmt = "Reconnect attempt {d} of {d} in {d} ms.";
-const reconnect_failed_fmt = "The client cannot reconnect after {d} attempts. The last " ++
-    "error is {t}.";
-const server_changed_note = "The new server has another model, window, or end token. The " ++
-    "client ends the chat.";
-const reconnecting_line_note = "The client is reconnecting and drops the line. Type it " ++
-    "again after the resume.";
+const reconnect_failed_fmt = "The client cannot reconnect after {d} attempts. " ++
+    "The last error is {t}.";
+const server_changed_note = "The new server has another model, window, or end token. " ++
+    "The client ends the chat.";
+const reconnecting_line_note = "The client is reconnecting and drops the line. " ++
+    "Type it again after the resume.";
 
-/// At most this many dials, each after a wait that starts at the first delay
-/// and doubles up to the cap.
 const reconnect_attempts_max: u32 = 8;
 
 const reconnect_delay_first_ms: u32 = 100;
 const reconnect_delay_max_ms: u32 = 2000;
 
-/// A relay that accepts and never forwards answers never, so the attempt ends
-/// here.
 const reconnect_greet_deadline_ms: u32 = 10_000;
 
-/// The server answers a resume only after the prefill in flight. A cold
-/// prefill of 32704 positions takes about 55 s on the fused GPU runner, so the
-/// deadline leaves twice that.
 const reconnect_resume_deadline_ms: u32 = 120_000;
 
 // -- types ------------------------------------------------------------------
@@ -53,8 +62,7 @@ pub const Outcome = union(enum) {
     quit,
 };
 
-/// The values one attempt task needs. They are copies, so the task shares
-/// no state with the control unit.
+/// The values that one attempt task copies.
 const AttemptJob = struct {
     gpa: std.mem.Allocator,
     io: Io,
@@ -64,20 +72,17 @@ const AttemptJob = struct {
     next_request_id: u32,
     token: ?protocol.Token,
     gen: u32,
-    /// The last pass of the reconnect loop. A retryable refusal ends in a
-    /// rebuild there, because no later pass can retry.
+    /// The last pass of the loop. No later pass can retry, so a retryable refusal rebuilds.
     final: bool,
 };
 
-/// The result of one attempt task. A client that it returns is connected
-/// and greeted, and the control unit owns it.
+/// The result of one attempt task.
 const Attempt = struct {
     client: ?Client = null,
     info: ?Client.HelloInfo = null,
     outcome: union(enum) {
         resumed: Client.ResumedSession,
-        /// The resume was refused, with the reason, or the client held no
-        /// token.
+        /// The reason that the server refused the resume, or null with no token to send.
         no_lease: ?Client.LastError,
         /// The new server serves another model or window.
         changed,
@@ -97,19 +102,20 @@ const ResumeRefusal = enum {
 
 // -- api --------------------------------------------------------------------
 
-/// The `reconnecting` state. Each pass waits out the backoff, then runs one
-/// attempt task under a deadline, so the loop runs at most
-/// `reconnect_attempts_max` passes. Stdin stays live, so `/quit` and the end
-/// of stdin end the wait at once.
+/// The `reconnecting` state. Each pass waits out the backoff, then runs one attempt task under a
+/// deadline, so the loop runs at most `reconnect_attempts_max` passes.
 pub fn reconnect(c: *Chat, queue: *InputQueue) !Outcome {
     c.state = .reconnecting;
+
     var last_err: anyerror = error.ConnectionClosed;
     for (0..reconnect_attempts_max) |i| {
+        // Wait out the backoff.
         const attempt: u32 = @intCast(i);
         const ms = reconnectDelayMs(attempt);
         try c.out.note(reconnect_fmt, .{ attempt + 1, reconnect_attempts_max, ms });
         if (try waitTimer(c, queue, ms) == .quit) return quitReconnect(c);
 
+        // Start the attempt of a new generation.
         c.gen += 1;
         var task = try c.io.concurrent(attemptTask, .{ AttemptJob{
             .gpa = c.gpa,
@@ -122,6 +128,7 @@ pub fn reconnect(c: *Chat, queue: *InputQueue) !Outcome {
             .final = i + 1 == reconnect_attempts_max,
         }, queue });
 
+        // Collect the attempt. A quit also frees the client that the task returns.
         const wake = try waitAttempt(c, queue);
         var result = if (wake == .attempt) task.await(c.io) else task.cancel(c.io);
         if (wake == .quit) {
@@ -132,14 +139,14 @@ pub fn reconnect(c: *Chat, queue: *InputQueue) !Outcome {
             return quitReconnect(c);
         }
 
-        // A task cut at its deadline reports the cancel, and the attempt
-        // failed on time.
+        // A task cut at its deadline reports the cancel, and the attempt failed on time.
         if (wake == .timer and result.outcome == .failed and result.outcome.failed ==
             error.Canceled)
         {
             result.outcome = .{ .failed = error.Timeout };
         }
 
+        // Dial again after a failure. End the chat on a changed server.
         switch (result.outcome) {
             .failed => |err| {
                 std.debug.assert(result.client == null);
@@ -165,14 +172,13 @@ pub fn reconnect(c: *Chat, queue: *InputQueue) !Outcome {
 
 // -- helpers: reconnect -----------------------------------------------------
 
-/// Install the client of a finished attempt. The attempt is `resumed` or
-/// `no_lease`.
+/// Install the client of a finished attempt. The attempt is `resumed` or `no_lease`.
 fn adoptAttempt(c: *Chat, result: Attempt) !Outcome {
     c.client.deinit();
     c.client.* = result.client.?;
 
-    // The new server can differ in its think mode and card rows, and the
-    // rebuild opens its session from them.
+    // The new server can differ in its think mode and card rows, and the rebuild opens its session
+    // from them.
     c.info = result.info.?;
     c.sampling = c.opts.sessionSampling(c.info);
     if (c.info.resume_ttl_max_ms == 0 and c.keep_ttl > 0) {
@@ -193,8 +199,8 @@ fn adoptAttempt(c: *Chat, result: Attempt) !Outcome {
     };
 }
 
-/// A quit while the client reconnects. No server hears a close now, so the
-/// lease waits out its time to live.
+/// A quit while the client reconnects. No server hears a close, so the lease waits out its time
+/// to live.
 fn quitReconnect(c: *Chat) Outcome {
     c.quit_pending = true;
     c.lease = null;
@@ -211,8 +217,8 @@ fn waitTimer(c: *Chat, queue: *InputQueue, ms: u32) !Wake {
     return waitFor(c, queue, c.timer_gen);
 }
 
-/// Wait for the attempt task of `c.gen` under its deadlines: one for the
-/// dial and the greeting, then one for the resume.
+/// Wait for the attempt task of `c.gen` under its deadlines: one for the dial and the greeting,
+/// then one for the resume.
 fn waitAttempt(c: *Chat, queue: *InputQueue) !Wake {
     c.timer_gen += 1;
     var timer = try c.io.concurrent(
@@ -234,14 +240,14 @@ fn waitAttempt(c: *Chat, queue: *InputQueue) !Wake {
     defer resume_timer.cancel(c.io);
 
     const second = try waitFor(c, queue, c.timer_gen);
+
     // The task sends one greeting marker per attempt.
     std.debug.assert(second != .greeted);
     return second;
 }
 
-/// Each pass takes one input. The loop ends at the timer `timer_id`, a
-/// marker of the attempt `c.gen`, a quit, or the end of stdin. No socket
-/// task runs in this state, so no frame arrives.
+/// Each pass takes one input. The loop ends at the timer `timer_id`, a marker of the attempt
+/// `c.gen`, a quit, or the end of stdin. No socket task runs in this state, so no frame arrives.
 fn waitFor(c: *Chat, queue: *InputQueue, timer_id: u32) !Wake {
     while (true) {
         const input = try queue.getOne(c.io);
@@ -268,10 +274,7 @@ fn timerTask(io: Io, queue: *InputQueue, ms: u32, id: u32) void {
     queue.putOne(io, .{ .timer = id }) catch {};
 }
 
-/// One dial, greeting, and resume on a new connection. A cancel at the
-/// deadline ends a blocked read with an error, and the errdefer closes the
-/// connection. A resume that fails on the carrier keeps the token, because
-/// the server can still hold it.
+/// One dial, greeting, and resume on a new connection.
 fn attemptTask(job: AttemptJob, queue: *InputQueue) Attempt {
     defer queue.putOne(job.io, .{ .attempt_done = job.gen }) catch {};
 
@@ -286,8 +289,8 @@ fn attemptRun(job: AttemptJob, queue: *InputQueue) !Attempt {
 
     errdefer fresh.deinit();
 
-    // Request ids keep growing across connections, so `reconcile` never
-    // takes an id of the old connection for a new request.
+    // Request ids keep growing across connections, so `reconcile` never takes an id of the old
+    // connection for a new request.
     fresh.next_request_id = job.next_request_id;
     const info = try fresh.hello();
     if (!sameServer(&job.expect, &info)) {
@@ -306,8 +309,6 @@ fn attemptRun(job: AttemptJob, queue: *InputQueue) !Attempt {
         if (err != error.ServerError) return err;
 
         const refusal = fresh.last_error.?;
-        // A retryable refusal leaves the token valid, because the server
-        // rotates it only after a successful resume.
         if (classifyResumeRefusal(refusal.code) == .retry and !job.final) return error.ServerError;
 
         return .{ .client = fresh, .info = info, .outcome = .{ .no_lease = refusal } };
@@ -316,8 +317,8 @@ fn attemptRun(job: AttemptJob, queue: *InputQueue) !Attempt {
     return .{ .client = fresh, .info = info, .outcome = .{ .resumed = r } };
 }
 
-/// Sort the refusal of a `session_resume`. A new `ErrorCode` fails to compile
-/// here until someone classifies it.
+/// Sort the refusal of a `session_resume`. A new `ErrorCode` fails to compile here until someone
+/// classifies it.
 fn classifyResumeRefusal(code: protocol.ErrorCode) ResumeRefusal {
     return switch (code) {
         .unknown_session, .forbidden => .no_lease,
@@ -335,15 +336,13 @@ fn classifyResumeRefusal(code: protocol.ErrorCode) ResumeRefusal {
     };
 }
 
-/// The transcript costs and the token ids hold only on the same model with
-/// the same window.
+/// The transcript costs and the token ids hold only on the same model with the same window.
 fn sameServer(old: *const Client.HelloInfo, new: *const Client.HelloInfo) bool {
     return old.max_seq == new.max_seq and old.eos_id == new.eos_id and
         std.mem.eql(u8, old.modelName(), new.modelName());
 }
 
-/// The wait before reconnect attempt `attempt`, counted from 0. It starts at
-/// the first delay and doubles up to the cap.
+/// The wait before reconnect attempt `attempt`, counted from 0.
 fn reconnectDelayMs(attempt: u32) u32 {
     std.debug.assert(attempt < reconnect_attempts_max);
 

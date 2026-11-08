@@ -3,15 +3,16 @@
 //! already calls on the CPU. The CPU op API has no whole-row attention op, so this module exports
 //! its own `attentionSingle` for the per-op branch of the runners.
 //!
+//! Comptime. A build gate stops the compiler when a non-Vulkan build includes this file.
+//!
 //! Cost. This is the simple end-to-end path. Every op call is its own submit and wait-idle, roughly
 //! 0.25 ms times hundreds of ops per Llama-8B token, which is the known floor. The fused decode
 //! path in `runtime/llama_fused.zig` records one command buffer per token and removes that floor.
 //! The per-op benchmarks and the GPU-against-CPU correctness checks run against this simple
 //! boundary.
 //!
-//! Placement. The backing is hybrid. The heavy ops run on the GPU. The small or fragmented ops stay
-//! on the CPU, because their microsecond cost beats the fixed overhead of a dispatch. Which side
-//! each op lands on:
+//! Op sides. The heavy ops run on the GPU. The small or fragmented ops stay on the CPU, because
+//! their microsecond cost beats the fixed overhead of a dispatch. Which side each op lands on:
 //!
 //!   embedLookup                       CPU. A pure memcpy loses to a dispatch.
 //!   ropeInplace                       CPU. One dispatch per head, 32 per layer,
@@ -55,7 +56,6 @@ comptime {
 pub const requires: op_requires.OpRequires = .{
     .arch = .any,
     .runtime = .vulkan,
-    // See "Tolerance" in the header.
     .tolerance = .{ .relative = 2e-3 },
 };
 
@@ -65,14 +65,12 @@ pub const InitError = vulkan_runner.Runner.InitError;
 
 // -- state ------------------------------------------------------------------
 
-// See "Globals" in the header.
 var g_runner: ?*vulkan_runner.Runner = null;
 var g_weight_cache: std.AutoHashMap(usize, kernels.Q80Weight) = undefined;
 var g_initialized: bool = false;
 
-/// The GPU Gated-DeltaNet pipeline, built on the first `gdnStep` call. It lives
-/// here rather than in `vulkan_runner.Runner`, so the shared per-op bundle
-/// carries no Qwen-only pipeline.
+/// The GPU Gated-DeltaNet pipeline, built on the first `gdnStep` call. It lives here, so the
+/// shared per-op bundle in `vulkan_runner.Runner` carries no Qwen-only pipeline.
 var g_gdn: ?kernels.GdnDecode = null;
 
 // -- api --------------------------------------------------------------------
@@ -210,11 +208,13 @@ pub fn gdnStep(
     conv_state: []f32,
     o_out: []f32,
 ) void {
+    // Build the pipeline on the first call.
     if (g_gdn == null) {
         g_gdn = kernels.GdnDecode.init(&runner().ctx) catch |e|
             std.debug.panic("ops_vulkan.wrap: GdnDecode.init failed: {t}", .{e});
     }
 
+    // Run one decode step.
     g_gdn.?.run(
         n_k_heads,
         n_v_heads,

@@ -1,29 +1,33 @@
 //! Role. The boot decisions of `run`, `serve`, and `bench-model` as one pure step. The CLI
-//! measures the host once (`Facts`), calls `early` before the model loads and `resolve` after,
+//! measures the host once (`Resources`), calls `early` before the model loads and `resolve` after,
 //! logs the `Resolved` value, and formats a `Refusal`. Nothing here reads a clock, a file, or a
 //! device, and nothing logs, so a table test runs every boot shape with no GPU.
 //!
+//! Comptime. Build options pick the Vulkan placements, so a CPU build drops them. `Result` is
+//! generic over its value type.
+//!
 //! Per-kind rules. Each difference between the kinds is on purpose.
 //!
-//!   rule                      run            serve                 bench
-//!   default window budget     run budget     serve budget          run budget
-//!   slots of the CPU arm      1              the structural slots  1
-//!   residency priced in RAM   no             yes                   no
-//!   prefix default (no Y)     none           the serve default     none
-//!   whole-model split         falls through  the arm it selects    refuses unless
-//!                             to the arm                           --force-hybrid
-//!   thinking refusals         `on`           `on` and a budget     none (auto)
-//!   per-op vulkan refusals    f16 KV         every boot            f16 KV
+//!   rule                        run               serve                     bench
+//!   default window budget       run budget        serve budget              run budget
+//!   slots of the CPU placement  1                 the structural slots      1
+//!   residency priced in RAM     no                yes                       no
+//!   prefix default (no Y)       none              the serve default         none
+//!   whole-model split           falls through     the placement it selects  refuses unless
+//!                               to the placement                            --force-hybrid
+//!   thinking refusals           `on`              `on` and a budget         none (auto)
+//!   per-op vulkan refusals      f16 KV            every boot                f16 KV
 //!
 //! Refusal order. Every refusal that needs no model file is in `early`, so it lands before the
 //! load.
 //!
-//! Device arms. The fused and hybrid arms live in `device_arm.zig`. They read one VRAM figure, the
-//! live budget, which the CLI measures from one device context and passes in `Facts.device`.
+//! Device placements. The fused and hybrid placements live in `device_placement.zig`. They read one
+//! VRAM figure, the live budget, which the CLI measures from one device context and passes in
+//! `Resources.device`.
 //!
-//! RAM refusals. A RAM refusal of the host arm sits in `Resolved.cpu`, so the CLI reports it where
-//! the arm starts, after the boot lines that come before it. A device arm that falls back to the
-//! host calls `cpuArm` itself.
+//! RAM refusals. A RAM refusal of the host placement sits in `Resolved.cpu`, so the CLI reports it
+//! where the placement starts, after the boot lines that come before it. A device placement that
+//! falls back to the host calls `hostPlacement` itself.
 //!
 //! Window. A named window must lie in `1..ceiling`. Only a default window shrinks to fit the VRAM
 //! or the device buffer limits.
@@ -35,23 +39,24 @@ const limits = @import("../core/limits.zig");
 const dtype = @import("../core/dtype.zig");
 const chat = @import("../core/chat.zig");
 const kv_budget = @import("../core/kv_budget.zig");
+const kv_index = @import("../core/kv_index.zig");
 const loader = @import("../io/gguf/loader.zig");
 const kv_cost = @import("../runtime/kv_cost.zig");
 const parallel = @import("../runtime/parallel.zig");
 const flags_mod = @import("flags.zig");
-pub const device_arm = @import("device_arm.zig");
+pub const device_placement = @import("device_placement.zig");
 
 pub const EngineFlags = flags_mod.EngineFlags;
-pub const ModelFacts = device_arm.ModelFacts;
-pub const DeviceFacts = device_arm.DeviceFacts;
-pub const DeviceArm = device_arm.DeviceArm;
-pub const caps = device_arm.caps;
+pub const ModelNeeds = device_placement.ModelNeeds;
+pub const DeviceCapacity = device_placement.DeviceCapacity;
+pub const DevicePlacement = device_placement.DevicePlacement;
+pub const caps = device_placement.caps;
 
 // -- types ------------------------------------------------------------------
 
 pub const Kind = enum { run, serve, bench };
 
-/// The registry facts of the model: what the boot knows before the load.
+/// The registry values of the model: what the boot knows before the load.
 pub const Entry = struct {
     pub_name: []const u8,
     chat_template_kind: chat.Kind,
@@ -73,12 +78,14 @@ pub const ServeShape = struct {
     slots_req: ?u16 = null,
     /// `--kv-vram` in bytes. Null names no device budget.
     kv_vram_bytes: ?u64 = null,
+    /// Buy slots with all the VRAM that the other reservations leave. `kv_vram_bytes` wins.
+    kv_vram_rest: bool = false,
 };
 
 pub const Input = struct {
     engine: EngineFlags = .{},
     serve: ServeShape = .{},
-    /// `run --prompt-cache`. The qwen fused arm prices the cache in its RAM
+    /// `run --prompt-cache`. The qwen fused placement prices the cache in its RAM
     /// quote.
     prompt_cache: bool = false,
     /// `bench-model --force-hybrid`.
@@ -86,17 +93,17 @@ pub const Input = struct {
 };
 
 /// What the CLI measures once per boot.
-pub const Facts = struct {
+pub const Resources = struct {
     /// `MemAvailable` at boot. Null turns the RAM check off.
     ram_free: ?u64,
     /// The weight census and the fused runner reservations. Null skips the
-    /// placement line of the host arm.
-    model: ?ModelFacts = null,
-    /// What the device context states. Null resolves no device arm.
-    device: ?DeviceFacts = null,
+    /// placement line of the host placement.
+    model: ?ModelNeeds = null,
+    /// What the device context states. Null resolves no device placement.
+    device: ?DeviceCapacity = null,
 };
 
-/// The window of a boot before any device fit, and the facts its log line
+/// The window of a boot before any device fit, and the figures its log line
 /// names.
 pub const Window = struct {
     /// The `--max-seq` value, or the default window when the flag is absent.
@@ -118,29 +125,29 @@ pub const Early = struct {
     kv_dtype: dtype.KvDtype,
 };
 
-/// The all-host arm: the plan, and the RAM quote of the split that keeps
+/// The all-host placement: the plan, and the RAM quote of the split that keeps
 /// every layer on the host.
-pub const CpuArm = struct {
+pub const HostPlacement = struct {
     plan: kv_budget.KvPlan,
     /// True when no `--kv-ram` named a Y, so the prefix took the serve default.
     prefix_default: bool,
     quote: kv_budget.RamQuote,
 };
 
-/// The host arm of a `run` of a llama model: the plan and the placement line.
+/// The host placement of a `run` of a llama model: the plan and the placement line.
 pub const RunHost = struct {
     plan: kv_budget.KvPlan,
-    /// Null when the facts hold no weight census.
-    report: ?kv_budget.PlacementPlan,
+    /// Null when `Resources` holds no weight census.
+    report: ?kv_budget.LayerSplit,
 };
 
 pub const Resolved = struct {
     early: Early,
     window: Window,
-    /// The all-host arm, or null for a device arm. See "RAM refusals" in the header.
-    cpu: ?Result(CpuArm),
-    /// The device arm, when the boot opens a device and the facts state it.
-    device: ?DeviceArm = null,
+    /// The all-host placement, or null for a device placement.
+    cpu: ?Result(HostPlacement),
+    /// The device placement, when the boot opens a device and `Resources` states it.
+    device: ?DevicePlacement = null,
 };
 
 /// Why a boot stops. The CLI formats each tag with its message.
@@ -156,7 +163,7 @@ pub const Refusal = union(enum) {
     gpu_layers_past_model: struct { n: u32, n_layers: u32 },
     /// The structural slot count a pinned `--vram-slots` asks of a split.
     hybrid_slots: u32,
-    placement_vram: struct { kind: Kind, n_gpu: u32, spend: u64, usable: u64 },
+    layer_split_vram: struct { kind: Kind, n_gpu: u32, spend: u64, usable: u64 },
     /// The pin of a bench split that keeps the whole model on one tier. Null
     /// is the auto pin.
     whole_model_split: ?u32,
@@ -166,7 +173,7 @@ pub const Refusal = union(enum) {
         rows: u64,
         per_slot: u64,
         window: u32,
-        clamp: ?device_arm.Clamp,
+        clamp: ?device_placement.Clamp,
     },
 };
 
@@ -177,7 +184,7 @@ pub fn Result(comptime T: type) type {
 // -- api --------------------------------------------------------------------
 
 /// True when the boot opens a device context. The bench of a fused build always opens one,
-/// because it places a zero count to refuse it as a whole model.
+/// because it prices a zero count to refuse it as a whole model.
 pub fn needsDevice(kind: Kind, flags: EngineFlags, card: loader.ModelCard) bool {
     if (comptime build_options.use_vulkan_fused_ops) {
         if (kind == .bench) return true;
@@ -205,7 +212,8 @@ pub fn early(kind: Kind, input: Input, entry: Entry) Result(Early) {
 
     const kv_dtype = flags.kv_dtype orelse entry.kv_dtype_default;
     if (comptime build_options.use_vulkan_ops) {
-        // The serve paths never start the per-op kernel context, and the per-op arm uploads f32 KV.
+        // The serve paths never start the per-op kernel context, and the per-op backend uploads f32
+        // KV.
         if (kind == .serve) return .{ .refused = .serve_per_op_vulkan };
         if (kv_dtype != .f32) return .{ .refused = .{ .kv_dtype_per_op_vulkan = kv_dtype } };
     }
@@ -219,7 +227,7 @@ pub fn resolve(
     input: Input,
     entry: Entry,
     card: loader.ModelCard,
-    facts: Facts,
+    resources: Resources,
 ) Result(Resolved) {
     const e = switch (early(kind, input, entry)) {
         .ok => |v| v,
@@ -245,27 +253,72 @@ pub fn resolve(
     };
     std.debug.assert(window.base <= window.ceiling);
 
-    // Pick the host arm or the device arm.
+    // Pick the host placement or the device placement.
     var out: Resolved = .{ .early = e, .window = window, .cpu = null };
     if (!needsDevice(kind, input.engine, card)) {
-        out.cpu = cpuArm(kind, input, card, e.kv_dtype, window, facts);
-    } else if (facts.device != null) {
-        out.device = device_arm.arm(kind, input, card, e.kv_dtype, window, facts);
+        out.cpu = hostPlacement(kind, input, card, e.kv_dtype, window, resources);
+    } else if (resources.device != null) {
+        out.device = device_placement.choosePlacement(
+            kind,
+            input,
+            card,
+            e.kv_dtype,
+            window,
+            resources,
+        );
     }
 
     return .{ .ok = out };
 }
 
-/// The all-host arm at `w`: the plan and its RAM quote. Serve holds every session resident and
-/// prices the residency stages. Run and bench hold one slot and price no stage.
-pub fn cpuArm(
+/// The input of a `serve` boot of `sessions` sessions that buys slots with all the VRAM the other
+/// reservations leave, as `--max-sessions` with a `--kv-vram` of that size does.
+pub fn spendVram(input: Input, sessions: u16) Input {
+    std.debug.assert(sessions >= 1);
+
+    const width: u16 = @intCast(@min(@as(u32, sessions), limits.max_batch));
+    var out = input;
+    out.serve = .{
+        .max_sessions = sessions,
+        .structural_slots = width,
+        .batch = width,
+        .kv_vram_rest = true,
+    };
+    return out;
+}
+
+/// The most sessions, at most `cap`, that `spendVram` gives a slot each. Null when no count fits.
+/// The walk starts at `cap`, because a plan refuses a decode width it cannot fund, so a refused
+/// count states nothing about the count that fits.
+pub fn mostSessions(
+    input: Input,
+    entry: Entry,
+    card: loader.ModelCard,
+    resources: Resources,
+    cap: u16,
+) ?u16 {
+    std.debug.assert(cap >= 1);
+    std.debug.assert(cap <= limits.max_logical_sessions);
+
+    var sessions = cap;
+    while (sessions >= 1) : (sessions -= 1) {
+        const shaped = spendVram(input, sessions);
+        if (eachSessionHasSlot(shaped, entry, card, resources)) return sessions;
+    }
+
+    return null;
+}
+
+/// The all-host placement at `w`: the plan and its RAM quote. Serve holds every session resident
+/// and prices the residency stages. Run and bench hold one slot and price no stage.
+pub fn hostPlacement(
     kind: Kind,
     input: Input,
     card: loader.ModelCard,
     kv_dtype: dtype.KvDtype,
     w: Window,
-    facts: Facts,
-) Result(CpuArm) {
+    resources: Resources,
+) Result(HostPlacement) {
     const window = w.base;
     std.debug.assert(window >= 1);
     std.debug.assert(window <= limits.max_model_ctx);
@@ -293,7 +346,7 @@ pub fn cpuArm(
         prefix_default = shape.kv_ram_bytes == null;
         n_logical = shape.max_sessions;
     } else if (kind == .run and card.gdn == null) {
-        plan = runHost(card, facts.model, kv_dtype, w).plan;
+        plan = runHost(card, resources.model, kv_dtype, w).plan;
     } else {
         plan = kv_budget.pinned(1, window);
     }
@@ -312,11 +365,11 @@ pub fn cpuArm(
         host,
         n_logical,
         named,
-        facts.ram_free,
+        resources.ram_free,
     ) catch |err| switch (err) {
         error.HostRamBudgetTooSmall => return .{
             .refused = .{
-                .host_ram = kv_budget.ramRefusal(kv, card.n_layers, host, facts.ram_free.?),
+                .host_ram = kv_budget.ramRefusal(kv, card.n_layers, host, resources.ram_free.?),
             },
         },
         error.BlobRamBudgetTooSmall => return .{
@@ -326,7 +379,7 @@ pub fn cpuArm(
                     card.n_layers,
                     host,
                     n_logical,
-                    facts.ram_free.?,
+                    resources.ram_free.?,
                 ),
             },
         },
@@ -335,11 +388,11 @@ pub fn cpuArm(
     return .{ .ok = .{ .plan = plan, .prefix_default = prefix_default, .quote = quote } };
 }
 
-/// The host arm of a llama `run`. A fused build plans against the fused runner reservations at no
-/// VRAM, so the placement line prices what the device arm prices.
+/// The host placement of a llama `run`. A fused build plans against the fused runner reservations
+/// at no VRAM, so the placement line prices what the device placement prices.
 pub fn runHost(
     card: loader.ModelCard,
-    model: ?ModelFacts,
+    model: ?ModelNeeds,
     kv_dtype: dtype.KvDtype,
     w: Window,
 ) RunHost {
@@ -347,7 +400,7 @@ pub fn runHost(
     std.debug.assert(w.base <= w.ceiling);
 
     const m = model orelse return .{ .plan = kv_budget.pinned(1, w.base), .report = null };
-    const c = device_arm.caps(card, m, 0, w.ceiling, 1, kv_dtype);
+    const c = device_placement.caps(card, m, 0, w.ceiling, 1, kv_dtype);
     const plan = if (comptime build_options.use_vulkan_fused_ops)
         kv_budget.kvPlan(
             c,
@@ -358,7 +411,7 @@ pub fn runHost(
         kv_budget.pinned(1, w.base);
 
     std.debug.assert(plan.window == w.base);
-    return .{ .plan = plan, .report = device_arm.report(c, card, m, kv_dtype, plan) };
+    return .{ .plan = plan, .report = device_placement.report(c, card, m, kv_dtype, plan) };
 }
 
 /// The window before any device fit: the `--max-seq` value, or else the default window.
@@ -374,6 +427,59 @@ pub fn baseWindow(flag: ?u32, ceiling: u32, default_window: u32) error{WindowOut
     std.debug.assert(w >= 1);
     std.debug.assert(w <= ceiling);
     return w;
+}
+
+// -- helpers ----------------------------------------------------------------
+
+/// Whether the `serve` boot of `input` holds every session in a slot, inside the device limits. A
+/// host figure without a device reads the host placement.
+fn eachSessionHasSlot(
+    input: Input,
+    entry: Entry,
+    card: loader.ModelCard,
+    resources: Resources,
+) bool {
+    const host_only: Resources = .{ .ram_free = resources.ram_free, .model = resources.model };
+    const boot = switch (resolve(.serve, input, entry, card, host_only)) {
+        .ok => |r| r,
+        .refused => return false,
+    };
+
+    const device = resources.device orelse {
+        const host = boot.cpu orelse return false;
+        return host == .ok;
+    };
+
+    const dev = device_placement.choosePlacement(
+        .serve,
+        input,
+        card,
+        boot.early.kv_dtype,
+        boot.window,
+        resources,
+    );
+    const placement = switch (dev.placement) {
+        .ok => |p| p,
+        .refused => return false,
+    };
+
+    const f = switch (placement) {
+        .fused => |fused_placement| fused_placement,
+        .hybrid, .cpu => return false,
+    };
+
+    if (f.quote == .refused) return false;
+    if (f.plan.n_slots < input.serve.max_sessions) return false;
+
+    // A plan wider than the device limits leaves the refusal to the runner, so check here.
+    const row = card.kvShape().kv_row_elems;
+    const slots_max = kv_index.maxSlotsForLimits(
+        f.plan.window,
+        row,
+        boot.early.kv_dtype,
+        device.buffer_limits,
+    );
+    return f.plan.n_slots <= slots_max;
 }
 
 // -- tests ------------------------------------------------------------------
@@ -553,7 +659,9 @@ fn cpuRows(comptime kind: Kind, comptime model: Model, comptime cases: anytype) 
             .input = asInput(c[1]),
             .want = c[2],
         };
-        if (c.len == 4) out[i] = overlay(out[i], c[3]);
+        if (c.len == 4) {
+            out[i] = overlay(out[i], c[3]);
+        }
     }
 
     return out;
@@ -614,16 +722,16 @@ test "resolve: the CPU oracle rows resolve to their logged window, slots, and RA
     }
 
     for (rows) |row| {
-        const facts: Facts = .{ .ram_free = row.ram_mib * mib };
+        const resources: Resources = .{ .ram_free = row.ram_mib * mib };
         const card = if (row.qwen) qwenCard() else smollm2Card();
         const entry = if (row.qwen) qwen_entry else smollm2_entry;
-        const got = resolve(row.kind, row.input, entry, card, facts);
+        const got = resolve(row.kind, row.input, entry, card, resources);
         errdefer std.debug.print("row {s}\n", .{row.name});
 
         switch (row.want) {
             .refused => |tag| {
                 // A window or flag refusal stops the boot. A RAM or slot refusal goes with the host
-                // arm.
+                // placement.
                 const refusal = switch (got) {
                     .refused => |r| r,
                     .ok => |r| switch (r.cpu.?) {
@@ -640,11 +748,11 @@ test "resolve: the CPU oracle rows resolve to their logged window, slots, and RA
                     .refused => return error.TestUnexpectedResult,
                 };
 
-                const arm = r.cpu.?.ok;
-                try std.testing.expectEqual(w.window, arm.plan.window);
-                try std.testing.expectEqual(w.slots, arm.plan.n_slots);
-                try std.testing.expectEqual(w.host_kv_mib, arm.quote.ram.host_kv / mib);
-                try std.testing.expectEqual(w.prefix_mib, arm.quote.ram.prefix / mib);
+                const placement = r.cpu.?.ok;
+                try std.testing.expectEqual(w.window, placement.plan.window);
+                try std.testing.expectEqual(w.slots, placement.plan.n_slots);
+                try std.testing.expectEqual(w.host_kv_mib, placement.quote.ram.host_kv / mib);
+                try std.testing.expectEqual(w.prefix_mib, placement.quote.ram.prefix / mib);
             },
         }
     }
@@ -742,8 +850,8 @@ fn checkCase(_: void, c: Case) anyerror!void {
         try std.testing.expectEqual(w, r.window.base);
     }
 
-    const arm = switch (r.cpu orelse return) {
-        .ok => |a| a,
+    const placement = switch (r.cpu orelse return) {
+        .ok => |v| v,
         .refused => |refusal| {
             switch (refusal) {
                 // Only a known RAM figure refuses on RAM.
@@ -756,13 +864,13 @@ fn checkCase(_: void, c: Case) anyerror!void {
         },
     };
 
-    // A plan never spends more host RAM than the facts it was given.
+    // A plan never spends more host RAM than the resources it was given.
     if (c.ram_free) |free| {
-        try std.testing.expect(arm.quote.ram.spend() <= free);
+        try std.testing.expect(placement.quote.ram.spend() <= free);
     }
 
-    try std.testing.expect(arm.plan.n_slots >= 1);
-    try std.testing.expectEqual(r.window.base, arm.plan.window);
+    try std.testing.expect(placement.plan.n_slots >= 1);
+    try std.testing.expectEqual(r.window.base, placement.plan.window);
 }
 
 test "resolve: no window past the ceiling, no plan past the RAM it was given" {
@@ -777,8 +885,8 @@ test "resolve: no window past the ceiling, no plan past the RAM it was given" {
 
 /// The weight census of SmolLM2-135M-Instruct-Q8_0: 30 equal layers and a tied
 /// head. The ledger lines of the device rows state 50 MiB for six layers.
-fn smollm2Model() ModelFacts {
-    var m: ModelFacts = .{ .n_layers = 30, .layer_weights = @splat(0), .head_weights = 30_083_328 };
+fn smollm2Model() ModelNeeds {
+    var m: ModelNeeds = .{ .n_layers = 30, .layer_weights = @splat(0), .head_weights = 30_083_328 };
     for (m.layer_weights[0..30]) |*w| {
         w.* = 3_764_736;
     }
@@ -792,8 +900,8 @@ fn smollm2Model() ModelFacts {
 /// The weight census of Qwen3.5-2B-Q8_0: every fourth layer is full attention
 /// and lighter, and the head is tied. The ledger lines state 860 MiB for six
 /// layers.
-fn qwenModel() ModelFacts {
-    var m: ModelFacts = .{
+fn qwenModel() ModelNeeds {
+    var m: ModelNeeds = .{
         .n_layers = 24,
         .layer_weights = @splat(0),
         .head_weights = 540_352_512,
@@ -811,7 +919,7 @@ fn qwenModel() ModelFacts {
 /// The device of the capture: the storage range it reports, which no row of
 /// the default storage range passes. The rows log no VRAM cut, so any figure
 /// that funds every row stands for the live budget.
-const capture_device: DeviceFacts = .{
+const capture_device: DeviceCapacity = .{
     .vram = 12 << 30,
     .buffer_limits = .{
         .storage_range = 128 << 20,
@@ -829,21 +937,21 @@ const DeviceRow = struct {
     input: Input,
     storage_range: u64 = 128 << 20,
     /// The live VRAM budget and the free host RAM, in MiB. A small figure
-    /// makes the budget arms refuse.
+    /// makes the VRAM budgets refuse.
     vram_mib: u64 = 12 * 1024,
     ram_mib: u64 = 64 * 1024,
     /// The window a clamped row cuts to.
     clamp_window: u32 = 131_072,
     /// The split of the placement line, for a `--gpu-layers` row.
-    split: ?u32 = null,
+    host_layers: ?u32 = null,
     /// True when the window line names the storage-buffer range.
     clamped: bool = false,
     want: DeviceWant,
 };
 
-/// The figures of an arm row, in MiB.
-const ArmWant = struct {
-    tag: device_arm.ArmTag,
+/// The figures of a placement row, in MiB.
+const PlacementWant = struct {
+    tag: device_placement.PlacementKind,
     slots: u32,
     window: u32,
     vram_kv_mib: u64 = 0,
@@ -853,15 +961,15 @@ const ArmWant = struct {
     stages_mib: u64 = 0,
 };
 
-const DeviceWant = union(enum) { arm: ArmWant, refused: std.meta.Tag(Refusal) };
+const DeviceWant = union(enum) { placement: PlacementWant, refused: std.meta.Tag(Refusal) };
 
 fn refused(tag: std.meta.Tag(Refusal)) DeviceWant {
     return .{ .refused = tag };
 }
 
-/// A fused arm of a run or bench boot: the KV lives on the device.
+/// A fused placement of a run or bench boot: the KV lives on the device.
 fn fused(slots: u32, window: u32, vram_kv_mib: u64) DeviceWant {
-    return .{ .arm = .{
+    return .{ .placement = .{
         .tag = .fused,
         .slots = slots,
         .window = window,
@@ -869,9 +977,9 @@ fn fused(slots: u32, window: u32, vram_kv_mib: u64) DeviceWant {
     } };
 }
 
-/// A hybrid arm of a run or bench boot: the KV lives on the host.
+/// A hybrid placement of a run or bench boot: the KV lives on the host.
 fn hybrid(slots: u32, window: u32, host_kv_mib: u64) DeviceWant {
-    return .{ .arm = .{
+    return .{ .placement = .{
         .tag = .hybrid,
         .slots = slots,
         .window = window,
@@ -879,25 +987,25 @@ fn hybrid(slots: u32, window: u32, host_kv_mib: u64) DeviceWant {
     } };
 }
 
-/// The same arms of a serve boot, which add the prefix and the swap stages.
+/// The same placements of a serve boot, which add the prefix and the swap stages.
 fn fusedS(slots: u32, window: u32, vram_kv_mib: u64, prefix_mib: u64, stages_mib: u64) DeviceWant {
     var w = fused(slots, window, vram_kv_mib);
-    w.arm.prefix_mib = prefix_mib;
-    w.arm.stages_mib = stages_mib;
+    w.placement.prefix_mib = prefix_mib;
+    w.placement.stages_mib = stages_mib;
     return w;
 }
 
 fn hybridS(slots: u32, window: u32, host_kv_mib: u64, prefix_mib: u64, stages_mib: u64) DeviceWant {
     var w = hybrid(slots, window, host_kv_mib);
-    w.arm.prefix_mib = prefix_mib;
-    w.arm.stages_mib = stages_mib;
+    w.placement.prefix_mib = prefix_mib;
+    w.placement.stages_mib = stages_mib;
     return w;
 }
 
-/// An arm that also holds weight blobs in RAM.
+/// A placement that also holds weight blobs in RAM.
 fn blobs(blobs_mib: u64, want: DeviceWant) DeviceWant {
     var w = want;
-    w.arm.blobs_mib = blobs_mib;
+    w.placement.blobs_mib = blobs_mib;
     return w;
 }
 
@@ -940,7 +1048,9 @@ fn deviceRows(
             .input = asInput(c[1]),
             .want = c[2],
         };
-        if (c.len == 4) out[i] = overlay(out[i], c[3]);
+        if (c.len == 4) {
+            out[i] = overlay(out[i], c[3]);
+        }
     }
 
     return out;
@@ -951,8 +1061,8 @@ const device_rows =
         .{ "default", .{}, fused(1, 8192, 360) },
         .{ "maxseq512", .{ .engine = seq512 }, fused(1, 512, 22) },
         .{ "f16", .{ .engine = f16kv }, fused(1, 8192, 180) },
-        .{ "gl6", .{ .engine = gl6 }, hybrid(1, 8192, 288), .{ .split = 24 } },
-        .{ "glauto", auto_in, fused(1, 8192, 360), .{ .split = 0 } },
+        .{ "gl6", .{ .engine = gl6 }, hybrid(1, 8192, 288), .{ .host_layers = 24 } },
+        .{ "glauto", auto_in, fused(1, 8192, 360), .{ .host_layers = 0 } },
         .{ "range1073741824", .{}, fused(1, 8192, 360), range_1gib },
         .{ "gl31", .{ .engine = gl31 }, refused(.gpu_layers_past_model) },
     }) ++
@@ -963,8 +1073,18 @@ const device_rows =
         .{ "kvram64", gpu4(.{ .kv_ram_bytes = 64 * mib }), fusedS(4, 2816, 495, 64, 247) },
         .{ "kvram1", gpu4(.{ .kv_ram_bytes = 1 * mib }), fusedS(4, 2816, 495, 1, 247) },
         .{ "f16", gpu4(.{ .engine = f16kv }), fusedS(4, 5632, 495, 1024, 247) },
-        .{ "gl6", gpu4(.{ .engine = gl6 }), hybridS(4, 2816, 396, 1024, 49), .{ .split = 24 } },
-        .{ "glauto", gpu4(.{ .engine = auto }), fusedS(4, 2816, 495, 1024, 247), .{ .split = 0 } },
+        .{
+            "gl6",
+            gpu4(.{ .engine = gl6 }),
+            hybridS(4, 2816, 396, 1024, 49),
+            .{ .host_layers = 24 },
+        },
+        .{
+            "glauto",
+            gpu4(.{ .engine = auto }),
+            fusedS(4, 2816, 495, 1024, 247),
+            .{ .host_layers = 0 },
+        },
         .{ "range1073741824", gpu4(.{}), fusedS(4, 2816, 495, 1024, 247), range_1gib },
         .{ "gl31", gpu4(.{ .engine = gl31 }), refused(.gpu_layers_past_model) },
         .{ "gl6-slots-pinned", pinned16, refused(.hybrid_slots) },
@@ -977,18 +1097,23 @@ const device_rows =
         .{ "default", .{}, fused(1, 8192, 360) },
         .{ "maxseq512", .{ .engine = seq512 }, fused(1, 512, 22) },
         .{ "f16", .{ .engine = f16kv }, fused(1, 8192, 180) },
-        .{ "gl0", gl0_in, refused(.whole_model_split), .{ .split = 30 } },
-        .{ "gl6", .{ .engine = gl6 }, hybrid(1, 8192, 288), .{ .split = 24 } },
-        .{ "glauto", auto_in, refused(.whole_model_split), .{ .split = 0 } },
-        .{ "gl0-force-hybrid", forced0, hybrid(1, 8192, 360), .{ .split = 30 } },
+        .{ "gl0", gl0_in, refused(.whole_model_split), .{ .host_layers = 30 } },
+        .{ "gl6", .{ .engine = gl6 }, hybrid(1, 8192, 288), .{ .host_layers = 24 } },
+        .{ "glauto", auto_in, refused(.whole_model_split), .{ .host_layers = 0 } },
+        .{ "gl0-force-hybrid", forced0, hybrid(1, 8192, 360), .{ .host_layers = 30 } },
     }) ++
     deviceRows(.run, qwen, .{
         .{ "default", .{}, fused(1, 131072, 1555), .{ .clamped = true } },
         .{ "maxseq512", .{ .engine = seq512 }, fused(1, 512, 25) },
-        .{ "gl6", .{ .engine = gl6 }, hybrid(1, 131072, 1038), .{ .split = 18, .clamped = true } },
-        .{ "glauto", auto_in, fused(1, 131072, 1555), .{ .split = 0, .clamped = true } },
+        .{
+            "gl6",
+            .{ .engine = gl6 },
+            hybrid(1, 131072, 1038),
+            .{ .host_layers = 18, .clamped = true },
+        },
+        .{ "glauto", auto_in, fused(1, 131072, 1555), .{ .host_layers = 0, .clamped = true } },
         .{ "range1073741824", .{}, fused(1, 174592, 2065), range_1gib },
-        .{ "gl6-vram-small", .{ .engine = gl6 }, refused(.placement_vram), tight_vram },
+        .{ "gl6-vram-small", .{ .engine = gl6 }, refused(.layer_split_vram), tight_vram },
         .{ "range64MiB", .{}, fused(1, 65_536, 787), range_64mib },
     }) ++
     deviceRows(.serve, qwen, .{
@@ -997,41 +1122,57 @@ const device_rows =
         .{ "maxseq1024", gpu4(.{ .engine = seq1024 }), fusedS(4, 1024, 125, 1024, 62) },
         .{ "kvram64", gpu4(.{ .kv_ram_bytes = 64 * mib }), fusedS(4, 10752, 581, 64, 290) },
         .{ "kvram1", gpu4(.{ .kv_ram_bytes = 1 * mib }), fusedS(4, 10752, 581, 1, 290) },
-        .{ "gl6", gpu4(.{ .engine = gl6 }), hybridS(4, 10752, 395, 1024, 92), .{ .split = 18 } },
-        .{ "glauto", gpu4(.{ .engine = auto }), fusedS(4, 10752, 581, 1024, 290), .{ .split = 0 } },
+        .{
+            "gl6",
+            gpu4(.{ .engine = gl6 }),
+            hybridS(4, 10752, 395, 1024, 92),
+            .{ .host_layers = 18 },
+        },
+        .{
+            "glauto",
+            gpu4(.{ .engine = auto }),
+            fusedS(4, 10752, 581, 1024, 290),
+            .{ .host_layers = 0 },
+        },
         .{ "range1073741824", gpu4(.{}), fusedS(4, 10752, 581, 1024, 290), range_1gib },
     }) ++
     deviceRows(.bench, qwen, .{
         .{ "default", .{}, fused(1, 131072, 1555), .{ .clamped = true } },
         .{ "maxseq512", .{ .engine = seq512 }, fused(1, 512, 25) },
         .{ "range1073741824", .{}, fused(1, 174592, 2065), range_1gib },
-        .{ "gl0", gl0_in, refused(.whole_model_split), .{ .split = 24, .clamped = true } },
-        .{ "gl6", .{ .engine = gl6 }, hybrid(1, 131072, 1038), .{ .split = 18, .clamped = true } },
-        .{ "glauto", auto_in, refused(.whole_model_split), .{ .split = 0, .clamped = true } },
+        .{ "gl0", gl0_in, refused(.whole_model_split), .{ .host_layers = 24, .clamped = true } },
+        .{
+            "gl6",
+            .{ .engine = gl6 },
+            hybrid(1, 131072, 1038),
+            .{ .host_layers = 18, .clamped = true },
+        },
+        .{ "glauto", auto_in, refused(.whole_model_split), .{ .host_layers = 0, .clamped = true } },
     });
 
-/// The refusal of a device arm: the arm itself, or the RAM quote of the arm it took.
-fn deviceRefusal(arm: Result(device_arm.Arm)) ?Refusal {
-    const a = switch (arm) {
+/// The refusal of a device placement: the placement itself, or the RAM quote of the placement it
+/// took.
+fn deviceRefusal(placement: Result(device_placement.Placement)) ?Refusal {
+    const taken = switch (placement) {
         .refused => |r| return r,
-        .ok => |a| a,
+        .ok => |v| v,
     };
 
-    return switch (a) {
+    return switch (taken) {
         .fused => |f| if (f.quote == .refused) f.quote.refused else null,
         .hybrid => |h| if (h.quote == .refused) h.quote.refused else null,
         .cpu => |c| if (c == .refused) c.refused else null,
     };
 }
 
-/// The window, slots, VRAM KV, and RAM quote of the arm a device row takes.
-fn deviceShape(a: device_arm.Arm) struct {
+/// The window, slots, VRAM KV, and RAM quote of the placement a device row takes.
+fn deviceShape(placement: device_placement.Placement) struct {
     slots: u32,
     window: u32,
     vram_kv: u64,
-    ram: kv_budget.PlacementPlan.Ram,
+    ram: kv_budget.LayerSplit.Ram,
 } {
-    return switch (a) {
+    return switch (placement) {
         .fused => |f| .{
             .slots = f.plan.n_slots,
             .window = f.plan.window,
@@ -1053,6 +1194,84 @@ fn deviceShape(a: device_arm.Arm) struct {
     };
 }
 
+test "mostSessions: VRAM and the storage range bound the count" {
+    const case = struct {
+        fn most(range: u64, vram_mib: u64, cap: u16) ?u16 {
+            var device = capture_device;
+            device.buffer_limits.storage_range = range;
+            device.vram = vram_mib * mib;
+            const resources: Resources = .{
+                .ram_free = 32 << 30,
+                .model = qwenModel(),
+                .device = device,
+            };
+            return mostSessions(.{}, qwen_entry, qwenCard(), resources, cap);
+        }
+    };
+
+    // The 128 MiB range holds 12 slots at the serve window. With a 1 GiB range the VRAM decides:
+    // 7/8 of 16 GiB less the weights, the scratch, and the logits of this fixture leaves 12,163
+    // MiB, and a slot costs 145.3 MiB.
+    try std.testing.expectEqual(@as(?u16, 12), case.most(128 << 20, 16 << 10, 128));
+    try std.testing.expectEqual(@as(?u16, 83), case.most(1 << 30, 16 << 10, 128));
+    // The cap binds first, and a budget below the weights fits no session.
+    try std.testing.expectEqual(@as(?u16, 4), case.most(1 << 30, 16 << 10, 4));
+    try std.testing.expectEqual(@as(?u16, null), case.most(1 << 30, 512, 128));
+}
+
+test "mostSessions: every count it returns plans a slot per session, and more VRAM never cuts it" {
+    const models = [_]struct { card: loader.ModelCard, need: ModelNeeds, entry: Entry }{
+        .{ .card = qwenCard(), .need = qwenModel(), .entry = qwen_entry },
+        .{ .card = smollm2Card(), .need = smollm2Model(), .entry = smollm2_entry },
+    };
+
+    for (models) |m| {
+        var last: u16 = 0;
+        var vram_mib: u64 = 1 << 9;
+        while (vram_mib <= 32 << 10) : (vram_mib *= 2) {
+            var device = capture_device;
+            device.vram = vram_mib * mib;
+            const resources: Resources = .{
+                .ram_free = 64 << 30,
+                .model = m.need,
+                .device = device,
+            };
+            const most = mostSessions(.{}, m.entry, m.card, resources, 128) orelse continue;
+
+            try std.testing.expect(most >= last);
+            last = most;
+
+            const shaped = spendVram(.{}, most);
+            const boot = resolve(.serve, shaped, m.entry, m.card, .{ .ram_free = 64 << 30 }).ok;
+            const placed = device_placement.choosePlacement(
+                .serve,
+                shaped,
+                m.card,
+                boot.early.kv_dtype,
+                boot.window,
+                resources,
+            ).placement.ok.fused;
+            try std.testing.expect(placed.plan.n_slots >= most);
+            try std.testing.expect(kv_budget.planFits(placed.caps, placed.plan));
+        }
+
+        try std.testing.expect(last >= 1);
+    }
+}
+
+test "mostSessions: a host with no device stops at the decode width it holds" {
+    const resources: Resources = .{ .ram_free = 64 << 30 };
+    const cap: u16 = @intCast(limits.max_batch);
+    const most = mostSessions(.{}, qwen_entry, qwenCard(), resources, cap);
+    if (comptime build_options.use_vulkan_fused_ops) return error.SkipZigTest;
+
+    try std.testing.expectEqual(@as(?u16, cap), most);
+    // A RAM figure below one session fits no count.
+    const small: Resources = .{ .ram_free = 1 << 20 };
+    const none = mostSessions(.{}, qwen_entry, qwenCard(), small, cap);
+    try std.testing.expectEqual(@as(?u16, null), none);
+}
+
 test "resolve: the device oracle rows resolve to their logged split, window, slots, and RAM" {
     if (comptime build_options.use_vulkan_ops) return error.SkipZigTest;
     for (device_rows) |row| {
@@ -1061,45 +1280,54 @@ test "resolve: the device oracle rows resolve to their logged split, window, slo
         var device = capture_device;
         device.buffer_limits.storage_range = row.storage_range;
         device.vram = row.vram_mib * mib;
-        const facts: Facts = .{
+        const resources: Resources = .{
             .ram_free = row.ram_mib * mib,
             .model = if (row.qwen) qwenModel() else smollm2Model(),
             .device = device,
         };
-        // A host build resolves no device arm, so the row takes the window of
-        // the boot and calls the device arm itself.
+        // A host build resolves no device placement, so the row takes the window of
+        // the boot and calls the device placement itself.
         const pre = early(row.kind, row.input, entry).ok;
         const base = switch (resolve(
             row.kind,
             row.input,
             entry,
             card,
-            .{ .ram_free = facts.ram_free },
+            .{ .ram_free = resources.ram_free },
         )) {
             .ok => |r| r.window,
             .refused => return error.TestUnexpectedResult,
         };
 
-        const dev = device_arm.arm(row.kind, row.input, card, pre.kv_dtype, base, facts);
+        const dev = device_placement.choosePlacement(
+            row.kind,
+            row.input,
+            card,
+            pre.kv_dtype,
+            base,
+            resources,
+        );
         errdefer std.debug.print("row {s}\n", .{row.name});
 
-        if (row.split) |want| {
-            try std.testing.expectEqual(want, dev.placed.?.split.?.split);
+        if (row.host_layers) |want| {
+            try std.testing.expectEqual(want, dev.layer_choice.?.layer_split.?.host_layers);
         }
 
-        if (row.split == null and row.want != .refused) {
-            try std.testing.expect(dev.placed == null);
+        if (row.host_layers == null and row.want != .refused) {
+            try std.testing.expect(dev.layer_choice == null);
         }
 
         switch (row.want) {
             .refused => |tag| try std.testing.expectEqual(
                 tag,
-                std.meta.activeTag(deviceRefusal(dev.arm) orelse return error.TestUnexpectedResult),
+                std.meta.activeTag(
+                    deviceRefusal(dev.placement) orelse return error.TestUnexpectedResult,
+                ),
             ),
-            .arm => |w| {
-                const a = dev.arm.ok;
-                try std.testing.expectEqual(w.tag, std.meta.activeTag(a));
-                const got = deviceShape(a);
+            .placement => |w| {
+                const placement = dev.placement.ok;
+                try std.testing.expectEqual(w.tag, std.meta.activeTag(placement));
+                const got = deviceShape(placement);
                 try std.testing.expectEqual(w.slots, got.slots);
                 try std.testing.expectEqual(w.window, got.window);
                 try std.testing.expectEqual(w.vram_kv_mib, got.vram_kv / mib);
@@ -1108,15 +1336,19 @@ test "resolve: the device oracle rows resolve to their logged split, window, slo
                 try std.testing.expectEqual(w.prefix_mib, got.ram.prefix / mib);
                 try std.testing.expectEqual(w.stages_mib, got.ram.swap_stages / mib);
                 // The run of a llama model states the all-device placement.
-                if (a == .fused and row.kind == .run and !row.qwen) {
-                    try std.testing.expectEqual(@as(u32, 0), a.fused.report.?.split);
+                if (placement == .fused and row.kind == .run and !row.qwen) {
+                    const report = placement.fused.report.?;
+                    try std.testing.expectEqual(@as(u32, 0), report.host_layers);
                 }
             },
         }
 
-        const clamp = if (dev.placed) |p|
+        const clamp = if (dev.layer_choice) |p|
             p.clamp
-        else if (dev.arm == .ok and dev.arm.ok == .fused) dev.arm.ok.fused.clamp else null;
+        else if (dev.placement == .ok and dev.placement.ok == .fused)
+            dev.placement.ok.fused.clamp
+        else
+            null;
 
         try std.testing.expectEqual(row.clamped, clamp != null);
         if (clamp) |c| {
@@ -1130,5 +1362,5 @@ test "resolve: the device oracle rows resolve to their logged split, window, slo
 }
 
 test {
-    _ = device_arm;
+    _ = device_placement;
 }

@@ -1,5 +1,7 @@
 //! Token selection from a logits vector.
 //!
+//! Comptime. Asserts pin the weight block to the lane count and the radix key to 32 bits.
+//!
 //! Greedy. `greedy` is argmax. It is deterministic by construction, with no RNG, temperature, or
 //! top-k/p, and it anchors every cross-backend token-stream hash gate. The sampled path never
 //! touches it.
@@ -240,7 +242,6 @@ pub fn sample(logits: []const f32, params: Params, random: std.Random, scratch: 
 }
 
 /// Copy `source` into `target` and apply the penalties to every id that the sets mark.
-/// See "Penalties" in the header.
 pub fn penalize(source: []const f32, target: []f32, sets: PenaltySets, knobs: Penalties) void {
     assert(source.len == target.len);
     assert(source.len > 0);
@@ -464,7 +465,7 @@ fn rowMax(row: []const f32) f32 {
 }
 
 /// The exact top_p cut among the weights at or above `floor`: the smallest ranked prefix whose
-/// mass reaches `top_p` of their mass. `floor_mass` is at least 1. See "Exact top_p cut".
+/// mass reaches `top_p` of their mass. `floor_mass` is at least 1.
 fn selectCut(weights: []const f32, floor: f32, floor_mass: f32, top_p: f32) Cut {
     assert(floor > 0);
     assert(floor_mass >= 1);
@@ -800,7 +801,7 @@ fn lastPositive(weights: []const f32, b: usize) u32 {
 }
 
 /// Pool draw: the top `top_k` candidates as weights, the min_p and nucleus cuts, then one CDF draw
-/// within the cut. See "Pool selection" in the header for why it stays `noinline`.
+/// within the cut.
 noinline fn samplePool(row: []const f32, params: Params, random: std.Random) u32 {
     var pool: [limits.max_top_k]Candidate = undefined;
     var probs: [limits.max_top_k]f32 = undefined;

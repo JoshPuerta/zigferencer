@@ -1,6 +1,9 @@
 //! The decode core: greedy generation from a runner. `run` and `bench-model` share this one
 //! control loop.
 //!
+//! Comptime. `@hasDecl` and `@hasField` find the optional sink and runner hooks, so an absent hook
+//! costs nothing.
+//!
 //! Ownership. The loop owns the sequencing (sample, step, stop) and the timing. The caller owns
 //! the per-token effect and passes it in as a `sink` value, because boundaries are values. A sink
 //! streams the detokenized piece, or folds the id into a hash. Prefill stays the job of the caller

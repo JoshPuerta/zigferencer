@@ -4,6 +4,9 @@
 //! the linear kernels, and the SIMD variants also override the attention part kernel and the
 //! serial row.
 //!
+//! Comptime. `E` makes the kernels generic over f32 and f16, and `kernel` binds a row kernel at
+//! build time.
+//!
 //! Reference. This file is the correctness reference. Every other variant must match its output
 //! inside a stated tolerance. No fusion, no shortcuts. Each op asserts its shape preconditions and,
 //! under runtime safety, a finiteness postcondition. Boundary inputs are `Tensor`, and inner
@@ -69,7 +72,7 @@ pub const requires: op_requires.OpRequires = .{ .arch = .any };
 // -- types ------------------------------------------------------------------
 
 /// Which lanes form a RoPE rotation pair. The angle for pair i is the same either way.
-/// Only the memory layout differs. See "RoPE" in the header.
+/// Only the memory layout differs.
 pub const RopeStyle = enum {
     /// Adjacent pairs (x[2i], x[2i+1]).
     norm,
@@ -79,7 +82,7 @@ pub const RopeStyle = enum {
 
 // -- api --------------------------------------------------------------------
 
-/// Linear layer: `out = input @ W.T`. See "Linear layout" in the header.
+/// Linear layer: `out = input @ W.T`.
 pub fn linearF32(input: []const f32, weight: Tensor, out: []f32) void {
     std.debug.assert(weight.dtype == .f32);
     std.debug.assert(weight.n_dims == 2);
@@ -108,7 +111,7 @@ pub fn linearF32(input: []const f32, weight: Tensor, out: []f32) void {
     }
 }
 
-/// Linear layer with Q8_0 weights. See "Quant blocks" in the header.
+/// Linear layer with Q8_0 weights.
 pub fn linearF32Q80(input: []const f32, weight: Tensor, out: []f32) void {
     std.debug.assert(weight.dtype == .q8_0);
     std.debug.assert(weight.n_dims == 2);
@@ -145,7 +148,7 @@ pub fn linearF32Q80(input: []const f32, weight: Tensor, out: []f32) void {
     }
 }
 
-/// Batched linear: `batch` input rows against one f32 weight. See "Batch" in the header.
+/// Batched linear: `batch` input rows against one f32 weight.
 /// Each row is bit-identical to a B=1 `linearF32` call.
 pub fn linearF32Batch(
     inputs: []const f32,
@@ -154,6 +157,7 @@ pub fn linearF32Batch(
     batch: usize,
     out_stride: usize,
 ) void {
+    // Check the shapes.
     std.debug.assert(weight.dtype == .f32);
     std.debug.assert(weight.n_dims == 2);
     std.debug.assert(batch > 0);
@@ -164,6 +168,7 @@ pub fn linearF32Batch(
     std.debug.assert(out_stride >= out_features);
     std.debug.assert(outs.len >= (batch - 1) * out_stride + out_features);
 
+    // Dot each batch row with each weight row.
     const w = std.mem.bytesAsSlice(f32, weight.data);
     var j: usize = 0;
     while (j < out_features) : (j += 1) {
@@ -180,6 +185,7 @@ pub fn linearF32Batch(
         }
     }
 
+    // Check that the outputs are finite.
     if (std.debug.runtime_safety) {
         var b: usize = 0;
         while (b < batch) : (b += 1) {
@@ -190,7 +196,7 @@ pub fn linearF32Batch(
     }
 }
 
-/// Batched linear with Q8_0 weights. See "Batch" in the header.
+/// Batched linear with Q8_0 weights.
 /// The block walk and accumulation order are those of `linearF32Q80`.
 pub fn linearF32Q80Batch(
     inputs: []const f32,
@@ -276,7 +282,7 @@ pub fn linearBatchPerRow(
     }
 }
 
-/// Linear layer with Q4_0 weights. See "Quant blocks" in the header.
+/// Linear layer with Q4_0 weights.
 pub fn linearF32Q40(input: []const f32, weight: Tensor, out: []f32) void {
     std.debug.assert(weight.dtype == .q4_0);
     std.debug.assert(weight.n_dims == 2);
@@ -329,8 +335,9 @@ pub fn linearF32Q40Batch(
     linearBatchPerRow(linearF32Q40, inputs, weight, outs, batch, out_stride);
 }
 
-/// Linear layer with Q4_1 weights. See "Quant blocks" in the header.
+/// Linear layer with Q4_1 weights.
 pub fn linearF32Q41(input: []const f32, weight: Tensor, out: []f32) void {
+    // Check the shapes.
     std.debug.assert(weight.dtype == .q4_1);
     std.debug.assert(weight.n_dims == 2);
 
@@ -340,6 +347,7 @@ pub fn linearF32Q41(input: []const f32, weight: Tensor, out: []f32) void {
     std.debug.assert(out.len >= out_features);
     std.debug.assert(in_features % 32 == 0);
 
+    // Dot each weight row, one block at a time.
     const row_bytes = (in_features / 32) * 20;
     var j: usize = 0;
     while (j < out_features) : (j += 1) {
@@ -365,6 +373,7 @@ pub fn linearF32Q41(input: []const f32, weight: Tensor, out: []f32) void {
         out[j] = sum;
     }
 
+    // Check that the outputs are finite.
     if (std.debug.runtime_safety) {
         for (out[0..out_features]) |x| {
             std.debug.assert(std.math.isFinite(x));
@@ -386,7 +395,6 @@ pub fn linearF32Q41Batch(
 }
 
 /// Linear layer with Q6_K weights, with `in / 256` superblocks per row. It allocates nothing.
-/// See "Quant blocks" in the header.
 pub fn linearF32Q6K(input: []const f32, weight: Tensor, out: []f32) void {
     std.debug.assert(weight.dtype == .q6_k);
     std.debug.assert(weight.n_dims == 2);
@@ -559,7 +567,7 @@ pub fn quantizeQ40(src: []const f32, dst: []u8) void {
 }
 
 /// Dequantize a Q6_K buffer into f32 (`src.len % 210 == 0`, `dst.len == (src.len/210)*256`).
-/// It mirrors ggml `dequantize_row_q6_K`. See "Quant blocks" in the header.
+/// It mirrors ggml `dequantize_row_q6_K`.
 pub fn dequantQ6K(src: []const u8, dst: []f32) void {
     std.debug.assert(src.len % 210 == 0);
 
@@ -611,13 +619,15 @@ pub fn dequantQ6K(src: []const u8, dst: []f32) void {
 }
 
 /// Look up `weight[token_id, :]` (length `dim`) into `dst`. A quantized table dequantizes.
-/// `shape[0] = dim` and `shape[1] = vocab`. See "Linear layout" in the header.
+/// `shape[0] = dim` and `shape[1] = vocab`.
 pub fn embedLookup(weight: Tensor, token_id: u32, dim: usize, dst: []f32) void {
+    // Check the shapes.
     std.debug.assert(weight.n_dims == 2);
     std.debug.assert(weight.shape[0] == dim);
     std.debug.assert(token_id < weight.shape[1]);
     std.debug.assert(dst.len >= dim);
 
+    // Copy or dequantize the row of the token.
     switch (weight.dtype) {
         .f32 => {
             const view = std.mem.bytesAsSlice(f32, weight.data);
@@ -648,6 +658,7 @@ pub fn embedLookup(weight: Tensor, token_id: u32, dim: usize, dst: []f32) void {
         else => unreachable, // `requireWeights` refuses any other dtype at runner init
     }
 
+    // Check that the row is finite.
     if (std.debug.runtime_safety) {
         for (dst[0..dim]) |v| {
             std.debug.assert(std.math.isFinite(v));
@@ -710,7 +721,7 @@ pub fn residualAdd(x: []const f32, dst: []f32) void {
 }
 
 /// In-place RoPE on one head_dim vector at position `pos`. Dims beyond `rope_dim` stay untouched.
-/// `freq_factors` is null for classic RoPE. See "RoPE" in the header.
+/// `freq_factors` is null for classic RoPE.
 pub fn ropeInplace(
     x: []f32,
     pos: u32,
@@ -752,7 +763,7 @@ pub fn ropeInplace(
 
 /// One part of a decode attention row: heads `[h_lo, h_hi)` over positions `[t_lo, t_hi)`, one
 /// record per head. It walks the heads of a KV head in blocks of `max_group`, so each K and V row
-/// widens once per block, and the bits of a head never depend on its block. See "Attention part".
+/// widens once per block, and the bits of a head never depend on its block.
 pub fn attentionPartTyped(
     comptime E: type,
     q: []const f32,
@@ -943,7 +954,7 @@ pub fn attentionPartTyped(
 }
 
 /// Combine the first `n_parts` part records of every query head into the attention output.
-/// The order of the sums fixes the bits. See "Attention merge" in the header.
+/// The order of the sums fixes the bits.
 pub fn attentionMerge(
     parts_buf: []const f32,
     n_parts: usize,
@@ -1638,7 +1649,7 @@ test "attention row: the part row tracks the f64 reference across tile and part 
     }
 }
 
-test "attention row: a tail head width and a head wider than the stack row track the f64 reference" {
+test "attention row: a tail head width and a head over the stack row track the f64 reference" {
     // At width 20 the f16 widening runs two 8-lane chunks and a tail of 4. At
     // width 300 the dot walks the stack row in two chunks, and the second
     // chunk continues the accumulator.
@@ -1713,7 +1724,7 @@ test "attention part: a head range gives each head the records of a single-head 
     }
 }
 
-test "attention part: a group of 10 heads in blocks of 8 and 2 gives the records of single-head calls" {
+test "attention part: 10 heads in blocks of 8 and 2 give the records of single-head calls" {
     const shape: AttnShape = .{ .n_heads = 20, .n_kv_heads = 2, .head_dim = 8 };
     var leads = [_]Lead{.none} ** 20;
     leads[0] = .ramp;

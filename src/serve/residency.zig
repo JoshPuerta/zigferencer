@@ -3,6 +3,8 @@
 //! VRAM. This layer evicts idle ones to a host (RAM) blob and restores them on their next turn.
 //! This is sequence-level swap (the vLLM and LMCache shape), not per-token streaming.
 //!
+//! Comptime. Generic over the pool type, so the swap path compiles out without `evictSlot`.
+//!
 //! Decomposition. `Sessions` stays a 1:1 pool over the physical slots, so its `id == slot`
 //! invariant is untouched. This layer owns the LOGICAL session state. A resident session keeps its
 //! truth in `sessions.table[phys]`. An evicted session keeps it in `Entry{saved, blob}`. The layer
@@ -12,7 +14,7 @@
 //! Control unit and datapath. This file is the control unit: the residency FSM and the LRU. The
 //! datapath is the runner's `evictSlot` and `restoreSlot` (pure byte moves) and the step machinery
 //! of `Sessions`. A runner without `evictSlot` requires `n_logical <= n_physical`, so nothing is
-//! ever evicted and the swap path compiles out. Only a test fake compiles those identity arms.
+//! ever evicted. Only a test fake compiles those identity prongs.
 //!
 //! Victim choice. The victim is the least-recently-used resident entry whose physical slot the
 //! tick does not need. `exclude` holds those slots: the decode batch and, for a prefill, the feed
@@ -24,7 +26,7 @@
 //! Blob. An evicted session keeps a RAM blob: the trimmed slot bytes and the count of committed
 //! rows they cover. Only committed rows travel, because attention reads no position past `pos`.
 //! The disk tier adds its header (version, model fingerprint) at serialization time. A session
-//! with no blob has no RAM copy, so its next placement resets the slot.
+//! with no blob has no RAM copy, so its next entry into a slot resets the slot.
 //!
 //! Ledger. `ram_used` is the sum of the blob lengths after every public operation. The budget
 //! gate runs before any allocation or device copy, so a refusal leaves the pool as it was. A
@@ -34,9 +36,9 @@
 //! so the millisecond totals divide by the counts.
 //!
 //! Prefix seeding. `restorePrefix` and `restoreReady` seed a FRESH logical session with a cached
-//! prefix. They place the session first, because the bytes land in a physical slot. The session
-//! then reads as one that fed `n_rows` non-final tokens, and `pos` is the one variable that the
-//! tiers consult. A placement refusal (`error.NoEvictableSlot`, `error.RamBudgetExceeded`) or a
+//! prefix. They make the session resident first, because the bytes land in a physical slot. The
+//! session then reads as one that fed `n_rows` non-final tokens, and `pos` is the one variable that
+//! the tiers consult. A residency refusal (`error.NoEvictableSlot`, `error.RamBudgetExceeded`) or a
 //! device failure leaves the session at `pos` 0, so the caller degrades to a cold prefill, which
 //! rewrites each row before it reads it. The blob stays caller-owned, so the ledger never sees it.
 
@@ -87,7 +89,7 @@ pub fn Residency(comptime SessionsT: type) type {
 
         const Entry = struct {
             used: bool = false,
-            /// Physical slot when resident. Null when evicted or never placed.
+            /// Physical slot when resident. Null when evicted or never resident.
             phys: ?u32 = null,
             /// A KV blob exists to restore (false until first eviction).
             ever_resident: bool = false,
@@ -102,12 +104,12 @@ pub fn Residency(comptime SessionsT: type) type {
         sessions: *SessionsT,
         entries: []Entry, // [n_logical]
         phys_owner: []?u32, // [n_physical] -> logical id holding the slot
-        /// Host bytes the live blobs hold. See "Ledger" in the header.
+        /// Host bytes the live blobs hold.
         ram_used: u64,
         /// Ceiling on `ram_used`. Null accounts the tier without enforcing it.
         blob_budget: ?u64,
         tick: u64,
-        /// Swap counters. They cover device copies only. See "Ledger" in the header.
+        /// Swap counters. They cover device copies only.
         evicts: u64 = 0,
         restores: u64 = 0,
         evict_ms: f64 = 0,
@@ -227,7 +229,6 @@ pub fn Residency(comptime SessionsT: type) type {
         }
 
         /// The least-recently-used resident entry whose physical slot is not in `exclude`.
-        /// See "Victim choice" in the header.
         fn lruVictim(self: *const Self, exclude: []const u32) ?u32 {
             var best: ?u32 = null;
             for (self.entries, 0..) |*e, i| {
@@ -267,12 +268,12 @@ pub fn Residency(comptime SessionsT: type) type {
                 slot = try self.evictEntry(victim);
             }
 
-            try self.placeEntry(id, slot.?);
+            try self.bringResident(id, slot.?);
             self.assertLedger();
         }
 
         /// Spill `victim`'s live state to RAM and return its freed physical slot.
-        /// Only the committed rows travel. See "Blob" in the header.
+        /// Only the committed rows travel.
         fn evictEntry(self: *Self, victim: u32) !u32 {
             const e = &self.entries[victim];
             const s = e.phys.?;
@@ -330,7 +331,7 @@ pub fn Residency(comptime SessionsT: type) type {
 
         /// Bring `id` into the free physical slot `s`. Restore its blob if it has one. Otherwise
         /// clear the stale recurrent state of a vacated slot.
-        fn placeEntry(self: *Self, id: u32, s: u32) !void {
+        fn bringResident(self: *Self, id: u32, s: u32) !void {
             std.debug.assert(self.phys_owner[s] == null);
 
             // Install the saved bookkeeping.
@@ -339,7 +340,7 @@ pub fn Residency(comptime SessionsT: type) type {
             if (e.ever_resident) {
                 log.debug("swap-in: engine {d} slot {d} pos {d}", .{ id, s, e.saved.pos });
             } else {
-                log.debug("place: engine {d} slot {d} (fresh)", .{ id, s });
+                log.debug("resident: engine {d} slot {d} (fresh)", .{ id, s });
             }
 
             // Restore the blob, or reset a fresh slot.
@@ -352,7 +353,7 @@ pub fn Residency(comptime SessionsT: type) type {
                         ),
                     );
 
-                    // The blob stays until the restore succeeds. See "Ledger" in the header.
+                    // The blob stays until the restore succeeds.
                     const t0 = core_log.now();
                     try self.sessions.runner.restoreSlot(s, e.blob.n_rows, e.blob.bytes);
                     const t1 = core_log.now();
@@ -447,7 +448,7 @@ pub fn Residency(comptime SessionsT: type) type {
         }
 
         /// Seed a FRESH logical session with a cached KV prefix. Any failure leaves it at `pos` 0.
-        /// See "Prefix seeding" in the header. `blob` stays caller-owned.
+        /// `blob` stays caller-owned.
         pub fn restorePrefix(self: *Self, id: u32, n_rows: u32, blob: []const u8) !void {
             if (comptime !can_snapshot) @compileError("runner cannot snapshot slot state");
 
@@ -461,7 +462,7 @@ pub fn Residency(comptime SessionsT: type) type {
         }
 
         /// Seed a FRESH logical session with a cached prefix and its stored final-row logits
-        /// (`Sessions.restoreReady`). Placement and failure follow `restorePrefix`.
+        /// (`Sessions.restoreReady`). Residency and failure follow `restorePrefix`.
         pub fn restoreReady(
             self: *Self,
             id: u32,
@@ -493,7 +494,7 @@ pub fn Residency(comptime SessionsT: type) type {
 
         /// Copy the first `n_rows` of a session's KV into `out`, for the prefix cache. The caller
         /// runs it in the tick that completed the prefill, so the session is resident and no
-        /// placement runs.
+        /// session enters a slot.
         pub fn snapshotPrefix(self: *Self, id: u32, n_rows: u32, out: []u8) !void {
             if (comptime !can_snapshot) @compileError("runner cannot snapshot slot state");
 
@@ -504,7 +505,7 @@ pub fn Residency(comptime SessionsT: type) type {
             try self.sessions.snapshotPrefix(e.phys.?, n_rows, out);
         }
 
-        /// Release a logical session. Its credit has no later charge. See "Ledger" in the header.
+        /// Release a logical session. Its credit has no later charge.
         pub fn destroy(self: *Self, id: u32) void {
             std.debug.assert(id < self.entries.len);
 
@@ -610,7 +611,7 @@ pub fn Residency(comptime SessionsT: type) type {
         ) !?u32 {
             var phys_buf: [max_phys]u32 = undefined;
 
-            // Pin the feed session's slot, so a decode placement cannot evict it in this tick.
+            // Pin the feed session's slot, so a decode session cannot evict it in this tick.
             const pin: ?u32 = if (feed_chunk) |fc| self.entries[fc.id].phys else null;
             const decode_phys = try self.residentPhys(ids, &phys_buf, pin);
             var chunk: ?FeedChunk = null;
@@ -628,14 +629,14 @@ pub fn Residency(comptime SessionsT: type) type {
             return self.sessions.advance(chunk, decode_phys, tokens_out);
         }
 
-        /// Map logical decode ids to physical slots in `out`, in the order of `ids`. No placement
-        /// evicts another batch member or `pin`, the slot of the feed session.
+        /// Map logical decode ids to physical slots in `out`, in the order of `ids`. No entry into
+        /// a slot evicts another batch member or `pin`, the slot of the feed session.
         fn residentPhys(self: *Self, ids: []const u32, out: []u32, pin: ?u32) ![]u32 {
             std.debug.assert(ids.len <= out.len);
 
             var exclude: [max_phys + 1]u32 = undefined;
             for (ids, 0..) |id, i| {
-                @memcpy(exclude[0..i], out[0..i]); // already-placed batch members
+                @memcpy(exclude[0..i], out[0..i]); // already-resident batch members
                 var n = i;
                 if (pin) |p| {
                     exclude[n] = p;
@@ -989,7 +990,7 @@ test "residency ledger: a session with no committed rows evicts without a blob" 
 
     const res = &fx.res;
 
-    // Place three sessions without feeding any of them, so every `pos` is 0.
+    // Make three sessions resident without feeding any of them, so every `pos` is 0.
     const a = try res.create(1, .{});
     try res.ensureResident(a, &.{});
     const b = try res.create(2, .{});
@@ -1003,7 +1004,7 @@ test "residency ledger: a session with no committed rows evicts without a blob" 
     try std.testing.expectEqual(false, res.entries[a].ever_resident);
     try std.testing.expectEqual(@as(usize, 0), res.entries[a].blob.bytes.len);
 
-    // The next placement therefore takes the fresh path, not a restore.
+    // The next entry therefore takes the fresh path, not a restore.
     try res.ensureResident(a, &.{});
     try std.testing.expectEqual(@as(u32, 0), fx.fake.restores);
     try std.testing.expectEqual(resets_before + 2, fx.fake.resets);
@@ -1099,7 +1100,7 @@ test "residency ledger: a restore releases the blob, and the next eviction re-cr
     res.destroy(d);
 }
 
-test "residency prefix: a restore places the session and charges nothing" {
+test "residency prefix: a restore makes the session resident and charges nothing" {
     const gpa = std.testing.allocator;
     var fx: Fixture = undefined;
     try fx.setUp(gpa, 2, 3, null);
@@ -1161,7 +1162,7 @@ test "residency prefix: a restored session evicts and returns before its first f
     res.destroy(c);
 }
 
-test "residency prefix: restoreReady places the session decoding-ready and charges nothing" {
+test "residency prefix: restoreReady makes the session resident and charges nothing" {
     const gpa = std.testing.allocator;
     var fx: Fixture = undefined;
     try fx.setUp(gpa, 2, 3, null);
@@ -1216,7 +1217,7 @@ test "residency prefix: a snapshot reads a resident slot and moves nothing" {
     res.destroy(a);
 }
 
-test "residency prefix: an unfundable placement refuses and leaves a cold session" {
+test "residency prefix: an unfundable blob refuses and leaves a cold session" {
     const gpa = std.testing.allocator;
     // A budget of exactly one one-row blob, spent by the third session.
     var fx: Fixture = undefined;
@@ -1241,7 +1242,7 @@ test "residency prefix: an unfundable placement refuses and leaves a cold sessio
     const blob = prefixBlob(2);
     try std.testing.expectError(error.RamBudgetExceeded, res.restorePrefix(d, 2, &blob));
 
-    // The caller can still prefill `d` cold: it is unplaced at position zero,
+    // The caller can still prefill `d` cold: it is not resident at position zero,
     // exactly as `create` left it.
     try std.testing.expectEqual(@as(?u32, null), res.entries[d].phys);
     try std.testing.expectEqual(@as(u32, 0), res.posOf(d));
@@ -1273,7 +1274,7 @@ test "residency ledger: deinit drains every blob" {
     fx.tearDown(gpa);
 }
 
-/// A runner with no swap surface, so `Residency` compiles its identity arms.
+/// A runner with no swap surface, so `Residency` compiles its identity prongs.
 const NoSwapRunner = struct {
     n_slots: u32,
     max_seq: u32 = 64,
@@ -1429,7 +1430,7 @@ fn refused(err: anyerror, budget: ?u64) bool {
     return (err == error.RamBudgetExceeded and budget != null) or err == error.NoEvictableSlot;
 }
 
-/// Random create, feed, decode, place, and destroy steps on fewer physical
+/// Random create, feed, decode, bring-in, and destroy steps on fewer physical
 /// slots than sessions: the ledger is the blob sum, a restore releases its
 /// blob, and every session reads as on a pool that never evicts.
 fn checkResidencyTrace(_: void, seed: u64) anyerror!void {
@@ -1511,7 +1512,7 @@ fn checkResidencyTrace(_: void, seed: u64) anyerror!void {
                 try std.testing.expectEqualSlices(u32, want[0..ids.len], got[0..ids.len]);
             },
             3 => {
-                // Place one session.
+                // Make one session resident.
                 const live = liveIds(&t, false, &ids_buf);
                 if (live.len == 0) continue;
 

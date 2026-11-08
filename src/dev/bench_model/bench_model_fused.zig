@@ -1,5 +1,7 @@
 //! The whole-model GPU path of `bench-model`, on a fused build. Every run shares
 //! one runner, so the weights upload once.
+//!
+//! Comptime. Generic over the model family. A block rejects a non-fused build.
 
 const std = @import("std");
 const zigferencer = @import("zigferencer");
@@ -8,7 +10,7 @@ const build_options = @import("build_options");
 
 const common = @import("bench_model_common.zig");
 const exec = @import("bench_model_exec.zig");
-const boot_facts = zigferencer.cli.boot_facts;
+const boot_resources = zigferencer.cli.boot_resources;
 const boot_lines = zigferencer.cli.boot_lines;
 const vocab_mod = zigferencer.vocab;
 const sampler = zigferencer.sampler;
@@ -34,12 +36,10 @@ pub fn bench(comptime Family: type, b: *const Bench) !void {
     const kv_dtype = b.kvDtype();
 
     const ctxp = try ctx.arena.create(vulkan_ctx_mod.Context);
-    ctxp.* = try vulkan_ctx_mod.Context.init(ctx.arena, .{
-        .storage_range_override = ctx.vk_storage_range,
-    });
+    ctxp.* = try vulkan_ctx_mod.Context.init(ctx.arena, ctx.vk_options);
     defer ctxp.deinit();
 
-    const f = try boot_facts.fusedOn(ctx.io, b.boot, ctxp);
+    const f = try boot_resources.fusedOn(ctx.io, b.boot, ctxp);
     _ = try boot_lines.logFused(ctx.io, b.model.pub_name, f, true, false, kv_dtype);
 
     const runner = try Family.initFused(ctx.gpa, ctxp, b.loaded, f.plan, kv_dtype);

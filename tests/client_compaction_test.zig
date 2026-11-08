@@ -44,7 +44,7 @@ const castle_prompt = "Describe the castle where the old dragon sleeps, " ++
 const village_prompt = "Describe the village below the mountain, " ++
     "with its farms, its market, its mill, and the people who live there.";
 
-/// The script of turns. See "Script" in the header.
+/// The script of turns.
 const steps = [_]Step{
     .{ .prompt = "Tell me about dragons.", .max_tokens = 5 },
     .{ .prompt = "What do they eat?", .max_tokens = 5 },

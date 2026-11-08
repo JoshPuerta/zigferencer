@@ -2,6 +2,9 @@
 //! louder, or per-subsystem is one env var away, with no rebuild. Diagnostics only: generated
 //! text stays on stdout.
 //!
+//! Comptime. Scope and format are comptime arguments, and `hot` compiles the hot scopes out
+//! without `-Dtrace`.
+//!
 //! Gate. The comptime ceiling (`std_options.log_level` in `main.zig`) is `debug` in every build,
 //! so this module is the only gate and a release binary stays verbose on demand. Flow traces sit
 //! at boundaries, never per element, and the gate runs only for messages that cleared the comptime
@@ -26,9 +29,11 @@
 //!     debug,parallel=off     everyone at debug, except the noisy `parallel`
 //!
 //! Mistakes. An unknown level word reads as a scope name. A mistyped `scope=level` term is
-//! skipped, so the default stands and the run does not fail.
+//! skipped, so the default stands and the run does not fail. A scope term past `max_log_scopes` is
+//! dropped, and one line on stderr gives the count.
 
 const std = @import("std");
+const builtin = @import("builtin");
 const build_options = @import("build_options");
 
 // -- constants --------------------------------------------------------------
@@ -36,6 +41,10 @@ const build_options = @import("build_options");
 /// Bound on distinct scopes nameable in one `$ZIGFERENCER_LOG`. The engine
 /// defines 16 scopes. This leaves headroom without unbounding the surface.
 const max_log_scopes = 24;
+
+/// The drop notice. The log layer can stay silent at this point, so stderr carries it directly.
+const dropped_fmt = "warning: ZIGFERENCER_LOG names too many scopes. The cap is {d}. " ++
+    "The parser dropped {d} terms\n";
 
 /// Comptime gate for hot-path traces (the `layer`, `dispatch`, and `token`
 /// scopes). `-Dtrace` sets it: on in Debug, off in release unless forced. A
@@ -57,6 +66,9 @@ const LevelSpec = union(enum) { off, level: std.log.Level, unknown };
 var scope_ceilings: [max_log_scopes]ScopeCeiling = undefined;
 
 var scope_count: usize = 0;
+
+/// Scope terms of the last `setFromEnv` past the table capacity.
+var scopes_dropped: usize = 0;
 
 /// Global ceiling for any scope not named in the table. `null` = silent.
 var threshold: ?std.log.Level = .info;
@@ -91,6 +103,7 @@ pub fn setFromEnv(value: ?[]const u8) void {
     const v = value orelse return;
     raw_env = v;
     scope_count = 0;
+    scopes_dropped = 0;
     threshold = .info;
     var saw_scope = false;
     var saw_level = false;
@@ -138,6 +151,11 @@ pub fn setFromEnv(value: ?[]const u8) void {
     }
 
     std.debug.assert(scope_count <= max_log_scopes);
+
+    // A test checks the count. A line in a passing test reads as a failure in the build output.
+    if (scopes_dropped > 0 and !builtin.is_test) {
+        writeDropped();
+    }
 }
 
 /// `std.options.logFn`: drop messages above the scope's runtime ceiling, else write the dim
@@ -182,6 +200,15 @@ pub fn rawEnv() ?[]const u8 {
 
 // -- helpers ----------------------------------------------------------------
 
+// A failed write has nowhere useful to go, as in `logFn`.
+fn writeDropped() void {
+    var buffer: [64]u8 = undefined;
+    const stderr = std.debug.lockStderr(&buffer).terminal();
+    defer std.debug.unlockStderr();
+
+    stderr.writer.print(dropped_fmt, .{ max_log_scopes, scopes_dropped }) catch {};
+}
+
 fn elapsedNs() u64 {
     const t0 = start orelse blk: {
         const t = now();
@@ -214,7 +241,10 @@ fn parseLevel(word: []const u8) LevelSpec {
 fn addScope(name: []const u8, level: ?std.log.Level) void {
     std.debug.assert(name.len > 0);
 
-    if (scope_count >= max_log_scopes) return; // bounded: a term past the cap drops
+    if (scope_count >= max_log_scopes) {
+        scopes_dropped += 1;
+        return;
+    }
 
     std.debug.assert(scope_count < max_log_scopes);
     scope_ceilings[scope_count] = .{ .name = name, .level = level };
@@ -248,6 +278,25 @@ const EnvCase = struct {
     parallel: Level,
 };
 
+/// A table row: the env value, the threshold, the scope count, and the three probe ceilings.
+fn envCase(
+    env: []const u8,
+    global: Level,
+    scopes: usize,
+    gguf: Level,
+    run: Level,
+    parallel: Level,
+) EnvCase {
+    return .{
+        .env = env,
+        .threshold = global,
+        .scopes = scopes,
+        .gguf = gguf,
+        .run = run,
+        .parallel = parallel,
+    };
+}
+
 /// One env value gives one global threshold and one ceiling per scope, and
 /// `enabled` passes a level exactly when it does not exceed that ceiling.
 fn checkEnv(c: EnvCase) !void {
@@ -277,16 +326,16 @@ fn checkEnv(c: EnvCase) !void {
 test "setFromEnv: the grammar gives the threshold and the scope ceilings" {
     const cases = [_]EnvCase{
         // A bare level is the global threshold.
-        .{ .env = "debug", .threshold = .debug, .scopes = 0, .gguf = .debug, .run = .debug, .parallel = .debug },
-        .{ .env = "off", .threshold = null, .scopes = 0, .gguf = null, .run = null, .parallel = null },
-        .{ .env = "info", .threshold = .info, .scopes = 0, .gguf = .info, .run = .info, .parallel = .info },
+        envCase("debug", .debug, 0, .debug, .debug, .debug),
+        envCase("off", null, 0, null, null, null),
+        envCase("info", .info, 0, .info, .info, .info),
         // A bare scope silences the rest.
-        .{ .env = "gguf", .threshold = null, .scopes = 1, .gguf = .debug, .run = null, .parallel = null },
+        envCase("gguf", null, 1, .debug, null, null),
         // A scope=level term overrides the global level for that scope.
-        .{ .env = "info,parallel=debug", .threshold = .info, .scopes = 1, .gguf = .info, .run = .info, .parallel = .debug },
-        .{ .env = "debug,parallel=off", .threshold = .debug, .scopes = 1, .gguf = .debug, .run = .debug, .parallel = null },
+        envCase("info,parallel=debug", .info, 1, .info, .info, .debug),
+        envCase("debug,parallel=off", .debug, 1, .debug, .debug, null),
         // A mistyped level skips the term, and the default stands.
-        .{ .env = "gguf=verbose", .threshold = .info, .scopes = 0, .gguf = .info, .run = .info, .parallel = .info },
+        envCase("gguf=verbose", .info, 0, .info, .info, .info),
     };
     for (cases) |c| {
         errdefer std.debug.print("env case: {s}\n", .{c.env});
@@ -295,7 +344,7 @@ test "setFromEnv: the grammar gives the threshold and the scope ceilings" {
     }
 }
 
-test "setFromEnv: the scope table is bounded" {
+test "setFromEnv: a term past the scope table is counted, and the next value clears the count" {
     const many = comptime blk: {
         var s: []const u8 = "";
         var i: usize = 0;
@@ -308,6 +357,10 @@ test "setFromEnv: the scope table is bounded" {
 
     setFromEnv(many);
     try std.testing.expectEqual(@as(usize, max_log_scopes), scope_count);
+    try std.testing.expectEqual(@as(usize, 5), scopes_dropped);
+
+    setFromEnv("gguf");
+    try std.testing.expectEqual(@as(usize, 0), scopes_dropped);
 }
 
 test "prefixText: fixed-width milliseconds with three decimals" {

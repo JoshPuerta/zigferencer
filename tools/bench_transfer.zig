@@ -5,6 +5,8 @@
 //! runs copies alone, with no model, no kernels, and no dispatch. Both sections need a device,
 //! so `main` calls them under the runner guard.
 //!
+//! Comptime. An assert pins the readback region inside the crossing buffer.
+//!
 //! Order. `main` runs the crossing section before `benchStagedCopy`, which returns early when
 //! its 512 MiB pair does not fit.
 //!

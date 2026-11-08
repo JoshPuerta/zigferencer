@@ -1,6 +1,9 @@
 //! The run body every placement of `bench-model` shares: the prompt ids, one
 //! run, and the series of runs on one runner. The code is generic over the
 //! runner type, so each family and each placement reach the same body.
+//!
+//! Comptime. Build options and runner declarations pick the chunked prefill and the recurrent
+//! state prongs.
 
 const std = @import("std");
 const zigferencer = @import("zigferencer");
@@ -111,10 +114,13 @@ pub fn runOnce(runner: anytype, turn: Turn, ctx: context.Context) !RunResult {
         t_start,
         &sink,
     );
+    const t_end = Io.Clock.Timestamp.now(ctx.io, .awake);
+    const turn_s = common.toMs(t_start, t_end) / 1000.0;
 
     return .{
         .ttft_ms = generated.ttft_ms,
         .itl_ms = generated.itl_ms,
+        .tok_s = @as(f64, @floatFromInt(generated.tokens_generated)) / turn_s,
         .tokens_hash = hasher.final(),
         .tokens_generated = generated.tokens_generated,
         .itl_by_depth = try depth.collect(ctx.arena),
@@ -136,9 +142,8 @@ pub fn runSeries(
     const Runner = std.meta.Child(@TypeOf(runner));
     const results = try b.ctx.arena.alloc(RunResult, b.opt.runs);
     for (results, 0..) |*result, run_index| {
-        // A run folds the prompt into the recurrent state, and no prefill rewrites
-        // it. Positional KV needs no scrub, because a run writes a row before
-        // attention reads it.
+        // A run folds the prompt into the recurrent state, and no prefill rewrites it.
+        // Positional KV needs no scrub, because a run writes a row before attention reads it.
         if (comptime @hasDecl(Runner, "has_recurrent_state")) {
             if (warm or run_index > 0) {
                 runner.resetSlotState(0);

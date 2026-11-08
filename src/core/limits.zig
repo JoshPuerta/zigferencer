@@ -1,5 +1,7 @@
-//! Project-wide static engine limits. The doc of a constant holds the facts of that constant. This
+//! Project-wide static engine limits. The doc of a constant states what it bounds and why. This
 //! header holds the rules that span constants.
+//!
+//! Comptime. Asserts keep the window and session budget limits consistent with each other.
 //!
 //! Load bounds. The loader rejects a model that exceeds a structural bound with a typed error at
 //! load. It caps a declared context at `max_model_ctx` and logs both numbers. It never truncates in
@@ -116,6 +118,10 @@ pub const gdn_head_dim: u32 = 128;
 /// The Qwen3.5-2B runs 1 and the Qwen3.5-9B runs 2.
 pub const gdn_max_v_per_k: u32 = 8;
 
+/// The head_dim of `qwen_qk_norm.comp`, its `local_size_x`. One lane owns one head index, so the
+/// shader takes this width only. That constant must equal this one. Every Qwen3.5 model runs 256.
+pub const qwen_qk_head_dim: u32 = 256;
+
 /// Input elements the subgroup matvec holds in shared memory, 16 KiB of f32 at 4096. The build
 /// feeds it as LDS_CAPACITY of `linear_q8_0_subgroup.comp`. The kernel wrapper refuses a wider
 /// weight rather than corrupt memory.
@@ -188,8 +194,8 @@ pub const trace_spans_env = "ZIGFERENCER_TRACE_SPANS";
 
 /// Ceiling on logical serve sessions. A session is resident in a VRAM slot or evicted to a RAM blob
 /// (`serve/residency.zig`). The residency table is heap, so this bounds memory, not stack. Only the
-/// fused-GPU build can evict, so CPU builds keep logical equal to physical. The budget arm of
-/// `cli/boot/serve_checks.zig` takes the minimum of this and `max_vram_slots`.
+/// fused-GPU build can evict, so CPU builds keep logical equal to physical. The VRAM budget in
+/// `engine/device_placement.zig` caps its slots at the logical count and `max_vram_slots`.
 pub const max_logical_sessions: u32 = 128;
 
 /// Ceiling on live serve connections, the clients one server holds at once. A binary connection
@@ -220,10 +226,10 @@ pub const max_presence_penalty: f32 = 2;
 pub const max_repetition_penalty: f32 = 2;
 
 /// Longest model name the serve layer carries in a session handshake. A serve bound, not a
-/// wire-format fact. The trust boundary rejects an oversize name, and never truncates it.
+/// wire-format rule. The trust boundary rejects an oversize name, and never truncates it.
 pub const max_model_name_bytes: usize = 64;
 
-/// Longest detokenized piece a streamed token event carries. A serve bound, not a wire-format fact,
+/// Longest detokenized piece a streamed token event carries. A serve bound, not a wire-format rule,
 /// checked against the whole vocab at server start. The BPE of Llama-3 holds pieces past 64 bytes
 /// (runs of dashes, multi-byte scripts). 256 clears every registry vocab with headroom.
 pub const max_token_text_bytes: usize = 256;
@@ -315,7 +321,19 @@ pub const storage_range_env = "ZIGFERENCER_VK_STORAGE_RANGE";
 /// The largest value `storage_range_env` takes. Vulkan states the range as a 32-bit count.
 pub const storage_range_max: u64 = std.math.maxInt(u32);
 
+/// The environment variable that runs the Vulkan paths on a CPU device. The value `1` takes a CPU
+/// device and no other, so a debug run with no GPU is a named choice.
+pub const software_device_env = "ZIGFERENCER_VK_SOFTWARE";
+
 // -- types ------------------------------------------------------------------
+
+/// The device choices of the environment. Every command that opens a Vulkan context passes them.
+pub const DeviceOptions = struct {
+    /// Replaces the reported `maxStorageBufferRange`. It comes from `storage_range_env`.
+    storage_range_override: ?u64 = null,
+    /// Takes a CPU Vulkan device and no other. It comes from `software_device_env`.
+    software: bool = false,
+};
 
 /// The storage-buffer limits of one device, read once when its context opens.
 pub const BufferLimits = struct {
@@ -411,6 +429,14 @@ pub fn parseStorageRange(text: []const u8) error{InvalidStorageRange}!u64 {
     std.debug.assert(value >= 1);
     std.debug.assert(value <= storage_range_max);
     return value;
+}
+
+/// Parse the value of `software_device_env`: `1` or `0`.
+pub fn parseSoftwareDevice(text: []const u8) error{InvalidSoftwareDevice}!bool {
+    if (std.mem.eql(u8, text, "1")) return true;
+    if (std.mem.eql(u8, text, "0")) return false;
+
+    return error.InvalidSoftwareDevice;
 }
 
 /// Parse the value of `trace_spans_env`: a decimal ring capacity in
@@ -673,6 +699,14 @@ test "bufferFits: the first broken limit in check order wins" {
         BufferVerdict.past_storage_range,
         bufferFits(1 << 20, (128 << 20) + 1, lim),
     );
+}
+
+test "parseSoftwareDevice: only 1 and 0 name a choice" {
+    try std.testing.expectEqual(true, try parseSoftwareDevice("1"));
+    try std.testing.expectEqual(false, try parseSoftwareDevice("0"));
+    for ([_][]const u8{ "", "yes", "true", "2", " 1" }) |text| {
+        try std.testing.expectError(error.InvalidSoftwareDevice, parseSoftwareDevice(text));
+    }
 }
 
 test "parseStorageRange: digits in 1..2^32-1 only" {

@@ -1,6 +1,8 @@
 //! The decode record ring of a fused runner: two decode command buffers, one persistent fence, and
 //! the `core/record_ring.zig` state over them.
 //!
+//! Comptime. `core_log.hot` removes the trace code from builds without hot tracing.
+//!
 //! Flow. A step submits the buffer that holds its key, or records the key first on a miss. While
 //! the GPU runs that buffer, the step records the predicted next key into the other buffer. Then it
 //! waits on the fence. The next step at the predicted key submits with no record on its critical
@@ -145,7 +147,7 @@ pub const DecodeRing = struct {
 
         const t1 = core_log.now();
 
-        // Submit the buffer and arm the fence.
+        // Submit the buffer and set the fence.
         self.ring.submit(p.buf, key);
         const fences = [_]vk.Fence{self.fence};
         try vkd.resetFences(self.ctx.device, &fences);

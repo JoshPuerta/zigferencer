@@ -2,7 +2,10 @@
 //! give the same last-row logits, bit for bit, and the same greedy continuation as the prompt fed
 //! one token at a time through `step`.
 //!
-//! Legs. The reference path runs `step` per token at one thread with `max_rows = 0`, the shape of
+//! Comptime. Asserts pin the chunk sizes and the prompt length against the production chunk. The
+//! runner type is a parameter.
+//!
+//! Paths. The reference path runs `step` per token at one thread with `max_rows = 0`, the shape of
 //! the per-token prefill. The chunked paths run chunks of 1, 17, and 64 rows over a 70-token
 //! prompt, so a chunk boundary falls inside and outside the 4-row groups of the batch kernel. Each
 //! chunked path runs at one thread and at four threads with the fan-out forced on.
@@ -20,10 +23,11 @@ const QwenRunner = zigferencer.qwen_runner.QwenRunner;
 
 // -- fixtures ---------------------------------------------------------------
 
-const prompt_text = "The dragon flew over the quiet valley at dawn, and the people of the " ++
-    "old town looked up from their fields. Tell me a story about what they saw " ++
-    "next, and why the river turned silver before the bells rang at noon. The " ++
-    "miller counted the boats, the children ran to the bridge, and nobody spoke. " ++
+const prompt_text = "The dragon flew over the quiet valley at dawn, " ++
+    "and the people of the old town looked up from their fields. " ++
+    "Tell me a story about what they saw next, " ++
+    "and why the river turned silver before the bells rang at noon. " ++
+    "The miller counted the boats, the children ran to the bridge, and nobody spoke. " ++
     "At dusk the dragon came back, and it carried a lantern in its claws.";
 const n_prompt: usize = 70;
 const n_decode: usize = 8;
@@ -70,7 +74,7 @@ fn decodeTail(
 }
 
 /// The per-token reference: `step` over every prompt id at one thread.
-fn referenceLeg(
+fn referencePath(
     comptime Runner: type,
     arena: std.mem.Allocator,
     loaded: *const loader.Loaded,
@@ -103,7 +107,7 @@ fn referenceLeg(
 
 /// The chunked path: `prefillBatch` in chunks of `chunk` rows on a runner that
 /// holds the production row scratch.
-fn chunkedLeg(
+fn chunkedPath(
     comptime Runner: type,
     arena: std.mem.Allocator,
     loaded: *const loader.Loaded,
@@ -150,10 +154,10 @@ fn expectChunksMatch(
     loaded: *const loader.Loaded,
 ) !void {
     const ids = try promptIds(arena, loaded);
-    const ref = try referenceLeg(Runner, arena, loaded, ids);
+    const ref = try referencePath(Runner, arena, loaded, ids);
     for ([_]test_policy.Policy{ serial_policy, forced_policy }) |policy| {
         for (chunk_sizes) |chunk| {
-            const got = try chunkedLeg(Runner, arena, loaded, ids, chunk, policy);
+            const got = try chunkedPath(Runner, arena, loaded, ids, chunk, policy);
             // Bytes, not floats: the claim is bit identity, NaN included.
             try std.testing.expectEqualSlices(
                 u8,

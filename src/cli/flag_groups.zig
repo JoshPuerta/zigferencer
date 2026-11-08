@@ -1,8 +1,10 @@
-//! The flag values that several commands share. `EngineFlags` holds the options of an engine boot,
-//! and `run`, `serve`, `serve-openai`, and the benches nest it, so each option has one flag name
-//! and
+//! The flag values that several commands share. `EngineFlags` holds the options of an engine boot.
+//! `run`, `serve`, `serve-openai`, and the benches nest it, so each option has one flag name and
 //! one help text. A command that does not take an option names it in `omit`. `ServeFlags` adds the
 //! options of `serve` and `serve-openai`. The docs follow the help dialect in `command.zig`.
+//!
+//! Comptime. Help text builds at comptime from the flag structs and the limits, so the numbers
+//! cannot drift.
 
 const std = @import("std");
 
@@ -57,8 +59,8 @@ pub const EngineDocs = struct {
         },
         .max_seq = Doc{
             .group = "kv",
-            .text = "KV positions per session, 1..the model ceiling. A window larger\nthan " ++
-                "VRAM needs --gpu-layers, which keeps the KV of the host\nlayers in RAM",
+            .text = "KV positions per session, 1..the model ceiling. A window larger\n" ++
+                "than VRAM needs --gpu-layers, which keeps the KV of the host\nlayers in RAM",
             .default = windowDefault(limits.run_session_kv_bytes),
         },
         .gpu_layers = Doc{
@@ -97,8 +99,8 @@ pub const ServeFlags = struct {
     pub const docs = .{
         .max_seq = Doc{
             .group = "kv",
-            .text = "KV positions per session. A window larger than VRAM " ++
-                "needs\n--gpu-layers, which keeps the KV of the host layers in RAM",
+            .text = "KV positions per session. A window larger than VRAM needs\n" ++
+                "--gpu-layers, which keeps the KV of the host layers in RAM",
             .default = windowDefault(limits.serve_session_kv_bytes),
         },
         .gpu_layers = Doc{
@@ -131,16 +133,17 @@ pub const ServeFlags = struct {
         },
         .prefill_chunk = Doc{
             .group = "sessions",
-            .text = "prompt tokens prefilled per pass. Unset, a pass with no decode\nrow " ++
-                "takes a full runner row width and a pass with decode rows\ntakes the spare " ++
-                "ones. 0 = always the spare decode rows\n(max-batch minus decode rows)",
+            .text = "prompt tokens prefilled per pass. Unset, a pass with no decode\n" ++
+                "row takes a full runner row width and a pass with decode rows\n" ++
+                "takes the spare ones. 0 = always the spare decode rows\n" ++
+                "(max-batch minus decode rows)",
             .default = "unset",
         },
         .vram_slots = Doc{
             .group = "gpu (fused-GPU build only)",
             .text = std.fmt.comptimePrint(
-                "physical VRAM KV slots, 1..{d}, sized weights-aware. Below\n--max-sessions " ++
-                    "it swaps idle KV to RAM",
+                "physical VRAM KV slots, 1..{d}, sized weights-aware. Below\n" ++
+                    "--max-sessions it swaps idle KV to RAM",
                 .{limits.max_vram_slots},
             ),
             .default = "--max-sessions",
@@ -148,8 +151,8 @@ pub const ServeFlags = struct {
         .kv_vram = Doc{
             .group = "kv",
             .value = "MiB",
-            .text = "VRAM the KV economy can spend. It buys the slots, so it\nexcludes " ++
-                "--vram-slots. fused-GPU build only",
+            .text = "VRAM the KV economy can spend. It buys the slots, so it\n" ++
+                "excludes --vram-slots. fused-GPU build only",
         },
         .kv_ram = Doc{
             .group = "kv",
@@ -161,17 +164,17 @@ pub const ServeFlags = struct {
         .prefix_disk = Doc{
             .group = "kv",
             .value = "MiB",
-            .text = "disk ceiling for prefix-cache entries. They survive\nrestarts " ++
-                "($ZIGFERENCER_CACHE_DIR)",
+            .text = "disk ceiling for prefix-cache entries. They survive\n" ++
+                "restarts ($ZIGFERENCER_CACHE_DIR)",
             .default = "off",
         },
         .preload = Doc{
             .group = "kv",
             .value = "FILE",
             .text = std.fmt.comptimePrint(
-                "prefill the text of FILE (a system prompt) into the prefix\ncache at boot, " ++
-                    "so the first session that opens with it\nstarts warm. Repeatable, up " ++
-                    "to {d} files",
+                "prefill the text of FILE (a system prompt) into the prefix\n" ++
+                    "cache at boot, so the first session that opens with it\nstarts warm. " ++
+                    "Repeatable, up to {d} files",
                 .{limits.serve_preload_max},
             ),
         },
@@ -183,14 +186,14 @@ pub const ServeFlags = struct {
 /// The default text of `--max-seq` for a session budget of `bytes`.
 fn windowDefault(comptime bytes: u64) []const u8 {
     return std.fmt.comptimePrint(
-        "the {d} MiB session budget, capped by the model ceiling.\nOn the fused-GPU build, " ++
-            "a default shrinks to fit the device\nbuffer limits and the free VRAM",
+        "the {d} MiB session budget, capped by the model ceiling.\n" ++
+            "On the fused-GPU build, a default shrinks to fit the device\n" ++
+            "buffer limits and the free VRAM",
         .{bytes >> 20},
     );
 }
 
-/// The decimal digits of `v` in groups of three, joined by `_`, the way the
-/// Zig source writes the constant.
+/// The decimal digits of `v` in groups of three, joined by `_`, as Zig source writes them.
 fn groupDigits(comptime v: u64) []const u8 {
     comptime {
         const plain = std.fmt.comptimePrint("{d}", .{v});

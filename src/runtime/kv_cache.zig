@@ -5,6 +5,8 @@
 //! Ops never see the struct. They get plain typed K/V slices for the current decode step, because
 //! boundaries are values.
 //!
+//! Comptime. `E` names the element type of a view, and one tag check ties it to the cache dtype.
+//!
 //! Tag. The slab is bytes tagged with the element type it was framed at. The `As` accessors take
 //! that element type and hand back a typed view, and they assert against the tag. A view at any
 //! other type is a framing bug. The f32-named accessors are the same views pinned to f32. The

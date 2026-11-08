@@ -71,7 +71,7 @@ pub const cache_dir_env = "ZIGFERENCER_CACHE_DIR";
 
 const default_cache_dir = ".prompt_cache";
 
-/// Magic and version of the snapshot file. See "Disk file" in the header.
+/// Magic and version of the snapshot file.
 const magic: u32 = 0x315A4B5A; // "ZKV1"
 
 const version: u32 = 1;
@@ -101,7 +101,7 @@ const Entry = struct {
     blob: []u8, // owned snapshot bytes (opaque to the cache)
     last_logits: []f32, // owned, logits of token n-1 (sample first output, 0 forwards)
     last_used: u64, // LRU tick
-    hits: u64 = 0, // longest-prefix queries served. See "Prefix hits" in the header.
+    hits: u64 = 0, // longest-prefix queries served
 };
 
 /// One row of the disk index: the key and the prefix tokens of a file, never the blob.
@@ -141,7 +141,7 @@ pub const PromptCache = struct {
     }
 
     /// Enable the disk tier: create `dir` (cwd-relative) and record the budget and fingerprint.
-    /// `dir` must outlive the cache. See "Namespaces" in the header.
+    /// `dir` must outlive the cache.
     pub fn enableDisk(
         self: *PromptCache,
         io: Io,
@@ -313,7 +313,7 @@ pub const PromptCache = struct {
     // -- the disk index -----------------------------------------------------
 
     /// Build the disk index: one row per `.zkv` file of this namespace. Best-effort, because a
-    /// missing row is a cache miss. See "Disk index" in the header.
+    /// missing row is a cache miss.
     pub fn loadDiskIndex(self: *PromptCache) void {
         const io = self.io orelse return;
         var dir = Io.Dir.cwd().openDir(io, self.dir.?, .{ .iterate = true }) catch return;
@@ -401,7 +401,7 @@ pub const PromptCache = struct {
     // -- admission ----------------------------------------------------------
 
     /// Admit a snapshot for `tokens` to each tier that `worthwhile` accepts.
-    /// Returns true when the snapshot reached at least one tier. See "Admission" in the header.
+    /// Returns true when the snapshot reached at least one tier.
     pub fn admit(
         self: *PromptCache,
         key: u64,
@@ -699,7 +699,7 @@ pub const PromptCache = struct {
     }
 
     /// Evict the oldest own file by mtime until this namespace plus `need` fits `disk_budget`.
-    /// Best-effort: a directory error stops the eviction. See "Namespaces" in the header.
+    /// Best-effort: a directory error stops the eviction.
     fn diskEvictToFit(self: *PromptCache, need: usize) void {
         const io = self.io orelse return;
         var scan = self.scanOwnNamespace(io) orelse return;

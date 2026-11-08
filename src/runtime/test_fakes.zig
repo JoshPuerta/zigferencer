@@ -4,6 +4,8 @@
 //! logits. Test code imports this file. The root module re-exports it only for the tests under
 //! `tests/`.
 //!
+//! Comptime. Asserts pin the test windows to the model context limit.
+//!
 //! Fake model. The model is a pure function of the token of each row: argmax of the logits of row
 //! i is `(rows[i].token + 1) % vocab`. Greedy parameters then give fully predictable streams, so a
 //! reader derives every expected stream by hand. Each fake keeps its own hooks, such as a row log,

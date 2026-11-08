@@ -109,8 +109,8 @@ pub fn benchFanoutCost(gpa: std.mem.Allocator, io: std.Io) !void {
 
     // Print the table header.
     std.debug.print(
-        "\nzigferencer bench: parallel dispatch cost of linearBatch (pool path, near-empty " ++
-            "kernel)\n",
+        "\nzigferencer bench: parallel dispatch cost of linearBatch (pool path, " ++
+            "near-empty kernel)\n",
         .{},
     );
     std.debug.print(

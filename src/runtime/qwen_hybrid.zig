@@ -1,7 +1,9 @@
 //! `QwenHybridRunner` splits one Qwen3.5 forward pass across both executors. A `QwenRunner` runs
-//! the layer prefix `[0..split)` on the CPU. A `QwenFusedRunner` runs the suffix
-//! `[split..n_layers)`, the final norm, and the lm_head on the GPU. The budget planner picks
+//! the layer prefix `[0..host_layers)` on the CPU. A `QwenFusedRunner` runs the suffix
+//! `[host_layers..n_layers)`, the final norm, and the lm_head on the GPU. The budget planner picks
 //! `split` so the device suffix fits the VRAM budget.
+//!
+//! Comptime. A build gate stops the compiler when a non-Vulkan build includes this file.
 //!
 //! Composition. `QwenRunner.initPrefix` builds the host prefix, and the hidden-row entry points of
 //! `QwenFusedRunner` take the crossing rows. This file records no dispatch and copies no layer
@@ -12,7 +14,7 @@
 //! third buffer exists. The CPU prefix runs the whole batch before the one crossing. So the GDN
 //! recurrence sees time order on both tiers.
 //!
-//! Split bounds. The two degenerate placements are whole-model runners, and the CLI dispatches them
+//! Split bounds. The two degenerate splits are whole-model runners, and the CLI dispatches them
 //! to `QwenRunner` and `QwenFusedRunner` directly. A hybrid that accepted them holds a second
 //! construction of each. No gate reaches it, and no token hash covers it.
 //!
@@ -74,14 +76,14 @@ comptime {
 pub const QwenHybridRunner = struct {
     gpa: Allocator,
 
-    /// The host layers `[0..split)`, which live in `prefix_arena`, so `deinit` reclaims them in one
-    /// call.
+    /// The host layers `[0..host_layers)`, which live in `prefix_arena`, so `deinit` reclaims them
+    /// in one call.
     prefix: QwenRunner,
     prefix_arena: std.heap.ArenaAllocator,
-    /// The device layers `[split..n_layers)`, the final norm, and the lm_head.
+    /// The device layers `[host_layers..n_layers)`, the final norm, and the lm_head.
     suffix: *QwenFusedRunner,
 
-    split: u32,
+    host_layers: u32,
     n_layers: u32,
     hidden: u32,
     card: loader.ModelCard,
@@ -103,13 +105,13 @@ pub const QwenHybridRunner = struct {
     /// swaps.
     swap_priced: bool,
 
-    /// Both tiers hold GDN slabs. See "Slot state" in the header.
+    /// Both tiers hold GDN slabs.
     pub const has_recurrent_state = true;
 
     /// The `run` command batches the prompt through `prefillBatch`, as serve and bench-model do.
     pub const chunked_prefill: bool = true;
 
-    /// The literal frame of a placement tag, which the bound and the format share.
+    /// The literal frame of a provenance tag, which the bound and the format share.
     const tag_prefix = "vulkan_hybrid_qwen:k=";
 
     /// The one weight element the qwen family stages: `qwen_fused` refuses any other dtype at
@@ -122,7 +124,7 @@ pub const QwenHybridRunner = struct {
         std.fmt.comptimePrint("{d}", .{std.math.maxInt(u32)}).len + 1 +
         quant_tag.len + dtype.kv_tag_suffix_max;
 
-    /// The snapshot-provenance tag of a qwen hybrid placement. See "Disk namespace" in the header.
+    /// The snapshot-provenance tag of a qwen hybrid placement.
     /// `buf` must hold `backend_tag_buf_len` bytes, the bound that makes the format infallible.
     pub fn backendTag(buf: []u8, split: u32, kv_dtype: dtype.KvDtype) []const u8 {
         std.debug.assert(buf.len >= backend_tag_buf_len);
@@ -143,19 +145,19 @@ pub const QwenHybridRunner = struct {
         gpa: Allocator,
         ctx: *const vulkan_ctx.Context,
         loaded: *const loader.Loaded,
-        plan: kv_budget.PlacementPlan,
+        plan: kv_budget.LayerSplit,
         io: std.Io,
         pool: *Pool,
         policy: parallel.Policy,
         kv_dtype: dtype.KvDtype,
     ) !*QwenHybridRunner {
-        // Name the placement.
+        // Name the split.
         const card = loaded.card;
-        const split: u32 = plan.split;
+        const split: u32 = plan.host_layers;
         const n_layers: u32 = plan.n_layers;
         std.debug.assert(n_layers == card.n_layers);
 
-        // A degenerate split belongs to a whole-model runner. See "Split bounds" in the header.
+        // A degenerate split belongs to a whole-model runner.
         std.debug.assert(split >= 1);
         std.debug.assert(split < n_layers);
 
@@ -181,7 +183,7 @@ pub const QwenHybridRunner = struct {
         );
         std.debug.assert(plan.ram.host_kv == plan.kv_host);
 
-        // Check the swap stages. See "Swap stages" in the header.
+        // Check the swap stages.
         const stage_one = blobSpanBytes(card, kv_dtype, plan.window, split, n_layers);
         std.debug.assert(stage_one == device_span);
         const swap_priced = plan.ram.swap_stages == 2 * kv_budget.stageBytes(stage_one);
@@ -216,7 +218,7 @@ pub const QwenHybridRunner = struct {
             .prefix = undefined,
             .prefix_arena = .init(gpa),
             .suffix = suffix,
-            .split = split,
+            .host_layers = split,
             .n_layers = n_layers,
             .hidden = card.embedding_length,
             .card = card,
@@ -243,7 +245,7 @@ pub const QwenHybridRunner = struct {
             kv_dtype,
         );
 
-        // The prefix allocated what the planner priced for `[0..split)`: one slot's KV at the
+        // The prefix allocated what the planner priced for `[0..host_layers)`: one slot's KV at the
         // window plus its GDN slabs. The suffix ran the same check on its own range.
         std.debug.assert(self.prefix.evictSlotBytesFor(plan.window) == host_span);
         std.debug.assert(self.prefix.maxStepRows() >= suffix.maxStepRows());
@@ -280,9 +282,9 @@ pub const QwenHybridRunner = struct {
 
     // -- step ---------------------------------------------------------------
 
-    /// Run the CPU prefix over `rows`: embed, then layers `[0..split)`. The crossing activations
-    /// stay in `prefix.x`. `embedLookup` is the naive function on every op backend, as in
-    /// `QwenRunner.stepBatch`.
+    /// Run the CPU prefix over `rows`: embed, then layers `[0..host_layers)`. The crossing
+    /// activations stay in `prefix.x`. `embedLookup` is the naive function on every op backend, as
+    /// in `QwenRunner.stepBatch`.
     fn hostPrefix(self: *QwenHybridRunner, rows: []const StepRow) qwen_runner.Error!void {
         const sp = span.beginHot(.host_prefix);
         defer sp.end();
@@ -295,7 +297,7 @@ pub const QwenHybridRunner = struct {
         }
 
         var l: u32 = 0;
-        while (l < self.split) : (l += 1) {
+        while (l < self.host_layers) : (l += 1) {
             self.prefix.layerForward(l, rows);
         }
     }
@@ -320,7 +322,7 @@ pub const QwenHybridRunner = struct {
     }
 
     /// Advance a batch of rows under the rules of `QwenRunner.stepBatch`, with compact logits for
-    /// the `want_logits` suffix. See "Crossing" in the header.
+    /// the `want_logits` suffix.
     pub fn stepBatch(self: *QwenHybridRunner, rows: []const StepRow) !void {
         // The row rules bind the prefix drive too, so the check runs ahead of the first host layer.
         _ = try step_row.validateRows(rows, self.n_slots, self.maxStepRows(), self.max_seq);
@@ -379,7 +381,7 @@ pub const QwenHybridRunner = struct {
     }
 
     // -- tiered kv ----------------------------------------------------------
-    // Evict a slot to a host blob, and restore it back. See "Blob" in the header.
+    // Evict a slot to a host blob, and restore it back.
 
     /// Bytes the state of one slot occupies in a blob over the absolute layer range `[from..to)` at
     /// `n_rows` committed positions. It is the `slotSpanBytes` of the planner with the row count in
@@ -404,10 +406,10 @@ pub const QwenHybridRunner = struct {
     /// runner against the whole-model walk, so neither direction can drift from the other.
     fn seam(self: *const QwenHybridRunner, n_rows: u32, blob_len: usize) usize {
         const host: usize = @intCast(
-            blobSpanBytes(self.card, self.kv_dtype, n_rows, 0, self.split),
+            blobSpanBytes(self.card, self.kv_dtype, n_rows, 0, self.host_layers),
         );
         const device: usize = @intCast(
-            blobSpanBytes(self.card, self.kv_dtype, n_rows, self.split, self.n_layers),
+            blobSpanBytes(self.card, self.kv_dtype, n_rows, self.host_layers, self.n_layers),
         );
         std.debug.assert(host == @as(usize, @intCast(self.prefix.evictSlotBytesFor(n_rows))));
         std.debug.assert(device == @as(usize, @intCast(self.suffix.evictSlotBytesFor(n_rows))));
@@ -432,7 +434,7 @@ pub const QwenHybridRunner = struct {
         try self.prefix.evictSlot(slot, n_rows, out[0..at]);
         try self.suffix.evictSlot(slot, n_rows, out[at..]);
         log_kv.debug("evict slot {d}: {d} rows, {d} KiB ({d} host + {d} gpu layers)", .{
-            slot, n_rows, out.len / 1024, self.split, self.n_layers - self.split,
+            slot, n_rows, out.len / 1024, self.host_layers, self.n_layers - self.host_layers,
         });
     }
 
@@ -448,7 +450,7 @@ pub const QwenHybridRunner = struct {
         try self.prefix.restoreSlot(slot, n_rows, blob[0..at]);
         try self.suffix.restoreSlot(slot, n_rows, blob[at..]);
         log_kv.debug("restore slot {d}: {d} rows, {d} KiB ({d} host + {d} gpu layers)", .{
-            slot, n_rows, blob.len / 1024, self.split, self.n_layers - self.split,
+            slot, n_rows, blob.len / 1024, self.host_layers, self.n_layers - self.host_layers,
         });
     }
 };
@@ -531,7 +533,7 @@ test "qwen split: a mid split prices each tier by the layers it holds" {
         .weights = 0,
         .logits = 0,
         .model_ctx = card.context_length,
-        // The placement planner reads neither default window.
+        // The layer split planner reads neither default window.
         .serve_default = limits.min_kv_window,
         .default_ceil = limits.min_kv_window,
     };
@@ -544,7 +546,7 @@ test "qwen split: a mid split prices each tier by the layers it holds" {
     var table: [limits.max_layers]u64 = undefined;
     // Twelve GPU layers leave the split at 12, and each half holds three
     // attention layers and nine recurrent ones.
-    const plan = try kv_budget.placementPlan(
+    const plan = try kv_budget.planLayerSplit(
         caps,
         tensor_lookup.layerWeightBytes(&refs, card.n_layers, &table),
         tensor_lookup.headWeightBytes(&refs),
@@ -556,14 +558,14 @@ test "qwen split: a mid split prices each tier by the layers it holds" {
         12,
     );
     const half: u64 = @as(u64, kv.n_slots) * (@as(u64, kv.window) * 3 * 4_096 + 9 * 1_122_304);
-    try std.testing.expectEqual(@as(u32, 12), plan.split);
+    try std.testing.expectEqual(@as(u32, 12), plan.host_layers);
     try std.testing.expectEqual(half, plan.kv_vram);
     try std.testing.expectEqual(half, plan.kv_host);
     // The boundary the runner walks is the same span the planner priced, which is
     // the equality `init` asserts before it allocates.
     try std.testing.expectEqual(
-        kv_budget.slotSpanBytes(kv, 0, plan.split),
-        QwenHybridRunner.blobSpanBytes(card, kv_dtype, kv.window, 0, plan.split),
+        kv_budget.slotSpanBytes(kv, 0, plan.host_layers),
+        QwenHybridRunner.blobSpanBytes(card, kv_dtype, kv.window, 0, plan.host_layers),
     );
     // The resident weights are the suffix layers plus the head the suffix runs.
     try std.testing.expectEqual(@as(u64, 12 * 1024 + 4096 + 1024), plan.weight_resident);
@@ -571,7 +573,7 @@ test "qwen split: a mid split prices each tier by the layers it holds" {
     // half when that is smaller.
     try std.testing.expectEqual(
         2 * kv_budget.stageBytes(
-            QwenHybridRunner.blobSpanBytes(card, kv_dtype, kv.window, plan.split, 24),
+            QwenHybridRunner.blobSpanBytes(card, kv_dtype, kv.window, plan.host_layers, 24),
         ),
         plan.ram.swap_stages,
     );

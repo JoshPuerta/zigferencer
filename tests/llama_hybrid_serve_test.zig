@@ -108,7 +108,7 @@ fn initHybrid(
     );
     const kv_costs = zigferencer.kv_cost.llamaCostVector(card, kv_dtype);
     var table: [limits.max_layers]u64 = undefined;
-    const plan = kv_budget.placementPlan(
+    const plan = kv_budget.planLayerSplit(
         caps,
         tensor_lookup.layerWeightBytes(loaded.tensors, n_layers, &table),
         tensor_lookup.headWeightBytes(loaded.tensors),
@@ -135,8 +135,8 @@ fn initHybrid(
         error.VramBudgetExceeded => return error.SkipZigTest,
         else => return e,
     };
-    std.debug.assert(hybrid.split > 0);
-    std.debug.assert(hybrid.split < hybrid.n_layers);
+    std.debug.assert(hybrid.host_layers > 0);
+    std.debug.assert(hybrid.host_layers < hybrid.n_layers);
     return hybrid;
 }
 
@@ -240,7 +240,7 @@ fn expectSameStreams(reference: []const Stream, got: []const Stream) !void {
 }
 
 /// The over-subscription round trip at one KV dtype. A swapped stream must equal an unswapped
-/// stream, against the solo references of the same dtype. See "Tests" in the header.
+/// stream, against the solo references of the same dtype.
 fn overSubscribedRoundTrip(kv_dtype: dtype.KvDtype) !void {
     const io = std.testing.io;
     const gpa = std.testing.allocator;

@@ -85,9 +85,8 @@ fn runLinearQ80Check(
     const out_cpu = try allocator.alloc(f32, out_features);
     defer allocator.free(out_cpu);
 
-    // `@sin(i)` is the input pattern of the linear bench cases in
-    // tools/bench.zig. The same pattern keeps the numerics in a realistic
-    // range without adversarial values.
+    // `@sin(i)` is the input pattern of the linear bench cases in tools/bench.zig. It keeps
+    // the numerics in a realistic range.
     for (input, 0..) |*v, i| {
         v.* = @sin(@as(f32, @floatFromInt(i)));
     }

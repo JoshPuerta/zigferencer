@@ -1,6 +1,8 @@
 //! A Vulkan `Context` and the compute pipelines that act on it, kept together at a fixed heap
 //! address.
 //!
+//! Comptime. A build gate stops the compiler when a non-Vulkan build includes this file.
+//!
 //! Stable address. Every GPU kernel captures `*const Context` at init time, so the address of that
 //! Context must not change while a kernel holds the pointer. `LinearQ80.init` stores `&ctx`. A
 //! `ctx` can move: a factory returns it by value, or a call copies it across a function boundary.

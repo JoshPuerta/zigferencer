@@ -1,5 +1,8 @@
 //! Fidelity gate for the Vulkan attention kernels.
 //!
+//! Comptime. The cases are generic over the element type, so f32 and f16 share one body. Asserts
+//! pin the depth tables and the stream count.
+//!
 //! Tolerance. Each kernel must stay inside a 2e-3 relative tolerance against the CPU reference, the
 //! same tolerance the bench declares. The gate reads the maximum relative error over the whole
 //! output, so a metric artifact cannot hide a regression. The tests return `error.SkipZigTest` when
@@ -194,9 +197,8 @@ fn Case(comptime T: type) type {
             const parts = try allocator.alloc(f32, parts_len);
             defer allocator.free(parts);
 
-            // The generator matches the bench: small-magnitude trig, so the
-            // softmax never overflows and the reference path stays well
-            // defined. At f16 each value rounds once to the cache type.
+            // The generator matches the bench: small trig values keep the softmax finite.
+            // At f16 each value rounds once to the cache type.
             for (q, 0..) |*x, i| {
                 x.* = @sin(@as(f32, @floatFromInt(i)) * 0.07);
             }
@@ -243,9 +245,8 @@ fn worstRelative(ref: []const f32, got: []const f32) Worst {
     std.debug.assert(ref.len == got.len);
     std.debug.assert(ref.len >= 1);
 
-    // The 1e-5 floor on the denominator matches `computeErrors` in
-    // tools/bench.zig. The floor stops a near-zero cancellation output from
-    // dominating the relative error.
+    // The 1e-5 floor on the denominator matches `computeErrors` in tools/bench.zig. It stops
+    // a near-zero cancellation output from dominating the relative error.
     const abs_floor: f32 = 1e-5;
     var worst: Worst = .{ .rel = 0, .idx = 0 };
     for (ref, got, 0..) |r, g, i| {
@@ -292,8 +293,8 @@ fn runAttentionCheck(
         const h: usize = worst.idx / s.head_dim;
         const d_in_head: usize = worst.idx % s.head_dim;
         std.debug.print(
-            "{s} kv={s} t_len={d}: max_rel={e:.3} > tol={e:.3} at out[{d}] (h={d}, d={d}) " ++
-                "ref={d} gpu={d}\n",
+            "{s} kv={s} t_len={d}: max_rel={e:.3} > tol={e:.3} at out[{d}] (h={d}, " ++
+                "d={d}) ref={d} gpu={d}\n",
             .{
                 s.label,
                 @typeName(T),
@@ -490,10 +491,10 @@ const split_digests: [digest_geometries.len][digest_kv.len][digest_depths.len]?u
 };
 
 /// Digest the split output of every geometry, KV type, and depth, and compare
-/// each digest with the table. The kit of the build must sum in the
+/// each digest with the table. The kernel set of the build must sum in the
 /// `.split_ascending` order, because only that order promises fixed bytes.
 fn runSplitDigests() !void {
-    if (zigferencer.ops_vulkan.AttnKit.order != .split_ascending) return error.SkipZigTest;
+    if (zigferencer.ops_vulkan.AttnKernels.order != .split_ascending) return error.SkipZigTest;
 
     const allocator = std.testing.allocator;
     const runner = try openRunner(allocator);
@@ -610,9 +611,8 @@ fn fillNeedleRow(q_row: []f32, g: Geometry, k: []const f32, p: u32, seed: u64) v
     std.debug.assert(q_row.len == g.rowElems());
     std.debug.assert((@as(usize, p) + 2) * g.kvElems() <= k.len);
 
-    // A K value uniform in [-1, 1) has a mean square of 1/3. The score of
-    // position p is then near c * head_dim / 3 / sqrt(head_dim), and this c
-    // sets that score to needle_score.
+    // A K value uniform in [-1, 1) has a mean square of 1/3, so the score of position p is near
+    // c * head_dim / 3 / sqrt(head_dim). This c sets that score to needle_score.
     const hd: f32 = @floatFromInt(g.head_dim);
     const c = 3 * needle_score / @sqrt(hd);
     const group = g.n_heads / g.n_kv_heads;
@@ -799,7 +799,7 @@ const ChunkData = struct {
     }
 };
 
-/// Every attention pipeline of one KV element type behind the attention kit,
+/// Every attention pipeline of one KV element type behind the attention kernel set,
 /// as a runner holds them, with the sets that a prefill chunk binds and the
 /// host buffers they bind. K and V hold one stream, the slot 0 of a runner.
 const PrefillRig = struct {
@@ -950,13 +950,13 @@ const PrefillRig = struct {
             self.merge_set.desc_set,
             &.{ scratch_info, out_info },
         );
-        const kit: zigferencer.ops_vulkan.AttnKit = .{
+        const kernels: zigferencer.ops_vulkan.AttnKernels = .{
             .single = &self.single,
             .multi = &self.multi,
             .passes = &self.split,
             .batch = &self.batch,
         };
-        const binding: zigferencer.ops_vulkan.AttnKit.Binding = .{
+        const binding: zigferencer.ops_vulkan.AttnKernels.Binding = .{
             .shape = .{
                 .n_heads = g.n_heads,
                 .n_kv_heads = g.n_kv_heads,
@@ -971,8 +971,8 @@ const PrefillRig = struct {
         const cb = self.batch_set.cmd_buffer;
         try begin(self.ctx, cb);
         zigferencer.attn_record.recordPrefill(
-            zigferencer.ops_vulkan.AttnKit,
-            kit,
+            zigferencer.ops_vulkan.AttnKernels,
+            kernels,
             cb,
             plan,
             binding,
@@ -1646,9 +1646,8 @@ fn runStreamChecks(
         try expectStreamRows(g, "resident shifted", kv, t_len, &shifted, ref, got);
     }
 
-    // Split rows, recorded as a runner records them: one group of four rows
-    // that read their own streams, then a second group that reuses scratch
-    // row 0 for a row whose q row and stream differ.
+    // Split rows as a runner records them: one group of four rows on their own streams, then a
+    // group that reuses scratch row 0 for a row whose q row and stream differ.
     const extra: Pair = .{ .q_row = 3, .stream = 1, .out_row = n_streams };
     const split_pairs = own ++ [_]Pair{extra};
     const deep_scratch = zigferencer.attn_split.Scratch.init(g.n_heads, g.head_dim, deep_depth);

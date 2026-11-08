@@ -1,19 +1,20 @@
-//! The flag parser of every command. A field `snake_case`
-//! is the flag `--snake-case`, and the field default is the flag default. The
-//! same struct generates the flag lines of the `--help` text, so the parse and
-//! the help cannot drift.
+//! The flag parser of every command. A field `snake_case` is the flag `--snake-case`, and the field
+//! default is the flag default.
 //!
-//! A command type declares `help` (the usage line, the prose, the footer) and
-//! `docs` (one `Doc` per flag). It can declare `positional`, the name of one
-//! `?[]const u8` field that takes the one bare argument, and `omit`, nested
-//! fields that the command does not take. A doc of the command replaces the doc
-//! of a nested type for one field, so a shared option keeps one name and can
-//! state a default of its own command. A type can also name `docs_from`, a
-//! type whose `docs` cover nested fields that carry no help of their own.
+//! Comptime. `parseInto` walks the flag struct, so one struct states the flags, the parser, and the
+//! help.
 //!
-//! Every error prints one `error:` line to stderr and returns
-//! `error.UsageError`. `main` exits cleanly on that error, with no developer
-//! stack trace. The full usage block belongs to `--help`.
+//! Declarations. A command type declares `help` (the usage line, the prose, the footer) and
+//! `docs` (one `Doc` per flag). It can declare `positional`, the name of one `?[]const u8` field
+//! that takes the one bare argument, and `omit`, nested fields that the command does not take.
+//!
+//! Doc lookup. A doc of the command replaces the doc of a nested type for one field, so a shared
+//! option keeps one name and can state a default of its own command. A type can also name
+//! `docs_from`, a type whose `docs` cover nested fields that carry no help of their own.
+//!
+//! Errors. Every error prints one `error:` line to stderr and returns `error.UsageError`. `main`
+//! exits cleanly on that error, with no developer stack trace. The full usage block belongs to
+//! `--help`.
 
 const std = @import("std");
 const Io = std.Io;
@@ -150,9 +151,8 @@ fn Base(comptime F: type) type {
 
 // -- api --------------------------------------------------------------------
 
-/// Parse `ctx.args` into a value of `T`. A `--help` or `-h` prints the help of
-/// `T` to stdout and returns null. A bad invocation prints one `error:` line
-/// and returns `error.UsageError`. `ctx` is a `cli.Context`.
+/// Parse `ctx.args` into a value of `T`. A `--help` or `-h` prints the help and returns null.
+/// A bad invocation prints one `error:` line and returns `error.UsageError`.
 pub fn parseInto(comptime T: type, ctx: anytype) error{UsageError}!?T {
     var diag: Diag = .{};
     return parse(T, ctx.args, &diag) catch |err| switch (err) {
@@ -164,8 +164,7 @@ pub fn parseInto(comptime T: type, ctx: anytype) error{UsageError}!?T {
     };
 }
 
-/// Fill a value of `T` from `argv`, a slice of byte slices. The parse writes
-/// nothing. An error leaves its message in `diag`.
+/// Fill a value of `T` from `argv`. The parse writes nothing. An error leaves its text in `diag`.
 pub fn parse(comptime T: type, argv: anytype, diag: *Diag) error{ UsageError, Help }!T {
     comptime validate(T);
 
@@ -223,8 +222,7 @@ pub fn helpBody(comptime T: type) []const u8 {
     }
 }
 
-/// Print the help of `T` to `file`: stdout when the user asked for it, stderr
-/// when a usage error shows it. A failed write has nowhere to go.
+/// Print the help of `T` to `file`: stdout on request, stderr after a usage error.
 pub fn printHelp(comptime T: type, io: Io, file: Io.File, p: style.Palette) void {
     const body = comptime helpBody(T);
 
@@ -237,9 +235,8 @@ pub fn printHelp(comptime T: type, io: Io, file: Io.File, p: style.Palette) void
     w.flush() catch return;
 }
 
-/// Write `bytes` to stderr for usage text and diagnostics. The function discards a
-/// failed write, like `std.debug.print`. A broken stderr must not turn a usage
-/// line into a `WriteFailed` that the caller carries back up to `main`.
+/// Write `bytes` to stderr and discard a failed write, like `std.debug.print`. A broken stderr
+/// must not turn a usage line into a `WriteFailed` that reaches `main`.
 pub fn writeStderr(io: Io, bytes: []const u8) void {
     var stderr_buffer: [stderr_buffer_bytes]u8 = undefined;
     var stderr_writer: Io.File.Writer = .initStreaming(.stderr(), io, &stderr_buffer);
@@ -249,8 +246,7 @@ pub fn writeStderr(io: Io, bytes: []const u8) void {
     w.flush() catch {};
 }
 
-/// Print `error: <msg>` to stderr and return `error.UsageError`. The parser and
-/// the validation of each command both call it, so every refusal reads the same.
+/// Print `error: <msg>` to stderr and return `error.UsageError`, so every refusal reads the same.
 pub fn fail(io: Io, comptime fmt: []const u8, fmtargs: anytype) error{UsageError} {
     var stderr_buffer: [stderr_buffer_bytes]u8 = undefined;
     var stderr_writer: Io.File.Writer = .initStreaming(.stderr(), io, &stderr_buffer);
@@ -403,8 +399,7 @@ fn choiceSeparator(comptime index: usize, comptime count: usize) []const u8 {
     return if (count == 2) " or " else ", or ";
 }
 
-/// The refusal of a token that no flag takes. A known flag with `=value` gets
-/// the spelling that works, because the parser reads the value as the next token.
+/// The refusal of a token that no flag takes. A known flag with `=value` gets the working spelling.
 fn failUnknown(comptime T: type, token: []const u8, diag: *Diag) error{UsageError} {
     const eq = std.mem.findScalar(u8, token, '=') orelse
         return diag.fail("unknown flag '{s}'", .{token});
@@ -476,8 +471,7 @@ fn flagLines(comptime e: Entry, comptime width: usize) []const u8 {
     }
 }
 
-/// The `[default: X]` text after the description. A default that runs past the
-/// right margin starts its own line.
+/// The `[default: X]` text after the description. A default past the right margin starts a line.
 fn defaultSuffix(comptime e: Entry, comptime width: usize) []const u8 {
     comptime {
         if (e.default.len == 0) return "";
@@ -634,9 +628,8 @@ fn isPositional(comptime Container: type, comptime name: []const u8) bool {
     return @hasDecl(Container, "positional") and std.mem.eql(u8, Container.positional, name);
 }
 
-/// The doc of field `name`. `scopes` runs from the command type down to the
-/// type that holds the field, and the outermost doc wins, so a command can
-/// restate a shared option.
+/// The doc of field `name`. `scopes` runs from the command type down to the holder, and the
+/// outermost doc wins.
 fn docFor(comptime scopes: []const type, comptime name: []const u8) Doc {
     for (scopes) |S| {
         if (@hasDecl(S, "docs") and @hasField(@TypeOf(S.docs), name)) {
@@ -653,9 +646,8 @@ fn docFor(comptime scopes: []const type, comptime name: []const u8) Doc {
 
 // -- helpers: compile-time checks -------------------------------------------
 
-/// The compile-time checks of a command type: unique flag names, one doc per
-/// flag and no doc for a missing flag, a real positional field, and real omit
-/// names.
+/// The compile-time checks of a command type: unique flag names, one doc per flag, a real
+/// positional field, and real omit names.
 fn validate(comptime T: type) void {
     comptime {
         @setEvalBranchQuota(eval_branch_quota);

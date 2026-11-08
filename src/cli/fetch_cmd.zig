@@ -1,9 +1,9 @@
-//! `zigferencer fetch <arg>`: download a GGUF. An `<arg>` without `/` is a registry
-//! pub_name. An `<org>/<repo>/<path/to/file.gguf>` is a Hugging Face path, stored
-//! under `<org>_<repo>/<basename>` in the models root.
+//! `zigferencer fetch <arg>`: download a GGUF. An `<arg>` without `/` is a registry pub_name. An
+//! `<org>/<repo>/<path/to/file.gguf>` is a Hugging Face path. It lands under
+//! `<org>_<repo>/<basename>` in the models root.
 //!
-//! A fetch that replaces or duplicates a model already on disk asks first.
-//! `--force` skips the question. A stdin that is not a TTY refuses instead.
+//! Refetch. A fetch that replaces or duplicates a model already on disk asks first. `--force` skips
+//! the question. A stdin that is not a TTY refuses instead.
 
 const std = @import("std");
 const Io = std.Io;
@@ -76,6 +76,8 @@ const Flags = struct {
 
 pub fn run(ctx: context.Context) !void {
     const flags = try args.parseInto(Flags, ctx) orelse return;
+
+    // Take the argument from the flag or the picker.
     var arg = flags.model;
     if (arg == null and prompt.stdinIsTty(ctx.io)) {
         arg = try select.fetchPick(ctx);
@@ -88,6 +90,7 @@ pub fn run(ctx: context.Context) !void {
 
     const a = arg.?;
 
+    // Resolve the argument to a model.
     const model: registry.Model = if (std.mem.findScalar(u8, a, '/') != null) m: {
         const spec = parseHfPath(a) catch |err| {
             try printHfPathError(ctx.io, a, err);
@@ -101,8 +104,8 @@ pub fn run(ctx: context.Context) !void {
             const w = &stderr_writer.interface;
             try w.print("error: model '{s}' is not in the registry\n", .{a});
             try w.writeAll(
-                "       (run 'zigferencer list' for available names, or pass an HF path " ++
-                    "like 'org/repo/file.gguf')\n",
+                "       (run 'zigferencer list' for available names, " ++
+                    "or pass an HF path like 'org/repo/file.gguf')\n",
             );
             try w.flush();
             return error.UnknownModel;
@@ -112,8 +115,7 @@ pub fn run(ctx: context.Context) !void {
 
     if (flags.dry_run) return printPlan(ctx, model);
 
-    // `locate` spans the configured root and the repo-local `models/`, so it finds every copy a
-    // load can read.
+    // Ask before a refetch. `locate` finds every copy that a load can read.
     if (!flags.force) {
         if (try registry.locate(ctx.arena, ctx.io, ctx.models_root, model)) |found| {
             if (!try confirmRefetch(ctx, model, found)) {
@@ -123,13 +125,13 @@ pub fn run(ctx: context.Context) !void {
         }
     }
 
+    // Download.
     try download.fetchModel(ctx.io, ctx.arena, ctx.gpa, ctx.models_root, model);
 }
 
 // -- helpers ----------------------------------------------------------------
 
-/// Ask before a second fetch of a model already on disk. A stdin that is not a TTY
-/// refuses and points at `--force`.
+/// Ask before a second fetch of a model already on disk. A stdin that is not a TTY refuses.
 fn confirmRefetch(ctx: context.Context, model: registry.Model, found: []const u8) !bool {
     const dest = try registry.modelFilePath(ctx.arena, ctx.models_root, model);
     const overwrites = std.mem.eql(u8, found, dest);
@@ -196,8 +198,7 @@ fn printPlan(ctx: context.Context, model: registry.Model) !void {
     try w.flush();
 }
 
-/// Split `org/repo/file_in_repo` on the first two `/` only. `file_in_repo` can
-/// hold further `/` for the subdirectories inside the repo.
+/// Split `org/repo/file_in_repo` on the first two `/` only. `file_in_repo` can hold further `/`.
 fn parseHfPath(s: []const u8) HfPathError!HfSpec {
     if (!std.mem.endsWith(u8, s, gguf_suffix)) return error.NotAGguf;
 

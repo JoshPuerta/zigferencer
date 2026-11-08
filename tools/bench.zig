@@ -4,6 +4,8 @@
 //! and a time. Each GPU variant also carries a relative error and a pass/fail mark against its
 //! CPU reference.
 //!
+//! Comptime. `build_options.use_vulkan` gates the GPU code, so a CPU build never reads it.
+//!
 //! Layout. `main` is the control unit. It owns the lifetime of the GPU runner and drives the
 //! section files. `bench_util` holds the shared timing and printing helpers. The per-family
 //! sections live in `bench_matmul`, `bench_layer`, `bench_gdn`, `bench_parallel`, and
@@ -16,7 +18,7 @@
 //! Order. The crossing latency section runs before the staged-copy sweep, because the sweep
 //! returns early when its 512 MiB pair does not fit.
 //!
-//! Attention grid alone. `zig build bench -- attn-kit` runs the attention kernel set grid alone,
+//! Attention grid alone. `zig build bench -- attn-grid` runs the attention kernel set grid alone,
 //! so a kernel experiment skips the full table.
 
 const std = @import("std");
@@ -70,8 +72,8 @@ pub fn main(init: std.process.Init) !void {
     if (comptime build_options.use_vulkan) {
         if (runner) |r| {
             const args = try init.minimal.args.toSlice(init.arena.allocator());
-            if (args.len >= 2 and std.mem.eql(u8, args[1], "attn-kit")) {
-                try layer.benchAttnKitGrid(gpa, io, r);
+            if (args.len >= 2 and std.mem.eql(u8, args[1], "attn-grid")) {
+                try layer.benchAttnGrid(gpa, io, r);
                 return;
             }
         }

@@ -2,6 +2,8 @@
 //! and the integration tests and `bench-serve` drive the server through it. The client uses
 //! ZMTP 3.x as a DEALER, and a ZMQ binding in any language can replace it.
 //!
+//! Comptime. Asserts pin the model name length and the error sets of the turn methods.
+//!
 //! Methods. Each request method is send-only or terminal-wait. A send-only method writes one
 //! frame and returns its request id. The caller then reads frames through `next` or
 //! `collectTurn`. A terminal-wait method writes one frame, consumes frames until the terminal
@@ -41,9 +43,6 @@ const limits = @import("../core/limits.zig");
 const log = std.log.scoped(.serve_client);
 
 // -- constants --------------------------------------------------------------
-
-/// The long ZMTP frame head: one flags byte and an 8-byte size.
-const zmtp_head_bytes: usize = 9;
 
 // -- types ------------------------------------------------------------------
 
@@ -181,7 +180,7 @@ pub const Client = struct {
 
         const frame_buf = try gpa.alloc(
             u8,
-            zmtp_head_bytes + protocol.header_bytes + protocol.max_frame_payload_bytes,
+            zmtp.long_head_bytes + protocol.header_bytes + protocol.max_frame_payload_bytes,
         );
         errdefer gpa.free(frame_buf);
 
@@ -212,9 +211,9 @@ pub const Client = struct {
         var greeting: [zmtp.greeting_bytes]u8 = undefined;
         zmtp.encodeGreeting(&greeting);
         try w.writeAll(&greeting);
-        const body = self.frame_buf[zmtp_head_bytes..];
+        const body = self.frame_buf[zmtp.long_head_bytes..];
         const n = zmtp.encodeReady(zmtp.socket_type_dealer, body);
-        const head_len = zmtp.encodeFrameHead(n, true, self.frame_buf[0..zmtp_head_bytes]);
+        const head_len = zmtp.encodeFrameHead(n, true, self.frame_buf[0..zmtp.long_head_bytes]);
         try w.writeAll(self.frame_buf[0..head_len]);
         try w.writeAll(body[0..n]);
         try w.flush();
@@ -223,7 +222,7 @@ pub const Client = struct {
         const r = &self.reader.interface;
         try zmtp.decodeGreeting(try r.takeArray(zmtp.greeting_bytes));
         log.debug("handshake: accepted server greeting", .{});
-        const head = try readFrameHead(r);
+        const head = try zmtp.readFrameHead(r);
         if (!head.command) return error.Malformed;
         if (head.size > zmtp.max_ready_bytes) return error.MessageTooLarge;
 
@@ -265,9 +264,9 @@ pub const Client = struct {
     pub fn send(self: *Client, msg: protocol.ClientMsg, session_id: u32) SendError!u32 {
         const request_id = self.next_request_id;
         self.next_request_id += 1;
-        const body = self.frame_buf[zmtp_head_bytes..];
+        const body = self.frame_buf[zmtp.long_head_bytes..];
         const n = protocol.encodeClientMsg(msg, request_id, session_id, body);
-        const head_len = zmtp.encodeFrameHead(n, false, self.frame_buf[0..zmtp_head_bytes]);
+        const head_len = zmtp.encodeFrameHead(n, false, self.frame_buf[0..zmtp.long_head_bytes]);
         try self.writer.interface.writeAll(self.frame_buf[0..head_len]);
         try self.writer.interface.writeAll(body[0..n]);
         try self.writer.interface.flush();
@@ -281,7 +280,7 @@ pub const Client = struct {
         const r = &self.reader.interface;
         // Each pass reads one frame. This client sends no PING, so the first message ends the loop.
         while (true) {
-            const head = try readFrameHead(r);
+            const head = try zmtp.readFrameHead(r);
             if (head.command) {
                 if (head.size > zmtp.max_ready_bytes) return error.MessageTooLarge;
 
@@ -572,7 +571,6 @@ pub const Client = struct {
     }
 
     /// Stop the turn in flight on `session_id`. A turn of that session must be in flight.
-    /// See "Cancel" in the header.
     pub fn cancel(self: *Client, session_id: u32) SendError!u32 {
         return self.send(.cancel, session_id);
     }
@@ -594,8 +592,7 @@ pub const Client = struct {
         decode_ms: f32,
     };
 
-    /// Collect one whole turn after `generate`, and return on `done`. See "Collected turns" in
-    /// the header.
+    /// Collect one whole turn after `generate`, and return on `done`.
     pub fn collectTurn(self: *Client, ids_out: []u32, text_out: []u8) CollectError!Turn {
         return self.collectTurnWith(ids_out, text_out, NoTokenHook{});
     }
@@ -758,17 +755,6 @@ pub fn toOwned(ev: Event) OwnedEvent {
 
 // -- helpers ----------------------------------------------------------------
 
-/// Reads the flags byte, then the rest of the head that the flags announce.
-/// The head holds at most `zmtp_head_bytes`.
-fn readFrameHead(r: *Io.Reader) (Io.Reader.Error || zmtp.Error)!zmtp.FrameHead {
-    var head: [zmtp_head_bytes]u8 = undefined;
-    head[0] = try r.takeByte();
-    const n = zmtp.headLen(head[0]);
-    std.debug.assert(n <= zmtp_head_bytes);
-    try r.readSliceAll(head[1..n]);
-    return zmtp.decodeFrameHead(head[0..n]);
-}
-
 // -- tests ------------------------------------------------------------------
 
 /// Copies each hook call, because the text borrows the payload buffer.
@@ -797,7 +783,7 @@ const HookLog = struct {
 fn appendServerFrame(gpa: Allocator, out: *std.ArrayList(u8), msg: protocol.ServerMsg) !void {
     var body: [protocol.max_server_frame_bytes]u8 = undefined;
     const n = protocol.encodeServerMsg(msg, 2, 1, &body);
-    var head: [zmtp_head_bytes]u8 = undefined;
+    var head: [zmtp.long_head_bytes]u8 = undefined;
     const head_len = zmtp.encodeFrameHead(n, false, &head);
     try out.appendSlice(gpa, head[0..head_len]);
     try out.appendSlice(gpa, body[0..n]);

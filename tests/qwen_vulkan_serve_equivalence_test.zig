@@ -223,7 +223,7 @@ test "qwen GPU residency over-subscription: 2 sessions, 1 VRAM slot, streams mat
         }
     }
 
-    // Two logical sessions share one VRAM slot. See "Residency" in the header.
+    // Two logical sessions share one VRAM slot.
     const ctxp = try arena.create(vulkan_ctx.Context);
     ctxp.* = vulkan_ctx.Context.init(arena, .{}) catch return error.SkipZigTest;
     defer ctxp.deinit();

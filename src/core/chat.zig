@@ -2,6 +2,8 @@
 //! interpolates the message into the scaffolding of the model's family (SmolLM2 ChatML, Llama-3
 //! chat, Qwen ChatML, or pass-through).
 //!
+//! Comptime. A test asserts that its case table covers every kind and thinking flag.
+//!
 //! Hand-coded templates. The GGUF embeds a full Jinja2 template, but a Jinja interpreter costs
 //! hundreds of lines against zero deps for marginal value. The hand-coded templates stay legible.
 //! They also pair-validate against the special tokens the BPE encoder matches greedily: a template
@@ -23,8 +25,8 @@ const log = std.log.scoped(.run);
 
 /// The system prompt SmolLM2-Instruct was trained with. `wrapMessagesAlloc` injects it when a
 /// conversation has no system message, so a bare user turn equals the `wrapAlloc` text.
-const smollm2_default_system = "You are a helpful AI assistant named SmolLM, trained by " ++
-    "Hugging Face";
+const smollm2_default_system = "You are a helpful AI assistant named SmolLM, " ++
+    "trained by Hugging Face";
 
 const chatml_smollm2 =
     \\<|im_start|>system
@@ -162,7 +164,7 @@ pub const Message = struct { role: Role, content: []const u8 };
 
 /// Where a kept (user, assistant) pair sits in a conversation. It names the
 /// user wrap that a live turn at the same place used.
-pub const PairPlace = enum { open_first, first_after_system, continuation };
+pub const PairOrder = enum { open_first, first_after_system, continuation };
 
 /// The think tags of a family as text. `separator` follows the close tag
 /// before the answer starts.
@@ -211,10 +213,9 @@ pub fn thinkText(kind: Kind) ?ThinkText {
     };
 }
 
-/// The reply of an assistant message without its think block: the text after
-/// the last `close` tag, with leading newlines dropped. Content with no close
-/// tag comes back unchanged. The model file's template renders an earlier
-/// reply the same way.
+/// The reply of an assistant message without its think block: the text after the last `close`
+/// tag, with leading newlines dropped. Content with no close tag comes back unchanged.
+/// The model file's template renders an earlier reply the same way.
 pub fn stripThink(content: []const u8, close: []const u8) []const u8 {
     std.debug.assert(close.len > 0);
 
@@ -293,12 +294,12 @@ pub fn wrapFirstTurnAlloc(arena: Allocator, kind: Kind, user_msg: []const u8) Al
     };
 }
 
-/// The user part of a kept (user, assistant) pair: the live user wrap at `place`, with the closed
+/// The user part of a kept (user, assistant) pair: the live user wrap at `order`, with the closed
 /// think tail. The wrap writes no end of the assistant turn, because the next wrap opens with it.
 pub fn wrapPairUserAlloc(
     arena: Allocator,
     kind: Kind,
-    place: PairPlace,
+    order: PairOrder,
     user_msg: []const u8,
 ) Allocator.Error![]u8 {
     const closed: Kind = switch (kind) {
@@ -308,7 +309,7 @@ pub fn wrapPairUserAlloc(
 
     std.debug.assert(!thinkOpen(closed));
     std.debug.assert(std.meta.activeTag(closed) == std.meta.activeTag(kind));
-    return switch (place) {
+    return switch (order) {
         .open_first => wrapAlloc(arena, closed, user_msg),
         .first_after_system => wrapFirstTurnAlloc(arena, closed, user_msg),
         .continuation => wrapContinuationAlloc(arena, closed, user_msg),
@@ -448,8 +449,13 @@ fn checkWrap(c: WrapCase) !void {
 test "wrapAlloc: each template wraps its scaffolding around the text" {
     const cases = [_]WrapCase{
         .{ .kind = .none, .text = "Hello", .exact = "Hello" },
-        .{ .kind = .chatml_smollm2, .text = "Hi", .has = &.{"<|im_start|>user\nHi<|im_end|>"}, .ends = "<|im_start|>assistant\n" },
-        // No template writes a BOS token. See "BOS" in the header.
+        .{
+            .kind = .chatml_smollm2,
+            .text = "Hi",
+            .has = &.{"<|im_start|>user\nHi<|im_end|>"},
+            .ends = "<|im_start|>assistant\n",
+        },
+        // No template writes a BOS token.
         .{
             .kind = .llama3,
             .text = "Hi",
@@ -737,7 +743,7 @@ test "wrapMessagesAlloc drops the think block of an earlier qwen reply" {
     try std.testing.expect(std.mem.find(u8, smol, reply) != null);
 }
 
-test "a kept pair renders the live user wrap of its place with the closed think tail" {
+test "a kept pair renders the live user wrap of its order with the closed think tail" {
     const gpa = std.testing.allocator;
     var arena_state = std.heap.ArenaAllocator.init(gpa);
     defer arena_state.deinit();
@@ -760,8 +766,8 @@ test "a kept pair renders the live user wrap of its place with the closed think 
             try wrapContinuationAlloc(arena, live, "Q"),
             try wrapPairUserAlloc(arena, kind, .continuation, "Q"),
         );
-        for (std.enums.values(PairPlace)) |place| {
-            const w = try wrapPairUserAlloc(arena, kind, place, "Q");
+        for (std.enums.values(PairOrder)) |order| {
+            const w = try wrapPairUserAlloc(arena, kind, order, "Q");
             try std.testing.expectEqual(
                 std.mem.count(u8, w, "<think>"),
                 std.mem.count(u8, w, "</think>"),

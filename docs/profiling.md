@@ -136,7 +136,7 @@ share one time base.
 The GPU has its own clock, and the engine knows the relation between the two
 clocks only at each submit and each wait. Some drivers slow or pause the GPU
 counter while the GPU is idle. One offset for the whole run then puts the later
-records in the wrong place. The trace writer therefore places each record by its own
+records in the wrong place. The trace writer therefore maps each record by its own
 offset. That offset is the smallest gap between a host wait and its GPU end, over
 the record and the 15 records after it. When a record still falls outside its host window, from the
 submit to the wait, the writer moves it inside and counts a clamp. Read the GPU

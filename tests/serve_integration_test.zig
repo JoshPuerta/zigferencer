@@ -1,6 +1,8 @@
 //! End-to-end serve gate over a real model and real sockets. Each test boots its own in-process
 //! server through `serve_harness.zig` and drives it through the reference client.
 //!
+//! Comptime. `keptPairsMatchLive` takes the harness type, so each runner family shares one body.
+//!
 //! Batch equality. The load-bearing assertion is exact. A turn that the server runs while other
 //! sessions decode in the same batch produces the same token stream the turn produces alone. This
 //! holds on one connection and across four at once. Batched serving is sequential serving, seen
@@ -534,7 +536,6 @@ test "cancel during prefill finishes the turn with no tokens" {
     defer h.stop(&client);
 
     // The spare-rows rule makes the prompt take 14 ticks, so the cancel lands during prefill.
-    // See "Cancel in prefill" in the header.
     const long_prompt = "The dragon flew over the quiet hills at dawn. " ** 4;
     const sid = try openGreedy(&client);
     const gen_id = try client.generate(sid, long_prompt, turn_tokens_max, null);
@@ -816,7 +817,6 @@ test "shutdown from the wire is refused unless allowed" {
 }
 
 // -- kept pairs -------------------------------------------------------------
-// See "Kept pairs" in the header.
 
 const kept_system = "You are a helpful assistant.";
 const kept_prompts = [_][]const u8{ "Name a color.", "Name an animal.", "Name a city." };
@@ -863,9 +863,8 @@ fn keptPairsMatchLive(comptime H: type, kind: harness.ChatKind) !void {
         .{ .user = kept_prompts[1], .assistant = turns[1].reply[0..turns[1].len] },
     };
     const appended = try client.append(kept, &pairs);
-    // A carried token sits at the start of the next live turn, and inside
-    // the reply of its own pair. Each position therefore differs from the
-    // live one by the carry of its own turn.
+    // A carried token sits at the start of the next live turn, and inside its own pair reply.
+    // So each position differs from the live one by the carry of its own turn.
     try std.testing.expectEqual(
         turns[0].kv_pos + @intFromBool(turns[0].carried),
         appended.positions()[0],

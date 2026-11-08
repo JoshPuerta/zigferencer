@@ -1,7 +1,9 @@
-//! `zigferencer serve-openai <pub_name>` is the OpenAI-compatible HTTP frontend. It
-//! parses the flags and hands an `OpenAiLauncher` to `serve_boot.buildAndServe`, so it
-//! batches requests over the scheduler of `serve` on every backend. It serves on
-//! `std.http.Server`, which adds no dependency. stdout holds only the READY line.
+//! `zigferencer serve-openai <pub_name>` is the OpenAI-compatible HTTP frontend. It parses the
+//! flags and hands an `OpenAiLauncher` to `serve_boot.buildAndServe`, so it batches requests over
+//! the scheduler of `serve` on every backend. It serves on `std.http.Server`, which adds no
+//! dependency. stdout holds only the READY line.
+//!
+//! Comptime. The launcher is generic over the engine type, so every backend shares one body.
 
 const std = @import("std");
 
@@ -21,8 +23,8 @@ const log = std.log.scoped(.serve_openai);
 
 // -- types ------------------------------------------------------------------
 
-/// Builds the `RawCodec`, which carries the tokenizer and the model metadata, and
-/// the HTTP `Server` over the shared engine, announces the bind, and runs.
+/// Builds the `RawCodec` and the HTTP `Server` over the shared engine, announces the bind, and
+/// runs.
 const OpenAiLauncher = struct {
     host: []const u8,
     port: u16,
@@ -37,10 +39,10 @@ const OpenAiLauncher = struct {
         parts: codec_parts.CodecParts,
         sched_cfg: scheduler_mod.Config,
     ) !void {
-        // A request can resolve the thinking mode to on only for `chatml_qwen`,
-        // and the reasoning splitter then needs the tags.
+        // Only `chatml_qwen` can resolve the thinking mode to on, and the splitter then needs tags.
         std.debug.assert((parts.think_ids != null) == (parts.kind == .chatml_qwen));
 
+        // Build the codec from the model parts and the request defaults.
         const defaults = self.sampling_defaults;
         const codec: RawCodec = .{
             .vocab = parts.vocab,
@@ -61,9 +63,8 @@ const OpenAiLauncher = struct {
             defaults, codec.defaults.think.temperature, codec.defaults.plain.temperature,
         });
 
-        // `RawCodec` encodes raw text, because the HTTP map renders the conversations.
-        // A preload text wraps here into the opening system block, so it tokenizes to
-        // the exact prefix of a conversation that opens with that system message.
+        // Wrap each preload text into a system block, so it tokenizes to the prefix of a
+        // conversation that opens with that system message. `RawCodec` encodes raw text.
         var cfg = sched_cfg;
         if (cfg.cache.preload.len > 0) {
             const wrapped = try ctx.arena.alloc([]const u8, cfg.cache.preload.len);
@@ -74,6 +75,7 @@ const OpenAiLauncher = struct {
             cfg.cache.preload = wrapped;
         }
 
+        // Bind, announce, and run.
         var server = try http_server.Server(EngineT).init(
             ctx.arena,
             ctx.gpa,
@@ -102,8 +104,8 @@ const Flags = struct {
     pub const help: args.Help = .{
         .usage = "zigferencer serve-openai <pub_name> [flags]   " ++
             "(<pub_name> omitted -> pick a model)",
-        .about = "OpenAI-compatible HTTP API: POST /v1/chat/completions (+SSE), " ++
-            "/v1/models, /healthz.\n",
+        .about = "OpenAI-compatible HTTP API: " ++
+            "POST /v1/chat/completions (+SSE), /v1/models, /healthz.\n",
         .footer =
         \\examples:
         \\  zigferencer serve-openai SmolLM2-135M-Instruct-Q8_0 --port 8080

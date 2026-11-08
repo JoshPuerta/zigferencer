@@ -1,4 +1,6 @@
 //! The fill and compare helpers that every check of `gpu-selftest` shares.
+//!
+//! Comptime. `fillTyped` is generic over the element type.
 
 const std = @import("std");
 

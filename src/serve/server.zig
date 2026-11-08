@@ -4,6 +4,8 @@
 //! encodes `OutEvent` values back. The connection uses ZMTP 3.x: the server answers a DEALER peer
 //! as a ROUTER, and one ZMTP message carries one `protocol.zig` frame.
 //!
+//! Comptime. Generic over the engine and the codec, so the adapter builds against any engine type.
+//!
 //! Task roots. `io.concurrent` builds an argument tuple for the function it spawns, and it cannot
 //! do that for an `anytype` parameter. So the spawned reader and writer live in a struct keyed on
 //! the engine type (`BinaryTasks`). The helpers they call (`readerLoop`, `fatalFrame`) stay
@@ -34,12 +36,9 @@ const log = std.log.scoped(.serve);
 
 // -- constants --------------------------------------------------------------
 
-/// The long ZMTP frame head: one flags byte and an 8-byte size.
-const zmtp_head_bytes: usize = 9;
-
 /// One frame head plus the largest body the server sends. The PONG and ERROR command bodies are
 /// smaller than that body.
-const writer_frame_bytes: usize = zmtp_head_bytes + protocol.max_server_frame_bytes;
+const writer_frame_bytes: usize = zmtp.long_head_bytes + protocol.max_server_frame_bytes;
 
 // -- types ------------------------------------------------------------------
 
@@ -116,13 +115,14 @@ pub fn Server(comptime Engine: type, comptime CodecT: type) type {
     return engine_mod.ServeEngine(Engine, CodecT, BinaryAdapter);
 }
 
-/// The per-connection task roots, concrete over the engine type. See "Task roots" in the header.
+/// The per-connection task roots, concrete over the engine type.
 fn BinaryTasks(comptime Eng: type) type {
     return struct {
         fn reader(engine: *Eng, conn: *Eng.Conn) void {
             span.nameThread("zf-read");
             readerLoop(engine, conn);
-            // Tell the engine about the drop. A closed queue means teardown already runs.
+            // The engine must hear about the drop exactly once, even when the queue is briefly
+            // full. A closed queue means teardown already runs.
             engine.submit(.{
                 .conn = conn.id,
                 .request_id = 0,
@@ -138,7 +138,7 @@ fn BinaryTasks(comptime Eng: type) type {
             var w = conn.stream.writer(engine.io, &write_buf);
             var frame: [writer_frame_bytes]u8 = undefined;
             send: {
-                // Send the opening first. See "Handshake order" in the header.
+                // Send the opening first.
                 writeOpening(&w.interface, &frame) catch break :send;
                 w.interface.flush() catch break :send;
                 log.debug("handshake: conn {d} sent greeting and READY", .{conn.id});
@@ -187,7 +187,7 @@ fn readerLoop(engine: anytype, conn: anytype) void {
     // Read one frame per pass. A command body holds at most `zmtp.max_ready_bytes`, and a message
     // at most `zmtp.max_message_bytes`.
     while (true) {
-        const head = readFrameHead(&r.interface) catch |e| switch (e) {
+        const head = zmtp.readFrameHead(&r.interface) catch |e| switch (e) {
             error.ReadFailed, error.EndOfStream => return,
             else => return fatalFrame(engine, conn, .malformed_frame, "bad frame head"),
         };
@@ -260,7 +260,7 @@ fn readHandshake(r: *Io.Reader, body_buf: []u8) HandshakeError![]const u8 {
     std.debug.assert(body_buf.len >= zmtp.max_ready_bytes);
 
     try zmtp.decodeGreeting(try r.takeArray(zmtp.greeting_bytes));
-    const head = try readFrameHead(r);
+    const head = try zmtp.readFrameHead(r);
     if (!head.command or head.size > zmtp.max_ready_bytes) return error.ReadyExpected;
 
     const body = body_buf[0..@intCast(head.size)];
@@ -273,17 +273,6 @@ fn readHandshake(r: *Io.Reader, body_buf: []u8) HandshakeError![]const u8 {
     if (!zmtp.peerAccepted(ready.socket_type)) return error.PeerTypeRefused;
 
     return ready.socket_type;
-}
-
-/// Reads the flags byte, then the rest of the head that the flags announce.
-/// The head holds at most `zmtp_head_bytes`.
-fn readFrameHead(r: *Io.Reader) (Io.Reader.Error || zmtp.Error)!zmtp.FrameHead {
-    var head: [zmtp_head_bytes]u8 = undefined;
-    head[0] = try r.takeByte();
-    const n = zmtp.headLen(head[0]);
-    std.debug.assert(n <= zmtp_head_bytes);
-    try r.readSliceAll(head[1..n]);
-    return zmtp.decodeFrameHead(head[0..n]);
 }
 
 /// Codes 1-4: reply, then close THAT connection. The process never dies on input.
@@ -315,9 +304,9 @@ fn writeOpening(w: *Io.Writer, frame: *[writer_frame_bytes]u8) Io.Writer.Error!v
     var greeting: [zmtp.greeting_bytes]u8 = undefined;
     zmtp.encodeGreeting(&greeting);
     try w.writeAll(&greeting);
-    const body = frame[zmtp_head_bytes..];
+    const body = frame[zmtp.long_head_bytes..];
     const n = zmtp.encodeReady(zmtp.socket_type_router, body);
-    const head_len = zmtp.encodeFrameHead(n, true, frame[0..zmtp_head_bytes]);
+    const head_len = zmtp.encodeFrameHead(n, true, frame[0..zmtp.long_head_bytes]);
     try w.writeAll(frame[0..head_len]);
     try w.writeAll(body[0..n]);
 }
@@ -329,7 +318,7 @@ fn writeEvent(
     frame: *[writer_frame_bytes]u8,
     ev: *const OutEvent,
 ) Io.Writer.Error!void {
-    const body = frame[zmtp_head_bytes..];
+    const body = frame[zmtp.long_head_bytes..];
     const command = ev.body == .zmtp_pong or ev.body == .zmtp_error;
     const n = switch (ev.body) {
         .zmtp_pong => |*m| zmtp.encodePong(m.context[0..m.len], body[0..32]),
@@ -338,7 +327,7 @@ fn writeEvent(
     };
 
     std.debug.assert(n <= protocol.max_server_frame_bytes);
-    const head_len = zmtp.encodeFrameHead(n, command, frame[0..zmtp_head_bytes]);
+    const head_len = zmtp.encodeFrameHead(n, command, frame[0..zmtp.long_head_bytes]);
     try w.writeAll(frame[0..head_len]);
     try w.writeAll(body[0..n]);
 }
@@ -351,6 +340,7 @@ fn toRequest(
     h: protocol.Header,
     msg: protocol.ClientMsg,
 ) Allocator.Error!Request {
+    // Copy the message body into the request body.
     const body: Request.Body = switch (msg) {
         .hello => .hello,
         .cancel => .cancel,
@@ -379,6 +369,7 @@ fn toRequest(
         } },
     };
 
+    // Add the ids of the header.
     return .{
         .conn = conn_id,
         .request_id = h.request_id,
@@ -391,7 +382,7 @@ fn toRequest(
 fn encodeMessage(ev: *const OutEvent, frame: []u8) usize {
     const msg: protocol.ServerMsg = switch (ev.body) {
         // Capture by pointer where a slice borrows from the event, because a by-value capture
-        // dies at the end of the arm.
+        // dies at the end of the prong.
         .hello_ack => |*m| .{ .hello_ack = .{
             .protocol_version = protocol.protocol_version,
             .max_seq = m.max_seq,
@@ -499,12 +490,12 @@ const FakeCodec = struct {
     pub fn pairTokens(
         self: *const FakeCodec,
         gpa: Allocator,
-        place: chat.PairPlace,
+        order: chat.PairOrder,
         user: []const u8,
         assistant: []const u8,
     ) ![]u32 {
         _ = self;
-        _ = place;
+        _ = order;
         const ids = try gpa.alloc(u32, user.len + assistant.len);
         for (user, 0..) |b, i| {
             ids[i] = @intCast(b % test_vocab);

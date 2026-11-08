@@ -1,10 +1,9 @@
 //! The support matrix of which op backends can execute each model architecture. `zigferencer info`
 //! prints it and marks the backend linked into this binary. The notes carry the limits that a
-//! reader
-//! otherwise finds in the runners: the weight quants a backend accepts, and what runs where.
+//! reader otherwise finds in the runners: the weight quants a backend accepts, and what runs where.
 //!
-//! A comptime check pins every row to `op_requires.ops_backend_names`, in order, so a new backend
-//! forces every architecture to state its support.
+//! Comptime. A check pins every row to `op_requires.ops_backend_names`, in order, so a
+//! new backend forces every architecture to state its support.
 
 const std = @import("std");
 const Io = std.Io;
@@ -19,21 +18,30 @@ const arch_rows = [_]ArchRow{
     .{
         .title = "llama: SmolLM2, Llama 3.x (full softmax attention)",
         .entries = .{
-            .{ .backend = "naive", .runtime = "cpu", .note = "scalar f32 reference. q8_0 linears" },
-            .{ .backend = "simd", .runtime = "cpu", .note = "AVX2 @Vector(8) linear kernels, rest shared with naive. q8_0 linears" },
-            .{ .backend = "simd_pf", .runtime = "cpu", .note = "AVX2+FMA register-blocked + prefetch (the auto pick). q8_0 linears" },
-            .{ .backend = "vulkan", .runtime = "vulkan", .note = "per-op GPU submits (correctness/bench reference). q8_0 linears" },
-            .{ .backend = "vulkan_fused", .runtime = "vulkan", .note = "one command buffer per token, weights in VRAM. q8_0, or q4_0 with a q6_k head" },
+            cpu("naive", "scalar f32 reference. q8_0 linears"),
+            cpu("simd", "AVX2 @Vector(8) linear kernels, rest shared with naive. q8_0 linears"),
+            cpu("simd_pf", "AVX2+FMA register-blocked + prefetch (the auto pick). q8_0 linears"),
+            vulkan("vulkan", "per-op GPU submits (correctness/bench reference). q8_0 linears"),
+            vulkan(
+                "vulkan_fused",
+                "one command buffer per token, weights in VRAM. q8_0, or q4_0 with a q6_k head",
+            ),
         },
     },
     .{
         .title = "qwen35: Qwen3.5 hybrid (Gated-DeltaNet + full attention)",
         .entries = .{
-            .{ .backend = "naive", .runtime = "cpu", .note = "GDN recurrence + attention on CPU. q8_0" },
-            .{ .backend = "simd", .runtime = "cpu", .note = "SIMD linear kernels, GDN shared with naive. q8_0" },
-            .{ .backend = "simd_pf", .runtime = "cpu", .note = "register-blocked linears, GDN shared with naive. q8_0" },
-            .{ .backend = "vulkan", .runtime = "vulkan", .note = "run only: matmuls per-op on GPU, GDN stays on CPU. bench-model unsupported" },
-            .{ .backend = "vulkan_fused", .runtime = "vulkan", .note = "one command buffer per token, GDN + attention on GPU. q8_0 only" },
+            cpu("naive", "GDN recurrence + attention on CPU. q8_0"),
+            cpu("simd", "SIMD linear kernels, GDN shared with naive. q8_0"),
+            cpu("simd_pf", "register-blocked linears, GDN shared with naive. q8_0"),
+            vulkan(
+                "vulkan",
+                "run only: matmuls per-op on GPU, GDN stays on CPU. bench-model unsupported",
+            ),
+            vulkan(
+                "vulkan_fused",
+                "one command buffer per token, GDN + attention on GPU. q8_0 only",
+            ),
         },
     },
 };
@@ -60,7 +68,7 @@ const Entry = struct {
 
 const ArchRow = struct {
     title: []const u8,
-    // One entry per backend, in the order of `ops_backend_names`.
+    /// One entry per backend, in the order of `ops_backend_names`.
     entries: [op_requires.ops_backend_names.len]Entry,
 };
 
@@ -98,6 +106,16 @@ pub fn print(w: *Io.Writer, p: style.Palette) Io.Writer.Error!void {
     try w.print("\n{s}[*] vulkan backends need -Druntime=vulkan (glslc + libvulkan-dev){s}\n", .{
         p.dim, p.reset,
     });
+}
+
+// -- helpers ----------------------------------------------------------------
+
+fn cpu(backend: []const u8, note: []const u8) Entry {
+    return .{ .backend = backend, .runtime = "cpu", .note = note };
+}
+
+fn vulkan(backend: []const u8, note: []const u8) Entry {
+    return .{ .backend = backend, .runtime = "vulkan", .note = note };
 }
 
 // -- tests ------------------------------------------------------------------

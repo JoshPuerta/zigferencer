@@ -1,5 +1,11 @@
 //! The lines a boot prints: the boot log lines of `run`, `serve`, and the benches, and the
 //! message of each `resolve` refusal. Every line keeps the `serve` log scope.
+//!
+//! Window source. A named window comes from the flag. A default at the model ceiling comes from
+//! the ceiling. A default below it comes from the session byte budget.
+//!
+//! Precision line. The engine holds no graph IR a reader can inspect, so `logPrecision` is where
+//! the per-site precisions become visible.
 
 const std = @import("std");
 const Io = std.Io;
@@ -13,19 +19,18 @@ const loader = @import("../../io/gguf/loader.zig");
 const tensor_lookup = @import("../../runtime/tensor_lookup.zig");
 
 const log = std.log.scoped(.serve);
-const device_arm = resolve_mod.device_arm;
+const device_placement = resolve_mod.device_placement;
 
 // -- constants --------------------------------------------------------------
 
 const mib = 1024 * 1024;
 
-/// The refusal of a slot count below the session count on the CPU runner. It takes
-/// the slots and the sessions.
-pub const cpu_slots_fmt = "the CPU runner holds one slot per session, so --vram-slots {d} " ++
-    "cannot serve --max-sessions {d}. Drop --vram-slots, or set it to the --max-sessions value";
+/// The refusal of a slot count below the session count on the CPU runner.
+pub const cpu_slots_fmt = "the CPU runner holds one slot per session, " ++
+    "so --vram-slots {d} cannot serve --max-sessions {d}. " ++
+    "Drop --vram-slots, or set it to the --max-sessions value";
 
-/// The refusal of a `--max-seq` value that `baseWindow` puts out of range. It
-/// takes the model ceiling.
+/// The refusal of a `--max-seq` value out of range. It takes the model ceiling.
 pub const window_out_of_range_fmt = "--max-seq must be in 1..{d} for this model";
 
 // -- types ------------------------------------------------------------------
@@ -33,17 +38,16 @@ pub const window_out_of_range_fmt = "--max-seq must be in 1..{d} for this model"
 /// The window of a boot before any device fit. `resolve` states it.
 pub const SessionWindow = resolve_mod.Window;
 
-/// Where a window that no device fit cut came from. A named window is the
-/// flag. A default at the model ceiling is the ceiling, and a default below it
-/// is the session byte budget.
+/// Where a window that no device fit cut came from.
 const WindowSource = enum { flag, ceiling, budget };
 
 // -- api --------------------------------------------------------------------
 
-/// Print one refusal of `resolve` with its message, and return the error the
-/// exit path knows. `name` is the public name of the model.
+/// Print one refusal of `resolve`, and return the error that the exit path knows.
 pub fn refuse(io: Io, name: []const u8, r: resolve_mod.Refusal) anyerror {
     const no_mode = " does not apply to {s}. Its chat template has no thinking mode";
+
+    // Map each refusal to its error.
     switch (r) {
         .thinking_unsupported => return args.fail(
             io,
@@ -72,6 +76,8 @@ pub fn refuse(io: Io, name: []const u8, r: resolve_mod.Refusal) anyerror {
             .{ceiling},
         ),
         .cpu_slots => |c| return args.fail(io, cpu_slots_fmt, .{ c.slots, c.sessions }),
+
+        // Log the RAM refusals.
         .host_ram => |q| {
             var buf: [kv_budget.ram_refusal_text_max]u8 = undefined;
             log.err("{s}", .{kv_budget.formatRamRefusal(&buf, q)});
@@ -82,6 +88,8 @@ pub fn refuse(io: Io, name: []const u8, r: resolve_mod.Refusal) anyerror {
             log.err("{s}", .{kv_budget.formatBlobRefusal(&buf, q)});
             return error.BlobRamBudgetTooSmall;
         },
+
+        // Refuse the GPU placement flags.
         .gpu_layers_past_model => |g| return args.fail(
             io,
             "--gpu-layers {d} exceeds the model's {d} layers",
@@ -93,7 +101,7 @@ pub fn refuse(io: Io, name: []const u8, r: resolve_mod.Refusal) anyerror {
                 "Lower --vram-slots, or drop --gpu-layers",
             .{ limits.max_batch, n },
         ),
-        .placement_vram => |p| return refusePlacementVram(io, p),
+        .layer_split_vram => |p| return refuseLayerSplitVram(io, p),
         .whole_model_split => |pin| return refuseWholeModelSplit(io, pin),
         .kv_vram_ceiling => |k| {
             log.err("kv budget: --max-seq {d} is past the model ceiling of {d} positions", .{
@@ -108,17 +116,17 @@ pub fn refuse(io: Io, name: []const u8, r: resolve_mod.Refusal) anyerror {
     }
 }
 
-/// The boot lines of a whole-model fused arm, in boot order, and its RAM
-/// quote. `session` names `run` and `bench-model`, which log the window line
-/// when no cut replaces it.
+/// The boot lines of a whole-model fused placement, in boot order, and its RAM quote. `session` is
+/// true for `run` and `bench-model`, which log the window line when no cut replaces it.
 pub fn logFused(
     io: Io,
     name: []const u8,
-    f: device_arm.Fused,
+    f: device_placement.Fused,
     session: bool,
     kv_ram_named: bool,
     kv_dtype: dtype.KvDtype,
 ) !kv_budget.RamQuote {
+    // Log the window cuts.
     if (f.clamp) |c| {
         logClamp(c);
     }
@@ -132,11 +140,15 @@ pub fn logFused(
 
     if (f.window.flag) |named| {
         if (f.plan.window < named) {
-            log.warn("kv window: --vram-slots {d} at --max-seq {d} does not fit the VRAM " ++
-                "budget, so the window is {d}", .{ f.plan.n_slots, named, f.plan.window });
+            log.warn(
+                "kv window: --vram-slots {d} at --max-seq {d} does not fit the VRAM budget, " ++
+                    "so the window is {d}",
+                .{ f.plan.n_slots, named, f.plan.window },
+            );
         }
     }
 
+    // Log the budget findings.
     if (f.stranded) |st| {
         log.warn("kv budget: the ceiling of {d} slots cut the count this budget bought. " ++
             "{d} MiB of the {d} MiB stays unspendable. Raise --max-seq to give each slot " ++
@@ -154,6 +166,7 @@ pub fn logFused(
         logPrefixDefault();
     }
 
+    // Log the plan, then the RAM quote.
     logPlan(f.plan, kv_dtype);
 
     return switch (f.quote) {
@@ -166,7 +179,7 @@ pub fn logFused(
 }
 
 /// The line of a default window that the device buffer limits cut.
-pub fn logClamp(c: device_arm.Clamp) void {
+pub fn logClamp(c: device_placement.Clamp) void {
     log.info("kv window: {d} slots at the default window of {d} positions need a KV region " ++
         "of {d} {t}. The {s} is {d} {t}, so the window is {d}", .{
         c.n_slots,
@@ -180,8 +193,7 @@ pub fn logClamp(c: device_arm.Clamp) void {
     });
 }
 
-/// The resolved count of `--gpu-layers auto`, so a log names the split the live
-/// budget chose.
+/// The resolved count of `--gpu-layers auto`, so a log names the split that the budget chose.
 pub fn logAutoSplit(split: u32, n_layers: u32) void {
     std.debug.assert(n_layers >= 1);
     std.debug.assert(split <= n_layers);
@@ -189,8 +201,7 @@ pub fn logAutoSplit(split: u32, n_layers: u32) void {
     log.info("--gpu-layers auto: gpu {d}/{d} layers", .{ n_layers - split, n_layers });
 }
 
-/// The startup witness of the KV economy. `kv_dtype` is the dtype the prices
-/// came from.
+/// The startup witness of the KV economy. `kv_dtype` is the dtype of the prices.
 pub fn logPlan(plan: kv_budget.KvPlan, kv_dtype: dtype.KvDtype) void {
     log.info("kv plan: {d} slots x {d} window{s} = {d} MiB vram kv, {d} MiB ram, {d} MiB prefix", .{
         plan.n_slots,
@@ -202,8 +213,7 @@ pub fn logPlan(plan: kv_budget.KvPlan, kv_dtype: dtype.KvDtype) void {
     });
 }
 
-/// The whole precision map of a boot. The engine holds no graph IR a reader can
-/// inspect, so this line is where the per-site precisions become visible.
+/// The whole precision map of a boot.
 pub fn logPrecision(loaded: *const loader.Loaded, kv_dtype: dtype.KvDtype) void {
     log.info("precision: weights {s}, activations f32, accum f32, kv {t}, logits f32", .{
         weightQuantName(loaded),
@@ -211,9 +221,8 @@ pub fn logPrecision(loaded: *const loader.Loaded, kv_dtype: dtype.KvDtype) void 
     });
 }
 
-/// Log the base window of a one-session command and its source. A window that the
-/// device limits cut logs nothing here, because the clamp logged it with both
-/// numbers.
+/// Log the base window of a one-session command and its source. A clamped window logs nothing
+/// here, because the clamp line logged it.
 pub fn logSessionWindow(w: SessionWindow) void {
     if (w.device_clamped) return;
 
@@ -227,8 +236,7 @@ pub fn logSessionWindow(w: SessionWindow) void {
     }
 }
 
-/// The boot lines of one RAM quote: the spend, then the blob tier. An absent
-/// tier prints no tier line, because no blob can exist.
+/// The boot lines of one RAM quote: the spend, then the blob tier. An absent tier prints no line.
 pub fn logRamQuote(q: kv_budget.RamQuote, kv_ram_named: bool) void {
     const r = q.ram;
     const parts_fmt = "{d} MiB host kv + {d} MiB blobs + {d} MiB prefix + {d} MiB stages";
@@ -249,8 +257,9 @@ pub fn logRamQuote(q: kv_budget.RamQuote, kv_ram_named: bool) void {
 
     switch (q.tier) {
         .absent => {},
-        .unenforced => log.info("kv ram tier: unenforced, {d} MiB need ({d} evictable sessions " ++
-            "+ 1 in a swap, {d} MiB each). Set --kv-ram to bound it", .{
+        .unenforced => log.info("kv ram tier: unenforced, " ++
+            "{d} MiB need ({d} evictable sessions + 1 in a swap, {d} MiB each). " ++
+            "Set --kv-ram to bound it", .{
             q.need / mib, q.evictable, q.blob / mib,
         }),
         .bounded => |bytes| {
@@ -258,11 +267,10 @@ pub fn logRamQuote(q: kv_budget.RamQuote, kv_ram_named: bool) void {
                 "(need {d} MiB, {d} MiB a blob)", .{
                 bytes / mib, q.evictable, q.need / mib, q.blob / mib,
             });
-            // A named budget below the need is a choice of backpressure, so
-            // the boot accepts it and says what it costs.
+            // A named budget below the need is a choice of backpressure. Say what it costs.
             if (kv_ram_named and bytes < q.need) {
-                log.warn("kv ram tier: --kv-ram funds {d} MiB of blobs, but the need is " ++
-                    "{d} MiB. A turn can wait until another session closes", .{
+                log.warn("kv ram tier: --kv-ram funds {d} MiB of blobs, " ++
+                    "but the need is {d} MiB. A turn can wait until another session closes", .{
                     bytes / mib, q.need / mib,
                 });
             }
@@ -270,8 +278,8 @@ pub fn logRamQuote(q: kv_budget.RamQuote, kv_ram_named: bool) void {
     }
 }
 
-/// The lines of a `--gpu-layers` boot before its arm.
-pub fn logPlaced(p: device_arm.Placed, n_layers: u32) void {
+/// The lines of a `--gpu-layers` boot before its placement.
+pub fn logLayerChoice(p: device_placement.LayerChoice, n_layers: u32) void {
     if (p.slots_from) |from| {
         log.info("hybrid: {d} vram kv slots, clamped from {d}", .{ limits.max_batch, from });
     }
@@ -284,21 +292,20 @@ pub fn logPlaced(p: device_arm.Placed, n_layers: u32) void {
         logPrefixDefault();
     }
 
-    if (p.split) |s| {
-        var span_buffer: [kv_budget.placement_text_max]u8 = undefined;
-        log.info("{s}", .{kv_budget.formatPlacement(s, &span_buffer)});
+    if (p.layer_split) |s| {
+        var span_buffer: [kv_budget.layer_split_text_max]u8 = undefined;
+        log.info("{s}", .{kv_budget.formatLayerSplit(s, &span_buffer)});
         if (p.pin == null) {
-            logAutoSplit(s.split, n_layers);
+            logAutoSplit(s.host_layers, n_layers);
         }
     }
 
     if (p.selects == .fused) {
-        logFusedArm(p.pin);
+        logFusedPlacement(p.pin);
     }
 }
 
-/// Zero-config serve keeps the prefix cache at a named default when no
-/// `--kv-ram` names a budget.
+/// The line of the prefix cache default that zero-config serve keeps without `--kv-ram`.
 pub fn logPrefixDefault() void {
     log.info("prefix cache: {d} MiB default budget (set --kv-ram to size both ram tiers)", .{
         limits.serve_prefix_ram_default / mib,
@@ -307,7 +314,7 @@ pub fn logPrefixDefault() void {
 
 // -- helpers ----------------------------------------------------------------
 
-fn refusePlacementVram(io: Io, p: @FieldType(resolve_mod.Refusal, "placement_vram")) anyerror {
+fn refuseLayerSplitVram(io: Io, p: @FieldType(resolve_mod.Refusal, "layer_split_vram")) anyerror {
     const advice = switch (p.kind) {
         .run => "Lower --gpu-layers, or use a smaller / Q4 model",
         .serve => "Lower --gpu-layers or --max-seq, or use a smaller / Q4 model",
@@ -322,8 +329,8 @@ fn refusePlacementVram(io: Io, p: @FieldType(resolve_mod.Refusal, "placement_vra
 }
 
 fn refuseWholeModelSplit(io: Io, pin: ?u32) anyerror {
-    const served = " resolves to a whole-model placement, which the fused (or CPU) " ++
-        "runner already serves. Drop the flag, ";
+    const served = " resolves to a whole-model placement, " ++
+        "which the fused (or CPU) runner already serves. Drop the flag, ";
     if (pin) |n_gpu| {
         return args.fail(
             io,
@@ -348,9 +355,9 @@ fn logKvVramSmall(k: @FieldType(resolve_mod.Refusal, "kv_vram_small")) void {
         logClamp(c);
     }
 
-    log.err("kv budget: {d} MiB of KV cannot fund {d} slot(s). One slot costs {d:.1} " ++
-        "MiB at window {d}, so raise --kv-vram to {d} MiB or more, or lower " ++
-        "--max-seq / --vram-slots", .{
+    log.err("kv budget: {d} MiB of KV cannot fund {d} slot(s). " ++
+        "One slot costs {d:.1} MiB at window {d}, so raise --kv-vram to {d} MiB or more, " ++
+        "or lower --max-seq / --vram-slots", .{
         k.x_bytes / mib,
         k.rows,
         @as(f64, @floatFromInt(k.per_slot)) / mib,
@@ -359,9 +366,8 @@ fn logKvVramSmall(k: @FieldType(resolve_mod.Refusal, "kv_vram_small")) void {
     });
 }
 
-/// The line of a placement that funds the whole model on the device. Null is
-/// the auto pin.
-fn logFusedArm(pin: ?u32) void {
+/// The line of a placement that funds the whole model on the device. A null `pin` is auto.
+fn logFusedPlacement(pin: ?u32) void {
     const funded = "the budget funds the whole model, so the fused runner serves it";
     if (pin) |n| {
         log.info("--gpu-layers {d}: " ++ funded, .{n});
@@ -383,8 +389,7 @@ fn windowSource(window: u32, ceiling: u32, flag: ?u32) WindowSource {
     return if (window == ceiling) .ceiling else .budget;
 }
 
-/// The weight quant the precision line names: the type of the first down projection,
-/// which every block of every family holds.
+/// The weight quant of the precision line: the type of the first down projection.
 fn weightQuantName(loaded: *const loader.Loaded) []const u8 {
     const t = tensor_lookup.find(loaded.tensors, "blk.0.ffn_down.weight") orelse return "unknown";
     return std.enums.tagName(dtype.GgmlType, t.dtype) orelse "unknown";
@@ -392,7 +397,7 @@ fn weightQuantName(loaded: *const loader.Loaded) []const u8 {
 
 // -- tests ------------------------------------------------------------------
 
-test "windowSource: a flag names its window, and a default names the ceiling or the budget that bound it" {
+test "windowSource: a flag names its window, a default names the ceiling or the budget" {
     const ceiling: u32 = 8192;
     try std.testing.expectEqual(WindowSource.ceiling, windowSource(ceiling, ceiling, null));
     try std.testing.expectEqual(WindowSource.budget, windowSource(2816, ceiling, null));

@@ -2,6 +2,12 @@
 //! SIMD probe. The ops backend is a build-time decision, so an unsupported target fails here and
 //! never as a runtime SIGILL. Only `-Druntime=vulkan` touches glslc and libvulkan.
 //!
+//! Comptime. `debugNoteStep` takes its note at comptime, so the print string joins at build time.
+//!
+//! Vulkan link. The Vulkan loader uses TLS, pthreads, and malloc. It segfaults in its own data
+//! setup when the executable does not link libc. With `-lc` the TLS init of the C runtime runs
+//! before `main`, so `libvulkan.so.1` finds the slots it expects.
+//!
 //! Common invocations. The Makefile wraps most of these as short targets, and
 //! `check-fmt` has no target of its own:
 //!   zig build                                Debug, auto-picks strongest CPU backend
@@ -171,20 +177,23 @@ const ops_backend_help = "Op kernel backend. 'auto' (default) picks the stronges
     "OpRequires the target satisfies. 'naive' = scalar f32 reference. 'simd' = @Vector(8) " ++
     "AVX2+FMA path. The build fails if the target lacks AVX2.";
 
-const runtime_help = "Dispatch runtime. 'cpu' = the ops/ variants alone. 'vulkan' = " ++
-    "also compile src/ops_vulkan/shaders/*.comp to SPIR-V with glslc, link libvulkan, and pull " ++
-    "vulkan-zig as a build dependency. It needs glslc on PATH and libvulkan-dev installed. " ++
+const runtime_help = "Dispatch runtime. 'cpu' = the ops/ variants alone. " ++
+    "'vulkan' = also compile src/ops_vulkan/shaders/*.comp to SPIR-V with glslc, " ++
+    "link libvulkan, and pull vulkan-zig as a build dependency. " ++
+    "It needs glslc on PATH and libvulkan-dev installed. " ++
     "The default is 'vulkan' for a GPU ops backend, otherwise 'cpu'.";
 
-const attn_kernel_help = "GPU attention kernel set. 'split' (default) = the resident kernels " ++
-    "inside one split and the split and merge passes past it. A CPU build ignores it.";
+const attn_kernel_help = "GPU attention kernel set. " ++
+    "'split' (default) = the resident kernels inside one split and the split " ++
+    "and merge passes past it. A CPU build ignores it.";
 
-const vk_registry_help = "Path to the Vulkan registry XML (vk.xml). The build reads it only " ++
-    "under -Druntime=vulkan. The default is the Ubuntu and Debian libvulkan-dev location.";
+const vk_registry_help = "Path to the Vulkan registry XML (vk.xml). " ++
+    "The build reads it only under -Druntime=vulkan. " ++
+    "The default is the Ubuntu and Debian libvulkan-dev location.";
 
-const trace_help = "Compile hot-path traces (the layer, dispatch, and token log scopes). The " ++
-    "default is true for Debug and false for a release mode. Output still needs " ++
-    "$ZIGFERENCER_LOG to turn the scope on.";
+const trace_help = "Compile hot-path traces (the layer, dispatch, and token log scopes). " ++
+    "The default is true for Debug and false for a release mode. " ++
+    "Output still needs $ZIGFERENCER_LOG to turn the scope on.";
 
 // GPU tests run one at a time on a shared device, so the suite needs to run a single named test.
 // A filtered-out test never executes, so its binary touches no device.
@@ -193,13 +202,14 @@ const test_filter_help = "Run only tests whose name contains this string (repeat
 const test_threads_help = "Pool threads of the runner tests whose thread count is incidental " ++
     "(default 4, at least 1). Serial reference runs keep 1 thread.";
 
-const llvm_help = "Build both executables and every test binary with the LLVM code generator " ++
-    "(default: the Zig choice for the target). A debugger shows local variables only in an " ++
-    "LLVM Debug build.";
+const llvm_help =
+    "Build both executables and every test binary with the LLVM code generator (default: " ++
+    "the Zig choice for the target). " ++
+    "A debugger shows local variables only in an LLVM Debug build.";
 
-const test_bin_help = "The test binary that test-install puts at zig-out/test/<name>: unit (the " ++
-    "tests of src/ outside src/dev/), dev_unit (the tests of src/dev/), or the stem of a " ++
-    "tests/*_test.zig file (default unit).";
+const test_bin_help = "The test binary that test-install puts at zig-out/test/<name>: " ++
+    "unit (the tests of src/ outside src/dev/), dev_unit (the tests of src/dev/), " ++
+    "or the stem of a tests/*_test.zig file (default unit).";
 
 // -- types ------------------------------------------------------------------
 
@@ -262,7 +272,7 @@ pub fn build(b: *std.Build) void {
 
     addBench(b, config, modules);
     addSimdProbe(b, config, modules);
-    addShaderLint(b, config);
+    addShaderLint(b, config, test_step);
 }
 
 // -- helpers: options -------------------------------------------------------
@@ -301,10 +311,9 @@ fn checkTestThreads(test_threads: u32) u32 {
     return test_threads;
 }
 
-/// Map `-Dops-backend` to a concrete variant. `.auto` picks the strongest variant whose published
-/// `OpRequires` the target satisfies: on x86_64 with AVX2+FMA, `simd_pf`, a register-blocked
-/// microkernel with software prefetch. An explicit choice on an unsupported target fails the build
-/// and never emits an illegal instruction at run time.
+/// Map `-Dops-backend` to a concrete variant. `.auto` picks the strongest variant that the target
+/// satisfies: `simd_pf` on x86_64 with AVX2+FMA. An explicit choice on an unsupported target fails
+/// the build.
 fn resolveOpsBackend(
     requested: OpsBackendOption,
     target: std.Build.ResolvedTarget,
@@ -331,10 +340,8 @@ fn resolveOpsBackend(
     };
 }
 
-/// Local mirror of the simd-variant requirements in `core/op_requires.zig`: `arch = x86_64`,
-/// `min_simd = avx2`, `needs_fma = true`. The `pub const requires` of the variant file is the
-/// source of truth at run time and inside the binary. This function is the build-time evaluator.
-/// The two must agree.
+/// The build-time mirror of the simd requirements in `core/op_requires.zig`: x86_64, AVX2, and
+/// FMA. The `pub const requires` of the variant file is the source of truth. The two must agree.
 fn simdBackendSupportedBy(cpu: std.Target.Cpu) bool {
     if (cpu.arch != .x86_64) return false;
 
@@ -345,9 +352,8 @@ fn simdBackendSupportedBy(cpu: std.Target.Cpu) bool {
     return true;
 }
 
-/// The CPU variant of a binary. The backend is cumulative: a GPU binary still owns engines that the
-/// GPU does not cover, such as the qwen session engine on a fused build. Those engines must run on
-/// the strongest CPU variant, and never silently on naive.
+/// The CPU variant of a binary. A GPU binary still owns engines that the GPU does not cover, such
+/// as the qwen session engine on a fused build. They must run on the strongest CPU variant.
 fn cpuOpsBackend(config: Config) OpsBackendResolved {
     const simd_ok = simdBackendSupportedBy(config.target.result.cpu);
     return switch (config.ops_backend) {
@@ -371,6 +377,9 @@ fn addModules(b: *std.Build, config: Config) Modules {
         .{ .name = "zigferencer", .module = exe },
         .{ .name = "build_options", .module = build_options },
     });
+
+    // A dependent package reads the engine with `dep.module("zigferencer")`.
+    b.modules.put(b.allocator, "zigferencer", exe) catch @panic("OOM");
 
     return .{
         .build_options = build_options,
@@ -477,6 +486,7 @@ fn addRun(b: *std.Build, exe: *Compile) void {
 
 /// Add the test steps and return `test`, so that later areas can add to it.
 fn addTests(b: *std.Build, config: Config, modules: Modules) *Step {
+    // Declare the steps.
     const test_step = b.step("test", "Run zigferencer tests");
     // This step compiles a test that cannot run where the build runs, such as a GPU test on a host
     // without a device.
@@ -489,6 +499,7 @@ fn addTests(b: *std.Build, config: Config, modules: Modules) *Step {
     // optimized mode keeps their Debug checks here.
     const test_unit_step = b.step("test-unit", "Run the unit tests of src/ only");
 
+    // Add the unit tests of both executables.
     var binaries: std.ArrayList(*Compile) = .empty;
 
     const unit_tests = b.addTest(.{
@@ -513,6 +524,7 @@ fn addTests(b: *std.Build, config: Config, modules: Modules) *Step {
         test_unit_step.dependOn(&run_binary.step);
     }
 
+    // Add the shader lint tests.
     const lint_tests = b.addTest(.{
         .name = "shader_lint",
         .root_module = createLintModule(b, config.target, config.optimize),
@@ -526,6 +538,7 @@ fn addTests(b: *std.Build, config: Config, modules: Modules) *Step {
     test_build_step.dependOn(&lint_tests.step);
     test_unit_step.dependOn(&run_lint_tests.step);
 
+    // Add the integration tests.
     requireListed(b, &all_integration_tests);
 
     for (integrationTestPaths(config)) |path| {
@@ -542,6 +555,7 @@ fn addTests(b: *std.Build, config: Config, modules: Modules) *Step {
         test_build_step.dependOn(&binary.step);
     }
 
+    // Wire the install step.
     wireTestInstall(b, test_install_step, config.test_bin, binaries.items);
     return test_step;
 }
@@ -763,10 +777,7 @@ fn wireVulkan(b: *std.Build, modules: Modules, vk_registry: []const u8) void {
     exe_mod.addImport("vulkan", vk_dep.module("vulkan-zig"));
     modules.dev.addImport("vulkan", vk_dep.module("vulkan-zig"));
 
-    // `link_libc` is load-bearing. The Vulkan loader uses TLS, pthreads, and malloc, and it
-    // segfaults inside its own data setup when the executable does not link against libc. With
-    // `-lc` the TLS init of the C runtime runs before main, so `libvulkan.so.1` finds the slots it
-    // expects. Without it every dispatched Vulkan call crashes at the first heap or TLS access.
+    // `link_libc` is load-bearing.
     exe_mod.linkSystemLibrary("vulkan", .{});
     exe_mod.link_libc = true;
 
@@ -816,10 +827,10 @@ fn createLintModule(
 }
 
 /// `lint-shaders` runs the style rules of `tools/shader_lint.zig` and needs no Vulkan SDK. Under
-/// `-Druntime=vulkan` it also compiles each shader with `glslc -Werror` and checks the blob with
-/// `spirv-val`. The step names the shader directory and `kernels.zig` as inputs, so `--watch` runs
-/// it again on a save.
-fn addShaderLint(b: *std.Build, config: Config) void {
+/// `-Druntime=vulkan` it also compiles each shader with `glslc -Werror` and runs `spirv-val`.
+/// The step names its inputs, so `--watch` runs it again on a save. `test` depends on the style
+/// rules alone, so a default `zig build test` stays free of a Vulkan SDK.
+fn addShaderLint(b: *std.Build, config: Config, test_step: *Step) void {
     const lint_step = b.step(
         "lint-shaders",
         "Check the shader rules (with -Druntime=vulkan: also glslc -Werror and spirv-val)",
@@ -834,6 +845,7 @@ fn addShaderLint(b: *std.Build, config: Config) void {
     run_lint.addFileArg(b.path("src/ops_vulkan/kernels.zig"));
     run_lint.expectExitCode(0);
     lint_step.dependOn(&run_lint.step);
+    test_step.dependOn(&run_lint.step);
 
     if (config.runtime != .vulkan) return;
 

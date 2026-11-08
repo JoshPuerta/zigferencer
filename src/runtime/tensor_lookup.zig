@@ -1,6 +1,8 @@
 //! Tensor-by-name lookup over a `loader.TensorRef` list. Every forward pass shares it to resolve
 //! the weights of a loaded GGUF model.
 //!
+//! Comptime. `findByFmt` takes the name format at comptime, so a bad format fails the build.
+//!
 //! Absence. One home keeps the four runners (CPU Llama, CPU Qwen, GPU Llama, GPU Qwen) on one
 //! found/not-found rule. An absence is either an optional (`find`) or an `error.MissingTensor`
 //! (`findRequired`). The call site picks the form it needs, and the runner does not change the

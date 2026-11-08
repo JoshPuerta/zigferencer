@@ -2,6 +2,8 @@
 //! consumed by `bpe.encodeAlloc` and `bpe.decodeAlloc`, which stay pure over Vocab with storage on
 //! the caller's arena.
 //!
+//! Comptime. The GPT-2 byte table (`gpt2_byte_table`) is built at comptime.
+//!
 //! Byte level. GPT-2 byte-level BPE maps every byte 0..255 to a printable Unicode codepoint, and
 //! the model only ever sees those. The byte-to-codepoint table is fixed and lives in `comptime`
 //! (see `gpt2_byte_table`). The table must produce exactly 68 escape codepoints, which is what the
@@ -74,7 +76,7 @@ pub const Special = struct {
     bytes: []const u8,
 };
 
-/// Pre-tokenization regime, from `tokenizer.ggml.pre`. See "Pre-tokenization" in the header.
+/// Pre-tokenization regime, from `tokenizer.ggml.pre`.
 pub const PreType = enum { default, llama3, qwen, smollm };
 
 pub const Vocab = struct {

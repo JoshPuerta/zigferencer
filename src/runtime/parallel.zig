@@ -3,6 +3,8 @@
 //! calls the kernel directly, at zero overhead: no pool touch, no alloc, no sync. Otherwise it
 //! splits the output rows into units and runs them on the pool.
 //!
+//! Comptime. `E` and `Kernels` make the fan-out generic, so f32 and f16 share one body.
+//!
 //! The module also holds the control units of CPU attention and of the GDN step. They spread the
 //! work units of one row over the same pool, with the same gate, `Policy.parts`.
 //!
@@ -70,7 +72,7 @@ const log = std.log.scoped(.parallel);
 
 // -- constants --------------------------------------------------------------
 
-/// The default fan-out floor in FLOPs. See "Defaults" in the header.
+/// The default fan-out floor in FLOPs.
 pub const default_min_parallel_flops: u64 = 250_000;
 
 /// The default spin budget of a pool worker.
@@ -121,7 +123,7 @@ pub const Policy = struct {
     }
 
     /// The participant count of one op on a pool of `threads` threads. 1 runs the op inline on
-    /// the caller. See "Fan-out gate" in the header.
+    /// the caller.
     pub fn parts(self: Policy, threads: u32, n_units: usize, flops: u64) u32 {
         std.debug.assert(threads >= 1);
 
@@ -285,6 +287,7 @@ pub fn defaultThreads(physical: u32) u32 {
 /// thread. A `--threads` value over `limits.max_threads` returns `error.TooManyThreads`.
 /// A `--spin-us` value over `max_spin_us` returns `error.SpinTooLong`.
 pub fn resolve(host: Policy, flags: Flags, runs_cpu_ops: bool) ResolveError!Resolved {
+    // Start from the host policy.
     std.debug.assert(host.n_threads >= 1);
 
     var out: Resolved = .{
@@ -293,6 +296,8 @@ pub fn resolve(host: Policy, flags: Flags, runs_cpu_ops: bool) ResolveError!Reso
         .flops_from = .auto,
         .spin_from = .auto,
     };
+
+    // Apply the flags.
     if (flags.threads) |t| {
         if (t > limits.max_threads) return error.TooManyThreads;
         if (t != 0) {
@@ -312,11 +317,13 @@ pub fn resolve(host: Policy, flags: Flags, runs_cpu_ops: bool) ResolveError!Reso
         out.spin_from = .flag;
     }
 
+    // Pin one thread when no CPU op runs.
     if (!runs_cpu_ops) {
         out.policy.n_threads = 1;
         out.threads_from = .placement;
     }
 
+    // Check the result.
     std.debug.assert(out.policy.n_threads >= 1);
     std.debug.assert(out.policy.n_threads <= limits.max_threads);
     if (flags.spin_us != null) {
@@ -377,7 +384,7 @@ pub fn countCores(lists: []const []const u8) u32 {
 }
 
 /// Run a linear matmul over `batch` input rows, on the pool when the work is large enough.
-/// The serial path is a direct kernel call. See "Matmul units" in the header.
+/// The serial path is a direct kernel call.
 /// `outs` must hold `batch` rows at stride `weight.shape[1]`.
 pub fn linearBatch(
     pool: *Pool,
@@ -443,7 +450,7 @@ pub fn matmulUnitRows(n: usize, threads: u32) usize {
     return rows;
 }
 
-/// The control unit of one CPU decode attention row. See "Attention units" in the header.
+/// The control unit of one CPU decode attention row.
 /// `Kernels` declares `attentionPartTyped` and `attentionMerge`. `E` is the KV element type.
 /// `parts_buf` holds at least `attn_cpu.partialLen(n_heads, head_dim)` f32s.
 pub fn attentionTyped(
@@ -516,7 +523,7 @@ pub fn attentionTyped(
     Kernels.attentionMerge(parts_buf, units.n_parts, n_heads, head_dim, out);
 }
 
-/// The control unit of one GDN step of one row. See "GDN units" in the header.
+/// The control unit of one GDN step of one row.
 /// `heads.qkv` must be `qkv`, the buffer that the prologue writes.
 pub fn gdnStep(
     pool: *Pool,
@@ -580,8 +587,8 @@ fn readSysfsCores(io: std.Io) ?u32 {
         };
         if (text.len == sibling_text_max) {
             log.info(
-                "cpu{d} sibling list is longer than {d} bytes. The thread default uses the " ++
-                    "logical estimate",
+                "cpu{d} sibling list is longer than {d} bytes. " ++
+                    "The thread default uses the logical estimate",
                 .{ n, sibling_text_max },
             );
             return null;
@@ -602,7 +609,7 @@ fn readSysfsCores(io: std.Io) ?u32 {
 }
 
 /// Build a Tensor view of `weight` over the output rows `[start, end)` (`shape[1]` in GGUF
-/// reversed-shape order). See "Weight slices" in the header.
+/// reversed-shape order).
 fn sliceWeightRows(weight: Tensor, start: usize, end: usize) Tensor {
     std.debug.assert(weight.n_dims == 2);
 
@@ -738,11 +745,14 @@ const Q80Fixture = struct {
     ) !Q80Fixture {
         std.debug.assert(in_features % 32 == 0);
 
+        // Allocate the inputs and the weights.
         const row_bytes = (in_features / 32) * 34;
         const inputs = try gpa.alloc(f32, batch * in_features);
         errdefer gpa.free(inputs);
 
         const w_data = try gpa.alignedAlloc(u8, .@"32", out_features * row_bytes);
+
+        // Fill the inputs and the quant rows.
         for (inputs, 0..) |*x, i| {
             x.* = @sin(@as(f32, @floatFromInt(i)) * 0.02);
         }

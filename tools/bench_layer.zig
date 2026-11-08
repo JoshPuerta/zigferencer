@@ -4,6 +4,9 @@
 //! behind the matmul rows unless it gets its own table. Each section runs the CPU reference on
 //! every build and the GPU variant under vulkan.
 //!
+//! Comptime. `build_options.use_vulkan` gates the GPU rows, so a CPU build never reads them. The
+//! element type and kernel set are parameters.
+//!
 //! Attention grid. The attention section also walks a context-depth grid on the two qwen
 //! full-attention shapes, the last ten cases. Qwen3.5-2B states 8 query heads over 2 kv heads,
 //! and Qwen3.5-9B states 16 over 4, both at head_dim 256. Attention is the one per-token cost
@@ -28,8 +31,8 @@
 //! caches and the bench calls `Attention.run`. `Attention.runTyped` takes f16 caches on an f16
 //! pipeline, and the kernel tests and `gpu-selftest attn` use it.
 //!
-//! Kit grid. `benchAttnKitGrid` records `rows` consecutive query rows of one stream that end at
-//! `depth`, through `attn_record` as a runner records them, and times one submission. The G/s
+//! Kernel set grid. `benchAttnGrid` records `rows` consecutive query rows of one stream that end
+//! at `depth`, through `attn_record` as a runner records them, and times one submission. The G/s
 //! column is the unique KV bytes of the stream, K and V, over the time. The rel_err column holds
 //! the error of the deepest row against the CPU reference. So a kernel experiment runs here
 //! without a model.
@@ -63,6 +66,37 @@ const rate = bench_util.rate;
 /// The fan-out of every threaded attention row. The count is fixed, so the rows of two hosts
 /// compare.
 const bench_threaded: zigferencer.parallel.Policy = .{ .n_threads = 16, .min_parallel_flops = 0 };
+
+const atn_cases = [_]AtnCase{
+    atnCase("attn 9h,3kv,d64,t128", 9, 3, 64, 128, false),
+    atnCase("attn 32h,8kv,d64,t512", 32, 8, 64, 512, false),
+    atnCase("attn 32h,8kv,d128,t512", 32, 8, 128, 512, false),
+    // This shape is the widest GQA group the kernel blocks for. No loaded
+    // model states it, so the row prices the block bound alone.
+    atnCase("attn 16h,2kv,d256,t512 group 8", 16, 2, 256, 512, false),
+    atnCase("attn 8h,2kv,d256,t512", 8, 2, 256, 512, true),
+    atnCase("attn 8h,2kv,d256,t1024", 8, 2, 256, 1024, true),
+    atnCase("attn 8h,2kv,d256,t2048", 8, 2, 256, 2048, true),
+    atnCase("attn 8h,2kv,d256,t4096", 8, 2, 256, 4096, true),
+    atnCase("attn 8h,2kv,d256,t8192", 8, 2, 256, 8192, true),
+    atnCase("attn 16h,4kv,d256,t512", 16, 4, 256, 512, true),
+    atnCase("attn 16h,4kv,d256,t1024", 16, 4, 256, 1024, true),
+    atnCase("attn 16h,4kv,d256,t2048", 16, 4, 256, 2048, true),
+    atnCase("attn 16h,4kv,d256,t4096", 16, 4, 256, 4096, true),
+    atnCase("attn 16h,4kv,d256,t8192", 16, 4, 256, 8192, true),
+};
+
+const grid_shapes = [_]GridShape{
+    gridShape("qwen35-2b 8h,2kv,d256", 8, 2, 256, true, 262_144),
+    gridShape("llama-8b 32h,8kv,d128", 32, 8, 128, true, 131_072),
+    gridShape("qwen35-9b 16h,4kv,d256", 16, 4, 256, true, 262_144),
+    gridShape("smollm2 9h,3kv,d64", 9, 3, 64, false, 8192),
+};
+
+const grid_depths = [_]u32{ 2048, 8192, 32_704 };
+
+// One decode row, one row tile of eight rows, and one prefill chunk.
+const grid_row_counts = [_]u32{ 1, 8, 128 };
 
 // -- types ------------------------------------------------------------------
 
@@ -134,9 +168,9 @@ fn AtnCpu(comptime E: type, comptime Kernels: type) type {
     };
 }
 
-/// One row of the kit grid: a head geometry, the KV type of its registry
+/// One row of the kernel set grid: a head geometry, the KV type of its registry
 /// default, and the deepest row its declared context holds.
-const KitShape = struct {
+const GridShape = struct {
     label: []const u8,
     n_heads: u32,
     n_kv_heads: u32,
@@ -144,24 +178,6 @@ const KitShape = struct {
     kv_f16: bool,
     max_depth: u32,
 };
-
-fn kitShape(
-    label: []const u8,
-    n_heads: u32,
-    n_kv_heads: u32,
-    head_dim: u32,
-    kv_f16: bool,
-    max_depth: u32,
-) KitShape {
-    return .{
-        .label = label,
-        .n_heads = n_heads,
-        .n_kv_heads = n_kv_heads,
-        .head_dim = head_dim,
-        .kv_f16 = kv_f16,
-        .max_depth = max_depth,
-    };
-}
 
 /// One CPU attention case: a head geometry, a context depth, and the KV storage type.
 const AtnCase = struct {
@@ -172,6 +188,217 @@ const AtnCase = struct {
     t_len: u32,
     kv_f16: bool,
 };
+
+/// The input slices that the f32 and the f16 rows of one attention case share.
+const AtnData = struct {
+    q: []const f32,
+    k_cache: []const f32,
+    v_cache: []const f32,
+    out_ref: []const f32,
+    out_work: []f32,
+};
+
+/// The f16 copies of the KV cache, with their scratch and the f16 reference output.
+const AtnF16 = struct {
+    k: []const f16,
+    v: []const f16,
+    parts: []f32,
+    out_ref: []f32,
+};
+
+const GridCtx = @TypeOf(@as(Runner, undefined).ctx);
+
+// The bench imports no Vulkan binding, so it reads the descriptor type from the binding helper.
+const DescriptorBufferInfo = @typeInfo(
+    @typeInfo(@TypeOf(vkops.updateStorageBindings)).@"fn".params[2].type.?,
+).pointer.child;
+
+/// The kernels, descriptor sets, and buffers that every row of one shape shares.
+const GridRig = struct {
+    ctx: *GridCtx,
+    single: *vkops.Attention,
+    multi: *vkops.AttentionMultiStream,
+    passes: *vkops.AttentionSplit,
+    single_set: vkops.OneShot,
+    multi_set: vkops.OneShot,
+    split_set: vkops.OneShot,
+    merge_set: vkops.OneShot,
+    buf_q: *vkops.HostBuffer,
+    buf_k: *vkops.HostBuffer,
+    buf_v: *vkops.HostBuffer,
+    buf_out: *vkops.HostBuffer,
+    dev_q: *vkops.DeviceBuffer,
+    dev_k: *vkops.DeviceBuffer,
+    dev_v: *vkops.DeviceBuffer,
+    dev_scratch: *vkops.DeviceBuffer,
+    dev_out: *vkops.DeviceBuffer,
+};
+
+/// One KV stream at one depth: the host values, their byte size, and the split scratch.
+const GridStream = struct {
+    depth: u32,
+    stream_elems: usize,
+    kv_bytes: usize,
+    elem_bytes: usize,
+    k_host: []f32,
+    v_host: []f32,
+    scratch: zigferencer.attn_split.Scratch,
+};
+
+/// One submission of the recorded kernel set: the timed closure of a grid point.
+const GridStep = struct {
+    ctx: *GridCtx,
+    kernels: vkops.AttnKernels,
+    cb: vkops.AttnKernels.Cmd,
+    plan: *const zigferencer.attn_split.AttnPlan,
+    binding: vkops.AttnKernels.Binding,
+
+    pub fn run(self: @This()) !void {
+        try self.ctx.vkd.resetCommandBuffer(self.cb, .{});
+        try self.ctx.vkd.beginCommandBuffer(
+            self.cb,
+            &.{ .flags = .{ .one_time_submit_bit = true } },
+        );
+        zigferencer.attn_record.record(
+            vkops.AttnKernels,
+            self.kernels,
+            self.cb,
+            self.plan,
+            self.binding,
+        );
+        try self.ctx.vkd.endCommandBuffer(self.cb);
+        const cmds = [_]vkops.AttnKernels.Cmd{self.cb};
+        try self.ctx.vkd.queueSubmit(
+            self.ctx.queue,
+            &.{.{ .command_buffer_count = 1, .p_command_buffers = &cmds }},
+            .null_handle,
+        );
+        try self.ctx.vkd.queueWaitIdle(self.ctx.queue);
+    }
+};
+
+// -- api --------------------------------------------------------------------
+
+/// The elementwise sections and the attention sections, in print order. Each section prints a
+/// header, then one row per variant for each case.
+pub fn benchElementwise(gpa: std.mem.Allocator, io: std.Io, runner: anytype) !void {
+    try benchResidualAdd(gpa, io, runner);
+    try benchSwiglu(gpa, io, runner);
+    try benchRmsnorm(gpa, io, runner);
+    try benchRope(gpa, io, runner);
+    try benchFusedAttention(gpa, io, runner);
+    if (comptime build_options.use_vulkan) {
+        if (runner) |r| {
+            try benchAttnGrid(gpa, io, r);
+            try benchDispatchAmortization(gpa, io, r);
+        }
+    }
+}
+
+/// Qwen3.5 full-attention output gate: `dst *= sigmoid(gate)`. GPU-only kernel
+/// with an inline CPU reference (there is no standalone CPU sigmoid-gate op).
+pub fn benchSigmoidGate(gpa: std.mem.Allocator, io: std.Io, runner: *Runner) !void {
+    printSectionHeader("sigmoid_gate (qwen full-attn output gate)");
+    var kern = try zigferencer.ops_vulkan.SigmoidGate.init(&runner.ctx);
+    defer kern.deinit();
+
+    const cases = [_]struct { label: []const u8, n: usize }{
+        .{ .label = "sigmoid n=2048 (qwen attn out)", .n = 2048 },
+        .{ .label = "sigmoid n=4096", .n = 4096 },
+    };
+    for (cases) |c| {
+        // Allocate and fill the inputs.
+        const gate = try gpa.alignedAlloc(f32, .of(f32), c.n);
+        defer gpa.free(gate);
+
+        const dst_init = try gpa.alignedAlloc(f32, .of(f32), c.n);
+        defer gpa.free(dst_init);
+
+        const dst_ref = try gpa.alignedAlloc(f32, .of(f32), c.n);
+        defer gpa.free(dst_ref);
+
+        const dst_work = try gpa.alignedAlloc(f32, .of(f32), c.n);
+        defer gpa.free(dst_work);
+
+        for (gate, 0..) |*v, i| {
+            v.* = @sin(@as(f32, @floatFromInt(i)) * 0.01);
+        }
+
+        for (dst_init, 0..) |*v, i| {
+            v.* = @cos(@as(f32, @floatFromInt(i)) * 0.01);
+        }
+
+        // Compute the reference.
+        @memcpy(dst_ref, dst_init);
+        for (dst_ref, gate) |*d, g| {
+            d.* *= 1.0 / (1.0 + @exp(-g));
+        }
+
+        const ref_hash = hashOut(dst_ref);
+        const work: f64 = @floatFromInt(c.n);
+
+        // Time the GPU row.
+        const Gpu = struct {
+            k: *zigferencer.ops_vulkan.SigmoidGate,
+            gate: []const f32,
+            dst_init: []const f32,
+            dst_work: []f32,
+
+            pub fn run(self: @This()) !void {
+                @memcpy(self.dst_work, self.dst_init);
+                try self.k.run(self.dst_work, self.gate);
+            }
+        };
+        const tol: op_requires.Tolerance = .{ .relative = 1e-5 };
+        try gpuRow(
+            io,
+            c.n,
+            c.label,
+            "vk_sigmoid",
+            work,
+            tol,
+            dst_ref,
+            ref_hash,
+            dst_work,
+            Gpu{ .k = &kern, .gate = gate, .dst_init = dst_init, .dst_work = dst_work },
+        );
+        flush();
+    }
+}
+
+/// The attention kernel set of the build over a grid of (shape, depth, rows), one timed submission
+/// per point.
+pub fn benchAttnGrid(gpa: std.mem.Allocator, io: std.Io, runner: *Runner) !void {
+    printSectionHeader(
+        "fused attention kernel set grid (-Dattn-kernel=" ++ @tagName(
+            build_options.attn_kernel,
+        ) ++ ")",
+    );
+
+    for (grid_shapes) |sh| {
+        try benchGridShape(gpa, io, &runner.ctx, sh);
+    }
+}
+
+// -- helpers ----------------------------------------------------------------
+
+fn gridShape(
+    label: []const u8,
+    n_heads: u32,
+    n_kv_heads: u32,
+    head_dim: u32,
+    kv_f16: bool,
+    max_depth: u32,
+) GridShape {
+    return .{
+        .label = label,
+        .n_heads = n_heads,
+        .n_kv_heads = n_kv_heads,
+        .head_dim = head_dim,
+        .kv_f16 = kv_f16,
+        .max_depth = max_depth,
+    };
+}
 
 fn atnCase(
     label: []const u8,
@@ -189,43 +416,6 @@ fn atnCase(
         .t_len = t_len,
         .kv_f16 = kv_f16,
     };
-}
-
-const atn_cases = [_]AtnCase{
-    atnCase("attn 9h,3kv,d64,t128", 9, 3, 64, 128, false),
-    atnCase("attn 32h,8kv,d64,t512", 32, 8, 64, 512, false),
-    atnCase("attn 32h,8kv,d128,t512", 32, 8, 128, 512, false),
-    // This shape is the widest GQA group the kernel blocks for. No loaded
-    // model states it, so the row prices the block bound alone.
-    atnCase("attn 16h,2kv,d256,t512 group 8", 16, 2, 256, 512, false),
-    atnCase("attn 8h,2kv,d256,t512", 8, 2, 256, 512, true),
-    atnCase("attn 8h,2kv,d256,t1024", 8, 2, 256, 1024, true),
-    atnCase("attn 8h,2kv,d256,t2048", 8, 2, 256, 2048, true),
-    atnCase("attn 8h,2kv,d256,t4096", 8, 2, 256, 4096, true),
-    atnCase("attn 8h,2kv,d256,t8192", 8, 2, 256, 8192, true),
-    atnCase("attn 16h,4kv,d256,t512", 16, 4, 256, 512, true),
-    atnCase("attn 16h,4kv,d256,t1024", 16, 4, 256, 1024, true),
-    atnCase("attn 16h,4kv,d256,t2048", 16, 4, 256, 2048, true),
-    atnCase("attn 16h,4kv,d256,t4096", 16, 4, 256, 4096, true),
-    atnCase("attn 16h,4kv,d256,t8192", 16, 4, 256, 8192, true),
-};
-
-// -- api --------------------------------------------------------------------
-
-/// The elementwise sections and the attention sections, in print order. Each section prints a
-/// header, then one row per variant for each case.
-pub fn benchElementwise(gpa: std.mem.Allocator, io: std.Io, runner: anytype) !void {
-    try benchResidualAdd(gpa, io, runner);
-    try benchSwiglu(gpa, io, runner);
-    try benchRmsnorm(gpa, io, runner);
-    try benchRope(gpa, io, runner);
-    try benchFusedAttention(gpa, io, runner);
-    if (comptime build_options.use_vulkan) {
-        if (runner) |r| {
-            try benchAttnKitGrid(gpa, io, r);
-            try benchDispatchAmortization(gpa, io, r);
-        }
-    }
 }
 
 fn benchResidualAdd(gpa: std.mem.Allocator, io: std.Io, runner: anytype) !void {
@@ -616,23 +806,6 @@ fn benchFusedAttention(gpa: std.mem.Allocator, io: std.Io, runner: anytype) !voi
     }
 }
 
-/// The input slices that the f32 and the f16 rows of one attention case share.
-const AtnData = struct {
-    q: []const f32,
-    k_cache: []const f32,
-    v_cache: []const f32,
-    out_ref: []const f32,
-    out_work: []f32,
-};
-
-/// The f16 copies of the KV cache, with their scratch and the f16 reference output.
-const AtnF16 = struct {
-    k: []const f16,
-    v: []const f16,
-    parts: []f32,
-    out_ref: []f32,
-};
-
 /// The f16 rows of one attention case. They carry their own reference hash.
 fn attentionF16Rows(
     io: std.Io,
@@ -684,6 +857,7 @@ fn attentionGpuRow(
     work: f64,
     ref_hash: u64,
 ) !void {
+    // Wrap the GPU call as a bench case.
     const Gpu = struct {
         r: *Runner,
         q: []const f32,
@@ -708,6 +882,8 @@ fn attentionGpuRow(
             );
         }
     };
+
+    // Run the GPU row against the reference.
     try gpuRow(
         io,
         total_work_elems,
@@ -865,174 +1041,8 @@ fn attentionCase(
     flush();
 }
 
-/// Qwen3.5 full-attention output gate: `dst *= sigmoid(gate)`. GPU-only kernel
-/// with an inline CPU reference (there is no standalone CPU sigmoid-gate op).
-pub fn benchSigmoidGate(gpa: std.mem.Allocator, io: std.Io, runner: *Runner) !void {
-    printSectionHeader("sigmoid_gate (qwen full-attn output gate)");
-    var kern = try zigferencer.ops_vulkan.SigmoidGate.init(&runner.ctx);
-    defer kern.deinit();
-
-    const cases = [_]struct { label: []const u8, n: usize }{
-        .{ .label = "sigmoid n=2048 (qwen attn out)", .n = 2048 },
-        .{ .label = "sigmoid n=4096", .n = 4096 },
-    };
-    for (cases) |c| {
-        // Allocate and fill the inputs.
-        const gate = try gpa.alignedAlloc(f32, .of(f32), c.n);
-        defer gpa.free(gate);
-
-        const dst_init = try gpa.alignedAlloc(f32, .of(f32), c.n);
-        defer gpa.free(dst_init);
-
-        const dst_ref = try gpa.alignedAlloc(f32, .of(f32), c.n);
-        defer gpa.free(dst_ref);
-
-        const dst_work = try gpa.alignedAlloc(f32, .of(f32), c.n);
-        defer gpa.free(dst_work);
-
-        for (gate, 0..) |*v, i| {
-            v.* = @sin(@as(f32, @floatFromInt(i)) * 0.01);
-        }
-
-        for (dst_init, 0..) |*v, i| {
-            v.* = @cos(@as(f32, @floatFromInt(i)) * 0.01);
-        }
-
-        // Compute the reference.
-        @memcpy(dst_ref, dst_init);
-        for (dst_ref, gate) |*d, g| {
-            d.* *= 1.0 / (1.0 + @exp(-g));
-        }
-
-        const ref_hash = hashOut(dst_ref);
-        const work: f64 = @floatFromInt(c.n);
-
-        // Time the GPU row.
-        const Gpu = struct {
-            k: *zigferencer.ops_vulkan.SigmoidGate,
-            gate: []const f32,
-            dst_init: []const f32,
-            dst_work: []f32,
-
-            pub fn run(self: @This()) !void {
-                @memcpy(self.dst_work, self.dst_init);
-                try self.k.run(self.dst_work, self.gate);
-            }
-        };
-        const tol: op_requires.Tolerance = .{ .relative = 1e-5 };
-        try gpuRow(
-            io,
-            c.n,
-            c.label,
-            "vk_sigmoid",
-            work,
-            tol,
-            dst_ref,
-            ref_hash,
-            dst_work,
-            Gpu{ .k = &kern, .gate = gate, .dst_init = dst_init, .dst_work = dst_work },
-        );
-        flush();
-    }
-}
-
-/// The attention kit of the build over a grid of (shape, depth, rows), one timed submission per
-/// point.
-pub fn benchAttnKitGrid(gpa: std.mem.Allocator, io: std.Io, runner: *Runner) !void {
-    printSectionHeader(
-        "fused attention kernel set grid (-Dattn-kernel=" ++ @tagName(
-            build_options.attn_kernel,
-        ) ++ ")",
-    );
-
-    for (kit_shapes) |sh| {
-        try benchKitShape(gpa, io, &runner.ctx, sh);
-    }
-}
-
-const kit_shapes = [_]KitShape{
-    kitShape("qwen35-2b 8h,2kv,d256", 8, 2, 256, true, 262_144),
-    kitShape("llama-8b 32h,8kv,d128", 32, 8, 128, true, 131_072),
-    kitShape("qwen35-9b 16h,4kv,d256", 16, 4, 256, true, 262_144),
-    kitShape("smollm2 9h,3kv,d64", 9, 3, 64, false, 8192),
-};
-const kit_depths = [_]u32{ 2048, 8192, 32_704 };
-// One decode row, one row tile of eight rows, and one prefill chunk.
-const kit_row_counts = [_]u32{ 1, 8, 128 };
-
-const KitCtx = @TypeOf(@as(Runner, undefined).ctx);
-
-// The bench imports no Vulkan binding, so it reads the descriptor type from the binding helper.
-const DescriptorBufferInfo = @typeInfo(
-    @typeInfo(@TypeOf(vkops.updateStorageBindings)).@"fn".params[2].type.?,
-).pointer.child;
-
-/// The kernels, descriptor sets, and buffers that every row of one shape shares.
-const KitRig = struct {
-    ctx: *KitCtx,
-    single: *vkops.Attention,
-    multi: *vkops.AttentionMultiStream,
-    passes: *vkops.AttentionSplit,
-    single_set: vkops.OneShot,
-    multi_set: vkops.OneShot,
-    split_set: vkops.OneShot,
-    merge_set: vkops.OneShot,
-    buf_q: *vkops.HostBuffer,
-    buf_k: *vkops.HostBuffer,
-    buf_v: *vkops.HostBuffer,
-    buf_out: *vkops.HostBuffer,
-    dev_q: *vkops.DeviceBuffer,
-    dev_k: *vkops.DeviceBuffer,
-    dev_v: *vkops.DeviceBuffer,
-    dev_scratch: *vkops.DeviceBuffer,
-    dev_out: *vkops.DeviceBuffer,
-};
-
-/// One KV stream at one depth: the host values, their byte size, and the split scratch.
-const KitStream = struct {
-    depth: u32,
-    stream_elems: usize,
-    kv_bytes: usize,
-    elem_bytes: usize,
-    k_host: []f32,
-    v_host: []f32,
-    scratch: zigferencer.attn_split.Scratch,
-};
-
-/// One submission of the recorded kit: the timed closure of a grid point.
-const KitStep = struct {
-    ctx: *KitCtx,
-    kit: vkops.AttnKit,
-    cb: vkops.AttnKit.Cmd,
-    plan: *const zigferencer.attn_split.AttnPlan,
-    binding: vkops.AttnKit.Binding,
-
-    pub fn run(self: @This()) !void {
-        try self.ctx.vkd.resetCommandBuffer(self.cb, .{});
-        try self.ctx.vkd.beginCommandBuffer(
-            self.cb,
-            &.{ .flags = .{ .one_time_submit_bit = true } },
-        );
-        zigferencer.attn_record.record(
-            vkops.AttnKit,
-            self.kit,
-            self.cb,
-            self.plan,
-            self.binding,
-        );
-        try self.ctx.vkd.endCommandBuffer(self.cb);
-        const cmds = [_]vkops.AttnKit.Cmd{self.cb};
-        try self.ctx.vkd.queueSubmit(
-            self.ctx.queue,
-            &.{.{ .command_buffer_count = 1, .p_command_buffers = &cmds }},
-            .null_handle,
-        );
-        try self.ctx.vkd.queueWaitIdle(self.ctx.queue);
-    }
-};
-
 /// All depths and row counts of one shape.
-fn benchKitShape(gpa: std.mem.Allocator, io: std.Io, ctx: *KitCtx, sh: KitShape) !void {
+fn benchGridShape(gpa: std.mem.Allocator, io: std.Io, ctx: *GridCtx, sh: GridShape) !void {
     // Build the kernels and their descriptor sets.
     const kv: zigferencer.dtype.KvDtype = if (sh.kv_f16) .f16 else .f32;
     var single = try vkops.Attention.initKv(ctx, kv);
@@ -1095,7 +1105,7 @@ fn benchKitShape(gpa: std.mem.Allocator, io: std.Io, ctx: *KitCtx, sh: KitShape)
     defer dev_out.deinit();
 
     // Bundle the rig, then walk the depths.
-    const rig: KitRig = .{
+    const rig: GridRig = .{
         .ctx = ctx,
         .single = &single,
         .multi = &multi,
@@ -1117,14 +1127,14 @@ fn benchKitShape(gpa: std.mem.Allocator, io: std.Io, ctx: *KitCtx, sh: KitShape)
 
     const kv_elems: usize = @as(usize, sh.n_kv_heads) * sh.head_dim;
     const elem_bytes: usize = if (sh.kv_f16) 2 else 4;
-    for (kit_depths) |depth| {
+    for (grid_depths) |depth| {
         if (depth > sh.max_depth) continue;
 
         const stream_elems = @as(usize, depth) * kv_elems;
         // The f16 shaders read the caches as 32-bit words, so each binding covers whole words.
         const kv_bytes = std.mem.alignForward(usize, stream_elems * elem_bytes, 4);
         if (kv_bytes > ctx.buffer_limits.storage_range) {
-            bench_util.skipRow(sh.label, "kit", "range");
+            bench_util.skipRow(sh.label, "attn", "range");
             continue;
         }
 
@@ -1135,7 +1145,7 @@ fn benchKitShape(gpa: std.mem.Allocator, io: std.Io, ctx: *KitCtx, sh: KitShape)
         const v_host = try gpa.alloc(f32, stream_elems);
         defer gpa.free(v_host);
 
-        const stream: KitStream = .{
+        const stream: GridStream = .{
             .depth = depth,
             .stream_elems = stream_elems,
             .kv_bytes = kv_bytes,
@@ -1144,14 +1154,14 @@ fn benchKitShape(gpa: std.mem.Allocator, io: std.Io, ctx: *KitCtx, sh: KitShape)
             .v_host = v_host,
             .scratch = zigferencer.attn_split.Scratch.init(sh.n_heads, sh.head_dim, depth),
         };
-        try kitUploadStream(rig, sh, stream);
+        try gridUploadStream(rig, sh, stream);
         try dev_scratch.ensure(stream.scratch.totalBytes());
 
         // Time every row count. The reporter keeps the label slices until the flush.
-        var label_bufs: [kit_row_counts.len][48]u8 = undefined;
+        var label_bufs: [grid_row_counts.len][48]u8 = undefined;
 
-        for (kit_row_counts, 0..) |rows, ri| {
-            try benchKitPoint(gpa, io, rig, sh, stream, rows, &label_bufs[ri]);
+        for (grid_row_counts, 0..) |rows, ri| {
+            try benchGridPoint(gpa, io, rig, sh, stream, rows, &label_bufs[ri]);
         }
 
         flush();
@@ -1159,7 +1169,7 @@ fn benchKitShape(gpa: std.mem.Allocator, io: std.Io, ctx: *KitCtx, sh: KitShape)
 }
 
 /// Fill the host stream, copy it to the device buffers, and quantize the reference to f16.
-fn kitUploadStream(rig: KitRig, sh: KitShape, stream: KitStream) !void {
+fn gridUploadStream(rig: GridRig, sh: GridShape, stream: GridStream) !void {
     const k_host = stream.k_host;
     const v_host = stream.v_host;
     const stream_elems = stream.stream_elems;
@@ -1205,12 +1215,12 @@ fn kitUploadStream(rig: KitRig, sh: KitShape, stream: KitStream) !void {
 
 /// One grid point: record `rows` query rows that end at the stream depth, time one submission,
 /// and print the row.
-fn benchKitPoint(
+fn benchGridPoint(
     gpa: std.mem.Allocator,
     io: std.Io,
-    rig: KitRig,
-    sh: KitShape,
-    stream: KitStream,
+    rig: GridRig,
+    sh: GridShape,
+    stream: GridStream,
     rows: u32,
     label_buf: *[48]u8,
 ) !void {
@@ -1238,7 +1248,7 @@ fn benchKitPoint(
     const out_bytes = q_host.len * @sizeOf(f32);
     try rig.buf_out.ensure(out_bytes);
     try rig.dev_out.ensure(out_bytes);
-    kitBindSets(rig, stream, q_bytes, out_bytes);
+    gridBindSets(rig, stream, q_bytes, out_bytes);
 
     // Plan the rows. Row i attends to positions `[0, depth - rows + 1 + i)`, so the last row
     // reads the whole stream.
@@ -1248,7 +1258,7 @@ fn benchKitPoint(
     }
 
     const plan = attn_split.planRows(sites[0..rows], stream.scratch.max_splits);
-    const binding: vkops.AttnKit.Binding = .{
+    const binding: vkops.AttnKernels.Binding = .{
         .shape = .{
             .n_heads = sh.n_heads,
             .n_kv_heads = sh.n_kv_heads,
@@ -1265,9 +1275,9 @@ fn benchKitPoint(
     };
 
     // Run once and read the output back.
-    const step: KitStep = .{
+    const step: GridStep = .{
         .ctx = ctx,
-        .kit = .{ .single = rig.single, .multi = rig.multi, .passes = rig.passes },
+        .kernels = .{ .single = rig.single, .multi = rig.multi, .passes = rig.passes },
         .cb = rig.single_set.cmd_buffer,
         .plan = &plan,
         .binding = binding,
@@ -1283,7 +1293,7 @@ fn benchKitPoint(
     // Compare the deepest row with the CPU reference.
     const last_q = q_host[(rows - 1) * row_elems ..][0..row_elems];
     const deepest = out[(rows - 1) * row_elems ..][0..row_elems];
-    const errs = try kitReferenceErrors(gpa, sh, stream, last_q, deepest);
+    const errs = try gridReferenceErrors(gpa, sh, stream, last_q, deepest);
 
     // Time the submission and print the row.
     const t = try timed(io, rows * depth * row_elems, step);
@@ -1294,13 +1304,14 @@ fn benchKitPoint(
         "{s} t{d} r{d}",
         .{ sh.label, depth, rows },
     ) catch unreachable;
-    const variant: []const u8 = if (sh.kv_f16) "kit_f16" else "kit_f32";
-    const tol = vkops.AttnKit.tolerance;
+    const variant: []const u8 = if (sh.kv_f16) "attn_f16" else "attn_f32";
+    const tol = vkops.AttnKernels.tolerance;
     rawRow(label, variant, t.ms, gbs, errs.rel, hsh, opStatus(tol, errs.rel, false));
 }
 
 /// Point the four descriptor sets at the device buffers of one grid point.
-fn kitBindSets(rig: KitRig, stream: KitStream, q_bytes: usize, out_bytes: usize) void {
+fn gridBindSets(rig: GridRig, stream: GridStream, q_bytes: usize, out_bytes: usize) void {
+    // Describe the range of each buffer.
     const ctx = rig.ctx;
     const q_info: DescriptorBufferInfo = .{
         .buffer = rig.dev_q.buffer,
@@ -1328,6 +1339,7 @@ fn kitBindSets(rig: KitRig, stream: KitStream, q_bytes: usize, out_bytes: usize)
         .range = out_bytes,
     };
 
+    // Bind the sets of each kernel.
     vkops.updateStorageBindings(
         ctx,
         rig.single_set.desc_set,
@@ -1349,10 +1361,10 @@ fn kitBindSets(rig: KitRig, stream: KitStream, q_bytes: usize, out_bytes: usize)
 }
 
 /// The error of one device row against the CPU attention over the same stream.
-fn kitReferenceErrors(
+fn gridReferenceErrors(
     gpa: std.mem.Allocator,
-    sh: KitShape,
-    stream: KitStream,
+    sh: GridShape,
+    stream: GridStream,
     last_q: []const f32,
     device_row: []const f32,
 ) !bench_util.Errors {
@@ -1380,8 +1392,6 @@ fn kitReferenceErrors(
     );
     return computeErrors(ref, device_row);
 }
-
-// -- helpers ----------------------------------------------------------------
 
 /// The vector rows of one attention case: the serial `simd` row, then the 16-thread rows of the
 /// `simd` and `simd_pf` kernels. `ref_out` holds the naive row of the same dtype.

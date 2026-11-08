@@ -34,6 +34,7 @@ pub fn run(ctx: context.Context) !void {
     const flags = try args.parseInto(Flags, ctx) orelse return;
     if (flags.present) return printPresent(ctx);
 
+    // Print the legend and the models directory.
     const p = style.Palette.init(ctx.color);
 
     const w = &ctx.stdout.interface;
@@ -49,6 +50,7 @@ pub fn run(ctx: context.Context) !void {
     try select.printModelsDir(w, p, ctx.models_root);
     try w.writeAll("\n");
 
+    // Print each model, and count the ones on disk.
     var present_count: usize = 0;
     for (models) |m| {
         // A non-null path means the GGUF is on disk there.
@@ -60,6 +62,7 @@ pub fn run(ctx: context.Context) !void {
         try printModel(w, p, m, path);
     }
 
+    // Print the total, and a hint when a model is missing.
     try w.print("\n{d}/{d} present.\n", .{ present_count, models.len });
     if (present_count < models.len) {
         try w.writeAll("download a missing model with `zigferencer fetch <name>`");

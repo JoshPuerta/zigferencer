@@ -3,6 +3,8 @@
 //! thread. `Codec` carries the text and token knowledge (chat template, tokenizer, piece table)
 //! that the scheduler needs without owning it.
 //!
+//! Comptime. An assert pins the token text length to the `u16` wire field.
+//!
 //! Ownership. `OutEvent` is a fixed-size value. Token text, error detail, and model name are
 //! inline bounded arrays, so the bounded output queues hold plain copies and need no ownership
 //! rule. `Request` is the one value that owns bytes across a thread hop. The reader dupes
@@ -68,7 +70,7 @@ pub const Request = struct {
         stats,
         ping,
         shutdown,
-        /// Synthesized when a connection drops. See "Synthesized requests" in the header.
+        /// Synthesized when a connection drops.
         conn_closed,
         /// Synthesized by a writer task to wake an idle engine. The scheduler treats it as a no-op.
         wakeup,
@@ -126,9 +128,9 @@ pub const OutEvent = struct {
         appended: protocol.Appended,
         kept: struct { granted_ms: u32, token: protocol.Token },
         resumed: protocol.Resumed,
-        /// The PONG for a peer PING. See "Writer hand-offs" in the header.
+        /// The PONG for a peer PING.
         zmtp_pong: struct { len: u8, context: [zmtp.max_ping_context_bytes]u8 },
-        /// The ERROR that refuses a handshake. See "Writer hand-offs" in the header.
+        /// The ERROR that refuses a handshake.
         zmtp_error: struct { len: u8, reason: [64]u8 },
     };
 
@@ -223,19 +225,19 @@ pub const Codec = struct {
         return ids;
     }
 
-    /// Tokenize one kept pair at `place`. The user wrap and the reply encode apart, as a live turn
+    /// Tokenize one kept pair at `order`. The user wrap and the reply encode apart, as a live turn
     /// feeds the wrap and then samples the reply. The caller owns the ids.
     pub fn pairTokens(
         self: *const Codec,
         gpa: Allocator,
-        place: chat.PairPlace,
+        order: chat.PairOrder,
         user: []const u8,
         assistant: []const u8,
     ) ![]u32 {
-        const wrapped = try chat.wrapPairUserAlloc(gpa, self.kind, place, user);
+        const wrapped = try chat.wrapPairUserAlloc(gpa, self.kind, order, user);
         defer gpa.free(wrapped);
 
-        const head = try bpe.encodeAlloc(self.vocab, gpa, wrapped, place == .open_first);
+        const head = try bpe.encodeAlloc(self.vocab, gpa, wrapped, order == .open_first);
         defer gpa.free(head);
 
         const reply = try bpe.encodeAlloc(self.vocab, gpa, assistant, false);
@@ -244,7 +246,7 @@ pub const Codec = struct {
         const ids = try std.mem.concat(gpa, u32, &.{ head, reply });
         log.debug(
             "encode: {t} pair, {d}+{d} B -> {d}+{d} tokens",
-            .{ place, user.len, assistant.len, head.len, reply.len },
+            .{ order, user.len, assistant.len, head.len, reply.len },
         );
         return ids;
     }

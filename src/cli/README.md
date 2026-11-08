@@ -28,7 +28,7 @@ The building blocks:
 
 | File | What it holds |
 | --- | --- |
-| `boot_facts.zig` | What a boot measures: the model facts, the free RAM and VRAM, the device context, and the thread policy. `run`, the servers, and the benches share it. |
+| `boot_resources.zig` | What a boot measures: the model needs, the free RAM and VRAM, the device context, and the thread policy. `run`, the servers, and the benches share it. |
 | `boot_lines.zig` | What a boot prints: the boot log lines and the message of each `resolve` refusal. `run`, the servers, and the benches share it. |
 | `serve_checks.zig` | The checks of the serve flags that need no model file. |
 | `codec_parts.zig` | The token pieces of a frontend codec and the think tags of the scheduler. |
@@ -64,16 +64,14 @@ The commands:
 
 ## How the pieces fit
 
-An arrow means "imports". A name with a slash is the first module outside `src/cli`.
-
 The layers point one way. The engine reads no CLI file. A building block reads no command.
 `boot/` reads no command. A command reads no other command. `tests/tidy_test.zig` checks the
 four rules on every build of the test suite.
 
 ```
-main.zig
-    |
-    v
+main.zig --> cli.zig
+                |
+                v
 command.zig --- release table ---> <command>_cmd.run(ctx)
                                        |
        +---------+-------------+-------+------+-----------+
@@ -85,52 +83,24 @@ command.zig --- release table ---> <command>_cmd.run(ctx)
                            io/gguf/loader
 ```
 
-The commands that read files or print facts stop early:
+A command takes one of three paths:
 
-```
-list_cmd ----> core/registry
-fetch_cmd ---> core/registry, io/download
-inspect_cmd -> io/gguf/loader, io/gguf/parser
-info_cmd ----> arch_matrix --> core/op_requires
-           +-> core/hwinfo, runtime/vulkan_ctx
-```
+| Path | Commands | What it reads below the CLI |
+| --- | --- | --- |
+| Look something up | `list`, `fetch`, `inspect`, `info` | `core/`, `io/` |
+| Run a model | `run`, `serve`, `serve-openai` | `boot/`, `engine/`, then `runtime/` or `serve/` |
+| Talk to a server | `client` | `serve/client`, `serve/protocol` |
 
-The commands that run a model meet in `boot/` and `engine/`. `engine/resolve` makes the boot
-decisions, and `engine/family` holds the runner of each placement, for each model family. A
-command turns the architecture into a family once:
+A command that runs a model takes four steps:
 
-```
-run_cmd ----------> boot_facts, boot_lines ----> engine/resolve --> engine/device_arm
-serve_cmd --------> serve_boot ---+              engine/family ---> runtime/llama_runner
-serve_openai_cmd -> serve_boot ---+-> serve_checks                  runtime/llama_fused
-                                  +-> codec_parts                   runtime/llama_hybrid
-                                  +-> boot_facts, boot_lines        runtime/qwen_runner
-                                  |                                 runtime/qwen_fused
-                                  v                                 runtime/qwen_hybrid
-                            serve/scheduler
-                            serve/residency
+1. `boot/boot_resources` measures the host and the device.
+2. `engine/resolve` picks the placement, or refuses.
+3. `engine/family` names the runner of that placement.
+4. `run_cmd` runs the turn through `runtime/generate`. `boot/serve_boot` builds the engine, and
+   `serve_cmd` or `serve_openai_cmd` hands it to its transport.
 
-run_cmd ---------> runtime/generate
-serve_cmd -------> serve/server
-serve_openai_cmd -> serve/openai/http_server
-```
-
-The client talks to a server over the wire, so it needs no runner. `client_cmd` starts the
-chat and picks a loop. The arrows inside `client/` hold no cycle:
-
-```
-client_cmd --> client_streaming --> client_reconnect --> client_chat
-           |          |                    |                 |
-           +-> client_blocking             |                 |
-           |          |                    |                 |
-           +----------+--> client_startup <+-----------------+
-                                |
-                                v
-              client_input, client_output, client_history
-                                |
-                                v
-                 client_transcript, serve/protocol, serve/client
-```
+`client` needs no runner, because it talks to a server over the wire. `client_cmd` picks a loop:
+`client_streaming`, or `client_blocking` under `--no-stream`.
 
 ## Rules
 

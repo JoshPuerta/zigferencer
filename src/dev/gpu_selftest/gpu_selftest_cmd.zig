@@ -2,6 +2,8 @@
 //! verified CPU reference on random inputs. A divergence shows here as a numeric diff
 //! on one kernel, not as wrong tokens many layers deep in an end-to-end run.
 //! Each check stays small, because a long submit is fragile under a translation-layer driver.
+//!
+//! Comptime. The `use_vulkan` build option removes the check path from a build without Vulkan.
 
 const std = @import("std");
 const build_options = @import("build_options");

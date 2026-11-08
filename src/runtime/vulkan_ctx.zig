@@ -5,14 +5,21 @@
 //! from this `Context`. Initialization is one shot, and teardown reverses it
 //! in order.
 //!
+//! Comptime. A build gate stops the compiler when a non-Vulkan build includes this file.
+//!
 //! The module compiles only under `-Druntime=vulkan`. The runtime is a
 //! build-time axis, gated by `build_options.use_vulkan` and the conditional
 //! re-export in `main.zig`, so CPU builds never link libvulkan or the Vulkan
 //! bindings.
 //!
 //! Device selection (`scoreDeviceType`) ranks DISCRETE > INTEGRATED > VIRTUAL
-//! and rejects `.cpu` outright, so a software rasterizer like llvmpipe never
-//! wins the tiebreak on a system that also has real hardware.
+//! and rejects `.cpu`, so a software rasterizer like llvmpipe never wins the
+//! tiebreak on a system that also has real hardware.
+//!
+//! Software device. `Options.software` turns that rule around: it takes a CPU device and no other,
+//! so a debug run with no GPU is a named choice. The subgroup-size pin stays off there, because
+//! such a device holds fewer lanes. Only `linear_q8_0_subgroup.comp` reads the lanes of a subgroup,
+//! and only `tools/bench_matmul.zig` runs it. Timings on this device mean nothing.
 //!
 //! The engine targets a translation-layer driver, and four properties of that
 //! driver shape this file. It advertises Vulkan 1.2, so the code stays inside
@@ -53,14 +60,13 @@ const log = std.log.scoped(.gpu);
 comptime {
     if (!build_options.use_vulkan) {
         @compileError("runtime/vulkan_ctx.zig was included in a non-vulkan build. " ++
-            "Either build with -Druntime=vulkan, or fix the caller to gate on " ++
-            "build_options.use_vulkan.");
+            "Either build with -Druntime=vulkan, " ++
+            "or fix the caller to gate on build_options.use_vulkan.");
     }
 }
 
-/// `vkGetInstanceProcAddr` is the one symbol the dynamic linker resolves. Every
-/// other Vulkan function pointer loads through it. `build.zig`'s `wireVulkan`
-/// links it from `libvulkan.so.1` (or the platform equivalent).
+/// The one symbol the dynamic linker resolves. Every other Vulkan function pointer loads
+/// through it. `wireVulkan` in `build.zig` links `libvulkan.so.1` (or the platform equivalent).
 extern fn vkGetInstanceProcAddr(
     instance: vk.Instance,
     name: [*:0]const u8,
@@ -110,11 +116,7 @@ pub const InitError = error{
     std.mem.Allocator.Error;
 
 /// What a caller states when it opens a context.
-pub const Options = struct {
-    /// Replaces the reported `maxStorageBufferRange`. The CLI reads it once
-    /// from `limits.storage_range_env`.
-    storage_range_override: ?u64 = null,
-};
+pub const Options = limits.DeviceOptions;
 
 /// The live usage and budget of one memory heap, from VK_EXT_memory_budget.
 pub const HeapBudget = struct {
@@ -125,7 +127,7 @@ pub const HeapBudget = struct {
 pub const PickedDevice = struct {
     device: vk.PhysicalDevice,
     props: vk.PhysicalDeviceProperties,
-    /// 3 = discrete, 2 = integrated, 1 = virtual, 0 = other, -1 = cpu (rejected).
+    /// See `scoreDeviceType`. A negative score rejects the device.
     score: i32,
 };
 
@@ -136,6 +138,8 @@ pub const Context = struct {
     mem_props: vk.PhysicalDeviceMemoryProperties,
     /// True when VK_EXT_memory_budget is enabled, which makes `deviceLocalBudget` live.
     has_memory_budget: bool,
+    /// True on a CPU device. A pipeline then leaves the subgroup size to the driver.
+    software: bool,
     /// The limits every buffer check reads. The storage range is the override when set.
     buffer_limits: limits.BufferLimits,
     /// The storage range the driver reports, kept for the boot log and `info`.
@@ -146,7 +150,7 @@ pub const Context = struct {
     /// Valid bits of a queue timestamp. A tick difference is taken modulo this width.
     timestamp_valid_bits: u32,
     command_pool: vk.CommandPool,
-    /// The one command buffer of every one-shot submit. See "One-shot submit" in the header.
+    /// The one command buffer of every one-shot submit.
     staging_cmd: vk.CommandBuffer,
     /// The start and end timestamp slots of `staging_cmd`. A null handle unless timestamps are on.
     staging_query_pool: vk.QueryPool,
@@ -182,7 +186,13 @@ pub const Context = struct {
         errdefer vki.destroyInstance(instance, null);
 
         // Pick the device and its compute queue family.
-        const picked = try pickPhysicalDevice(vki, instance, allocator);
+        const picked = try pickPhysicalDevice(vki, instance, allocator, options.software);
+        if (options.software) {
+            log.warn("the GPU paths run on the software device {s}. Timings mean nothing", .{
+                std.mem.sliceTo(&picked.props.device_name, 0),
+            });
+        }
+
         const family = try findComputeQueueFamily(vki, picked.device, allocator);
         const queue_family = family.index;
 
@@ -207,7 +217,7 @@ pub const Context = struct {
             },
         };
 
-        // Enable f16 storage, and pin wave32. See "Device features" in the header.
+        // Enable f16 storage, and pin wave32.
         var sgsc_features: vk.PhysicalDeviceSubgroupSizeControlFeatures = .{
             .subgroup_size_control = .true,
         };
@@ -220,7 +230,7 @@ pub const Context = struct {
             .p_next = @ptrCast(&v11_features),
         };
 
-        // Probe the optional extensions. See "Memory budget" in the header.
+        // Probe the optional extensions.
         const avail_exts = vki.enumerateDeviceExtensionPropertiesAlloc(
             picked.device,
             null,
@@ -363,6 +373,7 @@ pub const Context = struct {
             .physical_device_props = picked.props,
             .mem_props = mem_props,
             .has_memory_budget = has_memory_budget,
+            .software = options.software,
             .buffer_limits = buffer_limits,
             .reported_storage_range = reported.storage_range,
             .device = device,
@@ -500,8 +511,8 @@ pub const Context = struct {
         const range = verdict == .past_storage_range;
         const advice: []const u8 = if (fit == 0)
             (if (range) "No window fits this many slots. Use fewer sessions, or set " ++
-                "" ++ limits.storage_range_env else "No window fits this many slots. Use " ++
-                "fewer sessions")
+                "" ++ limits.storage_range_env else "No window fits this many slots. " ++
+                "Use fewer sessions")
         else if (range)
             std.fmt.bufPrint(&advice_buf, kv_range_advice_fmt, .{fit}) catch unreachable
         else
@@ -557,8 +568,8 @@ pub const Context = struct {
             ),
             .past_storage_range => log.err(
                 "Split attention scratch of {d} bytes is larger than the {s} of {d} {t}. " ++
-                    "Set " ++ limits.storage_range_env ++ " to a range that this device " ++
-                    "reads correctly",
+                    "Set " ++ limits.storage_range_env ++
+                    " to a range that this device reads correctly",
                 .{ bytes, limit.name, limit.value, limit.unit },
             ),
         }
@@ -575,6 +586,7 @@ pub fn pickPhysicalDevice(
     vki: vk.InstanceWrapper,
     instance: vk.Instance,
     allocator: std.mem.Allocator,
+    software: bool,
 ) InitError!PickedDevice {
     const devices = try vki.enumeratePhysicalDevicesAlloc(instance, allocator);
     defer allocator.free(devices);
@@ -585,7 +597,7 @@ pub fn pickPhysicalDevice(
     var best: ?PickedDevice = null;
     for (devices) |dev| {
         const props = vki.getPhysicalDeviceProperties(dev);
-        const score = scoreDeviceType(props.device_type);
+        const score = scoreDeviceType(props.device_type, software);
         if (score < 0) continue;
 
         if (best == null or score > best.?.score) {
@@ -593,7 +605,17 @@ pub fn pickPhysicalDevice(
         }
     }
 
-    const picked = best orelse return error.NoVulkanDevice;
+    const picked = best orelse {
+        if (software) {
+            log.err(
+                limits.software_device_env ++ " takes a CPU Vulkan device, and none exists",
+                .{},
+            );
+        }
+
+        return error.NoVulkanDevice;
+    };
+
     const name = std.mem.sliceTo(&picked.props.device_name, 0);
     log.debug(
         "select: {s} type {s}, score {d}, from {d} adapters",
@@ -645,20 +667,20 @@ fn readBufferLimits(
     props: vk.PhysicalDeviceProperties,
     has_maintenance4: bool,
 ) error{DeviceBufferLimitsInvalid}!limits.BufferLimits {
-    var m4: vk.PhysicalDeviceMaintenance4Properties = .{ .max_buffer_size = 0 };
-    var m3: vk.PhysicalDeviceMaintenance3Properties = .{
+    var maintenance4: vk.PhysicalDeviceMaintenance4Properties = .{ .max_buffer_size = 0 };
+    var maintenance3: vk.PhysicalDeviceMaintenance3Properties = .{
         .max_per_set_descriptors = 0,
         .max_memory_allocation_size = 0,
-        .p_next = if (has_maintenance4) @ptrCast(&m4) else null,
+        .p_next = if (has_maintenance4) @ptrCast(&maintenance4) else null,
     };
     var props2: vk.PhysicalDeviceProperties2 = .{
         .properties = undefined,
-        .p_next = @ptrCast(&m3),
+        .p_next = @ptrCast(&maintenance3),
     };
     vki.getPhysicalDeviceProperties2(dev, &props2);
-    var allocation_size: u64 = m3.max_memory_allocation_size;
+    var allocation_size: u64 = maintenance3.max_memory_allocation_size;
     if (has_maintenance4) {
-        allocation_size = @min(allocation_size, m4.max_buffer_size);
+        allocation_size = @min(allocation_size, maintenance4.max_buffer_size);
     }
 
     const lim: limits.BufferLimits = .{
@@ -675,7 +697,11 @@ fn readBufferLimits(
     return lim;
 }
 
-fn scoreDeviceType(t: vk.PhysicalDeviceType) i32 {
+/// The rank of a device type: 3 = discrete, 2 = integrated, 1 = virtual, 0 = other, -1 = rejected.
+/// A software run scores a CPU device 0 and rejects every other type.
+fn scoreDeviceType(t: vk.PhysicalDeviceType, software: bool) i32 {
+    if (software) return if (t == .cpu) 0 else -1;
+
     return switch (t) {
         .discrete_gpu => 3,
         .integrated_gpu => 2,
@@ -723,6 +749,14 @@ fn fakeMemProps(flag_words: []const u32) vk.PhysicalDeviceMemoryProperties {
 }
 
 const all_types: u32 = 0xffff_ffff;
+
+test "scoreDeviceType: a CPU device needs the software option, which rejects a GPU" {
+    try std.testing.expectEqual(@as(i32, 3), scoreDeviceType(.discrete_gpu, false));
+    try std.testing.expectEqual(@as(i32, -1), scoreDeviceType(.cpu, false));
+    try std.testing.expectEqual(@as(i32, 0), scoreDeviceType(.cpu, true));
+    try std.testing.expectEqual(@as(i32, -1), scoreDeviceType(.discrete_gpu, true));
+    try std.testing.expectEqual(@as(i32, -1), scoreDeviceType(.integrated_gpu, true));
+}
 
 test "pickHostType: a cached type wins when the buffer allows it" {
     const props = fakeMemProps(&.{ 0x0, 0x6, 0xe, 0x1 });

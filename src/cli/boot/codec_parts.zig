@@ -1,5 +1,9 @@
 //! The vocabulary values a serve frontend needs: the token pieces of its codec and the think
 //! tags of the scheduler.
+//!
+//! Think tags. A vocab that breaks a rule of `thinkTagsFrom` refuses the boot, which keeps model
+//! data away from the scheduler asserts. Each tag is one id. The forced ids start with the close,
+//! number at most `think_force_ids_max`, and hold no end-of-sequence id.
 
 const std = @import("std");
 
@@ -24,8 +28,7 @@ pub const CodecParts = struct {
     think_ids: ?chat.ThinkIds = null,
 };
 
-/// The think tags as the scheduler reads them: the two tags and the ids a
-/// spent budget forces.
+/// The think tags as the scheduler reads them: the two tags and the ids that a spent budget forces.
 pub const ThinkTags = struct {
     ids: chat.ThinkIds,
     force: [limits.think_force_ids_max]u32,
@@ -34,8 +37,8 @@ pub const ThinkTags = struct {
 
 // -- api --------------------------------------------------------------------
 
-/// id to displayable bytes for the whole vocab, decoded once at startup. A vocab
-/// whose pieces exceed the serve cap fails the boot, never a silent truncation.
+/// Decode the displayable bytes of every id once at startup. A piece past the serve cap fails the
+/// boot, never a silent truncation.
 pub fn buildPieces(arena: std.mem.Allocator, v: *const vocab_mod.Vocab) ![]const []const u8 {
     const pieces = try arena.alloc([]const u8, v.tokens.len);
     for (pieces, 0..) |*piece, id| {
@@ -62,8 +65,8 @@ pub fn thinkTagsOf(
     return try thinkTags(arena, v, text);
 }
 
-/// The scheduler think config of `kind`. A kind with no tags gets the empty
-/// config, so the scheduler refuses every open turn and budget.
+/// The scheduler think config of `kind`. A kind with no tags gets the empty config, so the
+/// scheduler refuses every open turn and budget.
 pub fn schedulerThink(tags: ?ThinkTags, kind: chat.Kind, budget: u32) scheduler_mod.Think {
     const t = tags orelse return .{};
     return .{
@@ -93,9 +96,7 @@ pub fn codecParts(
 
 // -- helpers ----------------------------------------------------------------
 
-/// Encode the think tags of a model with a thinking mode. A vocab that breaks a
-/// rule of `thinkTagsFrom` refuses the boot, which keeps model data away from the
-/// scheduler asserts.
+/// Encode the think tags of a model with a thinking mode.
 fn thinkTags(
     arena: std.mem.Allocator,
     v: *const vocab_mod.Vocab,
@@ -104,8 +105,7 @@ fn thinkTags(
     const open = try bpe.encodeAlloc(v, arena, text.open, false);
     const close = try bpe.encodeAlloc(v, arena, text.close, false);
 
-    // The forced ids are the close and the separator the template writes after
-    // a closed block.
+    // The forced ids are the close and the separator that the template writes after a block.
     const force_text = try std.mem.concat(arena, u8, &.{ text.close, text.separator });
     const force = try bpe.encodeAlloc(v, arena, force_text, false);
 
@@ -113,8 +113,9 @@ fn thinkTags(
         log.err("think tags: {s} encodes to {any}, {s} to {any}, the forced close to {any}", .{
             text.open, open, text.close, close, force,
         });
-        log.err("think tags: each tag must be one id. The forced close must start with {s} " ++
-            "and hold at most {d} ids, none of them end-of-sequence {d}", .{
+        log.err("think tags: each tag must be one id. " ++
+            "The forced close must start with {s} and hold at most {d} ids, " ++
+            "none of them end-of-sequence {d}", .{
             text.close, limits.think_force_ids_max, v.eos_id,
         });
         return err;
@@ -125,9 +126,7 @@ fn thinkTags(
     return tags;
 }
 
-/// The rules the scheduler asserts at init, checked on the encoded ids. Each
-/// tag is one id. The forced ids start with the close, number at most
-/// `think_force_ids_max`, and hold no end-of-sequence id.
+/// The rules that the scheduler asserts at init, checked on the encoded ids.
 fn thinkTagsFrom(
     open: []const u32,
     close: []const u32,
@@ -156,8 +155,7 @@ fn thinkTagsFrom(
 // -- tests ------------------------------------------------------------------
 
 test "thinkTagsFrom: one id per tag, the close first, and no end-of-sequence id" {
-    // The Qwen3.5 ids: the two tags, and `\n\n`, the separator the forced
-    // close carries on that vocab.
+    // The Qwen3.5 ids: the two tags, and the `\n\n` separator of the forced close.
     const open = [_]u32{248068};
     const close = [_]u32{248069};
     const sep: u32 = 271;

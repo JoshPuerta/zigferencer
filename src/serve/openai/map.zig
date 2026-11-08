@@ -2,6 +2,9 @@
 //! into a value, and it maps a rejection to an HTTP error. These functions do no I/O. The HTTP
 //! shell (`http_server.zig`) calls them and owns the transport.
 //!
+//! Comptime. The refusal messages and the type probe walk the fields of `ChatRequest`, so a
+//! new field needs no table edit.
+//!
 //! Trust boundary. Every guard turns malformed input into a typed `ReqError` that the shell
 //! renders as a 4xx, never into an assert.
 //!
@@ -54,8 +57,9 @@ const thinking_unsupported_message = "enable_thinking true does not apply to thi
     "because its chat template has no thinking mode";
 const budget_unsupported_message = "thinking_token_budget above 0 does not apply to this " ++
     "model, because its chat template has no thinking mode";
-const budget_no_forced_close_message = "thinking_token_budget above 0 does not apply to " ++
-    "this model, because the server has no forced close for its think block";
+const budget_no_forced_close_message =
+    "thinking_token_budget above 0 does not apply to this model, " ++
+    "because the server has no forced close for its think block";
 
 // -- types ------------------------------------------------------------------
 
@@ -237,7 +241,6 @@ pub const Field = enum { reasoning, content };
 pub const Routed = struct { field: Field, text: []const u8 };
 
 /// Routes the token events of one turn to `reasoning_content` and `content`.
-/// See "Reasoning split" in the header.
 pub const ReasoningSplit = struct {
     tags: ?chat.ThinkIds,
     field: Field,
@@ -334,9 +337,11 @@ pub fn errorObject(e: HttpError) types.ErrorObject {
 /// error (4xx). The shell raises the `internal` 5xx on an engine fault.
 /// `diag` is the detail that `parseChatRequest` gives with the error.
 pub fn reqErrorToHttp(e: ReqError, diag: Diag) HttpError {
+    // Check that the diagnostic matches the error.
     if (e == error.BadField) std.debug.assert(diag.field != null);
     if (e != error.BadField) std.debug.assert(diag.field == null);
 
+    // Pick the message of the error.
     const message: []const u8 = switch (e) {
         error.BadJson => "malformed JSON body",
         error.BadField => bad_field_messages[@intFromEnum(diag.field.?)],
@@ -374,10 +379,11 @@ pub fn reqErrorToHttp(e: ReqError, diag: Diag) HttpError {
         },
     };
 
+    // Return the client error.
     return .{ .status = 400, .type = "invalid_request_error", .message = message };
 }
 
-/// Resolve the thinking of a turn against the model. See "Thinking" in the header.
+/// Resolve the thinking of a turn against the model.
 pub fn resolveTurn(
     server_kind: chat.Kind,
     flag: chat.ThinkingFlag,
@@ -435,7 +441,7 @@ pub fn resolveSampling(
 }
 
 /// Parse and validate `body` into a `Request`. `default_max_tokens` covers a request that omits
-/// a budget. `max_seq` is the session's hard ceiling. See "Parse" in the header.
+/// a budget. `max_seq` is the session's hard ceiling.
 pub fn parseChatRequest(
     arena: Allocator,
     body: []const u8,
@@ -447,7 +453,6 @@ pub fn parseChatRequest(
 }
 
 /// Length of the longest prefix of `bytes` that ends on a UTF-8 codepoint boundary.
-/// See "UTF-8" in the header.
 pub fn completeUtf8Len(bytes: []const u8) usize {
     if (bytes.len == 0) return 0;
 
@@ -476,8 +481,8 @@ fn reportUnknown(seen: *UnknownFields, name: []const u8) void {
             .{unknownName(name)},
         ),
         .full => log.info(
-            "the table of ignored request field names is full, so later unknown names are " ++
-                "not logged",
+            "the table of ignored request field names is full, " ++
+                "so later unknown names are not logged",
             .{},
         ),
     }
@@ -597,7 +602,7 @@ fn wrongTypedField(arena: Allocator, object: std.json.ObjectMap) error{OutOfMemo
     return null;
 }
 
-/// Check each sampling guard. See "Parse" in the header.
+/// Check each sampling guard.
 fn parseSampling(req: types.ChatRequest) ReqError!SamplingFields {
     var out: SamplingFields = .{ .seed = req.seed };
     if (req.temperature) |t| {
@@ -706,6 +711,7 @@ fn thinkingCase(comptime extra: []const u8, flag: chat.ThinkingFlag) ParseCase {
 /// A request field maps to its value, or its refusal. A field that the
 /// case does not name stays unchecked.
 fn checkParse(c: ParseCase) !void {
+    // Parse the body.
     var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena_state.deinit();
 
@@ -717,6 +723,8 @@ fn checkParse(c: ParseCase) !void {
         c.window,
         &diag,
     );
+
+    // Check the error, or each field that the case names.
     try std.testing.expectEqual(c.want.field, diag.field);
     if (c.want.err) |err| return std.testing.expectError(err, got);
 
@@ -824,10 +832,12 @@ test "unknownName: the log prints the capped name with no raw control byte" {
 test "parseChatRequest: each field maps to its value, and a value past its edge is refused" {
     const kwargs_think = ",\"chat_template_kwargs\":{\"enable_thinking\":";
     const body_full =
-        \\{"model":"m","messages":[{"role":"user","content":"hi"}],"frequency_penalty":0,"tools":[],"stop":["x"]}
+        \\{"model":"m","messages":[{"role":"user","content":"hi"}],
+        \\"frequency_penalty":0,"tools":[],"stop":["x"]}
     ;
     const body_two_messages =
-        \\{"messages":[{"role":"system","content":"s"},{"role":"user","content":"u"}],"stream":true,"temperature":0.7,"max_tokens":99999}
+        \\{"messages":[{"role":"system","content":"s"},{"role":"user","content":"u"}],
+        \\"stream":true,"temperature":0.7,"max_tokens":99999}
     ;
     const body_no_role =
         \\{"messages":[{"content":"x"}]}
@@ -1186,8 +1196,8 @@ test "reqErrorToHttp: thinking on a model without a thinking mode is a 400 in on
     try std.testing.expectEqual(@as(u16, 400), e.status);
     try std.testing.expectEqualStrings("invalid_request_error", e.type);
     try std.testing.expectEqualStrings(
-        "enable_thinking true does not apply to this model, because its chat template has " ++
-            "no thinking mode",
+        "enable_thinking true does not apply to this model, " ++
+            "because its chat template has no thinking mode",
         e.message,
     );
 }
@@ -1461,9 +1471,8 @@ const body_values = [_][]const u8{
     "-9223372036854775808",
 };
 
-/// A random mutation of a valid chat body: each field keeps its value, takes
-/// an edge value, or drops out, and some bodies then take raw byte writes.
-/// The parse gives a 400 that names the refused field, or a request that the
+/// A random mutation of a valid chat body: each field keeps, edges, or drops, and some bodies
+/// take raw byte writes. The parse gives a 400 that names the field, or a request that the
 /// sampling and thinking resolvers accept for every model kind.
 fn checkChatMutation(_: void, seed: u64) anyerror!void {
     var prng = std.Random.DefaultPrng.init(seed);

@@ -1,97 +1,82 @@
-# src/serve
+# Serving
 
-The serving layer. It turns the single-sequence engine into a server that
-clients reach over a socket. It holds each conversation as a session with a KV
-slot whose position persists across turns. It advances a batch of them through
-one forward pass per tick. It is a separate layer because it is one engine plus
-two transports. `engine.zig` and `scheduler.zig` know no wire format. Each
-connector is a thin adapter that maps bytes to and from `Request` and `OutEvent`
-values. The layer repeats the shape of the whole project one level down. It has
-a pure datapath (`protocol.zig`, `openai/map.zig`), a control unit
-(`scheduler.zig`), and an imperative shell (`engine.zig`), as the serve section
-of [docs/architecture.md](../../docs/architecture.md) sets out.
+This directory holds the serving layer. It turns the single-sequence engine into a server that
+clients reach over a socket. Each conversation is a session with a KV slot, and its position
+persists across turns. One forward pass per tick advances a batch of sessions. `engine.zig` and
+`scheduler.zig` know no wire format. Each frontend is a thin adapter between bytes and values.
 
 ## Files
 
-| File | Role |
+| File | Holds |
 | --- | --- |
-| `protocol.zig` | The binary wire format and the document a client implementer reads. One frame is a 20-byte header plus a bounded payload, little-endian throughout. Encode and decode are pure, allocate nothing, and borrow their text slices from the payload buffer. |
-| `zmtp.zig` | The pure ZMTP 3.x codec under the frames. It encodes and decodes the greeting, the frame head, and the READY, PING, PONG, and ERROR commands of the NULL security method. ZMTP integers are big-endian. Every decode is total and bounded, and the module does no I/O and allocates nothing. |
-| `event.zig` | The values across the two internal boundaries: `Request` (adapter to engine), `OutEvent` (engine to adapter), and `Codec`, which carries the chat template, the tokenizer, and the piece table the scheduler needs without owning them. |
-| `scheduler.zig` | The control unit: a fixed table of sessions, each with its own state machine, advanced by one composed engine call per `tick`. One tick retries parked emits, finalizes stopped turns, then takes every admissible decode row plus a prefill chunk of the longest-waiting turn. A turn can open inside a think block, and a think budget forces the close tag in place of the sampled tokens. |
-| `prefill_chunk.zig` | The pure prefill chunk rule of the scheduler: how many prompt rows one forward pass takes from the turn that feeds. The scheduler owns the state and passes the numbers in. |
-| `engine.zig` | `ServeEngine(Engine, Codec, Adapter)`: one engine thread around the scheduler, a bounded request queue in, a bounded out-queue per connection, the non-blocking sink, and the connection-slot lifecycle. Both connectors run on it. |
-| `residency.zig` | The optional tiered KV pool. It maps logical sessions to VRAM slots or RAM blobs with an LRU clock and presents the same method surface `Sessions` does, so the scheduler only swaps its engine type. |
-| `prefix_manager.zig` | The serve prefix cache: its entries, its counters, its insert body, and the `--preload` boot warm-up. It keeps every engine call whose result only the cache consumes. |
-| `server.zig` | The binary transport adapter. It speaks ZMTP as a ROUTER, and `Server(E,C)` is `ServeEngine(E,C,BinaryAdapter)`. `BinaryAdapter` runs two tasks per connection, a reader and a writer. The writer is the single writer of the stream, and it sends the greeting and READY first. One ZMTP message carries one `protocol.zig` frame. The reader answers a peer PING through the out-queue. |
-| `client.zig` | The reference binary client behind the integration tests and `bench-serve`, and the file a port to another language copies. It speaks ZMTP as a DEALER, so a ZMQ binding in any language can replace it. Its methods are send-only or terminal-wait, as the client surface section sets out. `next` returns slices that borrow the payload buffer. |
-| `openai/http_server.zig` | The OpenAI HTTP adapter. `HttpAdapter` runs one task per connection over `std.http.Server`, because request and response are half-duplex there. One task both drains the out-queue and writes the response. |
-| `openai/map.zig` | The pure datapath of the HTTP connector and its trust boundary. It parses and validates an untrusted body into a value, and it maps a rejection to an HTTP status. It routes each token of a turn to `reasoning_content` or `content`, and it splits streamed token bytes on UTF-8 boundaries for SSE. |
-| `openai/types.zig` | The OpenAI request and response structs. Every optional field has a default, so a minimal request parses, and the parse drops unknown fields, so a full client with tools still round-trips. Every sampling field has a named field, so no sampling value drops in silence. |
-| `openai/raw_codec.zig` | The HTTP connector's codec. `map.zig` already rendered the whole conversation, so this one only tokenizes, and it carries the model metadata the HTTP task needs. |
+| `scheduler.zig` | `Scheduler`, the control unit: the session table and the composed tick. |
+| `engine.zig` | `ServeEngine`, the engine thread, the queues, and the connection lifecycle. |
+| `event.zig` | `Request`, `OutEvent`, and `Codec`, the values across the two boundaries. |
+| `prefill_chunk.zig` | The pure rule for the prefill rows of one pass. |
+| `residency.zig` | `Residency`, the optional tiered KV pool. |
+| `prefix_manager.zig` | `PrefixManager`, the serve prefix cache and its warm-up. |
+| `protocol.zig` | The binary wire format: frames, verbs, and error codes. |
+| `zmtp.zig` | The pure ZMTP 3.x codec under the frames. |
+| `server.zig` | The binary transport adapter, a ZMTP ROUTER. |
+| `client.zig` | The reference binary client, a ZMTP DEALER. |
+| `openai/http_server.zig` | The OpenAI HTTP adapter. |
+| `openai/map.zig` | The HTTP trust boundary: parse, validate, and map a body to a value. |
+| `openai/types.zig` | The OpenAI request and response structs. |
+| `openai/raw_codec.zig` | `RawCodec`, the HTTP codec that tokenizes a rendered conversation. |
 
 ## How the pieces fit
 
-`scheduler.zig` is generic over two boundaries. The first is an `Engine`, the
-runtime session pool, reached through `create`, `destroy`, `setParams`,
-`reseed`, `overridePending`, `posOf`, `capacityRemaining`, and `advance`. The second is a
-codec: `event.Codec` for the binary wire and `openai.RawCodec` for HTTP. It also
-takes a duck-typed sink with `emit` and `disconnect`. It owns all serve-layer
-state and imports no socket.
+A transport adapter decodes bytes into `Request` values, and the engine loop feeds them to the
+scheduler. The scheduler drives the session pool of `runtime/` and emits `OutEvent` values back.
 
-`engine.zig` instantiates the scheduler and wraps it in the engine loop. The
-thread that calls `run` is the engine thread, and it alone touches the runner,
-the sessions, and the scheduler.
+| Value | File | Holds | Made by | Read by |
+| --- | --- | --- | --- | --- |
+| `Request` | `event.zig` | One decoded client request, with owned text | The adapters | `Scheduler.handle` |
+| `OutEvent` | `event.zig` | One fixed-size event for a connection | `Scheduler` | The adapters |
+| `Codec` | `event.zig` | The chat template, the tokenizer, and the piece table | `cli/serve_cmd` | `Scheduler` |
+| `Scheduler` | `scheduler.zig` | The session table, the state machines, and the config | `ServeEngine` | The engine loop |
+| `ServeEngine` | `engine.zig` | One engine thread and its bounded queues | `server.Server`, `http_server.Server` | `cli/serve_cmd`, `cli/serve_openai_cmd` |
+| `Residency` | `residency.zig` | The logical sessions, the LRU clock, and the RAM ledger | `cli/boot/serve_boot` | `Scheduler`, as its `Engine` |
+| `PrefixManager` | `prefix_manager.zig` | The cache entries and counters over a `PromptCache` | `Scheduler` | `Scheduler` |
+| `Frame` payload | `protocol.zig` | A 20-byte header and a bounded payload | `client.zig`, `server.zig` | The same two |
+
+The scheduler takes its engine and its codec as parameters. The engine is `Residency` over
+`runtime/session.Sessions`, or `Sessions` alone. The codec is `event.Codec` for the binary wire and
+`openai.RawCodec` for HTTP. The scheduler imports no socket.
 
 ```
-  acceptor ----accept----> Adapter.onAccept(conn) --decode--> request_queue
-                                                                   |
-                                                                   v
-  conn[i] task(s) <--encode-- out_queue[i] <--emit-- ENGINE LOOP (run)
-                                  ^                       |
-                                  |   queue full: emit returns false,
-                                  |   the scheduler parks the event in the
-                                  +-- session's pending_event cell, and the
-                                      draining task signals a wakeup
+  acceptor --accept--> Adapter.onAccept(conn) --decode--> request_queue
+                                                              |
+                                                              v
+  conn task(s) <--encode-- out_queue[i] <--emit-- ENGINE LOOP: sched.handle, sched.tick
+                                                              |
+                                                              v
+                                         Residency --> Sessions --> runner.stepBatch
 ```
 
-`run` drains the request queue, hands each request to `sched.handle`, then calls
-`sched.tick` until the call returns `.idle`. It then blocks on the request queue
-and the process uses zero CPU. The two adapters differ in the per-connection task
-model, and in the traffic each is shaped for. The binary adapter carries each
-`protocol.zig` frame as one ZMTP message. The binary wire serves embedded
-interactive traffic: many concurrent, short, low-latency sessions that often
-share a prefilled prefix, under a tail-latency budget. The HTTP connector serves
-general interop, so existing clients, SDKs, and evaluation tools work unchanged.
-A third transport is a third adapter, with no engine change.
+The adapters differ in how a connection runs. `BinaryAdapter` in `server.zig` runs a reader task and
+a writer task per connection, and one ZMTP message carries one `protocol.zig` frame. `HttpAdapter`
+in `openai/http_server.zig` runs one task per connection. A third transport is a third adapter, with
+no engine change.
 
-`residency.zig` fits between the scheduler and `Sessions` without changing that
-picture. `Sessions` stays a one-to-one pool over the physical KV slots.
-`Residency` owns the logical sessions above it and presents the identical method
-surface. Eviction and restore are byte-faithful whole-slot copies through the
-runner's `evictSlot` and `restoreSlot`. Every blob is charged to a RAM ledger. The boot resolves the ledger budget as one of three blob tiers. `absent` means no session can be evicted. `bounded` carries the full need of one blob more than the evictable sessions. `unenforced` means `--kv-ram` is unset and the free RAM is unknown. A runner
-without `evictSlot` compiles `Residency` down to the identity, and the pool then
-needs `n_logical <= n_physical`.
+The wire layers stack from bytes to values.
 
-The scheduler also owns a prefix cache over the same byte moves, and
-`prefix_manager.zig` holds it. A turn that starts at position zero asks the
-manager for the longest cached prefix of its tokens. The scheduler restores that
-prefix into the slot and prefills only the suffix, so a repeated system prompt
-opens with zero forward passes. On prefill completion the manager snapshots the
-slot and admits the prefix when the measured gate says a future restore beats the
-prefill it replaces. The split is the engine boundary. The scheduler makes the
-calls whose result a slot's state machine consumes (`restorePrefix`,
-`restoreReady`). The manager makes the calls whose result only the cache consumes
-(`snapshotBytesFor`, `snapshotPrefix`, `copyFinalLogits`).
+```
+  socket --> zmtp.zig (greeting, READY, PING) --> protocol.zig (header + payload) --> Request
+  socket --> std.http.Server --> openai/map.zig (parse, validate)                 --> Request
+```
 
-`--prefix-disk` adds the second tier. All processes share one directory,
-`.prompt_cache` under the working directory by default, and
-`$ZIGFERENCER_CACHE_DIR` relocates it. Each file carries a fingerprint of the
-model and the backend in its header, and that fingerprint is the namespace of the
-file. The name is a namespace-opaque hash, so a process must read a header to
-tell its own file from a foreign one. The disk budget bounds one process's
-namespace and not the directory. An operator who shares a directory across models
-must size the disk for the sum of the active budgets.
+The prefix cache sits beside the pool.
+
+```
+  Scheduler --asks--> PrefixManager --> runtime/prompt_cache.PromptCache (RAM tier, disk tier)
+      |                                        ^
+      +--restorePrefix / snapshotPrefix--> Sessions --> runner blob
+```
+
+`Residency` presents the same method surface as `Sessions`, so the scheduler only swaps its engine
+type. The split with the cache is the engine boundary. The scheduler makes the calls whose result a
+slot state machine consumes. The manager makes the calls whose result only the cache consumes.
 
 ## Rules
 
@@ -100,12 +85,13 @@ must size the disk for the sum of the active budgets.
   across backends the greedy tokens are equal. `tests/serve_integration_test.zig`
   observes it from the binary wire and `tests/openai_integration_test.zig`
   observes it over HTTP, on top of the runner equivalence tests.
-- **The socket is a trust boundary.** `zmtp.zig` and the adapter check every ZMTP length first. A greeting has exactly 64 bytes. A command body has at most 1024 bytes. A message has at most 20 bytes plus 64 KiB. A ping context has at most 16 bytes. Then `protocol.zig` checks the frame inside the message
-  against `max_frame_payload_bytes` (64 KiB), `limits.max_token_text_bytes`
-  (256), and `limits.max_model_name_bytes` (64). `openai/map.zig` checks the
-  JSON the same way. A reader must consume a payload exactly, and trailing
-  bytes are malformed. A decode never panics. It returns a typed error the
-  adapter maps to an error frame or a 4xx.
+- **The socket is a trust boundary.** `zmtp.zig` and the adapter check every ZMTP length first. A
+  greeting has exactly 64 bytes. A command body has at most 1024 bytes. A message has at most 20
+  bytes plus 64 KiB. A ping context has at most 16 bytes. Then `protocol.zig` checks the frame
+  inside the message against `max_frame_payload_bytes` (64 KiB), `limits.max_token_text_bytes`
+  (256), and `limits.max_model_name_bytes` (64). `openai/map.zig` checks the JSON the same way. A
+  reader must consume a payload exactly, and trailing bytes are malformed. A decode never panics. It
+  returns a typed error the adapter maps to an error frame or a 4xx.
 - **Bounded everything.** `--max-connections` sets the live connections, 8 by
   default and 64 at most (`core/limits.zig`). A binary connection costs two
   worker threads, one payload buffer of 20 bytes plus 64 KiB, and one
@@ -130,50 +116,49 @@ must size the disk for the sum of the active budgets.
   share option, because HTTP has no shutdown verb and holds one session per
   connection. `tests/serve_integration_test.zig` checks the cap, the share, the
   sweep, and the refused shutdown from the wire.
-- **Session leases.** A lease keeps a session through a drop. The scheduler
-  holds it in the slot as a 128-bit token from the secure random source and a
-  time to live. `serve --resume-ttl MS` sets `Config.resume_ttl_max_ms`, the
-  cap on the time to live, and `limits.max_resume_ttl_ms` (one hour) caps the
-  flag. The default is 0, which turns resumption off, so every drop frees as
-  before. At a drop, a
-  leased slot detaches until the drop time plus its time to live. A turn in
-  flight takes the cancel rule, and an opening or append prefill runs on. A
-  detached slot takes no decode row, emits no event, and no request reaches
-  it. A resume with the token attaches the slot to the new connection within
-  its share, and the token rotates. The newest holder wins, so a resume also
-  takes an attached slot. A resume of a slot that is not idle waits in the
-  slot and ends at the moment the slot becomes idle. Until then, a generate,
-  an append, a clone, a cancel, a keep, or a close on the session gets
-  `session_busy`, because the client has no `resumed` reply yet. The scheduler frees a detached slot at its deadline
-  in a lazy scan at the tick head and at each admission, with one clock read
-  per scan. A live open with no free slot takes the detached slot with the
-  earliest deadline, so a lease never blocks a live client. An expiry and a
-  yield stop a prefill in flight before the release. A clone that tiered KV
-  refuses after a yield loses the yielded session, and the log line of the
-  yield names the loss. The serve stats line counts the expiries, the yields,
+- **Session leases.** A lease keeps a session through a drop. The scheduler holds it in the slot as
+  a 128-bit token from the secure random source and a time to live. `serve --resume-ttl MS` sets
+  `Config.resume_ttl_max_ms`, the cap on the time to live, and `limits.max_resume_ttl_ms` (one hour)
+  caps the flag. The default is 0, which turns resumption off, so every drop frees as before. At a
+  drop, a leased slot detaches until the drop time plus its time to live. A turn in flight takes the
+  cancel rule, and an opening or append prefill runs on. A detached slot takes no decode row, emits
+  no event, and no request reaches it. A resume with the token attaches the slot to the new
+  connection within its share, and the token rotates. The newest holder wins, so a resume also takes
+  an attached slot. A resume of a slot that is not idle waits in the slot and ends at the moment the
+  slot becomes idle. Until then, the session answers `session_busy` to a generate, an append, a clone, a cancel,
+  a keep, or a close. The client has no `resumed` reply yet. The scheduler frees a
+  detached slot at its deadline. It scans lazily at the tick head and at each admission, with one
+  clock read per scan. A live open with no free slot takes the detached slot with the earliest
+  deadline, so a lease never blocks a live client. An expiry and a yield stop a prefill in flight
+  before the release. A clone that tiered KV refuses after a yield loses the yielded session, and
+  the log line of the yield names the loss. The serve stats line counts the expiries, the yields,
   the lost yields, and the cut prefills. The server never logs a token.
-- **A lost lease reply strands the session until its time to live.** A resume rotates the token before the `resumed` reply goes out. A keep issues its token in the `kept` reply. If that reply is lost, for example because the
-  connection drops before the delivery, no client holds a valid token. The
-  session stays detached until its time to live ends, and the expiry scan then
-  frees it. The client falls back to a rebuild from its own history: an open
-  with the original system prompt and an append of the kept pairs. The time
-  to live bounds the stranded slot, and a live open can take it earlier.
+- **A lost lease reply strands the session until its time to live.** A resume rotates the token
+  before the `resumed` reply goes out. A keep issues its token in the `kept` reply. If that reply is
+  lost, for example because the connection drops before the delivery, no client holds a valid token.
+  The session stays detached until its time to live ends, and the expiry scan then frees it. The
+  client falls back to a rebuild from its own history: an open with the original system prompt and
+  an append of the kept pairs. The time to live bounds the stranded slot, and a live open can take
+  it earlier.
 - **The engine never blocks on a client.** Emission is non-blocking. A full
   out-queue parks one event in the session's single `pending_event` cell, and the
   session leaves the batch until the draining task signals a wakeup. A client
   whose queue stays full while it keeps sending is broken, and `disconnect` is
   the bounded answer.
-- **Backpressure is the only legal answer to a full RAM ledger.** An eviction that pushes the ledger past its budget gets `error.RamBudgetExceeded`. The scheduler then parks that turn until a slot frees. A blob is the only copy of its conversation, so dropping one is never
-  legal.
+- **Backpressure is the only legal answer to a full RAM ledger.** An eviction that pushes the ledger
+  past its budget gets `error.RamBudgetExceeded`. The scheduler then parks that turn until a slot
+  frees. A blob is the only copy of its conversation, so dropping one is never legal.
 - **A full window is a stop, never a shift or a cut.** The server ends a turn with
   `context_full` when the window fills. A turn or a system prompt that does
   not fit gets a `turn_too_long` refusal, and the detail names both numbers
   (`protocol.turn_too_long_fmt`, `protocol.system_too_long_fmt`). The server
   never drops, shifts, or truncates rows. The chat client continues a full
   conversation by compaction (`cli/client/client_transcript.zig`).
-- **The cache paths are best-effort.** Any refusal or failure in the prefix cache degrades to a cold prefill. A warm restore equals a cold prefill token for token.
-- **Boundary values carry the ownership rule.** `Request` is the one value that owns bytes across a thread hop. The adapter dupes the turn text into the gpa. The scheduler frees it after tokenizing. `OutEvent` is fixed-size, so the
-  queues hold plain copies and need no ownership rule at all.
+- **The cache paths are best-effort.** Any refusal or failure in the prefix cache degrades to a cold
+  prefill. A warm restore equals a cold prefill token for token.
+- **Boundary values carry the ownership rule.** `Request` is the one value that owns bytes across a
+  thread hop. The adapter dupes the turn text into the gpa. The scheduler frees it after tokenizing.
+  `OutEvent` is fixed-size, so the queues hold plain copies and need no ownership rule at all.
 - **Token text is raw bytes.** One `token` event can carry a partial UTF-8
   sequence, and only the concatenation of a turn is well-formed. The reference
   client returns the bytes as they are, and `cli/client/client_streaming.zig` holds a partial
@@ -182,6 +167,21 @@ must size the disk for the sum of the active budgets.
 - **The per-op GPU backend cannot serve.** `cli/boot/boot_lines.zig` returns
   `error.UnsupportedServeBackend` for it. The CPU runners, the fused runners, and
   the hybrids all serve.
+- **The blob tier of the RAM ledger has three values.** `absent` means no session can be evicted.
+  `bounded` carries the full need of one blob more than the evictable sessions. `unenforced` means
+  `--kv-ram` is unset and the free RAM is unknown. A runner without `evictSlot` compiles `Residency`
+  down to the identity, and the pool then needs `n_logical <= n_physical`.
+- **The disk tier of the prefix cache shares one directory.** `--prefix-disk` adds it. The default
+  is `.prompt_cache` under the working directory, and `$ZIGFERENCER_CACHE_DIR` relocates it. The
+  disk budget bounds one process namespace and not the directory. An operator who shares a directory
+  across models must size the disk for the sum of the active budgets.
+- **The engine thread owns the runner.** The thread that calls `run` alone touches the runner, the
+  sessions, and the scheduler. `run` drains the request queue, calls `sched.handle` for each
+  request, and calls `sched.tick` until it returns `.idle`. It then blocks on the request queue, so
+  an idle server uses no CPU.
+- **The two transports serve two kinds of traffic.** The binary wire serves embedded interactive
+  traffic. That means many short, low-latency sessions that often share a prefilled prefix. The HTTP frontend
+  serves general interop, so existing clients, SDKs, and evaluation tools work unchanged.
 
 ## The client surface
 
@@ -197,13 +197,15 @@ The server sends the end-of-sequence token as a token frame too. `hello`
 records its id, `collectTurn` skips its text, and a client that renders text
 skips the token whose id equals `eos_id` from `hello_ack`.
 
-The wire is `protocol_version` 3. The server refuses a header of any other
-version, version 2 included, with `unsupported_version` and closes the
-connection. Each `token` frame carries a channel byte: 0 content, 1 reasoning,
-2 the open tag of a think block, 3 its close tag. A tag keeps its text, so a
-client that ignores the channel prints the same bytes. `done` counts the
-reasoning tokens. `hello_ack` names the think mode of the server (0 no tags, 1 off, 2 on) and the think budget (0 is unbounded). It also names `resume_ttl_max_ms`, the longest lease (0 is resumption off). It also carries two card rows, `recommended_think` and `recommended_plain`. They hold the sampling that the model card recommends for a turn inside the think block and for a turn outside it. A model with no card values gets greedy. A client picks the row of the mode of
-each turn.
+The wire is `protocol_version` 3. The server refuses a header of any other version, version 2
+included, with `unsupported_version` and closes the connection. Each `token` frame carries a channel
+byte: 0 content, 1 reasoning, 2 the open tag of a think block, 3 its close tag. A tag keeps its
+text, so a client that ignores the channel prints the same bytes. `done` counts the reasoning
+tokens. `hello_ack` names the think mode of the server (0 no tags, 1 off, 2 on) and the think budget
+(0 is unbounded). It also names `resume_ttl_max_ms`, the longest lease (0 is resumption off). It
+also carries two card rows, `recommended_think` and `recommended_plain`. They hold the sampling that
+the model card recommends for a turn inside the think block and for a turn outside it. A model with
+no card values gets greedy. A client picks the row of the mode of each turn.
 
 `Sampling` is 36 bytes. It carries a presence penalty in [-2, 2], a repetition
 penalty in (0, 2], and a min_p in [0, 1]. The identity values are 0, 1, and 0.
@@ -259,15 +261,16 @@ A `done` frame ends every turn with one of four finish reasons: `eos`, `max_toke
 `generateWith` sends a `generate` with every per-turn field: the sampling
 block, the think switch, and the think budget.
 
-`session_keep{u32 ttl_ms}` keeps a session past a drop of this connection. The
-grant is `min(ttl_ms, resume_ttl_max_ms)`. The `kept` reply is 40 bytes: the
-`u32` grant, then a 16-byte token. A grant of 0 drops the lease and carries 16
-zero bytes. A positive grant carries a token that is not all zero. Each keep
-issues a new token, and the old token opens nothing. `session_resume{[16]u8
-token}` goes out with header session id 0 on any connection. Any other header
-id is `malformed_frame`. The `resumed` reply is 58 bytes. It holds the new token, `kv_pos`, `turns_done`, and a `has_last` byte. It then holds the last finished request: its id, its finish reason, its generated tokens, and its reasoning tokens. With `has_last` 0 these four fields are 0.
-The reply comes when the session is idle, so `kv_pos` is final. The presented
-token opens nothing after the resume, so a client stores the new one.
+`session_keep{u32 ttl_ms}` keeps a session past a drop of this connection. The grant is `min(ttl_ms,
+resume_ttl_max_ms)`. The `kept` reply is 40 bytes: the `u32` grant, then a 16-byte token. A grant of
+0 drops the lease and carries 16 zero bytes. A positive grant carries a token that is not all zero.
+Each keep issues a new token, and the old token opens nothing. `session_resume{[16]u8 token}` goes
+out with header session id 0 on any connection. Any other header id is `malformed_frame`. The
+`resumed` reply is 58 bytes. It holds the new token, `kv_pos`, `turns_done`, and a `has_last` byte.
+It then holds the last finished request: its id, its finish reason, its generated tokens, and its
+reasoning tokens. With `has_last` 0 these four fields are 0. The reply comes when the session is
+idle, so `kv_pos` is final. The presented token opens nothing after the resume, so a client stores
+the new one.
 
 | Request | Condition | Answer |
 | --- | --- | --- |
@@ -300,17 +303,22 @@ full window with this frame. It closes the session and opens one with the
 exact original system prompt, which a prefix cache can serve. It then appends
 the newest pairs that fit.
 
-The supporting values are plain data. `Event` is one decoded frame whose slices
-borrow the payload buffer. `OwnedEvent` is a fixed-size copy of an `Event` for a
-caller that hands frames across a task boundary. These calls return typed results. `collectTurn` and `collectTurnWith` return `Turn`. `hello` returns `HelloInfo`. `append` returns `protocol.Appended`. `openSessionInfo` and `cloneSessionInfo` return `Opened`. `keepSession` returns `Kept`. `resumeSession` returns `ResumedSession`. `stats` returns `Stats`. `LastError` records the last `err` frame that a method
-consumed. Its detail holds at most 64 bytes, and `truncated` marks a longer
-detail that the client cut.
+The supporting values are plain data. `Event` is one decoded frame whose slices borrow the payload
+buffer. `OwnedEvent` is a fixed-size copy of an `Event` for a caller that hands frames across a task
+boundary. These calls return typed results. `collectTurn` and `collectTurnWith` return `Turn`.
+`hello` returns `HelloInfo`. `append` returns `protocol.Appended`. `openSessionInfo` and
+`cloneSessionInfo` return `Opened`. `keepSession` returns `Kept`. `resumeSession` returns
+`ResumedSession`. `stats` returns `Stats`. `LastError` records the last `err` frame that a method
+consumed. Its detail holds at most 64 bytes, and `truncated` marks a longer detail that the client
+cut.
 
 ### A client in any language
 
 1. Create a DEALER socket with your ZMQ binding.
-2. Connect it to `tcp://HOST:PORT` or to `ipc://PATH`. The `READY` line of `serve` gives the address.
-3. Send one message per request. The message is the 20-byte header of `protocol.zig` followed by the payload.
+2. Connect it to `tcp://HOST:PORT` or to `ipc://PATH`. The `READY` line of `serve` gives the
+   address.
+3. Send one message per request. The message is the 20-byte header of `protocol.zig` followed by the
+   payload.
 4. Receive one message per reply. Decode the header, then the payload, with the same tables.
 
 - **Single-part messages only.** A message with the MORE flag closes the
@@ -328,7 +336,7 @@ detail that the client cut.
   with a lease detaches for its time to live, and `session_resume` with the
   token attaches it to the new connection (see "Session leases").
 - **On `unknown_session` for a kept session, resume first.** A libzmq DEALER
-  reconnects by itself and queues sends in the gap, so the application can
+  reconnects by itself and queues sends in the gap. The application can
   miss the drop. Its next request on the session then gets
   `unknown_session`. Send `session_resume` with the stored token, store the
   new token, and send the request again.
@@ -370,7 +378,8 @@ request opens its own session, so the session-open seed starts the sampling
 stream of the request, and the turn sends no reseed. The table lists what the
 front does with each request field.
 
-To try the front, start `zig-out/bin/zigferencer serve-openai MODEL --port 8080`, then send a request:
+To try the front, start `zig-out/bin/zigferencer serve-openai MODEL --port 8080`, then send a
+request:
 
 ```
 curl -N http://127.0.0.1:8080/v1/chat/completions -H 'Content-Type: application/json' \
@@ -394,7 +403,7 @@ curl -N http://127.0.0.1:8080/v1/chat/completions -H 'Content-Type: application/
 
 Every refusal is a 400 of type `invalid_request_error`, and its message names
 the field and the accepted range. A model with no think tags accepts only the
-closed modes: `enable_thinking: true` or a budget above 0 gets a 400, and a
+closed modes. `enable_thinking: true` or a budget above 0 gets a 400. A
 budget of 0 or -1 passes. A model with think tags and no forced close also
 refuses a budget above 0. A budget of 0 wins over `enable_thinking: true`.
 A field with the wrong JSON type, for example a string for `top_k`, gets
@@ -430,15 +439,6 @@ then, and not before.
 | Prefix RAM eviction | `runtime/prompt_cache.zig` `evictLru` | the budget can overshoot by at most one entry |
 | Prefix disk eviction | `runtime/prompt_cache.zig` `diskEvictToFit` | own namespace only. The budget bounds this process, and the victim is its oldest file by mtime |
 | Cache-insert eligibility | `prefix_manager.zig` `insert`, offered by `scheduler.zig` `maybeInsertPrefix` | position-zero completions only |
-| The RAM split, blobs against prefix | `core/kv_budget.zig` `splitRam`, with the corners in `engine/device_arm.zig` | blobs get their provable need, the prefix gets the surplus |
-| The blob tier of an unset `--kv-ram` | `core/kv_budget.zig` `quoteRam`, called through `engine/resolve.zig` and `engine/device_arm.zig` | the full need of `(E + 1)` blobs, or a boot refusal with both fits |
+| The RAM split, blobs against prefix | `core/kv_budget.zig` `splitRam`, with the corners in `engine/device_placement.zig` | blobs get their provable need, the prefix gets the surplus |
+| The blob tier of an unset `--kv-ram` | `core/kv_budget.zig` `quoteRam`, called through `engine/resolve.zig` and `engine/device_placement.zig` | the full need of `(E + 1)` blobs, or a boot refusal with both fits |
 | Full window | `scheduler.zig` decode admission and the turn refusal, `cli/client/client_transcript.zig` `plan` | the server stops and refuses with numbers, the client keeps the longest suffix of turns that fits beside the system prompt and the reserve |
-
-## Where to start
-
-1. `scheduler.zig`: the control unit, the per-session state machine, and the composed tick.
-2. `engine.zig`, then `event.zig`: the engine thread, queues, sink, and lifecycle, then the values that cross them.
-3. `server.zig` with `protocol.zig` and `zmtp.zig`: the binary adapter, the wire format it frames, and the ZMTP carrier under the frames.
-4. `openai/http_server.zig` with `openai/map.zig`: the HTTP adapter and its trust boundary.
-5. `residency.zig`, then `prefix_manager.zig`: the optional KV tier, then the prefix cache above it.
-6. `client.zig`: the far end of the binary wire, and the shortest statement of the format. [The client surface](#the-client-surface) lists its methods.

@@ -2,6 +2,8 @@
 //! quantized paths across rows. Both CPU runners call it, so the dtype ladder cannot drift between
 //! the two families.
 //!
+//! Comptime. `build_options.use_vulkan_ops` picks the Vulkan path, so a CPU build never reads it.
+//!
 //! Load gate. A GGUF names each dtype, so a file can name one that no kernel reads.
 //! `requireWeights` refuses such a file at runner init and names the tensor. The step functions
 //! then carry no dtype error, and the dispatch treats any other dtype as unreachable.

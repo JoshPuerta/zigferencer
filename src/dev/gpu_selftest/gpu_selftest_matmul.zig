@@ -39,16 +39,11 @@ const matmul_shapes = [_][3]u32{
 
 // -- api --------------------------------------------------------------------
 
-/// Check the batched Q8_0 matmuls (the prefill kernels) against the CPU
-/// `naive.linearF32Q80` reference on `matmul_shapes`, with both kernels per shape.
-/// The batch kernel reorders the reduction against the CPU, so it carries a
-/// `.relative` tolerance. The gate is therefore never a bit-exact one.
+/// Check the batch and gemm Q8_0 kernels against `naive.linearF32Q80` on `matmul_shapes`.
+/// Both kernels reorder the reduction against the CPU, so the gate is a tolerance, never bit-exact.
 pub fn matmulCheck(ctx: context.Context) !void {
     var ctxp = try ctx.arena.create(vulkan_ctx.Context);
-    ctxp.* = try vulkan_ctx.Context.init(
-        ctx.arena,
-        .{ .storage_range_override = ctx.vk_storage_range },
-    );
+    ctxp.* = try vulkan_ctx.Context.init(ctx.arena, ctx.vk_options);
     defer ctxp.deinit();
 
     var k_batch = try kernels.LinearQ80Batch.init(ctxp);
@@ -83,6 +78,7 @@ fn matmulCheckDims(
 ) !bool {
     std.debug.assert(k % q80_block_values == 0);
 
+    // Build the random weight and input.
     const a = ctx.arena;
     const blocks_per_row = k / q80_block_values;
     const row_bytes = blocks_per_row * q80_block_bytes;
@@ -94,9 +90,7 @@ fn matmulCheckDims(
     buildRandomQ80(r, weight, k, n);
     gpu_selftest_common.fillN(r, input, 1.0);
 
-    // The weight Tensor carries the GGUF reversed shape {k, n}, which is
-    // in_features then out_features. `linearF32Q80` derives row_bytes itself, and
-    // the byte_stride field still states the true stride.
+    // Compute the CPU reference. The GGUF shape is reversed: {k, n} is in then out features.
     const w_tensor: Tensor = .{
         .dtype = .q8_0,
         .n_dims = 2,
@@ -109,6 +103,7 @@ fn matmulCheckDims(
         naive.linearF32Q80(input[bi * k ..][0..k], w_tensor, out_cpu[bi * n ..][0..n]);
     }
 
+    // Run the GPU kernel and compare.
     const out_gpu = try a.alloc(f32, @as(usize, b) * n);
     try kernel.runOneShot(input, weight, b, k, n, out_gpu);
 
@@ -128,10 +123,8 @@ fn matmulCheckDims(
     return ok;
 }
 
-/// Build a synthetic Q8_0 weight in GGUF layout: `n` rows of out_features, each of
-/// `k/32` blocks of 34 bytes. A block holds a 2-byte f16 scale and 32 i8 quants.
-/// Random per-block scales in a small range, with full-range i8 quants, give a
-/// realistic numeric spread.
+/// Build a synthetic Q8_0 weight in GGUF layout: `n` rows of `k/32` blocks, each block 34 bytes.
+/// Small random scales with full-range i8 quants give a realistic numeric spread.
 fn buildRandomQ80(r: std.Random, data: []u8, k: u32, n: u32) void {
     const blocks_per_row = k / q80_block_values;
     const row_bytes = blocks_per_row * q80_block_bytes;

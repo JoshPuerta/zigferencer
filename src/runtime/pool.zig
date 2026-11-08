@@ -2,6 +2,9 @@
 //! the epoch word, and the claim counter. A unit function is the datapath: it computes one unit of
 //! an op, and its result does not depend on the thread that runs it.
 //!
+//! Comptime. `Ctx` and `unit_fn` are comptime, so each op gets its own dispatch. Asserts pin the
+//! control word and the line size.
+//!
 //! Ownership. The caller owns the pool and keeps its address fixed, because every worker holds a
 //! pointer to it. The calling thread is participant 0 of a dispatch, and `threads - 1` workers wait
 //! between dispatches.
@@ -203,7 +206,7 @@ pub const Pool = struct {
         self.seq = (self.seq + 1) & seq_mask;
         self.ctl.value.store(pack(self.seq, parts), .seq_cst);
 
-        // Wake every sleeper. See "Memory order" in the header.
+        // Wake every sleeper.
         if (self.sleepers.value.load(.seq_cst) > 0) {
             self.io.futexWake(u32, &self.ctl.value.raw, std.math.maxInt(u32));
         }

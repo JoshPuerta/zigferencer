@@ -2,6 +2,8 @@
 //! device query, no I/O. One arithmetic serves both the plan and the preflight, and any caller can
 //! replay it in a test.
 //!
+//! Comptime. `clipCopies` is generic over the copy record type.
+//!
 //! Modes. Mode A takes a VRAM byte budget X. Alone, X buys slots at the resolved window. With a
 //! slot count beside it (`--vram-slots`), the count is pinned and the window follows the money.
 //! Mode B has no budget: the caller's structure passes through and the window is the serve
@@ -14,13 +16,14 @@
 //! no window. The caller fills both default windows from `defaultWindow`, a byte budget per
 //! session.
 //!
-//! Placement planner. A second planner shares the file and the same usable-VRAM rule. It prices
-//! one weight placement: the host layers take the prefix `[0..split)` and the GPU layers take the
-//! suffix `[split..n_layers)`. It reads the KV structure the first planner resolved, so it never
-//! derives a window or a slot count of its own. It takes a per-layer price vector, so a family
-//! whose layers differ in price is priced by span instead of by one product. It also prices the
-//! host RAM of the split, and it refuses a split whose anonymous host bytes pass the usable share
-//! of the free RAM.
+//! Layer split planner. A second planner shares the file and the same usable-VRAM rule. It prices
+//! one layer split: the host layers take the prefix `[0..host_layers)` and the GPU layers take the
+//! suffix `[host_layers..n_layers)`. It reads the KV structure the first planner resolved, so it
+//! never derives a window or a slot count of its own.
+//!
+//! Layer prices. The planner takes a per-layer price vector, so a family whose layers differ in
+//! price is priced by span instead of by one product. It also prices the host RAM of the split, and
+//! it refuses a split whose anonymous host bytes pass the usable share of the free RAM.
 //!
 //! Overflow ledger. The window is at most 2^18 (`limits.max_model_ctx`). The per-token column sums
 //! to at most 2^30 and the fixed column to at most 2^32. So one slot's span stays under 2^49. The
@@ -71,8 +74,8 @@ pub const blob_refusal_text_max: usize = 512;
 pub const ram_refusal_text_max: usize = 512;
 
 /// Bytes the longest span form occupies. A caller sizes its stack buffer with
-/// it, and `formatPlacement: the three span forms` proves the ceiling holds.
-pub const placement_text_max: usize = 64;
+/// it, and `formatLayerSplit: the three span forms` proves the ceiling holds.
+pub const layer_split_text_max: usize = 64;
 
 /// The frames the ledger line writes. They are named, so the ceiling below
 /// reads the same literals the formatter writes. The RAM part has two forms:
@@ -87,7 +90,7 @@ const ledger_ram_unchecked = " | ram {d} MiB, not checked";
 /// placeholders too, and the byte fields print in MiB rather than whole, so
 /// this figure over-estimates. An over-estimate is sound for a ceiling, and
 /// `formatLedger: the widest ledger` proves the ceiling holds for both forms.
-pub const placement_ledger_text_max: usize = ledger_frame.len +
+pub const layer_split_ledger_text_max: usize = ledger_frame.len +
     @max(ledger_ram_checked.len, ledger_ram_unchecked.len) +
     2 * std.fmt.comptimePrint("{d}", .{std.math.maxInt(u32)}).len +
     8 * std.fmt.comptimePrint("{d}", .{std.math.maxInt(u64)}).len;
@@ -100,7 +103,7 @@ pub const vram_refusal_text_max: usize = 512;
 
 /// Device state and the static ceilings the planner reads. The static ceilings
 /// default to the engine limits. The two default windows have no default
-/// value, because each is a per-model fact that the caller derives.
+/// value, because each is a per-model value that the caller derives.
 pub const Caps = struct {
     vram_free: u64,
     weights: u64,
@@ -291,7 +294,7 @@ pub const KvCostVector = struct {
     }
 };
 
-/// The resolved KV structure a placement prices, plus what each layer charges.
+/// The resolved KV structure a layer split prices, plus what each layer charges.
 /// A family states one entry per layer, and a family that charges every layer
 /// the same states a uniform vector, so a split by layer count is exact by
 /// summation and needs no rounding.
@@ -301,17 +304,17 @@ pub const KvStructure = struct {
     costs: KvCostVector,
 };
 
-/// One weight placement. The host layers form the prefix `[0..split)` and the
-/// GPU layers form the suffix `[split..n_layers)`, so the residual stream
-/// crosses the host-device boundary once per token. `split == n_layers` is the
-/// pure CPU runner and `split == 0` is the whole-model GPU runner.
-pub const PlacementPlan = struct {
-    /// The host bytes one placement implies, all of it anonymous memory. The
-    /// vector funds nothing from Y. `placementPlan` refuses a placement whose
+/// One layer split. The host layers form the prefix `[0..host_layers)` and the
+/// GPU layers form the suffix `[host_layers..n_layers)`, so the residual stream
+/// crosses the host-device boundary once per token. `host_layers == n_layers` is the
+/// pure CPU runner and `host_layers == 0` is the whole-model GPU runner.
+pub const LayerSplit = struct {
+    /// The host bytes one split implies, all of it anonymous memory. The
+    /// vector funds nothing from Y. `planLayerSplit` refuses a split whose
     /// vector passes the usable RAM, and the stages price zero for a caller
     /// without residency.
     pub const Ram = struct {
-        /// The KV plan splits Y before a placement exists, so this planner carries both shares.
+        /// The KV plan splits Y before a layer split exists, so this planner carries both shares.
         blobs: u64,
         prefix: u64,
         /// `kv_host` under a second name, so the host ledger reads whole from
@@ -321,7 +324,7 @@ pub const PlacementPlan = struct {
         /// one slot span when smaller. Zero without a residency pool.
         swap_stages: u64,
 
-        /// The anonymous host bytes the placement spends: the figure the RAM
+        /// The anonymous host bytes the split spends: the figure the RAM
         /// check compares with the usable RAM. The sum saturates, because Y is
         /// an operator figure, and a saturated spend still refuses.
         pub fn spend(self: Ram) u64 {
@@ -329,31 +332,31 @@ pub const PlacementPlan = struct {
         }
     };
 
-    split: u32,
+    host_layers: u32,
     n_layers: u32,
     /// Weight bytes of the GPU suffix, resident. Any GPU layer adds the final norm and lm_head.
     weight_resident: u64,
     kv_vram: u64,
     kv_host: u64,
     ram: Ram,
-    /// The usable share of free RAM that funded `ram`. Null from `placementPlan` or unknown RAM.
+    /// The usable share of free RAM that funded `ram`. Null from `planLayerSplit` or unknown RAM.
     ram_usable: ?u64,
     logits: u64,
     scratch: u64,
     n_slots: u32,
     window: u32,
 
-    /// The device bytes this placement reserves. A pure CPU placement holds no
+    /// The device bytes this split reserves. A pure CPU split holds no
     /// device context, so it reserves none, exactly as `pinned` does.
-    pub fn spend(self: PlacementPlan) u64 {
-        if (self.n_layers <= self.split) return 0;
+    pub fn spend(self: LayerSplit) u64 {
+        if (self.n_layers <= self.host_layers) return 0;
         return self.weight_resident + self.kv_vram + self.logits + self.scratch;
     }
 
-    /// The placement with the host vector of its RAM quote. The planner checks
-    /// no RAM, and every arm quotes its RAM through `quoteRam`, so the quote
+    /// The split with the host vector of its RAM quote. The planner checks
+    /// no RAM, and every split quotes its RAM through `quoteRam`, so the quote
     /// carries the funded blobs.
-    pub fn priced(self: PlacementPlan, q: RamQuote) PlacementPlan {
+    pub fn priced(self: LayerSplit, q: RamQuote) LayerSplit {
         // The VRAM plan checks no RAM, and the quote prices the
         // same split, so every term but the blobs agrees.
         std.debug.assert(self.ram_usable == null);
@@ -371,14 +374,14 @@ pub const PlacementPlan = struct {
     }
 };
 
-/// What a pinned placement costs, against what the device budget allows.
-pub const PlacementQuote = struct {
+/// What a pinned split costs, against what the device budget allows.
+pub const LayerSplitQuote = struct {
     spend: u64,
     usable: u64,
 };
 
 /// The value of `--gpu-layers` on every command that takes it. A count pins the
-/// GPU layers, counted from the top. `auto` gives the placement planner a null
+/// GPU layers, counted from the top. `auto` gives the layer split planner a null
 /// pin, so the widest GPU suffix the live budget funds wins.
 pub const GpuLayers = union(enum) {
     auto,
@@ -407,7 +410,7 @@ pub const GpuLayers = union(enum) {
     }
 
     /// True only for `--gpu-layers 0`, the all-host pin that takes the CPU
-    /// arm with no device context.
+    /// placement with no device context.
     pub fn isZeroCount(self: GpuLayers) bool {
         return switch (self) {
             .auto => false,
@@ -416,7 +419,7 @@ pub const GpuLayers = union(enum) {
     }
 };
 
-/// The host side of one placement request: the vector terms the split does
+/// The host side of one layer split request: the vector terms the split does
 /// not set. The free RAM is not part of it, because only `quoteRam` checks it.
 pub const HostRequest = struct {
     /// The Y split the KV plan already ran. It goes into the host vector, so
@@ -426,7 +429,7 @@ pub const HostRequest = struct {
     residency: bool,
 };
 
-/// The facts a RAM refusal names, at the split the planner took. The byte
+/// The figures a RAM refusal names, at the split the planner took. The byte
 /// fields hold whole bytes, and the text prints them in MiB.
 pub const RamRefusal = struct {
     /// The anonymous host bytes the placement needs: the sum of the four tiers.
@@ -448,7 +451,7 @@ pub const RamRefusal = struct {
     fit: ?u32,
 };
 
-/// The blob tier of one boot. The three cases are different facts, so one
+/// The blob tier of one boot. The three cases are different states, so one
 /// integer must not carry them.
 pub const BlobTier = union(enum) {
     /// No session can be evicted, so no blob exists.
@@ -471,24 +474,24 @@ pub const BlobTier = union(enum) {
     }
 };
 
-/// The host RAM quote of one serve arm at one split: the vector, its tier, and
-/// the blob facts the boot lines print. The byte fields hold whole bytes.
+/// The host RAM quote of one serve placement at one split: the vector, its tier, and
+/// the blob figures the boot lines print. The byte fields hold whole bytes.
 pub const RamQuote = struct {
-    ram: PlacementPlan.Ram,
+    ram: LayerSplit.Ram,
     /// The usable share of the free RAM. Null when the free RAM is unknown.
     usable: ?u64,
     tier: BlobTier,
     /// One slot of the whole model at the window: the largest blob one
     /// evicted session holds.
     blob: u64,
-    /// The provable blob need, `(evictable + 1) * blob`, or zero when no
-    /// session can be evicted.
+    /// The provable blob need, `(evictable + 1) * blob`, or zero when no session can be evicted.
+    /// The extra blob exists because a swap holds the evicted and the restored blob at once.
     need: u64,
     /// The sessions the slots cannot hold.
     evictable: u32,
 };
 
-/// The facts a blob refusal names. The byte fields hold whole bytes, and the
+/// The figures a blob refusal names. The byte fields hold whole bytes, and the
 /// text prints them in MiB.
 pub const BlobRefusal = struct {
     need: u64,
@@ -546,7 +549,7 @@ pub const ChunkWalk = struct {
     }
 };
 
-/// The facts a VRAM refusal names. The byte fields hold whole bytes, and the
+/// The figures a VRAM refusal names. The byte fields hold whole bytes, and the
 /// text prints them in MiB.
 pub const VramRefusal = struct {
     /// Device bytes the plan needs in all.
@@ -864,7 +867,7 @@ pub fn derivedX(caps: Caps) u64 {
 
 /// Bytes one slot holds over the layer span `[from..to)`: the window price of every token
 /// position, plus the fixed state. The device suffix form is the blob half that one swap moves
-/// (`llama_hybrid.deviceSwapBytes` at `n_rows == window`). See "Overflow ledger" in the header.
+/// (`llama_hybrid.deviceSwapBytes` at `n_rows == window`).
 pub fn slotSpanBytes(kv: KvStructure, from: u32, to: u32) u64 {
     std.debug.assert(from <= to);
     std.debug.assert(to <= kv.costs.n_layers);
@@ -943,17 +946,17 @@ pub fn clipCopies(
     return out[0..c];
 }
 
-/// Plan the weight placement against a resolved KV structure. A null `gpu_layers` follows the
+/// Plan the layer split against a resolved KV structure. A null `gpu_layers` follows the
 /// money, and a pinned count that the budget cannot fund is a refusal, never a shrink. It checks
 /// no RAM and never reads `caps.weights`. `head_bytes` is the final norm plus the lm_head.
-pub fn placementPlan(
+pub fn planLayerSplit(
     caps: Caps,
     weights: []const u64,
     head_bytes: u64,
     kv: KvStructure,
     host: HostRequest,
     gpu_layers: ?u32,
-) error{WeightsVramBudgetTooSmall}!PlacementPlan {
+) error{WeightsVramBudgetTooSmall}!LayerSplit {
     // Check the weights and the KV structure.
     std.debug.assert(weights.len >= 1);
     std.debug.assert(weights.len <= limits.max_layers);
@@ -978,7 +981,7 @@ pub fn placementPlan(
     if (gpu_layers) |g| std.debug.assert(g <= n_layers);
 
     const split = if (gpu_layers) |g| n_layers - g else autoSplit(caps, weights, head_bytes, kv);
-    if (!placementFits(caps, weights, head_bytes, kv, split)) {
+    if (!layerSplitFits(caps, weights, head_bytes, kv, split)) {
         // Only a pinned count reaches here. The auto scan stops on a feasible
         // split, and the pure CPU split is feasible under any budget.
         std.debug.assert(gpu_layers != null);
@@ -988,8 +991,8 @@ pub fn placementPlan(
 
     // Price both sides of the split. The pure CPU split carries no head bytes.
     const head_resident: u64 = if (split < n_layers) head_bytes else 0;
-    const plan: PlacementPlan = .{
-        .split = split,
+    const plan: LayerSplit = .{
+        .host_layers = split,
         .n_layers = n_layers,
         .weight_resident = suffixWeights(weights, split) + head_resident,
         .kv_vram = kvVramBytes(kv, split),
@@ -1005,13 +1008,13 @@ pub fn placementPlan(
     // Check the plan against the budget and the KV structure.
     std.debug.assert(plan.spend() <= usable(caps));
     // One contiguous split covers the model exactly once.
-    std.debug.assert(plan.split <= plan.n_layers);
+    std.debug.assert(plan.host_layers <= plan.n_layers);
     // The split moves KV cost between the two ledgers and creates none.
     std.debug.assert(plan.kv_vram + plan.kv_host ==
         @as(u64, kv.n_slots) * perSlotBytes(whole, kv.window));
     // Each degenerate split empties the ledger it leaves behind.
-    if (plan.split == 0) std.debug.assert(plan.kv_host == 0);
-    if (plan.split == plan.n_layers) std.debug.assert(plan.kv_vram == 0);
+    if (plan.host_layers == 0) std.debug.assert(plan.kv_host == 0);
+    if (plan.host_layers == plan.n_layers) std.debug.assert(plan.kv_vram == 0);
 
     // The KV structure and the caps reservations pass through unchanged.
     std.debug.assert(plan.n_slots == kv.n_slots);
@@ -1035,19 +1038,19 @@ pub fn placementPlan(
 
     if (!host.residency) std.debug.assert(plan.ram.swap_stages == 0);
     // The pure CPU placement holds no device suffix, so it stages nothing.
-    if (plan.split == plan.n_layers) std.debug.assert(plan.ram.swap_stages == 0);
+    if (plan.host_layers == plan.n_layers) std.debug.assert(plan.ram.swap_stages == 0);
 
     // Check the split against the pin or the auto rule.
     if (gpu_layers) |g| {
         // A pinned count is honored exactly, or refused above.
-        std.debug.assert(plan.split == n_layers - g);
+        std.debug.assert(plan.host_layers == n_layers - g);
     } else {
         // The auto split is feasible and no smaller split is, so the GPU
         // suffix is the widest the budget funds.
-        std.debug.assert(placementFits(caps, weights, head_bytes, kv, plan.split));
+        std.debug.assert(layerSplitFits(caps, weights, head_bytes, kv, plan.host_layers));
 
-        if (plan.split > 0) {
-            std.debug.assert(!placementFits(caps, weights, head_bytes, kv, plan.split - 1));
+        if (plan.host_layers > 0) {
+            std.debug.assert(!layerSplitFits(caps, weights, head_bytes, kv, plan.host_layers - 1));
         }
     }
 
@@ -1056,13 +1059,13 @@ pub fn placementPlan(
 
 /// The price the planner charges for a pinned `gpu_layers` count. A refusal
 /// message reads it, so no call site rebuilds the arithmetic that refused it.
-pub fn placementQuote(
+pub fn quoteLayerSplit(
     caps: Caps,
     weights: []const u64,
     head_bytes: u64,
     kv: KvStructure,
     gpu_layers: u32,
-) PlacementQuote {
+) LayerSplitQuote {
     std.debug.assert(weights.len >= 1);
     std.debug.assert(weights.len <= limits.max_layers);
     // The same pair validation the plan runs, because a quote prices the same
@@ -1081,9 +1084,9 @@ pub fn placementQuote(
     };
 }
 
-/// Quote the host RAM of one serve arm at split `k` (CPU arm `k == n_layers`, fused `k == 0`).
-/// An unset blob share funds `(evictable + 1)` blobs or refuses `error.BlobRamBudgetTooSmall`. A
-/// vector past the usable RAM refuses `error.HostRamBudgetTooSmall`. Unknown `ram_free` skips both.
+/// Quote the host RAM of one serve placement at split `k`. An unset blob share funds
+/// `(evictable + 1)` blobs or refuses `error.BlobRamBudgetTooSmall`. A vector past the usable RAM
+/// refuses `error.HostRamBudgetTooSmall`. Unknown `ram_free` skips both.
 pub fn quoteRam(
     kv: KvStructure,
     k: u32,
@@ -1178,8 +1181,8 @@ pub fn formatBlobRefusal(buf: []u8, r: BlobRefusal) []const u8 {
         r.need / mib, r.left / mib,
     }) catch unreachable;
     w.print(
-        "One evicted session holds up to {d} MiB. The plan serves {d} sessions on {d} {s} " ++
-            "at {d} positions. ",
+        "One evicted session holds up to {d} MiB. " ++
+            "The plan serves {d} sessions on {d} {s} at {d} positions. ",
         .{
             r.blob / mib, r.n_logical, r.n_slots, slotWord(r.n_slots), r.window,
         },
@@ -1215,15 +1218,15 @@ pub fn formatRamRefusal(buf: []u8, r: RamRefusal) []const u8 {
     var w: std.Io.Writer = .fixed(buf);
     // The buffer holds the widest refusal, so no write can fail. Name the need and the plan.
     w.print(
-        "ram budget: the placement needs {d} MiB of RAM, but only {d} MiB of the {d} MiB " ++
-            "free are usable. ",
+        "ram budget: the placement needs {d} MiB of RAM, " ++
+            "but only {d} MiB of the {d} MiB free are usable. ",
         .{
             r.spend / mib, r.usable / mib, r.free / mib,
         },
     ) catch unreachable;
     w.print(
-        "It holds {d} MiB of host KV, {d} MiB of swap stages, {d} MiB of blobs, and {d} MiB " ++
-            "of prefix cache. ",
+        "It holds {d} MiB of host KV, {d} MiB of swap stages, {d} MiB of blobs, " ++
+            "and {d} MiB of prefix cache. ",
         .{
             r.host_kv / mib, r.swap_stages / mib, r.blobs / mib, r.prefix / mib,
         },
@@ -1233,7 +1236,8 @@ pub fn formatRamRefusal(buf: []u8, r: RamRefusal) []const u8 {
     }) catch unreachable;
     // Name the advice.
     if (r.fit) |fit| {
-        // Only a split arm names its layer count. The other arms take no `--gpu-layers` value.
+        // Only a hybrid placement names its layer count. The other placements take no
+        // `--gpu-layers` value.
         if (r.gpu_layers > 0 and r.gpu_layers < r.n_layers) {
             w.print(
                 "Use --gpu-layers {d} --max-seq {d} or less.",
@@ -1265,20 +1269,20 @@ pub fn formatRamRefusal(buf: []u8, r: RamRefusal) []const u8 {
     return text;
 }
 
-/// Write the placement in span form, such as `placement: 0..24 host, 24..32 resident (gpu 8/32
-/// layers)`, into `buf`. A degenerate placement drops the empty span.
-pub fn formatPlacement(plan: PlacementPlan, buf: []u8) []const u8 {
-    std.debug.assert(buf.len >= placement_text_max);
-    std.debug.assert(plan.split <= plan.n_layers);
+/// Write the split in span form, such as `placement: 0..24 host, 24..32 resident (gpu 8/32
+/// layers)`, into `buf`. A degenerate split drops the empty span.
+pub fn formatLayerSplit(plan: LayerSplit, buf: []u8) []const u8 {
+    std.debug.assert(buf.len >= layer_split_text_max);
+    std.debug.assert(plan.host_layers <= plan.n_layers);
 
-    const gpu = plan.n_layers - plan.split;
-    const text = if (plan.split == 0)
+    const gpu = plan.n_layers - plan.host_layers;
+    const text = if (plan.host_layers == 0)
         std.fmt.bufPrint(
             buf,
             "placement: 0..{d} resident (gpu {d}/{d} layers)",
             .{ plan.n_layers, gpu, plan.n_layers },
         )
-    else if (plan.split == plan.n_layers)
+    else if (plan.host_layers == plan.n_layers)
         std.fmt.bufPrint(
             buf,
             "placement: 0..{d} host (gpu {d}/{d} layers)",
@@ -1288,18 +1292,18 @@ pub fn formatPlacement(plan: PlacementPlan, buf: []u8) []const u8 {
         std.fmt.bufPrint(
             buf,
             "placement: 0..{d} host, {d}..{d} resident (gpu {d}/{d} layers)",
-            .{ plan.split, plan.split, plan.n_layers, gpu, plan.n_layers },
+            .{ plan.host_layers, plan.host_layers, plan.n_layers, gpu, plan.n_layers },
         );
 
     // The buffer holds the widest span form, so the write cannot fail.
     return text catch unreachable;
 }
 
-/// Write the placement in ledger form, which names what the spans cost, into `buf`: `ledger: 2
+/// Write the split in ledger form, which names what the spans cost, into `buf`: `ledger: 2
 /// slots x 512 window | gpu 3 MiB weights + 5 MiB kv | host 7 MiB kv + 11 MiB blobs + ... | ram
 /// 48 of 1792 MiB usable`.
-pub fn formatLedger(plan: PlacementPlan, buf: []u8) []const u8 {
-    std.debug.assert(buf.len >= placement_ledger_text_max);
+pub fn formatLedger(plan: LayerSplit, buf: []u8) []const u8 {
+    std.debug.assert(buf.len >= layer_split_ledger_text_max);
 
     const mib = 1024 * 1024;
     var w: std.Io.Writer = .fixed(buf);
@@ -1336,8 +1340,8 @@ pub fn formatVramRefusal(buf: []u8, r: VramRefusal) []const u8 {
     var w: std.Io.Writer = .fixed(buf);
     // The buffer holds the widest refusal, so no write can fail. Name the need and the parts.
     w.print(
-        "vram budget: the KV plan needs {d} MiB of VRAM, but only {d} MiB of the {d} MiB " ++
-            "free are usable. It holds {d} MiB of {s}weights",
+        "vram budget: the KV plan needs {d} MiB of VRAM, " ++
+            "but only {d} MiB of the {d} MiB free are usable. It holds {d} MiB of {s}weights",
         .{
             r.planned / mib,
             limits.vramUsable(
@@ -1384,7 +1388,7 @@ pub fn formatVramRefusal(buf: []u8, r: VramRefusal) []const u8 {
 // -- helpers ----------------------------------------------------------------
 
 /// `quoteRam` at an explicit stage chunk. The shipped quote takes
-/// `limits.swap_stage_chunk_bytes`, and a test replays the placement proofs
+/// `limits.swap_stage_chunk_bytes`, and a test replays the split proofs
 /// at the chunk they state.
 fn quoteRamAt(
     kv: KvStructure,
@@ -1621,7 +1625,7 @@ fn blobNeed(n_logical: u32, n_slots: u32, blob: u64) u64 {
 
 /// The host vector terms that an unset `--kv-ram` funds its blobs beside: the
 /// prefix cache, the host KV, and the stage pair.
-fn fixedRam(ram: PlacementPlan.Ram) u64 {
+fn fixedRam(ram: LayerSplit.Ram) u64 {
     return ram.prefix +| ram.host_kv +| ram.swap_stages;
 }
 
@@ -1635,7 +1639,7 @@ fn splitRam(cost: KvCostModel, req: Request, n_slots: u32, window: u32) KvPlan.R
 }
 
 /// The widest window the usable RAM funds at split `k`. `constant` is the fixed term that the
-/// window does not move. See "RAM fit formula" in the header.
+/// window does not move.
 fn ramFitWindow(kv: KvStructure, k: u32, blobs: u64, constant: u64, ram_usable: u64) ?u32 {
     std.debug.assert(k <= kv.costs.n_layers);
     std.debug.assert(blobs <= limits.max_logical_sessions + 1);
@@ -1668,7 +1672,7 @@ fn ramFitWindow(kv: KvStructure, k: u32, blobs: u64, constant: u64, ram_usable: 
 
 /// The host vector of split `k`, the one home of the stage formula. Only a residency pool grows
 /// the two swap stages. A stage holds one chunk at most, so the pair stops growing with the window.
-fn ramAt(kv: KvStructure, k: u32, n_layers: u32, host: HostRequest) PlacementPlan.Ram {
+fn ramAt(kv: KvStructure, k: u32, n_layers: u32, host: HostRequest) LayerSplit.Ram {
     return ramAtChunk(kv, k, n_layers, host, limits.swap_stage_chunk_bytes);
 }
 
@@ -1679,7 +1683,7 @@ fn ramAtChunk(
     n_layers: u32,
     host: HostRequest,
     chunk: u64,
-) PlacementPlan.Ram {
+) LayerSplit.Ram {
     std.debug.assert(k <= n_layers);
     std.debug.assert(n_layers == kv.costs.n_layers);
 
@@ -1750,7 +1754,7 @@ fn deviceSpend(caps: Caps, weights: []const u64, head_bytes: u64, kv: KvStructur
 
 /// The preflight at one split. It reuses `usable`, so the 7/8 rule keeps one
 /// home for both planners.
-fn placementFits(caps: Caps, weights: []const u64, head_bytes: u64, kv: KvStructure, k: u32) bool {
+fn layerSplitFits(caps: Caps, weights: []const u64, head_bytes: u64, kv: KvStructure, k: u32) bool {
     return deviceSpend(caps, weights, head_bytes, kv, k) <= usable(caps);
 }
 
@@ -1761,7 +1765,7 @@ fn autoSplit(caps: Caps, weights: []const u64, head_bytes: u64, kv: KvStructure)
     const n_layers: u32 = @intCast(weights.len);
     var k: u32 = 0;
     while (k < n_layers) : (k += 1) {
-        if (placementFits(caps, weights, head_bytes, kv, k)) return k;
+        if (layerSplitFits(caps, weights, head_bytes, kv, k)) return k;
     }
 
     return n_layers;
@@ -1820,7 +1824,7 @@ fn llama8bCaps(vram_free: u64) Caps {
     };
 }
 
-// A shared placement fixture: 32 layers of 1000 weight bytes, one slot at a 100-token window, and
+// A shared split fixture: 32 layers of 1000 weight bytes, one slot at a 100-token window, and
 // 10 KV bytes per layer per token. The device spend at split `k` is `2000 * (32 - k)`.
 const anchor_weights = [_]u64{1000} ** 32;
 const anchor_kv: KvStructure = .{
@@ -1831,12 +1835,12 @@ const anchor_kv: KvStructure = .{
 
 const no_ram_split: KvPlan.Ram = .{ .blobs = 0, .prefix = 0 };
 
-/// The host request the placement tests ran before the RAM check existed: a
+/// The host request the split tests ran before the RAM check existed: a
 /// serve caller that prices both stages, with the check off. Each such test
 /// keeps its meaning under it.
 const unchecked_serve: HostRequest = .{ .ram_split = no_ram_split, .residency = true };
 
-/// The placement planner reads neither default window, so the fixture pins both
+/// The layer split planner reads neither default window, so the fixture pins both
 /// at the window floor.
 fn anchorCaps(vram_free: u64) Caps {
     return .{
@@ -1927,12 +1931,15 @@ const PlanCase = struct {
 /// A refusal of the plan is the refusal of the quote, so no message prices a
 /// window that the plan refuses.
 fn checkPlan(c: PlanCase) !void {
+    // Apply the model context of the case.
     var caps = no_vram_caps;
     if (c.model_ctx) |ctx| {
         caps.model_ctx = ctx;
     }
 
     const w = c.want;
+
+    // Check that the plan and the quote refuse.
     if (w.err) |err| {
         try std.testing.expectEqual(
             err,
@@ -1945,6 +1952,7 @@ fn checkPlan(c: PlanCase) !void {
         return;
     }
 
+    // Check each field that the case names.
     const plan = try kvPlan(caps, c.cost, c.req);
     if (w.n_slots) |v| {
         try std.testing.expectEqual(v, plan.n_slots);
@@ -2894,11 +2902,11 @@ test "kvPlan mode A: the RAM split reads the budget-derived slot count" {
     try std.testing.expectEqual(@as(u64, 2 << 30), plan.ram.blobs + plan.ram.prefix);
 }
 
-test "placementPlan: the three placement anchors" {
+test "planLayerSplit: the three split anchors" {
     // 56000 free bytes give 49000 usable. The suffix `[8..32)` spends
     // `2000 * 24 = 48000` and fits. The suffix `[7..32)` spends
     // `2000 * 25 = 50000` and does not.
-    const tight = try placementPlan(
+    const tight = try planLayerSplit(
         anchorCaps(56_000),
         &anchor_weights,
         0,
@@ -2906,14 +2914,14 @@ test "placementPlan: the three placement anchors" {
         unchecked_serve,
         null,
     );
-    try std.testing.expectEqual(@as(u32, 8), tight.split);
+    try std.testing.expectEqual(@as(u32, 8), tight.host_layers);
     try std.testing.expectEqual(@as(u64, 24_000), tight.weight_resident);
     try std.testing.expectEqual(@as(u64, 24_000), tight.kv_vram);
     try std.testing.expectEqual(@as(u64, 8_000), tight.kv_host);
 
     // A pinned 32 GPU layers asks for `k = 0`, which spends `2000 * 32 = 64000`
     // against the same 49000 usable, so the planner refuses.
-    try std.testing.expectError(error.WeightsVramBudgetTooSmall, placementPlan(
+    try std.testing.expectError(error.WeightsVramBudgetTooSmall, planLayerSplit(
         anchorCaps(56_000),
         &anchor_weights,
         0,
@@ -2923,7 +2931,7 @@ test "placementPlan: the three placement anchors" {
     ));
 
     // 80000 free bytes give 70000 usable, which funds `2000 * 32 = 64000` whole.
-    const roomy = try placementPlan(
+    const roomy = try planLayerSplit(
         anchorCaps(80_000),
         &anchor_weights,
         0,
@@ -2931,7 +2939,7 @@ test "placementPlan: the three placement anchors" {
         unchecked_serve,
         null,
     );
-    try std.testing.expectEqual(@as(u32, 0), roomy.split);
+    try std.testing.expectEqual(@as(u32, 0), roomy.host_layers);
     try std.testing.expectEqual(@as(u64, 32_000), roomy.weight_resident);
     try std.testing.expectEqual(@as(u64, 0), roomy.kv_host);
 }
@@ -2966,7 +2974,7 @@ test "quoteRam: the RAM anchors, a run and a serve that fit, and a small host th
     // The VRAM planner picks the split and checks no RAM. The quote then
     // funds or refuses that split.
     const vram_host: HostRequest = .{ .ram_split = no_ram_split, .residency = false };
-    const vram = try placementPlan(
+    const vram = try planLayerSplit(
         caps,
         &ram_anchor_weights,
         ram_anchor_head,
@@ -2974,13 +2982,20 @@ test "quoteRam: the RAM anchors, a run and a serve that fit, and a small host th
         vram_host,
         null,
     );
-    try std.testing.expectEqual(@as(u32, 15), vram.split);
+    try std.testing.expectEqual(@as(u32, 15), vram.host_layers);
     try std.testing.expectEqual(@as(?u64, null), vram.ram_usable);
 
-    // The run arm: the stages price zero, and the host KV alone is the
+    // The run placement: the stages price zero, and the host KV alone is the
     // spend.
     const run_host: HostRequest = .{ .ram_split = no_ram_split, .residency = false };
-    const run = try quoteRam(ramAnchorKv(131_072), vram.split, run_host, 1, false, ram_anchor_free);
+    const run = try quoteRam(
+        ramAnchorKv(131_072),
+        vram.host_layers,
+        run_host,
+        1,
+        false,
+        ram_anchor_free,
+    );
     try std.testing.expectEqual(@as(u64, 8_053_063_680), run.ram.host_kv);
     try std.testing.expectEqual(@as(u64, 0), run.ram.swap_stages);
     try std.testing.expectEqual(@as(u64, 8_053_063_680), run.ram.spend());
@@ -2988,7 +3003,7 @@ test "quoteRam: the RAM anchors, a run and a serve that fit, and a small host th
     const run_plan = vram.priced(run);
     try std.testing.expectEqual(@as(?u64, 20_669_530_112), run_plan.ram_usable);
 
-    // The serve arm: two 256 MiB chunks replace two 8704 MiB device
+    // The serve placement: two 256 MiB chunks replace two 8704 MiB device
     // halves, so the 1 GiB prefix and the stage pair fit beside the host KV.
     const serve_host: HostRequest = .{
         .ram_split = .{ .blobs = 0, .prefix = 1_073_741_824 },
@@ -3160,11 +3175,11 @@ test "quoteRam: the CPU end and the fused end are the two ends of one vector" {
     const kv = ramAnchorKv(4_096);
     const n_layers = kv.costs.n_layers;
     const whole_host = kvHostBytes(kv, n_layers);
-    // The CPU arm holds every layer on the host and stages nothing.
+    // The CPU placement holds every layer on the host and stages nothing.
     const cpu = try quoteRam(kv, n_layers, blobAnchorHost(2), 2, false, null);
     try std.testing.expectEqual(@as(u64, 0), cpu.ram.swap_stages);
     try std.testing.expectEqual(whole_host, cpu.ram.host_kv);
-    // The fused arm holds no host KV and stages one chunk or one slot each way.
+    // The fused placement holds no host KV and stages one chunk or one slot each way.
     const fused = try quoteRam(kv, 0, blobAnchorHost(2), 2, false, null);
     try std.testing.expectEqual(@as(u64, 0), fused.ram.host_kv);
     try std.testing.expectEqual(
@@ -3278,7 +3293,7 @@ const lowered_free_bytes: u64 = 74 << 20;
 
 test "ramFitWindow: the stage pair is a constant term, so the fit never moves with it" {
     const kv = ramAnchorKv(131_072);
-    // The placement proofs state a 64 MiB chunk, so the stage pair here is
+    // The split proofs state a 64 MiB chunk, so the stage pair here is
     // their 128 MiB.
     const stages: u64 = 2 * (64 << 20);
     // On a host with 8 GiB free, only the host prefix grows with the window:
@@ -3471,7 +3486,7 @@ test "clipCopies: chunks tile the blob once, in order, on Llama rows and on the 
     }
 }
 
-test "placementPlan: the auto split is maximal and monotone, and every plan conserves KV" {
+test "planLayerSplit: the auto split is maximal and monotone, and every plan conserves KV" {
     const layer_counts = [_]u32{ 1, 8, 32, limits.max_layers };
     // 33 budgets from zero to 160000 bytes. The grid is fixed, so a failure
     // replays.
@@ -3494,42 +3509,49 @@ test "placementPlan: the auto split is maximal and monotone, and every plan cons
         var previous_split: u32 = n;
         for (0..33) |i| {
             const caps = anchorCaps(@as(u64, @intCast(i)) * step);
-            const plan = try placementPlan(caps, weights, 0, kv, unchecked_serve, null);
+            const plan = try planLayerSplit(caps, weights, 0, kv, unchecked_serve, null);
             try std.testing.expectEqual(n, plan.n_layers);
             try std.testing.expectEqual(total_kv, plan.kv_vram + plan.kv_host);
             try std.testing.expect(plan.spend() <= usable(caps));
-            try std.testing.expect(placementFits(caps, weights, 0, kv, plan.split));
-            if (plan.split > 0) {
-                try std.testing.expect(!placementFits(caps, weights, 0, kv, plan.split - 1));
+            try std.testing.expect(layerSplitFits(caps, weights, 0, kv, plan.host_layers));
+            if (plan.host_layers > 0) {
+                try std.testing.expect(!layerSplitFits(caps, weights, 0, kv, plan.host_layers - 1));
             }
 
             // A wider budget never moves a layer back to the host.
-            try std.testing.expect(plan.split <= previous_split);
-            previous_split = plan.split;
+            try std.testing.expect(plan.host_layers <= previous_split);
+            previous_split = plan.host_layers;
 
             // A pinned count lands on exactly its suffix, or refuses exactly
             // when that suffix does not fit.
             var g: u32 = 0;
             while (g <= n) : (g += 1) {
                 const k = n - g;
-                if (placementPlan(caps, weights, 0, kv, unchecked_serve, g)) |pin| {
-                    try std.testing.expectEqual(k, pin.split);
-                    try std.testing.expect(placementFits(caps, weights, 0, kv, k));
+                if (planLayerSplit(caps, weights, 0, kv, unchecked_serve, g)) |pin| {
+                    try std.testing.expectEqual(k, pin.host_layers);
+                    try std.testing.expect(layerSplitFits(caps, weights, 0, kv, k));
                     try std.testing.expectEqual(total_kv, pin.kv_vram + pin.kv_host);
                     try std.testing.expect(pin.spend() <= usable(caps));
                 } else |err| {
                     try std.testing.expectEqual(error.WeightsVramBudgetTooSmall, err);
-                    try std.testing.expect(!placementFits(caps, weights, 0, kv, k));
+                    try std.testing.expect(!layerSplitFits(caps, weights, 0, kv, k));
                 }
             }
         }
 
         // A zero budget puts every layer on the host, and a roomy one puts none.
-        const starved = try placementPlan(anchorCaps(0), weights, 0, kv, unchecked_serve, null);
-        try std.testing.expectEqual(n, starved.split);
+        const starved = try planLayerSplit(anchorCaps(0), weights, 0, kv, unchecked_serve, null);
+        try std.testing.expectEqual(n, starved.host_layers);
         try std.testing.expectEqual(@as(u64, 0), starved.spend());
-        const roomy = try placementPlan(anchorCaps(1 << 30), weights, 0, kv, unchecked_serve, null);
-        try std.testing.expectEqual(@as(u32, 0), roomy.split);
+        const roomy = try planLayerSplit(
+            anchorCaps(1 << 30),
+            weights,
+            0,
+            kv,
+            unchecked_serve,
+            null,
+        );
+        try std.testing.expectEqual(@as(u32, 0), roomy.host_layers);
 
         // The same grid on a ramp vector. A planner that multiplies one price by a layer count
         // moves the split here.
@@ -3541,27 +3563,29 @@ test "placementPlan: the auto split is maximal and monotone, and every plan cons
         var ramp_previous: u32 = n;
         for (0..33) |i| {
             const caps = anchorCaps(@as(u64, @intCast(i)) * step);
-            const plan = try placementPlan(caps, weights, 0, ramp, unchecked_serve, null);
+            const plan = try planLayerSplit(caps, weights, 0, ramp, unchecked_serve, null);
             try std.testing.expectEqual(ramp_total, plan.kv_vram + plan.kv_host);
             try std.testing.expect(plan.spend() <= usable(caps));
-            try std.testing.expect(placementFits(caps, weights, 0, ramp, plan.split));
-            if (plan.split > 0) {
-                try std.testing.expect(!placementFits(caps, weights, 0, ramp, plan.split - 1));
+            try std.testing.expect(layerSplitFits(caps, weights, 0, ramp, plan.host_layers));
+            if (plan.host_layers > 0) {
+                try std.testing.expect(
+                    !layerSplitFits(caps, weights, 0, ramp, plan.host_layers - 1),
+                );
             }
 
-            try std.testing.expect(plan.split <= ramp_previous);
-            ramp_previous = plan.split;
+            try std.testing.expect(plan.host_layers <= ramp_previous);
+            ramp_previous = plan.host_layers;
         }
     }
 }
 
-test "placementPlan: the KV structure and the caps reservations pass through" {
+test "planLayerSplit: the KV structure and the caps reservations pass through" {
     var caps = anchorCaps(1 << 20);
     caps.weights = 9_999;
     caps.logits = 4_096;
     caps.scratch = 2_048;
     const kv: KvStructure = .{ .n_slots = 3, .window = 128, .costs = KvCostVector.uniform(32, 16) };
-    const plan = try placementPlan(caps, &anchor_weights, 0, kv, unchecked_serve, null);
+    const plan = try planLayerSplit(caps, &anchor_weights, 0, kv, unchecked_serve, null);
     try std.testing.expectEqual(@as(u64, 4_096), plan.logits);
     try std.testing.expectEqual(@as(u64, 2_048), plan.scratch);
     try std.testing.expectEqual(@as(u32, 3), plan.n_slots);
@@ -3573,20 +3597,27 @@ test "placementPlan: the KV structure and the caps reservations pass through" {
 
     // A pure CPU placement reserves no device bytes, the way `pinned` does, and
     // the whole KV lands on the host ledger.
-    const cpu = try placementPlan(anchorCaps(0), &anchor_weights, 0, anchor_kv, unchecked_serve, 0);
-    try std.testing.expectEqual(@as(u32, 32), cpu.split);
+    const cpu = try planLayerSplit(
+        anchorCaps(0),
+        &anchor_weights,
+        0,
+        anchor_kv,
+        unchecked_serve,
+        0,
+    );
+    try std.testing.expectEqual(@as(u32, 32), cpu.host_layers);
     try std.testing.expectEqual(@as(u64, 0), cpu.weight_resident);
     try std.testing.expectEqual(@as(u64, 0), cpu.kv_vram);
     try std.testing.expectEqual(@as(u64, 32_000), cpu.kv_host);
     try std.testing.expectEqual(@as(u64, 0), cpu.spend());
 }
 
-test "placementPlan: the head anchors, with the head bytes on the device" {
+test "planLayerSplit: the head anchors, with the head bytes on the device" {
     // The same fixture under a 1500-byte head. The spend at split `k` is
     // `2000 * (32 - k) + 1500`, so 49000 usable funds `k = 9` (47500) and
     // refuses `k = 8` (49500).
     const head: u64 = 1_500;
-    const auto = try placementPlan(
+    const auto = try planLayerSplit(
         anchorCaps(56_000),
         &anchor_weights,
         head,
@@ -3594,13 +3625,13 @@ test "placementPlan: the head anchors, with the head bytes on the device" {
         unchecked_serve,
         null,
     );
-    try std.testing.expectEqual(@as(u32, 9), auto.split);
+    try std.testing.expectEqual(@as(u32, 9), auto.host_layers);
     try std.testing.expectEqual(@as(u64, 24_500), auto.weight_resident);
     try std.testing.expectEqual(@as(u64, 23_000), auto.kv_vram);
     try std.testing.expectEqual(@as(u64, 47_500), auto.spend());
 
     // A pinned 24 GPU layers asks for `k = 8`, which the same budget refuses.
-    try std.testing.expectError(error.WeightsVramBudgetTooSmall, placementPlan(
+    try std.testing.expectError(error.WeightsVramBudgetTooSmall, planLayerSplit(
         anchorCaps(56_000),
         &anchor_weights,
         head,
@@ -3611,7 +3642,7 @@ test "placementPlan: the head anchors, with the head bytes on the device" {
 
     // A pinned 23 GPU layers lands on `k = 9`: the 23000-byte suffix plus the
     // head.
-    const narrow = try placementPlan(
+    const narrow = try planLayerSplit(
         anchorCaps(56_000),
         &anchor_weights,
         head,
@@ -3619,18 +3650,18 @@ test "placementPlan: the head anchors, with the head bytes on the device" {
         unchecked_serve,
         23,
     );
-    try std.testing.expectEqual(@as(u32, 9), narrow.split);
+    try std.testing.expectEqual(@as(u32, 9), narrow.host_layers);
     try std.testing.expectEqual(@as(u64, 24_500), narrow.weight_resident);
 }
 
-test "placementPlan: the head bytes are charged exactly when a layer is resident" {
+test "planLayerSplit: the head bytes are charged exactly when a layer is resident" {
     const head: u64 = 4_000;
     // 33 budgets from zero to 160000 bytes. The grid is fixed, so a failure
     // replays.
     const step: u64 = 5_000;
     for (0..33) |i| {
         const caps = anchorCaps(@as(u64, @intCast(i)) * step);
-        const plan = try placementPlan(
+        const plan = try planLayerSplit(
             caps,
             &anchor_weights,
             head,
@@ -3638,8 +3669,8 @@ test "placementPlan: the head bytes are charged exactly when a layer is resident
             unchecked_serve,
             null,
         );
-        const suffix = suffixWeights(&anchor_weights, plan.split);
-        if (plan.split < plan.n_layers) {
+        const suffix = suffixWeights(&anchor_weights, plan.host_layers);
+        if (plan.host_layers < plan.n_layers) {
             try std.testing.expectEqual(suffix + head, plan.weight_resident);
         } else {
             try std.testing.expectEqual(suffix, plan.weight_resident);
@@ -3651,7 +3682,7 @@ test "placementPlan: the head bytes are charged exactly when a layer is resident
 
     // Both sides of the boundary, pinned under a roomy budget: the whole-host
     // split charges no head, and one GPU layer charges it whole.
-    const host = try placementPlan(
+    const host = try planLayerSplit(
         anchorCaps(1 << 30),
         &anchor_weights,
         head,
@@ -3660,7 +3691,7 @@ test "placementPlan: the head bytes are charged exactly when a layer is resident
         0,
     );
     try std.testing.expectEqual(@as(u64, 0), host.weight_resident);
-    const one = try placementPlan(
+    const one = try planLayerSplit(
         anchorCaps(1 << 30),
         &anchor_weights,
         head,
@@ -3671,20 +3702,20 @@ test "placementPlan: the head bytes are charged exactly when a layer is resident
     try std.testing.expectEqual(@as(u64, 1_000) + head, one.weight_resident);
 }
 
-test "placementQuote: the price it names is the price the plan pays" {
+test "quoteLayerSplit: the price it names is the price the plan pays" {
     const head: u64 = 1_500;
     const caps = anchorCaps(56_000);
-    const funded = placementQuote(caps, &anchor_weights, head, anchor_kv, 23);
-    const plan = try placementPlan(caps, &anchor_weights, head, anchor_kv, unchecked_serve, 23);
+    const funded = quoteLayerSplit(caps, &anchor_weights, head, anchor_kv, 23);
+    const plan = try planLayerSplit(caps, &anchor_weights, head, anchor_kv, unchecked_serve, 23);
     try std.testing.expectEqual(plan.spend(), funded.spend);
     try std.testing.expectEqual(@as(u64, 49_000), funded.usable);
     try std.testing.expect(funded.spend <= funded.usable);
 
     // One layer wider refuses, and the quote names both sides of the refusal.
-    const over = placementQuote(caps, &anchor_weights, head, anchor_kv, 24);
+    const over = quoteLayerSplit(caps, &anchor_weights, head, anchor_kv, 24);
     try std.testing.expectEqual(@as(u64, 49_500), over.spend);
     try std.testing.expect(over.spend > over.usable);
-    try std.testing.expectError(error.WeightsVramBudgetTooSmall, placementPlan(
+    try std.testing.expectError(error.WeightsVramBudgetTooSmall, planLayerSplit(
         caps,
         &anchor_weights,
         head,
@@ -3694,14 +3725,14 @@ test "placementQuote: the price it names is the price the plan pays" {
     ));
 
     // The whole-host pin holds no device context, whatever the head costs.
-    const none = placementQuote(caps, &anchor_weights, head, anchor_kv, 0);
+    const none = quoteLayerSplit(caps, &anchor_weights, head, anchor_kv, 0);
     try std.testing.expectEqual(@as(u64, 0), none.spend);
 }
 
-test "formatPlacement: the three span forms" {
-    var buf: [placement_text_max]u8 = undefined;
-    const mixed: PlacementPlan = .{
-        .split = 24,
+test "formatLayerSplit: the three span forms" {
+    var buf: [layer_split_text_max]u8 = undefined;
+    const mixed: LayerSplit = .{
+        .host_layers = 24,
         .n_layers = 32,
         .weight_resident = 8_000,
         .kv_vram = 8_000,
@@ -3720,37 +3751,37 @@ test "formatPlacement: the three span forms" {
     };
     try std.testing.expectEqualStrings(
         "placement: 0..24 host, 24..32 resident (gpu 8/32 layers)",
-        formatPlacement(mixed, &buf),
+        formatLayerSplit(mixed, &buf),
     );
 
     var whole = mixed;
-    whole.split = 0;
+    whole.host_layers = 0;
     try std.testing.expectEqualStrings(
         "placement: 0..32 resident (gpu 32/32 layers)",
-        formatPlacement(whole, &buf),
+        formatLayerSplit(whole, &buf),
     );
 
     var host = mixed;
-    host.split = 32;
+    host.host_layers = 32;
     try std.testing.expectEqualStrings(
         "placement: 0..32 host (gpu 0/32 layers)",
-        formatPlacement(host, &buf),
+        formatLayerSplit(host, &buf),
     );
 
     // The widest span the layer limit allows still fits the stated ceiling.
     var widest = mixed;
     widest.n_layers = limits.max_layers;
-    widest.split = limits.max_layers / 2;
+    widest.host_layers = limits.max_layers / 2;
     try std.testing.expectEqualStrings(
         "placement: 0..32 host, 32..64 resident (gpu 32/64 layers)",
-        formatPlacement(widest, &buf),
+        formatLayerSplit(widest, &buf),
     );
 }
 
-test "placementPlan: the RAM vector, and both staging buffers at high water" {
+test "planLayerSplit: the RAM vector, and both staging buffers at high water" {
     // At `k = 8` the host holds `1 * 100 * 8 * 10 = 8000` bytes, one stage holds
     // `100 * 24 * 10 = 24000`, and the pair holds 48000.
-    const tight = try placementPlan(
+    const tight = try planLayerSplit(
         anchorCaps(56_000),
         &anchor_weights,
         0,
@@ -3758,13 +3789,13 @@ test "placementPlan: the RAM vector, and both staging buffers at high water" {
         unchecked_serve,
         null,
     );
-    try std.testing.expectEqual(@as(u32, 8), tight.split);
+    try std.testing.expectEqual(@as(u32, 8), tight.host_layers);
     try std.testing.expectEqual(@as(u64, 8_000), tight.ram.host_kv);
     try std.testing.expectEqual(@as(u64, 48_000), tight.ram.swap_stages);
     try std.testing.expectEqual(tight.kv_host, tight.ram.host_kv);
 
     // The Model 2 split anchor passes through byte for byte.
-    const carried = try placementPlan(anchorCaps(56_000), &anchor_weights, 0, anchor_kv, .{
+    const carried = try planLayerSplit(anchorCaps(56_000), &anchor_weights, 0, anchor_kv, .{
         .ram_split = .{ .blobs = 384 << 20, .prefix = 128 << 20 },
         .residency = true,
     }, null);
@@ -3772,7 +3803,7 @@ test "placementPlan: the RAM vector, and both staging buffers at high water" {
     try std.testing.expectEqual(@as(u64, 128 << 20), carried.ram.prefix);
 
     // The pure CPU placement holds no device suffix, so it stages nothing.
-    const cpu = try placementPlan(
+    const cpu = try planLayerSplit(
         anchorCaps(56_000),
         &anchor_weights,
         0,
@@ -3780,12 +3811,12 @@ test "placementPlan: the RAM vector, and both staging buffers at high water" {
         unchecked_serve,
         0,
     );
-    try std.testing.expectEqual(@as(u32, 32), cpu.split);
+    try std.testing.expectEqual(@as(u32, 32), cpu.host_layers);
     try std.testing.expectEqual(@as(u64, 0), cpu.ram.swap_stages);
 
     // 70000 usable bytes fund `k = 0`, where one stage holds the whole model's
     // 32000 KV bytes.
-    const roomy = try placementPlan(
+    const roomy = try planLayerSplit(
         anchorCaps(80_000),
         &anchor_weights,
         0,
@@ -3793,7 +3824,7 @@ test "placementPlan: the RAM vector, and both staging buffers at high water" {
         unchecked_serve,
         null,
     );
-    try std.testing.expectEqual(@as(u32, 0), roomy.split);
+    try std.testing.expectEqual(@as(u32, 0), roomy.host_layers);
     try std.testing.expectEqual(@as(u64, 2 * 32_000), roomy.ram.swap_stages);
     try std.testing.expectEqual(2 * roomy.kv_vram, roomy.ram.swap_stages * roomy.n_slots);
 
@@ -3806,7 +3837,7 @@ test "placementPlan: the RAM vector, and both staging buffers at high water" {
         .window = 3,
         .costs = KvCostVector.uniform(4, 16),
     };
-    const bridge = try placementPlan(
+    const bridge = try planLayerSplit(
         anchorCaps(1 << 20),
         &bridge_weights,
         0,
@@ -3825,7 +3856,7 @@ test "placementPlan: the RAM vector, and both staging buffers at high water" {
         .window = 3,
         .costs = KvCostVector.uniform(4, 8),
     };
-    const bridge_half = try placementPlan(
+    const bridge_half = try planLayerSplit(
         anchorCaps(1 << 20),
         &bridge_weights,
         0,
@@ -3838,7 +3869,7 @@ test "placementPlan: the RAM vector, and both staging buffers at high water" {
     try std.testing.expectEqual(@as(u64, 96), bridge_half.ram.swap_stages);
 }
 
-test "placementPlan: the RAM vector conserves the split and prices the stages at every split" {
+test "planLayerSplit: the RAM vector conserves the split and prices the stages at every split" {
     const layer_counts = [_]u32{ 1, 8, 32, limits.max_layers };
     const split_ram: KvPlan.Ram = .{ .blobs = 7 << 20, .prefix = 3 << 20 };
     // 33 budgets from zero to 160000 bytes. The grid is fixed, so a failure
@@ -3864,7 +3895,7 @@ test "placementPlan: the RAM vector conserves the split and prices the stages at
             var g: u32 = 0;
             while (g <= n) : (g += 1) {
                 // A budget that refuses this pin prices nothing to check.
-                const plan = placementPlan(
+                const plan = planLayerSplit(
                     caps,
                     weights,
                     0,
@@ -3877,11 +3908,11 @@ test "placementPlan: the RAM vector conserves the split and prices the stages at
                 try std.testing.expectEqual(plan.kv_host, plan.ram.host_kv);
                 try std.testing.expectEqual(2 * plan.kv_vram, plan.ram.swap_stages * kv.n_slots);
                 try std.testing.expect(plan.ram.swap_stages * kv.n_slots <= 2 * total_kv);
-                if (plan.split == 0) {
+                if (plan.host_layers == 0) {
                     try std.testing.expectEqual(2 * total_kv, plan.ram.swap_stages * kv.n_slots);
                 }
 
-                if (plan.split == n) {
+                if (plan.host_layers == n) {
                     try std.testing.expectEqual(@as(u64, 0), plan.ram.swap_stages);
                 }
             }
@@ -3915,7 +3946,7 @@ test "KvCostVector: the column sums are the whole-model cost model" {
     try std.testing.expectEqual(@as(u64, 0), empty.total().fixed_state_bytes_per_slot);
 }
 
-test "placementPlan: the uniform vector reproduces the whole-model product at every split" {
+test "planLayerSplit: the uniform vector reproduces the whole-model product at every split" {
     // The pre-vector planner charged `n_slots * window * layers * kv_per_layer`
     // at every split. This grid replays that closed form field for field, so a
     // span sum that drifted from it fails here.
@@ -3943,7 +3974,7 @@ test "placementPlan: the uniform vector reproduces the whole-model product at ev
                     };
                     var k: u32 = 0;
                     while (k <= n) : (k += 1) {
-                        const plan = try placementPlan(
+                        const plan = try planLayerSplit(
                             caps,
                             weights,
                             0,
@@ -3951,7 +3982,7 @@ test "placementPlan: the uniform vector reproduces the whole-model product at ev
                             unchecked_serve,
                             n - k,
                         );
-                        try std.testing.expectEqual(k, plan.split);
+                        try std.testing.expectEqual(k, plan.host_layers);
                         try std.testing.expectEqual(
                             @as(u64, n_slots) * window * (n - k) * per_layer,
                             plan.kv_vram,
@@ -3977,13 +4008,13 @@ test "placementPlan: the uniform vector reproduces the whole-model product at ev
     }
 }
 
-test "placementPlan: a two-kind stack prices each tier by its own layers" {
+test "planLayerSplit: a two-kind stack prices each tier by its own layers" {
     const weights = [_]u64{1_000} ** 24;
     const kv: KvStructure = .{ .n_slots = 2, .window = 512, .costs = qwen2bCosts() };
     // A mid split: layers `[12..24)` hold 3 attention layers and 9 recurrent
     // ones, so the device pays 3 window prices and 9 slabs.
-    const plan = try placementPlan(anchorCaps(1 << 30), &weights, 0, kv, unchecked_serve, 12);
-    try std.testing.expectEqual(@as(u32, 12), plan.split);
+    const plan = try planLayerSplit(anchorCaps(1 << 30), &weights, 0, kv, unchecked_serve, 12);
+    try std.testing.expectEqual(@as(u32, 12), plan.host_layers);
     try std.testing.expectEqual(
         @as(u64, kv.n_slots) * (@as(u64, kv.window) * 3 * 4_096 + 9 * 1_122_304),
         plan.kv_vram,
@@ -4005,14 +4036,14 @@ test "placementPlan: a two-kind stack prices each tier by its own layers" {
     try std.testing.expectEqual(2 * plan.kv_vram, plan.ram.swap_stages * kv.n_slots);
 }
 
-test "placementPlan: a prefix with no attention layer still charges its recurrent state" {
+test "planLayerSplit: a prefix with no attention layer still charges its recurrent state" {
     const weights = [_]u64{1_000} ** 24;
     const kv: KvStructure = .{ .n_slots = 2, .window = 512, .costs = qwen2bCosts() };
     const whole = @as(u64, kv.n_slots) * perSlotBytes(kv.costs.total(), kv.window);
     // Layers 0, 1, and 2 are all recurrent, so a prefix that stops inside them
     // holds slabs and not one token of window.
     for ([_]u32{ 1, 2, 3 }) |k| {
-        const plan = try placementPlan(
+        const plan = try planLayerSplit(
             anchorCaps(1 << 30),
             &weights,
             0,
@@ -4036,7 +4067,7 @@ test "placementPlan: a prefix with no attention layer still charges its recurren
 
     const tail_kv: KvStructure = .{ .n_slots = 2, .window = 512, .costs = tail };
     const tail_weights = [_]u64{1_000} ** 4;
-    const tail_plan = try placementPlan(
+    const tail_plan = try planLayerSplit(
         anchorCaps(1 << 30),
         &tail_weights,
         0,
@@ -4044,7 +4075,7 @@ test "placementPlan: a prefix with no attention layer still charges its recurren
         unchecked_serve,
         3,
     );
-    try std.testing.expectEqual(@as(u32, 1), tail_plan.split);
+    try std.testing.expectEqual(@as(u32, 1), tail_plan.host_layers);
     try std.testing.expectEqual(@as(u64, tail_kv.n_slots) * 3 * 1_122_304, tail_plan.kv_vram);
     try std.testing.expectEqual(@as(u64, 2) * 3 * 1_122_304, tail_plan.ram.swap_stages);
     try std.testing.expectEqual(
@@ -4053,12 +4084,12 @@ test "placementPlan: a prefix with no attention layer still charges its recurren
     );
 }
 
-test "placementPlan: the window never multiplies the fixed state" {
+test "planLayerSplit: the window never multiplies the fixed state" {
     const weights = [_]u64{1_000} ** 24;
     const costs = qwen2bCosts();
     const narrow: KvStructure = .{ .n_slots = 2, .window = 512, .costs = costs };
     const wide: KvStructure = .{ .n_slots = 2, .window = 1_024, .costs = costs };
-    const narrow_plan = try placementPlan(
+    const narrow_plan = try planLayerSplit(
         anchorCaps(1 << 30),
         &weights,
         0,
@@ -4066,7 +4097,7 @@ test "placementPlan: the window never multiplies the fixed state" {
         unchecked_serve,
         12,
     );
-    const wide_plan = try placementPlan(
+    const wide_plan = try planLayerSplit(
         anchorCaps(1 << 30),
         &weights,
         0,
@@ -4085,7 +4116,7 @@ test "placementPlan: the window never multiplies the fixed state" {
     try std.testing.expectEqual(fixed, wide_plan.kv_vram - token_wide);
 }
 
-test "placementPlan: a pointwise-cheaper vector never yields a larger split" {
+test "planLayerSplit: a pointwise-cheaper vector never yields a larger split" {
     // Every entry halves in both columns, so the cheaper vector is pointwise no
     // dearer and the auto scan can only reach the same split or a lower one.
     const n: u32 = 32;
@@ -4102,17 +4133,17 @@ test "placementPlan: a pointwise-cheaper vector never yields a larger split" {
     const step: u64 = 5_000;
     for (0..33) |i| {
         const caps = anchorCaps(@as(u64, @intCast(i)) * step);
-        const dear_plan = try placementPlan(caps, weights, 0, dear, unchecked_serve, null);
-        const cheap_plan = try placementPlan(caps, weights, 0, cheap, unchecked_serve, null);
-        try std.testing.expect(cheap_plan.split <= dear_plan.split);
+        const dear_plan = try planLayerSplit(caps, weights, 0, dear, unchecked_serve, null);
+        const cheap_plan = try planLayerSplit(caps, weights, 0, cheap, unchecked_serve, null);
+        try std.testing.expect(cheap_plan.host_layers <= dear_plan.host_layers);
     }
 }
 
 test "formatLedger: the widest ledger" {
-    var buf: [placement_ledger_text_max]u8 = undefined;
+    var buf: [layer_split_ledger_text_max]u8 = undefined;
     const mib = 1024 * 1024;
-    const round: PlacementPlan = .{
-        .split = 24,
+    const round: LayerSplit = .{
+        .host_layers = 24,
         .n_layers = 32,
         .weight_resident = 3 * mib,
         .kv_vram = 5 * mib,
@@ -4147,8 +4178,8 @@ test "formatLedger: the widest ledger" {
     // The widest figure every field can carry still fits the stated ceiling,
     // in both RAM forms.
     const wide: u64 = std.math.maxInt(u64);
-    const widest: PlacementPlan = .{
-        .split = 0,
+    const widest: LayerSplit = .{
+        .host_layers = 0,
         .n_layers = limits.max_layers,
         .weight_resident = wide,
         .kv_vram = wide,
@@ -4180,19 +4211,19 @@ test "formatVramRefusal: the three families" {
         .fit = 2048,
     };
     try std.testing.expectEqualStrings(
-        "vram budget: the KV plan needs 9000 MiB of VRAM, but only 7168 MiB of the 8192 MiB " ++
-            "free are usable." ++
-            " It holds 8000 MiB of weights and 1000 MiB of KV for 4 slots x 4096 positions." ++
-            " Use --max-seq 2048 or less, or fewer sessions",
+        "vram budget: the KV plan needs 9000 MiB of VRAM, " ++
+            "but only 7168 MiB of the 8192 MiB free are usable. " ++
+            "It holds 8000 MiB of weights and 1000 MiB of KV for 4 slots x 4096 positions. " ++
+            "Use --max-seq 2048 or less, or fewer sessions",
         formatVramRefusal(&buf, whole),
     );
     var none = whole;
     none.fit = null;
     try std.testing.expectEqualStrings(
-        "vram budget: the KV plan needs 9000 MiB of VRAM, but only 7168 MiB of the 8192 MiB " ++
-            "free are usable." ++
-            " It holds 8000 MiB of weights and 1000 MiB of KV for 4 slots x 4096 positions." ++
-            " No window fits 4 slots. Use fewer sessions, or a smaller or Q4 model",
+        "vram budget: the KV plan needs 9000 MiB of VRAM, " ++
+            "but only 7168 MiB of the 8192 MiB free are usable. " ++
+            "It holds 8000 MiB of weights and 1000 MiB of KV for 4 slots x 4096 positions. " ++
+            "No window fits 4 slots. Use fewer sessions, or a smaller or Q4 model",
         formatVramRefusal(&buf, none),
     );
 
@@ -4200,20 +4231,20 @@ test "formatVramRefusal: the three families" {
     var suffix = whole;
     suffix.suffix = true;
     try std.testing.expectEqualStrings(
-        "vram budget: the KV plan needs 9000 MiB of VRAM, but only 7168 MiB of the 8192 MiB " ++
-            "free are usable." ++
-            " It holds 8000 MiB of suffix weights and 1000 MiB of KV for 4 slots x 4096 " ++
-            "positions." ++
-            " Use --max-seq 2048 or less, or lower --gpu-layers",
+        "vram budget: the KV plan needs 9000 MiB of VRAM, " ++
+            "but only 7168 MiB of the 8192 MiB free are usable. " ++
+            "It holds 8000 MiB of suffix weights " ++
+            "and 1000 MiB of KV for 4 slots x 4096 positions. " ++
+            "Use --max-seq 2048 or less, or lower --gpu-layers",
         formatVramRefusal(&buf, suffix),
     );
     suffix.fit = null;
     try std.testing.expectEqualStrings(
-        "vram budget: the KV plan needs 9000 MiB of VRAM, but only 7168 MiB of the 8192 MiB " ++
-            "free are usable." ++
-            " It holds 8000 MiB of suffix weights and 1000 MiB of KV for 4 slots x 4096 " ++
-            "positions." ++
-            " No window fits the suffix. Lower --gpu-layers, or use a smaller or Q4 model",
+        "vram budget: the KV plan needs 9000 MiB of VRAM, " ++
+            "but only 7168 MiB of the 8192 MiB free are usable. " ++
+            "It holds 8000 MiB of suffix weights " ++
+            "and 1000 MiB of KV for 4 slots x 4096 positions. No window fits the suffix. " ++
+            "Lower --gpu-layers, or use a smaller or Q4 model",
         formatVramRefusal(&buf, suffix),
     );
 
@@ -4221,20 +4252,20 @@ test "formatVramRefusal: the three families" {
     var recurrent = whole;
     recurrent.recurrent_state = 20 * mib;
     try std.testing.expectEqualStrings(
-        "vram budget: the KV plan needs 9000 MiB of VRAM, but only 7168 MiB of the 8192 MiB " ++
-            "free are usable." ++
-            " It holds 8000 MiB of weights, 1000 MiB of KV, and 20 MiB of recurrent state " ++
-            "for 4 slots x 4096 positions." ++
-            " Use --max-seq 2048 or less, or fewer sessions",
+        "vram budget: the KV plan needs 9000 MiB of VRAM, " ++
+            "but only 7168 MiB of the 8192 MiB free are usable. " ++
+            "It holds 8000 MiB of weights, 1000 MiB of KV, " ++
+            "and 20 MiB of recurrent state for 4 slots x 4096 positions. " ++
+            "Use --max-seq 2048 or less, or fewer sessions",
         formatVramRefusal(&buf, recurrent),
     );
     recurrent.fit = null;
     try std.testing.expectEqualStrings(
-        "vram budget: the KV plan needs 9000 MiB of VRAM, but only 7168 MiB of the 8192 MiB " ++
-            "free are usable." ++
-            " It holds 8000 MiB of weights, 1000 MiB of KV, and 20 MiB of recurrent state " ++
-            "for 4 slots x 4096 positions." ++
-            " No window fits 4 slots. Use fewer sessions, or a smaller or Q4 model",
+        "vram budget: the KV plan needs 9000 MiB of VRAM, " ++
+            "but only 7168 MiB of the 8192 MiB free are usable. " ++
+            "It holds 8000 MiB of weights, 1000 MiB of KV, " ++
+            "and 20 MiB of recurrent state for 4 slots x 4096 positions. " ++
+            "No window fits 4 slots. Use fewer sessions, or a smaller or Q4 model",
         formatVramRefusal(&buf, recurrent),
     );
 
@@ -4296,7 +4327,7 @@ fn sweepStack(random: std.Random, qwen_shaped: bool) SweepStack {
     return stack;
 }
 
-/// The RAM check over `cases` seeded random placements. The VRAM planner picks
+/// The RAM check over `cases` seeded random splits. The VRAM planner picks
 /// the split, and `quoteRam` funds or refuses it. The sweep checks the four
 /// statements the check owes against the VRAM plan of the same request, and
 /// the fit window against two re-quotes.
@@ -4329,7 +4360,7 @@ fn checkRamSweep(sweep: *RamSweep, seed: u64) anyerror!void {
     const open: HostRequest = .{ .ram_split = ram_split, .residency = residency };
 
     // A VRAM refusal comes first and reads no RAM figure.
-    const vram_plan = placementPlan(
+    const vram_plan = planLayerSplit(
         caps,
         weights,
         stack.head,
@@ -4344,7 +4375,7 @@ fn checkRamSweep(sweep: *RamSweep, seed: u64) anyerror!void {
     // one chunk or one device suffix of one slot, whichever is smaller.
     if (residency) {
         try std.testing.expectEqual(
-            2 * stageBytes(slotSpanBytes(stack.kv, vram_plan.split, n)),
+            2 * stageBytes(slotSpanBytes(stack.kv, vram_plan.host_layers, n)),
             vram_plan.ram.swap_stages,
         );
     } else {
@@ -4355,14 +4386,14 @@ fn checkRamSweep(sweep: *RamSweep, seed: u64) anyerror!void {
     const ram_free = random.intRangeAtMost(u64, 0, 2 * need + 16);
     const host = open;
     const ram_usable = limits.ramUsable(ram_free);
-    if (quoteRam(stack.kv, vram_plan.split, host, n_logical, true, ram_free)) |q| {
+    if (quoteRam(stack.kv, vram_plan.host_layers, host, n_logical, true, ram_free)) |q| {
         sweep.accepted += 1;
         // An accepted quote spends at most the usable RAM, and it kept the
         // vector of the split the VRAM planner chose.
         try std.testing.expect(q.ram.spend() <= ram_usable);
         try std.testing.expectEqual(vram_plan.ram, q.ram);
         const plan = vram_plan.priced(q);
-        try std.testing.expectEqual(vram_plan.split, plan.split);
+        try std.testing.expectEqual(vram_plan.host_layers, plan.host_layers);
         try std.testing.expectEqual(@as(?u64, ram_usable), plan.ram_usable);
     } else |err| {
         sweep.refused += 1;
@@ -4371,17 +4402,17 @@ fn checkRamSweep(sweep: *RamSweep, seed: u64) anyerror!void {
         // passes the usable RAM.
         try std.testing.expect(ram_usable < need);
 
-        const refusal = ramRefusal(stack.kv, vram_plan.split, host, ram_free);
+        const refusal = ramRefusal(stack.kv, vram_plan.host_layers, host, ram_free);
         try std.testing.expectEqual(need, refusal.spend);
         try std.testing.expectEqual(ram_usable, refusal.usable);
-        try std.testing.expectEqual(n - vram_plan.split, refusal.gpu_layers);
+        try std.testing.expectEqual(n - vram_plan.host_layers, refusal.gpu_layers);
 
         // Without residency, an auto refusal is final: every split the
         // VRAM funds spends at least as much RAM.
         if (gpu_layers == null and !residency) {
             var k: u32 = 0;
             while (k <= n) : (k += 1) {
-                if (!placementFits(caps, weights, stack.head, stack.kv, k)) continue;
+                if (!layerSplitFits(caps, weights, stack.head, stack.kv, k)) continue;
                 try std.testing.expectError(
                     error.HostRamBudgetTooSmall,
                     quoteRam(stack.kv, k, host, n_logical, true, ram_free),
@@ -4397,11 +4428,18 @@ fn checkRamSweep(sweep: *RamSweep, seed: u64) anyerror!void {
             try std.testing.expect(fit < stack.kv.window);
             try std.testing.expectEqual(@as(u32, 0), fit % limits.window_granule);
             narrow.window = fit;
-            const fitted = try quoteRam(narrow, vram_plan.split, host, n_logical, true, ram_free);
+            const fitted = try quoteRam(
+                narrow,
+                vram_plan.host_layers,
+                host,
+                n_logical,
+                true,
+                ram_free,
+            );
             try std.testing.expect(fitted.ram.spend() <= ram_usable);
             _ = try quoteRam(
                 narrow,
-                vram_plan.split,
+                vram_plan.host_layers,
                 host,
                 n_logical,
                 true,
@@ -4413,7 +4451,7 @@ fn checkRamSweep(sweep: *RamSweep, seed: u64) anyerror!void {
         // So one more position, or the floor with no exact fit, refuses on that same pair.
         const exact = ramFitWindow(
             stack.kv,
-            vram_plan.split,
+            vram_plan.host_layers,
             0,
             refusal.swap_stages +| refusal.blobs +| refusal.prefix,
             ram_usable,
@@ -4424,16 +4462,16 @@ fn checkRamSweep(sweep: *RamSweep, seed: u64) anyerror!void {
 
         if (exact) |e| {
             narrow.window = e;
-            _ = try quoteRam(narrow, vram_plan.split, host, n_logical, true, ram_free);
+            _ = try quoteRam(narrow, vram_plan.host_layers, host, n_logical, true, ram_free);
             narrow.window = e + 1;
         } else {
             narrow.window = caps.min_window;
         }
 
-        if (ramAt(narrow, vram_plan.split, n, host).swap_stages == refusal.swap_stages) {
+        if (ramAt(narrow, vram_plan.host_layers, n, host).swap_stages == refusal.swap_stages) {
             try std.testing.expectError(
                 error.HostRamBudgetTooSmall,
-                quoteRam(narrow, vram_plan.split, host, n_logical, true, ram_free),
+                quoteRam(narrow, vram_plan.host_layers, host, n_logical, true, ram_free),
             );
         }
     }
@@ -4472,12 +4510,12 @@ test "formatRamRefusal: the widest text and both advice forms" {
         .residency = true,
     }, 8 << 30);
     try std.testing.expectEqualStrings(
-        "ram budget: the placement needs 9216 MiB of RAM, but only 7168 MiB of the 8192 MiB " ++
-            "free are usable." ++
-            " It holds 7680 MiB of host KV, 512 MiB of swap stages, 0 MiB of blobs, and " ++
-            "1024 MiB of prefix cache." ++
-            " The plan serves 1 slot x 131072 positions at gpu 17/32 layers." ++
-            " Use --gpu-layers 17 --max-seq 93696 or less.",
+        "ram budget: the placement needs 9216 MiB of RAM, " ++
+            "but only 7168 MiB of the 8192 MiB free are usable. " ++
+            "It holds 7680 MiB of host KV, 512 MiB of swap stages, 0 MiB of blobs, " ++
+            "and 1024 MiB of prefix cache. " ++
+            "The plan serves 1 slot x 131072 positions at gpu 17/32 layers. " ++
+            "Use --gpu-layers 17 --max-seq 93696 or less.",
         formatRamRefusal(&buf, refusal),
     );
 
@@ -4499,12 +4537,12 @@ test "formatRamRefusal: the widest text and both advice forms" {
         .fit = null,
     };
     try std.testing.expectEqualStrings(
-        "ram budget: the placement needs 9000 MiB of RAM, but only 3584 MiB of the 4096 MiB " ++
-            "free are usable." ++
-            " It holds 4000 MiB of host KV, 4488 MiB of swap stages, 0 MiB of blobs, and " ++
-            "512 MiB of prefix cache." ++
-            " The plan serves 4 slots x 4096 positions at gpu 8/32 layers." ++
-            " No window fits this split. Use fewer slots, a lower --kv-ram, or a smaller model.",
+        "ram budget: the placement needs 9000 MiB of RAM, " ++
+            "but only 3584 MiB of the 4096 MiB free are usable. " ++
+            "It holds 4000 MiB of host KV, 4488 MiB of swap stages, 0 MiB of blobs, " ++
+            "and 512 MiB of prefix cache. " ++
+            "The plan serves 4 slots x 4096 positions at gpu 8/32 layers. " ++
+            "No window fits this split. Use fewer slots, a lower --kv-ram, or a smaller model.",
         formatRamRefusal(&buf, crowded),
     );
     var lone = crowded;
@@ -4512,12 +4550,12 @@ test "formatRamRefusal: the widest text and both advice forms" {
     lone.prefix = 0;
     lone.spend = 8488 * mib;
     try std.testing.expectEqualStrings(
-        "ram budget: the placement needs 8488 MiB of RAM, but only 3584 MiB of the 4096 MiB " ++
-            "free are usable." ++
-            " It holds 4000 MiB of host KV, 4488 MiB of swap stages, 0 MiB of blobs, and 0 " ++
-            "MiB of prefix cache." ++
-            " The plan serves 1 slot x 4096 positions at gpu 8/32 layers." ++
-            " No window fits this split. Use a smaller model.",
+        "ram budget: the placement needs 8488 MiB of RAM, " ++
+            "but only 3584 MiB of the 4096 MiB free are usable. " ++
+            "It holds 4000 MiB of host KV, 4488 MiB of swap stages, 0 MiB of blobs, " ++
+            "and 0 MiB of prefix cache. " ++
+            "The plan serves 1 slot x 4096 positions at gpu 8/32 layers. " ++
+            "No window fits this split. Use a smaller model.",
         formatRamRefusal(&buf, lone),
     );
 

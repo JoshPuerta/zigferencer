@@ -2,6 +2,8 @@
 //! spawns `serve` as a child and drives the whole path: spawn, parse READY, talk, shut
 //! down. `--connect host:port` drives a running server and leaves it running.
 //!
+//! Comptime. The target OS picks how the demo reports the child process.
+//!
 //! The script has four acts:
 //!   act 1  one turn on session a, streamed token by token.
 //!   act 2  `--turns` follow-ups on session a. Each turn prefills only its new prompt.
@@ -69,6 +71,9 @@ const ready_line_bytes = 256;
 /// One turn's outcome: the new committed position from the server's `done`, and
 /// whether the session hit a context limit and must stop taking turns.
 const Turn = struct { pos: u32, stopped: bool };
+
+/// Whether act 3 ran. A skipped batch also skips act 4.
+const BatchOutcome = enum { ran, skipped };
 
 /// One session's turn in a batch: the session id, a short label, and the prompt.
 const SessionTurn = struct { sid: u32, name: []const u8, prompt: []const u8 };
@@ -159,8 +164,8 @@ const Flags = struct {
         .kv_ram = args.Doc{
             .group = "gpu (fused-GPU build only)",
             .value = "MiB",
-            .text = "RAM budget for evicted KV blobs on the spawned server.\nSmall values " ++
-                "demo backpressure",
+            .text = "RAM budget for evicted KV blobs on the spawned server.\n" ++
+                "Small values demo backpressure",
         },
         .kv_dtype = args.Doc{
             .group = "kv",
@@ -172,6 +177,7 @@ const Flags = struct {
 // -- api --------------------------------------------------------------------
 
 pub fn run(ctx: context.Context) !void {
+    // Validate the flags and set up the output.
     const flags = try args.parseInto(Flags, ctx) orelse return;
     try validate(ctx, flags);
 
@@ -185,6 +191,7 @@ pub fn run(ctx: context.Context) !void {
     var child: ?std.process.Child = null;
     defer if (child) |*c| c.kill(ctx.io);
 
+    // Connect to the server.
     const address = try serverAddress(ctx, w, flags, &child);
     var client = try Client.connectTcp(ctx.gpa, ctx.io, address);
     defer client.deinit();
@@ -194,6 +201,7 @@ pub fn run(ctx: context.Context) !void {
         pal.dim, info.max_sessions, info.max_batch, info.max_seq, pal.reset,
     });
 
+    // Play the script and print the totals.
     const t0 = Io.Clock.Timestamp.now(ctx.io, .awake);
     const total = try playScript(ctx, w, pal, &client, .{
         .turns = flags.turns,
@@ -209,7 +217,7 @@ pub fn run(ctx: context.Context) !void {
     });
     try w.flush();
 
-    // A failed shutdown falls back to the kill in the defer.
+    // Stop the child. A failed shutdown falls back to the kill in the defer.
     if (child) |*c| {
         client.shutdown() catch {};
         _ = c.wait(ctx.io) catch {};
@@ -293,8 +301,7 @@ fn spawnServer(
 ) !Io.net.IpAddress {
     const argv = try serverArgv(ctx, opt);
 
-    // Two processes share one terminal, and the token stream carries no newline,
-    // so one child log line splits a word.
+    // Spawn the child. Two processes share one terminal, and one child log line splits a word.
     const tracing = corelog.rawEnv() != null;
     const trace_file: ?Io.File = if (tracing)
         (Io.Dir.cwd().createFile(ctx.io, serve_trace_file, .{}) catch null)
@@ -310,7 +317,7 @@ fn spawnServer(
         f.close(ctx.io); // the child holds its own copy now
     }
 
-    // The child id is a HANDLE on Windows, so only a POSIX build prints it.
+    // Announce the child. The child id is a HANDLE on Windows, so only a POSIX build prints it.
     if (comptime builtin.os.tag == .windows) {
         try w.print("spawned:  zigferencer serve {s}\n", .{opt.model_name});
     } else {
@@ -326,6 +333,7 @@ fn spawnServer(
 
     try w.flush();
 
+    // Read the READY line.
     var read_buffer: [ready_line_bytes]u8 = undefined;
     var reader: Io.File.Reader = .init(child.*.?.stdout.?, ctx.io, &read_buffer);
 
@@ -348,7 +356,7 @@ fn spawnServer(
         return error.ServerStartFailed;
     };
 
-    // "READY tcp 127.0.0.1:36847"
+    // Parse "READY tcp 127.0.0.1:36847".
     return parseReady(line) orelse {
         w.print("server printed \"{s}\" where READY was expected\n", .{line}) catch {};
         w.flush() catch {};
@@ -415,6 +423,7 @@ fn playScript(
 ) !u64 {
     var s: Script = .{ .ctx = ctx, .w = w, .p = p, .client = client, .opt = opt };
 
+    // Open session a and print the preamble.
     const t_open = Io.Clock.Timestamp.now(ctx.io, .awake);
     const a = try client.openSession(system_prompt, samplingFor(opt, 0));
     const cold_open_ms = time.msBetween(t_open, Io.Clock.Timestamp.now(ctx.io, .awake));
@@ -430,9 +439,10 @@ fn playScript(
         },
     );
 
+    // Run the acts. A skipped batch also skips the warm open.
     var a_pos = try actFirstTurn(&s, a);
     a_pos = try actFollowups(&s, a, a_pos);
-    if (!try actBatch(&s, a, a_pos)) return s.total;
+    if (try actBatch(&s, a, a_pos) == .skipped) return s.total;
 
     if (opt.max_sessions >= warm_open_min_sessions) {
         try actWarmOpen(&s, cold_open_ms);
@@ -492,8 +502,8 @@ fn actFollowups(s: *Script, a: u32, a_pos_start: u32) !u32 {
         const t = try oneTurnStreamed(s, a, q, cap);
         a_pos = t.pos;
         try w.print(
-            "{s}  (kv_pos {d} -> {d}: the prior {d} tokens stayed in the KV cache, not " ++
-                "re-prefilled){s}\n",
+            "{s}  (kv_pos {d} -> {d}: " ++
+                "the prior {d} tokens stayed in the KV cache, not re-prefilled){s}\n",
             .{
                 p.dim, prev, a_pos, prev, p.reset,
             },
@@ -504,8 +514,8 @@ fn actFollowups(s: *Script, a: u32, a_pos_start: u32) !u32 {
     return a_pos;
 }
 
-/// Act 3. Returns false when the act did not run, which also skips act 4.
-fn actBatch(s: *Script, a: u32, a_pos: u32) !bool {
+/// Act 3. Returns `.skipped` when the act did not run.
+fn actBatch(s: *Script, a: u32, a_pos: u32) !BatchOutcome {
     const w = s.w;
     const p = s.p;
     const client = s.client;
@@ -524,7 +534,7 @@ fn actBatch(s: *Script, a: u32, a_pos: u32) !bool {
                 p.dim, a_pos, s.opt.max_seq, p.reset,
             },
         );
-        return false;
+        return .skipped;
     }
 
     const b = client.cloneSession(
@@ -549,7 +559,7 @@ fn actBatch(s: *Script, a: u32, a_pos: u32) !bool {
         .{ .sid = b, .name = "b", .prompt = "Name one alternative to a KV cache." },
         .{ .sid = c, .name = "c", .prompt = "What is prefill versus decode?" },
     }, &.{ cap, cap, cap });
-    return true;
+    return .ran;
 }
 
 /// Act 4. A fresh session d opens with the system prompt that the prefix cache holds.
@@ -564,8 +574,8 @@ fn actWarmOpen(s: *Script, cold_open_ms: f64) !void {
     const d = try s.client.openSession(system_prompt, samplingFor(s.opt, 3));
     const warm_open_ms = time.msBetween(t_warm, Io.Clock.Timestamp.now(s.ctx.io, .awake));
     try w.print(
-        "{s}session d={d} opened in {d:.0} ms (cold open took {d:.0} ms). The server's " ++
-            "stats line counts the hit{s}\n",
+        "{s}session d={d} opened in {d:.0} ms (cold open took {d:.0} ms). " ++
+            "The server's stats line counts the hit{s}\n",
         .{
             p.dim, d, warm_open_ms, cold_open_ms, p.reset,
         },
@@ -592,8 +602,8 @@ fn genCap(max_seq: u32, pos: u32, requested: u32) u32 {
     return @min(requested, room);
 }
 
-/// A refused fork ends the demo where it stands. Returns false so the caller skips act 4.
-fn noteCloneRefused(s: *Script, err: anyerror) !bool {
+/// A refused fork ends the demo where it stands, so the caller skips act 4.
+fn noteCloneRefused(s: *Script, err: anyerror) !BatchOutcome {
     const reason: []const u8 = if (err == error.ServerError)
         (if (s.client.last_error) |*e| e.detail() else @errorName(err))
     else
@@ -606,7 +616,7 @@ fn noteCloneRefused(s: *Script, err: anyerror) !bool {
         },
     );
     try s.w.flush();
-    return false;
+    return .skipped;
 }
 
 /// One whole turn on a quiet connection. It prints up to `cap` tokens as they arrive.
@@ -666,6 +676,7 @@ fn batchedTurnsDemuxed(s: *Script, batch: []const SessionTurn, caps: []const u32
         _ = try client.generate(turn.sid, turn.prompt, cap, null);
     }
 
+    // Collect the token events per session.
     const replies = try s.ctx.arena.alloc(std.ArrayList(u8), batch.len);
     for (replies) |*r| {
         r.* = .empty;
@@ -705,6 +716,7 @@ fn batchedTurnsDemuxed(s: *Script, batch: []const SessionTurn, caps: []const u32
         }
     }
 
+    // Print the replies.
     try printBatchReplies(s, batch, replies, switches);
     try w.flush();
     return total;
@@ -736,8 +748,8 @@ fn printBatchReplies(
     }
 
     try w.print(
-        "{s}(token events switched sessions {d} times mid-stream: all {d} turns shared the " ++
-            "batch){s}\n",
+        "{s}(token events switched sessions {d} times mid-stream: " ++
+            "all {d} turns shared the batch){s}\n",
         .{
             p.dim, switches, batch.len, p.reset,
         },

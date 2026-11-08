@@ -1,7 +1,10 @@
 //! Style and truth rules for the GLSL kernels in `src/ops_vulkan/shaders`.
 //!
+//! Comptime. `add` and `addAt` take the format string at comptime, so the compiler checks each
+//! finding message.
+//!
 //! `glslc` and `spirv-val` own the semantics. This tool owns what they cannot see: the shape of
-//! the header, the comments, the blank lines, and the facts a header states about the code. It
+//! the header, the comments, the blank lines, and the claims a header states about the code. It
 //! reads text line by line and runs no compiler, so it needs no Vulkan SDK.
 //!
 //! Findings go to stderr, one per line, in the shape of a `glslc` diagnostic, so one problem
@@ -66,7 +69,7 @@ const Rule = enum {
     section_missing,
     section_length,
     header_length,
-    version_place,
+    version_line,
     banner_order,
     comment_block,
     step_label,
@@ -149,7 +152,7 @@ const Report = struct {
     }
 };
 
-/// The facts of one shader that more than one rule reads.
+/// The values of one shader that more than one rule reads.
 const Shader = struct {
     input: Input,
     lines: []const Line,
@@ -197,6 +200,7 @@ pub fn lint(arena: Allocator, input: Input) ![]const Finding {
 }
 
 pub fn main(init: std.process.Init) !void {
+    // Read the arguments and the kernel source.
     const gpa = init.gpa;
     const io = init.io;
     const arena = init.arena.allocator();
@@ -210,6 +214,7 @@ pub fn main(init: std.process.Init) !void {
     var stderr_writer: Io.File.Writer = .initStreaming(.stderr(), io, &buffer);
     const w = &stderr_writer.interface;
 
+    // List the shader files in order.
     var dir = try cwd.openDir(io, args[1], .{ .iterate = true });
     defer dir.close(io);
 
@@ -225,6 +230,7 @@ pub fn main(init: std.process.Init) !void {
 
     std.mem.sort([]const u8, names.items, {}, nameLessThan);
 
+    // Lint each shader and print its findings.
     var total: usize = 0;
     for (names.items) |name| {
         const source = try dir.readFileAlloc(io, name, arena, .limited(file_bytes_max));
@@ -239,6 +245,7 @@ pub fn main(init: std.process.Init) !void {
         total += findings.len;
     }
 
+    // Report the total, and exit nonzero on findings.
     if (total != 0) {
         try w.print("shader-lint: {d} findings in {d} files\n", .{ total, names.items.len });
     }
@@ -448,7 +455,7 @@ fn textRules(shader: *const Shader, report: *Report) !void {
 fn headerRules(arena: Allocator, shader: *const Shader, report: *Report) !void {
     const lines = shader.lines;
     if (shader.version < 2) {
-        try report.add(.version_place, 1, "a header comment comes before #version", .{});
+        try report.add(.version_line, 1, "a header comment comes before #version", .{});
         return;
     }
 
@@ -458,7 +465,7 @@ fn headerRules(arena: Allocator, shader: *const Shader, report: *Report) !void {
         try report.add(.header_length, 1, fmt, .{ header_lines, header_lines_max });
     }
     if (lines[shader.version - 1].kind != .blank or lines[shader.version - 2].kind != .comment) {
-        try report.add(.version_place, shader.version + 1, "one blank line ends the header", .{});
+        try report.add(.version_line, shader.version + 1, "one blank line ends the header", .{});
     }
 
     const prefix = try std.fmt.allocPrint(arena, "// {s}: ", .{shader.input.stem});
@@ -1047,14 +1054,13 @@ test "a lane must not skip a barrier" {
 
 test "the historic tail lane bug fails and the clamp does not" {
     const head = "    uint col = gl_GlobalInvocationID.x;\n";
-    const tail_returns = head ++ "    if (col >= params.n) return;\n\n" ++
-        "    shared_sum();\n    barrier();\n\n    x_buf.data[col] = 0.0;\n";
+    const tail_returns = head ++ "    if (col >= params.n) return;\n\n    shared_sum();\n" ++
+        "    barrier();\n\n    x_buf.data[col] = 0.0;\n";
     try expectRule(tail_returns, .uniform_guard);
 
     // The tail lane stays in the workgroup, reaches the barrier, and skips only the store.
-    const tail_stays = head ++ "    bool live = col < params.n;\n\n" ++
-        "    shared_sum();\n    barrier();\n\n    if (live) {\n        x_buf.data[col] = 0.0;\n" ++
-        "    }\n";
+    const tail_stays = head ++ "    bool live = col < params.n;\n\n    shared_sum();\n" ++
+        "    barrier();\n\n    if (live) {\n        x_buf.data[col] = 0.0;\n    }\n";
     try expectNoRule(tail_stays, .uniform_guard);
 }
 

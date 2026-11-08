@@ -56,7 +56,6 @@ pub const attentionPartTyped = attention_simd.plain.attentionPartTyped;
 pub const attentionMerge = attention_simd.plain.attentionMerge;
 pub const attentionRowTyped = attention_simd.plain.attentionRowTyped;
 
-// See "Q4 and Q6_K" in the header.
 pub const linearF32Q40 = naive.linearF32Q40;
 pub const linearF32Q40Batch = naive.linearF32Q40Batch;
 pub const linearF32Q41 = naive.linearF32Q41;

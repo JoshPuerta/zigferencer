@@ -3,6 +3,8 @@
 //! to and from the engine's `Request` and `OutEvent` values. The format layer is pure (`types.zig`,
 //! `map.zig`). This file is the imperative shell.
 //!
+//! Comptime. Generic over the engine, so the adapter builds against any engine type.
+//!
 //! Request flow. A chat request becomes an ephemeral session: `session_open("")`,
 //! `generate(rendered)`, `session_close`. It reaches the shared scheduler, which batches it with
 //! every other in-flight request.
@@ -83,7 +85,7 @@ const HttpAdapter = struct {
         return true;
     }
 
-    /// Unblock the task: close the queue, and shut the socket down. See "Teardown" in the header.
+    /// Unblock the task: close the queue, and shut the socket down.
     pub fn beginClose(engine: anytype, conn: anytype) void {
         engine.closeOutput(conn);
         if (engine.claimStreamForTeardown(conn)) {
@@ -123,7 +125,7 @@ const BufSink = struct {
     }
 };
 
-/// The response sink of a streamed chat request. See "Streaming" in the header.
+/// The response sink of a streamed chat request.
 const SseSink = struct {
     request: *http.Server.Request,
     id: []const u8,
@@ -465,12 +467,14 @@ fn HttpTasks(comptime Eng: type) type {
             input: TurnInput,
             id_str: []const u8,
         ) !void {
+            // Run the turn into a buffer.
             var sink: BufSink = .{ .arena = arena };
             const turn = switch (try runTurn(engine, c, arena, sid, input, &sink)) {
                 .done => |d| d,
                 .failed => |he| return respondError(request, he),
             };
 
+            // Build the response.
             const prompt_tokens = countPrompt(engine, input.rendered);
             const message: types.RespMessage = .{
                 .content = sink.content.items,
@@ -492,6 +496,8 @@ fn HttpTasks(comptime Eng: type) type {
                     } else null,
                 },
             };
+
+            // Send the body.
             var sbuf: [4096]u8 = undefined;
             var rbody = try request.respondStreaming(
                 &sbuf,
@@ -668,15 +674,20 @@ test "writeErrorEvent: one error event in the llama.cpp shape, then the end even
     var buf: [512]u8 = undefined;
     var w: Io.Writer = .fixed(&buf);
     try writeErrorEvent(&w, overflow);
-    try std.testing.expectEqualStrings(
-        \\data: {"error":{"code":400,"message":"the request of 130 tokens exceeds the context of 128 tokens","type":"exceed_context_size_error","n_prompt_tokens":130,"n_ctx":128}}
+    const want_open =
+        \\data: {"error":{"code":400,
+    ;
+    const want_message =
+        \\"message":"the request of 130 tokens exceeds the context of 128 tokens",
+    ;
+    const want_rest =
+        \\"type":"exceed_context_size_error","n_prompt_tokens":130,"n_ctx":128}}
         \\
         \\data: [DONE]
         \\
         \\
-    ,
-        w.buffered(),
-    );
+    ;
+    try std.testing.expectEqualStrings(want_open ++ want_message ++ want_rest, w.buffered());
 }
 
 test "the reply fields: reasoning_content sits next to content and vanishes when null" {

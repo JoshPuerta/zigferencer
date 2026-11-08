@@ -5,6 +5,9 @@
 //! lanes, so the record bits differ from naive inside a measured tolerance. naive stays the
 //! reference.
 //!
+//! Comptime. `Kernels` fixes the prefetch option, so the plain and the prefetching kernels are two
+//! builds of one source.
+//!
 //! Bit rules. The bits of one head are a function of its query, its part, and the KV rows alone.
 //! Five rules hold that:
 //! 1. Lane j of a score accumulator adds the products of dims j, j + 8, j + 16, and so on, one
@@ -67,17 +70,16 @@ const tile: usize = limits.attn_cpu_tile;
 /// up to it, and a wider head runs the naive kernel.
 const max_head_dim: usize = limits.attn_max_head_dim;
 
-/// The widest head block. See "Head blocks" in the header.
+/// The widest head block.
 const max_group: usize = limits.attn_max_group;
 
-/// Accumulators one register block holds. See "Register blocks" in the header.
+/// Accumulators one register block holds.
 const block_accs = 8;
 
-/// Positions one register run of the value pass walks. See "Value runs" in the header.
+/// Positions one register run of the value pass walks.
 const value_run = 32;
 
 /// How far ahead the prefetching kernels fetch the K and V rows, in positions.
-/// See "Prefetch distance" in the header.
 const prefetch_positions = 16;
 
 comptime {
@@ -208,7 +210,7 @@ fn Kernels(comptime opts: Options) type {
 
 // -- helpers ----------------------------------------------------------------
 
-/// The body of `Kernels.attentionPartTyped`. See "Inlining" in the header.
+/// The body of `Kernels.attentionPartTyped`.
 inline fn partKernel(
     comptime E: type,
     comptime opts: Options,
@@ -361,7 +363,6 @@ inline fn scoreTile(
     tile_n: usize,
     scores: *[n][tile]f32,
 ) void {
-    // See "Register blocks" in the header.
     const step: usize = comptime @max(1, block_accs / n);
     var t: usize = 0;
     while (t + step <= tile_n) : (t += step) {
@@ -498,7 +499,6 @@ inline fn valueTile(
     first: bool,
     rescale: [n]f32,
 ) void {
-    // See "Register blocks" in the header.
     const chunks: usize = comptime @max(1, block_accs / n);
     var run_lo: usize = 0;
     while (run_lo < tile_n) : (run_lo += value_run) {
@@ -603,9 +603,8 @@ inline fn transposeAdd(comptime m: usize, accs: [m]Vec) Vec {
         a[i] = accs[i];
     }
 
-    // Lane i of `low4` holds the sum of the low 4 lanes of accumulator i, and
-    // lane i + 4 the sum of its high 4 lanes. `high4` holds the same for
-    // accumulators 4 to 7.
+    // Lane i of `low4` sums the low 4 lanes of accumulator i, and lane i + 4 sums its high 4.
+    // `high4` does the same for accumulators 4 to 7.
     const low4 = pairAdd(pairAdd(a[0], a[1]), pairAdd(a[2], a[3]));
     const high4 = pairAdd(pairAdd(a[4], a[5]), pairAdd(a[6], a[7]));
     const lo = @shuffle(
@@ -661,6 +660,7 @@ fn partGapToNaive(
     t_lo: usize,
     t_hi: usize,
 ) !f64 {
+    // Allocate the buffers.
     const gpa = std.testing.allocator;
     const nh = shape.n_heads;
     const hd = shape.head_dim;
@@ -680,6 +680,7 @@ fn partGapToNaive(
     const recs_ref = try gpa.alloc(f32, nh * rec_len);
     defer gpa.free(recs_ref);
 
+    // Run both kernels on one random input.
     attention_ref.fillAttention(E, r, shape, t_hi, &.{}, 0, q, k, v);
     plain.attentionPartTyped(
         E,
@@ -711,6 +712,8 @@ fn partGapToNaive(
         recs_ref,
         rec_len,
     );
+
+    // Take the worst gap of the outputs and of the log norms.
     var worst: f64 = 0;
     for (0..nh) |h| {
         const a = recs_vec[h * rec_len ..][0..rec_len];
@@ -827,7 +830,7 @@ test "vector row: a sink, a ramp, and scores near 100 track the f64 reference" {
     }
 }
 
-test "vector part: a head range gives each head the records of a single-head call at an odd last tile" {
+test "vector part: a head range gives the records of single-head calls at an odd last tile" {
     // A single head walks 8 positions per score step, a group of 4 walks 2, and
     // a group of 3 walks 2. The range ends in a tile of 17 positions, so each
     // walk ends on a lone position. The ramp heads peak in the last tile, and
@@ -897,7 +900,7 @@ test "vector part: a head range gives each head the records of a single-head cal
     }
 }
 
-test "vector part: a group of 10 heads in blocks of 8 and 2 gives the records of single-head calls" {
+test "vector part: 10 heads in blocks of 8 and 2 give the records of single-head calls" {
     const shape: AttnShape = .{ .n_heads = 20, .n_kv_heads = 2, .head_dim = 8 };
     var leads = [_]Lead{.none} ** 20;
     leads[0] = .ramp;
@@ -923,7 +926,7 @@ test "vector part: a group of 10 heads in blocks of 8 and 2 gives the records of
     }
 }
 
-test "vector row: forced fan-out at 1, 2, 3, 4, and 16 threads gives the bits of the serial row, with and without prefetch" {
+test "vector row: fan-out at 1 to 16 threads gives the serial bits, with and without prefetch" {
     const T = cpu_tile;
     // The row of 17 tiles takes narrow heads alone, so the test stays short in
     // Debug. The widest registered head runs the one-part and two-part rows.

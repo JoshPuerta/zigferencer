@@ -48,13 +48,13 @@ pub const RawCodec = struct {
     pub fn pairTokens(
         self: *const RawCodec,
         gpa: Allocator,
-        place: chat.PairPlace,
+        order: chat.PairOrder,
         user: []const u8,
         assistant: []const u8,
     ) error{AppendUnsupported}![]u32 {
         _ = self;
         _ = gpa;
-        _ = place;
+        _ = order;
         _ = user;
         _ = assistant;
         return error.AppendUnsupported;

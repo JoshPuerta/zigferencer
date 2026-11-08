@@ -1,21 +1,23 @@
-//! Role. The device arms of a boot as pure values: the fused fit, the serve budget arms, and the
-//! hybrid placement. The CLI measures the device once (`ModelFacts`, `DeviceFacts`), `resolve`
-//! calls `arm`, and the CLI logs the value and constructs the runner it names. Nothing here reads
-//! a device or logs, so a table test runs every device row with no GPU.
+//! Role. The device placements of a boot as pure values: the fused fit, the VRAM budgets, and the
+//! hybrid placement. The CLI measures the device once (`ModelNeeds`,
+//! `DeviceCapacity`), `resolve` calls `choosePlacement`, and the CLI logs the value and constructs
+//! the runner it names. Nothing here reads a device or logs, so a table test runs every device row
+//! with no GPU.
 //!
-//! Log order. The value keeps the order of the boot lines. A `Placed` value holds the lines before
-//! the split and the split itself. The arm holds the lines of the runner the split selects. A
-//! refusal follows every line before it, so the CLI logs the `Placed` lines first and then formats
-//! the refusal.
+//! Log order. The value keeps the order of the boot lines. A `LayerChoice` value holds the lines
+//! before the split and the split itself. The placement holds the lines of the runner the split
+//! selects. A refusal follows every line before it, so the CLI logs the `LayerChoice` lines first
+//! and then formats the refusal.
 //!
-//! Budget arms. One KV region holds every slot at the window, so the device buffer limits bound
+//! VRAM budgets. One KV region holds every slot at the window, so the device buffer limits bound
 //! the product of the two. With pinned slots the money buys the window, so the clamp runs on the
-//! plan and a cut window replans at the same slot count. With unpinned slots the window is known
-//! first: the flag, or the serve default the limits leave for one slot. The money buys the slots,
-//! so the limits cap the slot count. The limits never shrink a named window, and a shape they
-//! refuse at any slot count reaches the runner, which refuses it with the numbers. With pinned
-//! slots the money can still lower a named window, which is a cap there
-//! (`kv_budget.resolveWindow`).
+//! plan and a cut window replans at the same slot count. The money can still lower a named window,
+//! which is a cap there (`kv_budget.resolveWindow`).
+//!
+//! Unpinned budgets. The window is known first: the flag, or the serve default the limits leave for
+//! one slot. The money buys the slots, so the limits cap the slot count. The limits never shrink a
+//! named window, and a shape they refuse at any slot count reaches the runner, which refuses it
+//! with the numbers.
 //!
 //! Window fits. A named window passes through every fit, so the planner or the runner refuses it
 //! with the numbers. A default window shrinks, first to the device buffer limits and then to the
@@ -27,14 +29,14 @@
 //!
 //! Per-kind rules.
 //!
-//!   rule                      run            serve                 bench
-//!   slots of the fused arm    1              the structural slots  1
-//!                                            (llama: at least 2)
-//!   default window fit        clamp, fit     clamp, fit            clamp, fit
-//!   budget arm                none           --kv-vram, --vram-slots  none
-//!   residency priced in RAM   no             yes                   no
-//!   whole-model split         falls through  the arm it selects    refuses unless
-//!                             to the arm                           --force-hybrid
+//!   rule                          run               serve                     bench
+//!   slots of the fused placement  1                 the structural slots      1
+//!                                                   (llama: at least 2)
+//!   default window fit            clamp, fit        clamp, fit                clamp, fit
+//!   VRAM budget                   none              --kv-vram, --vram-slots   none
+//!   residency priced in RAM       no                yes                       no
+//!   whole-model split             falls through     the placement it selects  refuses unless
+//!                                 to the placement                            --force-hybrid
 
 const std = @import("std");
 
@@ -56,7 +58,7 @@ const Result = resolve.Result;
 
 /// The reservations the fused runners make for one model. The CLI measures each field with the
 /// function the runner calls. A build without the fused ops states zero past the weight census.
-pub const ModelFacts = struct {
+pub const ModelNeeds = struct {
     n_layers: u32,
     /// `tensor_lookup.layerWeightBytes`. The first `n_layers` entries hold.
     layer_weights: [limits.max_layers]u64,
@@ -69,7 +71,7 @@ pub const ModelFacts = struct {
     /// One logits row: `logitsVramBytes(vocab_size, 1)` of the fused runner.
     logits_row: u64 = 0,
 
-    pub fn layers(self: *const ModelFacts) []const u64 {
+    pub fn layers(self: *const ModelNeeds) []const u64 {
         std.debug.assert(self.n_layers >= 1);
         std.debug.assert(self.n_layers <= limits.max_layers);
 
@@ -78,7 +80,7 @@ pub const ModelFacts = struct {
 };
 
 /// What the device context states.
-pub const DeviceFacts = struct {
+pub const DeviceCapacity = struct {
     /// The live VRAM budget, or the heap size on a driver without the budget extension.
     vram: u64,
     buffer_limits: limits.BufferLimits,
@@ -115,9 +117,9 @@ pub const DeviceSlots = struct {
     window: u32,
 };
 
-pub const ArmTag = enum { fused, hybrid, cpu };
+pub const PlacementKind = enum { fused, hybrid, cpu };
 
-/// The whole-model fused arm.
+/// The whole-model fused placement.
 pub const Fused = struct {
     caps: kv_budget.Caps,
     /// The cut of a default window to the buffer limits.
@@ -131,29 +133,29 @@ pub const Fused = struct {
     prefix_default: bool = false,
     plan: kv_budget.KvPlan,
     quote: Result(kv_budget.RamQuote),
-    /// The all-device placement that `run` states for a llama model.
-    report: ?kv_budget.PlacementPlan = null,
+    /// The all-device split that `run` states for a llama model.
+    report: ?kv_budget.LayerSplit = null,
 };
 
-/// The hybrid arm: a split with layers on both tiers.
+/// The hybrid placement: a split with layers on both tiers.
 pub const Hybrid = struct {
     /// The window the split prices.
     window: Window,
     quote: Result(kv_budget.RamQuote),
     /// The split with its RAM quote, when the quote holds.
-    plan: ?kv_budget.PlacementPlan,
+    plan: ?kv_budget.LayerSplit,
 };
 
-pub const Arm = union(ArmTag) {
+pub const Placement = union(PlacementKind) {
     fused: Fused,
     hybrid: Hybrid,
     /// An auto split that funds no GPU layer, or a serve split that keeps no
     /// layer on the device.
-    cpu: Result(resolve.CpuArm),
+    cpu: Result(resolve.HostPlacement),
 };
 
-/// The lines a `--gpu-layers` boot logs before its arm, and the split.
-pub const Placed = struct {
+/// The lines a `--gpu-layers` boot logs before its placement, and the split.
+pub const LayerChoice = struct {
     /// Null is the auto pin.
     pin: ?u32,
     /// The structural slot count that the hybrid slot ceiling cut.
@@ -161,16 +163,16 @@ pub const Placed = struct {
     clamp: ?Clamp,
     window: Window,
     prefix_default: bool = false,
-    /// The VRAM split, or null when the planner refused the pin.
-    split: ?kv_budget.PlacementPlan = null,
-    /// The arm the split selects. Null when the split refused.
-    selects: ?ArmTag = null,
+    /// The layer split, or null when the planner refused the pin.
+    layer_split: ?kv_budget.LayerSplit = null,
+    /// The placement the split selects. Null when the split refused.
+    selects: ?PlacementKind = null,
 };
 
-pub const DeviceArm = struct {
+pub const DevicePlacement = struct {
     /// Null for a boot that names no split.
-    placed: ?Placed = null,
-    arm: Result(Arm),
+    layer_choice: ?LayerChoice = null,
+    placement: Result(Placement),
 };
 
 const Budgeted = struct {
@@ -182,22 +184,22 @@ const Budgeted = struct {
 
 // -- api --------------------------------------------------------------------
 
-/// The device arm of one boot. `window` is the window before any device fit.
-pub fn arm(
+/// The device placement of one boot. `window` is the window before any device fit.
+pub fn choosePlacement(
     kind: Kind,
     input: Input,
     card: loader.ModelCard,
     kv_dtype: dtype.KvDtype,
     window: Window,
-    facts: resolve.Facts,
-) DeviceArm {
-    std.debug.assert(facts.model != null);
-    std.debug.assert(facts.device != null);
-    std.debug.assert(facts.model.?.n_layers == card.n_layers);
+    resources: resolve.Resources,
+) DevicePlacement {
+    std.debug.assert(resources.model != null);
+    std.debug.assert(resources.device != null);
+    std.debug.assert(resources.model.?.n_layers == card.n_layers);
 
     return switch (kind) {
-        .serve => serveArm(input, card, kv_dtype, window, facts),
-        .run, .bench => sessionArm(kind, input, card, kv_dtype, window, facts),
+        .serve => servePlacement(input, card, kv_dtype, window, resources),
+        .run, .bench => sessionPlacement(kind, input, card, kv_dtype, window, resources),
     };
 }
 
@@ -205,7 +207,7 @@ pub fn arm(
 /// returns for the same arguments.
 pub fn caps(
     card: loader.ModelCard,
-    m: ModelFacts,
+    m: ModelNeeds,
     vram: u64,
     ceiling: u32,
     logit_rows: u32,
@@ -233,17 +235,17 @@ pub fn caps(
 pub fn report(
     c: kv_budget.Caps,
     card: loader.ModelCard,
-    m: ModelFacts,
+    m: ModelNeeds,
     kv_dtype: dtype.KvDtype,
     plan: kv_budget.KvPlan,
-) kv_budget.PlacementPlan {
+) kv_budget.LayerSplit {
     const kv: kv_budget.KvStructure = .{
         .n_slots = plan.n_slots,
         .window = plan.window,
         .costs = kv_cost.costVector(card, kv_dtype),
     };
     // The all-host split reserves no device bytes, so the auto planner cannot refuse.
-    return kv_budget.placementPlan(
+    return kv_budget.planLayerSplit(
         c,
         m.layers(),
         m.head_weights,
@@ -253,8 +255,8 @@ pub fn report(
     ) catch unreachable;
 }
 
-/// The window a fused or hybrid arm plans at, before any VRAM fit. A default window whose region
-/// breaks a device limit shrinks to `kv_index.maxGranuleWindow`. See "Window fits" in the header.
+/// The window a fused or hybrid placement plans at, before any VRAM fit. A default window whose
+/// region breaks a device limit shrinks to `kv_index.maxGranuleWindow`.
 pub fn clampDefault(
     n_slots: u32,
     kv_row_elems: u32,
@@ -308,8 +310,8 @@ pub fn clampDefault(
     };
 }
 
-/// The window a whole-model fused arm plans at: the widest window the VRAM figure funds for
-/// `n_slots` slots. See "Window fits" in the header.
+/// The window a whole-model fused placement plans at: the widest window the VRAM figure funds for
+/// `n_slots` slots.
 pub fn fitDefault(
     c: kv_budget.Caps,
     cost: kv_budget.KvCostModel,
@@ -330,7 +332,7 @@ pub fn fitDefault(
     return .{ .window = fit, .cut = .{ .n_slots = n_slots, .base = base, .window = fit } };
 }
 
-/// The slots a hybrid placement can hold. See "Slots" in the header.
+/// The slots a hybrid placement can hold.
 pub fn hybridSlots(structural: u32, pinned: bool) error{HybridSlotsPinned}!u32 {
     std.debug.assert(structural >= 1);
 
@@ -340,9 +342,10 @@ pub fn hybridSlots(structural: u32, pinned: bool) error{HybridSlotsPinned}!u32 {
     return limits.max_batch;
 }
 
-/// The arm a serve split selects. A split with no host layer is the whole-model arm again.
-/// An auto split with no GPU layer is the all-host arm. A zero count never reaches here.
-pub fn armFor(gpu_layers: ?kv_budget.GpuLayers, split: u32, n_layers: u32) ArmTag {
+/// The placement a serve split selects. A split with no host layer is the whole-model placement
+/// again. An auto split with no GPU layer is the all-host placement. A zero count never reaches
+/// here.
+pub fn placementKindFor(gpu_layers: ?kv_budget.GpuLayers, split: u32, n_layers: u32) PlacementKind {
     std.debug.assert(n_layers >= 1);
     std.debug.assert(split <= n_layers);
 
@@ -364,30 +367,30 @@ pub fn armFor(gpu_layers: ?kv_budget.GpuLayers, split: u32, n_layers: u32) ArmTa
 
 // -- helpers ----------------------------------------------------------------
 
-/// The serve arms: a split when `--gpu-layers` names one, else the fused arm.
-fn serveArm(
+/// The serve placements: a split when `--gpu-layers` names one, else the fused placement.
+fn servePlacement(
     input: Input,
     card: loader.ModelCard,
     kv_dtype: dtype.KvDtype,
     window: Window,
-    facts: resolve.Facts,
-) DeviceArm {
+    resources: resolve.Resources,
+) DevicePlacement {
     const shape = input.serve;
     const flag = input.engine.gpu_layers orelse return .{
-        .arm = fusedOk(serveFused(input, card, kv_dtype, window, facts)),
+        .placement = fusedOk(serveFused(input, card, kv_dtype, window, resources)),
     };
-    // A zero count takes the host arm before the boot opens a device.
+    // A zero count takes the host placement before the boot opens a device.
     std.debug.assert(!flag.isZeroCount());
 
     // Refuse a pin past the model.
-    const m = facts.model.?;
-    const d = facts.device.?;
+    const m = resources.model.?;
+    const d = resources.device.?;
     const n_layers: u32 = card.n_layers;
     const pin = flag.pin();
     if (pin) |n| {
         if (n > n_layers) {
             return .{
-                .arm = .{
+                .placement = .{
                     .refused = .{ .gpu_layers_past_model = .{ .n = n, .n_layers = n_layers } },
                 },
             };
@@ -396,7 +399,7 @@ fn serveArm(
 
     // Plan the slots and the window the split prices.
     const slots = hybridSlots(shape.structural_slots, shape.slots_req != null) catch
-        return .{ .arm = .{ .refused = .{ .hybrid_slots = shape.structural_slots } } };
+        return .{ .placement = .{ .refused = .{ .hybrid_slots = shape.structural_slots } } };
     const c = caps(card, m, d.vram, window.ceiling, slots, kv_dtype);
     const cost = kv_budget.costModel(card.kvShape(), kv_dtype);
     const clamped = clampDefault(
@@ -420,15 +423,15 @@ fn serveArm(
     std.debug.assert(plan.window == clamped.window);
 
     // Record the lines before the split.
-    var placed: Placed = .{
+    var layer_choice: LayerChoice = .{
         .pin = pin,
         .slots_from = if (slots < shape.structural_slots) shape.structural_slots else null,
         .clamp = clamped.clamp,
         .window = window,
         .prefix_default = prefix_default,
     };
-    placed.window.base = clamped.window;
-    placed.window.device_clamped = clamped.clamp != null;
+    layer_choice.window.base = clamped.window;
+    layer_choice.window.device_clamped = clamped.clamp != null;
 
     // Price the split. A residency pool moves blobs through both swap stages, so it prices both.
     const kv: kv_budget.KvStructure = .{
@@ -437,58 +440,66 @@ fn serveArm(
         .costs = kv_cost.costVector(card, kv_dtype),
     };
     const host: kv_budget.HostRequest = .{ .ram_split = plan.ram, .residency = true };
-    const split = kv_budget.placementPlan(c, m.layers(), m.head_weights, kv, host, pin) catch
+    const split = kv_budget.planLayerSplit(c, m.layers(), m.head_weights, kv, host, pin) catch
         return .{
-            .placed = placed,
-            .arm = .{ .refused = placementRefusal(.serve, c, m, kv, pin.?) },
+            .layer_choice = layer_choice,
+            .placement = .{ .refused = layerSplitRefusal(.serve, c, m, kv, pin.?) },
         };
-    placed.split = split;
+    layer_choice.layer_split = split;
 
-    // Build the arm that the split selects.
-    const selects = armFor(flag, split.split, n_layers);
-    placed.selects = selects;
-    return .{ .placed = placed, .arm = switch (selects) {
-        .fused => fusedOk(serveFused(input, card, kv_dtype, placed.window, facts)),
-        .cpu => .{ .ok = .{ .cpu = resolve.cpuArm(.serve, input, card, kv_dtype, window, facts) } },
+    // Build the placement that the split selects.
+    const selects = placementKindFor(flag, split.host_layers, n_layers);
+    layer_choice.selects = selects;
+    return .{ .layer_choice = layer_choice, .placement = switch (selects) {
+        .fused => fusedOk(serveFused(input, card, kv_dtype, layer_choice.window, resources)),
+        .cpu => .{
+            .ok = .{
+                .cpu = resolve.hostPlacement(.serve, input, card, kv_dtype, window, resources),
+            },
+        },
         .hybrid => blk: {
-            std.debug.assert(split.split > 0);
-            std.debug.assert(split.split < n_layers);
+            std.debug.assert(split.host_layers > 0);
+            std.debug.assert(split.host_layers < n_layers);
 
             const q = quoteOf(
                 kv,
-                split.split,
+                split.host_layers,
                 host,
                 shape.max_sessions,
                 shape.kv_ram_bytes != null,
-                facts.ram_free,
+                resources.ram_free,
             );
             break :blk .{
                 .ok = .{
-                    .hybrid = .{ .window = placed.window, .quote = q, .plan = pricedOf(split, q) },
+                    .hybrid = .{
+                        .window = layer_choice.window,
+                        .quote = q,
+                        .plan = pricedOf(split, q),
+                    },
                 },
             };
         },
     } };
 }
 
-/// The whole-model serve arm. A budget flag spends a device budget. Otherwise every session holds
-/// a slot at the base window, fitted as the header says.
+/// The whole-model serve placement. A budget flag spends a device budget. Otherwise every session
+/// holds a slot at the base window, fitted as the header says.
 fn serveFused(
     input: Input,
     card: loader.ModelCard,
     kv_dtype: dtype.KvDtype,
     window: Window,
-    facts: resolve.Facts,
+    resources: resolve.Resources,
 ) Result(Fused) {
     const shape = input.serve;
-    const m = facts.model.?;
-    const d = facts.device.?;
+    const m = resources.model.?;
+    const d = resources.device.?;
     const llama = card.gdn == null;
     const cost = kv_budget.costModel(card.kvShape(), kv_dtype);
     const kv_row_elems = card.kvShape().kv_row_elems;
     var out: Fused = undefined;
-    if (shape.slots_req != null or shape.kv_vram_bytes != null) {
-        // Plan a budget arm. `--kv-vram` states X and buys the slots. `--vram-slots` pins the
+    if (shape.slots_req != null or shape.kv_vram_bytes != null or shape.kv_vram_rest) {
+        // Plan a VRAM budget. `--kv-vram` states X and buys the slots. `--vram-slots` pins the
         // count, and the VRAM left after the other reservations buys the window.
         const req_batch: u32 = if (llama) @max(2, @as(u32, shape.batch)) else shape.batch;
         const c = caps(card, m, d.vram, window.ceiling, req_batch + 1, kv_dtype);
@@ -563,38 +574,41 @@ fn serveFused(
         .{ .ram_split = out.plan.ram, .residency = true },
         shape.max_sessions,
         shape.kv_ram_bytes != null,
-        facts.ram_free,
+        resources.ram_free,
     );
     return .{ .ok = out };
 }
 
-/// The `run` and `bench-model` arms: one stream. A split prices one slot at the window the
+/// The `run` and `bench-model` placements: one stream. A split prices one slot at the window the
 /// device limits leave.
-fn sessionArm(
+fn sessionPlacement(
     kind: Kind,
     input: Input,
     card: loader.ModelCard,
     kv_dtype: dtype.KvDtype,
     window: Window,
-    facts: resolve.Facts,
-) DeviceArm {
+    resources: resolve.Resources,
+) DevicePlacement {
     std.debug.assert(kind != .serve);
 
     const flag = input.engine.gpu_layers orelse return .{
-        .arm = .{ .ok = .{ .fused = sessionFused(kind, input, card, kv_dtype, window, facts) } },
+        .placement = .{
+            .ok = .{ .fused = sessionFused(kind, input, card, kv_dtype, window, resources) },
+        },
     };
-    // A zero count of `run` takes the host arm. The bench places it, and the split refuses it.
+    // A zero count of `run` takes the host placement. The bench prices it, and the whole-model
+    // refusal stops it.
     if (kind == .run) std.debug.assert(!flag.isZeroCount());
 
     // Refuse a pin past the model.
-    const m = facts.model.?;
-    const d = facts.device.?;
+    const m = resources.model.?;
+    const d = resources.device.?;
     const n_layers: u32 = card.n_layers;
     const pin = flag.pin();
     if (pin) |n| {
         if (n > n_layers) {
             return .{
-                .arm = .{
+                .placement = .{
                     .refused = .{ .gpu_layers_past_model = .{ .n = n, .n_layers = n_layers } },
                 },
             };
@@ -616,38 +630,61 @@ fn sessionArm(
         .ram_split = .{ .blobs = 0, .prefix = 0 },
         .residency = false,
     };
-    var placed: Placed = .{ .pin = pin, .clamp = clamped.clamp, .window = clamped.window };
-    const split = kv_budget.placementPlan(c, m.layers(), m.head_weights, kv, host, pin) catch
+    var layer_choice: LayerChoice = .{
+        .pin = pin,
+        .clamp = clamped.clamp,
+        .window = clamped.window,
+    };
+    const split = kv_budget.planLayerSplit(c, m.layers(), m.head_weights, kv, host, pin) catch
         return .{
-            .placed = placed,
-            .arm = .{ .refused = placementRefusal(kind, c, m, kv, pin.?) },
+            .layer_choice = layer_choice,
+            .placement = .{ .refused = layerSplitRefusal(kind, c, m, kv, pin.?) },
         };
-    placed.split = split;
+    layer_choice.layer_split = split;
 
-    // Select the arm.
+    // Select the placement.
     if (kind == .bench) {
         // A whole-model split is a runner that the bench measures without the flag.
-        if (!input.force_hybrid and (split.split == 0 or split.split == n_layers)) {
-            return .{ .placed = placed, .arm = .{ .refused = .{ .whole_model_split = pin } } };
+        if (!input.force_hybrid and (split.host_layers == 0 or split.host_layers == n_layers)) {
+            return .{
+                .layer_choice = layer_choice,
+                .placement = .{ .refused = .{ .whole_model_split = pin } },
+            };
         }
 
-        placed.selects = .hybrid;
+        layer_choice.selects = .hybrid;
     } else {
-        placed.selects = armFor(flag, split.split, n_layers);
-        switch (placed.selects.?) {
-            // The host arm runs at the base window. Only the device clamps it.
+        layer_choice.selects = placementKindFor(flag, split.host_layers, n_layers);
+        switch (layer_choice.selects.?) {
+            // The host placement runs at the base window. Only the device clamps it.
             .cpu => return .{
-                .placed = placed,
-                .arm = .{
-                    .ok = .{ .cpu = resolve.cpuArm(.run, input, card, kv_dtype, window, facts) },
+                .layer_choice = layer_choice,
+                .placement = .{
+                    .ok = .{
+                        .cpu = resolve.hostPlacement(
+                            .run,
+                            input,
+                            card,
+                            kv_dtype,
+                            window,
+                            resources,
+                        ),
+                    },
                 },
             },
             // The clamped window clamps again to itself.
             .fused => return .{
-                .placed = placed,
-                .arm = .{
+                .layer_choice = layer_choice,
+                .placement = .{
                     .ok = .{
-                        .fused = sessionFused(kind, input, card, kv_dtype, clamped.window, facts),
+                        .fused = sessionFused(
+                            kind,
+                            input,
+                            card,
+                            kv_dtype,
+                            clamped.window,
+                            resources,
+                        ),
                     },
                 },
             },
@@ -656,39 +693,41 @@ fn sessionArm(
     }
 
     // Quote the hybrid.
-    const q = quoteOf(kv, split.split, host, 1, false, facts.ram_free);
+    const q = quoteOf(kv, split.host_layers, host, 1, false, resources.ram_free);
     var plan = pricedOf(split, q);
     if (plan) |*p| {
         // A forced all-host split prices no device bytes, but the hybrid still uploads the head.
-        if (p.split == n_layers) {
+        if (p.host_layers == n_layers) {
             p.weight_resident = m.head_weights;
         }
     }
 
     return .{
-        .placed = placed,
-        .arm = .{ .ok = .{ .hybrid = .{ .window = clamped.window, .quote = q, .plan = plan } } },
+        .layer_choice = layer_choice,
+        .placement = .{
+            .ok = .{ .hybrid = .{ .window = clamped.window, .quote = q, .plan = plan } },
+        },
     };
 }
 
-/// The whole-model arm of one stream, fitted as the header says.
+/// The whole-model placement of one stream, fitted as the header says.
 fn sessionFused(
     kind: Kind,
     input: Input,
     card: loader.ModelCard,
     kv_dtype: dtype.KvDtype,
     window: Window,
-    facts: resolve.Facts,
+    resources: resolve.Resources,
 ) Fused {
-    const m = facts.model.?;
-    const d = facts.device.?;
+    const m = resources.model.?;
+    const d = resources.device.?;
     const c = caps(card, m, d.vram, window.ceiling, 1, kv_dtype);
     const cost = kv_budget.costModel(card.kvShape(), kv_dtype);
     const clamped = clampSession(window, card, kv_dtype, d.buffer_limits);
     std.debug.assert(kv_budget.windowCeil(c) == window.ceiling);
     const fitted = fitDefault(c, cost, 1, clamped.window.base, clamped.window.flag);
     std.debug.assert(fitted.window <= clamped.window.base);
-    // The llama bench names its one slot, and the other arms let the batch state it.
+    // The llama bench names its one slot, and the other placements let the batch state it.
     const slots: ?u32 = if (kind == .bench and card.gdn == null) 1 else null;
     const plan = planShape(c, cost, .{ .window = fitted.window, .slots = slots, .batch = 1 });
     // The qwen run quote prices the prompt cache snapshots and their stages.
@@ -704,7 +743,7 @@ fn sessionFused(
         .costs = kv_cost.costVector(card, kv_dtype),
     };
 
-    // Assemble the arm.
+    // Assemble the placement.
     return .{
         .caps = c,
         .clamp = clamped.clamp,
@@ -717,7 +756,7 @@ fn sessionFused(
             .{ .ram_split = ram_split, .residency = cache },
             1,
             false,
-            facts.ram_free,
+            resources.ram_free,
         ),
         .report = if (kind == .run and card.gdn == null) report(
             c,
@@ -822,7 +861,7 @@ fn planBudget(
     return .{ .ok = out };
 }
 
-/// Plan a budget arm inside the device buffer limits. See "Budget arms" in the header.
+/// Plan a VRAM budget inside the device buffer limits.
 fn planBudgetOnDevice(
     caps_in: kv_budget.Caps,
     cost: kv_budget.KvCostModel,
@@ -918,7 +957,7 @@ fn deviceSlotsOf(
     return .{ .limit = kv_index.limitOf(verdict, lim), .slots = slots, .window = window };
 }
 
-/// The RAM quote of one arm at split `k`, or the refusal that names it.
+/// The RAM quote of one placement at split `k`, or the refusal that names it.
 fn quoteOf(
     kv: kv_budget.KvStructure,
     k: u32,
@@ -939,9 +978,9 @@ fn quoteOf(
 }
 
 fn pricedOf(
-    split: kv_budget.PlacementPlan,
+    split: kv_budget.LayerSplit,
     q: Result(kv_budget.RamQuote),
-) ?kv_budget.PlacementPlan {
+) ?kv_budget.LayerSplit {
     return switch (q) {
         .ok => |v| split.priced(v),
         .refused => null,
@@ -949,20 +988,20 @@ fn pricedOf(
 }
 
 /// A pinned split the VRAM figure cannot fund, with its cost. Only a count reaches it.
-fn placementRefusal(
+fn layerSplitRefusal(
     kind: Kind,
     c: kv_budget.Caps,
-    m: ModelFacts,
+    m: ModelNeeds,
     kv: kv_budget.KvStructure,
     n_gpu: u32,
 ) Refusal {
-    const q = kv_budget.placementQuote(c, m.layers(), m.head_weights, kv, n_gpu);
+    const q = kv_budget.quoteLayerSplit(c, m.layers(), m.head_weights, kv, n_gpu);
     return .{
-        .placement_vram = .{ .kind = kind, .n_gpu = n_gpu, .spend = q.spend, .usable = q.usable },
+        .layer_split_vram = .{ .kind = kind, .n_gpu = n_gpu, .spend = q.spend, .usable = q.usable },
     };
 }
 
-fn fusedOk(r: Result(Fused)) Result(Arm) {
+fn fusedOk(r: Result(Fused)) Result(Placement) {
     return switch (r) {
         .ok => |f| .{ .ok = .{ .fused = f } },
         .refused => |x| .{ .refused = x },
@@ -1190,49 +1229,52 @@ test "planBudgetOnDevice: pinned slots cut the window, and bought slots stop at 
     );
 }
 
-test "armFor: the flag and the resolved split select the runner" {
-    const Case = struct { flag: ?kv_budget.GpuLayers, split: u32, want: ArmTag };
+test "placementKindFor: the flag and the resolved split select the runner" {
+    const Case = struct { flag: ?kv_budget.GpuLayers, host_layers: u32, want: PlacementKind };
     const n: u32 = 32;
     const cases = [_]Case{
         // No flag keeps the whole-model path.
-        .{ .flag = null, .split = 0, .want = .fused },
+        .{ .flag = null, .host_layers = 0, .want = .fused },
         // A funded count of every layer is the whole-model path again.
-        .{ .flag = .{ .count = n }, .split = 0, .want = .fused },
-        .{ .flag = .{ .count = 16 }, .split = 16, .want = .hybrid },
+        .{ .flag = .{ .count = n }, .host_layers = 0, .want = .fused },
+        .{ .flag = .{ .count = 16 }, .host_layers = 16, .want = .hybrid },
         // The boundary pins: a suffix of one layer, and a prefix of one.
-        .{ .flag = .{ .count = 1 }, .split = n - 1, .want = .hybrid },
-        .{ .flag = .{ .count = n - 1 }, .split = 1, .want = .hybrid },
+        .{ .flag = .{ .count = 1 }, .host_layers = n - 1, .want = .hybrid },
+        .{ .flag = .{ .count = n - 1 }, .host_layers = 1, .want = .hybrid },
         // Auto selects by the split alone. The two degenerate splits are the
         // whole-model runners, one per tier.
-        .{ .flag = .auto, .split = 0, .want = .fused },
-        .{ .flag = .auto, .split = 1, .want = .hybrid },
-        .{ .flag = .auto, .split = 15, .want = .hybrid },
-        .{ .flag = .auto, .split = n - 1, .want = .hybrid },
-        .{ .flag = .auto, .split = n, .want = .cpu },
+        .{ .flag = .auto, .host_layers = 0, .want = .fused },
+        .{ .flag = .auto, .host_layers = 1, .want = .hybrid },
+        .{ .flag = .auto, .host_layers = 15, .want = .hybrid },
+        .{ .flag = .auto, .host_layers = n - 1, .want = .hybrid },
+        .{ .flag = .auto, .host_layers = n, .want = .cpu },
     };
     for (cases) |c| {
-        try std.testing.expectEqual(c.want, armFor(c.flag, c.split, n));
+        try std.testing.expectEqual(c.want, placementKindFor(c.flag, c.host_layers, n));
     }
 }
 
-test "armFor: the qwen 24-layer stack selects through the same arms" {
-    // The qwen arm reuses `armFor` unchanged, so the 2B's 24 layers select the
+test "placementKindFor: the qwen 24-layer stack selects through the same placements" {
+    // The qwen placement reuses `placementKindFor` unchanged, so the 2B's 24 layers select the
     // same way the Llama 32 do. The boundary values are the gate points: a
     // suffix of one layer, and a prefix of one.
     const n: u32 = 24;
-    try std.testing.expectEqual(ArmTag.fused, armFor(null, 0, n));
-    try std.testing.expectEqual(ArmTag.fused, armFor(.{ .count = n }, 0, n));
+    try std.testing.expectEqual(PlacementKind.fused, placementKindFor(null, 0, n));
+    try std.testing.expectEqual(PlacementKind.fused, placementKindFor(.{ .count = n }, 0, n));
     for ([_]u32{ 1, 2, 6, 12, 18, 22, 23 }) |g| {
-        try std.testing.expectEqual(ArmTag.hybrid, armFor(.{ .count = g }, n - g, n));
-        try std.testing.expectEqual(ArmTag.hybrid, armFor(.auto, n - g, n));
+        try std.testing.expectEqual(
+            PlacementKind.hybrid,
+            placementKindFor(.{ .count = g }, n - g, n),
+        );
+        try std.testing.expectEqual(PlacementKind.hybrid, placementKindFor(.auto, n - g, n));
     }
 
-    try std.testing.expectEqual(ArmTag.cpu, armFor(.auto, n, n));
+    try std.testing.expectEqual(PlacementKind.cpu, placementKindFor(.auto, n, n));
 }
 
-test "hybridSlots: the qwen arm inherits the eight-slot ceiling" {
-    // The qwen arm inherits the cap rather than lifting it, so a qwen serve
-    // derives the same clamp and refuses the same pin the Llama arm does.
+test "hybridSlots: the qwen placement inherits the eight-slot ceiling" {
+    // The qwen placement inherits the cap rather than lifting it, so a qwen serve
+    // derives the same clamp and refuses the same pin the Llama placement does.
     try std.testing.expectEqual(@as(u32, 8), limits.max_batch);
     try std.testing.expectError(error.HybridSlotsPinned, hybridSlots(16, true));
     try std.testing.expectEqual(@as(u32, 8), try hybridSlots(16, false));

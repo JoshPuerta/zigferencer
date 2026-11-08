@@ -2,6 +2,9 @@
 //! runner. A `Session` is one conversation: a KV slot, a position that persists
 //! across turns, a seeded RNG, and sampling params.
 //!
+//! Comptime. `Sessions` is generic over the runner. `@hasDecl` keeps each optional hook free for a
+//! runner without it, and a missing required hook stops the build.
+//!
 //! `Sessions` advances any subset of them one token per `decodeBatch` tick,
 //! which is the multi-session liveliness primitive. It feeds prompt turns
 //! through the same batched forward (`feed`), so chunked prefill and batched
@@ -103,7 +106,7 @@ pub fn Sessions(comptime RunnerT: type) type {
         /// The runner type, so the layers above can gate on its hooks.
         pub const Runner = RunnerT;
 
-        // Check the runner surface. See "Runner surface" in the header.
+        // Check the runner surface.
         comptime {
             requireSessionsSurface(RunnerT);
         }
@@ -165,7 +168,6 @@ pub fn Sessions(comptime RunnerT: type) type {
             for (self.table, 0..) |*s, id| {
                 if (s.state != .free) continue;
 
-                // See "KV reuse" in the header.
                 if (comptime @hasDecl(RunnerT, "resetSlotState")) {
                     self.runner.resetSlotState(@intCast(id));
                 }
@@ -230,7 +232,7 @@ pub fn Sessions(comptime RunnerT: type) type {
             return self.runner.evictSlotBytesFor(n_rows);
         }
 
-        /// Seed a fresh session with a cached KV prefix. See "Prefix seeding" in the header.
+        /// Seed a fresh session with a cached KV prefix.
         /// `blob` must come from `snapshotPrefix` at the same `n_rows`. The caller keeps it.
         pub fn restorePrefix(self: *Self, id: u32, n_rows: u32, blob: []const u8) !void {
             if (comptime !can_snapshot) @compileError("runner cannot snapshot slot state");
@@ -298,7 +300,7 @@ pub fn Sessions(comptime RunnerT: type) type {
             );
         }
 
-        /// Release a slot. See "KV reuse" in the header.
+        /// Release a slot.
         pub fn destroy(self: *Self, id: u32) void {
             std.debug.assert(id < self.table.len);
             std.debug.assert(self.table[id].state != .free);
@@ -560,10 +562,12 @@ fn checkFn(
     comptime params: []const type,
     comptime Payload: type,
 ) void {
+    // Resolve the function.
     const where = "runner surface: " ++ @typeName(T) ++ "." ++ name ++ " ";
     const info = @typeInfo(@TypeOf(@field(T, name)));
     if (info != .@"fn") @compileError(where ++ "is not a function");
 
+    // Check the arity and the receiver.
     const f = info.@"fn";
     if (f.params.len != params.len + 1) {
         @compileError(where ++ "takes " ++ std.fmt.comptimePrint("{d}", .{f.params.len}) ++
@@ -577,6 +581,7 @@ fn checkFn(
         );
     }
 
+    // Check the type of each argument.
     inline for (params, 0..) |Want, i| {
         const got = f.params[i + 1].type orelse @compileError(where ++ "has a generic argument");
         if (got != Want) {
@@ -587,6 +592,7 @@ fn checkFn(
         }
     }
 
+    // Check the payload type.
     const ret = f.return_type orelse @compileError(where ++ "has a generic return type");
     const payload = switch (@typeInfo(ret)) {
         .error_union => |eu| eu.payload,
@@ -857,7 +863,7 @@ test "runner surface: the session seam holds for every runner in this build" {
             for (hybrids) |T| {
                 requireStepSurface(T);
                 requireSwapSurface(T);
-                requirePlanValue(T, kv_budget.PlacementPlan);
+                requirePlanValue(T, kv_budget.LayerSplit);
             }
 
             requireRecurrentState(qwen_fused.QwenFusedRunner);

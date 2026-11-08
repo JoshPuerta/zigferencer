@@ -1,6 +1,8 @@
 //! Golden-id gate for the llama3 (`llama-bpe`) pre-tokenizer against the real
 //! Meta-Llama-3.1-8B-Instruct-Q8_0 GGUF.
 //!
+//! Comptime. `row` takes its text and ids at comptime, so each golden case is a constant.
+//!
 //! Reference. The expected ids come from the llama.cpp `llama-tokenize --ids` reference, so the ids
 //! must match it exactly. The gate pins the regex pre-split and `ignore_merges` to that reference.
 //!

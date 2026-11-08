@@ -94,10 +94,8 @@ pub fn hashOut(out: []const f32) u64 {
 pub fn computeErrors(ref: []const f32, got: []const f32) Errors {
     std.debug.assert(ref.len == got.len);
 
-    // Denominator floor: an expected magnitude below it counts as zero for rel_err.
-    // Without it, a near-cancellation output inflates rel_err by 4 to 5 orders of
-    // magnitude, while the absolute drift stays f32 noise. 1e-5 is far below the
-    // typical output of every op.
+    // Denominator floor: an expected magnitude below 1e-5 counts as zero for rel_err. Without it,
+    // a near-cancellation output inflates rel_err by 4 to 5 orders of magnitude over f32 noise.
     const abs_floor: f32 = 1e-5;
     var max_abs: f32 = 0;
     var max_rel: f32 = 0;

@@ -1,6 +1,8 @@
 //! The thread policy of the runner tests, and the start of the pool that
 //! serves it. Every test that builds a runner starts its own pool here, so no
 //! pool outlives the test that owns it.
+//!
+//! Comptime. An assert pins the test thread count at one or more.
 
 const std = @import("std");
 const zigferencer = @import("zigferencer");

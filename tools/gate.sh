@@ -26,7 +26,7 @@ readonly record_qwen_2b=0xd4f86c9b4daf7731
 
 # parse_args sets these once, and main makes them readonly.
 gate=""
-arm=all
+scope=all
 model="$smollm2"
 list=0
 extra=()
@@ -38,7 +38,7 @@ extra=()
 # per-op backend frames its KV at f32 alone, so its row sets f32 on every row.
 rows_backends() {
     local a="$model --prompt Hello --max-tokens 32 --runs 1"
-    [ "$arm" = cpu ] || a="$a --kv-dtype f32"
+    [ "$scope" = cpu ] || a="$a --kv-dtype f32"
     cat <<EOF
 naive    naive    same  $a
 simd     simd     same  $a
@@ -120,7 +120,7 @@ parse_args() {
                 usage
                 exit 0
                 ;;
-            --cpu | --gpu) arm="${1#--}" ;;
+            --cpu | --gpu) scope="${1#--}" ;;
             --list) list=1 ;;
             --model)
                 [ $# -ge 2 ] || die_usage "--model needs a name"
@@ -154,8 +154,8 @@ selected_rows() {
     local build rest
     "rows_$1" | while read -r build rest; do
         case "$build" in
-            vulkan*) [ "$arm" != cpu ] || continue ;;
-            *) [ "$arm" != gpu ] || continue ;;
+            vulkan*) [ "$scope" != cpu ] || continue ;;
+            *) [ "$scope" != gpu ] || continue ;;
         esac
         case "$build" in
             simd*) host_has_simd || { note "skip $build: the host lacks AVX2 or FMA"; continue; } ;;
@@ -226,7 +226,7 @@ run_rows() {
 
 main() {
     parse_args "$@"
-    readonly gate arm model list extra
+    readonly gate scope model list extra
 
     local table=() g
     if [ "$gate" = all ]; then

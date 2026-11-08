@@ -1,6 +1,7 @@
 //! The value every command handler receives, and the buffer size its stdout writer uses.
 
 const std = @import("std");
+const limits = @import("../core/limits.zig");
 const Io = std.Io;
 const Allocator = std.mem.Allocator;
 
@@ -19,15 +20,14 @@ pub const Context = struct {
     /// The one stdout writer of the process. `entry` owns it, so its address stays stable. A
     /// command flushes it at its own points. `entry` reads the cause of a failed write here.
     stdout: *Io.File.Writer,
-    /// Resolved once from `$ZIGFERENCER_MODELS_DIR`. See core/registry.zig.
+    /// Resolved once from `$ZIGFERENCER_MODELS_DIR`.
     models_root: []const u8,
-    /// Resolved once from `$ZIGFERENCER_CACHE_DIR`. See runtime/prompt_cache.zig.
+    /// Resolved once from `$ZIGFERENCER_CACHE_DIR`.
     cache_dir: []const u8,
-    /// Replaces the storage-buffer range that the device reports. Every command that opens a
-    /// Vulkan context passes it.
-    vk_storage_range: ?u64,
-    /// True when stdout takes ANSI color. Commands build a `style.Palette` from it.
+    /// The device choices of the environment. A command passes them to every Vulkan context.
+    vk_options: limits.DeviceOptions,
+    /// True when stdout takes ANSI color.
     color: bool,
-    /// The same for stderr, which redirects apart from stdout. The pickers key their palette on it.
+    /// The same for stderr, which redirects apart from stdout.
     color_err: bool,
 };

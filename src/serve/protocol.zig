@@ -3,6 +3,8 @@
 //! transport. A ZMQ message carries one frame. The server uses ZMTP 3.x with the NULL security
 //! method, and a DEALER socket is the client.
 //!
+//! Comptime. Asserts pin the largest frames to the frame limits. Codec helpers take the type.
+//!
 //! Frame. One frame is a 20-byte header and a payload:
 //!
 //!     off  field        type  rule
@@ -110,7 +112,7 @@ pub const max_server_frame_bytes: usize = header_bytes + 4 + 1 + 2 + limits.max_
 /// The bytes of a lease token on the wire.
 pub const token_bytes: usize = 16;
 
-/// The flag bits of a `generate` payload. See "Generate payload" in the header.
+/// The flag bits of a `generate` payload.
 const generate_flag_sampling: u8 = 1 << 0;
 
 const generate_flag_think_switch: u8 = 1 << 1;
@@ -264,7 +266,7 @@ pub const FinishReason = enum(u8) {
     cancelled = 3,
 };
 
-/// Sampling settings on the wire. See "Sampling block" in the header.
+/// Sampling settings on the wire.
 pub const Sampling = struct {
     temperature: f32,
     top_k: u32,
@@ -287,7 +289,7 @@ pub const LastDone = struct {
     reasoning_tokens: u32,
 };
 
-/// The reply to a `session_resume`. See "Resumed reply" in the header.
+/// The reply to a `session_resume`.
 pub const Resumed = struct {
     token: Token,
     kv_pos: u32,
@@ -373,7 +375,6 @@ pub const Appended = struct {
 pub const ClientMsg = union(enum) {
     hello,
     session_open: struct { sampling: Sampling, system_prompt: []const u8 },
-    /// See "Generate payload" in the header.
     generate: struct {
         max_tokens: u32,
         sampling: ?Sampling,
@@ -387,13 +388,13 @@ pub const ClientMsg = union(enum) {
     stats,
     ping,
     shutdown,
-    /// Fork the session in `header.session_id`. See "Session verbs" in the header.
+    /// Fork the session in `header.session_id`.
     session_clone: struct { sampling: Sampling },
-    /// Feed kept pairs into an idle session. See "Session verbs" in the header.
+    /// Feed kept pairs into an idle session.
     session_append: AppendPairs,
-    /// Keep the session past a connection drop for `ttl_ms`. See "Session verbs" in the header.
+    /// Keep the session past a connection drop for `ttl_ms`.
     session_keep: struct { ttl_ms: u32 },
-    /// Attach the session of `token` to this connection. See "Session verbs" in the header.
+    /// Attach the session of `token` to this connection.
     session_resume: struct { token: Token },
 };
 
@@ -439,7 +440,7 @@ pub const ServerMsg = union(enum) {
     session_closed,
     shutdown_ack,
     appended: Appended,
-    /// The granted time to live, then the token. See "Kept reply" in the header.
+    /// The granted time to live, then the token.
     kept: struct { granted_ms: u32, token: Token },
     resumed: Resumed,
 };
@@ -1934,6 +1935,7 @@ fn genClientMsg(r: std.Random, size: u32, text: *[256]u8, pair_buf: *[256]u8) Cl
 }
 
 fn genServerMsg(r: std.Random, size: u32, text: *[256]u8) ServerMsg {
+    // Pick a random message kind and fill its fields.
     const tag = r.enumValue(std.meta.Tag(ServerMsg));
     return switch (tag) {
         inline .pong, .session_closed, .shutdown_ack => |t| t,
@@ -1975,6 +1977,8 @@ fn genServerMsg(r: std.Random, size: u32, text: *[256]u8) ServerMsg {
             .tokens_generated_total = r.int(u64),
             .uptime_ms = r.int(u64),
         } },
+
+        // Build the messages that carry derived fields.
         .appended => blk: {
             var a: Appended = .{ .n = 1 + r.uintLessThan(u16, limits.max_append_pairs) };
             var pos: u32 = r.uintAtMost(u32, 1 << 20);

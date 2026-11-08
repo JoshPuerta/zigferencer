@@ -17,7 +17,7 @@
 //   sum += (input[blk * 32 + i] * scale) * float(q), as three separate IEEE-754 f32 ops. `glslc -O`
 //   emits no FMA, and the device compiler is the part that can fuse a multiply and an add.
 //   `precise` adds the NoContraction decoration, which forbids that fusion. A fused GPU result
-//   drifts by 1 to 4 ULP per term. With `precise`, every intermediate keeps its own rounding step
+//   drifts from the CPU result. With `precise`, every intermediate keeps its own rounding step
 //   and matches the CPU bit for bit, because the two sides multiply and add in the same order.
 //
 // Bindings

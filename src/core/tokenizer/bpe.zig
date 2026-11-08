@@ -33,8 +33,8 @@
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 const span = @import("../span.zig");
-const v = @import("vocab.zig");
-const Vocab = v.Vocab;
+const vocab_mod = @import("vocab.zig");
+const Vocab = vocab_mod.Vocab;
 
 // -- types ------------------------------------------------------------------
 
@@ -48,9 +48,9 @@ const Cp = struct { cp: u21, len: usize };
 
 // -- api --------------------------------------------------------------------
 
-/// Encode `text` to token ids: specials greedily, the rest through BPE merges. BOS is prepended
-/// when `vocab.add_bos` and `sequence_start` hold. A follow-up turn passes false, so BOS appears
-/// only at position 0.
+/// Encode `text` to token ids: specials greedily, the rest through BPE merges. A caller never
+/// prepends BOS: this function does, when `vocab.add_bos` and `sequence_start` hold. A follow-up
+/// turn passes false, so BOS appears only at position 0.
 pub fn encodeAlloc(
     vocab: *const Vocab,
     gpa: Allocator,
@@ -61,7 +61,7 @@ pub fn encodeAlloc(
     defer sp.end();
 
     std.debug.assert(vocab.tokens.len > 0);
-    // Take the pre-split path for a non-default tokenizer. See "Pre-split path" in the header.
+    // Take the pre-split path for a non-default tokenizer.
     if (vocab.pre != .default) {
         const pre_ids = try encodePreSplit(vocab, gpa, text, sequence_start);
         if (std.debug.runtime_safety) {
@@ -95,7 +95,7 @@ pub fn encodeAlloc(
         }
 
         const id = vocab.byte_to_id[text[pos]];
-        if (id == v.no_token) return error.UntokenizableByte;
+        if (id == vocab_mod.no_token) return error.UntokenizableByte;
 
         try pending.append(gpa, id);
         pos += 1;
@@ -179,7 +179,7 @@ fn flushSegment(
         var best_idx: ?usize = null;
         var i: usize = 0;
         while (i + 1 < pending.items.len) : (i += 1) {
-            const key = v.pairKey(pending.items[i], pending.items[i + 1]);
+            const key = vocab_mod.pairKey(pending.items[i], pending.items[i + 1]);
             if (vocab.merge_rank.get(key)) |rank| {
                 if (rank < best_rank) {
                     best_rank = rank;
@@ -192,7 +192,7 @@ fn flushSegment(
 
         const idx = best_idx.?;
         const merged = vocab.merge_to_id.get(
-            v.pairKey(pending.items[idx], pending.items[idx + 1]),
+            vocab_mod.pairKey(pending.items[idx], pending.items[idx + 1]),
         ).?;
         pending.items[idx] = merged;
         // Drop the consumed right-hand element.
@@ -215,6 +215,7 @@ fn encodePreSplit(
     text: []const u8,
     sequence_start: bool,
 ) EncodeError![]u32 {
+    // Open the output with the BOS token.
     var ids: std.ArrayList(u32) = .empty;
     errdefer ids.deinit(gpa);
 
@@ -228,6 +229,7 @@ fn encodePreSplit(
     var mapped: std.ArrayList(u8) = .empty; // byte-level pre-token, for ignore_merges
     defer mapped.deinit(gpa);
 
+    // Walk the text one pre-token at a time.
     var pos: usize = 0;
     while (pos < text.len) {
         if (matchSpecial(vocab, text, pos)) |m| {
@@ -239,10 +241,11 @@ fn encodePreSplit(
         const seg = capAtSpecial(vocab, text, pos, preTokenLen(vocab, text, pos));
         const bytes = text[pos..][0..seg];
 
+        // Emit a whole pre-token that the vocabulary holds.
         if (vocab.ignore_merges) {
             mapped.clearRetainingCapacity();
             for (bytes) |b| {
-                try mapped.appendSlice(gpa, v.byteLevel(b));
+                try mapped.appendSlice(gpa, vocab_mod.byteLevel(b));
             }
 
             if (vocab.token_to_id.get(mapped.items)) |id| {
@@ -252,9 +255,10 @@ fn encodePreSplit(
             }
         }
 
+        // Map the bytes and merge the pre-token.
         for (bytes) |b| {
             const id = vocab.byte_to_id[b];
-            if (id == v.no_token) return error.UntokenizableByte;
+            if (id == vocab_mod.no_token) return error.UntokenizableByte;
             try pending.append(gpa, id);
         }
 
@@ -406,8 +410,7 @@ fn preSplitLlama(text: []const u8, from: usize, digit_max: usize) usize {
     return j - from; // 7. \s+
 }
 
-/// Byte length of the next smollm (GPT-2) pre-token at `from`, always at least 1. See "Smollm
-/// regex" in the header.
+/// Byte length of the next smollm (GPT-2) pre-token at `from`, always at least 1.
 fn preSplitGpt2(text: []const u8, from: usize) usize {
     const len = text.len;
     const first = nextCp(text, from);
@@ -547,7 +550,7 @@ fn testVocab(arena: Allocator, pre: []const u8) !Vocab {
         .{ .key = "tokenizer.ggml.eos_token_id", .value = .{ .u32_val = 256 } },
         .{ .key = "tokenizer.ggml.pre", .value = .{ .string = pre } },
     });
-    return v.buildFromParsed(
+    return vocab_mod.buildFromParsed(
         arena,
         .{ .header = undefined, .kvs = kvs, .tensors = &.{}, .data_offset = 0, .alignment = 1 },
     );
@@ -627,11 +630,11 @@ test "property: decode(encode(s)) == s over random byte strings for every pre-sp
         vocab.* = try testVocab(arena, pre);
     }
 
-    for (vocabs, [_]v.PreType{ .default, .llama3, .qwen, .smollm }) |vocab, pre| {
+    for (vocabs, [_]vocab_mod.PreType{ .default, .llama3, .qwen, .smollm }) |vocab, pre| {
         try std.testing.expectEqual(pre, vocab.pre);
         try std.testing.expectEqual(@as(usize, 2), vocab.specials_sorted.len);
         for (vocab.byte_to_id) |id| {
-            try std.testing.expect(id != v.no_token);
+            try std.testing.expect(id != vocab_mod.no_token);
         }
     }
 
@@ -708,11 +711,14 @@ fn naiveEncode(arena: Allocator, text: []const u8, out: *std.ArrayList(u32)) !vo
     const table = byteLevelTable();
     var symbols: std.ArrayList([]const u8) = .empty;
     var pos: usize = 0;
+
+    // Read the text to its end.
     while (true) {
         const special = for (test_specials, 0..) |sp, i| {
             if (std.mem.startsWith(u8, text[pos..], sp)) break i;
         } else null;
 
+        // Merge by lowest rank at a special token or at the end.
         if (pos == text.len or special != null) {
             while (true) {
                 var best: ?usize = null;
@@ -746,6 +752,7 @@ fn naiveEncode(arena: Allocator, text: []const u8, out: *std.ArrayList(u32)) !vo
             continue;
         }
 
+        // Add the next byte as a symbol.
         const entry = &table[text[pos]];
         try symbols.append(arena, entry.bytes[0..entry.len]);
         pos += 1;

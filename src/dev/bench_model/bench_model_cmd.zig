@@ -2,6 +2,8 @@
 //! and repeats it `--runs` times. It reports TTFT and ITL with mean, stddev, min
 //! and max, and an FNV-1a 64 hash of the generated token ids.
 //!
+//! Comptime. Generic over the model family. The fused build option picks the GPU path.
+//!
 //! A stable hash across runs proves the forward pass is deterministic. A stable
 //! hash across binaries built with different `-Dops-backend` values is the
 //! cross-backend gate, because a backend that changes the tokens changed the math.
@@ -9,7 +11,7 @@
 //!
 //! This file checks the flags, loads the model, and picks one path. Each path owns
 //! its runner: `bench_model_host.zig` (CPU and per-op Vulkan), `bench_model_fused.zig`
-//! (the whole model on the GPU), and `bench_model_placement.zig` (a CPU and GPU split).
+//! (the whole model on the GPU), and `bench_model_hybrid.zig` (a CPU and GPU split).
 
 const std = @import("std");
 const zigferencer = @import("zigferencer");
@@ -18,7 +20,7 @@ const build_options = @import("build_options");
 const context = zigferencer.cli.context;
 const args = zigferencer.cli.args;
 const select = zigferencer.cli.select;
-const boot_facts = zigferencer.cli.boot_facts;
+const boot_resources = zigferencer.cli.boot_resources;
 const boot_lines = zigferencer.cli.boot_lines;
 const common = @import("bench_model_common.zig");
 const host = @import("bench_model_host.zig");
@@ -34,21 +36,22 @@ const per_op_build = build_options.use_vulkan_ops;
 
 // The device paths resolve to `void` on a CPU build, which never analyzes them.
 const fused = if (fused_build) @import("bench_model_fused.zig") else void;
-const placement = if (fused_build) @import("bench_model_placement.zig") else void;
+const hybrid_path = if (fused_build) @import("bench_model_hybrid.zig") else void;
 
 // -- api --------------------------------------------------------------------
 
 pub fn run(ctx: context.Context) !void {
+    // Check the flags and resolve the thread policy.
     const opt = try args.parseInto(common.Options, ctx) orelse return;
     try refuseBadFlags(ctx.io, opt);
 
     // A whole-model fused bench runs no CPU op, so its pool starts no workers.
     const runs_cpu_ops = !fused_build or opt.engine.gpu_layers != null;
     const flags = opt.engine.threads.policyFlags();
-    const policy = try boot_facts.resolvePolicy(ctx.io, flags, runs_cpu_ops);
+    const policy = try boot_resources.resolvePolicy(ctx.io, flags, runs_cpu_ops);
 
     const model = try select.model(ctx, opt.pub_name);
-    const entry = boot_facts.entryOf(model);
+    const entry = boot_resources.entryOf(model);
     const input: resolve_mod.Input = .{ .engine = opt.engine, .force_hybrid = opt.force_hybrid };
 
     // Every refusal that needs no model file lands here, before the load.
@@ -57,24 +60,26 @@ pub fn run(ctx: context.Context) !void {
         .refused => |r| return boot_lines.refuse(ctx.io, model.pub_name, r),
     }
 
+    // Load the model and resolve its placement.
     const path = try registry.resolveLoadPath(ctx.arena, ctx.io, ctx.models_root, model.*);
     var loaded = try loader.load(ctx.io, ctx.arena, path);
     defer loaded.close();
 
-    const model_facts = try boot_facts.modelFacts(ctx.gpa, &loaded);
-    const ram_free = boot_facts.hostRamFree(ctx.io);
-    const facts: resolve_mod.Facts = .{ .ram_free = ram_free, .model = model_facts };
-    const resolved = switch (resolve_mod.resolve(.bench, input, entry, loaded.card, facts)) {
+    const model_needs = try boot_resources.modelNeeds(ctx.gpa, &loaded);
+    const ram_free = boot_resources.hostRamFree(ctx.io);
+    const resources: resolve_mod.Resources = .{ .ram_free = ram_free, .model = model_needs };
+    const resolved = switch (resolve_mod.resolve(.bench, input, entry, loaded.card, resources)) {
         .ok => |r| r,
         .refused => |r| return boot_lines.refuse(ctx.io, model.pub_name, r),
     };
 
-    const boot: boot_facts.DeviceBoot = .{
+    // Hand the bench to the family.
+    const boot: boot_resources.DeviceBoot = .{
         .kind = .bench,
         .input = input,
         .entry = entry,
         .card = loaded.card,
-        .model = model_facts,
+        .model = model_needs,
         .ram = .{ .read = ram_free },
     };
     const bench: common.Bench = .{
@@ -98,7 +103,7 @@ pub fn run(ctx: context.Context) !void {
 fn benchFamily(comptime Family: type, b: *const common.Bench) !void {
     if (comptime fused_build) {
         if (b.opt.engine.gpu_layers == null) return fused.bench(Family, b);
-        return placement.bench(Family, b);
+        return hybrid_path.bench(Family, b);
     } else {
         return host.bench(Family, b);
     }

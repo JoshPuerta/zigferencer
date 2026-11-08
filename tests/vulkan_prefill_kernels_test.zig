@@ -1,5 +1,7 @@
 //! Digest gate for the batched-prefill kernels of the Qwen3.5-2B shapes.
 //!
+//! Comptime. Asserts pin the shapes and batch bounds that the digest tables assume.
+//!
 //! Digests. A kernel change that must keep the output bytes proves it here. Each test runs the
 //! current kernels on fixed seeded inputs and compares a 64-bit FNV-1a digest of the output bytes
 //! with a table that a device run minted. A null entry fails the test and prints the table to paste

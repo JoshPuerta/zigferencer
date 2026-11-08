@@ -1,5 +1,7 @@
 //! Per-op CPU decode timer, shared by the llama and the qwen CPU runners.
 //!
+//! Comptime. `core_log.hot` removes the timer brackets from builds without hot tracing.
+//!
 //! Categories. One `ProfileCat` enum names every category of both families. A family uses a fixed
 //! subset, and that subset partitions one decode step: the timed brackets do not overlap, and
 //! together they cover the step. `CpuProfile` records its family, so a bracket that charges a
@@ -143,7 +145,7 @@ pub const Span = if (core_log.hot) std.Io.Clock.Timestamp else void;
 // -- api --------------------------------------------------------------------
 
 /// Open a timing span. With `-Dtrace`, it reads the clock only when a profile is installed or the
-/// span recorder runs. See "Off path" in the header.
+/// span recorder runs.
 pub inline fn begin(slot: Slot, io: std.Io) Span {
     if (comptime core_log.hot) {
         return if (slot != null or span.enabled()) std.Io.Clock.Timestamp.now(

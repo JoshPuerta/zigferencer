@@ -2,6 +2,9 @@
 //! one `GpuProfile`: the two decode ring buffers, the batch and prefill buffer of each runner, and
 //! the one-shot staging buffer (through `vulkan_ctx.Context.staging_query_pool`).
 //!
+//! Comptime. `inline for` walks the `Phase` fields, and `core_log.hot` removes the trace code
+//! from builds without hot tracing.
+//!
 //! Levels. The level comes from `$ZIGFERENCER_TRACE_GPU` (`span.gpuLevel`). At `off`, the default,
 //! `begin`, `mark`, and `end` emit no command, so the command stream is byte-identical to an
 //! unprofiled one. At `submit`, a buffer writes two timestamps, start and end. At `phases`, it
@@ -170,7 +173,7 @@ pub const GpuProfile = struct {
     level: Level,
     /// Timestamps the last record wrote. Zero means nothing to read back.
     n: u32 = 0,
-    /// Marks past the `prof_max` bound since `begin`. See "Full bound" in the header.
+    /// Marks past the `prof_max` bound since `begin`.
     dropped: u32 = 0,
     /// True after the first warning of a full bound.
     warned_full: bool = false,
@@ -207,8 +210,9 @@ pub const GpuProfile = struct {
     pub fn reserve(self: *GpuProfile, level: Level) !void {
         if (level != .off and !self.canTime()) {
             log.err(
-                "this GPU queue writes no usable timestamps ({d} valid bits, a period of " ++
-                    "{d} ns), so a GPU profile cannot run. Run without the profile flag",
+                "this GPU queue writes no usable timestamps ({d} valid bits, " ++
+                    "a period of {d} ns), so a GPU profile cannot run. " ++
+                    "Run without the profile flag",
                 .{ self.ctx.timestamp_valid_bits, self.period_ns },
             );
             return error.TimestampsUnsupported;
@@ -258,8 +262,9 @@ pub const GpuProfile = struct {
         if (self.n >= prof_max) {
             if (!self.warned_full) {
                 log_dispatch.warn(
-                    "profile: the {d}-timestamp bound is full, so the rest of each such " ++
-                        "submit goes untimed. The readout counts the dropped marks",
+                    "profile: the {d}-timestamp bound is full, " ++
+                        "so the rest of each such submit goes untimed. " ++
+                        "The readout counts the dropped marks",
                     .{prof_max},
                 );
             }

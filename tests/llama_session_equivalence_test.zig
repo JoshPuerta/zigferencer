@@ -219,7 +219,7 @@ test "llama batched and chunk-fed decode are bit-identical to single-session run
                 .tokens = ids_late[fed..][0..1],
                 .final = final,
             }, &sids, &out);
-            // The decode rows sit at base+p. See "Compact logits" in the header.
+            // The decode rows sit at base+p.
             const base: usize = if (final) 1 else 0;
             for (0..2) |p| {
                 try std.testing.expectEqual(reference[p].tokens[k], out[p]);
@@ -296,7 +296,6 @@ test "llama batched and chunk-fed decode are bit-identical to single-session run
 
     // -- pass f: forced parallelism -----------------------------------------
     // Batched decode under forced parallelism must equal the serial reference.
-    // See "Forced parallelism" in the header.
     {
         const cfg_par: test_policy.Policy = .{ .n_threads = 4, .min_parallel_flops = 0 };
         var par_cpu_pool: test_policy.Pool = undefined;

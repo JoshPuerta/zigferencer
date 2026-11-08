@@ -3,13 +3,18 @@
 //! of a prefill chunk, so the record order of the resident rows, the split passes, and the merges
 //! has one home.
 //!
-//! Kit. The recorder knows no backend. It records through an attention kit, a type with a fixed
-//! method set: `recordResident`, `recordResidentRun`, `recordSplit`, `recordMerge`, and
-//! `recordBarrier`. A kit also declares two facts: `order`, the class of its summation order, and
-//! `tolerance`, its declared error against the CPU reference. A kit names its command handle `Cmd`
-//! and its per-layer bindings `Binding`. The build selects the Vulkan kit with `-Dattn-kernel`.
+//! Kernel set. The recorder knows no backend. It records through an attention kernel set, a type
+//! with a fixed method set: `recordResident`, `recordResidentRun`, `recordSplit`, `recordMerge`,
+//! and `recordBarrier`. A kernel set also declares two values: `order`, the class of its summation
+//! order, and `tolerance`, its declared error against the CPU reference. A kernel set names its
+//! command handle `Cmd` and its per-layer bindings `Binding`. The build selects the Vulkan kernel
+//! set with `-Dattn-kernel`.
+//!
+//! Comptime. `assertKernels` checks the kernel set when the recorder is built, so a backend that
+//! lacks a method fails the build.
 //!
 //! Record order. A plan records in this order:
+//!
 //!   1. The resident rows: one dispatch per row for a step, or one run of the resident prefix for
 //!      a prefill chunk.
 //!   2. Per record group: the split passes, a barrier, then the merges. Entry `k` of a group
@@ -44,34 +49,35 @@ pub fn planStep(rows: []const step_row.StepRow, max_splits: u32) attn_split.Attn
     return plan;
 }
 
-/// Record the attention of one layer of a step: every dispatch of `plan` through `kit` into `cmd`.
+/// Record the attention of one layer of a step: every dispatch of `plan` through `kernels` into
+/// `cmd`.
 pub fn record(
-    comptime Kit: type,
-    kit: Kit,
-    cmd: Kit.Cmd,
+    comptime Kernels: type,
+    kernels: Kernels,
+    cmd: Kernels.Cmd,
     plan: *const attn_split.AttnPlan,
-    binding: Kit.Binding,
+    binding: Kernels.Binding,
 ) void {
-    comptime assertKit(Kit);
+    comptime assertKernels(Kernels);
     plan.assertValid();
     for (plan.residentRows()) |r| {
-        kit.recordResident(cmd, binding, r);
+        kernels.recordResident(cmd, binding, r);
     }
 
-    recordGroups(Kit, kit, cmd, plan, binding);
+    recordGroups(Kernels, kernels, cmd, plan, binding);
 }
 
 /// Record the attention of one layer of a prefill chunk from `start_pos`. The resident rows are
 /// a prefix, so one run of the resident kernel records them.
 pub fn recordPrefill(
-    comptime Kit: type,
-    kit: Kit,
-    cmd: Kit.Cmd,
+    comptime Kernels: type,
+    kernels: Kernels,
+    cmd: Kernels.Cmd,
     plan: *const attn_split.AttnPlan,
-    binding: Kit.Binding,
+    binding: Kernels.Binding,
     start_pos: u32,
 ) void {
-    comptime assertKit(Kit);
+    comptime assertKernels(Kernels);
     plan.assertValid();
 
     // Check that the plan matches the chunk: resident rows first, positions ascending.
@@ -91,40 +97,40 @@ pub fn recordPrefill(
         const count: u32 = @intCast(resident.len);
         // The run ends at or before S, the bound of the resident kernel.
         assert(start_pos + count <= limits.attn_split_len);
-        kit.recordResidentRun(cmd, binding, start_pos, count);
+        kernels.recordResidentRun(cmd, binding, start_pos, count);
     }
 
-    recordGroups(Kit, kit, cmd, plan, binding);
+    recordGroups(Kernels, kernels, cmd, plan, binding);
 }
 
 // -- helpers ----------------------------------------------------------------
 
 fn recordGroups(
-    comptime Kit: type,
-    kit: Kit,
-    cmd: Kit.Cmd,
+    comptime Kernels: type,
+    kernels: Kernels,
+    cmd: Kernels.Cmd,
     plan: *const attn_split.AttnPlan,
-    binding: Kit.Binding,
+    binding: Kernels.Binding,
 ) void {
     for (plan.recordGroups(), 0..) |g, gi| {
         if (gi > 0) {
-            kit.recordBarrier(cmd);
+            kernels.recordBarrier(cmd);
         }
 
         const rows = plan.rowsOf(g);
         for (rows, 0..) |r, k| {
-            kit.recordSplit(cmd, binding, r, @intCast(k), g.stride);
+            kernels.recordSplit(cmd, binding, r, @intCast(k), g.stride);
         }
 
-        kit.recordBarrier(cmd);
+        kernels.recordBarrier(cmd);
         for (rows, 0..) |r, k| {
-            kit.recordMerge(cmd, binding, r, @intCast(k), g.stride);
+            kernels.recordMerge(cmd, binding, r, @intCast(k), g.stride);
         }
     }
 }
 
-/// A kit must declare the method set and both facts. A kit that lacks one fails the build.
-fn assertKit(comptime Kit: type) void {
+/// A kernel set must declare the method set and both values. One that lacks any fails the build.
+fn assertKernels(comptime Kernels: type) void {
     for ([_][]const u8{
         "recordResident",
         "recordResidentRun",
@@ -136,8 +142,8 @@ fn assertKit(comptime Kit: type) void {
         "Cmd",
         "Binding",
     }) |name| {
-        if (!@hasDecl(Kit, name)) {
-            @compileError("attention kernel set " ++ @typeName(Kit) ++ " lacks " ++ name);
+        if (!@hasDecl(Kernels, name)) {
+            @compileError("attention kernel set " ++ @typeName(Kernels) ++ " lacks " ++ name);
         }
     }
 }
@@ -147,8 +153,8 @@ fn assertKit(comptime Kit: type) void {
 const testing = std.testing;
 const S = limits.attn_split_len;
 
-/// A kit that logs each call, so a test reads the record order back.
-const LogKit = struct {
+/// A kernel set that logs each call, so a test reads the record order back.
+const LogKernels = struct {
     log: *Log,
 
     pub const order = .split_ascending;
@@ -176,20 +182,26 @@ const LogKit = struct {
         }
     };
 
-    pub fn recordResident(self: LogKit, cmd: Cmd, _: Binding, r: attn_split.PlanRow) void {
+    pub fn recordResident(self: LogKernels, cmd: Cmd, _: Binding, r: attn_split.PlanRow) void {
         assert(cmd == 7);
 
         self.log.add(.{ .resident = r.row });
     }
 
-    pub fn recordResidentRun(self: LogKit, cmd: Cmd, _: Binding, start_pos: u32, count: u32) void {
+    pub fn recordResidentRun(
+        self: LogKernels,
+        cmd: Cmd,
+        _: Binding,
+        start_pos: u32,
+        count: u32,
+    ) void {
         assert(cmd == 7);
 
         self.log.add(.{ .resident_run = .{ .start_pos = start_pos, .count = count } });
     }
 
     pub fn recordSplit(
-        self: LogKit,
+        self: LogKernels,
         cmd: Cmd,
         _: Binding,
         r: attn_split.PlanRow,
@@ -202,7 +214,7 @@ const LogKit = struct {
     }
 
     pub fn recordMerge(
-        self: LogKit,
+        self: LogKernels,
         cmd: Cmd,
         _: Binding,
         r: attn_split.PlanRow,
@@ -214,7 +226,7 @@ const LogKit = struct {
         self.log.add(.{ .merge = .{ .row = r.row, .scratch = scratch_row, .stride = stride } });
     }
 
-    pub fn recordBarrier(self: LogKit, cmd: Cmd) void {
+    pub fn recordBarrier(self: LogKernels, cmd: Cmd) void {
         assert(cmd == 7);
 
         self.log.add(.barrier);
@@ -224,7 +236,7 @@ const LogKit = struct {
 /// Replay a log against a model of the scratch: the row each scratch row holds, whether a barrier
 /// made it visible, and whether its merge read it. Each merge reads at the stride of its split.
 fn checkLog(
-    log: *const LogKit.Log,
+    log: *const LogKernels.Log,
     t_lens: []const u32,
     budget: u32,
     resident_seen: []bool,
@@ -313,8 +325,8 @@ fn checkRecordMerge(_: void, c: prop.Trial) anyerror!void {
 
     const max_splits = random.intRangeAtMost(u32, 3, 12);
     const plan = planStep(rows[0..n], max_splits);
-    var log: LogKit.Log = .{};
-    record(LogKit, .{ .log = &log }, 7, &plan, {});
+    var log: LogKernels.Log = .{};
+    record(LogKernels, .{ .log = &log }, 7, &plan, {});
     var resident_seen = [_]bool{false} ** attn_split.max_plan_rows;
     var merged_seen = [_]bool{false} ** attn_split.max_plan_rows;
     try checkLog(&log, t_lens[0..n], plan.budget, &resident_seen, &merged_seen);
@@ -357,8 +369,8 @@ fn checkRecordPrefill(_: void, c: prop.Trial) anyerror!void {
     }
 
     const plan = attn_split.planPrefill(0, start_pos, b, attn_split.splitCount(8 * S));
-    var log: LogKit.Log = .{};
-    recordPrefill(LogKit, .{ .log = &log }, 7, &plan, {}, start_pos);
+    var log: LogKernels.Log = .{};
+    recordPrefill(LogKernels, .{ .log = &log }, 7, &plan, {}, start_pos);
     var runs: u32 = 0;
     for (log.events[0..log.len]) |e| {
         if (e == .resident_run) {
@@ -392,17 +404,17 @@ test "recordPrefill: one resident run for the prefix, then the split groups, eve
 }
 
 test "record: a decode row past one split records its split, one barrier, and its merge" {
-    var log: LogKit.Log = .{};
+    var log: LogKernels.Log = .{};
     const plan = attn_split.planDecode(S + 1);
-    record(LogKit, .{ .log = &log }, 7, &plan, {});
+    record(LogKernels, .{ .log = &log }, 7, &plan, {});
     try testing.expectEqual(@as(u32, 3), log.len);
     try testing.expectEqual(
-        LogKit.Event{ .split = .{ .row = 0, .scratch = 0, .stride = 2 } },
+        LogKernels.Event{ .split = .{ .row = 0, .scratch = 0, .stride = 2 } },
         log.events[0],
     );
-    try testing.expectEqual(LogKit.Event.barrier, log.events[1]);
+    try testing.expectEqual(LogKernels.Event.barrier, log.events[1]);
     try testing.expectEqual(
-        LogKit.Event{ .merge = .{ .row = 0, .scratch = 0, .stride = 2 } },
+        LogKernels.Event{ .merge = .{ .row = 0, .scratch = 0, .stride = 2 } },
         log.events[2],
     );
 }

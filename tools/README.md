@@ -1,22 +1,65 @@
-# tools
+# Tools
 
-The development edge: benchmarks, a symbol-export probe, the token-hash gates, and the profiler
-driver. It is the relaxed side of the strict-core split and never reaches into the numeric core.
-See [../docs/architecture.md](../docs/architecture.md). The bench kernels follow `-Doptimize`, so a
-bare `zig build bench` uses Debug kernels and says so.
+This directory holds the development edge: the benchmarks, a symbol-export probe, a shader linter,
+the token-hash gates, and the profiler driver. It is the relaxed side of the strict-core split.
+The `Makefile` names a script only when a target needs more than 3 lines.
 
 ## Files
 
-| File | Role |
+| File | Holds |
 | --- | --- |
-| `bench.zig` | The bench entry point (`zig build bench`). It owns the GPU runner and drives the sections. |
-| `bench_{matmul,layer,gdn,parallel,transfer}.zig` | The sections. Each imports `bench_util.zig`. |
+| `bench.zig` | The entry point of `zig build bench`, which owns the GPU runner and runs the sections. |
+| `bench_matmul.zig` | The matrix-product section. |
+| `bench_layer.zig` | The per-layer op section. |
+| `bench_gdn.zig` | The Gated DeltaNet section. |
+| `bench_parallel.zig` | The CPU thread-pool section. |
+| `bench_transfer.zig` | The host-to-device copy section. |
 | `bench_util.zig` | The row helpers: timing, relative error, output hash, and the reporter. |
-| `simd_probe.zig` | The export probe (`zig build simd-probe`). `probed_ops` feeds `simd-report.sh`. |
-| `shader_lint.zig` | The shader rules (`zig build lint-shaders`). It needs no Vulkan SDK. |
-| `gate.sh`, `simd-report.sh` | The token-hash gates (`make gate`), and the SIMD width of each op (`make simd-report`). |
-| `profile.sh`, `profile_convert.py` | The perf driver (`make profile`) and its converter, see [profiling](../docs/profiling.md). |
-| `debug-build.sh`, `common.sh`, `help.awk` | `make debug-build`, the shared status lines and `zig_build`, and `make help`. |
+| `simd_probe.zig` | The export probe of `zig build simd-probe`. |
+| `shader_lint.zig` | The shader rules of `zig build lint-shaders`. |
+| `gate.sh` | The token-hash gates of `make gate`. |
+| `simd-report.sh` | The SIMD width of each op, or the assembly of one kernel. |
+| `profile.sh` | The perf driver of `make profile`, see [profiling](../docs/profiling.md). |
+| `profile_convert.py` | The converter of `perf script` text for `profile.sh`. |
+| `debug-build.sh` | The `zig build` runner with LLVM, for a debugger. |
+| `common.sh` | The status lines and `zig_build`, sourced by the scripts. |
+| `help.awk` | The awk program that prints the targets of the `Makefile`. |
+
+## How the pieces fit
+
+The files form three groups. The bench files measure ops, the probe and linter check the build
+output, and the scripts drive the two binaries. The bench and probe files read the engine through
+the `zigferencer` module and mutate no engine state.
+
+| Value | File | Holds | Made by | Read by |
+| --- | --- | --- | --- | --- |
+| Bench row | `bench_util.zig` | A label, a time, an output hash, and a relative error against `naive` | `cpuRow`, `gpuRow` | `bench.zig`, the section files |
+| `probed_ops` | `simd_probe.zig` | The op functions that the probe exports | the file itself | `simd-report.sh` |
+| `zig_build` | `common.sh` | One `zig build` call that installs both binaries | the file itself | `gate.sh`, `profile.sh` |
+| Gate row | `gate.sh` | A token hash of one `bench-model` run | `zigferencer-dev bench-model` | `gate.sh`, against the first row or a record |
+
+The `make` targets reach the files like this:
+
+```
+  make bench       --> zig build bench --> bench.zig --> the five bench_* sections --> bench_util
+  make simd-report --> simd-report.sh --> zig build simd-probe --> simd_probe.zig
+  make gate        --> gate.sh --> zig_build, then zigferencer-dev bench-model
+  make profile     --> profile.sh --> zig_build, perf, then profile_convert.py
+  make debug-build --> debug-build.sh
+  make help        --> help.awk
+  zig build lint-shaders --> shader_lint.zig
+```
+
+`gate.sh`, `profile.sh`, `simd-report.sh`, and `debug-build.sh` all source `common.sh`. The gates
+run `zigferencer-dev bench-model`, and the profiler runs any command of that binary.
+
+## Rules
+
+- **Every bench row carries an output hash and a relative error against `naive`.** A missing GPU
+  degrades with a skip banner and never aborts.
+- **The bench kernels follow `-Doptimize`.** A bare `zig build bench` uses Debug kernels.
+  It says so.
+- **`simd-report.sh` reads assembly, never a disassembly.**
 
 ## The gates
 
@@ -27,7 +70,7 @@ bare `zig build bench` uses Debug kernels and says so.
 | `hybrid` | cpu, fused, k=L, k=0, mid | the first row | a GPU |
 | `deep` | 2B and SmolLM2, CPU and fused | the hash on record | `--cpu` needs no GPU |
 
-A DIFF in `backends` can come from the SIMD attention, which differs from naive in bits inside a
+A DIFF in `backends` can come from the SIMD attention. It differs from naive in bits inside a
 tolerance, so check the kernel tolerance tests first. A DIFF in `hybrid` is a correctness bug. In
 `deep`, investigate before you update a record, and update only after the CPU and fused rows agree.
 
@@ -47,7 +90,8 @@ done
 
 Ask in order. A behavior of the product is a command or flag of the binary. A compile, a test run,
 or a format check of one configuration is a `zig build` step. One line with no trap is nothing, so
-document it. A join of commands or a fixed default in 3 lines is a `make` target. Else write a script.
+document it. A join of commands or a fixed default in 3 lines is a `make` target.
+Else write a script.
 
 ## Script rules
 
@@ -83,9 +127,3 @@ The tidy test checks rules 1, 2, and 17 in part. A reader checks the rest.
    goes to a script. Use no `.ONESHELL` and no `export` line.
 
 Run `shellcheck -x tools/*.sh` when the host has it. `make ci` skips it. Else rules 10 to 13 apply.
-
-## Rules
-- **Every bench row carries an output hash and a relative error against `naive`.** A missing GPU
-  degrades with a skip banner and never aborts.
-- **`simd-report.sh` reads assembly, never a disassembly.** The tools read engine values and
-  mutate no engine state. Start with `bench_util.zig`.

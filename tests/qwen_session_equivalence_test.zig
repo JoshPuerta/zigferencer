@@ -259,7 +259,7 @@ test "qwen time-sliced sessions are bit-identical to solo runs, and slot reuse s
             .tokens = prompt_ids[1][fed..][0..1],
             .final = final,
         }, &.{front}, &out);
-        // The decode row sits at base. See "Compact logits" in the header.
+        // The decode row sits at base.
         const base: usize = if (final) 1 else 0;
         try std.testing.expectEqual(reference[0].tokens[k], out[0]);
         try std.testing.expectEqual(reference[0].logits_hash[k], hashLogitsRow(&runner, base));
@@ -304,7 +304,7 @@ test "qwen time-sliced sessions are bit-identical to solo runs, and slot reuse s
     }
 
     // -- G: forced parallelism ----------------------------------------------
-    // Both streams must equal pass A exactly. See "Exactness" in the header.
+    // Both streams must equal pass A exactly.
     {
         const forced: test_policy.Policy = .{ .n_threads = 4, .min_parallel_flops = 0 };
         var par_cpu_pool: test_policy.Pool = undefined;

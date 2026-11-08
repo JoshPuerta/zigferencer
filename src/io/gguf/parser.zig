@@ -4,6 +4,8 @@
 //! rejects truncated or malformed input with a typed `Error`. The loader one level up joins the
 //! map, this parser, and the architecture-specific semantic checks.
 //!
+//! Comptime. The integer reader takes its type at comptime, so one body reads every width.
+//!
 //! File layout (v3).
 //!     magic                "GGUF" (4 bytes)
 //!     version              u32 LE  (asserted == 3)
@@ -262,8 +264,8 @@ pub fn parse(arena: Allocator, bytes: []const u8) Error!Parsed {
     for (tensors) |ti| {
         if (ti.offset_in_data % alignment != 0) {
             log.debug(
-                "tensor {s} starts at data offset {d}, which is not a multiple of the " ++
-                    "alignment {d}",
+                "tensor {s} starts at data offset {d}, " ++
+                    "which is not a multiple of the alignment {d}",
                 .{ ti.name, ti.offset_in_data, alignment },
             );
             return error.TensorOffsetUnaligned;
@@ -300,12 +302,14 @@ fn elemMinBytes(t: ValueType) usize {
 }
 
 fn readArray(r: *Reader, arena: Allocator) Error!Array {
+    // Read the element type and the bounded count.
     const elem_type_raw = try r.read(u32);
     const elem_type: ValueType = @enumFromInt(elem_type_raw);
     const n_u64 = try r.read(u64);
     try r.boundCount(n_u64, elemMinBytes(elem_type));
     const n: usize = @intCast(n_u64);
 
+    // Read the elements of the array.
     return switch (elem_type) {
         .u8 => blk: {
             const buf = try arena.alloc(u8, n);
@@ -582,7 +586,7 @@ fn expectParseInside(bytes: []const u8) !void {
     }
 }
 
-test "exhaustive: every single-byte change of the header, the kvs, and the tensor table parses inside the buffer or fails typed" {
+test "exhaustive: every single-byte change of the file head parses in bounds or fails typed" {
     const sample = try sampleGguf();
     const original = sample.bytes[0..sample.len];
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);

@@ -1,12 +1,12 @@
 # Zigferencer
 
-zigferencer is a small inference engine for LLMs (for now), written
+zigferencer is a small inference engine for LLMs (to be extended to other models), written
 in Zig 0.16. It reads a model file in the GGUF format and runs the model, with some extra conveniences.
 
 One of the main goals of this project is to provide a sandbox to tinker with small models and kernels implemented on
 non-typical hardware, using Zig. Don't expect a production-grade inference engine (not because of Zig, but due to the scope).
 Regarding development, AI assistance was and is heavily used. Most decisions came from experiments and iterations,
-but each relevant aspect was agreed, so in case of complaint, blame the author and not the tool.
+but each relevant aspect was agreed, so in case of complain, blame the author and not the tool.
 
 - **Models:** the Llama 3 family and the Qwen3.5 hybrid family (not all quantizations, check registered models with `list`)
 - **Hardware:** x86_64 CPUs, with scalar and AVX2 paths, and GPUs through Vulkan.
@@ -35,6 +35,9 @@ backend:
 | `simd`, `simd_pf` | CPU | AVX2 vector code. `simd_pf` adds software prefetch. It is the default on a CPU with AVX2 and FMA. |
 | `vulkan` | GPU | One GPU dispatch per operation. It is a correctness reference, not focusing in performance (dispatch per op is costly). |
 | `vulkan_fused` | GPU | The whole model step in one GPU submission. It is the fast GPU path. `--gpu-layers` can also split the layers between the CPU and the GPU. |
+
+The engine is also a Zig module. A dependent package reads it with `dep.module("zigferencer")`,
+and its API can change in any release.
 
 ## Requirements
 
@@ -113,8 +116,7 @@ benchmarks, the kernel checks, and the demo are in a second executable, `zigfere
 ## Performance
 
 One desktop made these numbers, the host of the worked example in
-[`docs/architecture.md`](docs/architecture.md), section 9. They are rounded, because
-the clock of that host drifts by a few percent.
+[`docs/architecture.md`](docs/architecture.md), section 9.
 
 | Model | Weights | Backend | Prompt + generated tokens | TTFT (mean) | ITL (mean) | Tokens/s, 1 prompt | Tokens/s, 4 sessions |
 | --- | --- | --- | --- | --- | --- | --- | --- |
@@ -124,10 +126,7 @@ the clock of that host drifts by a few percent.
 | Llama-3.1-8B-Instruct | Q8_0 | `vulkan_fused` | 512 + 128 | 2.1 s | 24 ms | 41 | 22 |
 | Llama-3.1-8B-Instruct | Q4_0 | `vulkan_fused` | 512 + 128 | 2.4 s | 18 ms | 54 | 33 |
 
-"Tokens/s, 1 prompt" is the decode rate of one stream, 1000 / ITL, so the prefill is
-not in it. "Tokens/s, 4 sessions" is the total of 4 concurrent sessions, each generating
-128 tokens. On the GPU, the 4 sessions total less than one stream. The batched step does
-not scale yet, and that work is open. To measure your own host, run:
+ To measure your own host, run:
 
 ```bash
 zigferencer-dev bench-model MODEL --prompt-tokens 512 --max-tokens 128 --ignore-eos --runs 3

@@ -1,5 +1,5 @@
-//! The start of a chat: the flags, the server check, and the first session. Both loops read
-//! the `Startup` value this file resolves once.
+//! The start of a chat: the flags, the server check, and the first session. Both loops read the
+//! `Startup` value that this file resolves once.
 
 const std = @import("std");
 const Io = std.Io;
@@ -51,8 +51,8 @@ pub const Options = struct {
 
     pub const help: args.Help = .{
         .usage = "zigferencer client (--connect IP:PORT | --socket PATH) [flags]",
-        .about = "Chat with a running server over the binary wire. Each line you type is " ++
-            "one turn.\n",
+        .about = "Chat with a running server over the binary wire. " ++
+            "Each line you type is one turn.\n",
         .footer = client_input.commands_text ++
             \\
             \\examples:
@@ -61,6 +61,7 @@ pub const Options = struct {
             \\
         ,
     };
+
     pub const docs = .{
         .connect = args.Doc{
             .group = "connection",
@@ -112,10 +113,10 @@ pub const Options = struct {
         },
         .seed = args.Doc{
             .group = "sampling",
-            .text = "sampling seed of the session. Set, every turn restarts the\nsampling " ++
-                "stream at N, so a turn replays. Unset, the stream\nof the session " ++
-                "continues across turns. The client has no\nfrequency penalty flag. The " ++
-                "server refuses that penalty until\nit supports it",
+            .text = "sampling seed of the session. Set, every turn restarts the\n" ++
+                "sampling stream at N, so a turn replays. Unset, the stream\n" ++
+                "of the session continues across turns. The client has no\n" ++
+                "frequency penalty flag. The server refuses that penalty until\nit supports it",
             .default = "unset",
         },
         .thinking = args.Doc{
@@ -156,8 +157,8 @@ pub const Options = struct {
         return o.thinkOpen() orelse (info.think_mode == .on);
     }
 
-    /// The sampling of every session. `model` takes the card row that the
-    /// server sends for the think mode of the turns.
+    /// The sampling of every session. `model` takes the card row that the server sends for the
+    /// think mode of the turns.
     pub fn sessionSampling(o: *const Options, info: Client.HelloInfo) protocol.Sampling {
         var s = switch (o.sampling) {
             .greedy => protocol.Sampling.greedy,
@@ -180,8 +181,8 @@ pub const Options = struct {
         return s;
     }
 
-    /// The per-turn fields of every `generate`. With `--seed`, each turn
-    /// asks for a reseed, so the turn replays.
+    /// The per-turn fields of every `generate`. With `--seed`, each turn asks for a reseed, so
+    /// the turn replays.
     pub fn turn(
         o: *const Options,
         max_tokens: u32,
@@ -224,10 +225,13 @@ pub const Startup = struct {
 /// Null means `--help` printed and the command has nothing more to do.
 pub fn parseOptions(ctx: context.Context) !?Options {
     const o = try args.parseInto(Options, ctx) orelse return null;
+
+    // Require exactly one target.
     if ((o.connect == null) == (o.socket == null)) {
         return args.fail(ctx.io, "give exactly one of --connect or --socket", .{});
     }
 
+    // Check the sampling and think flags against their ranges.
     if (o.temperature) |t| {
         if (!(t >= 0) or !std.math.isFinite(t)) {
             return args.fail(ctx.io, "--temperature must be 0 or more", .{});
@@ -258,6 +262,7 @@ pub fn parseOptions(ctx: context.Context) !?Options {
         }
     }
 
+    // Check the lease against its ceiling and its mode.
     if (o.resume_ttl > limits.max_resume_ttl_ms) {
         return args.fail(
             ctx.io,
@@ -265,6 +270,7 @@ pub fn parseOptions(ctx: context.Context) !?Options {
             .{limits.max_resume_ttl_ms},
         );
     }
+
     if (o.resume_ttl > 0 and o.no_stream) {
         return args.fail(
             ctx.io,
@@ -272,6 +278,8 @@ pub fn parseOptions(ctx: context.Context) !?Options {
             .{},
         );
     }
+
+    // Refuse a system prompt that no frame can carry.
     if (o.system.len > protocol.system_prompt_bytes_max) {
         return args.fail(
             ctx.io,
@@ -298,8 +306,8 @@ pub fn parseTarget(ctx: context.Context, opts: *const Options) !Target {
     return .{ .tcp = address };
 }
 
-/// Refuse a server whose `hello_ack` contradicts the options. The window
-/// comes from the network, and the blocking mode sizes its id buffer from it.
+/// Refuse a server whose `hello_ack` contradicts the options. The window comes from the network,
+/// and the blocking mode sizes its id buffer from it.
 pub fn checkServer(out: Out, opts: *const Options, info: Client.HelloInfo) !void {
     if (info.max_seq == 0 or info.max_seq > limits.max_model_ctx) {
         try out.note(
@@ -323,8 +331,8 @@ pub fn checkServer(out: Out, opts: *const Options, info: Client.HelloInfo) !void
 
     if (info.think_mode == .none and (opts.thinking == .on or opts.thinking_budget != null)) {
         try out.note(
-            "The server model has no think tags, so --thinking on and --thinking-budget do " ++
-                "not apply.",
+            "The server model has no think tags, " ++
+                "so --thinking on and --thinking-budget do not apply.",
             .{},
         );
         return error.ThinkingUnsupported;
@@ -343,9 +351,7 @@ pub fn printSampling(
             "repetition_penalty {d:.2}",
         .{
             info.think_mode,
-            opts.turnsOpen(
-                info,
-            ),
+            opts.turnsOpen(info),
             opts.thinking_budget orelse info.think_budget,
             sampling.temperature,
             sampling.top_k,
@@ -365,14 +371,12 @@ pub fn printStartup(out: Out, opts: *const Options, info: Client.HelloInfo, sess
             .{ session_id, info.max_seq, cap, reserve },
         );
     } else {
-        try out.dim(startup_fmt ++ ", reserve adaptive, from {d} to {d} positions", .{
-            session_id,                                 info.max_seq, cap,
-            transcript_mod.reserveFor(info.max_seq, 0),
-            transcript_mod.reserveFor(
-                info.max_seq,
-                std.math.maxInt(u32),
-            ),
-        });
+        const reserve_low = transcript_mod.reserveFor(info.max_seq, 0);
+        const reserve_high = transcript_mod.reserveFor(info.max_seq, std.math.maxInt(u32));
+        try out.dim(
+            startup_fmt ++ ", reserve adaptive, from {d} to {d} positions",
+            .{ session_id, info.max_seq, cap, reserve_low, reserve_high },
+        );
     }
 }
 
@@ -383,8 +387,8 @@ pub fn connect(ctx: context.Context, target: Target, opts: *const Options, out: 
     };
 }
 
-/// Keep the first session for `ttl_ms`. A server with resumption off, or a
-/// refused keep, gives no lease, and the chat goes on without one.
+/// Keep the first session for `ttl_ms`. A server with resumption off, or a refused keep, gives no
+/// lease, and the chat goes on without one.
 pub fn startKeep(
     out: Out,
     client: *Client,
@@ -417,8 +421,7 @@ pub fn startKeep(
     return .{ .ttl_ms = k.granted_ms, .token = k.token };
 }
 
-/// A failed write of the report is dropped, so the startup error itself
-/// reaches `main`.
+/// A failed write of the report is dropped, so the startup error itself reaches `main`.
 pub fn startupFailed(out: Out, client: *const Client, err: anyerror) anyerror {
     if (err == error.ServerError) {
         out.serverError(client.last_error) catch {};

@@ -1,6 +1,8 @@
 //! The session resumption gate over a real model and real sockets. Each test boots its own
 //! in-process server through `serve_harness.zig` and drives it through the reference client.
 //!
+//! Comptime. The twin checks take the harness type, so each runner family shares one body.
+//!
 //! Twin. The load-bearing assertion is exact. A session that a client keeps, drops, and resumes on
 //! a new connection continues with the ids and the position of an undropped twin that ran the same
 //! turns. This holds for greedy and for seeded sampling on SmolLM2, and for greedy on the Qwen CPU
@@ -44,11 +46,14 @@ const qwen_think_tokens: u32 = 12;
 const ttl_max_ms: u32 = 60_000;
 const ttl_ms: u32 = 30_000;
 
-/// The cut turn runs long enough that the drop always lands while it
-/// decodes. The window holds two turns and the whole budget.
+/// The cut turn must end by the drop, so no EOS can come first. After the two
+/// earlier turns, the greedy reply to `cut_prompt` runs 400 tokens with no EOS.
+/// The drop reaches the engine in milliseconds, and the budget takes about one
+/// second, so the budget cannot come first. The window holds two turns and the
+/// whole budget.
 const cut_window: u32 = 512;
 const cut_tokens: u32 = 200;
-const cut_prompt = "Count from one to one hundred in words, one number per line.";
+const cut_prompt = "List the first 100 prime numbers.";
 
 /// A drop and an open travel on two connections, and no order joins them.
 /// Each attempt is one full round trip that reads the session table, so a

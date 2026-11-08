@@ -16,41 +16,108 @@ a breakpoint by file and line. The LLVM code generator gives both debuggers both
 binary, so its times are not engine times. The next `make` target that builds
 replaces it.
 
+`BACKEND` picks the ops of the build. Each line below builds both binaries, and each one replaces
+the build before it.
+
+| Backend | Build | Where the ops run |
+| --- | --- | --- |
+| `naive` | `make debug BACKEND=naive` | The CPU, in scalar code. It is the reference. |
+| `simd_pf` | `make debug BACKEND=simd_pf` | The CPU, in AVX2 code with prefetch. |
+| `vulkan` | `make debug BACKEND=vulkan` | The GPU, one dispatch per operation. |
+| `vulkan_fused` | `make debug BACKEND=vulkan_fused` | The GPU, the whole step in one submission. |
+
 ## Step through a command
 
 1. If you have no model yet, run `zig-out/bin/zigferencer fetch SmolLM2-135M-Instruct-Q8_0`.
 2. Start `run` in lldb, with a stop at the greedy sample:
 
    ```
-   lldb zig-out/bin/zigferencer -o "breakpoint set --file generate.zig --line 154" \
+   lldb zig-out/bin/zigferencer -o "breakpoint set --name timedGreedy" \
      -o "run run SmolLM2-135M-Instruct-Q8_0 --max-tokens 1 --threads 1"
    ```
 
 3. At the stop, type `frame variable` for the locals and `bt` for the call stack.
 
-A line number moves when the code changes. Before you use a line from this page,
-read that line in the file. Use `--threads 1`. Then the main thread runs the
-whole forward pass, and a breakpoint in a kernel stops on that thread.
+A breakpoint by function name stays valid when the code moves. Use `--threads 1`. Then
+the main thread runs the whole forward pass, and a breakpoint in a kernel stops on that thread.
+
+`--name` stops in every function of that name. To name one function, use `--func-regex`. Do not
+join `--file` and `--name`: the build holds one compile unit, so that pair finds nothing. `--file`
+works with `--line`. If `lldb` is not on your path, the CodeLLDB extension holds one in its
+`lldb/bin` directory.
 
 To step through the server, use two terminals:
 
 1. In the first terminal, start the server in the debugger:
 
    ```
-   lldb zig-out/bin/zigferencer -o "breakpoint set --file session.zig --line 452" \
+   lldb zig-out/bin/zigferencer -o "breakpoint set --func-regex 'Sessions.*advance'" \
      -o "run serve SmolLM2-135M-Instruct-Q8_0 --port 8000 --threads 1"
    ```
 
 2. In the second terminal, connect and type one line: `zig-out/bin/zigferencer client --connect 127.0.0.1:8000`.
 
-The breakpoint stops the engine thread when a prompt finishes its prefill. For
-the GPU build, run `make debug BACKEND=vulkan_fused`. The host code steps the
-same way, but a CPU debugger cannot step through a shader.
+The breakpoint stops the engine thread at each step of the session pool, one prefill chunk plus
+the decode rows.
+
+## Step through the GPU paths
+
+A GPU build is a normal executable too. The debugger steps the host code: the plan, the record of
+each dispatch, the submit, the wait, and the readback. It cannot step through a shader.
+
+Build the backend, then stop at the part that you want:
+
+| Backend | Stop at | Breakpoint |
+| --- | --- | --- |
+| `vulkan_fused` | One forward step | `--func-regex 'LlamaFusedRunner\.step$'` |
+| `vulkan_fused` | The record of one attention layer | `--func-regex 'attn_record\.record'` |
+| `vulkan` | One attention dispatch | `--func-regex 'Attention\.runTyped'` |
+
+For example:
+
+```
+make debug BACKEND=vulkan_fused
+lldb zig-out/bin/zigferencer -o "breakpoint set --func-regex 'LlamaFusedRunner\.step$'" \
+  -o "run run SmolLM2-135M-Instruct-Q8_0 --prompt Hello --max-tokens 1"
+```
+
+To check one kernel family against its CPU reference, run
+`zig-out/bin/zigferencer-dev gpu-selftest attn`. The other families are `gdn` and `matmul`.
+
+### Run with no GPU
+
+Set `ZIGFERENCER_VK_SOFTWARE=1`. The engine then takes a CPU Vulkan device, such as Mesa lavapipe,
+and no other, and the shaders run on the CPU:
+
+```
+ZIGFERENCER_VK_SOFTWARE=1 zig-out/bin/zigferencer run SmolLM2-135M-Instruct-Q8_0 --prompt Hello
+```
+
+A warning names the device. With the value `0`, or with no variable, the engine refuses a CPU
+device. This mode is for logic and token streams:
+
+- Times mean nothing.
+- The subgroup-size pin stays off, because such a device holds fewer lanes.
+- A numeric check can differ. `gpu-selftest matmul` can report a row past its tolerance that a GPU
+  passes.
+- The faults of a GPU driver do not show, such as a lost device.
+
+### Check the Vulkan calls
+
+The Khronos validation layer needs no code change:
+
+```
+VK_INSTANCE_LAYERS=VK_LAYER_KHRONOS_validation zig-out/bin/zigferencer-dev gpu-selftest attn
+```
+
+A clean run prints nothing from the layer, so silence alone does not prove that it loaded. To
+prove it, add `VK_LAYER_REPORT_FLAGS=error,warn,info`. The layer then prints
+`Khronos Validation Layer Active`.
 
 ## Step through a test
 
 1. Build one test binary with only the tests whose name contains the filter: `make debug-test TEST=unit FILTER="decode: greedy walk"`.
-2. From the repository root, run `lldb zig-out/test/unit -o "breakpoint set --file generate.zig --line 154" -o run`.
+2. From the repository root, run `lldb zig-out/test/unit -o "breakpoint set --name timedGreedy" -o run`.
 
 `TEST=unit` selects the tests of `src/` outside `src/dev/`, and `TEST=dev_unit` selects the tests of `src/dev/`. The stem of a `tests/*_test.zig` file
 selects that integration test, for example `TEST=snapshot_smollm2_test`. An
@@ -116,7 +183,7 @@ Run `make debug` before you start the configuration.
 Run `zig build lint-shaders` to check the shader rules of `tools/shader_lint.zig`. Add
 `-Druntime=vulkan` to also run `glslc -Werror` and `spirv-val` on each shader. The first step needs
 no Vulkan SDK. A finding has the form `path:line:column: error: rule: message`, which is the form of
-a `glslc` diagnostic. A run with no finding prints nothing.
+a `glslc` diagnostic. A run with no finding prints nothing. `zig build test` runs the first step too.
 
 VS Code shows these findings with no extension. Add a task like this one to the `tasks.json` file
 of your workspace. Run it from the Terminal menu, and read the Problems panel:

@@ -1,5 +1,7 @@
 //! Lean per-run timers for the decode step. Values only.
 //!
+//! Comptime. `merge` walks the fields, so a new counter joins the sum with no edit.
+//!
 //! Stat. It folds one timed host step into a sum, a max, a min, and a count, so a run keeps its
 //! summary in fixed space and the hot path allocates nothing.
 //!
@@ -57,7 +59,7 @@ pub const Stat = struct {
     }
 };
 
-/// The outcomes of the decode record ring. See "Ring counts" in the header.
+/// The outcomes of the decode record ring.
 pub const RingCounts = struct {
     hits: u64 = 0,
     misses: u64 = 0,
@@ -126,7 +128,7 @@ test "Stat: sum, max, count, and mean follow the samples" {
     try std.testing.expectEqual(@as(f64, 0), (Stat{}).minMs());
 }
 
-test "DecodeHost: merge adds counts and keeps the larger max per leg" {
+test "DecodeHost: merge adds counts and keeps the larger max per host step" {
     var a: DecodeHost = .{};
     var b: DecodeHost = .{};
     a.record.add(4_000_000);
