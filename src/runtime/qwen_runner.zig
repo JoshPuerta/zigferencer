@@ -79,7 +79,6 @@ const step_row = @import("step_row.zig");
 const linear_dispatch = @import("linear_dispatch.zig");
 const tensor_lookup = @import("tensor_lookup.zig");
 const cpu_profile = @import("cpu_profile.zig");
-const ProfileCat = cpu_profile.ProfileCat;
 
 const StepRow = step_row.StepRow;
 
@@ -148,14 +147,9 @@ const Layer = struct {
 /// Qwen3.5 hybrid forward-pass state over `n_slots` session slots. One slot is the CLI shape.
 pub const QwenRunner = struct {
     card: loader.ModelCard,
-    /// The clock source of the CPU timer.
-    io: std.Io,
     /// Row-parallel matmul and attention fan-out. The caller owns the pool and must outlive it.
     pool: *Pool,
     policy: parallel.Policy,
-
-    /// Per-op CPU timer, present only in a `-Dtrace` build. A bench command installs one.
-    profile: cpu_profile.Slot = cpu_profile.slot_off,
 
     gdn_dims: gdn.Dims,
     n_heads: u32, // full-attn query heads
@@ -223,7 +217,6 @@ pub const QwenRunner = struct {
         loaded: *const loader.Loaded,
         plan: kv_budget.KvPlan,
         max_rows: u32,
-        io: std.Io,
         pool: *Pool,
         policy: parallel.Policy,
         kv_dtype: dtype.KvDtype,
@@ -234,7 +227,6 @@ pub const QwenRunner = struct {
             plan,
             loaded.card.n_layers,
             max_rows,
-            io,
             pool,
             policy,
             kv_dtype,
@@ -249,7 +241,6 @@ pub const QwenRunner = struct {
         plan: kv_budget.KvPlan,
         n_layers: u32,
         max_rows: u32,
-        io: std.Io,
         pool: *Pool,
         policy: parallel.Policy,
         kv_dtype: dtype.KvDtype,
@@ -410,7 +401,6 @@ pub const QwenRunner = struct {
         // Allocate the scratch and build the runner.
         return .{
             .card = c,
-            .io = io,
             .pool = pool,
             .policy = policy,
             .gdn_dims = gd,
@@ -509,19 +499,14 @@ pub const QwenRunner = struct {
             .{ rows.len, rows[0].slot, rows[0].pos, rows[rows.len - 1].pos },
         );
         const d = self.hidden;
-        if (comptime core_log.hot) {
-            if (self.profile) |p| {
-                p.steps += 1;
-            }
-        }
 
         // Embed each token.
-        const t_embed = self.tBegin();
+        const sp_embed = span.begin(.op_embed);
         for (rows, 0..) |r, i| {
             ops.embedLookup(self.embed.*, r.token, d, self.x[i * d ..][0..d]);
         }
 
-        self.tEnd(t_embed, .embed);
+        sp_embed.end();
 
         // Run all layers.
         const live = (comptime core_log.hot) and core_log.enabled(.layer, .debug);
@@ -554,7 +539,7 @@ pub const QwenRunner = struct {
 
         if (first == rows.len) return;
 
-        const t_norm = self.tBegin();
+        const sp_norm = span.begin(.op_rmsnorm);
         for (rows[first..], first..) |_, i| {
             ops.rmsnorm(
                 self.x[i * d ..][0..d],
@@ -564,14 +549,14 @@ pub const QwenRunner = struct {
             );
         }
 
-        self.tEnd(t_norm, .rmsnorm);
+        sp_norm.end();
         const n_logits = rows.len - first;
         self.linearBatch(
             self.x_norm[first * d .. rows.len * d],
             self.lm_head.*, // output.weight (9B) or tied embed (2B)
             self.logits[0..],
             n_logits,
-            .lm_head,
+            .op_lm_head,
         );
         std.debug.assert(first + n_logits == rows.len);
     }
@@ -579,7 +564,7 @@ pub const QwenRunner = struct {
     /// One decoder layer over all rows: norm, the mixer (GDN or full attention), residual, then the
     /// SwiGLU FFN. Public for a composing runner.
     pub fn layerForward(self: *QwenRunner, layer: u32, rows: []const StepRow) void {
-        const sp = span.beginHot(.layer_forward);
+        const sp = span.beginArg(.layer_forward, layer);
         defer sp.end();
 
         const d = self.hidden;
@@ -590,7 +575,7 @@ pub const QwenRunner = struct {
         const lw = &self.layers[layer];
 
         // Normalize, then run the mixer and add the residual.
-        const t_an = self.tBegin();
+        const sp_an = span.begin(.op_rmsnorm);
         for (0..n) |i| {
             ops.rmsnorm(
                 self.x[i * d ..][0..d],
@@ -600,21 +585,21 @@ pub const QwenRunner = struct {
             );
         }
 
-        self.tEnd(t_an, .rmsnorm);
+        sp_an.end();
         switch (lw.kind) {
             .gdn => |w| self.gdnMixer(w, rows, layer),
             .full => |w| self.fullMixer(w, rows),
         }
 
-        const t_res1 = self.tBegin();
+        const sp_res1 = span.begin(.op_residual);
         for (0..n) |i| {
             ops.residualAdd(self.mix_out[i * d ..][0..d], self.x[i * d ..][0..d]);
         }
 
-        self.tEnd(t_res1, .residual);
+        sp_res1.end();
 
         // Normalize for the feed-forward block.
-        const t_fn = self.tBegin();
+        const sp_fn = span.begin(.op_rmsnorm);
         for (0..n) |i| {
             ops.rmsnorm(
                 self.x[i * d ..][0..d],
@@ -624,12 +609,12 @@ pub const QwenRunner = struct {
             );
         }
 
-        self.tEnd(t_fn, .rmsnorm);
+        sp_fn.end();
 
         // Gate and up projections, then SwiGLU.
-        self.linearBatch(self.x_norm[0 .. n * d], lw.ffn_gate.*, self.ffn_g, n, .gate_up_proj);
-        self.linearBatch(self.x_norm[0 .. n * d], lw.ffn_up.*, self.ffn_u, n, .gate_up_proj);
-        const t_sg = self.tBegin();
+        self.linearBatch(self.x_norm[0 .. n * d], lw.ffn_gate.*, self.ffn_g, n, .op_gate_up_proj);
+        self.linearBatch(self.x_norm[0 .. n * d], lw.ffn_up.*, self.ffn_u, n, .op_gate_up_proj);
+        const sp_sg = span.begin(.op_swiglu);
         for (0..n) |i| {
             ops.swiglu(
                 self.ffn_g[i * fd ..][0..fd],
@@ -638,16 +623,16 @@ pub const QwenRunner = struct {
             );
         }
 
-        self.tEnd(t_sg, .swiglu);
+        sp_sg.end();
 
         // Down projection and the second residual add.
-        self.linearBatch(self.ffn_g[0 .. n * fd], lw.ffn_down.*, self.mix_out, n, .down_proj);
-        const t_res2 = self.tBegin();
+        self.linearBatch(self.ffn_g[0 .. n * fd], lw.ffn_down.*, self.mix_out, n, .op_down_proj);
+        const sp_res2 = span.begin(.op_residual);
         for (0..n) |i| {
             ops.residualAdd(self.mix_out[i * d ..][0..d], self.x[i * d ..][0..d]);
         }
 
-        self.tEnd(t_res2, .residual);
+        sp_res2.end();
     }
 
     // -- slot state ---------------------------------------------------------
@@ -799,13 +784,13 @@ pub const QwenRunner = struct {
         const nv = d.n_v_heads;
 
         // Project q|k|v, the z gate, the decay a, and beta b over all rows.
-        self.linearBatch(self.x_norm[0 .. n * hidden], w.qkv.*, self.qkv, n, .gdn_proj);
-        self.linearBatch(self.x_norm[0 .. n * hidden], w.gate.*, self.z, n, .gdn_proj);
-        self.linearBatch(self.x_norm[0 .. n * hidden], w.alpha.*, self.gdn_a, n, .gdn_proj);
-        self.linearBatch(self.x_norm[0 .. n * hidden], w.beta.*, self.gdn_b, n, .gdn_proj);
+        self.linearBatch(self.x_norm[0 .. n * hidden], w.qkv.*, self.qkv, n, .op_gdn_proj);
+        self.linearBatch(self.x_norm[0 .. n * hidden], w.gate.*, self.z, n, .op_gdn_proj);
+        self.linearBatch(self.x_norm[0 .. n * hidden], w.alpha.*, self.gdn_a, n, .op_gdn_proj);
+        self.linearBatch(self.x_norm[0 .. n * hidden], w.beta.*, self.gdn_b, n, .op_gdn_proj);
 
         // Run the recurrence per row. Row order is time order for same-slot rows.
-        const t_step = self.tBegin();
+        const sp_step = span.begin(.op_gdn_step);
         for (rows, 0..) |r, i| {
             const state_idx = @as(usize, r.slot) * self.layers.len + li;
             const qkv_row = self.qkv[i * cd ..][0..cd];
@@ -857,10 +842,10 @@ pub const QwenRunner = struct {
             }
         }
 
-        self.tEnd(t_step, .gdn_step);
+        sp_step.end();
 
         // Project the readouts back to hidden.
-        self.linearBatch(self.mix_o[0 .. n * vd], w.out.*, self.mix_out, n, .gdn_out);
+        self.linearBatch(self.mix_o[0 .. n * vd], w.out.*, self.mix_out, n, .op_gdn_out);
     }
 
     /// Full softmax attention with a sigmoid output gate. It writes the K/V of every row before any
@@ -877,13 +862,13 @@ pub const QwenRunner = struct {
         const kvd = self.n_kv_heads * hd;
 
         // Project q|gate, k, and v over all rows.
-        self.linearBatch(self.x_norm[0 .. n * hidden], w.q.*, self.q_gate, n, .attn_proj);
-        self.linearBatch(self.x_norm[0 .. n * hidden], w.k.*, self.k_buf, n, .attn_proj);
-        self.linearBatch(self.x_norm[0 .. n * hidden], w.v.*, self.v_buf, n, .attn_proj);
+        self.linearBatch(self.x_norm[0 .. n * hidden], w.q.*, self.q_gate, n, .op_attn_proj);
+        self.linearBatch(self.x_norm[0 .. n * hidden], w.k.*, self.k_buf, n, .op_attn_proj);
+        self.linearBatch(self.x_norm[0 .. n * hidden], w.v.*, self.v_buf, n, .op_attn_proj);
 
         // Per row: split query and gate, apply QK-norm and RoPE, then commit K/V.
         for (rows, 0..) |r, i| {
-            const t_qk = self.tBegin();
+            const sp_qk = span.begin(.op_qk_norm_rope);
             // De-interleave attn_q, which holds [query(head_dim) | gate(head_dim)] per head.
             const q = self.q_full[i * qd ..][0..qd];
             const gate = self.gate_full[i * qd ..][0..qd];
@@ -909,8 +894,8 @@ pub const QwenRunner = struct {
                 ops.ropeInplace(kh, r.pos, self.rope_dim, self.rope_base, .neox, null);
             }
 
-            self.tEnd(t_qk, .qk_norm_rope);
-            const t_kv = self.tBegin();
+            sp_qk.end();
+            const sp_kv = span.begin(.op_kv_commit);
             // The one conversion boundary.
             switch (self.kv_dtype) {
                 .f32 => {
@@ -935,12 +920,12 @@ pub const QwenRunner = struct {
                 },
             }
 
-            self.tEnd(t_kv, .kv_commit);
+            sp_kv.end();
         }
 
         // Per row: attend over the slot positions `0..=pos`, then apply the output gate.
         for (rows, 0..) |r, i| {
-            const t_attn = self.tBegin();
+            const sp_attn = span.begin(.op_attention);
             const t_len: usize = @intCast(r.pos + 1);
             if (comptime build_options.use_vulkan_ops) {
                 // Flag resolution refuses every dtype but f32 on this build,
@@ -992,20 +977,20 @@ pub const QwenRunner = struct {
                 }
             }
 
-            self.tEnd(t_attn, .attention);
+            sp_attn.end();
 
-            const t_gate = self.tBegin();
+            const sp_gate = span.begin(.op_attn_gate);
             const out_row = self.attn_out[i * qd ..][0..qd];
             const gate = self.gate_full[i * qd ..][0..qd];
             for (out_row, gate) |*o, gv| {
                 o.* *= 1.0 / (1.0 + @exp(-gv));
             }
 
-            self.tEnd(t_gate, .attn_gate);
+            sp_gate.end();
         }
 
         // Project the gated attention output.
-        self.linearBatch(self.attn_out[0 .. n * qd], w.o.*, self.mix_out, n, .o_proj);
+        self.linearBatch(self.attn_out[0 .. n * qd], w.o.*, self.mix_out, n, .op_o_proj);
     }
 
     // -- matmul dispatch ----------------------------------------------------
@@ -1018,26 +1003,14 @@ pub const QwenRunner = struct {
         w: Tensor,
         outs: []f32,
         batch: usize,
-        cat: ProfileCat,
+        name: span.Name,
     ) void {
-        std.debug.assert(cat.isMatmul());
+        std.debug.assert(cpu_profile.isMatmul(name));
 
-        const t0 = self.tBegin();
-        defer self.tEnd(t0, cat);
+        const sp = span.begin(name);
+        defer sp.end();
 
         linear_dispatch.linearBatchDispatch(self.pool, self.policy, inputs, w, outs, batch);
-    }
-
-    // -- timing -------------------------------------------------------------
-
-    /// Open a timing span. See `cpu_profile.begin`.
-    inline fn tBegin(self: *const QwenRunner) cpu_profile.Span {
-        return cpu_profile.begin(self.profile, self.io);
-    }
-
-    /// Close a timing span opened by `tBegin`, charging the elapsed ns to `cat`.
-    inline fn tEnd(self: *const QwenRunner, t0: cpu_profile.Span, cat: ProfileCat) void {
-        cpu_profile.end(self.profile, self.io, t0, cat);
     }
 };
 
@@ -1084,7 +1057,6 @@ test "cpu profile: the qwen categories partition one decode step" {
             &loaded,
             kv_budget.pinned(1, max_seq),
             0,
-            io,
             &pool,
             .{ .n_threads = 1 },
             .f32,
@@ -1094,20 +1066,23 @@ test "cpu profile: the qwen categories partition one decode step" {
         _ = try r.step(1, 0);
 
         var prof: cpu_profile.CpuProfile = .{ .family = .qwen };
-        r.profile = &prof;
+        span.installSums(&prof.sums);
         const t0 = std.Io.Clock.Timestamp.now(io, .awake);
         _ = try r.step(2, 1);
         const t1 = std.Io.Clock.Timestamp.now(io, .awake);
-        r.profile = null;
+        span.installSums(null);
+        prof.steps = 1;
         const wall: u64 = @intCast(t0.durationTo(t1).raw.toNanoseconds());
 
         try std.testing.expectEqual(@as(u64, 1), prof.steps);
         // Cover: one decode step charges every qwen category, and a llama category stays at zero.
-        for (std.enums.values(ProfileCat)) |cat| {
-            if (cat.usedBy(.qwen)) {
-                try std.testing.expect(prof.nsOf(cat) > 0);
+        for (std.enums.values(span.Name)) |name| {
+            if (!name.isOp()) continue;
+
+            if (cpu_profile.usedBy(name, .qwen)) {
+                try std.testing.expect(prof.nsOf(name) > 0);
             } else {
-                try std.testing.expectEqual(@as(u64, 0), prof.nsOf(cat));
+                try std.testing.expectEqual(@as(u64, 0), prof.nsOf(name));
             }
         }
 

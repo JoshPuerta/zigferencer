@@ -156,7 +156,8 @@ To step through `build.zig`:
 - `@breakpoint()` stops an attached debugger at that line.
 - `std.debug.dumpCurrentStackTrace(.{})` prints the call stack and continues.
 - `$ZIGFERENCER_LOG` sets the log level per scope with no rebuild. For example, `ZIGFERENCER_LOG=info,runner=debug` shows all milestones and every `runner` message. The grammar is in `src/core/log.zig`.
-- `-Dtrace` compiles the hot log scopes `layer`, `dispatch`, and `token`, and the per-op span sites. A Debug build has them by default. [profiling.md](profiling.md) tells how to record the spans.
+- `-Dtrace` compiles the span sites, the per-op CPU timer, and the hot log scopes `layer`, `dispatch`, and `token`. It is off by default in every mode, Debug included, so a Debug build runs no measurement code. For the hot scopes, build with `make debug FLAGS=-Dtrace=true`. [profiling.md](profiling.md) tells how to record the spans.
+- A site stays in the source as a call to `core.span`. In a Debug build without trace, the call is an empty inline function, and lldb can still stop on it once. In a `-Dtrace=true` Debug build, the call is a real function. To step over both, run `settings set target.process.thread.step-avoid-regexp '^core\.span\.'`. This replaces any earlier value of that setting. If you keep a filter, add this pattern to it as an alternative.
 - `zig build -freference-trace` shows the chain of references to a compile error deep in generic code.
 - The tidy test fails on a `std.debug.print` call outside a test in `src/`. Thus a temporary print cannot ship.
 

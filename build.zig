@@ -191,9 +191,9 @@ const vk_registry_help = "Path to the Vulkan registry XML (vk.xml). " ++
     "The build reads it only under -Druntime=vulkan. " ++
     "The default is the Ubuntu and Debian libvulkan-dev location.";
 
-const trace_help = "Compile hot-path traces (the layer, dispatch, and token log scopes). " ++
-    "The default is true for Debug and false for a release mode. " ++
-    "Output still needs $ZIGFERENCER_LOG to turn the scope on.";
+const trace_help = "Compile the trace: the span sites, the per-op CPU timer, " ++
+    "and the layer, dispatch, and token log scopes. The default is false in every mode. " ++
+    "A trace still needs $ZIGFERENCER_TRACE_OUT, and a log scope needs $ZIGFERENCER_LOG.";
 
 // GPU tests run one at a time on a shared device, so the suite needs to run a single named test.
 // A filtered-out test never executes, so its binary touches no device.
@@ -298,7 +298,7 @@ fn readConfig(b: *std.Build) Config {
         .attn_kernel = b.option(AttnKernelOption, "attn-kernel", attn_kernel_help) orelse .split,
         .vk_registry = b.option([]const u8, "vk-registry", vk_registry_help) orelse
             "/usr/share/vulkan/registry/vk.xml",
-        .trace_hot = b.option(bool, "trace", trace_help) orelse (optimize == .Debug),
+        .trace_hot = b.option(bool, "trace", trace_help) orelse false,
         .test_filters = b.option([]const []const u8, "test-filter", test_filter_help) orelse &.{},
         .test_threads = checkTestThreads(b.option(u32, "test-threads", test_threads_help) orelse 4),
         .use_llvm = b.option(bool, "llvm", llvm_help),

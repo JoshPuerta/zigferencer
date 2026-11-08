@@ -113,7 +113,6 @@ const Fixture = struct {
             &fx.loaded,
             zigferencer.kv_budget.pinned(4, max_seq),
             0,
-            io,
             &fx.cpu_pool,
             policy,
             .f32,

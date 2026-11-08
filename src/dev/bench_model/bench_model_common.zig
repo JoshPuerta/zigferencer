@@ -115,7 +115,7 @@ pub const Options = struct {
                 "only). Needs a --gpu-layers count",
         },
         .profile_cpu_decode = args.Doc{
-            .group = "profiling (cpu, hot-trace build only: Debug or -Dtrace=true)",
+            .group = "profiling (cpu, trace build only: -Dtrace=true)",
             .text = "per-op CPU decode timer. Print the parallel and serial shares, exit",
         },
         .profile_prefill = args.Doc{

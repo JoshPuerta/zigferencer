@@ -75,7 +75,6 @@ const default_policy: test_policy.Policy = test_policy.policy();
 /// constructor at a single place.
 fn cpuRunner(
     arena: std.mem.Allocator,
-    io: std.Io,
     cpu_pool: *test_policy.Pool,
     loaded: *const loader.Loaded,
     n_slots: u32,
@@ -87,7 +86,6 @@ fn cpuRunner(
         loaded,
         zigferencer.kv_budget.pinned(n_slots, zigferencer.test_fakes.test_window),
         0,
-        io,
         cpu_pool,
         policy,
         kv_dtype,
@@ -104,7 +102,7 @@ fn soloStream(
     try test_policy.startPool(&cpu_pool, io, default_policy);
     defer cpu_pool.deinit();
 
-    var runner = try cpuRunner(arena, io, &cpu_pool, loaded, 1, .f32, default_policy);
+    var runner = try cpuRunner(arena, &cpu_pool, loaded, 1, .f32, default_policy);
     var pool = try Sessions(QwenRunner).init(arena, &runner);
     const sid = try pool.create(0, .{});
     var s: Stream = undefined;
@@ -135,7 +133,7 @@ fn greedyProbe(
     try test_policy.startPool(&cpu_pool, io, default_policy);
     defer cpu_pool.deinit();
 
-    var runner = try cpuRunner(arena, io, &cpu_pool, loaded, 1, kv_dtype, default_policy);
+    var runner = try cpuRunner(arena, &cpu_pool, loaded, 1, kv_dtype, default_policy);
     var pool = try Sessions(QwenRunner).init(arena, &runner);
     const sid = try pool.create(0, .{});
     out[0] = (try pool.feed(sid, ids, true)).?;
@@ -176,7 +174,7 @@ test "qwen time-sliced sessions are bit-identical to solo runs, and slot reuse s
     try test_policy.startPool(&cpu_pool, io, default_policy);
     defer cpu_pool.deinit();
 
-    var runner = try cpuRunner(arena, io, &cpu_pool, &loaded, prompts.len, .f32, default_policy);
+    var runner = try cpuRunner(arena, &cpu_pool, &loaded, prompts.len, .f32, default_policy);
     var pool = try Sessions(QwenRunner).init(arena, &runner);
     var sids: [prompts.len]u32 = undefined;
     for (prompt_ids, 0..) |ids, p| {
@@ -313,7 +311,6 @@ test "qwen time-sliced sessions are bit-identical to solo runs, and slot reuse s
 
         var par_runner = try cpuRunner(
             arena,
-            io,
             &par_cpu_pool,
             &loaded,
             prompts.len,
@@ -364,7 +361,7 @@ test "qwen prefix restore: a warm-restored prefix continues bit-exactly" {
     try test_policy.startPool(&cpu_pool, io, default_policy);
     defer cpu_pool.deinit();
 
-    var runner = try cpuRunner(arena, io, &cpu_pool, &loaded, 2, .f32, default_policy);
+    var runner = try cpuRunner(arena, &cpu_pool, &loaded, 2, .f32, default_policy);
     var pool = try Sessions(QwenRunner).init(arena, &runner);
 
     // Cold: feed the prefix without logits, snapshot those rows, then feed the suffix.
@@ -415,8 +412,8 @@ test "qwen kv f16: the kv slab halves and the blob round-trips" {
     try test_policy.startPool(&cpu_pool, io, default_policy);
     defer cpu_pool.deinit();
 
-    var wide = try cpuRunner(arena, io, &cpu_pool, &loaded, 1, .f32, default_policy);
-    var narrow = try cpuRunner(arena, io, &cpu_pool, &loaded, 1, .f16, default_policy);
+    var wide = try cpuRunner(arena, &cpu_pool, &loaded, 1, .f32, default_policy);
+    var narrow = try cpuRunner(arena, &cpu_pool, &loaded, 1, .f16, default_policy);
 
     // The slab prices whole rows, so f16 halves the storage exactly.
     try std.testing.expectEqual(wide.kv_slots[0].sizeBytes(), 2 * narrow.kv_slots[0].sizeBytes());

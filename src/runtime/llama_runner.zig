@@ -76,7 +76,6 @@ const step_row = @import("step_row.zig");
 const linear_dispatch = @import("linear_dispatch.zig");
 const tensor_lookup = @import("tensor_lookup.zig");
 const cpu_profile = @import("cpu_profile.zig");
-const ProfileCat = cpu_profile.ProfileCat;
 
 const Error = step_row.Error;
 const StepRow = step_row.StepRow;
@@ -106,14 +105,9 @@ const log_layer = std.log.scoped(.layer);
 pub const LlamaRunner = struct {
     card: loader.ModelCard,
 
-    /// The clock source of the CPU timer.
-    io: std.Io,
     /// Row-parallel matmul and attention fan-out. The caller owns the pool and must outlive it.
     pool: *Pool,
     policy: parallel.Policy,
-
-    /// Per-op CPU timer, present only in a `-Dtrace` build. A bench command installs one.
-    profile: cpu_profile.Slot = cpu_profile.slot_off,
 
     embed: *const Tensor,
     output_norm: *const Tensor,
@@ -172,7 +166,6 @@ pub const LlamaRunner = struct {
         loaded: *const loader.Loaded,
         plan: kv_budget.KvPlan,
         max_rows: u32,
-        io: std.Io,
         pool: *Pool,
         policy: parallel.Policy,
         kv_dtype: dtype.KvDtype,
@@ -183,7 +176,6 @@ pub const LlamaRunner = struct {
             plan,
             loaded.card.n_layers,
             max_rows,
-            io,
             pool,
             policy,
             kv_dtype,
@@ -198,7 +190,6 @@ pub const LlamaRunner = struct {
         plan: kv_budget.KvPlan,
         n_layers: u32,
         max_rows: u32,
-        io: std.Io,
         pool: *Pool,
         policy: parallel.Policy,
         kv_dtype: dtype.KvDtype,
@@ -301,7 +292,6 @@ pub const LlamaRunner = struct {
         // Allocate the scratch and build the runner.
         return .{
             .card = c,
-            .io = io,
             .pool = pool,
             .policy = policy,
             .embed = embed,
@@ -344,18 +334,6 @@ pub const LlamaRunner = struct {
     /// Max rows one `stepBatch` accepts. The scheduler fills decode rows plus a prefill chunk.
     pub fn maxStepRows(self: *const LlamaRunner) u32 {
         return self.max_rows;
-    }
-
-    // -- timing -------------------------------------------------------------
-
-    /// Open a timing span. See `cpu_profile.begin`.
-    inline fn tBegin(self: *const LlamaRunner) cpu_profile.Span {
-        return cpu_profile.begin(self.profile, self.io);
-    }
-
-    /// Close a timing span opened by `tBegin`, charging the elapsed ns to `cat`.
-    inline fn tEnd(self: *const LlamaRunner, t0: cpu_profile.Span, cat: ProfileCat) void {
-        cpu_profile.end(self.profile, self.io, t0, cat);
     }
 
     // -- step ---------------------------------------------------------------
@@ -406,19 +384,13 @@ pub const LlamaRunner = struct {
         );
         const c = self.card;
         const d = c.embedding_length;
-        if (comptime core_log.hot) {
-            if (self.profile) |p| {
-                p.steps += 1;
-            }
-        }
-
         // Embed each token.
-        const t_embed = self.tBegin();
+        const sp_embed = span.begin(.op_embed);
         for (rows, 0..) |r, i| {
             ops.embedLookup(self.embed.*, r.token, d, self.x[i * d ..][0..d]);
         }
 
-        self.tEnd(t_embed, .embed);
+        sp_embed.end();
 
         // Run all layers.
         const live = (comptime core_log.hot) and core_log.enabled(.layer, .debug);
@@ -446,7 +418,7 @@ pub const LlamaRunner = struct {
 
         if (first == rows.len) return;
 
-        const t_norm = self.tBegin();
+        const sp_norm = span.begin(.op_rmsnorm);
         for (rows[first..], first..) |_, i| {
             ops.rmsnorm(
                 self.x[i * d ..][0..d],
@@ -456,14 +428,14 @@ pub const LlamaRunner = struct {
             );
         }
 
-        self.tEnd(t_norm, .rmsnorm);
+        sp_norm.end();
         const n_logits = rows.len - first;
         self.linearBatch(
             self.x_norm[first * d .. rows.len * d],
             self.output.*,
             self.logits[0..],
             n_logits,
-            .lm_head,
+            .op_lm_head,
         );
         std.debug.assert(first + n_logits == rows.len);
     }
@@ -471,7 +443,7 @@ pub const LlamaRunner = struct {
     /// One decoder layer over all rows. It writes KV for every row before any row attends, so
     /// consecutive rows of one slot see exactly their causal prefix. Public for a composing runner.
     pub fn layerForward(self: *LlamaRunner, layer: u32, rows: []const StepRow) void {
-        const sp = span.beginHot(.layer_forward);
+        const sp = span.beginArg(.layer_forward, layer);
         defer sp.end();
 
         std.debug.assert(layer < self.n_layers);
@@ -490,7 +462,7 @@ pub const LlamaRunner = struct {
         const n = rows.len;
 
         // Normalize the residual stream.
-        const t_an = self.tBegin();
+        const sp_an = span.begin(.op_rmsnorm);
         for (0..n) |i| {
             ops.rmsnorm(
                 self.x[i * d ..][0..d],
@@ -500,27 +472,27 @@ pub const LlamaRunner = struct {
             );
         }
 
-        self.tEnd(t_an, .rmsnorm);
+        sp_an.end();
 
         // Project Q, K, and V.
-        self.linearBatch(self.x_norm[0 .. n * d], self.attn_q_w[layer].*, self.q, n, .qkv_proj);
+        self.linearBatch(self.x_norm[0 .. n * d], self.attn_q_w[layer].*, self.q, n, .op_qkv_proj);
         self.linearBatch(
             self.x_norm[0 .. n * d],
             self.attn_k_w[layer].*,
             self.k_scratch,
             n,
-            .qkv_proj,
+            .op_qkv_proj,
         );
         self.linearBatch(
             self.x_norm[0 .. n * d],
             self.attn_v_w[layer].*,
             self.v_scratch,
             n,
-            .qkv_proj,
+            .op_qkv_proj,
         );
 
         // Rotate each row at its own position, then commit its K/V to its slot.
-        const t_rope = self.tBegin();
+        const sp_rope = span.begin(.op_rope);
         for (rows, 0..) |r, i| {
             var h: u32 = 0;
             while (h < c.n_heads) : (h += 1) {
@@ -573,10 +545,10 @@ pub const LlamaRunner = struct {
             }
         }
 
-        self.tEnd(t_rope, .rope);
+        sp_rope.end();
 
         // Attend causally per row over positions 0..=pos. The CPU path fans the parts over threads.
-        const t_attn = self.tBegin();
+        const sp_attn = span.begin(.op_attention);
         for (rows, 0..) |r, i| {
             const t_len: usize = @intCast(r.pos + 1);
             if (comptime build_options.use_vulkan_ops) {
@@ -630,7 +602,7 @@ pub const LlamaRunner = struct {
             }
         }
 
-        self.tEnd(t_attn, .attention);
+        sp_attn.end();
 
         // Project the attention output and add the residual.
         self.linearBatch(
@@ -638,14 +610,14 @@ pub const LlamaRunner = struct {
             self.attn_o_w[layer].*,
             self.x_norm,
             n,
-            .o_proj,
+            .op_o_proj,
         );
-        const t_res1 = self.tBegin();
+        const sp_res1 = span.begin(.op_residual);
         for (0..n) |i| {
             ops.residualAdd(self.x_norm[i * d ..][0..d], self.x[i * d ..][0..d]);
         }
 
-        self.tEnd(t_res1, .residual);
+        sp_res1.end();
     }
 
     /// The second half of a layer: norm, SwiGLU feed-forward, and the residual add.
@@ -654,7 +626,7 @@ pub const LlamaRunner = struct {
         const d = c.embedding_length;
 
         // Normalize for the feed-forward block.
-        const t_fn = self.tBegin();
+        const sp_fn = span.begin(.op_rmsnorm);
         for (0..n) |i| {
             ops.rmsnorm(
                 self.x[i * d ..][0..d],
@@ -664,7 +636,7 @@ pub const LlamaRunner = struct {
             );
         }
 
-        self.tEnd(t_fn, .rmsnorm);
+        sp_fn.end();
 
         // Gate and up projections, then SwiGLU.
         self.linearBatch(
@@ -672,17 +644,17 @@ pub const LlamaRunner = struct {
             self.ffn_gate_w[layer].*,
             self.ffn_gate,
             n,
-            .gate_up_proj,
+            .op_gate_up_proj,
         );
         self.linearBatch(
             self.x_norm[0 .. n * d],
             self.ffn_up_w[layer].*,
             self.ffn_up,
             n,
-            .gate_up_proj,
+            .op_gate_up_proj,
         );
         const fd = c.feed_forward_length;
-        const t_sg = self.tBegin();
+        const sp_sg = span.begin(.op_swiglu);
         for (0..n) |i| {
             ops.swiglu(
                 self.ffn_gate[i * fd ..][0..fd],
@@ -691,7 +663,7 @@ pub const LlamaRunner = struct {
             );
         }
 
-        self.tEnd(t_sg, .swiglu);
+        sp_sg.end();
 
         // Down projection and the second residual add.
         self.linearBatch(
@@ -699,14 +671,14 @@ pub const LlamaRunner = struct {
             self.ffn_down_w[layer].*,
             self.ffn_down,
             n,
-            .down_proj,
+            .op_down_proj,
         );
-        const t_res2 = self.tBegin();
+        const sp_res2 = span.begin(.op_residual);
         for (0..n) |i| {
             ops.residualAdd(self.ffn_down[i * d ..][0..d], self.x[i * d ..][0..d]);
         }
 
-        self.tEnd(t_res2, .residual);
+        sp_res2.end();
     }
 
     /// Copy KV rows `0..pos` of the source slot into the target slot, for a session fork.
@@ -785,12 +757,12 @@ pub const LlamaRunner = struct {
         w: Tensor,
         outs: []f32,
         batch: usize,
-        cat: ProfileCat,
+        name: span.Name,
     ) void {
-        std.debug.assert(cat.isMatmul());
+        std.debug.assert(cpu_profile.isMatmul(name));
 
-        const t0 = r.tBegin();
-        defer r.tEnd(t0, cat);
+        const sp = span.begin(name);
+        defer sp.end();
 
         linear_dispatch.linearBatchDispatch(r.pool, r.policy, inputs, w, outs, batch);
     }
@@ -826,7 +798,6 @@ test "cpu profile: the categories partition one decode step" {
             &loaded,
             kv_budget.pinned(1, max_seq),
             0,
-            io,
             &pool,
             .{ .n_threads = 1 },
             .f32,
@@ -836,20 +807,23 @@ test "cpu profile: the categories partition one decode step" {
         _ = try r.step(1, 0);
 
         var prof: cpu_profile.CpuProfile = .{ .family = .llama };
-        r.profile = &prof;
+        span.installSums(&prof.sums);
         const t0 = std.Io.Clock.Timestamp.now(io, .awake);
         _ = try r.step(2, 1);
         const t1 = std.Io.Clock.Timestamp.now(io, .awake);
-        r.profile = null;
+        span.installSums(null);
+        prof.steps = 1;
         const wall: u64 = @intCast(t0.durationTo(t1).raw.toNanoseconds());
 
         try std.testing.expectEqual(@as(u64, 1), prof.steps);
         // Cover: one decode step charges every llama category, and a qwen category stays at zero.
-        for (std.enums.values(ProfileCat)) |cat| {
-            if (cat.usedBy(.llama)) {
-                try std.testing.expect(prof.nsOf(cat) > 0);
+        for (std.enums.values(span.Name)) |name| {
+            if (!name.isOp()) continue;
+
+            if (cpu_profile.usedBy(name, .llama)) {
+                try std.testing.expect(prof.nsOf(name) > 0);
             } else {
-                try std.testing.expectEqual(@as(u64, 0), prof.nsOf(cat));
+                try std.testing.expectEqual(@as(u64, 0), prof.nsOf(name));
             }
         }
 

@@ -75,7 +75,6 @@ fn checkSnapshot(
         &loaded,
         zigferencer.kv_budget.pinned(1, window),
         0, // max_rows: single-sequence snapshot, no wide prefill chunk
-        io,
         &cpu_pool,
         cfg,
         .f32,
@@ -154,9 +153,9 @@ test "SmolLM2-Q8_0 at kv f16: the slab halves and the blob round-trips" {
     defer cpu_pool.deinit();
 
     const plan = zigferencer.kv_budget.pinned(1, 64);
-    var wide = try LlamaRunner.init(arena, &loaded, plan, 0, io, &cpu_pool, cfg, .f32);
-    var narrow = try LlamaRunner.init(arena, &loaded, plan, 0, io, &cpu_pool, cfg, .f16);
-    var restored = try LlamaRunner.init(arena, &loaded, plan, 0, io, &cpu_pool, cfg, .f16);
+    var wide = try LlamaRunner.init(arena, &loaded, plan, 0, &cpu_pool, cfg, .f32);
+    var narrow = try LlamaRunner.init(arena, &loaded, plan, 0, &cpu_pool, cfg, .f16);
+    var restored = try LlamaRunner.init(arena, &loaded, plan, 0, &cpu_pool, cfg, .f16);
 
     const rows: u32 = 8;
     try std.testing.expectEqual(wide.kv_slots[0].sizeBytes() / 2, narrow.kv_slots[0].sizeBytes());

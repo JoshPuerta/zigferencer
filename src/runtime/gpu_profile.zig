@@ -15,6 +15,10 @@
 //! the first write. `collect` reads the pool only after the wait that the submit path already does,
 //! so the pool is never read while its buffer is pending.
 //!
+//! Readback. `collect` reads first without the wait flag, because with the flag a driver can make
+//! one blocking call for each query. A result that is not ready yet counts in `not_ready` and
+//! reads again with the flag.
+//!
 //! Full bound. `prof_max` bounds the marks of one submit. `dropped` counts the marks past it, and
 //! `report` prints the count, so a full pool never deflates the per-phase percentages in silence.
 //! Each profile warns once, which keeps a long run from writing one line per record.
@@ -177,6 +181,8 @@ pub const GpuProfile = struct {
     dropped: u32 = 0,
     /// True after the first warning of a full bound.
     warned_full: bool = false,
+    /// Readbacks that found a result not ready after the wait and read again with the wait flag.
+    not_ready: u32 = 0,
     labels: [prof_max]Phase = undefined,
 
     /// A profile at `level`. Its pool holds the slots of `pool_for`, or of `level` when that is
@@ -304,9 +310,8 @@ pub const GpuProfile = struct {
         }
     }
 
-    /// Read back the last record of this buffer, or null when it wrote no
-    /// timestamp. Call it only after the wait of the submit, so the results
-    /// are available and the wait flag never blocks.
+    /// Read back the last record of this buffer, or null when it wrote no timestamp. Call it only
+    /// after the wait of the submit: a read with the wait flag blocks until the submit runs.
     pub fn collect(self: *GpuProfile) !?Readout {
         if (self.n == 0) return null;
 
@@ -315,18 +320,8 @@ pub const GpuProfile = struct {
         std.debug.assert(n <= self.capacity);
         self.n = 0;
 
-        // Read the ticks back.
         var ts: [prof_max]u64 = undefined;
-        _ = try self.ctx.vkd.getQueryPoolResults(
-            self.ctx.device,
-            self.query_pool,
-            0,
-            n,
-            n * @sizeOf(u64),
-            &ts,
-            @sizeOf(u64),
-            .{ .@"64_bit" = true, .wait_bit = true },
-        );
+        try self.readAll(ts[0..n]);
 
         // Turn the ticks into intervals, and bucket the intervals at `phases`.
         var deltas: [prof_max - 1]u64 = undefined;
@@ -363,6 +358,45 @@ pub const GpuProfile = struct {
         const r = try self.collect() orelse return null;
         span.gpu(r.record(runner, label, submit, wait));
         return r;
+    }
+
+    /// Read the first `ts.len` slots, and read again with the wait flag only when a result is not
+    /// ready yet.
+    fn readAll(self: *GpuProfile, ts: []u64) !void {
+        const sp = span.begin(.gpu_collect);
+        defer sp.end();
+
+        if (try self.readTicks(ts, false) == .success) return;
+
+        self.not_ready +|= 1;
+        if (self.not_ready == 1) {
+            log.warn(
+                "profile: a timestamp was not ready after the wait, " ++
+                    "so this profile reads again with the wait flag when that happens",
+                .{},
+            );
+        }
+
+        const again = try self.readTicks(ts, true);
+        std.debug.assert(again == .success);
+    }
+
+    /// Read the first `ts.len` slots. With `wait`, the driver blocks until each result is ready.
+    fn readTicks(self: *GpuProfile, ts: []u64, wait: bool) !vk.Result {
+        std.debug.assert(ts.len >= 2);
+        std.debug.assert(ts.len <= self.capacity);
+
+        const n: u32 = @intCast(ts.len);
+        return self.ctx.vkd.getQueryPoolResults(
+            self.ctx.device,
+            self.query_pool,
+            0,
+            n,
+            n * @sizeOf(u64),
+            ts.ptr,
+            @sizeOf(u64),
+            .{ .@"64_bit" = true, .wait_bit = wait },
+        );
     }
 
     fn ensurePool(self: *GpuProfile, slots: u32) !void {

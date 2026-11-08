@@ -24,7 +24,10 @@ the host details from `/proc`, and `registry.locate` checks a path on disk.
 | `registry.zig` | The table of known models and the paths of the model store. |
 | `chat.zig` | The chat wrap of each model family. |
 | `log.zig` | The process log, gated at run time. |
-| `span.zig` | The span recorder and the trace file. |
+| `span.zig` | The trace sites, the per-thread span logs, and the flush. |
+| `trace_file.zig` | The layout of the trace: names, tracks, slices, flows, and args. |
+| `perfetto.zig` | The protobuf encoder and the nesting walk. |
+| `gpu_record.zig` | The GPU record and the host-clock mapping of its ticks. |
 | `time.zig` | Elapsed-time arithmetic. |
 | `step_stats.zig` | The timers of a decode step. |
 | `record_ring.zig` | The state of the decode record ring. |
@@ -72,7 +75,8 @@ A byte budget becomes the shape of the KV cache:
 
 Inside the directory, `Tensor` reads `dtype` and `limits`, `Model` reads `chat` and `dtype`, and
 `OpRequires` reads `hwinfo`. `ring_fsm` faces one consumer, `ops_vulkan/stream_ring`, and
-`record_ring` faces `runtime/decode_ring`.
+`record_ring` faces `runtime/decode_ring`. `span` reads `trace_file` and `gpu_record`, and
+`trace_file` reads `perfetto` and `gpu_record`.
 
 ## Rules
 

@@ -45,7 +45,6 @@ const tokens = [_]u32{ 1, 2 };
 /// so the plan and the thread count reach the constructor at a single place.
 fn prefixRunner(
     arena: std.mem.Allocator,
-    io: std.Io,
     cpu_pool: *test_policy.Pool,
     loaded: *const loader.Loaded,
     n_layers: u32,
@@ -58,7 +57,6 @@ fn prefixRunner(
         zigferencer.kv_budget.pinned(n_slots, window),
         n_layers,
         0,
-        io,
         cpu_pool,
         serial,
         kv_dtype,
@@ -110,12 +108,11 @@ test "qwen initPrefix reproduces the whole-model layers, KV, and GDN state" {
             &loaded,
             zigferencer.kv_budget.pinned(1, window),
             0,
-            io,
             &cpu_pool,
             serial,
             .f32,
         );
-        var prefix = try prefixRunner(arena, io, &cpu_pool, &loaded, k, 1, .f32);
+        var prefix = try prefixRunner(arena, &cpu_pool, &loaded, k, 1, .f32);
         try std.testing.expectEqual(@as(usize, n_layers), full.layers.len);
         try std.testing.expectEqual(@as(usize, k), prefix.layers.len);
 
@@ -180,7 +177,7 @@ test "qwen prefix shapes: KV height, GDN slabs, and the compacted kv_slot" {
 
     const k: u32 = 6;
     const n_slots: u32 = 2;
-    var prefix = try prefixRunner(arena, io, &cpu_pool, &loaded, k, n_slots, .f32);
+    var prefix = try prefixRunner(arena, &cpu_pool, &loaded, k, n_slots, .f32);
 
     try std.testing.expectEqual(@as(usize, n_slots), prefix.kv_slots.len);
     try std.testing.expectEqual(@as(u32, 1), prefix.kv_slots[0].n_layers);
@@ -242,7 +239,7 @@ test "qwen prefix below the attention interval holds no KV and still steps" {
     // full-attention layers at the interval-4 layout. The slot vector is empty,
     // so every path that indexes a cache must stay behind a layer-kind branch.
     const k: u32 = 3;
-    var prefix = try prefixRunner(arena, io, &cpu_pool, &loaded, k, 2, .f32);
+    var prefix = try prefixRunner(arena, &cpu_pool, &loaded, k, 2, .f32);
     try std.testing.expectEqual(@as(usize, 0), prefix.kv_slots.len);
     for (0..k) |li| {
         try std.testing.expect(std.meta.activeTag(prefix.layers[li].kind) == .gdn);
@@ -301,7 +298,7 @@ test "qwen prefix resetSlotState zeroes its own slot's slabs only" {
 
     const k: u32 = 6;
     const n_slots: u32 = 2;
-    var prefix = try prefixRunner(arena, io, &cpu_pool, &loaded, k, n_slots, .f32);
+    var prefix = try prefixRunner(arena, &cpu_pool, &loaded, k, n_slots, .f32);
     for (0..n_slots) |s| {
         try driveRow(
             &prefix,
@@ -361,7 +358,6 @@ test "qwen prefix init reports an allocation failure and leaves nothing behind" 
 
         try std.testing.expectError(error.OutOfMemory, prefixRunner(
             runner_arena.allocator(),
-            io,
             &cpu_pool,
             &loaded,
             6,
@@ -391,6 +387,6 @@ test "qwen prefix init refuses a non-qwen model before it sizes anything" {
     // typed error and never the layer walk.
     try std.testing.expectError(
         error.NotQwen,
-        prefixRunner(arena, io, &cpu_pool, &loaded, 1, 1, .f32),
+        prefixRunner(arena, &cpu_pool, &loaded, 1, 1, .f32),
     );
 }

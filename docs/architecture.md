@@ -191,7 +191,7 @@ const requires: OpRequires` that declares its target requirements, and
 | Option | Effect |
 | --- | --- |
 | `-Doptimize` | `Debug` (the default of `zig build`), `ReleaseSafe` (keeps every assertion), or `ReleaseFast` (every measurement). |
-| `-Dtrace` | Compiles the hot log scopes (`layer`, `dispatch`, `token`) and the per-op trace spans. It is on by default in a Debug build. |
+| `-Dtrace` | Compiles the trace: the span sites, the per-op CPU timer, and the hot log scopes (`layer`, `dispatch`, `token`). It is off by default in every mode. |
 | `-Dllvm` | Forces the LLVM code generator. A debugger needs it to show local variables. |
 | `-Dvk-registry` | The path of the Vulkan registry, `vk.xml`. The default is the Debian and Ubuntu location. |
 | `-Dattn-kernel` | The set of GPU attention kernels. `split` is the only set. |

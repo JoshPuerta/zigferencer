@@ -1,8 +1,8 @@
 //! `bench-model --profile-cpu-decode`: the per-op decode timer of the CPU runners.
 //! It prefills the prompt unprofiled, so its numbers are steady-state decode, and
 //! prints the breakdown to stderr, because it is a diagnostic and not a result.
-//! The timer compiles into a hot-trace build only. `cpu_profile.ProfileCat` is the
-//! one list of categories, so a new category reaches the table with no edit here.
+//! The sums fill in a trace build only. The `op_*` names of `span.Name` are the one list of
+//! categories, so a new op name reaches the table with no edit here.
 //!
 //! Comptime. Generic over the model family and the runner, so every CPU runner shares one timer
 //! body.
@@ -19,9 +19,9 @@ const cpu_profile = zigferencer.cpu_profile;
 const parallel = zigferencer.parallel;
 const Pool = zigferencer.pool.Pool;
 const sampler = zigferencer.sampler;
+const span = zigferencer.span;
 
 const CpuProfile = cpu_profile.CpuProfile;
-const ProfileCat = cpu_profile.ProfileCat;
 
 // -- constants --------------------------------------------------------------
 
@@ -44,7 +44,6 @@ pub fn bench(
         b.loaded,
         kv_budget.pinned(1, max_seq),
         limits.cpu_prefill_chunk,
-        ctx.io,
         pool,
         b.policy,
         b.kvDtype(),
@@ -88,8 +87,8 @@ fn profileDecode(
     var tok = sampler.greedy(last);
 
     var prof: CpuProfile = .{ .family = family };
-    runner.profile = &prof;
-    defer runner.profile = null;
+    span.installSums(&prof.sums);
+    defer span.installSums(null);
 
     var k: u32 = 0;
     while (k < decode_len and pos < max_seq) : (k += 1) {
@@ -98,6 +97,7 @@ fn profileDecode(
         tok = sampler.greedy(lg);
     }
 
+    prof.steps = k;
     std.debug.assert(prof.steps == k);
     std.debug.assert(prof.total() > 0);
     return prof;
@@ -144,17 +144,17 @@ fn reportCpuProfile(
     );
     // Print one row per category.
     try w.writeAll("  " ++ "-" ** 54 ++ "\n");
-    for (std.enums.values(ProfileCat)) |cat| {
-        if (!cat.usedBy(p.family)) continue;
+    for (std.enums.values(span.Name)) |name| {
+        if (!name.isOp() or !cpu_profile.usedBy(name, p.family)) continue;
 
-        const ns: f64 = @floatFromInt(p.nsOf(cat));
+        const ns: f64 = @floatFromInt(p.nsOf(name));
         const ns_step = ns / steps;
         try w.print("  {s:<14}{d:>12.0}{d:>12.4}{d:>7.1}%  {s}\n", .{
-            @tagName(cat),
+            @tagName(name)["op_".len..],
             ns_step,
             ns_step / 1e6,
             100.0 * ns / total,
-            if (cat.isParallel()) "parallel" else "serial",
+            if (cpu_profile.isParallel(name)) "parallel" else "serial",
         });
     }
 

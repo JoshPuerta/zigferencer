@@ -66,14 +66,13 @@ test "llama initPrefix at the full layer count reproduces the whole-model residu
 
     const plan = zigferencer.kv_budget.pinned(1, window);
 
-    var full = try LlamaRunner.init(arena, &loaded, plan, 0, io, &cpu_pool, policy, .f32);
+    var full = try LlamaRunner.init(arena, &loaded, plan, 0, &cpu_pool, policy, .f32);
     var prefix = try LlamaRunner.initPrefix(
         arena,
         &loaded,
         plan,
         loaded.card.n_layers,
         0,
-        io,
         &cpu_pool,
         policy,
         .f32,
@@ -114,14 +113,13 @@ test "llama initPrefix sizes the weight slices and the KV to its own layer count
     std.debug.assert(n_layers >= 2); // the split needs a layer on each side
 
     const half: u32 = n_layers / 2;
-    var full = try LlamaRunner.init(arena, &loaded, plan, 0, io, &cpu_pool, policy, .f32);
+    var full = try LlamaRunner.init(arena, &loaded, plan, 0, &cpu_pool, policy, .f32);
     var short = try LlamaRunner.initPrefix(
         arena,
         &loaded,
         plan,
         half,
         0,
-        io,
         &cpu_pool,
         policy,
         .f32,

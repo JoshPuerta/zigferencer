@@ -23,10 +23,10 @@ carry no storage. A `Loaded` model comes in, and token ids go out.
 | `sampler.zig` | The greedy and the seeded sampling of one logits row. |
 | `generate.zig` | The single-sequence decode loop and its `sink` boundary. |
 | `parallel.zig` | The threading `Policy`, the row-parallel matmul, and CPU attention dispatch. |
-| `pool.zig` | `Pool`, the fork-join pool of the CPU ops. |
+| `pool.zig` | `Pool`, the fork-join pool of the CPU ops, and the spans of its work. |
 | `linear_dispatch.zig` | `linearBatchDispatch`, the batched linear by weight dtype. |
 | `tensor_lookup.zig` | The lookup of a weight by name over a `TensorRef` list. |
-| `cpu_profile.zig` | The per-op CPU decode timer. |
+| `cpu_profile.zig` | The per-op CPU decode profile, summed from the `op_*` spans. |
 | `attn_record.zig` | The attention recorder of the fused and hybrid runners. |
 | `decode_ring.zig` | `DecodeRing`, the two decode command buffers of a GPU runner. |
 | `gpu_profile.zig` | `GpuProfile`, the timestamps of one command buffer. |

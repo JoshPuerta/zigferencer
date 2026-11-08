@@ -92,7 +92,6 @@ fn initHybridAt(
     gpa: std.mem.Allocator,
     ctxp: *const vulkan_ctx.Context,
     loaded: *const loader.Loaded,
-    io: std.Io,
     thread_pool: *test_policy.Pool,
     gpu_layers: u32,
 ) !*LlamaHybridRunner {
@@ -128,7 +127,6 @@ fn initHybridAt(
         ctxp,
         loaded,
         plan,
-        io,
         thread_pool,
         cpu_cfg,
         .f32,
@@ -145,12 +143,11 @@ fn initHybrid(
     gpa: std.mem.Allocator,
     ctxp: *const vulkan_ctx.Context,
     loaded: *const loader.Loaded,
-    io: std.Io,
     thread_pool: *test_policy.Pool,
 ) !*LlamaHybridRunner {
     const n_layers: u32 = loaded.card.n_layers;
     std.debug.assert(n_layers >= 2); // a mid split needs a layer on each side
-    const hybrid = try initHybridAt(gpa, ctxp, loaded, io, thread_pool, n_layers / 2);
+    const hybrid = try initHybridAt(gpa, ctxp, loaded, thread_pool, n_layers / 2);
     std.debug.assert(hybrid.host_layers > 0);
     std.debug.assert(hybrid.host_layers < hybrid.n_layers);
     return hybrid;
@@ -230,7 +227,7 @@ test "llama hybrid swap: the blob is split-independent" {
     const ctxp = try initCtx(arena);
     defer ctxp.deinit();
 
-    const hybrid = try initHybrid(gpa, ctxp, &loaded, io, &thread_pool);
+    const hybrid = try initHybrid(gpa, ctxp, &loaded, &thread_pool);
     defer hybrid.deinit();
 
     const cpu = try LlamaRunner.init(
@@ -238,7 +235,6 @@ test "llama hybrid swap: the blob is split-independent" {
         &loaded,
         kv_budget.pinned(n_slots, window),
         0,
-        io,
         &thread_pool,
         cpu_cfg,
         .f32,
@@ -276,7 +272,7 @@ test "llama hybrid swap: one blob carries the whole-model framing" {
     const ctxp = try initCtx(arena);
     defer ctxp.deinit();
 
-    const hybrid = try initHybrid(gpa, ctxp, &loaded, io, &thread_pool);
+    const hybrid = try initHybrid(gpa, ctxp, &loaded, &thread_pool);
     defer hybrid.deinit();
 
     var cpu = try LlamaRunner.init(
@@ -284,7 +280,6 @@ test "llama hybrid swap: one blob carries the whole-model framing" {
         &loaded,
         kv_budget.pinned(n_slots, window),
         0,
-        io,
         &thread_pool,
         cpu_cfg,
         .f32,
@@ -358,7 +353,6 @@ test "llama hybrid swap: a restored slot decodes as if it never left" {
             &loaded,
             kv_budget.pinned(n_slots, window),
             0,
-            io,
             &thread_pool,
             cpu_cfg,
             .f32,
@@ -382,7 +376,7 @@ test "llama hybrid swap: a restored slot decodes as if it never left" {
     const ctxp = try initCtx(arena);
     defer ctxp.deinit();
 
-    const hybrid = try initHybrid(gpa, ctxp, &loaded, io, &thread_pool);
+    const hybrid = try initHybrid(gpa, ctxp, &loaded, &thread_pool);
     defer hybrid.deinit();
 
     var pool = try Sessions(LlamaHybridRunner).init(arena, hybrid);
@@ -432,7 +426,7 @@ test "llama hybrid swap: a fork decodes beside its source" {
     const ctxp = try initCtx(arena);
     defer ctxp.deinit();
 
-    const hybrid = try initHybrid(gpa, ctxp, &loaded, io, &thread_pool);
+    const hybrid = try initHybrid(gpa, ctxp, &loaded, &thread_pool);
     defer hybrid.deinit();
 
     var pool = try Sessions(LlamaHybridRunner).init(arena, hybrid);
@@ -474,7 +468,7 @@ test "llama hybrid dispatch: split 0 decodes the stream of the fused runner" {
 
     // Every layer on the device is dispatch-identical to the fused runner by claim.
     // A shell gate proves the whole split ladder, and this case proves one end of it.
-    const hybrid = try initHybridAt(gpa, ctxp, &loaded, io, &thread_pool, loaded.card.n_layers);
+    const hybrid = try initHybridAt(gpa, ctxp, &loaded, &thread_pool, loaded.card.n_layers);
     defer hybrid.deinit();
 
     try std.testing.expectEqual(@as(u32, 0), hybrid.host_layers);

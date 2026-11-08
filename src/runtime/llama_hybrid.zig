@@ -295,7 +295,6 @@ pub const LlamaHybridRunner = struct {
         ctx: *const vulkan_ctx.Context,
         loaded: *const loader.Loaded,
         plan: kv_budget.LayerSplit,
-        io: std.Io,
         pool: *Pool,
         policy: parallel.Policy,
         kv_dtype: dtype.KvDtype,
@@ -556,7 +555,6 @@ pub const LlamaHybridRunner = struct {
                 kv_budget.pinned(n_slots, max_seq),
                 split,
                 self.prefill_batch_max,
-                io,
                 pool,
                 policy,
                 kv_dtype,
@@ -1198,7 +1196,7 @@ pub const LlamaHybridRunner = struct {
     /// Run the CPU prefix over `rows`, and leave the crossing activations in `stage_in`. At `split
     /// == 0` the embeddings go straight to `stage_in`, which is exactly the fused runner's entry.
     fn hostPrefix(self: *LlamaHybridRunner, rows: []const step_row.StepRow) step_row.Error!void {
-        const sp = span.beginHot(.host_prefix);
+        const sp = span.begin(.host_prefix);
         defer sp.end();
 
         const d = self.hidden_dim;

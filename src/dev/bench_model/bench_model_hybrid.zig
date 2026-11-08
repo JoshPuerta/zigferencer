@@ -79,7 +79,6 @@ pub fn bench(comptime Family: type, b: *const Bench) !void {
         ctxp,
         b.loaded,
         plan,
-        ctx.io,
         &pool,
         b.policy,
         kv_dtype,

@@ -47,9 +47,9 @@ const dropped_fmt = "warning: ZIGFERENCER_LOG names too many scopes. The cap is 
     "The parser dropped {d} terms\n";
 
 /// Comptime gate for hot-path traces (the `layer`, `dispatch`, and `token`
-/// scopes). `-Dtrace` sets it: on in Debug, off in release unless forced. A
-/// call site wraps the whole trace, including any clock read, in
-/// `if (comptime hot)`, so a release build compiles the site out entirely.
+/// scopes) and for the span sites. `-Dtrace` sets it, and it is off by default
+/// in every mode. A call site wraps the whole trace, including any clock read,
+/// in `if (comptime hot)`, so a build without trace compiles the site out.
 pub const hot = build_options.trace_hot;
 
 // -- types ------------------------------------------------------------------

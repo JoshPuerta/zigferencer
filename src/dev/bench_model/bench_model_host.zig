@@ -83,7 +83,6 @@ pub fn bench(comptime Family: type, b: *const Bench) !void {
             b.loaded,
             kv_budget.pinned(1, max_seq),
             limits.cpu_prefill_chunk,
-            ctx.io,
             &pool,
             b.policy,
             b.kvDtype(),

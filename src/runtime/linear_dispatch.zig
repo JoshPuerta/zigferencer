@@ -254,7 +254,6 @@ fn expectRunnerRefuses(comptime Runner: type, card: loader.ModelCard) !void {
             &loaded,
             kv_budget.pinned(1, 16),
             1,
-            std.testing.io,
             &pool,
             .{},
             .f32,

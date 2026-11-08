@@ -54,11 +54,11 @@ Environment:
   FREQ        The sample rate in Hz (default 999).
   PYTHON      The python3 that runs tools/profile_convert.py (default python3).
   TRACE       Any value, such as 1, turns on the span recorder of the engine. `record` sets
-              ZIGFERENCER_TRACE_OUT=DIR/trace.json for the command. `attach` copies the trace
-              file that the process names in its own ZIGFERENCER_TRACE_OUT into DIR/trace.json
+              ZIGFERENCER_TRACE_OUT=DIR/trace.pftrace for the command. `attach` copies the trace
+              file that the process names in its own ZIGFERENCER_TRACE_OUT into DIR/trace.pftrace
               after the capture. ZIGFERENCER_TRACE_GPU, ZIGFERENCER_TRACE_SECONDS, and
               ZIGFERENCER_TRACE_SPANS pass through to the command. `report` renders
-              DIR/trace.json.gpu.folded into flame-gpu.svg when the file exists.
+              DIR/trace.pftrace.gpu.folded into flame-gpu.svg when the file exists.
   The `all` step also reads these:
   BACKEND     The ops backend of the build (default auto).
   FLAGS       More zig build flags.
@@ -190,10 +190,10 @@ cmd_record() {
     note "record $(cat "$dir/command.txt")"
     local trace_env=()
     if [ -n "${TRACE:-}" ]; then
-        rm -f "$dir/trace.json" "$dir/trace.json.gpu.folded"
-        trace_env=(ZIGFERENCER_TRACE_OUT="$dir/trace.json")
+        rm -f "$dir/trace.pftrace" "$dir/trace.pftrace.gpu.folded"
+        trace_env=(ZIGFERENCER_TRACE_OUT="$dir/trace.pftrace")
         # The engine log line "trace: recording to" states the ring capacity it uses.
-        note "span trace to $dir/trace.json (GPU level ${ZIGFERENCER_TRACE_GPU:-off}," \
+        note "span trace to $dir/trace.pftrace (GPU level ${ZIGFERENCER_TRACE_GPU:-off}," \
             "ring ${ZIGFERENCER_TRACE_SPANS:-at the engine default})"
     fi
     run_perf record -e cpu-clock:u -F "$freq" -g -k mono -o "$dir/perf.data" \
@@ -219,7 +219,7 @@ cmd_attach() {
         trace_src="$(tr '\0' '\n' </proc/"$pid"/environ |
             sed -n 's/^ZIGFERENCER_TRACE_OUT=//p')"
         [ -n "$trace_src" ] ||
-            note "pid $pid has no ZIGFERENCER_TRACE_OUT, so the cell gets no trace.json"
+            note "pid $pid has no ZIGFERENCER_TRACE_OUT, so the cell gets no trace.pftrace"
     fi
     run_perf record -e cpu-clock:u -F "$freq" -g -k mono -o "$dir/perf.data" \
         -p "$pid" -- sleep "$seconds"
@@ -230,9 +230,9 @@ cmd_attach() {
             *) trace_src="$(readlink -f /proc/"$pid"/cwd)/$trace_src" ;;
         esac
         if [ -f "$trace_src" ]; then
-            cp "$trace_src" "$dir/trace.json"
+            cp "$trace_src" "$dir/trace.pftrace"
             if [ -f "$trace_src.gpu.folded" ]; then
-                cp "$trace_src.gpu.folded" "$dir/trace.json.gpu.folded"
+                cp "$trace_src.gpu.folded" "$dir/trace.pftrace.gpu.folded"
             fi
             note "copied $trace_src into the cell"
         else
@@ -260,6 +260,16 @@ cmd_report() {
     "$python" "$here/profile_convert.py" fold \
         "$dir/samples.raw" "$bin" "$dir/symfs$bin" "$dir/stacks.raw.folded"
     shorten_names <"$dir/stacks.raw.folded" >"$dir/stacks.folded"
+
+    # The samples carry perf times on CLOCK_MONOTONIC, as the engine spans do, so the two files
+    # concatenate into one timeline.
+    note "samples as a Perfetto trace"
+    "$python" "$here/profile_convert.py" samples \
+        "$dir/samples.raw" "$bin" "$dir/symfs$bin" "$dir/samples.pftrace"
+    rm -f "$dir/timeline.pftrace"
+    if [ -f "$dir/trace.pftrace" ]; then
+        cat "$dir/trace.pftrace" "$dir/samples.pftrace" >"$dir/timeline.pftrace"
+    fi
     rm -f "$dir/samples.raw" "$dir/stacks.raw.folded"
     "$fg/flamegraph.pl" --title "$title" --subtitle "CPU samples, inlined frames shown" \
         --countname ns "$dir/stacks.folded" >"$dir/flame.svg"
@@ -279,10 +289,10 @@ cmd_report() {
     note "sampled timeline"
     run_perf script -i "$dir/perf.data" "${sym[@]}" -F +pid >"$dir/samples.perf" 2>/dev/null
 
-    if [ -s "$dir/trace.json.gpu.folded" ]; then
+    if [ -s "$dir/trace.pftrace.gpu.folded" ]; then
         note "GPU phases"
         "$fg/flamegraph.pl" --title "$title" --subtitle "GPU time by runner, label, and phase" \
-            --countname ns --colors aqua "$dir/trace.json.gpu.folded" >"$dir/flame-gpu.svg"
+            --countname ns --colors aqua "$dir/trace.pftrace.gpu.folded" >"$dir/flame-gpu.svg"
     fi
     note "done: $dir/flame.svg"
 }
@@ -333,7 +343,7 @@ cmd_diff() {
 # file. It holds no script.
 cmd_index() {
     [ $# -eq 1 ] || die_usage "index needs ROOT"
-    local root="$1" cell f
+    local root="$1" cell f tl
     [ -d "$root" ] || die "$root is not a directory"
     {
         cat <<EOF
@@ -341,17 +351,23 @@ cmd_index() {
 <style>body{font:14px sans-serif;margin:16px}td,th{padding:4px 8px;text-align:left}</style>
 <h1>profiles $(basename "$root")</h1>
 <p>SVG: open in a browser, click a frame to zoom, Ctrl-F to search.
-trace.json: ui.perfetto.dev, Open trace file.
+timeline.pftrace (engine spans with CPU samples), samples.pftrace, trace.pftrace:
+ui.perfetto.dev, Open trace file.
 samples.perf: profiler.firefox.com or speedscope.app. Text files: any editor.</p>
 <table><tr><th>cell</th><th>files</th></tr>
 EOF
         for cell in "$root"/*/; do
             [ -d "$cell" ] || continue
             printf '<tr><td>%s</td><td>' "$(basename "$cell")"
-            for f in "$cell"*.svg "$cell"*.json "$cell"*.txt "$cell"*.md \
+            for f in "$cell"*.svg "$cell"*.json "$cell"*.pftrace "$cell"*.txt "$cell"*.md \
                 "$cell"samples.perf "$cell"structure/*.svg; do
                 [ ! -f "$f" ] || printf '<a href="%s">%s</a> ' "${f#"$root"/}" "${f#"$cell"}"
             done
+            tl="$cell"timeline.pftrace
+            [ -f "$tl" ] || tl="$cell"samples.pftrace
+            [ ! -f "$tl" ] ||
+                printf '<br>%s: download it, then open it in ui.perfetto.dev with Open trace file' \
+                    "$(printf '<a href="%s">%s</a>' "${tl#"$root"/}" "${tl#"$cell"}")"
             printf '</td></tr>\n'
         done
         printf '</table>\n'

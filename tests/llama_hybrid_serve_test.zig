@@ -91,7 +91,6 @@ fn initHybrid(
     gpa: std.mem.Allocator,
     ctxp: *const vulkan_ctx.Context,
     loaded: *const loader.Loaded,
-    io: std.Io,
     cpu_pool: *test_policy.Pool,
     kv_dtype: dtype.KvDtype,
 ) !*LlamaHybridRunner {
@@ -127,7 +126,6 @@ fn initHybrid(
         ctxp,
         loaded,
         plan,
-        io,
         cpu_pool,
         cpu_cfg,
         kv_dtype,
@@ -268,7 +266,7 @@ fn overSubscribedRoundTrip(kv_dtype: dtype.KvDtype) !void {
     try test_policy.startPool(&cpu_pool, io, cpu_cfg);
     defer cpu_pool.deinit();
 
-    const hybrid = try initHybrid(gpa, ctxp, &loaded, io, &cpu_pool, kv_dtype);
+    const hybrid = try initHybrid(gpa, ctxp, &loaded, &cpu_pool, kv_dtype);
     defer hybrid.deinit();
 
     // Three logical sessions over two VRAM slots: the third forces a swap on every tick.
@@ -360,7 +358,7 @@ test "llama hybrid serve: an interleaved turn matches its solo stream" {
     try test_policy.startPool(&cpu_pool, io, cpu_cfg);
     defer cpu_pool.deinit();
 
-    const hybrid = try initHybrid(gpa, ctxp, &loaded, io, &cpu_pool, .f32);
+    const hybrid = try initHybrid(gpa, ctxp, &loaded, &cpu_pool, .f32);
     defer hybrid.deinit();
 
     // Full residency: no swap can run, so the batched pass alone answers for the streams.

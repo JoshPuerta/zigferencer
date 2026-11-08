@@ -196,7 +196,7 @@ fn prefillChunks(runner: anytype, prompt_ids: []const u32) !Prefilled {
         const remaining = prompt_ids.len - pos;
         const chunk: u32 = @intCast(@min(remaining, @as(usize, room)));
 
-        const sp = span.begin(.prefill_chunk);
+        const sp = span.beginArg(.prefill_chunk, chunk);
         last_logits = try runner.prefillBatch(prompt_ids[pos..][0..chunk], pos);
         sp.end();
 
@@ -214,7 +214,7 @@ fn prefillTokens(runner: anytype, prompt_ids: []const u32) !Prefilled {
     for (prompt_ids) |id| {
         if (pos >= window) break;
 
-        const sp = span.begin(.prefill_chunk);
+        const sp = span.beginArg(.prefill_chunk, 1);
         last_logits = try runner.step(id, pos);
         sp.end();
 

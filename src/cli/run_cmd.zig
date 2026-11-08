@@ -321,7 +321,6 @@ fn runHost(
         b.loaded,
         plan,
         limits.cpu_prefill_chunk,
-        ctx.io,
         t.pool,
         b.policy,
         b.kvDtype(),
@@ -469,7 +468,6 @@ fn runHybrid(
         ctxp,
         b.loaded,
         layer_split,
-        ctx.io,
         t.pool,
         b.policy,
         b.kvDtype(),
@@ -676,7 +674,7 @@ fn prefillChunks(runner: anytype, ids: []const u32) !Prefilled {
     while (pos < ids.len) {
         const chunk: u32 = @intCast(@min(ids.len - pos, runner.prefill_batch_max));
 
-        const sp = trace_span.begin(.prefill_chunk);
+        const sp = trace_span.beginArg(.prefill_chunk, chunk);
         last_logits = try runner.prefillBatch(ids[pos..][0..chunk], pos);
         sp.end();
 
@@ -691,7 +689,7 @@ fn prefillTokens(runner: anytype, ids: []const u32) !Prefilled {
     var last_logits: []f32 = undefined;
 
     for (ids) |id| {
-        const sp = trace_span.begin(.prefill_chunk);
+        const sp = trace_span.beginArg(.prefill_chunk, 1);
         last_logits = try runner.step(id, pos);
         sp.end();
 

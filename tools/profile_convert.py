@@ -16,6 +16,15 @@ fold RAW DSO FILE OUT
     lie in the next inlined scope, so the lookup uses the return address minus
     one. Writes folded stacks, root first, weighted by the sample period.
 
+samples RAW DSO FILE OUT
+    RAW, DSO, and FILE are as for `fold`, and the frames expand the same way,
+    with the same names as the flame graph. Writes a Perfetto proto trace on
+    the CLOCK_MONOTONIC clock that `perf record -k mono` uses: one packet per
+    sample with its thread and its call stack, and the thread names. Perfetto
+    shows the samples beside the engine spans, where the thread ids match. The
+    trace uses packet sequence 2. The engine spans use sequence 1, so
+    `cat spans samples` makes one valid trace.
+
 tree FOLDED CALLEES CALLERS
     FOLDED holds one stack per line, root first, then a weight. The first
     frame names the thread, and the tree keeps only the thread name, so equal
@@ -32,6 +41,7 @@ import os
 import re
 import subprocess
 import sys
+import time
 from collections import Counter, defaultdict
 from typing import Iterator, NamedTuple, Optional
 
@@ -44,6 +54,16 @@ FRAME = re.compile(r"^\s+(?P<ip>[0-9a-f]+)\s+(?P<sym>.+?)(?:\s+\((?P<dso>[^()]*)
 SYMOFF = re.compile(r"\+0x[0-9a-f]+$")
 THREAD_ID = re.compile(r"-[?\d]+/\d+$")
 TREE_CUT = 0.005
+ANON = re.compile(r"__anon_\d+")
+PAREN = re.compile(r"\(([^()]*)\)")
+MODULE_PREFIX = re.compile(r"\b(?:[a-z_][a-z0-9_]*\.)+(?=[A-Za-z_])")
+
+# Perfetto constants. The field numbers come from the protos of Perfetto v59.1.
+CLOCK_MONOTONIC = 3
+CLOCK_BOOTTIME = 6
+SAMPLE_SEQUENCE = 2
+SEQ_CLEARED = 1
+SEQ_NEEDS_STATE = 2
 
 # perf prints a switch in one of two forms: the raw tracepoint fields, or the
 # libtraceevent form `prev_comm:prev_pid [prio] STATE ==> next_comm:next_pid [prio]`.
@@ -150,37 +170,169 @@ def inline_chains(binary: str, addresses: set[int]) -> dict[int, list[str]]:
     return chains
 
 
+def frame_names(
+    frame: Frame, depth: int, dso_name: str, chains: dict[int, list[str]]
+) -> list[str]:
+    """Return the names of one frame, outermost first.
+
+    A frame of DSO expands into its inline chain.
+    """
+    names: list[str] = []
+    if frame.dso == dso_name:
+        names = chains.get(frame.ip if depth == 0 else frame.ip - 1, [])
+    names = [n for n in names if n != "??"]
+    if names:
+        return list(reversed(names))
+    if frame.sym == "[unknown]" and frame.dso:
+        return [f"[{os.path.basename(frame.dso)}]"]
+    return [SYMOFF.sub("", frame.sym)]
+
+
+def wanted_addresses(stacks, dso_name: str) -> set[int]:
+    """Return the addresses of the frames of DSO to look up.
+
+    A caller frame holds a return address, so the lookup uses the address minus one.
+    """
+    wanted: set[int] = set()
+    for frames in stacks:
+        for depth, frame in enumerate(frames):
+            if frame.dso == dso_name:
+                wanted.add(frame.ip if depth == 0 else frame.ip - 1)
+    return wanted
+
+
+def shorten_name(name: str) -> str:
+    """Apply `shorten_names` of profile.sh.
+
+    It drops `__anon_N`, and the module paths inside parentheses.
+    """
+    name = ANON.sub("", name)
+    prev = None
+    while prev != name:
+        prev = name
+        name = PAREN.sub(lambda m: "\x01" + MODULE_PREFIX.sub("", m.group(1)) + "\x02", name)
+    return name.replace("\x01", "(").replace("\x02", ")")
+
+
 def fold(raw: str, dso_name: str, binary: str, out_path: str) -> None:
     # One pass sums the period of each distinct stack, so memory grows with
     # the distinct stacks, not with the samples.
     stacks: Counter[tuple[str, Optional[int], int, tuple[Frame, ...]]] = Counter()
     for s in parse(raw):
         stacks[(s.comm, s.pid, s.tid, tuple(s.frames))] += s.period
-    wanted: set[int] = set()
-    for _comm, _pid, _tid, frames in stacks:
-        for depth, frame in enumerate(frames):
-            if frame.dso == dso_name:
-                wanted.add(frame.ip if depth == 0 else frame.ip - 1)
+    wanted = wanted_addresses((key[3] for key in stacks), dso_name)
     chains = inline_chains(binary, wanted)
     folded: dict[str, int] = defaultdict(int)
     for (comm, pid, tid, frames), period in stacks.items():
         path = [f"{comm}-{pid if pid is not None else '?'}/{tid}"]
         for depth in range(len(frames) - 1, -1, -1):
-            frame = frames[depth]
-            names: list[str] = []
-            if frame.dso == dso_name:
-                names = chains.get(frame.ip if depth == 0 else frame.ip - 1, [])
-            names = [n for n in names if n != "??"]
-            if names:
-                path.extend(reversed(names))
-            elif frame.sym == "[unknown]" and frame.dso:
-                path.append(f"[{os.path.basename(frame.dso)}]")
-            else:
-                path.append(SYMOFF.sub("", frame.sym))
+            path.extend(frame_names(frames[depth], depth, dso_name, chains))
         folded[";".join(path)] += period
     with open(out_path, "w", encoding="utf-8") as out:
         for key, weight in sorted(folded.items()):
             out.write(f"{key} {weight}\n")
+
+
+def varint(v: int) -> bytes:
+    v &= (1 << 64) - 1
+    out = bytearray()
+    while True:
+        b = v & 0x7F
+        v >>= 7
+        if not v:
+            out.append(b)
+            return bytes(out)
+        out.append(b | 0x80)
+
+
+def field_varint(field: int, v: int) -> bytes:
+    return varint(field << 3) + varint(v)
+
+
+def field_bytes(field: int, data: bytes | str) -> bytes:
+    if isinstance(data, str):
+        data = data.encode()
+    return varint(field << 3 | 2) + varint(len(data)) + data
+
+
+def packet(body: bytes) -> bytes:
+    return field_bytes(1, body)  # Trace.packet
+
+
+def samples(raw: str, dso_name: str, binary: str, out_path: str) -> None:
+    """Write the samples of RAW as a Perfetto trace. The module docstring has the layout."""
+    # Pass one finds the distinct stacks, so memory grows with them, not with the samples.
+    distinct: set[tuple[Frame, ...]] = set()
+    threads: dict[int, tuple[int, str]] = {}  # tid -> (pid, comm), the last sample wins
+    for s in parse(raw):
+        distinct.add(tuple(s.frames))
+        threads[s.tid] = (s.pid if s.pid is not None else s.tid, s.comm)
+    chains = inline_chains(binary, wanted_addresses(distinct, dso_name))
+
+    name_ids: dict[str, int] = {}  # one id per name serves as function id and as frame id
+    callstack_ids: dict[tuple[Frame, ...], int] = {}
+    callstacks: list[bytes] = []
+    for frames in sorted(distinct, key=lambda fs: [(f.ip, f.sym, f.dso) for f in fs]):
+        ids: list[int] = []
+        for depth in range(len(frames) - 1, -1, -1):
+            for name in frame_names(frames[depth], depth, dso_name, chains):
+                ids.append(name_ids.setdefault(shorten_name(name), len(name_ids) + 1))
+        callstack_ids[frames] = len(callstack_ids) + 1
+        callstacks.append(
+            field_bytes(
+                7,
+                field_varint(1, callstack_ids[frames])
+                + b"".join(field_varint(2, i) for i in ids),
+            )
+        )
+    interned = (
+        b"".join(
+            field_bytes(5, field_varint(1, i) + field_bytes(2, n)) for n, i in name_ids.items()
+        )
+        + b"".join(
+            field_bytes(6, field_varint(1, i) + field_varint(2, i)) for i in name_ids.values()
+        )
+        + b"".join(callstacks)
+    )
+
+    mono = time.clock_gettime_ns(time.CLOCK_MONOTONIC)
+    boot = time.clock_gettime_ns(time.CLOCK_BOOTTIME)
+    clocks = (
+        field_bytes(1, field_varint(1, CLOCK_MONOTONIC) + field_varint(2, mono))
+        + field_bytes(1, field_varint(1, CLOCK_BOOTTIME) + field_varint(2, boot))
+        + field_varint(2, CLOCK_MONOTONIC)
+    )
+    tree = b"".join(
+        field_bytes(2, field_varint(1, tid) + field_bytes(2, comm) + field_varint(3, pid))
+        for tid, (pid, comm) in sorted(threads.items())
+    )
+    seq = field_varint(10, SAMPLE_SEQUENCE)
+    with open(out_path, "wb") as out:
+        out.write(packet(seq + field_bytes(6, clocks)))
+        out.write(
+            packet(
+                seq
+                + field_varint(13, SEQ_CLEARED)
+                + field_bytes(59, field_varint(58, CLOCK_MONOTONIC))
+                + field_bytes(12, interned)
+            )
+        )
+        out.write(packet(seq + field_bytes(2, tree)))
+        for s in parse(raw):
+            perf_sample = (
+                field_varint(1, 0)  # the perf script text has no CPU column
+                + field_varint(2, s.pid if s.pid is not None else s.tid)
+                + field_varint(3, s.tid)
+                + field_varint(4, callstack_ids[tuple(s.frames)])
+            )
+            out.write(
+                packet(
+                    field_varint(8, s.ns)
+                    + seq
+                    + field_varint(13, SEQ_NEEDS_STATE)
+                    + field_bytes(66, perf_sample)
+                )
+            )
 
 
 def new_node() -> dict:
@@ -278,6 +430,11 @@ def main() -> int:
     p.add_argument("dso")
     p.add_argument("file")
     p.add_argument("out")
+    p = sub.add_parser("samples", help="write the CPU samples as a Perfetto trace")
+    p.add_argument("raw")
+    p.add_argument("dso")
+    p.add_argument("file")
+    p.add_argument("out")
     p = sub.add_parser("tree", help="write the callee and the caller trees")
     p.add_argument("folded")
     p.add_argument("callees")
@@ -289,6 +446,8 @@ def main() -> int:
     args = ap.parse_args()
     if args.command == "fold":
         fold(args.raw, args.dso, args.file, args.out)
+    elif args.command == "samples":
+        samples(args.raw, args.dso, args.file, args.out)
     elif args.command == "tree":
         tree(args.folded, args.callees, args.callers)
     else:

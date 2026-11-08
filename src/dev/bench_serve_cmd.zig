@@ -388,7 +388,6 @@ fn cpuCurve(comptime Family: type, c: *const Curve) !void {
             c.loaded,
             kv_budget.pinned(b, c.max_seq),
             prefill_chunk.stepRows(prefill_chunk.cpu_rule, b, b),
-            ctx.io,
             c.pool,
             c.policy,
             c.kv_dtype,

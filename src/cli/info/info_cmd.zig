@@ -140,10 +140,10 @@ fn printBuild(w: *Io.Writer, p: style.Palette) !void {
     );
 
     if (log.hot) {
-        try w.print("  hot traces:      {s}compiled (-Dtrace){s}\n", .{ p.green, p.reset });
+        try w.print("  trace:           {s}compiled (-Dtrace){s}\n", .{ p.green, p.reset });
     } else {
         try w.print(
-            "  hot traces:      {s}off (release, Debug or -Dtrace=true to compile){s}\n",
+            "  trace:           {s}off (build with -Dtrace=true to compile){s}\n",
             .{ p.dim, p.reset },
         );
     }

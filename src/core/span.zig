@@ -1,18 +1,25 @@
-//! The span recorder: a timeline of the engine boundaries for one process,
-//! written as Chrome Trace Event JSON for ui.perfetto.dev.
+//! The span recorder: a timeline of the engine boundaries for one process, written as a Perfetto
+//! protobuf trace for ui.perfetto.dev and trace_processor.
 //!
-//! Comptime. Asserts pin the sizes of `Span` and `GpuRecord`. `beginHot` accepts only hot names
-//! and compiles out without `-Dtrace`.
+//! Comptime. `compiled` is `-Dtrace`. Each site entry is `live.x` with it and `off.x` without it.
+//! `off` holds empty inline bodies, so a build without trace emits nothing at a site. Asserts pin
+//! the size of `Span` and the bound of each event packet.
 //!
 //! Switches. `$ZIGFERENCER_TRACE_OUT=path` turns the recorder on at startup. A span site then reads
 //! the monotonic clock twice and pushes one `Span` into the ring of its thread. With the recorder
 //! off, a site costs one atomic load and one branch, and it touches no thread-local state.
 //! `$ZIGFERENCER_TRACE_SECONDS=N` bounds the capture window. The recorder writes the trace when the
 //! window ends or at exit, whichever comes first. `$ZIGFERENCER_TRACE_SPANS=N` sets the capacity of
-//! every ring, so a long per-op capture keeps its spans.
+//! every span ring. The GPU ring holds `limits.trace_gpu_records`.
 //!
-//! Levels. As in `log.zig`, the boundary spans (`Name.isHot` false) compile in every build. The
-//! per-op spans compile only under `-Dtrace`, through `beginHot`.
+//! Gate. One atomic word: bit 0 is set while the recorder records, and the bits above it count the
+//! installed `Sums`. A site loads the word once, and a zero word gives an inert scope. The flush
+//! clears bit 0 before the writer reads the rings.
+//!
+//! Scopes. `begin` and `beginArg` save the innermost open name of the thread and set their own.
+//! `end` restores it, so `current` names the innermost open `begin` scope. `beginPart` leaves it.
+//! Only the end of a `begin` scope with an op name adds to the `Sums` of its thread, so a pool
+//! share never counts an op twice.
 //!
 //! Storage. It is the dynamic shell of this module. Nothing is allocated when the recorder stays
 //! off. Each thread claims one fixed ring from a table bounded by `limits.span_threads_max` and
@@ -33,6 +40,9 @@
 //! state the loss. A retry gains nothing: the published prefix cannot pass the unwritten index of
 //! the failed push.
 //!
+//! Output. The flush sorts each ring and hands the rings and the GPU records to
+//! `trace_file.writeTrace`, which owns the layout. The GPU folded file goes beside the trace.
+//!
 //! Flush. Only the first `flush` call writes. A later call waits for that write to end, for at most
 //! `flush_wait_max_s`, so an exit after `finish` keeps the whole trace that the window thread
 //! writes. Happens-before: the writer closes both files, then stores `done` with release order. A
@@ -41,178 +51,52 @@
 //!
 //! Clock. It is `.awake` (`CLOCK_MONOTONIC` on Linux), the clock of `perf record -k mono`, so a
 //! span file and a perf file share one time base. A GPU clock maps to that base only through the
-//! submit and wait points of each record. The device counter is not a stable clock across submits,
-//! so the writer maps each record to its own host times (see `hostInterval`).
-//!
-//! GPU clock. The true offset of a record, host time minus device time, lies at or below
-//! `host_wait - gpu_end` of that record. A device counter that pauses while the GPU idles only lets
-//! the host clock run ahead, so the offset never falls from one record to a later one. The bound of
-//! a later record therefore bounds this record too, and the minimum over the record and the records
-//! after it comes closest to the true offset.
-//!
-//! Clamp. Records arrive in host order within a few positions, because two threads can push in
-//! the reverse order of their waits. The forward window and the clamp absorb that inversion. A
-//! clamp moves the record inside `[host_submit, host_wait]` when a counter breaks that rule, and
-//! keeps its duration when it fits.
-//!
-//! Device ticks. A stamp delta wraps at the valid bits of the queue, so `tickSpan` masks each
-//! delta. A masked delta above `mask / 2` is a step back of the counter, not a near-full wrap. It
-//! counts as zero ticks and as one backstep. The end is the start plus the sum of the deltas, so
-//! `end - start` and the phase sums agree. A sum past `u64` saturates.
+//! submit and wait points of each record, with `gpu_record.hostInterval`.
 
 const std = @import("std");
 const builtin = @import("builtin");
 const limits = @import("limits.zig");
 const core_log = @import("log.zig");
+const gpu_record = @import("gpu_record.zig");
+const trace_file = @import("trace_file.zig");
 
 const assert = std.debug.assert;
 const log = std.log.scoped(.span);
 
 // -- constants --------------------------------------------------------------
 
-pub const gpu_phase_count = std.meta.fields(GpuPhase).len;
+/// True under `-Dtrace`. Without it, every site entry is an empty inline body.
+pub const compiled: bool = core_log.hot;
 
-/// Records that the local offset of one record reads: itself and the records after it.
-pub const anchor_window: u32 = 16;
+pub const gpu_phase_count = gpu_record.gpu_phase_count;
+
+/// The gate bit of a recording recorder, and the gate step of one installed `Sums`.
+const gate_record: u32 = 1;
+const gate_sink: u32 = 2;
+
+/// The longest wait of a later `flush` caller. It only catches a stalled file system.
+const flush_wait_max_s = 60;
+
+const write_buffer_bytes = 1 << 20;
 
 // -- types ------------------------------------------------------------------
 
-/// The closed span vocabulary. The JSON event name is the tag name.
-pub const Name = enum(u16) {
-    model_load,
-    tokenize,
-    prefill_chunk,
-    decode_step,
-    sample,
-    gpu_record,
-    gpu_submit,
-    gpu_speculate,
-    gpu_wait,
-    sched_tick,
-    composed_step,
-    kv_evict,
-    kv_restore,
-    socket_read,
-    socket_write,
-    http_chat,
-    client_stream,
-    // The per-op spans. Only `-Dtrace` builds record them.
-    pool_run,
-    run_share,
-    worker_wait,
-    layer_forward,
-    host_prefix,
-    // One span per `cpu_profile.ProfileCat`, in its order.
-    op_embed,
-    op_rmsnorm,
-    op_gdn_proj,
-    op_gdn_step,
-    op_gdn_out,
-    op_qkv_proj,
-    op_attn_proj,
-    op_rope,
-    op_qk_norm_rope,
-    op_kv_commit,
-    op_attention,
-    op_attn_gate,
-    op_o_proj,
-    op_gate_up_proj,
-    op_swiglu,
-    op_down_proj,
-    op_residual,
-    op_lm_head,
+pub const Name = trace_file.Name;
+pub const Span = trace_file.Span;
 
-    /// True for the spans that only `-Dtrace` builds record.
-    pub fn isHot(self: Name) bool {
-        return @intFromEnum(self) >= @intFromEnum(Name.pool_run);
-    }
-};
+/// The nanoseconds per op name of one thread, filled by `installSums`.
+pub const Sums = std.EnumArray(Name, u64);
 
-/// One closed span. The times are nanoseconds on the `.awake` clock.
-pub const Span = extern struct {
-    start_ns: u64,
-    end_ns: u64,
-    name: Name,
-    pad: [6]u8 = @splat(0),
+pub const GpuLevel = gpu_record.GpuLevel;
+pub const GpuRunner = gpu_record.GpuRunner;
+pub const GpuLabel = gpu_record.GpuLabel;
+pub const GpuPhase = gpu_record.GpuPhase;
+pub const GpuRecord = gpu_record.GpuRecord;
 
-    comptime {
-        assert(@sizeOf(Span) == 24);
-        // The ring ceiling in `limits` prices one thread ring at 96 MiB.
-        assert(@as(u64, limits.spans_per_thread_max) * @sizeOf(Span) == 96 << 20);
-    }
-};
-
-/// The GPU timestamp level, from `$ZIGFERENCER_TRACE_GPU`. `submit` writes a start and an end
-/// stamp per command buffer. `phases` also writes every phase mark of the record functions.
-pub const GpuLevel = enum(u8) { off, submit, phases };
-
-/// The runner that recorded a GPU command buffer. `staging` is `kernels.submitOnce`, which no
-/// runner owns.
-pub const GpuRunner = enum(u8) { llama_fused, qwen_fused, llama_hybrid, qwen_hybrid, staging };
-
-/// What a GPU command buffer did. The last four are the labels of `kernels.SubmitLabel`.
-pub const GpuLabel = enum(u8) { decode, decode_batch, prefill_chunk, copy, fill, clone, dispatch };
-
-/// The op groups of the GPU phase marks. Each matmul phase names its projection group.
-pub const GpuPhase = enum(u8) {
-    /// GDN input projections: qkv, z, alpha, beta.
-    matmul_gdn_in,
-    /// Attention input projections: q, k, v.
-    matmul_attn_in,
-    /// Output projections: ssm_out and o.
-    matmul_out,
-    /// FFN gate and up.
-    matmul_ffn_up,
-    /// FFN down.
-    matmul_ffn_down,
-    gdn_conv,
-    gdn_scan,
-    qknorm,
-    rope,
-    attn,
-    elementwise,
-    norm,
-    lmhead,
-    copy,
-};
-
-/// One GPU command buffer, read back after the wait its path already does. The device ticks stay
-/// raw, and `period_ns` converts them. The host times are `.awake` nanoseconds at submit and wait.
-pub const GpuRecord = struct {
-    runner: GpuRunner,
-    label: GpuLabel,
-    gpu_start: u64,
-    gpu_end: u64,
-    period_ns: f64,
-    host_submit_ns: u64,
-    host_wait_ns: u64,
-    /// The phase sums of a `phases` record. A `submit` record has none.
-    phases: ?[gpu_phase_count]u64 = null,
-    /// The intervals where the device counter stepped back. Each counts as zero ticks.
-    backsteps: u32 = 0,
-
-    comptime {
-        // The ring stores one ready flag beside each record, so an entry costs 169 bytes.
-        // `docs/profiling.md` prices the GPU ring with it.
-        assert(@sizeOf(GpuRecord) == 168);
-    }
-
-    fn gpuStartNs(self: GpuRecord) i64 {
-        return ticksToNs(self.gpu_start, self.period_ns);
-    }
-
-    fn gpuEndNs(self: GpuRecord) i64 {
-        return ticksToNs(self.gpu_end, self.period_ns);
-    }
-};
-
-/// Where one GPU record sits on the host clock, in nanoseconds.
-pub const HostInterval = struct {
-    start_ns: i64,
-    end_ns: i64,
-    /// How far the clamp moved the record into its host window.
-    clamp_ns: u64,
-};
+const ThreadTrack = trace_file.ThreadTrack;
+const Meta = trace_file.Meta;
+const Written = trace_file.Written;
+const GpuSlot = trace_file.GpuSlot;
 
 /// One fixed ring of spans, written by its owner thread alone.
 pub const Ring = struct {
@@ -255,41 +139,6 @@ pub const Ring = struct {
     }
 };
 
-/// One thread track of the JSON output. `spans` must be sorted by `lessThan`.
-pub const ThreadTrack = struct {
-    tid: u64,
-    name: []const u8,
-    spans: []const Span,
-};
-
-/// The counts the trace metadata states.
-pub const Meta = struct {
-    dropped: u64 = 0,
-    threads_dropped: u64 = 0,
-    /// The spans of the threads that hold no ring.
-    orphan_spans: u64 = 0,
-    gpu_dropped: u64 = 0,
-    gpu_level: GpuLevel = .off,
-};
-
-/// One open span. `start_ns == 0` means the recorder was off at `begin`, and
-/// `end` then does nothing.
-pub const Scope = struct {
-    start_ns: u64,
-    name: Name,
-
-    pub inline fn end(self: Scope) void {
-        if (self.start_ns == 0) return;
-        endSlow(self);
-    }
-};
-
-/// The scope of a per-op span: a `Scope` under `-Dtrace`, and an empty value
-/// otherwise, so a release build compiles the site out.
-pub const HotScope = if (core_log.hot) Scope else struct {
-    pub inline fn end(_: @This()) void {}
-};
-
 /// The startup inputs of the recorder, read from the environment by `main`.
 pub const Env = struct {
     out: ?[]const u8 = null,
@@ -298,11 +147,213 @@ pub const Env = struct {
     spans: ?[]const u8 = null,
 };
 
-/// The device times of one command buffer, in raw ticks.
-pub const TickSpan = struct {
-    start: u64,
-    end: u64,
-    backsteps: u32,
+/// One open span. `end` closes it.
+pub const Scope = if (compiled) live.Scope else off.Scope;
+
+/// The recording site entries. Plain functions, so a debugger step filter can skip them by name.
+const live = struct {
+    /// `start_ns == 0` means the gate was zero at the open, and `end` then does nothing.
+    pub const Scope = struct {
+        start_ns: u64,
+        name: Name,
+        prev: ?Name,
+        arg: u32,
+        part: u8,
+        flags: u8,
+        kind: Kind,
+
+        pub const Kind = enum(u8) { begin, part };
+
+        pub fn end(self: live.Scope) void {
+            if (self.start_ns == 0) return;
+            self.endAt(nowNs());
+        }
+
+        /// The sink installed at the end counts the span, and the gate at the end decides the push.
+        fn endAt(self: live.Scope, end_ns: u64) void {
+            assert(self.start_ns != 0);
+            assert(self.start_ns <= end_ns);
+
+            if (self.kind == .begin) {
+                assert(tl_current == self.name);
+                tl_current = self.prev;
+                if (self.name.isOp()) {
+                    if (tl_sums) |sums| {
+                        sums.getPtr(self.name).* += end_ns - self.start_ns;
+                    }
+                }
+            }
+
+            if (active.load(.acquire) & gate_record == 0) return;
+            pushCurrent(.{
+                .start_ns = self.start_ns,
+                .end_ns = end_ns,
+                .name = self.name,
+                .part = self.part,
+                .flags = self.flags,
+                .arg = self.arg,
+            });
+        }
+    };
+
+    pub fn begin(name: Name) live.Scope {
+        return open(name, 0, 0);
+    }
+
+    pub fn beginArg(name: Name, arg: u32) live.Scope {
+        return open(name, arg, Span.flag_arg);
+    }
+
+    /// A `pool_run` or a worker share, in the shape of `Name.partFits`. It leaves `current` and the
+    /// `Sums` alone.
+    pub fn beginPart(name: Name, arg: u32, part: u8) live.Scope {
+        assert(name.partFits(part));
+
+        const scope: live.Scope = .{
+            .start_ns = 0,
+            .name = name,
+            .prev = null,
+            .arg = arg,
+            .part = part,
+            .flags = Span.flag_arg,
+            .kind = .part,
+        };
+        if (active.load(.acquire) == 0) return scope;
+
+        var live_scope = scope;
+        live_scope.start_ns = nowNs();
+        return live_scope;
+    }
+
+    pub fn current() ?Name {
+        return tl_current;
+    }
+
+    pub fn record(name: Name, start: std.Io.Timestamp, end_ts: std.Io.Timestamp) void {
+        if (active.load(.acquire) & gate_record == 0) return;
+        pushCurrent(.{ .start_ns = tsNs(start), .end_ns = tsNs(end_ts), .name = name });
+    }
+
+    pub fn gpu(rec: GpuRecord) void {
+        if (active.load(.acquire) & gate_record == 0) return;
+
+        assert(rec.gpu_start <= rec.gpu_end);
+        const r = recorder.?;
+        r.gpu.push(r.gpa, rec);
+    }
+
+    pub fn enabled() bool {
+        return active.load(.acquire) & gate_record != 0;
+    }
+
+    pub fn gpuLevel() GpuLevel {
+        return gpu_level;
+    }
+
+    pub fn setGpuLevel(level: GpuLevel) void {
+        gpu_level = level;
+    }
+
+    /// Install `sums` as the sink of this thread, or remove the installed one with null.
+    pub fn installSums(sums: ?*Sums) void {
+        if (sums) |s| {
+            assert(tl_sums == null);
+            tl_sums = s;
+            _ = active.fetchAdd(gate_sink, .acq_rel);
+        } else {
+            assert(tl_sums != null);
+            tl_sums = null;
+            const old = active.fetchSub(gate_sink, .acq_rel);
+            assert(old >= gate_sink);
+        }
+    }
+
+    pub fn setFromEnv(io: std.Io, env: Env) error{InvalidTraceSpans}!void {
+        return setup(std.heap.page_allocator, io, env);
+    }
+
+    pub fn finish() void {
+        const r = recorder orelse return;
+        _ = r.flush();
+    }
+
+    /// A `begin` scope. A zero gate gives an inert scope that leaves `current` alone.
+    fn open(name: Name, arg: u32, flags: u8) live.Scope {
+        var scope: live.Scope = .{
+            .start_ns = 0,
+            .name = name,
+            .prev = null,
+            .arg = arg,
+            .part = 0,
+            .flags = flags,
+            .kind = .begin,
+        };
+        if (active.load(.acquire) == 0) return scope;
+
+        scope.prev = tl_current;
+        scope.start_ns = nowNs();
+        tl_current = name;
+        return scope;
+    }
+};
+
+/// The site entries of a build without trace: empty inline bodies.
+const off = struct {
+    pub const Scope = struct {
+        pub inline fn end(_: off.Scope) void {}
+    };
+
+    pub inline fn begin(_: Name) off.Scope {
+        return .{};
+    }
+
+    pub inline fn beginArg(_: Name, _: u32) off.Scope {
+        return .{};
+    }
+
+    pub inline fn beginPart(_: Name, _: u32, _: u8) off.Scope {
+        return .{};
+    }
+
+    pub inline fn current() ?Name {
+        return null;
+    }
+
+    pub inline fn record(_: Name, _: std.Io.Timestamp, _: std.Io.Timestamp) void {}
+
+    pub inline fn gpu(_: GpuRecord) void {}
+
+    pub inline fn enabled() bool {
+        return false;
+    }
+
+    pub inline fn gpuLevel() GpuLevel {
+        return .off;
+    }
+
+    pub inline fn setGpuLevel(_: GpuLevel) void {}
+
+    pub inline fn installSums(_: ?*Sums) void {}
+
+    /// Warn once for each trace variable that is set, because this build cannot record it.
+    pub fn setFromEnv(_: std.Io, env: Env) error{InvalidTraceSpans}!void {
+        const vars = [_]struct { []const u8, bool }{
+            .{ "ZIGFERENCER_TRACE_OUT", env.out != null },
+            .{ "ZIGFERENCER_TRACE_SECONDS", env.seconds != null },
+            .{ "ZIGFERENCER_TRACE_GPU", env.gpu != null },
+            .{ limits.trace_spans_env, env.spans != null },
+        };
+        for (vars) |v| {
+            if (!v[1]) continue;
+
+            log.warn(
+                "{s} is set, but this build has no trace. Build with -Dtrace=true to record one.",
+                .{v[0]},
+            );
+        }
+    }
+
+    pub inline fn finish() void {}
 };
 
 /// The trace storage: the ring headers of every thread, and the spans of each claimed ring.
@@ -320,11 +371,26 @@ const Recorder = struct {
     gpu: GpuRing,
     flushed: std.atomic.Value(FlushState) = .init(.idle),
 
-    /// `per` is the capacity of each span ring and of the GPU ring. `gpa` must be thread-safe,
-    /// because `claim` and the first GPU record allocate on any thread.
-    fn create(gpa: std.mem.Allocator, io: std.Io, path: []const u8, per: u32) !*Recorder {
+    /// The published rings, sorted, and the counts they state.
+    const Collected = struct {
+        tracks: [limits.span_threads_max]ThreadTrack,
+        n_tracks: usize,
+        n_spans: u64,
+        dropped: u64,
+    };
+
+    /// `per` is the capacity of each span ring, and `gpu_per` of the GPU ring. `gpa` must be
+    /// thread-safe, because `claim` and the first GPU record allocate on any thread.
+    fn create(
+        gpa: std.mem.Allocator,
+        io: std.Io,
+        path: []const u8,
+        per: u32,
+        gpu_per: u32,
+    ) !*Recorder {
         assert(per >= 1);
         assert(per <= limits.spans_per_thread_max);
+        assert(gpu_per >= 1);
 
         const self = try gpa.create(Recorder);
         errdefer gpa.destroy(self);
@@ -341,7 +407,7 @@ const Recorder = struct {
             .path = path,
             .rings = rings,
             .per = per,
-            .gpu = .{ .per = per },
+            .gpu = .{ .per = gpu_per },
         };
         return self;
     }
@@ -392,7 +458,7 @@ const Recorder = struct {
             return self.awaitWrite();
         }
 
-        on.store(false, .release);
+        _ = active.fetchAnd(~gate_record, .release);
         self.write() catch |err| log.err("trace: writing {s} failed: {t}", .{ self.path, err });
         self.flushed.store(.done, .release);
         self.io.futexWake(FlushState, &self.flushed.raw, std.math.maxInt(u32));
@@ -426,48 +492,74 @@ const Recorder = struct {
         return .timed_out;
     }
 
-    fn write(self: *Recorder) !void {
-        assert(self.flushed.load(.monotonic) == .writing);
-
-        // Collect the published rings into sorted thread tracks.
+    /// Collect the published rings into sorted thread tracks.
+    fn collect(self: *Recorder, out: *Collected) void {
+        out.n_tracks = 0;
+        out.n_spans = 0;
+        out.dropped = 0;
         const n_rings = @min(self.claimed.load(.acquire), self.rings.len);
-        var tracks: [limits.span_threads_max]ThreadTrack = undefined;
-        var n_tracks: usize = 0;
-        const gpu_kept = self.gpu.kept();
-        var meta: Meta = .{
-            .threads_dropped = self.threads_dropped.load(.monotonic),
-            .orphan_spans = self.orphan_spans.load(.monotonic),
-            .gpu_dropped = self.gpu.dropped.load(.monotonic) + gpu_kept.unready,
-            .gpu_level = gpu_level,
-        };
-        var n_spans: u64 = 0;
-        for (self.rings[0..n_rings]) |*r| {
+        for (self.rings[0..n_rings], 0..) |*r, i| {
             // A ring claimed but not yet published holds no span.
             if (!r.published.load(.acquire)) continue;
 
             // The owner writes only past `len`, so the kept prefix sorts in place.
             const spans = r.kept();
-            meta.dropped += r.dropped.load(.monotonic);
+            out.dropped += r.dropped.load(.monotonic);
             if (spans.len == 0) continue;
 
             std.mem.sort(Span, spans, {}, lessThan);
-            n_spans += spans.len;
-            tracks[n_tracks] = .{ .tid = r.tid, .name = r.label(), .spans = spans };
-            n_tracks += 1;
+            out.n_spans += spans.len;
+            out.tracks[out.n_tracks] = .{
+                .ring = @intCast(i),
+                .tid = r.tid,
+                .name = r.label(),
+                .spans = spans,
+            };
+            out.n_tracks += 1;
         }
 
-        // Write the trace file.
-        const gpu_records = gpu_kept.records;
+        assert(out.n_tracks <= n_rings);
+    }
 
-        const buf = try self.gpa.alloc(u8, 1 << 20);
+    fn write(self: *Recorder) !void {
+        assert(self.flushed.load(.monotonic) == .writing);
+
+        // Collect the rings, then read both clocks back to back.
+        var got: Collected = undefined;
+        self.collect(&got);
+        const gpu_kept = self.gpu.kept();
+        const gpu_records = gpu_kept.records;
+        const meta: Meta = .{
+            .dropped = got.dropped,
+            .threads_dropped = self.threads_dropped.load(.monotonic),
+            .orphan_spans = self.orphan_spans.load(.monotonic),
+            .gpu_dropped = self.gpu.dropped.load(.monotonic) + gpu_kept.unready,
+            .gpu_level = gpu_level,
+        };
+        const monotonic_ns = tsNs(std.Io.Clock.now(.awake, self.io));
+        const boottime: u64 = @intCast(std.Io.Clock.now(.boot, self.io).nanoseconds);
+
+        // Write the trace file.
+        const gpu_slots = try self.gpa.alloc(GpuSlot, gpu_records.len);
+        defer self.gpa.free(gpu_slots);
+        const buf = try self.gpa.alloc(u8, write_buffer_bytes);
         defer self.gpa.free(buf);
 
+        var written: Written = undefined;
         {
             const file = try self.dir.createFile(self.io, self.path, .{});
             defer file.close(self.io);
 
             var fw: std.Io.File.Writer = .init(file, self.io, buf);
-            try writeJson(&fw.interface, processId(), tracks[0..n_tracks], gpu_records, meta);
+            written = try trace_file.writeTrace(&fw.interface, .{
+                .monotonic_ns = monotonic_ns,
+                .boottime_ns = boottime,
+                .pid = processId(),
+                .threads = got.tracks[0..got.n_tracks],
+                .gpu_records = gpu_records,
+                .gpu_slots = gpu_slots,
+                .meta = meta,
+            });
             try fw.interface.flush();
         }
 
@@ -479,23 +571,25 @@ const Recorder = struct {
             defer file.close(self.io);
 
             var fw: std.Io.File.Writer = .init(file, self.io, buf);
-            try writeFolded(&fw.interface, gpu_records);
+            try gpu_record.writeFolded(&fw.interface, gpu_records);
             try fw.interface.flush();
         }
 
         // Report the counts.
         log.info(
             "trace: wrote {s}: {d} spans on {d} threads, {d} GPU records, dropped {d} " ++
-                "spans, {d} threads, {d} spans of threads with no ring, {d} GPU records",
+                "spans, {d} threads, {d} spans of threads with no ring, {d} GPU records, " ++
+                "{d} misnested",
             .{
                 self.path,
-                n_spans,
-                n_tracks,
+                got.n_spans,
+                got.n_tracks,
                 gpu_records.len,
                 meta.dropped,
                 meta.threads_dropped,
                 meta.orphan_spans,
                 meta.gpu_dropped,
+                written.misnested,
             },
         );
     }
@@ -593,73 +687,68 @@ const GpuRing = struct {
 
 // -- state ------------------------------------------------------------------
 
-/// The one gate of every span site. It turns on once after `recorder` is set, and off once before
-/// the writer reads the rings.
-var on: std.atomic.Value(bool) = .init(false);
+/// The gate of every span site: `gate_record` while the recorder records, plus `gate_sink` per
+/// installed `Sums`. The recording bit turns on after `recorder` is set.
+var active: std.atomic.Value(u32) = .init(0);
 
 /// The GPU timestamp level. `setFromEnv` sets it before any runner exists.
 var gpu_level: GpuLevel = .off;
 
-/// The process recorder. It is set before `on` turns on and never freed, so it lives to exit.
+/// The process recorder. It is set before the gate turns on and never freed, so it lives to exit.
 var recorder: ?*Recorder = null;
 
 threadlocal var tl_ring: ?*Ring = null;
 threadlocal var tl_no_ring: bool = false;
 threadlocal var tl_name_buf: [16]u8 = @splat(0);
 threadlocal var tl_name_len: u8 = 0;
+/// The innermost open `begin` scope of this thread.
+threadlocal var tl_current: ?Name = null;
+threadlocal var tl_sums: ?*Sums = null;
 
 // -- api --------------------------------------------------------------------
 
+/// Open a span. `Scope.end` closes it, and `current` names it until then.
+pub const begin = if (compiled) live.begin else off.begin;
+
+/// Open a span with one arg: a layer index, a chunk of tokens, or a row count.
+pub const beginArg = if (compiled) live.beginArg else off.beginArg;
+
+/// Open a pool share or a `pool_run`. `part` is the worker index or the participant count.
+pub const beginPart = if (compiled) live.beginPart else off.beginPart;
+
+/// The innermost open `begin` scope of this thread. It is null while the gate is zero, because an
+/// inert scope leaves it alone.
+pub const current = if (compiled) live.current else off.current;
+
+/// Record a span from two timestamps that the caller already read.
+pub const record = if (compiled) live.record else off.record;
+
+/// Hand over one GPU record.
+pub const gpu = if (compiled) live.gpu else off.gpu;
+
 /// True while the recorder records.
-pub inline fn enabled() bool {
-    return on.load(.acquire);
-}
+pub const enabled = if (compiled) live.enabled else off.enabled;
 
 /// The GPU timestamp level of this process.
-pub fn gpuLevel() GpuLevel {
-    return gpu_level;
-}
+pub const gpuLevel = if (compiled) live.gpuLevel else off.gpuLevel;
 
 /// Set the GPU timestamp level. Only startup code calls it, before any GPU runner exists, because
 /// a runner sizes its query pools from it.
-pub fn setGpuLevel(level: GpuLevel) void {
-    gpu_level = level;
-}
+pub const setGpuLevel = if (compiled) live.setGpuLevel else off.setGpuLevel;
 
-/// Open a boundary span.
-pub inline fn begin(name: Name) Scope {
-    if (!on.load(.acquire)) return .{ .start_ns = 0, .name = name };
-    return .{ .start_ns = nowNs(), .name = name };
-}
+/// Install a `Sums` sink on this thread, or remove it with null.
+pub const installSums = if (compiled) live.installSums else off.installSums;
 
-/// Open a per-op span. It compiles to nothing without `-Dtrace`.
-pub inline fn beginHot(comptime name: Name) HotScope {
-    comptime assert(name.isHot());
-    if (comptime core_log.hot) return begin(name);
-    return .{};
-}
+/// Read the four trace variables. Call it once in `main`, before any thread or runner exists. A
+/// bad ring capacity returns an error, because a silent default drops the spans that the operator
+/// asked to keep. A build without trace only warns.
+pub const setFromEnv = if (compiled) live.setFromEnv else off.setFromEnv;
 
-/// Record a span from two timestamps that the caller already read.
-pub inline fn record(name: Name, start: std.Io.Timestamp, end_ts: std.Io.Timestamp) void {
-    if (!on.load(.acquire)) return;
-    pushCurrent(.{ .start_ns = tsNs(start), .end_ns = tsNs(end_ts), .name = name });
-}
+/// Write the trace if the window has not written it already. `main` calls it at exit.
+pub const finish = if (compiled) live.finish else off.finish;
 
-/// Hand over one GPU record.
-pub fn gpu(rec: GpuRecord) void {
-    if (!on.load(.acquire)) return;
-
-    assert(rec.gpu_start <= rec.gpu_end);
-    const r = recorder.?;
-    r.gpu.push(r.gpa, rec);
-}
-
-/// Nanoseconds of a timestamp on the `.awake` clock.
-pub fn tsNs(t: std.Io.Timestamp) u64 {
-    assert(t.nanoseconds > 0);
-
-    return @intCast(t.nanoseconds);
-}
+pub const tickSpan = gpu_record.tickSpan;
+pub const lessThan = trace_file.lessThan;
 
 /// Name the calling thread, for the trace track and for the kernel `comm`
 /// that perf prints. Call it before the first span of the thread.
@@ -679,239 +768,17 @@ pub fn nameThread(name: []const u8) void {
     }
 }
 
-/// Read the four trace variables. Call it once in `main`, before any thread or runner exists.
-/// A bad level or window logs a warning and leaves that part off. A bad ring capacity returns an
-/// error first, because a silent default drops the spans that the operator asked to keep.
-pub fn setFromEnv(io: std.Io, env: Env) error{InvalidTraceSpans}!void {
-    return setup(std.heap.page_allocator, io, env);
-}
+/// Nanoseconds of a timestamp on the `.awake` clock.
+pub fn tsNs(t: std.Io.Timestamp) u64 {
+    assert(t.nanoseconds > 0);
 
-/// Write the trace if the window has not written it already. `main` calls it
-/// at exit.
-pub fn finish() void {
-    const r = recorder orelse return;
-    _ = r.flush();
-}
-
-/// Map record `i` of `records` on the host clock.
-pub fn hostInterval(records: []const GpuRecord, i: usize) HostInterval {
-    assert(i < records.len);
-
-    const lo = i;
-    const hi = @min(records.len, i + anchor_window);
-    var offset: i64 = std.math.maxInt(i64);
-    for (records[lo..hi]) |rec| {
-        offset = @min(offset, @as(i64, @intCast(rec.host_wait_ns)) - rec.gpuEndNs());
-    }
-
-    const rec = records[i];
-    const submit: i64 = @intCast(rec.host_submit_ns);
-    const wait: i64 = @intCast(rec.host_wait_ns);
-    assert(submit <= wait);
-    const dur = @min(rec.gpuEndNs() - rec.gpuStartNs(), wait - submit);
-    assert(dur >= 0);
-    const want = rec.gpuStartNs() + offset;
-    const start = std.math.clamp(want, submit, wait - dur);
-    const p: HostInterval = .{
-        .start_ns = start,
-        .end_ns = start + dur,
-        .clamp_ns = @abs(start - want),
-    };
-    assert(p.start_ns >= submit);
-    assert(p.end_ns <= wait);
-    return p;
-}
-
-/// Read the start, the end, and the interval deltas of `ts`, the raw stamps of one command buffer
-/// in write order.
-pub fn tickSpan(ts: []const u64, mask: u64, deltas: ?[]u64) TickSpan {
-    assert(ts.len >= 2);
-    assert(mask != 0);
-
-    if (deltas) |d| assert(d.len == ts.len - 1);
-
-    var sum: u64 = 0;
-    var backsteps: u32 = 0;
-    for (ts[0 .. ts.len - 1], ts[1..], 0..) |prev, cur, i| {
-        var dt = (cur -% prev) & mask;
-        if (dt > mask / 2) {
-            dt = 0;
-            backsteps += 1;
-        }
-
-        if (deltas) |d| {
-            d[i] = dt;
-        }
-
-        sum +|= dt;
-    }
-
-    const start = ts[0] & mask;
-    const out: TickSpan = .{ .start = start, .end = start +| sum, .backsteps = backsteps };
-    assert(out.start <= out.end);
-    assert(out.backsteps < ts.len);
-    return out;
-}
-
-/// The span order of one thread track: by start, and the longer span first on a tie.
-pub fn lessThan(_: void, a: Span, b: Span) bool {
-    if (a.start_ns != b.start_ns) return a.start_ns < b.start_ns;
-    return a.end_ns > b.end_ns;
-}
-
-/// Write the Chrome Trace Event JSON: the `M` name event and `X` events of each thread, one GPU
-/// queue track per runner kind, then `otherData`. The `ts` and `dur` fields are microseconds.
-pub fn writeJson(
-    w: *std.Io.Writer,
-    pid: u64,
-    threads: []const ThreadTrack,
-    gpu_records: []const GpuRecord,
-    meta: Meta,
-) std.Io.Writer.Error!void {
-    // Write the thread tracks.
-    var clamps: u32 = 0;
-    var clamp_max_ns: u64 = 0;
-    var backsteps: u64 = 0;
-    try w.writeAll("{\"traceEvents\":[\n");
-    var first = true;
-    for (threads) |t| {
-        try sep(w, &first);
-        try w.print(
-            "{{\"ph\":\"M\",\"name\":\"thread_name\",\"pid\":{d},\"tid\":{d}," ++
-                "\"args\":{{\"name\":\"",
-            .{ pid, t.tid },
-        );
-        try writeSafe(w, t.name);
-        try w.writeAll("\"}}");
-        for (t.spans, 0..) |s, i| {
-            if (i > 0) assert(!lessThan({}, s, t.spans[i - 1]));
-
-            try sep(w, &first);
-            try w.print(
-                "{{\"ph\":\"X\",\"name\":\"{t}\",\"pid\":{d},\"tid\":{d},\"ts\":",
-                .{ s.name, pid, t.tid },
-            );
-            try writeUs(w, @intCast(s.start_ns));
-            try w.writeAll(",\"dur\":");
-            try writeUs(w, @intCast(s.end_ns - s.start_ns));
-            try w.writeAll("}");
-        }
-    }
-
-    // Name one GPU queue track per runner kind that has a record.
-    var used: [std.meta.fields(GpuRunner).len]bool = @splat(false);
-    for (gpu_records) |rec| {
-        used[@intFromEnum(rec.runner)] = true;
-    }
-
-    for (used, 0..) |u, i| {
-        if (!u) continue;
-
-        const runner: GpuRunner = @enumFromInt(i);
-        try sep(w, &first);
-        try w.print(
-            "{{\"ph\":\"M\",\"name\":\"thread_name\",\"pid\":{d},\"tid\":{d}," ++
-                "\"args\":{{\"name\":\"GPU queue {t}\"}}}}",
-            .{ pid, gpuTid(runner), runner },
-        );
-    }
-
-    // Write each GPU record at its interval.
-    for (gpu_records, 0..) |rec, i| {
-        const at = hostInterval(gpu_records, i);
-        if (at.clamp_ns > 0) {
-            clamps += 1;
-        }
-
-        clamp_max_ns = @max(clamp_max_ns, at.clamp_ns);
-        backsteps += rec.backsteps;
-        try sep(w, &first);
-        try w.print(
-            "{{\"ph\":\"X\",\"name\":\"{t}\",\"pid\":{d},\"tid\":{d},\"ts\":",
-            .{ rec.label, pid, gpuTid(rec.runner) },
-        );
-        try writeUs(w, at.start_ns);
-        try w.writeAll(",\"dur\":");
-        try writeUs(w, at.end_ns - at.start_ns);
-        try w.writeAll(",\"args\":{\"gpu_dur_us\":");
-        try writeUs(w, rec.gpuEndNs() - rec.gpuStartNs());
-        try w.writeAll(",\"host_submit_us\":");
-        try writeUs(w, @intCast(rec.host_submit_ns));
-        try w.writeAll(",\"host_wait_us\":");
-        try writeUs(w, @intCast(rec.host_wait_ns));
-        if (rec.phases) |ph| {
-            for (ph, 0..) |ns, p| {
-                if (ns == 0) continue;
-                try w.print(",\"{t}_us\":", .{@as(GpuPhase, @enumFromInt(p))});
-                try writeUs(w, @intCast(ns));
-            }
-        }
-
-        try w.writeAll("}}");
-    }
-
-    // Write the metadata.
-    try w.writeAll("\n],\"displayTimeUnit\":\"ms\",\"otherData\":{");
-    try w.print(
-        "\"clock\":\"CLOCK_MONOTONIC\",\"dropped\":{d},\"threads_dropped\":{d}," ++
-            "\"orphan_spans\":{d},",
-        .{ meta.dropped, meta.threads_dropped, meta.orphan_spans },
-    );
-    try w.print(
-        "\"gpu_level\":\"{t}\",\"gpu_records\":{d},\"gpu_dropped\":{d},\"gpu_backsteps\":{d},",
-        .{ meta.gpu_level, gpu_records.len, meta.gpu_dropped, backsteps },
-    );
-    try w.print(
-        "\"gpu_anchor\":\"local\",\"gpu_anchor_window\":{d},\"gpu_clamps\":{d}," ++
-            "\"gpu_clamp_max_us\":",
-        .{ anchor_window, clamps },
-    );
-    try writeUs(w, @intCast(clamp_max_ns));
-    try w.writeAll("}}\n");
-}
-
-/// Write one folded-stack line per runner kind, label, and phase with the summed nanoseconds, for
-/// `flamegraph.pl`. A `submit` record adds its whole span to its runner and label line.
-pub fn writeFolded(w: *std.Io.Writer, records: []const GpuRecord) std.Io.Writer.Error!void {
-    const n_runner = std.meta.fields(GpuRunner).len;
-    const n_label = std.meta.fields(GpuLabel).len;
-    // The last phase column holds the records without phases.
-    var sum: [n_runner][n_label][gpu_phase_count + 1]u64 = @splat(@splat(@splat(0)));
-    for (records) |rec| {
-        const cell = &sum[@intFromEnum(rec.runner)][@intFromEnum(rec.label)];
-        if (rec.phases) |ph| {
-            for (ph, 0..) |ns, p| {
-                cell[p] += ns;
-            }
-        } else {
-            cell[gpu_phase_count] += @intCast(rec.gpuEndNs() - rec.gpuStartNs());
-        }
-    }
-
-    for (sum, 0..) |per_runner, ri| {
-        for (per_runner, 0..) |cell, li| {
-            for (cell, 0..) |ns, p| {
-                if (ns == 0) continue;
-
-                const runner: GpuRunner = @enumFromInt(ri);
-                const label: GpuLabel = @enumFromInt(li);
-                if (p == gpu_phase_count) {
-                    try w.print("{t};{t} {d}\n", .{ runner, label, ns });
-                } else {
-                    try w.print(
-                        "{t};{t};{t} {d}\n",
-                        .{ runner, label, @as(GpuPhase, @enumFromInt(p)), ns },
-                    );
-                }
-            }
-        }
-    }
+    return @intCast(t.nanoseconds);
 }
 
 // -- helpers ----------------------------------------------------------------
 
 fn setup(gpa: std.mem.Allocator, io: std.Io, env: Env) error{InvalidTraceSpans}!void {
-    assert(!on.load(.monotonic));
+    assert(active.load(.monotonic) & gate_record == 0);
     assert(recorder == null);
 
     // Parse the ring capacity and the GPU level.
@@ -948,13 +815,13 @@ fn setup(gpa: std.mem.Allocator, io: std.Io, env: Env) error{InvalidTraceSpans}!
     }
 
     // Start the recorder and the window thread.
-    const r = Recorder.create(gpa, io, path, capacity) catch |err| {
+    const r = Recorder.create(gpa, io, path, capacity, limits.trace_gpu_records) catch |err| {
         log.warn("trace: no storage for the span rings ({t}), so tracing stays off", .{err});
         return;
     };
     recorder = r;
     nameThread("main");
-    on.store(true, .release);
+    _ = active.fetchOr(gate_record, .release);
     if (seconds) |s| {
         const t = std.Thread.spawn(.{}, windowMain, .{ io, s }) catch |err| {
             log.warn("trace: no window thread ({t}), so the trace runs to exit", .{err});
@@ -964,13 +831,6 @@ fn setup(gpa: std.mem.Allocator, io: std.Io, env: Env) error{InvalidTraceSpans}!
     }
 
     log.info("trace: recording to {s}, {d} spans per thread", .{ path, capacity });
-}
-
-/// The longest wait of a later `flush` caller. It only catches a stalled file system.
-const flush_wait_max_s = 60;
-
-fn endSlow(s: Scope) void {
-    pushCurrent(.{ .start_ns = s.start_ns, .end_ns = nowNs(), .name = s.name });
 }
 
 fn pushCurrent(s: Span) void {
@@ -1000,52 +860,14 @@ fn currentTid() u64 {
     return @intCast(std.Thread.getCurrentId());
 }
 
-fn processId() u64 {
+fn processId() u32 {
     if (builtin.os.tag == .linux) return @intCast(std.os.linux.getpid());
     return 1;
 }
 
-/// The synthetic thread id of one GPU queue track, past any kernel tid.
-fn gpuTid(runner: GpuRunner) u64 {
-    return (1 << 32) + @as(u64, @intFromEnum(runner));
-}
-
-fn ticksToNs(ticks: u64, period_ns: f64) i64 {
-    assert(period_ns > 0);
-
-    return @intFromFloat(@as(f64, @floatFromInt(ticks)) * period_ns);
-}
-
 fn windowMain(io: std.Io, seconds: u32) void {
     io.sleep(.fromSeconds(seconds), .awake) catch {};
-    finish();
-}
-
-fn sep(w: *std.Io.Writer, first: *bool) !void {
-    if (!first.*) {
-        try w.writeAll(",\n");
-    }
-
-    first.* = false;
-}
-
-/// Microseconds with three decimals, from nanoseconds, with no float.
-fn writeUs(w: *std.Io.Writer, ns: i64) !void {
-    const mag: u64 = @abs(ns);
-    if (ns < 0) {
-        try w.writeAll("-");
-    }
-
-    try w.print("{d}.{d:0>3}", .{ mag / 1000, mag % 1000 });
-}
-
-/// A thread name with every byte outside [A-Za-z0-9_.-] replaced, so the
-/// JSON string needs no escape.
-fn writeSafe(w: *std.Io.Writer, text: []const u8) !void {
-    for (text) |c| {
-        const ok = std.ascii.isAlphanumeric(c) or c == '_' or c == '-' or c == '.' or c == ' ';
-        try w.writeByte(if (ok) c else '_');
-    }
+    live.finish();
 }
 
 // -- tests ------------------------------------------------------------------
@@ -1053,20 +875,60 @@ fn writeSafe(w: *std.Io.Writer, text: []const u8) !void {
 const prop = @import("prop.zig");
 const testing = std.testing;
 
-test "every hot span name follows every boundary name" {
-    var seen_hot = false;
-    for (std.enums.values(Name)) |n| {
-        if (n.isHot()) {
-            seen_hot = true;
-        }
+/// A recorder for the tests of other modules. The tests start it, run threads, join them, then
+/// call `finish` to read the tracks. Only one capture can exist at a time.
+pub const TestCapture = struct {
+    rec: *Recorder,
+    got: Recorder.Collected = undefined,
 
-        if (seen_hot) {
-            try testing.expect(n.isHot());
-        }
+    const spans_per_thread = 4096;
+
+    pub fn start(gpa: std.mem.Allocator) !*TestCapture {
+        assert(recorder == null);
+        assert(active.load(.monotonic) & gate_record == 0);
+
+        const self = try gpa.create(TestCapture);
+        errdefer gpa.destroy(self);
+
+        self.* = .{ .rec = try Recorder.create(
+            gpa,
+            std.testing.io,
+            "unused.pftrace",
+            spans_per_thread,
+            1,
+        ) };
+        recorder = self.rec;
+        _ = active.fetchOr(gate_record, .release);
+        return self;
     }
 
-    try testing.expect(!Name.decode_step.isHot());
-    try testing.expect(Name.op_lm_head.isHot());
+    /// Stop recording and return the thread tracks. Every thread that recorded must have ended.
+    pub fn finish(self: *TestCapture) []const ThreadTrack {
+        _ = active.fetchAnd(~gate_record, .release);
+        self.rec.collect(&self.got);
+        return self.got.tracks[0..self.got.n_tracks];
+    }
+
+    pub fn deinit(self: *TestCapture) void {
+        const gpa = self.rec.gpa;
+        if (active.load(.monotonic) & gate_record != 0) {
+            _ = active.fetchAnd(~gate_record, .release);
+        }
+
+        recorder = null;
+        tl_ring = null;
+        tl_no_ring = false;
+        self.rec.destroy();
+        gpa.destroy(self);
+    }
+};
+
+const perfetto = @import("perfetto.zig");
+
+test {
+    _ = gpu_record;
+    _ = perfetto;
+    _ = trace_file;
 }
 
 /// A random push sequence against one small ring.
@@ -1116,282 +978,133 @@ test "ring: an overflow counts the drop and keeps every kept span intact" {
     try prop.forAll(.{ .site = 0x5350_0001 }, {}, RingCase, genRing, checkRing);
 }
 
-/// A random forest of nested spans on a few threads.
-const TraceCase = struct {
-    spans: [3][48]Span,
-    lens: [3]u32,
-};
+test "scopes: current follows begin and end, and only op begin scopes add to the sums" {
+    var sums: Sums = .initFill(0);
+    live.installSums(&sums);
+    {
+        defer live.installSums(null);
 
-fn genTrace(_: void, random: std.Random, size: u32) TraceCase {
-    var c: TraceCase = .{ .spans = undefined, .lens = @splat(0) };
-    for (0..3) |t| {
-        var n: u32 = 0;
-        var cursor: u64 = 1_000_000 + random.uintLessThan(u64, 1000);
-        // Each root holds up to two levels of children inside its bounds.
-        while (n + 7 <= 48 and n < size) {
-            const root_start = cursor;
-            var inner = root_start;
-            const kids = random.uintLessThan(u32, 3);
-            var k: u32 = 0;
-            var buf: [6]Span = undefined;
-            var nb: u32 = 0;
-            while (k < kids) : (k += 1) {
-                const ks = inner + random.uintLessThan(u64, 50);
-                var ke = ks + random.uintLessThan(u64, 500);
-                if (random.boolean()) {
-                    const gs = ks + random.uintLessThan(u64, 10);
-                    const ge = gs + random.uintLessThan(u64, 100);
-                    buf[nb] = .{ .start_ns = gs, .end_ns = ge, .name = .sample };
-                    nb += 1;
-                    ke = @max(ke, ge);
-                }
-
-                buf[nb] = .{ .start_ns = ks, .end_ns = ke, .name = .decode_step };
-                nb += 1;
-                inner = ke;
-            }
-
-            const root_end = inner + random.uintLessThan(u64, 50);
-            // Push order is end order, as the recorder pushes: children first.
-            for (buf[0..nb]) |s| {
-                c.spans[t][n] = s;
-                n += 1;
-            }
-
-            c.spans[t][n] = .{ .start_ns = root_start, .end_ns = root_end, .name = .sched_tick };
-            n += 1;
-            cursor = root_end + random.uintLessThan(u64, 100);
-        }
-
-        c.lens[t] = n;
+        try testing.expect(live.current() == null);
+        const outer = live.begin(.decode_step);
+        try testing.expectEqual(Name.decode_step, live.current().?);
+        const op = live.beginArg(.op_rmsnorm, 3);
+        try testing.expectEqual(Name.op_rmsnorm, live.current().?);
+        // A share keeps the open name and never counts its op.
+        const share = live.beginPart(.op_attention, 7, 2);
+        try testing.expectEqual(Name.op_rmsnorm, live.current().?);
+        share.endAt(share.start_ns + 40);
+        try testing.expectEqual(Name.op_rmsnorm, live.current().?);
+        op.endAt(op.start_ns + 50);
+        try testing.expectEqual(Name.decode_step, live.current().?);
+        outer.endAt(outer.start_ns + 90);
+        try testing.expect(live.current() == null);
     }
 
-    return c;
+    try testing.expectEqual(@as(u64, 50), sums.get(.op_rmsnorm));
+    try testing.expectEqual(@as(u64, 0), sums.get(.op_attention));
+    try testing.expectEqual(@as(u64, 0), sums.get(.decode_step));
+    // The removal gives the gate back, so a later scope is inert.
+    try testing.expectEqual(@as(u32, 0), active.load(.acquire));
+    try testing.expectEqual(@as(u64, 0), live.begin(.op_rope).start_ns);
 }
 
-fn checkTrace(_: void, case: TraceCase) anyerror!void {
-    var c = case;
-    var tracks: [3]ThreadTrack = undefined;
-    for (0..3) |t| {
-        const s = c.spans[t][0..c.lens[t]];
-        std.mem.sort(Span, s, {}, lessThan);
-        tracks[t] = .{ .tid = 100 + t, .name = "worker \"q\"", .spans = s };
-    }
-
-    var out: std.Io.Writer.Allocating = .init(testing.allocator);
-    defer out.deinit();
-
-    try writeJson(&out.writer, 7, &tracks, &.{}, .{});
-
-    var parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, out.written(), .{});
-    defer parsed.deinit();
-
-    const events = parsed.value.object.get("traceEvents").?.array.items;
-    // Per thread, `ts` never falls and every span nests in the open span that holds its start.
-    var last_ts: [3]i64 = @splat(-1);
-    var stack: [3][64]i64 = undefined;
-    var depth: [3]u32 = @splat(0);
-    for (events) |e| {
-        if (!std.mem.eql(u8, e.object.get("ph").?.string, "X")) continue;
-
-        const t: usize = @intCast(e.object.get("tid").?.integer - 100);
-        // Compare in whole nanoseconds, because float sums round.
-        const ts = usToNs(e.object.get("ts").?);
-        const end_ts = ts + usToNs(e.object.get("dur").?);
-        try testing.expect(ts >= last_ts[t]);
-        last_ts[t] = ts;
-        while (depth[t] > 0 and stack[t][depth[t] - 1] <= ts) {
-            depth[t] -= 1;
-        }
-
-        if (depth[t] > 0) {
-            try testing.expect(end_ts <= stack[t][depth[t] - 1]);
-        }
-
-        stack[t][depth[t]] = end_ts;
-        depth[t] += 1;
+/// Set or clear the recording bit by hand, as `setup` and `flush` do. No recorder exists, so a
+/// push under the bit fails the test on the null `recorder`.
+fn setRecordBit(on: bool) void {
+    if (on) {
+        _ = active.fetchOr(gate_record, .acq_rel);
+    } else {
+        _ = active.fetchAnd(~gate_record, .acq_rel);
     }
 }
 
-fn usToNs(v: std.json.Value) i64 {
-    return @intFromFloat(@round(jsonNumber(v) * 1000));
+test "gate: a scope that the flush outlives restores current and pushes nothing" {
+    setRecordBit(true);
+    const s = live.begin(.decode_step);
+    try testing.expect(s.start_ns != 0);
+    try testing.expectEqual(Name.decode_step, live.current().?);
+    setRecordBit(false);
+    s.endAt(s.start_ns + 10);
+    try testing.expect(live.current() == null);
+    try testing.expectEqual(@as(u32, 0), active.load(.acquire));
 }
 
-fn jsonNumber(v: std.json.Value) f64 {
-    return switch (v) {
-        .float => |f| f,
-        .integer => |i| @floatFromInt(i),
-        .number_string => |s| std.fmt.parseFloat(f64, s) catch unreachable,
-        else => unreachable,
-    };
+test "gate: an inert scope ended after the gate rises does nothing" {
+    var sums: Sums = .initFill(0);
+    const s = live.begin(.op_rope);
+    try testing.expectEqual(@as(u64, 0), s.start_ns);
+    live.installSums(&sums);
+    s.end();
+    live.installSums(null);
+    try testing.expect(live.current() == null);
+    try testing.expectEqual(@as(u64, 0), sums.get(.op_rope));
+    try testing.expectEqual(@as(u32, 0), active.load(.acquire));
 }
 
-test "json: the output parses, ts never falls per thread, and spans nest" {
-    try prop.forAll(
-        .{ .site = 0x5350_0002, .cases = 64, .max_size = 40 },
-        {},
-        TraceCase,
-        genTrace,
-        checkTrace,
-    );
+test "gate: a sink installed between the open and the end counts the span" {
+    // Another sink holds the gate open, so the scope is live without a recorder.
+    _ = active.fetchAdd(gate_sink, .acq_rel);
+    defer _ = active.fetchSub(gate_sink, .acq_rel);
+
+    var sums: Sums = .initFill(0);
+    const s = live.begin(.op_swiglu);
+    live.installSums(&sums);
+    s.endAt(s.start_ns + 30);
+    live.installSums(null);
+    try testing.expectEqual(@as(u64, 30), sums.get(.op_swiglu));
+    try testing.expect(live.current() == null);
 }
 
-/// GPU records whose device clock drifts against the host clock: a counter that pauses (the offset
-/// grows) or runs fast (the offset falls). `true_start` holds the host time of each GPU start.
-const AnchorCase = struct {
-    records: [48]GpuRecord,
-    true_start: [48]i64,
-    n: u32,
-    /// True when the offset never falls from one record to the next.
-    monotone: bool,
-};
-
-const jitter_max_ns: u64 = 2_000;
-
-fn genAnchor(_: void, random: std.Random, size: u32) AnchorCase {
-    // Pick the case size and the drift mode.
-    var c: AnchorCase = .{
-        .records = undefined,
-        .true_start = undefined,
-        .n = @as(u32, @min(size, 47)) + 1,
-        .monotone = true,
-    };
-    const mode = random.uintLessThan(u32, 3);
-    c.monotone = mode != 2;
-    const rate: i64 = @intCast(random.uintLessThan(u64, 60_000));
-    var offset: i64 = @intCast(1_000_000_000 + random.uintLessThan(u64, 1_000_000));
-    var gpu_t: u64 = 10_000_000 + random.uintLessThan(u64, 10_000);
-
-    // Generate each record from the drifting clock.
-    for (c.records[0..c.n], 0..) |*r, i| {
-        const change: i64 = switch (mode) {
-            0 => rate,
-            1 => if (random.uintLessThan(u32, 8) == 0) @intCast(
-                1_000 + random.uintLessThan(u64, 5_000_000),
-            ) else 0,
-            else => -@divTrunc(rate, 8),
-        };
-
-        if (i > 0) {
-            offset += change;
-        }
-
-        const busy = 1_000 + random.uintLessThan(u64, 100_000);
-        const lead = 5_000 + random.uintLessThan(u64, 5_000);
-        const host_start: i64 = @as(i64, @intCast(gpu_t)) + offset;
-        c.true_start[i] = host_start;
-        r.* = .{
-            .runner = .qwen_fused,
-            .label = .decode,
-            .gpu_start = gpu_t,
-            .gpu_end = gpu_t + busy,
-            .period_ns = 1.0,
-            .host_submit_ns = @intCast(host_start - @as(i64, @intCast(lead))),
-            .host_wait_ns = @intCast(
-                host_start + @as(i64, @intCast(busy + random.uintLessThan(u64, jitter_max_ns))),
-            ),
-        };
-        gpu_t += busy + random.uintLessThan(u64, 500);
-    }
-
-    return c;
+test "gate: an inner scope opened after the gate falls stays inert inside a live outer one" {
+    _ = active.fetchAdd(gate_sink, .acq_rel);
+    const outer = live.begin(.decode_step);
+    _ = active.fetchSub(gate_sink, .acq_rel);
+    const inner = live.begin(.sample);
+    try testing.expectEqual(@as(u64, 0), inner.start_ns);
+    try testing.expectEqual(Name.decode_step, live.current().?);
+    inner.end();
+    try testing.expectEqual(Name.decode_step, live.current().?);
+    outer.endAt(outer.start_ns + 5);
+    try testing.expect(live.current() == null);
+    try testing.expectEqual(@as(u32, 0), active.load(.acquire));
 }
 
-fn checkAnchor(_: void, c: AnchorCase) anyerror!void {
-    const records = c.records[0..c.n];
-    for (records, 0..) |rec, i| {
-        const p = hostInterval(records, i);
-        // Every record sits inside its host window, at its device duration.
-        try testing.expect(p.start_ns >= @as(i64, @intCast(rec.host_submit_ns)));
-        try testing.expect(p.end_ns <= @as(i64, @intCast(rec.host_wait_ns)));
-        try testing.expect(p.end_ns - p.start_ns == rec.gpuEndNs() - rec.gpuStartNs());
-        // With an offset that never falls, the interval is late by less than the wait jitter.
-        if (c.monotone) {
-            const err = p.start_ns - c.true_start[i];
-            try testing.expect(err >= 0);
-            try testing.expect(err < @as(i64, @intCast(jitter_max_ns)));
-        }
-    }
+test "off: every entry compiles with a runtime name and holds no state" {
+    try testing.expectEqual(@as(usize, 0), @sizeOf(off.Scope));
+    var name: Name = .decode_step;
+    _ = &name;
+    off.begin(name).end();
+    off.beginArg(name, 3).end();
+    off.beginPart(name, 1, 2).end();
+    try testing.expect(off.current() == null);
+    off.record(name, .{ .nanoseconds = 1 }, .{ .nanoseconds = 2 });
+    off.gpu(test_record);
+    try testing.expect(!off.enabled());
+    try testing.expectEqual(GpuLevel.off, off.gpuLevel());
+    off.setGpuLevel(.submit);
+    try testing.expectEqual(GpuLevel.off, off.gpuLevel());
+    var sums: Sums = .initFill(0);
+    off.installSums(&sums);
+    off.installSums(null);
+    try off.setFromEnv(testing.io, .{});
+    off.finish();
+    try testing.expect(tl_ring == null);
 }
 
-test "anchor: each record sits in its host window and follows a drifting device clock" {
-    try prop.forAll(
-        .{ .site = 0x5350_0003, .max_size = 47 },
-        {},
-        AnchorCase,
-        genAnchor,
-        checkAnchor,
-    );
-}
-
-test "folded: one line per runner, label, and phase with the summed time" {
-    var ph: [gpu_phase_count]u64 = @splat(0);
-    ph[@intFromEnum(GpuPhase.attn)] = 300;
-    ph[@intFromEnum(GpuPhase.lmhead)] = 50;
-    const recs = [_]GpuRecord{
-        .{
-            .runner = .llama_fused,
-            .label = .decode,
-            .gpu_start = 0,
-            .gpu_end = 350,
-            .period_ns = 1,
-            .host_submit_ns = 1,
-            .host_wait_ns = 400,
-            .phases = ph,
-        },
-        .{
-            .runner = .llama_fused,
-            .label = .decode,
-            .gpu_start = 400,
-            .gpu_end = 750,
-            .period_ns = 1,
-            .host_submit_ns = 1,
-            .host_wait_ns = 800,
-            .phases = ph,
-        },
-        .{
-            .runner = .staging,
-            .label = .copy,
-            .gpu_start = 0,
-            .gpu_end = 40,
-            .period_ns = 2,
-            .host_submit_ns = 1,
-            .host_wait_ns = 100,
-        },
-    };
-    var buf: [256]u8 = undefined;
-    var w: std.Io.Writer = .fixed(&buf);
-    try writeFolded(&w, &recs);
-    try testing.expectEqualStrings(
-        "llama_fused;decode;attn 600\n" ++
-            "llama_fused;decode;lmhead 100\n" ++
-            "staging;copy 80\n",
-        w.buffered(),
-    );
-}
-
-test "off path: a span site allocates nothing and records nothing" {
+test "off path: a live site with the gate zero allocates nothing and records nothing" {
     // An unset output path leaves the recorder off and takes no storage.
     var failing: std.testing.FailingAllocator = .init(testing.allocator, .{});
     try setup(failing.allocator(), testing.io, .{});
     try testing.expectEqual(@as(usize, 0), failing.allocations);
-    try testing.expect(!enabled());
-    const s = begin(.decode_step);
+    try testing.expect(!live.enabled());
+    const s = live.begin(.decode_step);
     try testing.expectEqual(@as(u64, 0), s.start_ns);
+    try testing.expect(live.current() == null);
     s.end();
-    beginHot(.pool_run).end();
-    record(.gpu_wait, .{ .nanoseconds = 1 }, .{ .nanoseconds = 2 });
-    gpu(
-        .{
-            .runner = .staging,
-            .label = .fill,
-            .gpu_start = 0,
-            .gpu_end = 1,
-            .period_ns = 1,
-            .host_submit_ns = 1,
-            .host_wait_ns = 2,
-        },
-    );
+    live.beginArg(.layer_forward, 2).end();
+    live.beginPart(.pool_run, 1, 3).end();
+    live.record(.gpu_wait, .{ .nanoseconds = 1 }, .{ .nanoseconds = 2 });
+    live.gpu(test_record);
     try testing.expect(tl_ring == null);
     try testing.expect(recorder == null);
     try testing.expectEqual(@as(usize, 0), failing.allocations);
@@ -1403,7 +1116,7 @@ test "setup: a ring capacity outside the bound refuses before any allocation" {
     for (bad) |text| {
         try testing.expectError(
             error.InvalidTraceSpans,
-            setup(failing.allocator(), testing.io, .{ .out = "unused.json", .spans = text }),
+            setup(failing.allocator(), testing.io, .{ .out = "unused.pftrace", .spans = text }),
         );
         // The capacity also refuses with the recorder off.
         try testing.expectError(
@@ -1433,7 +1146,7 @@ const create_allocations: usize = 2;
 test "recorder: create takes no span or GPU storage, and each claim allocates one ring" {
     const per: u32 = 3;
     var failing: std.testing.FailingAllocator = .init(testing.allocator, .{});
-    const r = try Recorder.create(failing.allocator(), testing.io, "unused.json", per);
+    const r = try Recorder.create(failing.allocator(), testing.io, "unused.pftrace", per, per);
     defer r.destroy();
 
     try testing.expectEqual(create_allocations, failing.allocations);
@@ -1483,7 +1196,7 @@ test "recorder: a failed ring allocation drops one thread and the next claim suc
         testing.allocator,
         .{ .fail_index = create_allocations + 1 },
     );
-    const r = try Recorder.create(failing.allocator(), testing.io, "unused.json", 2);
+    const r = try Recorder.create(failing.allocator(), testing.io, "unused.pftrace", 2, 2);
     defer r.destroy();
 
     try testing.expect(r.claim(10, "a") == &r.rings[0]);
@@ -1602,24 +1315,28 @@ test "gpu ring: racing first pushes allocate one block and keep every record" {
 }
 
 /// One flushing thread: flush, then read the trace back at once.
-fn flushAndParse(r: *Recorder, result: *Flushed, whole: *bool) void {
+fn flushAndDecode(r: *Recorder, result: *Flushed, whole: *bool) void {
     result.* = r.flush();
-    const text = r.dir.readFileAlloc(
+    const bytes = r.dir.readFileAlloc(
         r.io,
         r.path,
         testing.allocator,
         .limited(1 << 22),
     ) catch return;
-    defer testing.allocator.free(text);
+    defer testing.allocator.free(bytes);
 
-    const parsed = std.json.parseFromSlice(
-        std.json.Value,
-        testing.allocator,
-        text,
-        .{},
-    ) catch return;
-    parsed.deinit();
-    whole.* = true;
+    // The trace is whole when every packet decodes and the last one is the `trace_meta` instant.
+    const interned = testing.allocator.create(perfetto.TestInterned) catch return;
+    defer testing.allocator.destroy(interned);
+    interned.* = .{};
+    var reader: perfetto.TestReader = .init(bytes);
+    var last_instant = false;
+    while (reader.next(interned) catch return) |p| {
+        const e = p.event orelse continue;
+        last_instant = e.type == @intFromEnum(perfetto.EventType.instant);
+    }
+
+    whole.* = last_instant;
 }
 
 test "flush: of two racing callers one writes, and both return after the write ends" {
@@ -1629,7 +1346,7 @@ test "flush: of two racing callers one writes, and both return after the write e
     const per: u32 = 4096;
     var round: u32 = 0;
     while (round < 8) : (round += 1) {
-        const r = try Recorder.create(testing.allocator, testing.io, "trace.json", per);
+        const r = try Recorder.create(testing.allocator, testing.io, "trace.pftrace", per, per);
         defer r.destroy();
 
         r.dir = tmp.dir;
@@ -1644,8 +1361,12 @@ test "flush: of two racing callers one writes, and both return after the write e
 
         var results: [2]Flushed = undefined;
         var whole: [2]bool = @splat(false);
-        const a = try std.Thread.spawn(.{}, flushAndParse, .{ r, &results[0], &whole[0] });
-        const b = std.Thread.spawn(.{}, flushAndParse, .{ r, &results[1], &whole[1] }) catch |err| {
+        const a = try std.Thread.spawn(.{}, flushAndDecode, .{ r, &results[0], &whole[0] });
+        const b = std.Thread.spawn(
+            .{},
+            flushAndDecode,
+            .{ r, &results[1], &whole[1] },
+        ) catch |err| {
             a.join();
             return err;
         };
@@ -1663,90 +1384,5 @@ test "flush: of two racing callers one writes, and both return after the write e
         try testing.expect(whole[0]);
         try testing.expect(whole[1]);
         try testing.expectEqual(FlushState.done, r.flushed.load(.acquire));
-    }
-}
-
-test "tickSpan: wrap, step back, equal ticks, and normal order" {
-    const narrow: u64 = (1 << 36) - 1;
-    const wide: u64 = std.math.maxInt(u64);
-    const Row = struct {
-        name: []const u8,
-        ts: []const u64,
-        mask: u64,
-        start: u64,
-        end: u64,
-        backsteps: u32,
-        deltas: []const u64,
-    };
-    const rows = [_]Row{
-        .{
-            .name = "normal order",
-            .ts = &.{ 100, 150, 400 },
-            .mask = wide,
-            .start = 100,
-            .end = 400,
-            .backsteps = 0,
-            .deltas = &.{ 50, 250 },
-        },
-        .{
-            .name = "equal ticks",
-            .ts = &.{ 7, 7, 7 },
-            .mask = wide,
-            .start = 7,
-            .end = 7,
-            .backsteps = 0,
-            .deltas = &.{ 0, 0 },
-        },
-        // A 36-bit counter wraps between the stamps. The high bits are noise.
-        .{
-            .name = "wrap on a narrow counter",
-            .ts = &.{ (0xab << 36) | (narrow - 9), (0xcd << 36) | 5, 20 },
-            .mask = narrow,
-            .start = narrow - 9,
-            .end = narrow - 9 + 30,
-            .backsteps = 0,
-            .deltas = &.{ 15, 15 },
-        },
-        // The middle stamp reads 10 ticks before the first one.
-        .{
-            .name = "step back on a 64-bit counter",
-            .ts = &.{ 1000, 990, 1100 },
-            .mask = wide,
-            .start = 1000,
-            .end = 1110,
-            .backsteps = 1,
-            .deltas = &.{ 0, 110 },
-        },
-        // The end stamp reads before the start, which makes the raw delta wrap.
-        .{
-            .name = "end before start on a 64-bit counter",
-            .ts = &.{ 1000, 990 },
-            .mask = wide,
-            .start = 1000,
-            .end = 1000,
-            .backsteps = 1,
-            .deltas = &.{0},
-        },
-        .{
-            .name = "step back on a narrow counter",
-            .ts = &.{ 50, 40 },
-            .mask = narrow,
-            .start = 50,
-            .end = 50,
-            .backsteps = 1,
-            .deltas = &.{0},
-        },
-    };
-    for (rows) |row| {
-        errdefer std.debug.print("tickSpan row: {s}\n", .{row.name});
-
-        var deltas: [4]u64 = undefined;
-        const got = tickSpan(row.ts, row.mask, deltas[0 .. row.ts.len - 1]);
-        try testing.expectEqual(row.start, got.start);
-        try testing.expectEqual(row.end, got.end);
-        try testing.expectEqual(row.backsteps, got.backsteps);
-        try testing.expectEqualSlices(u64, row.deltas, deltas[0 .. row.ts.len - 1]);
-        // The staging record passes no delta buffer and reads the same span.
-        try testing.expectEqual(got, tickSpan(row.ts, row.mask, null));
     }
 }

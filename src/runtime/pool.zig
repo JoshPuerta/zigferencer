@@ -77,6 +77,10 @@ const Job = struct {
     unit_fn: *const fn (ctx: *const anyopaque, unit: u32) void,
     ctx: *const anyopaque,
     n_units: u32,
+    /// The op name that was open on the owner at the dispatch, or null when none was.
+    name: if (span.compiled) ?span.Name else void,
+    /// The epoch word of the dispatch. It links each worker share to the `pool_run` span.
+    word: if (span.compiled) u32 else void,
 };
 
 /// One atomic word on a cache line of its own. The alignment rounds the size up to the line.
@@ -185,9 +189,6 @@ pub const Pool = struct {
         self.enter();
         defer self.leave();
 
-        const sp = span.beginHot(.pool_run);
-        defer sp.end();
-
         // Run inline when one participant owns every unit.
         if (builtin.single_threaded or parts == 1) {
             var unit: u32 = 0;
@@ -198,13 +199,25 @@ pub const Pool = struct {
             return;
         }
 
-        // Publish the job, then the new epoch word.
+        // Compute the next epoch word.
         assert(self.pending.value.load(.monotonic) == 0);
-        self.job = .{ .unit_fn = Erased.call, .ctx = ctx, .n_units = n_units };
+        const seq = (self.seq + 1) & seq_mask;
+        const word = pack(seq, parts);
+        const sp = span.beginPart(.pool_run, word, @intCast(parts));
+        defer sp.end();
+
+        // Publish the job, then the new epoch word.
+        self.job = .{
+            .unit_fn = Erased.call,
+            .ctx = ctx,
+            .n_units = n_units,
+            .name = if (comptime span.compiled) openOp() else {},
+            .word = if (comptime span.compiled) word else {},
+        };
         self.claim.value.store(parts, .monotonic);
         self.pending.value.store(parts - 1, .monotonic);
-        self.seq = (self.seq + 1) & seq_mask;
-        self.ctl.value.store(pack(self.seq, parts), .seq_cst);
+        self.seq = seq;
+        self.ctl.value.store(word, .seq_cst);
 
         // Wake every sleeper.
         if (self.sleepers.value.load(.seq_cst) > 0) {
@@ -256,9 +269,7 @@ pub const Pool = struct {
         span.nameThread(std.fmt.bufPrint(&name_buf, "zf-pool-{d}", .{w}) catch unreachable);
         var seen = seen_first;
         while (true) {
-            const wait_sp = span.beginHot(.worker_wait);
             const word = self.waitChange(seen);
-            wait_sp.end();
             assert(word != seen);
             seen = word;
             if (word == ctl_stop) return;
@@ -273,19 +284,34 @@ pub const Pool = struct {
     /// The spin budget restarts on every call, so a worker that skips an epoch spins again.
     fn waitChange(self: *Pool, seen: u32) u32 {
         if (self.spin_ns > 0) {
-            const start = nowNs(self.io);
-            var spins: u32 = 0;
-            while (true) {
-                const word = self.ctl.value.load(.acquire);
-                if (word != seen) return word;
-
-                std.atomic.spinLoopHint();
-                spins +%= 1;
-                if (spins % spin_check == 0 and nowNs(self.io) - start >= self.spin_ns) break;
-            }
+            if (self.spinChange(seen)) |word| return word;
         }
 
-        // Sleep until the word changes. A spurious wake-up goes back to sleep.
+        return self.sleepChange(seen);
+    }
+
+    /// Spin until the word changes, or until the spin budget ends and the result is null.
+    fn spinChange(self: *Pool, seen: u32) ?u32 {
+        const sp = span.begin(.worker_spin);
+        defer sp.end();
+
+        const start = nowNs(self.io);
+        var spins: u32 = 0;
+        while (true) {
+            const word = self.ctl.value.load(.acquire);
+            if (word != seen) return word;
+
+            std.atomic.spinLoopHint();
+            spins +%= 1;
+            if (spins % spin_check == 0 and nowNs(self.io) - start >= self.spin_ns) return null;
+        }
+    }
+
+    /// Sleep until the word changes. A spurious wake-up goes back to sleep.
+    fn sleepChange(self: *Pool, seen: u32) u32 {
+        const sp = span.begin(.worker_sleep);
+        defer sp.end();
+
         while (true) {
             _ = self.sleepers.value.fetchAdd(1, .seq_cst);
             if (self.ctl.value.load(.seq_cst) == seen) {
@@ -337,7 +363,7 @@ comptime {
 fn runShare(job: *const Job, claim: *std.atomic.Value(u32), first: u32) void {
     const n_units = job.n_units;
     assert(first < n_units);
-    const sp = span.beginHot(.run_share);
+    const sp = openShare(job, first);
     defer sp.end();
 
     job.unit_fn(job.ctx, first);
@@ -346,6 +372,21 @@ fn runShare(job: *const Job, claim: *std.atomic.Value(u32), first: u32) void {
         if (unit >= n_units) return;
         job.unit_fn(job.ctx, unit);
     }
+}
+
+/// The scope of one share. Participant 0 is a `run_share`, and a worker carries the op name of
+/// the dispatch.
+fn openShare(job: *const Job, part: u32) span.Scope {
+    if (comptime !span.compiled) return span.begin(.run_share);
+
+    const name: span.Name = if (part == 0) .run_share else job.name orelse .run_share;
+    return span.beginPart(name, job.word, @intCast(part));
+}
+
+/// The open name of the owner when it is an op name, because only an op name can label a share.
+fn openOp() ?span.Name {
+    const name = span.current() orelse return null;
+    return if (name.isOp()) name else null;
 }
 
 fn nowNs(io: std.Io) i96 {
@@ -507,4 +548,56 @@ test "pool: 10000 back-to-back dispatches of tiny units, spinning and sleeping" 
             try testing.expectEqual(pack(10_000, 4), pool.ctl.value.load(.seq_cst));
         }
     }
+}
+
+test "pool: each worker share names the open op and links to the pool_run word" {
+    if (comptime !span.compiled or builtin.single_threaded) return error.SkipZigTest;
+
+    var cap = try span.TestCapture.start(testing.allocator);
+    defer cap.deinit();
+
+    const parts = 3;
+    var runs: [32]std.atomic.Value(u32) = undefined;
+    const counts: Counts = .{ .runs = &runs };
+    {
+        var pool: Pool = undefined;
+        try pool.init(testing.io, parts, 0);
+        defer pool.deinit();
+
+        counts.reset();
+        const outer = span.begin(.op_gate_up_proj);
+        pool.run(Counts, &counts, Counts.unit, runs.len, parts);
+        outer.end();
+    }
+
+    // The pool joined its workers, so every ring is complete.
+    var word: ?u32 = null;
+    var seen = [_]bool{false} ** parts;
+    const tracks = cap.finish();
+    for (tracks) |t| {
+        for (t.spans) |s| {
+            if (s.name == .pool_run) {
+                try testing.expect(word == null);
+                try testing.expectEqual(@as(u8, parts), s.part);
+                word = s.arg;
+            }
+        }
+    }
+
+    try testing.expect(word != null);
+    for (tracks) |t| {
+        if (!std.mem.startsWith(u8, t.name, "zf-pool-")) continue;
+
+        const w = try std.fmt.parseInt(u8, t.name["zf-pool-".len..], 10);
+        for (t.spans) |s| {
+            if (s.name != .op_gate_up_proj) continue;
+
+            try testing.expectEqual(w, s.part);
+            try testing.expectEqual(word.?, s.arg);
+            try testing.expect(s.flags & span.Span.flag_arg != 0);
+            seen[w] = true;
+        }
+    }
+
+    try testing.expect(seen[1] and seen[2]);
 }

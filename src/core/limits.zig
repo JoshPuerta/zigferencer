@@ -180,16 +180,20 @@ pub const max_threads: u32 = 64;
 /// and the trace metadata counts it.
 pub const span_threads_max: u32 = 64;
 
-/// The default capacity of one trace ring: the spans of one thread, and the GPU submit records. A
-/// span costs 24 bytes, so the default ring of one thread holds 384 KiB. A full ring drops the
-/// entry and counts it. Per-op spans under `-Dtrace` fill the default ring in seconds.
-pub const spans_per_thread: u32 = 16 * 1024;
+/// The default capacity of the span ring of one thread. A span costs 24 bytes, so the ring
+/// reserves 24 MiB, and its pages fault in only as spans arrive. A full ring drops the span and
+/// counts it.
+pub const spans_per_thread: u32 = 1024 * 1024;
+
+/// The capacity of the GPU submit ring. A record and its ready flag cost 169 bytes.
+pub const trace_gpu_records: u32 = 64 * 1024;
 
 /// The largest ring capacity that `trace_spans_env` sets. A thread allocates its ring at its first
 /// span, so this maximum prices 96 MiB per recording thread.
 pub const spans_per_thread_max: u32 = 4 * 1024 * 1024;
 
-/// The environment variable that sets the capacity of every trace ring.
+/// The environment variable that sets the capacity of every span ring. The GPU ring keeps
+/// `trace_gpu_records`.
 pub const trace_spans_env = "ZIGFERENCER_TRACE_SPANS";
 
 /// Ceiling on logical serve sessions. A session is resident in a VRAM slot or evicted to a RAM blob
@@ -733,7 +737,7 @@ test "parseStorageRange: digits in 1..2^32-1 only" {
 
 test "parseTraceSpans: digits in 1..spans_per_thread_max only" {
     try std.testing.expectEqual(@as(u32, 1), try parseTraceSpans("1"));
-    try std.testing.expectEqual(spans_per_thread, try parseTraceSpans("16384"));
+    try std.testing.expectEqual(spans_per_thread, try parseTraceSpans("1048576"));
     try std.testing.expectEqual(spans_per_thread_max, try parseTraceSpans("4194304"));
     const bad = [_][]const u8{
         "",

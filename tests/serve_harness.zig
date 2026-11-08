@@ -165,7 +165,6 @@ pub fn HarnessFor(comptime Runner: type) type {
                 loaded,
                 zigferencer.kv_budget.pinned(opts.max_sessions, opts.window),
                 prefill_chunk.stepRows(opts.prefill, opts.max_sessions, opts.max_batch),
-                io,
                 cpu_pool,
                 policy,
                 .f32,

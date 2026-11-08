@@ -20,7 +20,7 @@ The `Makefile` names a script only when a target needs more than 3 lines.
 | `gate.sh` | The token-hash gates of `make gate`. |
 | `simd-report.sh` | The SIMD width of each op, or the assembly of one kernel. |
 | `profile.sh` | The perf driver of `make profile`, see [profiling](../docs/profiling.md). |
-| `profile_convert.py` | The converter of `perf script` text for `profile.sh`. |
+| `profile_convert.py` | The converter of `perf script` text for `profile.sh`: folded stacks, trees, and the Perfetto sample trace. |
 | `debug-build.sh` | The `zig build` runner with LLVM, for a debugger. |
 | `common.sh` | The status lines and `zig_build`, sourced by the scripts. |
 | `help.awk` | The awk program that prints the targets of the `Makefile`. |

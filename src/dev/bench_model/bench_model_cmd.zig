@@ -156,12 +156,12 @@ fn refuseGpuFlags(io: std.Io, opt: common.Options) error{UsageError}!void {
 fn refuseCpuProfile(io: std.Io, opt: common.Options) !void {
     if (!opt.profile_cpu_decode) return;
 
-    // The per-op CPU timer compiles into a hot-trace build only, so a release
+    // The per-op CPU timer compiles into a trace build only, so a release
     // binary holds no clock read in the forward pass.
     if (!core_log.hot) {
         return args.fail(
             io,
-            "--profile-cpu-decode requires a hot-trace build (Debug or -Dtrace=true)",
+            "--profile-cpu-decode requires a trace build (-Dtrace=true)",
             .{},
         );
     }

@@ -140,7 +140,7 @@ zigferencer-dev bench-serve MODEL --max-tokens 128
 - [`docs/gpu-rdna2.md`](docs/gpu-rdna2.md): the target GPU. The RDNA2 hardware details
   and how the Vulkan kernels use them.
 - [`docs/profiling.md`](docs/profiling.md): how to find where the time is spent. Linux
-  perf on the host, the span trace of the engine, and GPU timestamps.
+  perf on the host, the span trace of the engine (a `-Dtrace=true` build), and GPU timestamps.
 - [`docs/debugging.md`](docs/debugging.md): step through a command, a test, or `build.zig` in lldb
   or gdb.
 - Each top-level source directory (`src/*`, `tests/`, `tools/`) has a `README.md`

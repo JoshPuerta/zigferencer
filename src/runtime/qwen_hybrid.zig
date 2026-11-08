@@ -146,7 +146,6 @@ pub const QwenHybridRunner = struct {
         ctx: *const vulkan_ctx.Context,
         loaded: *const loader.Loaded,
         plan: kv_budget.LayerSplit,
-        io: std.Io,
         pool: *Pool,
         policy: parallel.Policy,
         kv_dtype: dtype.KvDtype,
@@ -239,7 +238,6 @@ pub const QwenHybridRunner = struct {
             kv_budget.pinned(plan.n_slots, plan.window),
             split,
             suffix.maxStepRows(),
-            io,
             pool,
             policy,
             kv_dtype,
@@ -286,7 +284,7 @@ pub const QwenHybridRunner = struct {
     /// activations stay in `prefix.x`. `embedLookup` is the naive function on every op backend, as
     /// in `QwenRunner.stepBatch`.
     fn hostPrefix(self: *QwenHybridRunner, rows: []const StepRow) qwen_runner.Error!void {
-        const sp = span.beginHot(.host_prefix);
+        const sp = span.begin(.host_prefix);
         defer sp.end();
 
         std.debug.assert(rows.len >= 1);

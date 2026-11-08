@@ -1,202 +1,131 @@
-//! Per-op CPU decode timer, shared by the llama and the qwen CPU runners.
+//! The per-op CPU decode profile, shared by the llama and the qwen CPU runners.
 //!
-//! Comptime. `core_log.hot` removes the timer brackets from builds without hot tracing.
+//! Categories. The `op_*` names of `span.Name` are the categories of both families. A family uses a
+//! fixed subset, and that subset partitions one decode step: the timed brackets do not overlap, and
+//! together they cover the step. `CpuProfile` records its family, so the report prints only the
+//! rows of the family.
 //!
-//! Categories. One `ProfileCat` enum names every category of both families. A family uses a fixed
-//! subset, and that subset partitions one decode step: the timed brackets do not overlap, and
-//! together they cover the step. `CpuProfile` records its family, so a bracket that charges a
-//! category of the other family fails an assert, and the report prints only the rows of the family.
-//!
-//! Build modes. `-Dtrace` decides whether the instrument exists. Without it, `CpuProfile`, `Slot`,
-//! and `Span` are `void`, and `begin` and `end` compile to nothing, so a release runner reads no
-//! clock in the hot path. With it, the brackets stay dormant until a caller installs an accumulator
-//! or the span recorder runs.
-//!
-//! Callers. `bench-model --profile-cpu-decode` is the one caller that installs an accumulator. Each
-//! closed bracket also feeds the span recorder as an `op_*` span.
-//!
-//! Off path. When no profile is installed and the recorder is off, `begin` returns `undefined`,
-//! which `end` never reads because its guard is false. The off path is two predictable branches and
-//! zero clock reads. The recorder only turns off after startup, so a span that `end` sees always
-//! opened with a clock read.
+//! Source. The runners open a `span.begin` scope per bracket. A caller installs `CpuProfile.sums`
+//! with `span.installSums` on the decode thread, and each closed op scope adds its time there.
+//! `bench-model --profile-cpu-decode` is the one caller. The profile is plain data in every build,
+//! and a build without `-Dtrace` leaves it at zero.
 
 const std = @import("std");
-const core_log = @import("../core/log.zig");
 const span = @import("../core/span.zig");
 
-// -- constants --------------------------------------------------------------
-
-/// The empty slot value of both build modes.
-pub const slot_off: Slot = if (core_log.hot) null else {};
+const Name = span.Name;
 
 // -- types ------------------------------------------------------------------
 
-/// The runner family a profile belongs to. Each family charges its own subset of `ProfileCat`.
+/// The runner family a profile belongs to. Each family charges its own subset of the op names.
 pub const Family = enum { llama, qwen };
 
-/// The op categories of one decode step. The declaration order is the row order of the report.
-pub const ProfileCat = enum {
-    embed,
-    rmsnorm,
-    gdn_proj,
-    gdn_step,
-    gdn_out,
-    qkv_proj,
-    attn_proj,
-    rope,
-    qk_norm_rope,
-    kv_commit,
-    attention,
-    attn_gate,
-    o_proj,
-    gate_up_proj,
-    swiglu,
-    down_proj,
-    residual,
-    lm_head,
-
-    /// True for the row-parallel matmuls. Each runner charges them at its one matmul boundary.
-    pub fn isMatmul(self: ProfileCat) bool {
-        return switch (self) {
-            .gdn_proj,
-            .gdn_out,
-            .qkv_proj,
-            .attn_proj,
-            .o_proj,
-            .gate_up_proj,
-            .down_proj,
-            .lm_head,
-            => true,
-            else => false,
-        };
-    }
-
-    /// True for the categories that fan out on the pool. The report labels the other rows serial.
-    pub fn isParallel(self: ProfileCat) bool {
-        return self.isMatmul() or self == .attention or self == .gdn_step;
-    }
-
-    /// True when `family` charges this category.
-    pub fn usedBy(self: ProfileCat, family: Family) bool {
-        return switch (self) {
-            .embed,
-            .rmsnorm,
-            .attention,
-            .o_proj,
-            .gate_up_proj,
-            .swiglu,
-            .down_proj,
-            .residual,
-            .lm_head,
-            => true,
-            .qkv_proj, .rope => family == .llama,
-            .gdn_proj,
-            .gdn_step,
-            .gdn_out,
-            .attn_proj,
-            .qk_norm_rope,
-            .kv_commit,
-            .attn_gate,
-            => family == .qwen,
-        };
-    }
-};
-
-/// Per-category CPU-time accumulator. It is `void` without `-Dtrace`.
-pub const CpuProfile = if (core_log.hot) struct {
+/// Per-op CPU-time accumulator. The caller installs `sums` and sets `steps`.
+pub const CpuProfile = struct {
     family: Family,
-    ns: std.EnumArray(ProfileCat, u64) = .initFill(0),
+    sums: span.Sums = .initFill(0),
     steps: u64 = 0,
 
-    /// Nanoseconds charged to one category.
-    pub fn nsOf(self: *const CpuProfile, cat: ProfileCat) u64 {
-        return self.ns.get(cat);
+    /// Nanoseconds charged to one op name.
+    pub fn nsOf(self: *const CpuProfile, name: Name) u64 {
+        std.debug.assert(name.isOp());
+
+        return self.sums.get(name);
     }
 
-    /// Sum across categories. The per-step CPU time is `total() / steps`.
+    /// Sum across the op names of the family. The per-step CPU time is `total() / steps`.
     pub fn total(self: *const CpuProfile) u64 {
         var sum: u64 = 0;
-        for (self.ns.values) |v| {
-            sum += v;
-        }
-
-        return sum;
-    }
-
-    /// Time spent in the categories that fan out on the pool.
-    pub fn nsParallel(self: *const CpuProfile) u64 {
-        var sum: u64 = 0;
-        for (std.enums.values(ProfileCat)) |cat| {
-            if (cat.isParallel()) {
-                sum += self.ns.get(cat);
+        for (std.enums.values(Name)) |name| {
+            if (name.isOp() and usedBy(name, self.family)) {
+                sum += self.sums.get(name);
             }
         }
 
         return sum;
     }
-} else void;
 
-/// The runner-side timer slot. It is `void` without `-Dtrace`, so a release runner has no branch.
-pub const Slot = if (core_log.hot) ?*CpuProfile else void;
+    /// Time spent in the op names that fan out on the pool.
+    pub fn nsParallel(self: *const CpuProfile) u64 {
+        var sum: u64 = 0;
+        for (std.enums.values(Name)) |name| {
+            if (name.isOp() and usedBy(name, self.family) and isParallel(name)) {
+                sum += self.sums.get(name);
+            }
+        }
 
-/// One open timing span. It is `void` without `-Dtrace`.
-pub const Span = if (core_log.hot) std.Io.Clock.Timestamp else void;
+        return sum;
+    }
+};
 
 // -- api --------------------------------------------------------------------
 
-/// Open a timing span. With `-Dtrace`, it reads the clock only when a profile is installed or the
-/// span recorder runs.
-pub inline fn begin(slot: Slot, io: std.Io) Span {
-    if (comptime core_log.hot) {
-        return if (slot != null or span.enabled()) std.Io.Clock.Timestamp.now(
-            io,
-            .awake,
-        ) else undefined;
-    } else {
-        return {};
-    }
+/// True for the row-parallel matmuls. Each runner charges them at its one matmul boundary.
+pub fn isMatmul(name: Name) bool {
+    std.debug.assert(name.isOp());
+
+    return switch (name) {
+        .op_gdn_proj,
+        .op_gdn_out,
+        .op_qkv_proj,
+        .op_attn_proj,
+        .op_o_proj,
+        .op_gate_up_proj,
+        .op_down_proj,
+        .op_lm_head,
+        => true,
+        else => false,
+    };
 }
 
-/// Close a timing span opened by `begin`, charge the elapsed time to `cat`, and hand the span to
-/// the recorder.
-pub inline fn end(slot: Slot, io: std.Io, t0: Span, cat: ProfileCat) void {
-    if (comptime core_log.hot) {
-        const tracing = span.enabled();
-        if (slot == null and !tracing) return;
-
-        const t1 = std.Io.Clock.Timestamp.now(io, .awake);
-        if (slot) |p| {
-            std.debug.assert(cat.usedBy(p.family));
-
-            p.ns.getPtr(cat).* += @intCast(t0.durationTo(t1).raw.toNanoseconds());
-        }
-
-        if (tracing) {
-            span.record(spanName(cat), t0.raw, t1.raw);
-        }
-    }
+/// True for the op names that fan out on the pool. The report labels the other rows serial.
+pub fn isParallel(name: Name) bool {
+    return isMatmul(name) or name == .op_attention or name == .op_gdn_step;
 }
 
-/// The span name of a category.
-pub fn spanName(cat: ProfileCat) span.Name {
-    return switch (cat) {
-        inline else => |c| @field(span.Name, "op_" ++ @tagName(c)),
+/// True when `family` charges this op name.
+pub fn usedBy(name: Name, family: Family) bool {
+    std.debug.assert(name.isOp());
+
+    return switch (name) {
+        .op_embed,
+        .op_rmsnorm,
+        .op_attention,
+        .op_o_proj,
+        .op_gate_up_proj,
+        .op_swiglu,
+        .op_down_proj,
+        .op_residual,
+        .op_lm_head,
+        => true,
+        .op_qkv_proj, .op_rope => family == .llama,
+        .op_gdn_proj,
+        .op_gdn_step,
+        .op_gdn_out,
+        .op_attn_proj,
+        .op_qk_norm_rope,
+        .op_kv_commit,
+        .op_attn_gate,
+        => family == .qwen,
+        else => unreachable,
     };
 }
 
 // -- tests ------------------------------------------------------------------
 
-test "cpu profile: each family uses a fixed category set" {
+test "cpu profile: each family uses a fixed op set" {
     var llama: u32 = 0;
     var qwen: u32 = 0;
-    for (std.enums.values(ProfileCat)) |cat| {
-        // No category is dead: at least one family charges it.
-        try std.testing.expect(cat.usedBy(.llama) or cat.usedBy(.qwen));
-        if (cat.usedBy(.llama)) {
+    for (std.enums.values(Name)) |name| {
+        if (!name.isOp()) continue;
+
+        // No op is dead: at least one family charges it.
+        try std.testing.expect(usedBy(name, .llama) or usedBy(name, .qwen));
+        if (usedBy(name, .llama)) {
             llama += 1;
         }
 
-        if (cat.usedBy(.qwen)) {
+        if (usedBy(name, .qwen)) {
             qwen += 1;
         }
     }
@@ -204,30 +133,35 @@ test "cpu profile: each family uses a fixed category set" {
     try std.testing.expectEqual(@as(u32, 11), llama);
     try std.testing.expectEqual(@as(u32, 16), qwen);
     // The lm_head and the FFN matmuls are common to both families.
-    for ([_]ProfileCat{ .gate_up_proj, .down_proj, .lm_head }) |cat| {
-        try std.testing.expect(cat.isMatmul());
-        try std.testing.expect(cat.usedBy(.llama));
-        try std.testing.expect(cat.usedBy(.qwen));
+    for ([_]Name{ .op_gate_up_proj, .op_down_proj, .op_lm_head }) |name| {
+        try std.testing.expect(isMatmul(name));
+        try std.testing.expect(usedBy(name, .llama));
+        try std.testing.expect(usedBy(name, .qwen));
     }
 
-    try std.testing.expect(!ProfileCat.attention.isMatmul());
-    try std.testing.expect(!ProfileCat.gdn_step.isMatmul());
+    try std.testing.expect(!isMatmul(.op_attention));
+    try std.testing.expect(!isMatmul(.op_gdn_step));
     // Every matmul fans out. So do attention and the GDN step.
-    for (std.enums.values(ProfileCat)) |cat| {
-        if (cat.isMatmul()) {
-            try std.testing.expect(cat.isParallel());
+    for (std.enums.values(Name)) |name| {
+        if (name.isOp() and isMatmul(name)) {
+            try std.testing.expect(isParallel(name));
         }
     }
 
-    try std.testing.expect(ProfileCat.attention.isParallel());
-    try std.testing.expect(ProfileCat.gdn_step.isParallel());
-    try std.testing.expect(!ProfileCat.rmsnorm.isParallel());
+    try std.testing.expect(isParallel(.op_attention));
+    try std.testing.expect(isParallel(.op_gdn_step));
+    try std.testing.expect(!isParallel(.op_rmsnorm));
 }
 
-test "cpu profile: every category has a span name in its order" {
-    for (std.enums.values(ProfileCat), 0..) |cat, i| {
-        const name = spanName(cat);
-        try std.testing.expect(name.isHot());
-        try std.testing.expectEqual(@intFromEnum(span.Name.op_embed) + i, @intFromEnum(name));
+test "cpu profile: the op names are exactly the names that isOp accepts" {
+    var ops: u32 = 0;
+    for (std.enums.values(Name)) |name| {
+        const prefixed = std.mem.startsWith(u8, @tagName(name), "op_");
+        try std.testing.expectEqual(prefixed, name.isOp());
+        if (name.isOp()) {
+            ops += 1;
+        }
     }
+
+    try std.testing.expectEqual(@as(u32, 18), ops);
 }
