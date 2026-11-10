@@ -3,7 +3,7 @@
 This directory holds the CPU kernels of the model: pure f32 ops that allocate nothing and keep no
 state. The caller supplies the output buffer. A `Tensor` crosses the edge inward, and a
 caller-owned `[]f32` crosses outward. `naive.zig` is the reference, and the SIMD backends are
-shims that override only the hot kernels. The build fixes the backend, so the decode loop branches
+files that override only the hot kernels. The build fixes the backend, so the decode loop branches
 on no backend.
 
 ## Files
@@ -20,7 +20,7 @@ on no backend.
 
 ## How the pieces fit
 
-`naive.zig` defines the op surface, and the two SIMD files repeat it. Each shim re-exports what it
+`naive.zig` defines the op surface, and the two SIMD files repeat it. Each SIMD file re-exports what it
 does not override, so every backend offers the same names and a missing override is a fallback,
 never a gap.
 
@@ -30,13 +30,13 @@ never a gap.
 | `requires` | each backend | An `OpRequires`: the target and the tolerance against `naive` | each backend | `cli/info`, `tools/bench_util` |
 | The attention kernels | `attention_simd.zig` | `plain` and `prefetched` sets of part, merge, and row | the file itself | `simd`, `simd_pf` |
 | `expNeg` | `exp_simd.zig` | The vector exponential for inputs at or below 0 | the file itself | `attention_simd`, `runtime/sampler` |
-| `RopeStyle` | `naive.zig` | `norm` or `neox` | `llama_runner` and `qwen_runner`, per family | `ropeInplace` |
-| `gdn.step` | `gdn.zig` | The per-token recurrence over a state the runner owns | the file itself | `runtime/qwen_runner`, `runtime/parallel`, `dev/gpu_selftest` |
+| `RopeStyle` | `naive.zig` | `norm` or `neox` | `llama_layer` and `qwen_layer`, per family | `ropeInplace` |
+| `gdn.step` | `gdn.zig` | The per-token recurrence over a state the runner owns | the file itself | `runtime/parallel`, `dev/gpu_selftest` |
 | `gdn.chunkScan` | `gdn.zig` | The chunked matrix form of the same recurrence | the file itself | `tools/simd_probe`, the tests |
 
-A runner picks the backend once, at compile time. The `ops` constant of `runtime/llama_runner`,
-`runtime/qwen_runner`, and `runtime/linear_dispatch` reads `build_options`, and `build.zig` sets
-them from `-Dops-backend`:
+A runner picks the backend once, at compile time. The `ops` constant of `runtime/cpu_runner`,
+`runtime/cpu_layer_kernels`, and `runtime/linear_dispatch` reads `build_options`, and `build.zig`
+sets them from `-Dops-backend`:
 
 ```
   -Dops-backend --> build.resolveOpsBackend --> build_options
@@ -47,7 +47,7 @@ them from `-Dops-backend`:
        otherwise       -->  ops/naive.zig
 ```
 
-The shims share the attention kernels:
+The SIMD files share the attention kernels:
 
 ```
   simd.zig     --> attention_simd.plain      ---+--> exp_simd.expNeg

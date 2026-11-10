@@ -1,12 +1,12 @@
 //! Swap gate for the llama hybrid runner. The tiered KV swap must restore a conversation byte for
-//! byte, and the provenance tag must refuse a blob that another split or dtype wrote.
+//! byte, and the provenance tag must refuse a blob that another host layer count or dtype wrote.
 //!
 //! Two tiers. A hybrid slot lives in two tiers. The host prefix holds layers `[0..k)` and the
 //! device suffix holds layers `[k..L)`, so two walks write one blob. The state model proves that
 //! algebra at anchor scale, and these tests replay it at model scale through the public surface of
 //! the runner.
 //!
-//! Witnesses. The blob size never moves with the split, and "the blob is split-independent"
+//! Witnesses. The blob size never moves with the host layers, and "the blob is split-independent"
 //! witnesses that across a CPU runner and a hybrid runner. The two walks together write the
 //! whole-model framing, and "one blob carries the whole-model framing" witnesses it three ways:
 //!
@@ -14,7 +14,7 @@
 //!      the same ops over the same weights.
 //!   2. A CPU blob goes through the H2D walk of the hybrid in and its D2H walk out byte for byte.
 //!      The transport therefore writes and recovers every region. The shipped fingerprint forbids
-//!      this cross-executor restore, and the test does it on purpose, because only a foreign blob
+//!      this cross-placement restore, and the test does it on purpose, because only a foreign blob
 //!      proves that the walks address the whole-model framing and not merely each other.
 //!   3. A greedy decode over the restored rows continues on the path of the CPU runner, so the
 //!      regions sit where attention expects them. A region that the walk misplaces garbles the
@@ -22,13 +22,12 @@
 //!
 //! Bits. The device halves hold the same values in the same places, but not the same bits. The
 //! GPU-computed suffix KV differs from the CPU-computed suffix KV in the low mantissa, because the
-//! reduce kernel sums in a different order. Byte equality across executors is therefore not a
+//! reduce kernel sums in a different order. Byte equality across runners is therefore not a
 //! guarantee this engine makes, and that guarantee is the reason the snapshot fingerprint folds the
-//! split. A blob must not restore under an executor that did not write it.
+//! host layers. A blob must not restore under a runner that did not write it.
 //!
-//! Mid split. Every runner here builds at a true mid split, except the split-0 case that pins the
-//! fused stream. A degenerate split lets a single-tier runner pass this whole file, so `initHybrid`
-//! asserts the split it got.
+//! Interior count. Every runner here builds with an interior count of host layers. A whole-model
+//! count lets a single-tier runner pass this whole file, so `initHybrid` asserts the count it got.
 //!
 //! Hardware. The hardware tests need a Vulkan device and the canonical SmolLM2-135M-Instruct-Q8_0
 //! fixture from `test_fixtures.path`. They return `error.SkipZigTest` when the device is absent.
@@ -46,10 +45,10 @@ const prompt_cache = zigferencer.prompt_cache;
 const tensor_lookup = zigferencer.tensor_lookup;
 const vocab_mod = zigferencer.vocab;
 const vulkan_ctx = zigferencer.vulkan_ctx;
-const llama_fused = zigferencer.llama_fused;
 
-const LlamaHybridRunner = zigferencer.llama_hybrid.LlamaHybridRunner;
-const LlamaRunner = zigferencer.llama_runner.LlamaRunner;
+const LlamaRow = zigferencer.family.Of(.llama);
+const LlamaHybrid = LlamaRow.Hybrid;
+const LlamaCpu = zigferencer.family.Of(.llama).Cpu;
 const Sessions = zigferencer.session.Sessions;
 
 // -- fixtures ---------------------------------------------------------------
@@ -62,10 +61,6 @@ const window: u32 = 64;
 const prompts = [_][]const u8{ "The dragon flew over", "Tell me a story about" };
 const n_decode: usize = 4;
 const n_tokens = n_decode + 1;
-
-/// Tokens the split-0 identity gate compares. A drift in one layer body shows
-/// within a few greedy steps, and 16 leaves the window room for the prompt.
-const n_identity_tokens: usize = 16;
 
 /// One thread everywhere, so a byte comparison reads the same work split on the
 /// reference runner and on the hybrid's prefix runner.
@@ -85,21 +80,21 @@ fn initCtx(arena: std.mem.Allocator) !*vulkan_ctx.Context {
     return ctxp;
 }
 
-/// Build a hybrid through the production planner with `gpu_layers` on the
-/// device. A device that cannot fund that placement cannot run this gate, so a
-/// budget refusal skips.
-fn initHybridAt(
+/// Build a hybrid through the production planner, half the layers on each tier. A degenerate count
+/// lets a single-tier runner pass the swap gates, so the helper asserts the count. A device that
+/// cannot fund the placement skips the gate on its budget refusal.
+fn initHybrid(
     gpa: std.mem.Allocator,
     ctxp: *const vulkan_ctx.Context,
     loaded: *const loader.Loaded,
     thread_pool: *test_policy.Pool,
-    gpu_layers: u32,
-) !*LlamaHybridRunner {
+) !*LlamaHybrid {
     const card = loaded.card;
     const n_layers: u32 = card.n_layers;
-    std.debug.assert(gpu_layers <= n_layers);
-    const caps = try llama_fused.LlamaFusedRunner.kvCaps(
-        gpa,
+    const gpu_layers: u32 = n_layers / 2;
+    std.debug.assert(1 <= gpu_layers);
+    std.debug.assert(gpu_layers < n_layers);
+    const caps = zigferencer.family.Of(.llama).Fused.kvCaps(
         loaded,
         limits.contextCeiling(loaded.card.context_length, null),
         ctxp.deviceLocalAvailableBytes(),
@@ -122,76 +117,28 @@ fn initHybridAt(
         .{ .ram_split = .{ .blobs = 0, .prefix = 0 }, .residency = true },
         gpu_layers,
     ) catch return error.SkipZigTest;
-    return LlamaHybridRunner.init(
+    const hybrid = LlamaHybrid.init(
         gpa,
         ctxp,
         loaded,
-        plan,
-        thread_pool,
-        cpu_cfg,
-        .f32,
+        .{
+            .plan = plan,
+            .pool = thread_pool,
+            .policy = cpu_cfg,
+            .kv_dtype = .f32,
+        },
     ) catch |e| switch (e) {
         error.VramBudgetExceeded => return error.SkipZigTest,
         else => return e,
     };
-}
-
-/// The true mid split the swap gates need: half the layers on the device, the
-/// rest on the host. A degenerate split lets a single-tier runner pass those
-/// gates, so this helper asserts the split it got.
-fn initHybrid(
-    gpa: std.mem.Allocator,
-    ctxp: *const vulkan_ctx.Context,
-    loaded: *const loader.Loaded,
-    thread_pool: *test_policy.Pool,
-) !*LlamaHybridRunner {
-    const n_layers: u32 = loaded.card.n_layers;
-    std.debug.assert(n_layers >= 2); // a mid split needs a layer on each side
-    const hybrid = try initHybridAt(gpa, ctxp, loaded, thread_pool, n_layers / 2);
     std.debug.assert(hybrid.host_layers > 0);
     std.debug.assert(hybrid.host_layers < hybrid.n_layers);
     return hybrid;
 }
 
-/// The fused runner over the whole model, at the slot count and window the
-/// hybrid takes. A budget refusal skips, like the hybrid's.
-fn initFused(
-    gpa: std.mem.Allocator,
-    ctxp: *const vulkan_ctx.Context,
-    loaded: *const loader.Loaded,
-) !*llama_fused.LlamaFusedRunner {
-    const caps = try llama_fused.LlamaFusedRunner.kvCaps(
-        gpa,
-        loaded,
-        limits.contextCeiling(loaded.card.context_length, null),
-        ctxp.deviceLocalAvailableBytes(),
-        n_slots,
-        .f32,
-    );
-    const plan = kv_budget.kvPlan(
-        caps,
-        llama_fused.LlamaFusedRunner.kvCostModel(loaded.card, .f32),
-        .{
-            .window = window,
-            .slots = n_slots,
-            .batch = n_slots,
-        },
-    ) catch return error.SkipZigTest;
-    return llama_fused.LlamaFusedRunner.initFromLoaded(
-        gpa,
-        ctxp,
-        loaded,
-        plan,
-        .f32,
-    ) catch |e| switch (e) {
-        error.VramBudgetExceeded => return error.SkipZigTest,
-        else => return e,
-    };
-}
-
 /// Bytes the host prefix layers hold inside an `n_rows` blob, by one layer's
-/// share of the whole-model figure times the split.
-fn hostBlobBytes(cpu: *const LlamaRunner, hybrid: *const LlamaHybridRunner, n_rows: u32) usize {
+/// share of the whole-model figure times the host layers.
+fn hostBlobBytes(cpu: *const LlamaCpu, hybrid: *const LlamaHybrid, n_rows: u32) usize {
     return @intCast(cpu.evictSlotBytesFor(n_rows) / hybrid.n_layers * hybrid.host_layers);
 }
 
@@ -230,15 +177,13 @@ test "llama hybrid swap: the blob is split-independent" {
     const hybrid = try initHybrid(gpa, ctxp, &loaded, &thread_pool);
     defer hybrid.deinit();
 
-    const cpu = try LlamaRunner.init(
-        arena,
-        &loaded,
-        kv_budget.pinned(n_slots, window),
-        0,
-        &thread_pool,
-        cpu_cfg,
-        .f32,
-    );
+    const cpu = try LlamaCpu.init(arena, &loaded, .{
+        .plan = kv_budget.pinned(n_slots, window),
+        .max_rows = 0,
+        .pool = &thread_pool,
+        .policy = cpu_cfg,
+        .kv_dtype = .f32,
+    });
 
     // The residency tier sizes a RAM blob before it knows which runner holds
     // the slot, so the two figures must agree at every row count.
@@ -275,15 +220,13 @@ test "llama hybrid swap: one blob carries the whole-model framing" {
     const hybrid = try initHybrid(gpa, ctxp, &loaded, &thread_pool);
     defer hybrid.deinit();
 
-    var cpu = try LlamaRunner.init(
-        arena,
-        &loaded,
-        kv_budget.pinned(n_slots, window),
-        0,
-        &thread_pool,
-        cpu_cfg,
-        .f32,
-    );
+    var cpu = try LlamaCpu.init(arena, &loaded, .{
+        .plan = kv_budget.pinned(n_slots, window),
+        .max_rows = 0,
+        .pool = &thread_pool,
+        .policy = cpu_cfg,
+        .kv_dtype = .f32,
+    });
 
     // Four positions cover one KV write and three KV reads on each tier.
     // Each runner takes its own entry point, as in a residency swap.
@@ -311,7 +254,7 @@ test "llama hybrid swap: one blob carries the whole-model framing" {
     try hybrid.evictSlot(0, n_rows, round_blob);
     try std.testing.expectEqualSlices(u8, cpu_blob, round_blob);
 
-    // Witness 3: the hybrid now holds the CPU state, so the greedy path must match the CPU runner.
+    // Witness 3: the hybrid holds the CPU state, so the greedy path must match the CPU runner.
     var pos: u32 = n_rows;
     while (pos < n_rows + 3) : (pos += 1) {
         const cpu_logits = try cpu.step(ids[0], pos);
@@ -348,16 +291,14 @@ test "llama hybrid swap: a restored slot decodes as if it never left" {
     // The reference: both prompts on one two-slot CPU runner, decoded together.
     var reference: [prompts.len][n_tokens]u32 = undefined;
     {
-        var cpu = try LlamaRunner.init(
-            arena,
-            &loaded,
-            kv_budget.pinned(n_slots, window),
-            0,
-            &thread_pool,
-            cpu_cfg,
-            .f32,
-        );
-        var cpu_pool = try Sessions(LlamaRunner).init(arena, &cpu);
+        var cpu = try LlamaCpu.init(arena, &loaded, .{
+            .plan = kv_budget.pinned(n_slots, window),
+            .max_rows = 0,
+            .pool = &thread_pool,
+            .policy = cpu_cfg,
+            .kv_dtype = .f32,
+        });
+        var cpu_pool = try Sessions(LlamaCpu).init(arena, &cpu);
         var cpu_ids: [prompts.len]u32 = undefined;
         for (prompt_ids, 0..) |ids, p| {
             cpu_ids[p] = try cpu_pool.create(0, .{});
@@ -379,7 +320,7 @@ test "llama hybrid swap: a restored slot decodes as if it never left" {
     const hybrid = try initHybrid(gpa, ctxp, &loaded, &thread_pool);
     defer hybrid.deinit();
 
-    var pool = try Sessions(LlamaHybridRunner).init(arena, hybrid);
+    var pool = try Sessions(LlamaHybrid).init(arena, hybrid);
 
     var sids: [prompts.len]u32 = undefined;
     for (prompt_ids, 0..) |ids, p| {
@@ -429,7 +370,7 @@ test "llama hybrid swap: a fork decodes beside its source" {
     const hybrid = try initHybrid(gpa, ctxp, &loaded, &thread_pool);
     defer hybrid.deinit();
 
-    var pool = try Sessions(LlamaHybridRunner).init(arena, hybrid);
+    var pool = try Sessions(LlamaHybrid).init(arena, hybrid);
 
     const source = try pool.create(0, .{});
     _ = (try pool.feed(source, ids, true)).?;
@@ -444,66 +385,15 @@ test "llama hybrid swap: a fork decodes beside its source" {
     }
 }
 
-test "llama hybrid dispatch: split 0 decodes the stream of the fused runner" {
-    const io = std.testing.io;
-    var thread_pool: test_policy.Pool = undefined;
-    try test_policy.startPool(&thread_pool, io, cpu_cfg);
-    defer thread_pool.deinit();
-
-    const gpa = std.testing.allocator;
-    var arena_state = std.heap.ArenaAllocator.init(gpa);
-    defer arena_state.deinit();
-
-    const arena = arena_state.allocator();
-    const fixture = try zigferencer.test_fixtures.path(arena, "SmolLM2-135M-Instruct-Q8_0");
-
-    var loaded = try loader.load(io, arena, fixture);
-    defer loaded.close();
-
-    var v = try vocab_mod.buildFromParsed(arena, loaded.parsed);
-    const ids = try bpe.encodeAlloc(&v, arena, prompts[0], true);
-
-    const ctxp = try initCtx(arena);
-    defer ctxp.deinit();
-
-    // Every layer on the device is dispatch-identical to the fused runner by claim.
-    // A shell gate proves the whole split ladder, and this case proves one end of it.
-    const hybrid = try initHybridAt(gpa, ctxp, &loaded, &thread_pool, loaded.card.n_layers);
-    defer hybrid.deinit();
-
-    try std.testing.expectEqual(@as(u32, 0), hybrid.host_layers);
-
-    const fused = try initFused(gpa, ctxp, &loaded);
-    defer fused.deinit();
-
-    var hybrid_pool = try Sessions(LlamaHybridRunner).init(arena, hybrid);
-    var fused_pool = try Sessions(llama_fused.LlamaFusedRunner).init(arena, fused);
-    const h_sid = try hybrid_pool.create(0, .{});
-    const f_sid = try fused_pool.create(0, .{});
-
-    // Two runners that record the same dispatches emit one stream.
-    // The first token that differs names the layer body that drifted.
-    const h_first = (try hybrid_pool.feed(h_sid, ids, true)).?;
-    const f_first = (try fused_pool.feed(f_sid, ids, true)).?;
-    try std.testing.expectEqual(f_first, h_first);
-    for (1..n_identity_tokens) |_| {
-        var h_out: [1]u32 = undefined;
-        var f_out: [1]u32 = undefined;
-        try hybrid_pool.decodeBatch(&.{h_sid}, &h_out);
-        try fused_pool.decodeBatch(&.{f_sid}, &f_out);
-        try std.testing.expectEqual(f_out[0], h_out[0]);
-    }
-}
-
 test "llama hybrid provenance: the tag names the split, the quant, and the dtype" {
-    var buf_15: [LlamaHybridRunner.backend_tag_buf_len]u8 = undefined;
-    var buf_16: [LlamaHybridRunner.backend_tag_buf_len]u8 = undefined;
-    var buf_q4: [LlamaHybridRunner.backend_tag_buf_len]u8 = undefined;
-    var buf_f16: [LlamaHybridRunner.backend_tag_buf_len]u8 = undefined;
-    const at_15 = LlamaHybridRunner.backendTag(&buf_15, 15, .q8_0, .f32);
-    const at_16 = LlamaHybridRunner.backendTag(&buf_16, 16, .q8_0, .f32);
-    const at_15_q4 = LlamaHybridRunner.backendTag(&buf_q4, 15, .q4_0, .f32);
-    const at_15_f16 = LlamaHybridRunner.backendTag(&buf_f16, 15, .q8_0, .f16);
+    var buf_15: [LlamaRow.hybrid_tag_buf_len]u8 = undefined;
+    var buf_16: [LlamaRow.hybrid_tag_buf_len]u8 = undefined;
+    var buf_q4: [LlamaRow.hybrid_tag_buf_len]u8 = undefined;
+    var buf_f16: [LlamaRow.hybrid_tag_buf_len]u8 = undefined;
+    const at_15 = LlamaRow.hybridBackendTag(&buf_15, 15, .q8_0, .f32);
+    const at_16 = LlamaRow.hybridBackendTag(&buf_16, 16, .q8_0, .f32);
+    const at_15_q4 = LlamaRow.hybridBackendTag(&buf_q4, 15, .q4_0, .f32);
+    const at_15_f16 = LlamaRow.hybridBackendTag(&buf_f16, 15, .q8_0, .f16);
 
     // The split, the quant and the KV dtype are the three parts of a tag,
     // and each one alone must move the tag.
@@ -545,22 +435,22 @@ test "llama hybrid provenance: a foreign tag is another namespace" {
     var dirbuf: [128]u8 = undefined;
     const dir = try std.fmt.bufPrint(&dirbuf, ".zig-cache/tmp/{s}/hybrid", .{&tmp.sub_path});
 
-    var buf_mine: [LlamaHybridRunner.backend_tag_buf_len]u8 = undefined;
-    var buf_theirs: [LlamaHybridRunner.backend_tag_buf_len]u8 = undefined;
-    var buf_half: [LlamaHybridRunner.backend_tag_buf_len]u8 = undefined;
+    var buf_mine: [LlamaRow.hybrid_tag_buf_len]u8 = undefined;
+    var buf_theirs: [LlamaRow.hybrid_tag_buf_len]u8 = undefined;
+    var buf_half: [LlamaRow.hybrid_tag_buf_len]u8 = undefined;
     const model_fp = prompt_cache.modelFingerprint("smollm2-135m", 145_000_000);
     const mine = prompt_cache.backendFingerprint(
         model_fp,
-        LlamaHybridRunner.backendTag(&buf_mine, 15, .q8_0, .f32),
+        LlamaRow.hybridBackendTag(&buf_mine, 15, .q8_0, .f32),
     );
     const theirs = prompt_cache.backendFingerprint(
         model_fp,
-        LlamaHybridRunner.backendTag(&buf_theirs, 16, .q8_0, .f32),
+        LlamaRow.hybridBackendTag(&buf_theirs, 16, .q8_0, .f32),
     );
     // The same split at the other KV dtype. A blob that crosses the dtype lands wrong bytes.
     const half = prompt_cache.backendFingerprint(
         model_fp,
-        LlamaHybridRunner.backendTag(&buf_half, 15, .q8_0, .f16),
+        LlamaRow.hybridBackendTag(&buf_half, 15, .q8_0, .f16),
     );
 
     const seq = [_]u32{ 1, 2, 3, 4 };

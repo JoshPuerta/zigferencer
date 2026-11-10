@@ -7,7 +7,7 @@
 //!
 //! Cost. This is the simple end-to-end path. Every op call is its own submit and wait-idle, roughly
 //! 0.25 ms times hundreds of ops per Llama-8B token, which is the known floor. The fused decode
-//! path in `runtime/llama_fused.zig` records one command buffer per token and removes that floor.
+//! path in `runtime/fused_runner.zig` records one command buffer per token and removes that floor.
 //! The per-op benchmarks and the GPU-against-CPU correctness checks run against this simple
 //! boundary.
 //!
@@ -28,8 +28,8 @@
 //! signatures that every backend compiles against. A parallel GPU-only op API duplicates the
 //! signatures that the runner is built against. So the GPU lifetime stays confined here:
 //! `initBackend` creates it, `deinitBackend` tears it down, and nothing outside this file observes
-//! it. The unit of work of the fused path is a whole forward pass, owned by one explicit
-//! LlamaFusedRunner value. A per-op function has no such natural owner.
+//! it. The unit of work of the fused path is a whole forward pass, owned by one explicit fused
+//! runner value. A per-op function has no such natural owner.
 //!
 //! Tolerance. The per-op tolerances vary: the matmul near 2e-4, rmsnorm near 1e-6, and attention
 //! near 1e-3. The declared 2e-3 is the loosest of those with a 2x cushion. It holds end to end,

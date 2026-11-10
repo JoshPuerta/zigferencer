@@ -866,8 +866,8 @@ pub fn derivedX(caps: Caps) u64 {
 }
 
 /// Bytes one slot holds over the layer span `[from..to)`: the window price of every token
-/// position, plus the fixed state. The device suffix form is the blob half that one swap moves
-/// (`llama_hybrid.deviceSwapBytes` at `n_rows == window`).
+/// position, plus the fixed state. The GPU layer form is the blob half that one swap moves, and
+/// `HybridRunner.blobSpanBytes` is this span at `n_rows` in the place of the window.
 pub fn slotSpanBytes(kv: KvStructure, from: u32, to: u32) u64 {
     std.debug.assert(from <= to);
     std.debug.assert(to <= kv.costs.n_layers);
@@ -946,9 +946,9 @@ pub fn clipCopies(
     return out[0..c];
 }
 
-/// Plan the layer split against a resolved KV structure. A null `gpu_layers` follows the
-/// money, and a pinned count that the budget cannot fund is a refusal, never a shrink. It checks
-/// no RAM and never reads `caps.weights`. `head_bytes` is the final norm plus the lm_head.
+/// Plan the layer split against a resolved KV structure. A null `gpu_layers` follows the money. A
+/// pin that the budget cannot fund, or a GPU range without a KV layer, is a refusal. It reads no
+/// RAM and no `caps.weights`. `head_bytes` is the final norm plus the lm_head.
 pub fn planLayerSplit(
     caps: Caps,
     weights: []const u64,
@@ -956,7 +956,7 @@ pub fn planLayerSplit(
     kv: KvStructure,
     host: HostRequest,
     gpu_layers: ?u32,
-) error{WeightsVramBudgetTooSmall}!LayerSplit {
+) error{ WeightsVramBudgetTooSmall, NoKvLayerInRange }!LayerSplit {
     // Check the weights and the KV structure.
     std.debug.assert(weights.len >= 1);
     std.debug.assert(weights.len <= limits.max_layers);
@@ -981,6 +981,13 @@ pub fn planLayerSplit(
     if (gpu_layers) |g| std.debug.assert(g <= n_layers);
 
     const split = if (gpu_layers) |g| n_layers - g else autoSplit(caps, weights, head_bytes, kv);
+    if (split < n_layers and !suffixHoldsKv(kv.costs, split)) {
+        // The auto scan never lands on such a range, so only a pinned count reaches here.
+        std.debug.assert(gpu_layers != null);
+
+        return error.NoKvLayerInRange;
+    }
+
     if (!layerSplitFits(caps, weights, head_bytes, kv, split)) {
         // Only a pinned count reaches here. The auto scan stops on a feasible
         // split, and the pure CPU split is feasible under any budget.
@@ -1045,11 +1052,11 @@ pub fn planLayerSplit(
         // A pinned count is honored exactly, or refused above.
         std.debug.assert(plan.host_layers == n_layers - g);
     } else {
-        // The auto split is feasible and no smaller split is, so the GPU
-        // suffix is the widest the budget funds.
+        // The auto split is feasible. A GPU suffix holds a KV layer, and no smaller split is
+        // feasible, so the suffix is the widest the budget funds.
         std.debug.assert(layerSplitFits(caps, weights, head_bytes, kv, plan.host_layers));
 
-        if (plan.host_layers > 0) {
+        if (plan.host_layers > 0 and plan.host_layers < n_layers) {
             std.debug.assert(!layerSplitFits(caps, weights, head_bytes, kv, plan.host_layers - 1));
         }
     }
@@ -1765,10 +1772,25 @@ fn autoSplit(caps: Caps, weights: []const u64, head_bytes: u64, kv: KvStructure)
     const n_layers: u32 = @intCast(weights.len);
     var k: u32 = 0;
     while (k < n_layers) : (k += 1) {
-        if (layerSplitFits(caps, weights, head_bytes, kv, k)) return k;
+        if (!layerSplitFits(caps, weights, head_bytes, kv, k)) continue;
+
+        // A GPU range without a KV layer is refused, and every narrower range lacks one too. So
+        // the widest funded range without one leaves every layer on the host.
+        return if (suffixHoldsKv(kv.costs, k)) k else n_layers;
     }
 
     return n_layers;
+}
+
+/// True when a layer of `[from, L)` holds KV rows.
+fn suffixHoldsKv(costs: KvCostVector, from: u32) bool {
+    std.debug.assert(from < costs.n_layers);
+
+    for (costs.layers()[from..]) |entry| {
+        if (entry.kv_bytes_per_token > 0) return true;
+    }
+
+    return false;
 }
 
 // -- tests ------------------------------------------------------------------
@@ -3612,6 +3634,46 @@ test "planLayerSplit: the KV structure and the caps reservations pass through" {
     try std.testing.expectEqual(@as(u64, 0), cpu.spend());
 }
 
+test "planLayerSplit: a GPU range without a KV layer is refused, and auto keeps it on the host" {
+    // Layers 28 to 31 hold a recurrent slab of 1000 bytes and no KV, so every layer prices 2000
+    // bytes, and a suffix of four layers or fewer holds no KV.
+    var costs = KvCostVector.uniform(32, 10);
+    var layer: u32 = 28;
+    while (layer < 32) : (layer += 1) {
+        costs.set(layer, 0, 1_000);
+    }
+
+    const kv: KvStructure = .{ .n_slots = 1, .window = 100, .costs = costs };
+    const roomy = anchorCaps(1 << 20);
+    try std.testing.expectError(
+        error.NoKvLayerInRange,
+        planLayerSplit(roomy, &anchor_weights, 0, kv, unchecked_serve, 4),
+    );
+    const five = try planLayerSplit(roomy, &anchor_weights, 0, kv, unchecked_serve, 5);
+    try std.testing.expectEqual(@as(u32, 27), five.host_layers);
+
+    // 9600 bytes fund 8400 usable: four GPU layers (8000) and not five (10000). Those four hold no
+    // KV, so the auto rule keeps every layer on the host. 12000 bytes fund five layers.
+    const tail = try planLayerSplit(
+        anchorCaps(9_600),
+        &anchor_weights,
+        0,
+        kv,
+        unchecked_serve,
+        null,
+    );
+    try std.testing.expectEqual(@as(u32, 32), tail.host_layers);
+    const wider = try planLayerSplit(
+        anchorCaps(12_000),
+        &anchor_weights,
+        0,
+        kv,
+        unchecked_serve,
+        null,
+    );
+    try std.testing.expectEqual(@as(u32, 27), wider.host_layers);
+}
+
 test "planLayerSplit: the head anchors, with the head bytes on the device" {
     // The same fixture under a 1500-byte head. The spend at split `k` is
     // `2000 * (32 - k) + 1500`, so 49000 usable funds `k = 9` (47500) and
@@ -4057,8 +4119,8 @@ test "planLayerSplit: a prefix with no attention layer still charges its recurre
         try std.testing.expectEqual(2 * plan.kv_vram, plan.ram.swap_stages * kv.n_slots);
     }
 
-    // The mirror: an all-recurrent SUFFIX stages fixed bytes and no window
-    // price at all.
+    // The mirror: an all-recurrent GPU suffix holds no KV layer, which the fused runner needs,
+    // so the planner refuses it.
     var tail = KvCostVector.uniform(4, 0);
     tail.set(0, 4_096, 0);
     for ([_]u32{ 1, 2, 3 }) |i| {
@@ -4067,21 +4129,14 @@ test "planLayerSplit: a prefix with no attention layer still charges its recurre
 
     const tail_kv: KvStructure = .{ .n_slots = 2, .window = 512, .costs = tail };
     const tail_weights = [_]u64{1_000} ** 4;
-    const tail_plan = try planLayerSplit(
+    try std.testing.expectError(error.NoKvLayerInRange, planLayerSplit(
         anchorCaps(1 << 30),
         &tail_weights,
         0,
         tail_kv,
         unchecked_serve,
         3,
-    );
-    try std.testing.expectEqual(@as(u32, 1), tail_plan.host_layers);
-    try std.testing.expectEqual(@as(u64, tail_kv.n_slots) * 3 * 1_122_304, tail_plan.kv_vram);
-    try std.testing.expectEqual(@as(u64, 2) * 3 * 1_122_304, tail_plan.ram.swap_stages);
-    try std.testing.expectEqual(
-        @as(u64, tail_kv.n_slots) * tail_kv.window * 4_096,
-        tail_plan.kv_host,
-    );
+    ));
 }
 
 test "planLayerSplit: the window never multiplies the fixed state" {
@@ -4227,7 +4282,7 @@ test "formatVramRefusal: the three families" {
         formatVramRefusal(&buf, none),
     );
 
-    // The llama hybrid runner, which holds the suffix of a split model.
+    // The hybrid runner of any family, which holds the suffix of a split model.
     var suffix = whole;
     suffix.suffix = true;
     try std.testing.expectEqualStrings(
@@ -4367,9 +4422,14 @@ fn checkRamSweep(sweep: *RamSweep, seed: u64) anyerror!void {
         stack.kv,
         open,
         gpu_layers,
-    ) catch |err| {
-        try std.testing.expectEqual(error.WeightsVramBudgetTooSmall, err);
-        return;
+    ) catch |err| switch (err) {
+        error.WeightsVramBudgetTooSmall => return,
+        // Only a pinned GPU range without a KV layer meets this refusal.
+        error.NoKvLayerInRange => {
+            try std.testing.expect(gpu_layers != null);
+            try std.testing.expect(!suffixHoldsKv(stack.kv.costs, n - gpu_layers.?));
+            return;
+        },
     };
     // No residency gives zero stages, and residency prices two stages of
     // one chunk or one device suffix of one slot, whichever is smaller.
@@ -4407,12 +4467,13 @@ fn checkRamSweep(sweep: *RamSweep, seed: u64) anyerror!void {
         try std.testing.expectEqual(ram_usable, refusal.usable);
         try std.testing.expectEqual(n - vram_plan.host_layers, refusal.gpu_layers);
 
-        // Without residency, an auto refusal is final: every split the
-        // VRAM funds spends at least as much RAM.
+        // Without residency an auto refusal is final: every split that the VRAM funds spends at
+        // least as much RAM. The planner never picks a GPU range without a KV layer.
         if (gpu_layers == null and !residency) {
             var k: u32 = 0;
             while (k <= n) : (k += 1) {
                 if (!layerSplitFits(caps, weights, stack.head, stack.kv, k)) continue;
+                if (k < n and !suffixHoldsKv(stack.kv.costs, k)) continue;
                 try std.testing.expectError(
                     error.HostRamBudgetTooSmall,
                     quoteRam(stack.kv, k, host, n_logical, true, ram_free),

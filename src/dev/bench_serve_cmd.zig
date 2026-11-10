@@ -383,15 +383,13 @@ fn cpuCurve(comptime Family: type, c: *const Curve) !void {
 
         const arena = round_arena_state.allocator();
 
-        var runner = try Runner.init(
-            arena,
-            c.loaded,
-            kv_budget.pinned(b, c.max_seq),
-            prefill_chunk.stepRows(prefill_chunk.cpu_rule, b, b),
-            c.pool,
-            c.policy,
-            c.kv_dtype,
-        );
+        var runner = try Runner.init(arena, c.loaded, .{
+            .plan = kv_budget.pinned(b, c.max_seq),
+            .max_rows = prefill_chunk.stepRows(prefill_chunk.cpu_rule, b, b),
+            .pool = c.pool,
+            .policy = c.policy,
+            .kv_dtype = c.kv_dtype,
+        });
         const EngineT = Sessions(Runner);
         var engine = try EngineT.init(arena, &runner);
         const rule = prefill_chunk.cpu_rule;
@@ -443,7 +441,7 @@ fn fusedCurve(comptime Family: type, c: *const Curve) !void {
     try common.requireSequenceFits(ctx.io, c.prompt_tokens, c.max_tokens, plan.window);
     try printDevicePlan(c, ctxp, placed, vram, live, most);
 
-    const fused = try Family.initFused(ctx.gpa, ctxp, c.loaded, plan, c.kv_dtype);
+    const fused = try Family.Fused.init(ctx.gpa, ctxp, c.loaded, plan, c.kv_dtype);
     defer fused.deinit();
 
     const EngineT = Sessions(Family.Fused);

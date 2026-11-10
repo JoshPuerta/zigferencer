@@ -63,6 +63,7 @@ const limits = @import("../core/limits.zig");
 const op_requires = @import("../core/op_requires.zig");
 const core_log = @import("../core/log.zig");
 const span = @import("../core/span.zig");
+const layer_op = @import("../core/layer_op.zig");
 const gpu_profile = @import("../runtime/gpu_profile.zig");
 const vulkan_ctx = @import("../runtime/vulkan_ctx.zig");
 const RopeStyle = @import("../ops/naive.zig").RopeStyle;
@@ -273,7 +274,46 @@ const qwen_qk_norm_spv: [
     ).len
 ]u8 align(@alignOf(u32)) = @embedFile("qwen_qk_norm.spv").*;
 
+/// The name of each SPIR-V blob, keyed by its address. A trace build reads it to name the shader
+/// of a recorded dispatch, and a build without trace holds an empty table.
+pub const spv_names: []const SpvName = if (core_log.hot) &.{
+    .{ .code = &vec_add_spv, .name = "vec_add" },
+    .{ .code = &residual_add_spv, .name = "residual_add" },
+    .{ .code = &sigmoid_gate_spv, .name = "sigmoid_gate" },
+    .{ .code = &attention_spv, .name = "attention" },
+    .{ .code = &attention_f16_spv, .name = "attention_f16" },
+    .{ .code = &attention_split_spv, .name = "attention_split" },
+    .{ .code = &attention_split_f16_spv, .name = "attention_split_f16" },
+    .{ .code = &attention_merge_spv, .name = "attention_merge" },
+    .{ .code = &rope_spv, .name = "rope" },
+    .{ .code = &rope_multi_spv, .name = "rope_multi" },
+    .{ .code = &rmsnorm_spv, .name = "rmsnorm" },
+    .{ .code = &swiglu_spv, .name = "swiglu" },
+    .{ .code = &linear_q8_0_spv, .name = "linear_q8_0" },
+    .{ .code = &linear_q8_0_reduce_spv, .name = "linear_q8_0_reduce" },
+    .{ .code = &linear_q4_0_reduce_spv, .name = "linear_q4_0_reduce" },
+    .{ .code = &linear_q8_0_subgroup_spv, .name = "linear_q8_0_subgroup" },
+    .{ .code = &linear_q8_0_batch_spv, .name = "linear_q8_0_batch" },
+    .{ .code = &linear_q8_0_gemm_spv, .name = "linear_q8_0_gemm" },
+    .{ .code = &linear_q4_0_batch_spv, .name = "linear_q4_0_batch" },
+    .{ .code = &rmsnorm_batch_spv, .name = "rmsnorm_batch" },
+    .{ .code = &rope_multi_batch_spv, .name = "rope_multi_batch" },
+    .{ .code = &attention_batch_spv, .name = "attention_batch" },
+    .{ .code = &attention_batch_f16_spv, .name = "attention_batch_f16" },
+    .{ .code = &attention_multi_stream_spv, .name = "attention_multi_stream" },
+    .{ .code = &attention_multi_stream_f16_spv, .name = "attention_multi_stream_f16" },
+    .{ .code = &kv_commit_f16_spv, .name = "kv_commit_f16" },
+    .{ .code = &gdn_decode_spv, .name = "gdn_decode" },
+    .{ .code = &gdn_chunk_conv_spv, .name = "gdn_chunk_conv" },
+    .{ .code = &gdn_chunk_scan_spv, .name = "gdn_chunk_scan" },
+    .{ .code = &gdn_chunk_norm_spv, .name = "gdn_chunk_norm" },
+    .{ .code = &qwen_qk_norm_spv, .name = "qwen_qk_norm" },
+} else &.{};
+
 // -- types ------------------------------------------------------------------
+
+/// One row of `spv_names`.
+pub const SpvName = struct { code: *const anyopaque, name: []const u8 };
 
 /// The four objects of one compute-pipeline chain, created and destroyed as a unit. Every kernel
 /// wrapper embeds one. Only the SPIR-V blob, the binding count, and the push size vary.
@@ -1483,6 +1523,8 @@ pub const SplitAttnKernels = struct {
     /// The resident kernel of a prefill chunk. A kernel set that records no prefill,
     /// as in the bench grid, leaves it null.
     batch: ?*AttentionBatch = null,
+    /// The profile of the command buffer, which takes the pass marks. Null: no marks.
+    prof: ?*gpu_profile.GpuProfile = null,
 
     pub const order: AttnOrderClass = .split_ascending;
     pub const tolerance: op_requires.Tolerance = AttentionSplit.requires.tolerance;
@@ -1630,6 +1672,13 @@ pub const SplitAttnKernels = struct {
             null,
             null,
         );
+    }
+
+    /// Close the interval of the resident rows, or of the pass `part`, on the attention op.
+    pub fn recordMark(self: SplitAttnKernels, cb: Cmd, part: ?layer_op.OpPart) void {
+        if (self.prof) |prof| {
+            prof.mark(cb, .initOne(.attention), part);
+        }
     }
 
     /// Group row `scratch_row` at `stride` splits per head ends inside the
@@ -2360,7 +2409,7 @@ pub const Q80Weight = struct {
         };
     }
 
-    /// The Q4_0 form of `initInArenas`, the upload path of `LlamaFusedRunner`. The quants buffer
+    /// The Q4_0 form of `initInArenas`, the arena upload of a fused runner. The quants buffer
     /// holds 16 bytes of 4-bit nibbles per block. `weight_bytes` is a Q4_0 tensor.
     pub fn initInArenasQ40(
         ctx: *const vulkan_ctx.Context,
@@ -4052,19 +4101,6 @@ pub const GdnChunkParallel = struct {
 
     pub const InitError = GdnDecode.InitError;
 
-    /// Refuse a model whose GDN state size the scan cannot take, before the
-    /// first allocation. A ReleaseFast build compiles the asserts of
-    /// `recordScan` out.
-    pub fn guardHeadDim(head_dim: u32) error{GdnHeadDimUnsupported}!void {
-        if (head_dim == limits.gdn_head_dim) return;
-        log.err(
-            "The model GDN state size is {d}. GPU prefill takes a state size of {d} only. " ++
-                "Run this model on a CPU build",
-            .{ head_dim, limits.gdn_head_dim },
-        );
-        return error.GdnHeadDimUnsupported;
-    }
-
     pub fn init(ctx: *const vulkan_ctx.Context) InitError!GdnChunkParallel {
         // Build the conv and scan pipelines.
         const pipeline_conv = try Pipeline.init(
@@ -4903,20 +4939,22 @@ pub const KvStore = struct {
 };
 
 /// Device-local VRAM arena. It sub-allocates from a small number of large buffer and memory
-/// segments, and it never frees one allocation.
+/// segments, and it never frees one allocation. A plan from a dry run of the same requests sizes
+/// each segment to the requests it holds, so no segment keeps an unused tail.
 pub const VramArena = struct {
     ctx: *const vulkan_ctx.Context,
     gpa: std.mem.Allocator,
-    segments: std.ArrayList(Segment),
-    seg_capacity: vk.DeviceSize,
     usage: vk.BufferUsageFlags,
-    align_bytes: vk.DeviceSize,
+    /// The segment and the offset of each request, and the capacity and the fill of each segment.
+    packing: Packing,
+    /// The buffer and the memory of each segment of `packing`, in the same order.
+    segments: std.ArrayList(Segment),
+    /// The device memory of every segment, which the driver can round up past its capacity.
+    memory_bytes: vk.DeviceSize,
 
     pub const Segment = struct {
         buffer: vk.Buffer,
         memory: vk.DeviceMemory,
-        capacity: vk.DeviceSize,
-        used: vk.DeviceSize,
     };
 
     /// A view of the arena, the shape that a descriptor update takes.
@@ -4937,6 +4975,175 @@ pub const VramArena = struct {
         vk.DeviceWrapper.AllocateMemoryError ||
         vk.DeviceWrapper.BindBufferMemoryError;
 
+    /// The placement rule of an arena without its device memory, so a dry run over the requests
+    /// of an upload finds the fill of each segment before the arena allocates one. A request lands
+    /// in the most recent segment, then in an older one, then in a new segment.
+    pub const Packing = struct {
+        /// The capacity of a new segment without a plan. A larger request takes its own size.
+        seg_capacity: vk.DeviceSize,
+        align_bytes: vk.DeviceSize,
+        /// The capacity and the fill of each segment, in the order they open.
+        fills: std.ArrayList(Fill),
+        /// The capacity of each segment in the order they open. Null: no plan.
+        plan: ?[]const vk.DeviceSize,
+        requests: u64,
+        request_bytes: u64,
+
+        pub const Fill = struct {
+            capacity: vk.DeviceSize,
+            used: vk.DeviceSize,
+        };
+
+        /// The segment and the offset of one request. `opens`: the request opens the segment.
+        pub const Place = struct {
+            segment: u32,
+            offset: vk.DeviceSize,
+            opens: bool,
+        };
+
+        pub fn init(seg_capacity: vk.DeviceSize, align_bytes: vk.DeviceSize) Packing {
+            std.debug.assert(seg_capacity >= 1);
+            std.debug.assert(std.math.isPowerOfTwo(align_bytes));
+
+            return .{
+                .seg_capacity = seg_capacity,
+                .align_bytes = align_bytes,
+                .fills = .empty,
+                .plan = null,
+                .requests = 0,
+                .request_bytes = 0,
+            };
+        }
+
+        /// Free the fills and the plan, which `gpa` holds too.
+        pub fn deinit(self: *Packing, gpa: std.mem.Allocator) void {
+            if (self.plan) |plan| {
+                gpa.free(plan);
+            }
+
+            self.fills.deinit(gpa);
+        }
+
+        /// Take the fill of each segment of `dry`, a dry run of the next requests in their order,
+        /// as its capacity. A planned segment is no larger than in the dry run and holds what the
+        /// dry run put in it, so each request lands where the dry run put it.
+        pub fn setPlan(
+            self: *Packing,
+            gpa: std.mem.Allocator,
+            dry: *const Packing,
+        ) std.mem.Allocator.Error!void {
+            std.debug.assert(self.fills.items.len == 0);
+            std.debug.assert(self.plan == null);
+            std.debug.assert(dry.plan == null);
+            std.debug.assert(dry.seg_capacity == self.seg_capacity);
+            std.debug.assert(dry.align_bytes == self.align_bytes);
+
+            const plan = try gpa.alloc(vk.DeviceSize, dry.fills.items.len);
+            for (plan, dry.fills.items) |*capacity, fill| {
+                capacity.* = fill.used;
+            }
+
+            self.plan = plan;
+        }
+
+        /// Place a request of `size` bytes in the first segment with room, or in a new segment.
+        pub fn place(
+            self: *Packing,
+            gpa: std.mem.Allocator,
+            size: vk.DeviceSize,
+        ) std.mem.Allocator.Error!Place {
+            std.debug.assert(size >= 1);
+
+            const at = self.fit(size) orelse try self.open(gpa, size);
+            self.requests += 1;
+            self.request_bytes += size;
+            std.debug.assert(at.offset % self.align_bytes == 0);
+            std.debug.assert(at.offset + size <= self.fills.items[at.segment].capacity);
+            return at;
+        }
+
+        /// The bytes of every segment.
+        pub fn capacityBytes(self: *const Packing) u64 {
+            var sum: u64 = 0;
+            for (self.fills.items) |fill| {
+                sum += fill.capacity;
+            }
+
+            return sum;
+        }
+
+        /// The bytes of every segment up to the end of its last request.
+        pub fn usedBytes(self: *const Packing) u64 {
+            var sum: u64 = 0;
+            for (self.fills.items) |fill| {
+                sum += fill.used;
+            }
+
+            std.debug.assert(sum >= self.request_bytes);
+            return sum;
+        }
+
+        /// The most padding that the requests so far can leave: one alignment for each, because
+        /// a request starts less than one alignment past the fill before it.
+        pub fn paddingBound(self: *const Packing) u64 {
+            return self.requests * self.align_bytes;
+        }
+
+        /// Every segment of the plan is open and full, so the segments hold the requests plus
+        /// their padding and nothing more.
+        pub fn assertFull(self: *const Packing) void {
+            std.debug.assert(self.plan != null);
+            const plan = self.plan.?;
+            std.debug.assert(self.fills.items.len == plan.len);
+            for (self.fills.items, plan) |fill, capacity| {
+                std.debug.assert(fill.capacity == capacity);
+                std.debug.assert(fill.used == fill.capacity);
+            }
+
+            std.debug.assert(self.usedBytes() - self.request_bytes <= self.paddingBound());
+        }
+
+        /// Fit `size` in the most recent segment, which is likeliest to have room, then in an
+        /// older one.
+        fn fit(self: *Packing, size: vk.DeviceSize) ?Place {
+            const n = self.fills.items.len;
+            if (n == 0) return null;
+            if (self.fitIn(n - 1, size)) |at| return at;
+
+            for (0..n - 1) |i| {
+                if (self.fitIn(i, size)) |at| return at;
+            }
+
+            return null;
+        }
+
+        fn fitIn(self: *Packing, index: usize, size: vk.DeviceSize) ?Place {
+            const fill = &self.fills.items[index];
+            const offset = alignUp(fill.used, self.align_bytes);
+            if (offset + size > fill.capacity) return null;
+
+            fill.used = offset + size;
+            return .{ .segment = @intCast(index), .offset = offset, .opens = false };
+        }
+
+        /// Open a segment for `size`. A plan holds one capacity for each segment of its dry run.
+        fn open(
+            self: *Packing,
+            gpa: std.mem.Allocator,
+            size: vk.DeviceSize,
+        ) std.mem.Allocator.Error!Place {
+            const n = self.fills.items.len;
+            const capacity = if (self.plan) |plan| blk: {
+                std.debug.assert(n < plan.len);
+                break :blk plan[n];
+            } else @max(self.seg_capacity, size);
+            std.debug.assert(size <= capacity);
+
+            try self.fills.append(gpa, .{ .capacity = capacity, .used = size });
+            return .{ .segment = @intCast(n), .offset = 0, .opens = true };
+        }
+    };
+
     /// `seg_capacity` is the default size of a new segment. Pick at least the largest single
     /// allocation, or `alloc` grows a segment to fit, which fragments the arena.
     pub fn init(
@@ -4948,25 +5155,33 @@ pub const VramArena = struct {
         return .{
             .ctx = ctx,
             .gpa = gpa,
-            .segments = .empty,
-            .seg_capacity = seg_capacity,
             .usage = usage,
-            .align_bytes = ctx.buffer_limits.offset_alignment,
+            .packing = .init(seg_capacity, ctx.buffer_limits.offset_alignment),
+            .segments = .empty,
+            .memory_bytes = 0,
         };
     }
 
     pub fn deinit(self: *VramArena) void {
-        for (self.segments.items) |*s| {
+        for (self.segments.items) |s| {
             self.ctx.vkd.destroyBuffer(self.ctx.device, s.buffer, null);
             self.ctx.vkd.freeMemory(self.ctx.device, s.memory, null);
         }
 
         self.segments.deinit(self.gpa);
+        self.packing.deinit(self.gpa);
     }
 
-    /// Allocate `size` bytes. Try the most recent segment first (typical for sequential weight
-    /// uploads), then any other segment, then a new one. A new segment holds at least
-    /// `seg_capacity` bytes, and more only when the request is larger.
+    /// Size each segment from `dry`, a dry run of the requests that `alloc` takes next, in the
+    /// same order. Call it before the first `alloc`.
+    pub fn setPlan(self: *VramArena, dry: *const Packing) std.mem.Allocator.Error!void {
+        std.debug.assert(self.segments.items.len == 0);
+
+        try self.packing.setPlan(self.gpa, dry);
+    }
+
+    /// Allocate `size` bytes where `Packing.place` puts them. A request that opens a segment
+    /// allocates the segment at its capacity. After an error, the caller must free the arena.
     pub fn alloc(self: *VramArena, size: vk.DeviceSize) AllocError!View {
         // The alloc sequence at debug scope is the VRAM map. Allocations follow the deterministic
         // weight-upload order, so a reader pairs each line with the load sequence.
@@ -4974,56 +5189,34 @@ pub const VramArena = struct {
             "arena alloc: {d} KiB ({d} MiB held before)",
             .{ size / 1024, self.totalUsed() / (1024 * 1024) },
         );
-        // Try the most-recent segment first. It is likeliest to have room.
-        if (self.segments.items.len > 0) {
-            const last = &self.segments.items[self.segments.items.len - 1];
-            if (tryFit(last, size, self.align_bytes)) |view| return view;
+        try self.segments.ensureUnusedCapacity(self.gpa, 1);
+        const at = try self.packing.place(self.gpa, size);
+        if (at.opens) {
+            const capacity = self.packing.fills.items[at.segment].capacity;
+            self.segments.appendAssumeCapacity(try self.createSegment(capacity));
         }
 
-        // Try older segments in case the latest was just exhausted.
-        for (self.segments.items[0..if (self.segments.items.len ==
-            0) 0 else self.segments.items.len - 1]) |*s|
-        {
-            if (tryFit(s, size, self.align_bytes)) |view| return view;
-        }
-
-        // Need a new segment. Size it for at least this request.
-        const new_cap = @max(self.seg_capacity, size);
-        try self.segments.append(self.gpa, try self.createSegment(new_cap));
-        const seg = &self.segments.items[self.segments.items.len - 1];
-        seg.used = size;
-        return .{ .buffer = seg.buffer, .offset = 0, .range = size };
+        std.debug.assert(self.segments.items.len == self.packing.fills.items.len);
+        const segment = self.segments.items[at.segment];
+        return .{ .buffer = segment.buffer, .offset = at.offset, .range = size };
     }
 
     /// One debug line per segment: the coarse VRAM map. Call after init,
     /// when the arena holds its final layout.
     pub fn logSegments(self: *const VramArena, name: []const u8) void {
         const mib = 1024 * 1024;
-        for (self.segments.items, 0..) |s, i| {
+        for (self.packing.fills.items, 0..) |fill, i| {
             log.debug(
                 "arena {s} seg {d}: {d} of {d} MiB used",
-                .{ name, i, s.used / mib, s.capacity / mib },
+                .{ name, i, fill.used / mib, fill.capacity / mib },
             );
         }
     }
 
     /// Total bytes claimed by allocations so far, the sum of `used` across the
-    /// segments. The traces and the VRAM budget of the tiered KV cache read it.
+    /// segments. The traces read it.
     pub fn totalUsed(self: *const VramArena) vk.DeviceSize {
-        var sum: vk.DeviceSize = 0;
-        for (self.segments.items) |s| {
-            sum += s.used;
-        }
-
-        return sum;
-    }
-
-    fn tryFit(seg: *Segment, size: vk.DeviceSize, align_bytes: vk.DeviceSize) ?View {
-        const aligned = alignUp(seg.used, align_bytes);
-        if (aligned + size > seg.capacity) return null;
-
-        seg.used = aligned + size;
-        return .{ .buffer = seg.buffer, .offset = aligned, .range = size };
+        return self.packing.usedBytes();
     }
 
     fn createSegment(self: *VramArena, capacity: vk.DeviceSize) AllocError!Segment {
@@ -5053,12 +5246,8 @@ pub const VramArena = struct {
 
         try self.ctx.vkd.bindBufferMemory(self.ctx.device, buffer, memory, 0);
         log.debug("vram segment {d}: {d} MiB", .{ self.segments.items.len, capacity >> 20 });
-        return .{
-            .buffer = buffer,
-            .memory = memory,
-            .capacity = capacity,
-            .used = 0,
-        };
+        self.memory_bytes += reqs.size;
+        return .{ .buffer = buffer, .memory = memory };
     }
 };
 
@@ -5883,5 +6072,74 @@ test "KvStore: two 2B sessions under the raised range start slot 1 at 128 MiB in
         try std.testing.expectEqual(128 * mib, second.range);
         const last = store.rowAt(c.layer, c.t, 1, 131_071);
         try std.testing.expectEqual(c.offset + 256 * mib - 1024, last.offset);
+    }
+}
+
+test "VramArena: a plan sizes each segment to its fill and keeps every offset" {
+    // A synthetic upload order into segments of 100 bytes at a 16-byte alignment. The 150-byte
+    // request opens a segment of its own, and three requests fill the tail of an older segment.
+    const gpa = std.testing.allocator;
+    const sizes = [_]vk.DeviceSize{ 40, 30, 50, 150, 20, 70, 10, 33, 64, 8, 5 };
+    const segments = [_]u32{ 0, 0, 1, 2, 0, 3, 3, 1, 4, 4, 4 };
+    const offsets = [_]vk.DeviceSize{ 0, 48, 0, 0, 80, 0, 80, 64, 0, 64, 80 };
+    const request_bytes: u64 = 480;
+
+    // The dry run takes the default capacity, so segments 1, 3, and 4 keep a tail.
+    var dry: VramArena.Packing = .init(100, 16);
+    defer dry.deinit(gpa);
+    for (sizes, segments, offsets) |size, segment, offset| {
+        const at = try dry.place(gpa, size);
+        try std.testing.expectEqual(segment, at.segment);
+        try std.testing.expectEqual(offset, at.offset);
+    }
+    try std.testing.expectEqual(@as(u64, 550), dry.capacityBytes());
+    try std.testing.expectEqual(@as(u64, 522), dry.usedBytes());
+    try std.testing.expectEqual(request_bytes, dry.request_bytes);
+
+    // The plan opens each segment at its fill, and every request lands where the dry run put it.
+    var planned: VramArena.Packing = .init(100, 16);
+    defer planned.deinit(gpa);
+    try planned.setPlan(gpa, &dry);
+    for (sizes, segments, offsets) |size, segment, offset| {
+        const at = try planned.place(gpa, size);
+        try std.testing.expectEqual(segment, at.segment);
+        try std.testing.expectEqual(offset, at.offset);
+    }
+    planned.assertFull();
+
+    // Five segments hold the requests plus 42 bytes of padding, under one alignment per request.
+    const capacities = [_]vk.DeviceSize{ 100, 97, 150, 90, 85 };
+    try std.testing.expectEqual(capacities.len, planned.fills.items.len);
+    for (capacities, planned.fills.items) |capacity, fill| {
+        try std.testing.expectEqual(capacity, fill.capacity);
+    }
+    try std.testing.expectEqual(request_bytes + 42, planned.capacityBytes());
+    try std.testing.expectEqual(@as(u64, 11 * 16), planned.paddingBound());
+    try std.testing.expect(planned.capacityBytes() <= request_bytes + planned.paddingBound());
+}
+
+test "spv_names holds a row for every SPIR-V blob of this file" {
+    const source = @embedFile("kernels.zig");
+    var declared: usize = 0;
+    var lines = std.mem.splitScalar(u8, source, '\n');
+    while (lines.next()) |line| {
+        if (!std.mem.startsWith(u8, line, "const ")) continue;
+
+        const colon = std.mem.indexOfScalar(u8, line, ':') orelse continue;
+        const name = line["const ".len..colon];
+        if (!std.mem.endsWith(u8, name, "_spv")) continue;
+
+        var needle_buffer: [96]u8 = undefined;
+        const needle = try std.fmt.bufPrint(&needle_buffer, ".code = &{s},", .{name});
+        std.testing.expect(std.mem.indexOf(u8, source, needle) != null) catch |err| {
+            std.debug.print("spv_names lacks a row for {s}\n", .{name});
+            return err;
+        };
+        declared += 1;
+    }
+
+    try std.testing.expect(declared > 0);
+    if (core_log.hot) {
+        try std.testing.expectEqual(declared, spv_names.len);
     }
 }

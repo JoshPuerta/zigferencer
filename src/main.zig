@@ -7,7 +7,7 @@
 //! `tests/` then imports `zigferencer` and needs no relative path across a module root, which Zig
 //! forbids.
 //!
-//! A CPU build compiles no Vulkan module, so each alias is an empty namespace.
+//! Aliases. A CPU build compiles no Vulkan module, so each alias is an empty namespace.
 //! The context, the kernels, and the per-op runner follow `use_vulkan`. The fused and the hybrid
 //! runners follow `use_vulkan_fused_ops`, the flag every construction site gates on. The
 //! `test {}` block and the integration-test lists of `build.zig` hold the same two levels.
@@ -42,6 +42,7 @@ pub const kv_cost = @import("runtime/kv_cost.zig");
 pub const kv_index = @import("core/kv_index.zig");
 pub const attn_split = @import("core/attn_split.zig");
 pub const attn_cpu = @import("core/attn_cpu.zig");
+pub const layer_op = @import("core/layer_op.zig");
 pub const attn_record = @import("runtime/attn_record.zig");
 pub const ring_fsm = @import("core/ring_fsm.zig");
 pub const tensor = @import("core/tensor.zig");
@@ -58,8 +59,7 @@ pub const resolve = @import("engine/resolve.zig");
 pub const generate = @import("runtime/generate.zig");
 pub const cpu_profile = @import("runtime/cpu_profile.zig");
 pub const step_row = @import("runtime/step_row.zig");
-pub const llama_runner = @import("runtime/llama_runner.zig");
-pub const qwen_runner = @import("runtime/qwen_runner.zig");
+pub const cpu_runner = @import("runtime/cpu_runner.zig");
 const kv_cache = @import("runtime/kv_cache.zig");
 pub const session = @import("runtime/session.zig");
 pub const sampler = @import("runtime/sampler.zig");
@@ -96,6 +96,11 @@ pub const ops_vulkan = if (build_options.use_vulkan)
 else
     struct {};
 
+pub const dispatch_list = if (build_options.use_vulkan and log.hot)
+    @import("ops_vulkan/dispatch_list.zig")
+else
+    struct {};
+
 pub const ops_vulkan_wrap = if (build_options.use_vulkan)
     @import("ops_vulkan/wrap.zig")
 else
@@ -106,23 +111,13 @@ pub const vulkan_runner = if (build_options.use_vulkan)
 else
     struct {};
 
-pub const llama_fused = if (build_options.use_vulkan_fused_ops)
-    @import("runtime/llama_fused.zig")
+pub const fused_runner = if (build_options.use_vulkan_fused_ops)
+    @import("runtime/fused_runner.zig")
 else
     struct {};
 
-pub const qwen_fused = if (build_options.use_vulkan_fused_ops)
-    @import("runtime/qwen_fused.zig")
-else
-    struct {};
-
-pub const llama_hybrid = if (build_options.use_vulkan_fused_ops)
-    @import("runtime/llama_hybrid.zig")
-else
-    struct {};
-
-const qwen_hybrid = if (build_options.use_vulkan_fused_ops)
-    @import("runtime/qwen_hybrid.zig")
+pub const hybrid_runner = if (build_options.use_vulkan_fused_ops)
+    @import("runtime/hybrid_runner.zig")
 else
     struct {};
 
@@ -249,6 +244,7 @@ fn isUserError(err: anyerror) bool {
         error.GdnHeadDimUnsupported,
         error.GdnHeadsUnsupported,
         error.QwenHeadDimUnsupported,
+        error.NoKvLayerInRange,
         // Configuration refusals.
         error.InvalidStorageRange,
         error.InvalidSoftwareDevice,
@@ -286,7 +282,11 @@ test {
     _ = kv_index;
     _ = attn_split;
     _ = attn_cpu;
+    _ = layer_op;
     _ = attn_record;
+    _ = @import("runtime/layer_kernels.zig");
+    _ = @import("runtime/qwen_layer.zig");
+    _ = @import("runtime/llama_layer.zig");
     _ = @import("core/ring_fsm.zig");
     _ = @import("core/time.zig");
     _ = @import("core/step_stats.zig");
@@ -356,14 +356,20 @@ test {
         _ = &ops_vulkan.StreamRing.deinit;
     }
 
+    if (build_options.use_vulkan and log.hot) {
+        _ = dispatch_list;
+    }
+
     if (build_options.use_vulkan_fused_ops) {
-        _ = llama_fused;
-        // The qwen fused tests are device-free and run only through this pull.
-        _ = qwen_fused;
-        _ = qwen_hybrid;
+        // The fused runner tests are device-free and run only through this pull.
+        _ = fused_runner;
+        // The hybrid tests are device-free and run only through this pull.
+        _ = hybrid_runner;
         // These methods reach production only through comptime branches, so take their addresses.
-        _ = &qwen_hybrid.QwenHybridRunner.logitRowsMax;
-        _ = &llama_fused.LlamaFusedRunner.initFromLoaded;
+        _ = &family.Of(.llama).Hybrid.logitRowsMax;
+        _ = &family.Of(.qwen35).Hybrid.logitRowsMax;
+        _ = &family.Of(.llama).Fused.init;
+        _ = &family.Of(.qwen35).Fused.init;
     }
 }
 

@@ -58,23 +58,24 @@ auto  t=8  same  $a --threads 8
 EOF
 }
 
-# The CPU runner, the fused runner, and the hybrid forced all-host (k=L), forced all-GPU (k=0), and
-# at a mid split. A split forward pass that disagrees with its parents is a correctness bug. @all
-# and @half take their values from the model file. Run a large model alone, with time between runs.
+# The CPU runner, the fused runner, and the hybrid at one host layer (k=1), at a mid split, and at
+# one GPU layer (k=L-1). A split forward pass that disagrees with its parents is a correctness bug.
+# @last and @half take their values from the model file. Run a large model alone, with time between
+# runs.
 rows_hybrid() {
     local a="$model --runs 1 --max-tokens 32 --ignore-eos"
     cat <<EOF
 auto          cpu    same  $a
 vulkan_fused  fused  same  $a
-vulkan_fused  k=L    same  $a --gpu-layers 0 --force-hybrid
-vulkan_fused  k=0    same  $a --gpu-layers @all --force-hybrid
+vulkan_fused  k=1    same  $a --gpu-layers @last
 vulkan_fused  mid    same  $a --gpu-layers @half
+vulkan_fused  k=L-1  same  $a --gpu-layers 1
 EOF
 }
 
 # The prompt passes `limits.attn_split_len`, so the prefill reaches the split passes of the GPU and
 # the tiles of the CPU attention. Short gates never run these paths. Each row must equal the record,
-# so a change that moves both executors the same way also fails. The 2B CPU row is the slowest.
+# so a change that moves both backends the same way also fails. The 2B CPU row is the slowest.
 rows_deep() {
     local a="--prompt-tokens 8064 --max-tokens 64 --ignore-eos --runs 1 --max-seq 8192"
     cat <<EOF
@@ -164,14 +165,14 @@ selected_rows() {
     done
 }
 
-# Replace @all and @half with the layer count of the model. The file is the one source of that
-# count, so a row cannot name a split that the model lacks.
+# Replace @last and @half with values of the layer count of the model. The file is the one
+# source of that count, so a row cannot name a split that the model lacks.
 resolve_layers() {
     local args="$1" layers
     if [[ "$args" == *@* ]]; then
         layers="$("$bin" inspect "$model" | awk '$1 == "layers:" { print $2 }')"
         [ -n "$layers" ] || die "inspect printed no layer count for $model"
-        args="${args//@all/$layers}"
+        args="${args//@last/$((layers - 1))}"
         args="${args//@half/$((layers / 2))}"
     fi
     printf '%s' "$args"

@@ -6,7 +6,7 @@
 //!
 //! Bits. The gate is bits, not values. The CPU commit narrows with F16C, which rounds to nearest
 //! even. The shader pins SPIR-V `RoundingModeRTE` at width 16 to ask the device for the same rule.
-//! Two executors that round the same way are the property under test. The bits are what the cache
+//! Two backends that round the same way are the property under test. The bits are what the cache
 //! stores, so comparing them states that property directly and keeps a second conversion out of the
 //! path under test.
 //!

@@ -69,7 +69,7 @@ Build the backend, then stop at the part that you want:
 
 | Backend | Stop at | Breakpoint |
 | --- | --- | --- |
-| `vulkan_fused` | One forward step | `--func-regex 'LlamaFusedRunner\.step$'` |
+| `vulkan_fused` | One forward step | `--func-regex 'FusedRunner\(.*llama_layer\)\.step$'` |
 | `vulkan_fused` | The record of one attention layer | `--func-regex 'attn_record\.record'` |
 | `vulkan` | One attention dispatch | `--func-regex 'Attention\.runTyped'` |
 
@@ -77,7 +77,7 @@ For example:
 
 ```
 make debug BACKEND=vulkan_fused
-lldb zig-out/bin/zigferencer -o "breakpoint set --func-regex 'LlamaFusedRunner\.step$'" \
+lldb zig-out/bin/zigferencer -o "breakpoint set --func-regex 'FusedRunner\(.*llama_layer\)\.step$'" \
   -o "run run SmolLM2-135M-Instruct-Q8_0 --prompt Hello --max-tokens 1"
 ```
 

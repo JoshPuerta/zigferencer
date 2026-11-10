@@ -102,6 +102,12 @@ pub fn refuse(io: Io, name: []const u8, r: resolve_mod.Refusal) anyerror {
             .{ limits.max_batch, n },
         ),
         .layer_split_vram => |p| return refuseLayerSplitVram(io, p),
+        .layer_split_no_kv => |n_gpu| return args.fail(
+            io,
+            "--gpu-layers {d} puts no attention layer on the GPU. The GPU layers must hold one. " ++
+                "Raise --gpu-layers",
+            .{n_gpu},
+        ),
         .whole_model_split => |pin| return refuseWholeModelSplit(io, pin),
         .kv_vram_ceiling => |k| {
             log.err("kv budget: --max-seq {d} is past the model ceiling of {d} positions", .{
@@ -330,24 +336,11 @@ fn refuseLayerSplitVram(io: Io, p: @FieldType(resolve_mod.Refusal, "layer_split_
 
 fn refuseWholeModelSplit(io: Io, pin: ?u32) anyerror {
     const served = " resolves to a whole-model placement, " ++
-        "which the fused (or CPU) runner already serves. Drop the flag, ";
-    if (pin) |n_gpu| {
-        return args.fail(
-            io,
-            "--gpu-layers {d}" ++ served ++
-                "or pass --force-hybrid to construct the hybrid at this split for the " ++
-                "cross-runner gate",
-            .{n_gpu},
-        );
-    }
+        "which the fused (or CPU) runner already serves. Drop the flag, " ++
+        "or pass a count above zero and below the layer count to run the hybrid";
+    if (pin) |n_gpu| return args.fail(io, "--gpu-layers {d}" ++ served, .{n_gpu});
 
-    return args.fail(
-        io,
-        "--gpu-layers auto" ++ served ++
-            "or pass a count with --force-hybrid to construct the hybrid at that " ++
-            "split for the cross-runner gate",
-        .{},
-    );
+    return args.fail(io, "--gpu-layers auto" ++ served, .{});
 }
 
 fn logKvVramSmall(k: @FieldType(resolve_mod.Refusal, "kv_vram_small")) void {

@@ -18,8 +18,8 @@ const test_policy = @import("test_policy.zig");
 const loader = zigferencer.loader;
 const vocab_mod = zigferencer.vocab;
 const bpe = zigferencer.bpe;
-const LlamaRunner = zigferencer.llama_runner.LlamaRunner;
-const QwenRunner = zigferencer.qwen_runner.QwenRunner;
+const LlamaCpu = zigferencer.family.Of(.llama).Cpu;
+const QwenCpu = zigferencer.family.Of(.qwen35).Cpu;
 
 // -- fixtures ---------------------------------------------------------------
 
@@ -85,15 +85,13 @@ fn referencePath(
     try test_policy.startPool(&cpu_pool, io, serial_policy);
     defer cpu_pool.deinit();
 
-    var runner = try Runner.init(
-        arena,
-        loaded,
-        zigferencer.kv_budget.pinned(1, max_seq),
-        0,
-        &cpu_pool,
-        serial_policy,
-        .f32,
-    );
+    var runner = try Runner.init(arena, loaded, .{
+        .plan = zigferencer.kv_budget.pinned(1, max_seq),
+        .max_rows = 0,
+        .pool = &cpu_pool,
+        .policy = serial_policy,
+        .kv_dtype = .f32,
+    });
     var last: []f32 = undefined;
     for (ids, 0..) |id, i| {
         last = try runner.step(id, @intCast(i));
@@ -119,15 +117,13 @@ fn chunkedPath(
     try test_policy.startPool(&cpu_pool, io, policy);
     defer cpu_pool.deinit();
 
-    var runner = try Runner.init(
-        arena,
-        loaded,
-        zigferencer.kv_budget.pinned(1, max_seq),
-        zigferencer.limits.cpu_prefill_chunk,
-        &cpu_pool,
-        policy,
-        .f32,
-    );
+    var runner = try Runner.init(arena, loaded, .{
+        .plan = zigferencer.kv_budget.pinned(1, max_seq),
+        .max_rows = zigferencer.limits.cpu_prefill_chunk,
+        .pool = &cpu_pool,
+        .policy = policy,
+        .kv_dtype = .f32,
+    });
     try std.testing.expectEqual(zigferencer.limits.cpu_prefill_chunk, runner.prefill_batch_max);
     var pos: u32 = 0;
     var last: []f32 = undefined;
@@ -178,7 +174,7 @@ test "llama chunked prefill is bit-identical to per-token step" {
     var loaded = try loader.load(std.testing.io, arena, fixture);
     defer loaded.close();
 
-    try expectChunksMatch(LlamaRunner, arena, &loaded);
+    try expectChunksMatch(LlamaCpu, arena, &loaded);
 }
 
 test "qwen chunked prefill is bit-identical to per-token step" {
@@ -190,7 +186,7 @@ test "qwen chunked prefill is bit-identical to per-token step" {
     var loaded = try loader.load(std.testing.io, arena, fixture);
     defer loaded.close();
 
-    try expectChunksMatch(QwenRunner, arena, &loaded);
+    try expectChunksMatch(QwenCpu, arena, &loaded);
 }
 
 test "llama stepBatch and prefillBatch refuse rows past the row scratch" {
@@ -208,15 +204,13 @@ test "llama stepBatch and prefillBatch refuse rows past the row scratch" {
     try test_policy.startPool(&cpu_pool, io, serial_policy);
     defer cpu_pool.deinit();
 
-    var runner = try LlamaRunner.init(
-        arena,
-        &loaded,
-        zigferencer.kv_budget.pinned(1, max_seq),
-        0,
-        &cpu_pool,
-        serial_policy,
-        .f32,
-    );
+    var runner = try LlamaCpu.init(arena, &loaded, .{
+        .plan = zigferencer.kv_budget.pinned(1, max_seq),
+        .max_rows = 0,
+        .pool = &cpu_pool,
+        .policy = serial_policy,
+        .kv_dtype = .f32,
+    });
     try std.testing.expectEqual(@as(u32, 1), runner.max_rows);
     try std.testing.expectEqual(@as(u32, 1), runner.prefill_batch_max);
     const two = [_]zigferencer.step_row.StepRow{
@@ -243,15 +237,13 @@ test "qwen stepBatch and prefillBatch refuse rows past the row scratch" {
     try test_policy.startPool(&cpu_pool, io, serial_policy);
     defer cpu_pool.deinit();
 
-    var runner = try QwenRunner.init(
-        arena,
-        &loaded,
-        zigferencer.kv_budget.pinned(1, max_seq),
-        0,
-        &cpu_pool,
-        serial_policy,
-        .f32,
-    );
+    var runner = try QwenCpu.init(arena, &loaded, .{
+        .plan = zigferencer.kv_budget.pinned(1, max_seq),
+        .max_rows = 0,
+        .pool = &cpu_pool,
+        .policy = serial_policy,
+        .kv_dtype = .f32,
+    });
     try std.testing.expectEqual(@as(u32, 1), runner.max_rows);
     const two = [_]zigferencer.step_row.StepRow{
         .{ .slot = 0, .token = 1, .pos = 0, .want_logits = false },

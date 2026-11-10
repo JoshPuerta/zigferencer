@@ -28,7 +28,7 @@ const test_policy = @import("test_policy.zig");
 const loader = zigferencer.loader;
 const vocab_mod = zigferencer.vocab;
 const bpe = zigferencer.bpe;
-const LlamaRunner = zigferencer.llama_runner.LlamaRunner;
+const LlamaCpu = zigferencer.family.Of(.llama).Cpu;
 const sampler = zigferencer.sampler;
 
 // -- fixtures ---------------------------------------------------------------
@@ -70,15 +70,14 @@ fn checkSnapshot(
     defer cpu_pool.deinit();
 
     const window = @min(loaded.card.context_length, zigferencer.test_fakes.test_window);
-    var runner = try LlamaRunner.init(
-        arena,
-        &loaded,
-        zigferencer.kv_budget.pinned(1, window),
-        0, // max_rows: single-sequence snapshot, no wide prefill chunk
-        &cpu_pool,
-        cfg,
-        .f32,
-    );
+    // A single-sequence snapshot takes no wide prefill chunk.
+    var runner = try LlamaCpu.init(arena, &loaded, .{
+        .plan = zigferencer.kv_budget.pinned(1, window),
+        .max_rows = 0,
+        .pool = &cpu_pool,
+        .policy = cfg,
+        .kv_dtype = .f32,
+    });
 
     const prompt_ids = try bpe.encodeAlloc(&v, arena, prompt, true);
 
@@ -153,9 +152,27 @@ test "SmolLM2-Q8_0 at kv f16: the slab halves and the blob round-trips" {
     defer cpu_pool.deinit();
 
     const plan = zigferencer.kv_budget.pinned(1, 64);
-    var wide = try LlamaRunner.init(arena, &loaded, plan, 0, &cpu_pool, cfg, .f32);
-    var narrow = try LlamaRunner.init(arena, &loaded, plan, 0, &cpu_pool, cfg, .f16);
-    var restored = try LlamaRunner.init(arena, &loaded, plan, 0, &cpu_pool, cfg, .f16);
+    var wide = try LlamaCpu.init(arena, &loaded, .{
+        .plan = plan,
+        .max_rows = 0,
+        .pool = &cpu_pool,
+        .policy = cfg,
+        .kv_dtype = .f32,
+    });
+    var narrow = try LlamaCpu.init(arena, &loaded, .{
+        .plan = plan,
+        .max_rows = 0,
+        .pool = &cpu_pool,
+        .policy = cfg,
+        .kv_dtype = .f16,
+    });
+    var restored = try LlamaCpu.init(arena, &loaded, .{
+        .plan = plan,
+        .max_rows = 0,
+        .pool = &cpu_pool,
+        .policy = cfg,
+        .kv_dtype = .f16,
+    });
 
     const rows: u32 = 8;
     try std.testing.expectEqual(wide.kv_slots[0].sizeBytes() / 2, narrow.kv_slots[0].sizeBytes());

@@ -214,7 +214,7 @@ fn planFor(comptime Family: type, b: *const Bench) !kv_budget.KvPlan {
         break :blk budget.budget -| budget.usage;
     } else 0;
 
-    const caps = try Family.kvCaps(b.ctx.gpa, b.loaded, b.ceiling, free, opt.streams, kv_dtype);
+    const caps = Family.Fused.kvCaps(b.loaded, b.ceiling, free, opt.streams, kv_dtype);
     const plan = try kv_budget.kvPlan(caps, Family.Fused.kvCostModel(b.loaded.card, kv_dtype), .{
         .x_bytes = if (opt.budget) kv_budget.derivedX(caps) else null,
         .slots = opt.streams,
@@ -257,11 +257,11 @@ fn benchOne(comptime Family: type, b: *const Bench) !void {
         b.model_name, opt.streams, pos, opt.reps, window, if (opt.budget) "budget" else "default",
     });
 
-    const runner = try Family.initFused(ctx.gpa, b.ctxp, b.loaded, plan, opt.resolved_kv_dtype);
+    const runner = try Family.Fused.init(ctx.gpa, b.ctxp, b.loaded, plan, opt.resolved_kv_dtype);
     defer runner.deinit();
 
     // Set the chunk before the first swap, because a stage only grows.
-    runner.swap_chunk_bytes = @as(u64, opt.chunk_mib) << 20;
+    runner.commands.swap_chunk_bytes = @as(u64, opt.chunk_mib) << 20;
     std.debug.assert(runner.max_seq == window);
     std.debug.assert(pos >= 1);
     std.debug.assert(pos + ticks <= window);
@@ -404,7 +404,7 @@ fn checkChunks(b: *const Bench, runner: anytype, blob: []u8, whole: []u8) !void 
     const round = try b.ctx.arena.alloc(u8, blob.len);
     try runner.evictSlot(0, pos, round);
 
-    runner.swap_chunk_bytes = std.math.maxInt(u64);
+    runner.commands.swap_chunk_bytes = std.math.maxInt(u64);
     try runner.evictSlot(0, pos, whole);
 
     if (!std.mem.eql(u8, blob, whole)) return error.BenchChunkMismatch;

@@ -38,7 +38,7 @@ around each op. Examples are the model load, a prefill chunk, a decode step, a G
 submit and its wait, a scheduler tick, and a socket read. The pool records the work
 of every worker too. The result is a timeline for each thread. On the GPU, the engine
 records a timestamp at the start and at the end of each command buffer. At the `phases`
-level it also records one at each phase. perf cannot see that time.
+level it also records one after each op. perf cannot see that time.
 
 The trace exists only in a build with `-Dtrace=true`. A build without it holds no span
 site and no clock read for the trace. If such a build sees a `ZIGFERENCER_TRACE_*`
@@ -49,7 +49,7 @@ variable, it warns once for each variable and records nothing.
 | Which host function takes the time? | `flame.svg`, `callees.txt`, `lines.txt` |
 | Which functions call this function? | `callers.txt` |
 | In what order do things happen on each thread? | `trace.pftrace` (spans) |
-| How long does the GPU take for each step and each phase? | the GPU tracks of `trace.pftrace`, `flame-gpu.svg` |
+| How long does the GPU take for each step and each op? | the GPU tracks of `trace.pftrace`, `flame-gpu.svg` |
 | What did each thread do while the samples fell? | `timeline.pftrace` |
 | Where do the threads wait, and for how long? | `flame-offcpu.svg`, `sched.txt` |
 
@@ -123,7 +123,7 @@ step.
 | --- | --- | --- |
 | `ZIGFERENCER_TRACE_OUT=PATH` | the engine | Turns the span recorder on and names the trace file. It needs `-Dtrace=true`. While it is unset, a span costs one atomic load and one branch. |
 | `ZIGFERENCER_TRACE_SECONDS=N` | the engine | Needs `-Dtrace=true`. Writes the trace N seconds after the start, or at exit if the exit comes first. |
-| `ZIGFERENCER_TRACE_GPU=off\|submit\|phases` | the engine | Needs `-Dtrace=true`. The GPU timestamp level. `submit` stamps the start and the end of each command buffer. `phases` also stamps each phase of a step. `off`, the default, records no timestamp, so the commands to the GPU do not change. |
+| `ZIGFERENCER_TRACE_GPU=off\|submit\|phases` | the engine | Needs `-Dtrace=true`. The GPU timestamp level. `submit` stamps the start and the end of each command buffer. `phases` also stamps each op of a step. `off`, the default, records no timestamp, so the commands to the GPU do not change. |
 | `ZIGFERENCER_TRACE_SPANS=N` | the engine | Needs `-Dtrace=true`. The capacity of each span log. `limits.spans_per_thread_max` is the largest value. The engine refuses a value out of range at the start. |
 | `TRACE` | `tools/profile.sh` | Any value sets `ZIGFERENCER_TRACE_OUT=DIR/trace.pftrace` for `record`, and copies the trace file for `attach`. |
 | `PERF`, `FLAMEGRAPH`, `FREQ`, `PYTHON` | `tools/profile.sh` | The perf binary, the FlameGraph directory, the sample rate, and the python3 of the converter. |
@@ -143,11 +143,11 @@ names in its `comm` column. The spans use `CLOCK_MONOTONIC`, the clock of
 
 **The pool work.** A worker shows `worker_spin` while it spins, which costs CPU, and
 `worker_sleep` while it waits on the futex. Between them it shows the share that it
-runs, named by the op of the dispatch, for example `op_gate_up_proj`. The dispatching
+runs, named by the op of the dispatch, for example `gate_up_proj`. The dispatching
 thread shows the op bracket, then `pool_run`, then its own `run_share`. Each `pool_run`
 has a flow arrow to each worker share of that dispatch. The slices carry these args:
 `layer`, `tokens`, `rows`, `epoch`, `parts`, and `worker`. A GPU slice adds `gpu_ns`,
-`host_submit_ns`, `host_wait_ns`, and one `<phase>_ns` for each phase at `phases`.
+`host_submit_ns`, `host_wait_ns`, and at `phases` one `<op>_ns` for each op with time.
 
 **The timeline.** `timeline.pftrace` holds the engine trace and the perf samples in one
 file, both on `CLOCK_MONOTONIC`. Each thread shows its slices and its CPU samples on one
@@ -188,7 +188,7 @@ one blocking call for each stamp. The engine now reads them without the flag, af
 wait that it already does. Take a Qwen3.5-2B decode on an RDNA2 card.
 One run each took 8.83 ms for each token at `off`, 8.96 ms at `submit`, and 9.05 ms
 at `phases`. Before the fix, `phases` took 29.41 ms. `phases` is
-now fit for the timeline and for the proportions between phases.
+now fit for the timeline and for the proportions between ops.
 
 **Counts.** The trace holds one instant, `trace_meta`, on the process track. It carries
 every count: `dropped`, `threads_dropped`, `orphan_spans`, `misnested`, `gpu_records`,
@@ -201,7 +201,7 @@ it. A thread past the thread table records nothing, and its spans count as
 holds 1,048,576 spans (`limits.spans_per_thread`) of 24 bytes each, so it reserves 24 MiB
 of address space. Memory pages fill only as spans arrive. A thread that records nothing
 costs nothing. `ZIGFERENCER_TRACE_SPANS` sets the capacity, up to 4,194,304. The GPU
-records have their own fixed capacity, 65,536 records of 169 bytes
+records have their own fixed capacity, 65,536 records of 281 bytes
 (`limits.trace_gpu_records`). A full log drops the new entry and counts it.
 
 `bench-decode-host --mode gap` reads the GPU idle time from the end stamp of one
@@ -232,9 +232,32 @@ Every span compiles only under `-Dtrace=true`.
 | `worker_sleep` | a pool worker that waits on the futex between two dispatches |
 | `layer_forward` | one layer of a CPU runner |
 | `host_prefix` | the CPU layers of a hybrid runner |
-| `op_*` | one CPU op group of a decode step, one name for each category of `--profile-cpu-decode` |
+| an op, such as `attn_proj` | one op of a CPU step, one row of `--profile-cpu-decode` |
 
 The GPU labels are `decode`, `decode_batch`, `prefill_chunk`, and the one-shot
-labels `copy`, `fill`, `clone`, and `dispatch`. The GPU phases are the rows of
-`--profile-decode`: the five matmul groups, `gdn_conv`, `gdn_scan`, `qknorm`,
-`rope`, `attn`, `elementwise`, `norm`, `lmhead`, and `copy`.
+labels `copy`, `fill`, `clone`, and `dispatch`.
+
+## Op names
+
+One list names the ops of the CPU spans and of the GPU marks: `LayerOp` in
+`src/core/layer_op.zig`. It holds the ops of a decoder layer, then the ops of the
+runner: `embed`, `final_norm`, `lm_head`, and the two transfers of a GPU step,
+`stage_in` (the input copy) and `readback` (the logits copy).
+
+Each op has a class: `matmul`, `attention`, `recurrent`, `elementwise`, `norm`, or
+`transfer`. The tables of `--profile-cpu-decode`, `--profile-decode`, and
+`--profile-prefill` show each class, then the ops of the class.
+
+A GPU op of two passes marks each pass. The GPU table shows the passes under their op,
+and the op row holds their sum:
+
+| Op | Passes |
+| --- | --- |
+| `kv_commit` | `narrow` and `copy`, at a narrow KV dtype |
+| `gdn` | `conv` and `scan`, in a prefill chunk |
+| `attention` | `split` and `merge`, for each row past one split |
+
+A trace arg names a pass as `op.part`, for example `attention.split_ns`. A folded stack
+of `flame-gpu.svg` reads the runner, the label, the class, the op, and the pass. A
+kernel that fuses two ops marks both, and its row reads `a+b`. Each such set must stand
+in `fused_sets` of `layer_op.zig`.

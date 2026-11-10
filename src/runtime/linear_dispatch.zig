@@ -194,6 +194,8 @@ fn isF32Weight(name: []const u8, n_layers: u32) bool {
 
 // -- tests ------------------------------------------------------------------
 
+const CpuRunner = @import("cpu_runner.zig").CpuRunner;
+
 fn refFor(name: []const u8, d: dtype.GgmlType) loader.TensorRef {
     var tensor: Tensor = undefined;
     tensor.dtype = d;
@@ -249,15 +251,14 @@ fn expectRunnerRefuses(comptime Runner: type, card: loader.ModelCard) !void {
         var loaded: loader.Loaded = undefined;
         loaded.card = card;
         loaded.tensors = refs;
-        try std.testing.expectError(error.UnsupportedWeightDtype, Runner.init(
-            arena_state.allocator(),
-            &loaded,
-            kv_budget.pinned(1, 16),
-            1,
-            &pool,
-            .{},
-            .f32,
-        ));
+        const refused = Runner.init(arena_state.allocator(), &loaded, .{
+            .plan = kv_budget.pinned(1, 16),
+            .max_rows = 1,
+            .pool = &pool,
+            .policy = .{},
+            .kv_dtype = .f32,
+        });
+        try std.testing.expectError(error.UnsupportedWeightDtype, refused);
     }
 }
 
@@ -266,11 +267,11 @@ test "runner init refuses a dtype from the file before the first step" {
     card.n_layers = 1;
     card.arch = .llama;
     card.gdn = null;
-    try expectRunnerRefuses(@import("llama_runner.zig").LlamaRunner, card);
+    try expectRunnerRefuses(CpuRunner(@import("llama_layer.zig")), card);
 
     var gdn: loader.GdnParams = undefined;
     gdn.full_attention_interval = 1;
     card.arch = .qwen35;
     card.gdn = gdn;
-    try expectRunnerRefuses(@import("qwen_runner.zig").QwenRunner, card);
+    try expectRunnerRefuses(CpuRunner(@import("qwen_layer.zig")), card);
 }

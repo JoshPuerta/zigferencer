@@ -383,10 +383,12 @@ fn serveHybrid(
         ctx.gpa,
         open.ctxp,
         b.loaded,
-        plan,
-        b.pool,
-        b.policy,
-        kv_dtype,
+        .{
+            .plan = plan,
+            .pool = b.pool,
+            .policy = b.policy,
+            .kv_dtype = kv_dtype,
+        },
     );
     defer hybrid.deinit();
 
@@ -406,7 +408,7 @@ fn serveHybrid(
 
     // Name the family, the split, and the dtype in the cache fingerprint.
     var cfg = cfg_in;
-    var tag_buffer: [Family.Hybrid.backend_tag_buf_len]u8 = undefined;
+    var tag_buffer: [Family.hybrid_tag_buf_len]u8 = undefined;
     cfg.cache.model_fp = b.fingerprint(
         Family.hybridTag(&tag_buffer, hybrid, plan.host_layers, kv_dtype),
     );
@@ -439,7 +441,7 @@ fn serveFused(
     const cost = kv_budget.costModel(b.loaded.card.kvShape(), kv_dtype);
     std.debug.assert(f.caps.serve_default == kv_budget.defaultWindows(cost, ceiling).serve);
 
-    const fused = try Family.initFused(ctx.gpa, open.ctxp, b.loaded, plan, kv_dtype);
+    const fused = try Family.Fused.init(ctx.gpa, open.ctxp, b.loaded, plan, kv_dtype);
     defer fused.deinit();
 
     log.info("{s} gpu engine ready in {d:.0} ms: logical={d} vram={d} batch={d} max_seq={d}", .{
@@ -490,15 +492,13 @@ fn serveCpu(
     }
 
     // Build the runner.
-    var runner = try Family.Cpu.init(
-        ctx.arena,
-        b.loaded,
-        plan,
-        b.checked.max_step_rows,
-        b.pool,
-        b.policy,
-        kv_dtype,
-    );
+    var runner = try Family.Cpu.init(ctx.arena, b.loaded, .{
+        .plan = plan,
+        .max_rows = b.checked.max_step_rows,
+        .pool = b.pool,
+        .policy = b.policy,
+        .kv_dtype = kv_dtype,
+    });
     log.info("{s} engine ready in {d:.0} ms: sessions={d} batch={d} max_seq={d} kv={d} MiB", .{
         Family.name,
         msBetween(ctx.io, t_init),

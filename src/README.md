@@ -54,8 +54,8 @@ read.
   module runs the tests of that module alone.
 - Reference a function by its address (`_ = &f`) to get its body analyzed. A
   discarded value (`_ = f`) resolves the signature and leaves the body alone.
-- The eight GPU aliases evaluate to an empty `struct {}` when their build flag is
-  off, so the compiler never reads a file it cannot use. `vulkan_ctx`, `ops_vulkan`, `ops_vulkan_wrap`, and `vulkan_runner` check on `build_options.use_vulkan`. The four runners `llama_fused`, `qwen_fused`, `llama_hybrid`, and `qwen_hybrid` check one level stricter on `build_options.use_vulkan_fused_ops`. Every construction site tests that flag. The `test {}` block gates the same two ways.
+- The GPU aliases evaluate to an empty `struct {}` when their build flag is
+  off, so the compiler never reads a file it cannot use. `vulkan_ctx`, `ops_vulkan`, `ops_vulkan_wrap`, and `vulkan_runner` check on `build_options.use_vulkan`. The two files `fused_runner` and `hybrid_runner` check one level stricter on `build_options.use_vulkan_fused_ops`. Every construction site tests that flag. The `test {}` block gates the same two ways.
 - `isUserError` is the single list of errors whose handler already printed a
   readable line to stderr. `main` exits 1 on one of them with no return trace,
   and it keeps the trace for every other error. A new usage error belongs in

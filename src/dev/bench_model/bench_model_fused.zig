@@ -15,6 +15,7 @@ const boot_lines = zigferencer.cli.boot_lines;
 const vocab_mod = zigferencer.vocab;
 const sampler = zigferencer.sampler;
 const vulkan_ctx_mod = zigferencer.vulkan_ctx;
+const device_placement = zigferencer.resolve.device_placement;
 
 comptime {
     if (!build_options.use_vulkan_fused_ops) {
@@ -39,10 +40,8 @@ pub fn bench(comptime Family: type, b: *const Bench) !void {
     ctxp.* = try vulkan_ctx_mod.Context.init(ctx.arena, ctx.vk_options);
     defer ctxp.deinit();
 
-    const f = try boot_resources.fusedOn(ctx.io, b.boot, ctxp);
-    _ = try boot_lines.logFused(ctx.io, b.model.pub_name, f, true, false, kv_dtype);
-
-    const runner = try Family.initFused(ctx.gpa, ctxp, b.loaded, f.plan, kv_dtype);
+    const f = try place(b, ctxp);
+    const runner = try Family.Fused.init(ctx.gpa, ctxp, b.loaded, f.plan, kv_dtype);
     defer runner.deinit();
 
     const v = try vocab_mod.buildFromParsed(ctx.arena, b.loaded.parsed);
@@ -63,6 +62,13 @@ pub fn bench(comptime Family: type, b: *const Bench) !void {
     };
     const plan = common.PlanInfo.fromPlan(f.plan, kv_dtype);
     return exec.runSeries(runner, b, turn, plan, false);
+}
+
+/// Resolve the whole-model placement on `ctxp` and log it. The runner takes its plan.
+pub fn place(b: *const Bench, ctxp: *vulkan_ctx_mod.Context) !device_placement.Fused {
+    const f = try boot_resources.fusedOn(b.ctx.io, b.boot, ctxp);
+    _ = try boot_lines.logFused(b.ctx.io, b.model.pub_name, f, true, false, b.kvDtype());
+    return f;
 }
 
 // -- helpers ----------------------------------------------------------------

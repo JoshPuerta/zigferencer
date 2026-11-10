@@ -4,9 +4,9 @@
 //! Equality. Greedy tokens are exact across backends. The per-op numerics stay under the tolerance
 //! each kernel declares.
 //!
-//! Batched decode. Two sessions decode interleaved through `Sessions(LlamaFusedRunner)`. This also
+//! Batched decode. Two sessions decode interleaved through `Sessions(LlamaFused)`. This also
 //! drives the same-slot ascending rows of chunked prefill through the per-row rope and attention
-//! dispatches. The test compares each stream against a solo CPU `LlamaRunner` run.
+//! dispatches. The test compares each stream against a solo run of the CPU runner.
 //!
 //! Composed advance. This is the exact path of the serve scheduler and the hardest compact-logits
 //! case. One final chunk carries a whole prompt while another session decodes, inside one fused
@@ -30,10 +30,10 @@ const test_policy = @import("test_policy.zig");
 const loader = zigferencer.loader;
 const vocab_mod = zigferencer.vocab;
 const bpe = zigferencer.bpe;
-const LlamaRunner = zigferencer.llama_runner.LlamaRunner;
+const LlamaCpu = zigferencer.family.Of(.llama).Cpu;
 const Sessions = zigferencer.session.Sessions;
 const limits = zigferencer.limits;
-const LlamaFusedRunner = zigferencer.llama_fused.LlamaFusedRunner;
+const LlamaFused = zigferencer.family.Of(.llama).Fused;
 
 // -- fixtures ---------------------------------------------------------------
 
@@ -44,19 +44,17 @@ const n_tokens = n_decode + 1;
 /// Build the plan for the fused runner: `n_slots` streams at the multi-slot
 /// test window, and no device budget.
 fn fusedPlan(
-    gpa: std.mem.Allocator,
     loaded: *const loader.Loaded,
     n_slots: u32,
 ) !zigferencer.kv_budget.KvPlan {
-    const caps = try LlamaFusedRunner.kvCaps(
-        gpa,
+    const caps = LlamaFused.kvCaps(
         loaded,
         limits.contextCeiling(loaded.card.context_length, null),
         0,
         n_slots,
         .f32,
     );
-    return zigferencer.kv_budget.kvPlan(caps, LlamaFusedRunner.kvCostModel(loaded.card, .f32), .{
+    return zigferencer.kv_budget.kvPlan(caps, LlamaFused.kvCostModel(loaded.card, .f32), .{
         .window = @min(loaded.card.context_length, zigferencer.test_fakes.test_serve_window),
         .slots = n_slots,
         .batch = n_slots,
@@ -92,16 +90,14 @@ test "llama GPU batched decode matches the CPU reference streams (greedy, exact)
             try test_policy.startPool(&cpu_pool, io, test_policy.policy());
             defer cpu_pool.deinit();
 
-            var runner = try LlamaRunner.init(
-                arena,
-                &loaded,
-                zigferencer.kv_budget.pinned(1, max_seq),
-                0,
-                &cpu_pool,
-                test_policy.policy(),
-                .f32,
-            );
-            var pool = try Sessions(LlamaRunner).init(arena, &runner);
+            var runner = try LlamaCpu.init(arena, &loaded, .{
+                .plan = zigferencer.kv_budget.pinned(1, max_seq),
+                .max_rows = 0,
+                .pool = &cpu_pool,
+                .policy = test_policy.policy(),
+                .kv_dtype = .f32,
+            });
+            var pool = try Sessions(LlamaCpu).init(arena, &runner);
             const sid = try pool.create(0, .{});
             reference[p][0] = (try pool.feed(sid, ids, true)).?;
             for (1..n_tokens) |k| {
@@ -117,16 +113,16 @@ test "llama GPU batched decode matches the CPU reference streams (greedy, exact)
     ctxp.* = zigferencer.vulkan_ctx.Context.init(arena, .{}) catch return error.SkipZigTest;
     defer ctxp.deinit();
 
-    const fused = try LlamaFusedRunner.initFromLoaded(
+    const fused = try LlamaFused.init(
         gpa,
         ctxp,
         &loaded,
-        try fusedPlan(gpa, &loaded, prompts.len + 1),
+        try fusedPlan(&loaded, prompts.len + 1),
         .f32,
     );
     defer fused.deinit();
 
-    var pool = try Sessions(LlamaFusedRunner).init(arena, fused);
+    var pool = try Sessions(LlamaFused).init(arena, fused);
     var sids: [prompts.len]u32 = undefined;
     var got: [prompts.len][n_tokens]u32 = undefined;
     for (prompt_ids, 0..) |ids, p| {
@@ -183,32 +179,28 @@ test "llama GPU composed advance: a multi-row prefill chunk riding a decode row 
         try test_policy.startPool(&cpu_pool, io, test_policy.policy());
         defer cpu_pool.deinit();
 
-        var r0 = try LlamaRunner.init(
-            arena,
-            &loaded,
-            zigferencer.kv_budget.pinned(1, max_seq),
-            0,
-            &cpu_pool,
-            test_policy.policy(),
-            .f32,
-        );
-        var p0 = try Sessions(LlamaRunner).init(arena, &r0);
+        var r0 = try LlamaCpu.init(arena, &loaded, .{
+            .plan = zigferencer.kv_budget.pinned(1, max_seq),
+            .max_rows = 0,
+            .pool = &cpu_pool,
+            .policy = test_policy.policy(),
+            .kv_dtype = .f32,
+        });
+        var p0 = try Sessions(LlamaCpu).init(arena, &r0);
         const s0 = try p0.create(0, .{});
         _ = (try p0.feed(s0, prompt_ids[0], true)).?;
         var o0: [1]u32 = undefined;
         try p0.decodeBatch(&.{s0}, &o0);
         ref_front1 = o0[0];
 
-        var r1 = try LlamaRunner.init(
-            arena,
-            &loaded,
-            zigferencer.kv_budget.pinned(1, max_seq),
-            0,
-            &cpu_pool,
-            test_policy.policy(),
-            .f32,
-        );
-        var p1 = try Sessions(LlamaRunner).init(arena, &r1);
+        var r1 = try LlamaCpu.init(arena, &loaded, .{
+            .plan = zigferencer.kv_budget.pinned(1, max_seq),
+            .max_rows = 0,
+            .pool = &cpu_pool,
+            .policy = test_policy.policy(),
+            .kv_dtype = .f32,
+        });
+        var p1 = try Sessions(LlamaCpu).init(arena, &r1);
         const s1 = try p1.create(0, .{});
         ref_late0 = (try p1.feed(s1, prompt_ids[1], true)).?;
     }
@@ -217,16 +209,16 @@ test "llama GPU composed advance: a multi-row prefill chunk riding a decode row 
     ctxp.* = zigferencer.vulkan_ctx.Context.init(arena, .{}) catch return error.SkipZigTest;
     defer ctxp.deinit();
 
-    const fused = try LlamaFusedRunner.initFromLoaded(
+    const fused = try LlamaFused.init(
         gpa,
         ctxp,
         &loaded,
-        try fusedPlan(gpa, &loaded, prompts.len + 1),
+        try fusedPlan(&loaded, prompts.len + 1),
         .f32,
     );
     defer fused.deinit();
 
-    var pool = try Sessions(LlamaFusedRunner).init(arena, fused);
+    var pool = try Sessions(LlamaFused).init(arena, fused);
     const front = try pool.create(0, .{});
     _ = (try pool.feed(front, prompt_ids[0], true)).?; // front ready, pending its first token
 
@@ -264,16 +256,16 @@ test "llama GPU prefix restore: a warm-restored prefix continues bit-exactly" {
     ctxp.* = zigferencer.vulkan_ctx.Context.init(arena, .{}) catch return error.SkipZigTest;
     defer ctxp.deinit();
 
-    const fused = try LlamaFusedRunner.initFromLoaded(
+    const fused = try LlamaFused.init(
         gpa,
         ctxp,
         &loaded,
-        try fusedPlan(gpa, &loaded, 2),
+        try fusedPlan(&loaded, 2),
         .f32,
     );
     defer fused.deinit();
 
-    var pool = try Sessions(LlamaFusedRunner).init(arena, fused);
+    var pool = try Sessions(LlamaFused).init(arena, fused);
 
     // Cold: feed the prefix without logits, snapshot those rows, then feed the suffix.
     var cold_stream: [n_tokens]u32 = undefined;

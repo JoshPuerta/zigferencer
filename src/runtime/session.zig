@@ -56,7 +56,7 @@
 //! Runner surface. `Sessions` reaches a runner through a duck-typed surface. A renamed member
 //! breaks only the call sites that instantiate it, and a GPU-only runner can break where no CPU
 //! test looks. So `Sessions(RunnerT)` checks the rows it reads when the pool type is built, and
-//! the surface test instantiates the whole surface against every runner of the build. A runner
+//! each family row checks the whole surface of its runners in `engine/family.zig`. A runner
 //! that holds recurrent state must declare `has_recurrent_state` and both slot hooks, because
 //! `@hasDecl` alone lets a runner omit `resetSlotState` and inherit the state of the last
 //! conversation.
@@ -65,6 +65,7 @@ const std = @import("std");
 const Allocator = std.mem.Allocator;
 const sampler = @import("sampler.zig");
 const StepRow = @import("step_row.zig").StepRow;
+const runner_surface = @import("runner_surface.zig");
 const core_log = @import("../core/log.zig");
 
 const log = std.log.scoped(.serve);
@@ -108,7 +109,7 @@ pub fn Sessions(comptime RunnerT: type) type {
 
         // Check the runner surface.
         comptime {
-            requireSessionsSurface(RunnerT);
+            runner_surface.requireSessionsSurface(RunnerT);
         }
 
         /// Whether `clone` is available: the runner must copy the state of a slot.
@@ -515,182 +516,6 @@ pub fn Sessions(comptime RunnerT: type) type {
     };
 }
 
-// -- helpers ----------------------------------------------------------------
-
-/// One field of the surface: the name and the exact type a consumer reads.
-fn requireField(comptime T: type, comptime name: []const u8, comptime Want: type) void {
-    if (!@hasField(T, name)) {
-        @compileError("runner surface: " ++ @typeName(T) ++ " has no field '" ++ name ++ "'");
-    }
-    if (@FieldType(T, name) != Want) {
-        @compileError("runner surface: " ++ @typeName(T) ++ "." ++ name ++ " is " ++
-            @typeName(@FieldType(T, name)) ++ ", the surface states " ++ @typeName(Want));
-    }
-}
-
-/// One method of the surface.
-fn requireFn(
-    comptime T: type,
-    comptime name: []const u8,
-    comptime params: []const type,
-    comptime Payload: type,
-) void {
-    if (!@hasDecl(T, name)) {
-        @compileError("runner surface: " ++ @typeName(T) ++ " has no declaration '" ++ name ++ "'");
-    }
-
-    checkFn(T, name, params, Payload);
-}
-
-/// A method that `Sessions` gates on `@hasDecl`. Absence is legal, and a wrong shape is not.
-fn optionalFn(
-    comptime T: type,
-    comptime name: []const u8,
-    comptime params: []const type,
-    comptime Payload: type,
-) void {
-    if (@hasDecl(T, name)) {
-        checkFn(T, name, params, Payload);
-    }
-}
-
-/// The receiver, the arguments after it, and the value the method yields.
-/// An error union counts as its payload, because each family declares its own error set.
-fn checkFn(
-    comptime T: type,
-    comptime name: []const u8,
-    comptime params: []const type,
-    comptime Payload: type,
-) void {
-    // Resolve the function.
-    const where = "runner surface: " ++ @typeName(T) ++ "." ++ name ++ " ";
-    const info = @typeInfo(@TypeOf(@field(T, name)));
-    if (info != .@"fn") @compileError(where ++ "is not a function");
-
-    // Check the arity and the receiver.
-    const f = info.@"fn";
-    if (f.params.len != params.len + 1) {
-        @compileError(where ++ "takes " ++ std.fmt.comptimePrint("{d}", .{f.params.len}) ++
-            " arguments, the surface states " ++ std.fmt.comptimePrint("{d}", .{params.len + 1}));
-    }
-
-    const receiver = f.params[0].type orelse @compileError(where ++ "has a generic receiver");
-    if (receiver != *T and receiver != *const T) {
-        @compileError(
-            where ++ "takes " ++ @typeName(receiver) ++ ", not a pointer to its own runner",
-        );
-    }
-
-    // Check the type of each argument.
-    inline for (params, 0..) |Want, i| {
-        const got = f.params[i + 1].type orelse @compileError(where ++ "has a generic argument");
-        if (got != Want) {
-            @compileError(
-                where ++ "argument " ++ std.fmt.comptimePrint("{d}", .{i + 1}) ++ " is " ++
-                    @typeName(got) ++ ", the surface states " ++ @typeName(Want),
-            );
-        }
-    }
-
-    // Check the payload type.
-    const ret = f.return_type orelse @compileError(where ++ "has a generic return type");
-    const payload = switch (@typeInfo(ret)) {
-        .error_union => |eu| eu.payload,
-        else => ret,
-    };
-
-    if (payload != Payload) {
-        @compileError(
-            where ++ "yields " ++ @typeName(
-                payload,
-            ) ++ ", the surface states " ++ @typeName(Payload),
-        );
-    }
-}
-
-/// The slot hooks of a runner with recurrent state. The `has_recurrent_state` marker makes
-/// the check require both hooks by name.
-fn requireRecurrentHooks(comptime T: type) void {
-    if (!@hasDecl(T, "has_recurrent_state")) return;
-    if (@TypeOf(T.has_recurrent_state) != bool) {
-        @compileError("runner surface: " ++ @typeName(T) ++ ".has_recurrent_state is " ++
-            @typeName(@TypeOf(T.has_recurrent_state)) ++ ", the surface states bool");
-    }
-    if (!T.has_recurrent_state) return;
-
-    inline for ([_][]const u8{ "resetSlotState", "cloneSlotState" }) |hook| {
-        if (!@hasDecl(T, hook)) {
-            @compileError("runner surface: " ++ @typeName(T) ++ " declares has_recurrent_state, " ++
-                "so it must declare '" ++ hook ++ "'");
-        }
-    }
-}
-
-/// The marker itself. Without it, `requireRecurrentHooks` passes on a runner that dropped both.
-fn requireRecurrentState(comptime T: type) void {
-    if (!@hasDecl(T, "has_recurrent_state") or !T.has_recurrent_state) {
-        @compileError("runner surface: " ++ @typeName(T) ++ " holds recurrent state, " ++
-            "so it must declare 'pub const has_recurrent_state = true'");
-    }
-}
-
-/// The surface `Sessions` reads. The optional rows can be absent. `evictSlot` brings the swap
-/// surface with it.
-fn requireSessionsSurface(comptime T: type) void {
-    requireFn(T, "stepBatch", &.{[]const StepRow}, void);
-    requireFn(T, "maxStepRows", &.{}, u32);
-    requireField(T, "logits", []f32);
-    requireField(T, "n_slots", u32);
-    requireField(T, "max_seq", u32);
-    optionalFn(T, "logitRowsMax", &.{}, u32);
-    optionalFn(T, "resetSlotState", &.{u32}, void);
-    optionalFn(T, "cloneSlotState", &.{ u32, u32, u32 }, void);
-    requireRecurrentHooks(T);
-    if (@hasDecl(T, "evictSlot")) {
-        requireSwapSurface(T);
-    }
-}
-
-/// The pool surface plus the single-row `step` that `generate.decode` and `run` call.
-fn requireStepSurface(comptime T: type) void {
-    requireSessionsSurface(T);
-    requireFn(T, "step", &.{ u32, u32 }, []f32);
-}
-
-/// The swap surface of a tiered pool: size, evict, and restore.
-fn requireSwapSurface(comptime T: type) void {
-    requireFn(T, "evictSlotBytesFor", &.{u32}, u64);
-    requireFn(T, "evictSlot", &.{ u32, u32, []u8 }, void);
-    requireFn(T, "restoreSlot", &.{ u32, u32, []const u8 }, void);
-}
-
-/// A runner takes its resource plan as a value at `init` and cannot outgrow it.
-/// The argument position differs per family, so the check finds the plan by type.
-fn requirePlanValue(comptime T: type, comptime Plan: type) void {
-    if (!@hasDecl(T, "init")) {
-        @compileError("runner surface: " ++ @typeName(T) ++ " has no declaration 'init'");
-    }
-
-    const info = @typeInfo(@TypeOf(@field(T, "init")));
-    if (info != .@"fn") {
-        @compileError("runner surface: " ++ @typeName(T) ++ ".init is not a function");
-    }
-
-    comptime var reads_plan = false;
-    inline for (info.@"fn".params) |p| {
-        if (p.type) |ty| {
-            if (ty == Plan) {
-                reads_plan = true;
-            }
-        }
-    }
-
-    if (!reads_plan) {
-        @compileError("runner surface: " ++ @typeName(T) ++ ".init takes no " ++ @typeName(Plan) ++
-            ", so its shape is not a value the caller planned");
-    }
-}
-
 // -- tests ------------------------------------------------------------------
 
 // Canned logits make the model a pure function of the row token: argmax of row i is
@@ -726,7 +551,7 @@ const FakeRunner = struct {
         return self.rows_log[0..self.rows_log_len];
     }
 
-    fn maxStepRows(self: *const FakeRunner) u32 {
+    pub fn maxStepRows(self: *const FakeRunner) u32 {
         return self.n_slots;
     }
 
@@ -773,7 +598,7 @@ const SnapFakeRunner = struct {
         gpa.free(self.markers);
     }
 
-    fn maxStepRows(self: *const SnapFakeRunner) u32 {
+    pub fn maxStepRows(self: *const SnapFakeRunner) u32 {
         return self.n_slots;
     }
 
@@ -806,83 +631,6 @@ const SnapFakeRunner = struct {
         self.restores += 1;
     }
 };
-
-test "runner surface: the session seam holds for every runner in this build" {
-    const build_options = @import("build_options");
-    const kv_budget = @import("../core/kv_budget.zig");
-    // This test is the one place that names every shipped runner.
-    const llama_runner = @import("llama_runner.zig");
-    const qwen_runner = @import("qwen_runner.zig");
-    // The fused GPU modules compile only under a vulkan build.
-    const llama_fused = if (build_options.use_vulkan_fused_ops)
-        @import("llama_fused.zig")
-    else
-        struct {};
-
-    const qwen_fused = if (build_options.use_vulkan_fused_ops)
-        @import("qwen_fused.zig")
-    else
-        struct {};
-
-    const llama_hybrid = if (build_options.use_vulkan_fused_ops)
-        @import("llama_hybrid.zig")
-    else
-        struct {};
-
-    const qwen_hybrid = if (build_options.use_vulkan_fused_ops)
-        @import("qwen_hybrid.zig")
-    else
-        struct {};
-
-    comptime {
-        const cpu = .{ llama_runner.LlamaRunner, qwen_runner.QwenRunner };
-        for (cpu) |T| {
-            requireStepSurface(T);
-            requireSwapSurface(T);
-            requirePlanValue(T, kv_budget.KvPlan);
-        }
-
-        // The qwen family holds GDN recurrent state and carries the marker. The llama family
-        // does not.
-        requireRecurrentState(qwen_runner.QwenRunner);
-        if (@hasDecl(llama_runner.LlamaRunner, "has_recurrent_state")) {
-            @compileError(
-                "runner surface: the LlamaRunner holds no recurrent state, so it states no marker",
-            );
-        }
-
-        if (build_options.use_vulkan_fused_ops) {
-            const gpu = .{ llama_fused.LlamaFusedRunner, qwen_fused.QwenFusedRunner };
-            for (gpu) |T| {
-                requireStepSurface(T);
-                requireSwapSurface(T);
-                requirePlanValue(T, kv_budget.KvPlan);
-            }
-
-            const hybrids = .{ llama_hybrid.LlamaHybridRunner, qwen_hybrid.QwenHybridRunner };
-            for (hybrids) |T| {
-                requireStepSurface(T);
-                requireSwapSurface(T);
-                requirePlanValue(T, kv_budget.LayerSplit);
-            }
-
-            requireRecurrentState(qwen_fused.QwenFusedRunner);
-            requireRecurrentState(qwen_hybrid.QwenHybridRunner);
-            if (@hasDecl(llama_fused.LlamaFusedRunner, "has_recurrent_state")) {
-                @compileError(
-                    "runner surface: the llama LlamaFusedRunner holds no recurrent state, " ++
-                        "so it states no marker",
-                );
-            }
-            if (@hasDecl(llama_hybrid.LlamaHybridRunner, "has_recurrent_state")) {
-                @compileError(
-                    "runner surface: the llama LlamaHybridRunner holds no recurrent state, " ++
-                        "so it states no marker",
-                );
-            }
-        }
-    }
-}
 
 test "create/destroy lifecycle and pool exhaustion" {
     const gpa = std.testing.allocator;

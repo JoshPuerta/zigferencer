@@ -144,7 +144,7 @@ pub fn runSeries(
     for (results, 0..) |*result, run_index| {
         // A run folds the prompt into the recurrent state, and no prefill rewrites it.
         // Positional KV needs no scrub, because a run writes a row before attention reads it.
-        if (comptime @hasDecl(Runner, "has_recurrent_state")) {
+        if (comptime @hasDecl(Runner, "has_recurrent_state") and Runner.has_recurrent_state) {
             if (warm or run_index > 0) {
                 runner.resetSlotState(0);
             }

@@ -78,15 +78,13 @@ pub fn bench(comptime Family: type, b: *const Bench) !void {
     };
     const results = try ctx.arena.alloc(RunResult, b.opt.runs);
     for (results) |*result| {
-        var runner = try Family.Cpu.init(
-            ctx.arena,
-            b.loaded,
-            kv_budget.pinned(1, max_seq),
-            limits.cpu_prefill_chunk,
-            &pool,
-            b.policy,
-            b.kvDtype(),
-        );
+        var runner = try Family.Cpu.init(ctx.arena, b.loaded, .{
+            .plan = kv_budget.pinned(1, max_seq),
+            .max_rows = limits.cpu_prefill_chunk,
+            .pool = &pool,
+            .policy = b.policy,
+            .kv_dtype = b.kvDtype(),
+        });
         result.* = try exec.runOnce(&runner, turn, ctx);
     }
 

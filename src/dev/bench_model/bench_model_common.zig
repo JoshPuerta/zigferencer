@@ -1,7 +1,8 @@
 //! The values the files of `bench-model` pass to each other, and their leaf
 //! helpers.
 //!
-//! Comptime. An assert pins the depth buckets to divide the model context evenly.
+//! Comptime. An assert pins the depth buckets to divide the model context evenly. `loadAndRun`
+//! turns the architecture into a family row and calls a handler generic over it.
 
 const std = @import("std");
 const zigferencer = @import("zigferencer");
@@ -19,6 +20,14 @@ const args = zigferencer.cli.args;
 const context = zigferencer.cli.context;
 const flags_mod = zigferencer.cli.flag_groups;
 const boot_resources = zigferencer.cli.boot_resources;
+const boot_lines = zigferencer.cli.boot_lines;
+const select = zigferencer.cli.select;
+const family = zigferencer.family;
+const build_options = @import("build_options");
+const core_log = zigferencer.log;
+
+const use_fused = build_options.use_vulkan_fused_ops;
+const use_per_op = build_options.use_vulkan_ops;
 
 pub const writeStderr = args.writeStderr;
 
@@ -60,8 +69,6 @@ pub const Options = struct {
     ignore_eos: bool = false,
     /// The bench takes no thinking option, so the engine thinking stays `auto`.
     engine: flags_mod.EngineFlags = .{},
-    /// With a --gpu-layers count: build the hybrid even at a degenerate split (0 or all layers).
-    force_hybrid: bool = false,
     /// CPU backends only: print the per-op decode breakdown (`bench_model_profile`), then exit.
     profile_cpu_decode: bool = false,
     /// qwen35 fused only: print the per-stage GPU breakdown of one step, then exit.
@@ -108,11 +115,6 @@ pub const Options = struct {
         .ignore_eos = args.Doc{
             .group = "prompt shape",
             .text = "spend the full decode budget per run (clean ITL)",
-        },
-        .force_hybrid = args.Doc{
-            .group = "gpu (fused-GPU build only)",
-            .text = "construct the hybrid even at a degenerate split (gate\nruns, llama " ++
-                "only). Needs a --gpu-layers count",
         },
         .profile_cpu_decode = args.Doc{
             .group = "profiling (cpu, trace build only: -Dtrace=true)",
@@ -218,6 +220,67 @@ pub const RunResult = struct {
 
 // -- api --------------------------------------------------------------------
 
+/// Load the model of `opt`, resolve its placement as `kind` for `input`, and call
+/// `handler(Family, &bench, extra)` with the family row of its architecture.
+pub fn loadAndRun(
+    ctx: context.Context,
+    opt: Options,
+    kind: resolve_mod.Kind,
+    input: resolve_mod.Input,
+    comptime handler: anytype,
+    extra: anytype,
+) !void {
+    // A whole-model fused bench runs no CPU op, so its pool starts no workers.
+    const runs_cpu_ops = !build_options.use_vulkan_fused_ops or opt.engine.gpu_layers != null;
+    const flags = opt.engine.threads.policyFlags();
+    const policy = try boot_resources.resolvePolicy(ctx.io, flags, runs_cpu_ops);
+
+    const model = try select.model(ctx, opt.pub_name);
+    const entry = boot_resources.entryOf(model);
+
+    // Every refusal that needs no model file lands here, before the load.
+    switch (resolve_mod.early(kind, input, entry)) {
+        .ok => {},
+        .refused => |r| return boot_lines.refuse(ctx.io, model.pub_name, r),
+    }
+
+    // Load the model and resolve its placement.
+    const path = try registry.resolveLoadPath(ctx.arena, ctx.io, ctx.models_root, model.*);
+    var loaded = try loader.load(ctx.io, ctx.arena, path);
+    defer loaded.close();
+
+    const model_needs = boot_resources.modelNeeds(&loaded);
+    const ram_free = boot_resources.hostRamFree(ctx.io);
+    const resources: resolve_mod.Resources = .{ .ram_free = ram_free, .model = model_needs };
+    const resolved = switch (resolve_mod.resolve(kind, input, entry, loaded.card, resources)) {
+        .ok => |r| r,
+        .refused => |r| return boot_lines.refuse(ctx.io, model.pub_name, r),
+    };
+
+    // Hand the bench to the family.
+    const boot: boot_resources.DeviceBoot = .{
+        .kind = kind,
+        .input = input,
+        .entry = entry,
+        .card = loaded.card,
+        .model = model_needs,
+        .ram = .{ .read = ram_free },
+    };
+    const bench: Bench = .{
+        .ctx = ctx,
+        .opt = opt,
+        .model = model,
+        .loaded = &loaded,
+        .boot = &boot,
+        .resolved = &resolved,
+        .policy = policy,
+    };
+
+    switch (loaded.card.arch) {
+        inline else => |arch| return handler(family.Of(arch), &bench, extra),
+    }
+}
+
 pub fn toMs(t0: Io.Clock.Timestamp, t1: Io.Clock.Timestamp) f64 {
     const ns_i96 = t0.durationTo(t1).raw.toNanoseconds();
     const ns: f64 = @floatFromInt(@as(i64, @intCast(ns_i96)));
@@ -256,6 +319,64 @@ pub fn synthPromptIds(arena: Allocator, n: u32, vocab: u32) ![]u32 {
     }
 
     return ids;
+}
+
+/// Refuse a flag set that this build cannot run. `bench-model` and `dispatch-list` call it.
+pub fn refuseBadFlags(io: std.Io, opt: Options) !void {
+    if (opt.runs == 0 or opt.runs > limits.bench_runs_max) {
+        return args.fail(io, "--runs must be in 1..{d}", .{limits.bench_runs_max});
+    }
+    if (opt.max_tokens < 2) {
+        return args.fail(io, "--max-tokens must be >= 2 (need at least 1 step for ITL)", .{});
+    }
+
+    try refuseGpuFlags(io, opt);
+    try refuseCpuProfile(io, opt);
+}
+
+// -- helpers ----------------------------------------------------------------
+
+fn refuseGpuFlags(io: std.Io, opt: Options) error{UsageError}!void {
+    const gpu_layers = opt.engine.gpu_layers;
+
+    if (!use_fused) {
+        const need_fused = "requires -Dops-backend=vulkan_fused";
+        if (gpu_layers != null) return args.fail(io, "--gpu-layers " ++ need_fused, .{});
+
+        // The device profilers read device timestamps.
+        if (opt.profile_prefill) return args.fail(io, "--profile-prefill " ++ need_fused, .{});
+        if (opt.profile_decode) return args.fail(io, "--profile-decode " ++ need_fused, .{});
+    }
+
+    if (gpu_layers != null and (opt.profile_prefill or opt.profile_decode)) {
+        return args.fail(
+            io,
+            "--gpu-layers benches the hybrid runner and does not combine with profile flags",
+            .{},
+        );
+    }
+}
+
+fn refuseCpuProfile(io: std.Io, opt: Options) !void {
+    if (!opt.profile_cpu_decode) return;
+
+    // The per-op CPU timer compiles into a trace build only, so a release
+    // binary holds no clock read in the forward pass.
+    if (!core_log.hot) {
+        return args.fail(
+            io,
+            "--profile-cpu-decode requires a trace build (-Dtrace=true)",
+            .{},
+        );
+    }
+
+    if (use_fused or use_per_op) {
+        writeStderr(
+            io,
+            "error: --profile-cpu-decode is for CPU backends (rebuild without -Druntime=vulkan)\n",
+        );
+        return error.UnsupportedArchForBackend;
+    }
 }
 
 // -- tests ------------------------------------------------------------------

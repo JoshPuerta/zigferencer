@@ -3,9 +3,9 @@
 //! Comptime. `HarnessFor` builds one harness type per runner, so each runner family shares one
 //! boot.
 //!
-//! Boot. A harness loads the SmolLM2 fixture, builds the CPU `LlamaRunner` and its session pool,
-//! and starts an in-process binary server. `QwenHarness` does the same with the CPU `QwenRunner`
-//! over the Qwen fixture.
+//! Boot. A harness loads the SmolLM2 fixture, builds the CPU runner of the Llama row and its
+//! session pool, and starts an in-process binary server. `QwenHarness` does the same with the CPU
+//! runner over the Qwen fixture.
 //!
 //! Transport. The server listens on an ephemeral TCP port or on a unix socket in a temporary
 //! directory. A test drives it through the reference client and stops it over the wire or through
@@ -26,8 +26,8 @@ const test_policy = @import("test_policy.zig");
 const loader = zigferencer.loader;
 const vocab_mod = zigferencer.vocab;
 const bpe = zigferencer.bpe;
-const LlamaRunner = zigferencer.llama_runner.LlamaRunner;
-const QwenRunner = zigferencer.qwen_runner.QwenRunner;
+const LlamaCpu = zigferencer.family.Of(.llama).Cpu;
+const QwenCpu = zigferencer.family.Of(.qwen35).Cpu;
 const Sessions = zigferencer.session.Sessions;
 const limits = zigferencer.limits;
 const protocol = zigferencer.serve_protocol;
@@ -75,10 +75,10 @@ pub const Stream = struct {
 };
 
 /// One in-process server over the SmolLM2 fixture.
-pub const Harness = HarnessFor(LlamaRunner);
+pub const Harness = HarnessFor(LlamaCpu);
 
 /// One in-process server over the Qwen fixture.
-pub const QwenHarness = HarnessFor(QwenRunner);
+pub const QwenHarness = HarnessFor(QwenCpu);
 
 /// One in-process server over the fixture of `Runner`. The value moves
 /// freely, because the server tasks point only into the arena, and the arena
@@ -126,7 +126,7 @@ pub fn HarnessFor(comptime Runner: type) type {
             errdefer arena_state.deinit();
 
             const arena = arena_state.allocator();
-            const fixture_name = if (Runner == QwenRunner)
+            const fixture_name = if (Runner == QwenCpu)
                 "Qwen3.5-2B-Q8_0"
             else
                 "SmolLM2-135M-Instruct-Q8_0";
@@ -160,15 +160,13 @@ pub fn HarnessFor(comptime Runner: type) type {
             errdefer cpu_pool.deinit();
 
             const runner = try arena.create(Runner);
-            runner.* = try Runner.init(
-                arena,
-                loaded,
-                zigferencer.kv_budget.pinned(opts.max_sessions, opts.window),
-                prefill_chunk.stepRows(opts.prefill, opts.max_sessions, opts.max_batch),
-                cpu_pool,
-                policy,
-                .f32,
-            );
+            runner.* = try Runner.init(arena, loaded, .{
+                .plan = zigferencer.kv_budget.pinned(opts.max_sessions, opts.window),
+                .max_rows = prefill_chunk.stepRows(opts.prefill, opts.max_sessions, opts.max_batch),
+                .pool = cpu_pool,
+                .policy = policy,
+                .kv_dtype = .f32,
+            });
             const engine = try arena.create(Sessions(Runner));
             engine.* = try Sessions(Runner).init(arena, runner);
 

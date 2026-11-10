@@ -73,9 +73,9 @@ pub fn decode(
 
     // Detect the optional sink and runner hooks at comptime.
     const has_on_step = comptime @hasDecl(Pointee(@TypeOf(sink)), "onStep");
-    const has_host = comptime @hasField(Pointee(@TypeOf(runner)), "host");
-    if (has_host) {
-        runner.host = .{};
+    const host_out = decodeHost(runner);
+    if (host_out) |h| {
+        h.* = .{};
     }
 
     var argmax: step_stats.Stat = .{};
@@ -146,7 +146,7 @@ pub fn decode(
     std.debug.assert(pos <= max_seq);
     std.debug.assert(pos - pos_in == steps);
     std.debug.assert(steps == n or steps + 1 == n);
-    var host: step_stats.DecodeHost = if (has_host) runner.host else .{};
+    var host: step_stats.DecodeHost = if (host_out) |h| h.* else .{};
     host.argmax = argmax;
     return .{
         .ttft_ms = ms(t_start, t_first),
@@ -178,6 +178,13 @@ fn timedGreedy(logits: []const f32, io: Io, stat: *step_stats.Stat) u32 {
     stat.add(nsBetween(t0, t1));
     span.record(.sample, t0.raw, t1.raw);
     return id;
+}
+
+/// The decode host times of a runner that declares them, or null.
+fn decodeHost(runner: anytype) ?*step_stats.DecodeHost {
+    const R = Pointee(@TypeOf(runner));
+    if (comptime @hasDecl(R, "decodeHost")) return runner.decodeHost();
+    return null;
 }
 
 // -- tests ------------------------------------------------------------------

@@ -23,9 +23,10 @@ This document explains how zigferencer works, from the build to a served token.
 
 | Term | Meaning |
 | --- | --- |
-| op | One operation of the model: a matrix product, a norm, attention. |
+| op | One operation of the model: a matrix product, a norm, attention. `LayerOp` in `core/layer_op.zig` lists them, and every CPU span and every GPU mark of a profile names ops of that list. |
 | kernel | One implementation of an op: a Zig function on the CPU, a compute shader on the GPU. |
 | backend | The set of kernels that the build selects (`-Dops-backend`). |
+| layer kernel set | The ten methods that a decoder layer calls: `norm`, `project`, `qkNorm`, `rope`, `kvCommit`, `attention`, `gate`, `residual`, `swiglu`, and `gdn`. `CpuLayerKernels` computes each one, and `FusedLayerKernels` records each one into a command buffer. A decoder layer file (`llama_layer`, `qwen_layer`) calls them in the order of its `forward`. |
 | runtime | What the binary links and can drive: the CPU only, or the CPU and a Vulkan GPU (`-Druntime`). |
 | runner | The code that runs the forward pass of one model family on one placement. It owns all the state of that pass. |
 | placement | Where the layers of a model run: `fused` (all on the GPU), `hybrid` (a CPU prefix and a GPU suffix), or `cpu`. It says nothing about sessions. A session enters a VRAM slot and is then resident. |
@@ -169,7 +170,7 @@ The build turns the choice into compile-time constants in `build_options`, and e
 runner imports exactly one op module:
 
 ```
--Dops-backend=auto                                         llama_runner.zig
+-Dops-backend=auto                                         cpu_runner.zig
 -Druntime=cpu       --> resolveOpsBackend -->  build_options  -->  const ops = if (use_vulkan_ops) wrap.zig
                         (build.zig)           cpu_ops_simd_pf         else if (cpu_ops_simd_pf) simd_pf.zig
                                               = true                  else if (cpu_ops_simd) simd.zig
@@ -323,7 +324,7 @@ the lessons from digital design in VHDL I had many years ago.
 | [`src/io/`](../src/io/README.md) | Files and the network. | `gguf/parser.zig`, `gguf/loader.zig`, `mmap.zig`, `download.zig` |
 | [`src/ops/`](../src/ops/README.md) | The CPU kernels. | `naive.zig` (the reference), `simd_pf.zig` (the default), `gdn.zig` |
 | [`src/ops_vulkan/`](../src/ops_vulkan/README.md) | The GPU kernels. | `shaders/`, `kernels.zig` (one pipeline for each shader), `wrap.zig` (the per-op GPU backend) |
-| [`src/runtime/`](../src/runtime/README.md) | The runners and their state. | `llama_runner.zig`, `qwen_runner.zig`, `llama_fused.zig`, `qwen_fused.zig`, `llama_hybrid.zig`, `qwen_hybrid.zig`, `session.zig`, `sampler.zig`, `parallel.zig` |
+| [`src/runtime/`](../src/runtime/README.md) | The runners and their state. | `cpu_runner.zig`, `fused_runner.zig`, `hybrid_runner.zig`, `session.zig`, `sampler.zig`, `parallel.zig` |
 | [`src/serve/`](../src/serve/README.md) | The server. | `scheduler.zig`, `engine.zig`, `protocol.zig`, `server.zig`, `openai/`, `residency.zig`, `prefix_manager.zig` |
 | [`tests/`](../tests/README.md) | The integration tests against real model files. | `snapshot_smollm2_test.zig`, the `*_equivalence_test.zig` files |
 | [`tools/`](../tools/README.md) | The op micro-benchmarks, the gates, the profiler driver, and the shader lint. | `bench.zig`, `gate.sh`, `profile.sh`, `shader_lint.zig` |
@@ -367,12 +368,12 @@ engine file imports `src/cli/`.
 The model architecture comes from the GGUF at load, so one binary runs both
 families.
 
-- **Llama family** (`runtime/llama_runner.zig`). Each layer has two blocks. The
+- **Llama family** (`runtime/llama_layer.zig`). Each layer has two blocks. The
   first block is attention: RMSNorm, the Q, K, and V projections, RoPE, the KV
   write, grouped-query attention, and the output projection. The second block is a
   SwiGLU feed-forward network. Each block adds its output back to the residual
   stream. The same code runs SmolLM2-135M and Llama-3.1-8B.
-- **Qwen3.5 hybrid family** (`runtime/qwen_runner.zig`). Most layers replace
+- **Qwen3.5 hybrid family** (`runtime/qwen_layer.zig`). Most layers replace
   attention with Gated-DeltaNet (`ops/gdn.zig`). A GDN layer keeps a recurrent state
   of fixed size for each head instead of a KV cache which does not grow with the sequence. 
   Every Nth layer is full attention with a norm on Q and K and an output gate. 
@@ -385,9 +386,9 @@ three placements give six runners:
 
 | Placement | Llama | Qwen3.5 | Weights | KV |
 | --- | --- | --- | --- | --- |
-| CPU | `LlamaRunner` | `QwenRunner` | the memory map | host RAM |
-| GPU (fused) | `LlamaFusedRunner` | `QwenFusedRunner` | VRAM | VRAM slots |
-| Hybrid | `LlamaHybridRunner` | `QwenHybridRunner` | the memory map for the CPU layers, VRAM for the GPU layers | each side holds the KV of its own layers |
+| CPU | `CpuRunner(llama_layer)` | `CpuRunner(qwen_layer)` | the memory map | host RAM |
+| GPU (fused) | `FusedRunner(llama_layer)` | `FusedRunner(qwen_layer)` | VRAM | VRAM slots |
+| Hybrid | `HybridRunner(Llama)` | `HybridRunner(Qwen)` | the memory map for the CPU layers, VRAM for the GPU layers | each side holds the KV of its own layers |
 
 ```
   hybrid, split = 10 of 24 layers
@@ -434,7 +435,7 @@ A runner computes a layer as a fixed sequence of op calls, for example
 op module exports the same names with the same signatures:
 
 ```
-                    a layer of llama_runner.zig
+                    a layer of llama_layer.zig
    rmsnorm -> linear Q,K,V -> rope -> attention -> linear out -> add
    rmsnorm -> linear gate,up -> swiglu -> linear down -> add
                                  |
@@ -1130,7 +1131,7 @@ main -> entry(init, dispatchRelease) -> dispatchOver(argv)   main.zig, cli/comma
     parallel.initPool(policy)                              runtime/parallel.zig: the worker threads
     vocab.buildFromParsed, bpe.encodeAlloc(prompt)         core/tokenizer/: the prompt ids
     runHost
-      LlamaRunner.init(loaded, plan, pool)                 runtime/llama_runner.zig: weight views, KV slab
+      CpuRunner(llama_layer).init(loaded, plan, pool)      runtime/cpu_runner.zig: weight views, KV slab
       prefillAndStream(runner, ids)                        cli/run_cmd.zig
         runner.prefillBatch(chunk, pos) -> stepBatch(rows) one chunk of prompt rows
         generate.decode(runner, logits, max_tokens)        runtime/generate.zig: the decode loop
@@ -1142,16 +1143,18 @@ main -> entry(init, dispatchRelease) -> dispatchOver(argv)   main.zig, cli/comma
 One step of the Llama runner:
 
 ```
-LlamaRunner.stepBatch(rows)                                runtime/llama_runner.zig
+CpuRunner(llama_layer).stepBatch(rows)                     runtime/cpu_runner.zig
   ops.embedLookup(token), for each row                     ops = the backend module of the build
-  layerForward(layer, rows), for each layer
-    ops.rmsnorm
-    linearBatch(q), linearBatch(k), linearBatch(v)         -> parallel.linearBatch -> pool.run -> ops.linearF32Q80Batch
-    ops.ropeInplace, then write K and V into the slot
-    parallel.attentionTyped                                -> ops.attentionPartTyped for each KV head group and part
+  llama_layer.forward(CpuLayerKernels, layer), for each layer
+    CpuLayerKernels.norm                                   -> ops.rmsnorm
+    CpuLayerKernels.project (q, k, v)                      -> linear_dispatch.linearBatchDispatch -> pool.run -> ops.linearF32Q80Batch
+    CpuLayerKernels.rope                                   -> ops.ropeInplace
+    CpuLayerKernels.kvCommit                               writes K and V into the slot, narrowed to the KV dtype
+    CpuLayerKernels.attention                              -> parallel.attentionTyped -> ops.attentionPartTyped for each KV head group and part
                                                            -> ops.attentionMerge
-    linearBatch(out), ops.residualAdd
-    ops.rmsnorm, linearBatch(gate), linearBatch(up), ops.swiglu, linearBatch(down), ops.residualAdd
+    CpuLayerKernels.project (out), .residual               -> linearBatchDispatch, ops.residualAdd
+    CpuLayerKernels.norm, .project (gate, up)              -> ops.rmsnorm, linearBatchDispatch
+    CpuLayerKernels.swiglu, .project (down), .residual     -> ops.swiglu, linearBatchDispatch, ops.residualAdd
   ops.rmsnorm, linearBatch(lm_head), on the rows that want logits
 ```
 
@@ -1167,7 +1170,7 @@ run_cmd.run(ctx)
     openDevice -> vulkan_ctx.Context.init                  runtime/vulkan_ctx.zig: instance, device, queue, limits
     fusedOn(ctx) -> resolve.resolve with device capacity   cli/boot/boot_resources.zig, engine/device_placement.zig: region check, VRAM fit, plan
   runFusedOn(ctx, fused, ...)                              cli/run_cmd.zig
-    QwenFusedRunner.init(ctx, loaded, plan)                runtime/qwen_fused.zig
+    FusedRunner(qwen_layer).init(ctx, loaded, plan)        runtime/fused_runner.zig
       the VRAM preflight, guardKvLayout
       the pipelines, the scratch buffers, the KvStore, the weight upload
       the descriptor sets (bound once), DecodeRing.init
@@ -1188,11 +1191,11 @@ the fused tree:
 run_cmd.run(ctx)                                           the pool gets workers again, for the CPU layers
   attemptDevice(pin = 12)                                  cli/run_cmd.zig
     openDevice, DeviceBoot.resolveOn -> DevicePlacement    cli/boot/boot_resources.zig, engine/device_placement.zig: kv_budget.planLayerSplit picks the split
-    QwenHybridRunner.init(ctx, loaded, plan)               runtime/qwen_hybrid.zig
-      QwenFusedRunner.initSuffix(first = split)            the GPU holds layers split .. n
-      QwenRunner.initPrefix(split)                         the CPU holds layers 0 .. split
+    HybridRunner(Qwen).init(ctx, loaded, plan)             runtime/hybrid_runner.zig
+      FusedRunner(qwen_layer).initSuffix(host_layers)      the GPU holds layers host_layers .. n
+      CpuRunner(qwen_layer).initPrefix(host_layers)        the CPU holds layers 0 .. host_layers
     hybrid.step(id, pos)
-      hostPrefix(rows): QwenRunner.layerForward for each CPU layer
+      hostPrefix(rows): prefix.layerForward for each CPU layer
       crossing(rows): the residual rows, one copy to the GPU
       suffix.stepHidden(x, pos) -> DecodeRing.step as on the fused path
 ```
@@ -1208,7 +1211,7 @@ serve_cmd.run(ctx)                                         cli/serve_cmd.zig
     parallel.initPool, the vocab, scheduler.Config
     the placement: fused | hybrid | CPU                    the build options and --gpu-layers
       fused: Context.init, resolveOn -> DevicePlacement      the serve rules of the plan
-             QwenFusedRunner.init
+             FusedRunner(qwen_layer).init
     launch(runner, sessions = 4)
       Sessions.init(runner)                                runtime/session.zig: the slot table, the row buffer
       Residency.init(sessions, blob budget)                serve/residency.zig: logical sessions over slots

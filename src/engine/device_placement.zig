@@ -23,20 +23,23 @@
 //! with the numbers. A default window shrinks, first to the device buffer limits and then to the
 //! VRAM figure. When no granule fits, the default stands and the runner refuses it.
 //!
-//! Slots. The llama fused runner keeps a spare stream, so it never plans one slot. The hybrid
-//! runner indexes its device suffix by `limits.max_batch`, so a hybrid slot count past that
-//! ceiling refuses when a flag pinned it and clamps when the serve options derived it.
+//! Slots. A fused serve plan holds at least the `fused_min_slots` of the family row: the llama
+//! runner keeps a spare stream. The hybrid runner indexes its device suffix by `limits.max_batch`,
+//! so a hybrid slot count past that ceiling refuses when a flag pinned it and clamps when the
+//! serve options derived it.
+//!
+//! Family. A placement reads the values of the family row of the card, never the layer shape.
 //!
 //! Per-kind rules.
 //!
 //!   rule                          run               serve                     bench
 //!   slots of the fused placement  1                 the structural slots      1
-//!                                                   (llama: at least 2)
+//!                                                   (at least fused_min_slots)
 //!   default window fit            clamp, fit        clamp, fit                clamp, fit
 //!   VRAM budget                   none              --kv-vram, --vram-slots   none
 //!   residency priced in RAM       no                yes                       no
-//!   whole-model split             falls through     the placement it selects  refuses unless
-//!                                 to the placement                            --force-hybrid
+//!   whole-model split             falls through     the placement it selects  refuses
+//!                                 to the placement
 
 const std = @import("std");
 
@@ -46,6 +49,7 @@ const kv_budget = @import("../core/kv_budget.zig");
 const kv_index = @import("../core/kv_index.zig");
 const loader = @import("../io/gguf/loader.zig");
 const kv_cost = @import("../runtime/kv_cost.zig");
+const family = @import("family.zig");
 const resolve = @import("resolve.zig");
 
 const Kind = resolve.Kind;
@@ -55,6 +59,16 @@ const Refusal = resolve.Refusal;
 const Result = resolve.Result;
 
 // -- types ------------------------------------------------------------------
+
+/// The values of a family row that a placement reads.
+const RowValues = struct {
+    /// The fewest slots of a fused serve plan.
+    fused_min_slots: u32,
+    /// The fused path of `run` honors `--prompt-cache`.
+    prompt_cache: bool,
+    /// `run` logs a placement line where each placement starts.
+    run_logs_every_placement: bool,
+};
 
 /// The reservations the fused runners make for one model. The CLI measures each field with the
 /// function the runner calls. A build without the fused ops states zero past the weight census.
@@ -343,8 +357,8 @@ pub fn hybridSlots(structural: u32, pinned: bool) error{HybridSlotsPinned}!u32 {
 }
 
 /// The placement a serve split selects. A split with no host layer is the whole-model placement
-/// again. An auto split with no GPU layer is the all-host placement. A zero count never reaches
-/// here.
+/// again. A split with no GPU layer is the all-host placement. A zero count reaches here from the
+/// bench only, and the bench refuses the result.
 pub fn placementKindFor(gpu_layers: ?kv_budget.GpuLayers, split: u32, n_layers: u32) PlacementKind {
     std.debug.assert(n_layers >= 1);
     std.debug.assert(split <= n_layers);
@@ -352,14 +366,14 @@ pub fn placementKindFor(gpu_layers: ?kv_budget.GpuLayers, split: u32, n_layers: 
     const flag = gpu_layers orelse return .fused;
     switch (flag) {
         .count => |n| {
-            std.debug.assert(n >= 1);
             std.debug.assert(n <= n_layers);
             // The planner honors a pinned count exactly, or refuses it.
             std.debug.assert(split == n_layers - n);
         },
-        .auto => if (split == n_layers) return .cpu,
+        .auto => {},
     }
 
+    if (split == n_layers) return .cpu;
     if (split == 0) return .fused;
 
     return .hybrid;
@@ -440,10 +454,14 @@ fn servePlacement(
         .costs = kv_cost.costVector(card, kv_dtype),
     };
     const host: kv_budget.HostRequest = .{ .ram_split = plan.ram, .residency = true };
-    const split = kv_budget.planLayerSplit(c, m.layers(), m.head_weights, kv, host, pin) catch
+    // Only a pinned count is refused: the auto rule leaves every layer on the host instead.
+    const split = kv_budget.planLayerSplit(c, m.layers(), m.head_weights, kv, host, pin) catch |err|
         return .{
             .layer_choice = layer_choice,
-            .placement = .{ .refused = layerSplitRefusal(.serve, c, m, kv, pin.?) },
+            .placement = .{ .refused = switch (err) {
+                error.WeightsVramBudgetTooSmall => layerSplitRefusal(.serve, c, m, kv, pin.?),
+                error.NoKvLayerInRange => .{ .layer_split_no_kv = pin.? },
+            } },
         };
     layer_choice.layer_split = split;
 
@@ -494,19 +512,20 @@ fn serveFused(
     const shape = input.serve;
     const m = resources.model.?;
     const d = resources.device.?;
-    const llama = card.gdn == null;
+    const min_slots = rowValues(&card).fused_min_slots;
     const cost = kv_budget.costModel(card.kvShape(), kv_dtype);
+    // The flag checks fixed every count at one or more, so a floor of one keeps each count.
+    std.debug.assert(shape.batch >= 1);
+    std.debug.assert(shape.structural_slots >= 1);
+    if (shape.slots_req) |s| std.debug.assert(s >= 1);
     const kv_row_elems = card.kvShape().kv_row_elems;
     var out: Fused = undefined;
     if (shape.slots_req != null or shape.kv_vram_bytes != null or shape.kv_vram_rest) {
         // Plan a VRAM budget. `--kv-vram` states X and buys the slots. `--vram-slots` pins the
         // count, and the VRAM left after the other reservations buys the window.
-        const req_batch: u32 = if (llama) @max(2, @as(u32, shape.batch)) else shape.batch;
+        const req_batch: u32 = @max(min_slots, @as(u32, shape.batch));
         const c = caps(card, m, d.vram, window.ceiling, req_batch + 1, kv_dtype);
-        const slots: ?u32 = if (shape.slots_req) |s| (if (llama) @max(
-            2,
-            @as(u32, s),
-        ) else s) else null;
+        const slots: ?u32 = if (shape.slots_req) |s| @max(min_slots, @as(u32, s)) else null;
 
         const budgeted = switch (planBudgetOnDevice(c, cost, .{
             .x_bytes = shape.kv_vram_bytes orelse kv_budget.derivedX(c),
@@ -530,10 +549,7 @@ fn serveFused(
         };
     } else {
         // Plan one slot per session at the base window.
-        const n_slots: u32 = if (llama) @max(
-            2,
-            @as(u32, shape.structural_slots),
-        ) else shape.structural_slots;
+        const n_slots: u32 = @max(min_slots, @as(u32, shape.structural_slots));
 
         const c = caps(card, m, d.vram, window.ceiling, n_slots, kv_dtype);
         const clamped = clampDefault(
@@ -615,8 +631,6 @@ fn sessionPlacement(
         }
     }
 
-    if (input.force_hybrid) std.debug.assert(pin != null);
-
     // Price the split at the window the device limits leave.
     const c = caps(card, m, d.vram, window.ceiling, 1, kv_dtype);
     const clamped = clampSession(window, card, kv_dtype, d.buffer_limits);
@@ -635,24 +649,29 @@ fn sessionPlacement(
         .clamp = clamped.clamp,
         .window = clamped.window,
     };
-    const split = kv_budget.planLayerSplit(c, m.layers(), m.head_weights, kv, host, pin) catch
+    // Only a pinned count is refused: the auto rule leaves every layer on the host instead.
+    const split = kv_budget.planLayerSplit(c, m.layers(), m.head_weights, kv, host, pin) catch |err|
         return .{
             .layer_choice = layer_choice,
-            .placement = .{ .refused = layerSplitRefusal(kind, c, m, kv, pin.?) },
+            .placement = .{ .refused = switch (err) {
+                error.WeightsVramBudgetTooSmall => layerSplitRefusal(kind, c, m, kv, pin.?),
+                error.NoKvLayerInRange => .{ .layer_split_no_kv = pin.? },
+            } },
         };
     layer_choice.layer_split = split;
 
     // Select the placement.
     if (kind == .bench) {
         // A whole-model split is a runner that the bench measures without the flag.
-        if (!input.force_hybrid and (split.host_layers == 0 or split.host_layers == n_layers)) {
+        const selected = placementKindFor(flag, split.host_layers, n_layers);
+        if (selected != .hybrid) {
             return .{
                 .layer_choice = layer_choice,
                 .placement = .{ .refused = .{ .whole_model_split = pin } },
             };
         }
 
-        layer_choice.selects = .hybrid;
+        layer_choice.selects = selected;
     } else {
         layer_choice.selects = placementKindFor(flag, split.host_layers, n_layers);
         switch (layer_choice.selects.?) {
@@ -694,12 +713,10 @@ fn sessionPlacement(
 
     // Quote the hybrid.
     const q = quoteOf(kv, split.host_layers, host, 1, false, resources.ram_free);
-    var plan = pricedOf(split, q);
-    if (plan) |*p| {
-        // A forced all-host split prices no device bytes, but the hybrid still uploads the head.
-        if (p.host_layers == n_layers) {
-            p.weight_resident = m.head_weights;
-        }
+    const plan = pricedOf(split, q);
+    if (plan) |p| {
+        std.debug.assert(p.host_layers >= 1);
+        std.debug.assert(p.host_layers < n_layers);
     }
 
     return .{
@@ -727,15 +744,18 @@ fn sessionFused(
     std.debug.assert(kv_budget.windowCeil(c) == window.ceiling);
     const fitted = fitDefault(c, cost, 1, clamped.window.base, clamped.window.flag);
     std.debug.assert(fitted.window <= clamped.window.base);
-    // The llama bench names its one slot, and the other placements let the batch state it.
-    const slots: ?u32 = if (kind == .bench and card.gdn == null) 1 else null;
-    const plan = planShape(c, cost, .{ .window = fitted.window, .slots = slots, .batch = 1 });
-    // The qwen run quote prices the prompt cache snapshots and their stages.
-    const cache = kind == .run and card.gdn != null and input.prompt_cache;
-    const ram_split: kv_budget.KvPlan.Ram = if (card.gdn != null)
-        .{ .blobs = 0, .prefix = if (cache) limits.prompt_cache_ram_default else 0 }
-    else
-        plan.ram;
+    // The batch of one states the one slot, and the plan funds no RAM.
+    const row = rowValues(&card);
+    const plan = planShape(c, cost, .{ .window = fitted.window, .batch = 1 });
+    std.debug.assert(plan.n_slots == 1);
+    std.debug.assert(plan.ram.blobs == 0);
+    std.debug.assert(plan.ram.prefix == 0);
+    // The run quote of a family that honors the prompt cache prices its snapshots and stages.
+    const cache = kind == .run and row.prompt_cache and input.prompt_cache;
+    const ram_split: kv_budget.KvPlan.Ram = .{
+        .blobs = 0,
+        .prefix = if (cache) limits.prompt_cache_ram_default else 0,
+    };
 
     const kv: kv_budget.KvStructure = .{
         .n_slots = plan.n_slots,
@@ -758,7 +778,7 @@ fn sessionFused(
             false,
             resources.ram_free,
         ),
-        .report = if (kind == .run and card.gdn == null) report(
+        .report = if (kind == .run and row.run_logs_every_placement) report(
             c,
             card,
             m,
@@ -998,6 +1018,17 @@ fn layerSplitRefusal(
     const q = kv_budget.quoteLayerSplit(c, m.layers(), m.head_weights, kv, n_gpu);
     return .{
         .layer_split_vram = .{ .kind = kind, .n_gpu = n_gpu, .spend = q.spend, .usable = q.usable },
+    };
+}
+
+/// The values of the family row of `card`.
+fn rowValues(card: *const loader.ModelCard) RowValues {
+    return switch (card.arch) {
+        inline else => |arch| .{
+            .fused_min_slots = family.Of(arch).fused_min_slots,
+            .prompt_cache = family.Of(arch).prompt_cache,
+            .run_logs_every_placement = family.Of(arch).run_logs_every_placement,
+        },
     };
 }
 
@@ -1270,6 +1301,46 @@ test "placementKindFor: the qwen 24-layer stack selects through the same placeme
     }
 
     try std.testing.expectEqual(PlacementKind.cpu, placementKindFor(.auto, n, n));
+}
+
+test "placementKindFor: the four-layer route of the placement model" {
+    // The anchor of the route in the placement model: split 0 is the fused runner, a split at the
+    // layer count is the CPU runner, and the splits between are the hybrid.
+    const want = [_]PlacementKind{ .fused, .hybrid, .hybrid, .hybrid, .cpu };
+    for (want, 0..) |kind, host_layers| {
+        try std.testing.expectEqual(kind, placementKindFor(.auto, @intCast(host_layers), 4));
+    }
+}
+
+/// The three rules of the route, stated once for the grid below.
+fn expectedKind(host_layers: u32, n_layers: u32) PlacementKind {
+    if (host_layers == 0) return .fused;
+    if (host_layers == n_layers) return .cpu;
+    return .hybrid;
+}
+
+test "placementKindFor: the flag follows the route, so the hybrid sees interior counts only" {
+    for ([_]u32{ 1, 4, 24, 30 }) |n_layers| {
+        // Auto selects by the host layer count alone, at every count the planner can return.
+        var host_layers: u32 = 0;
+        while (host_layers <= n_layers) : (host_layers += 1) {
+            const kind = placementKindFor(.auto, host_layers, n_layers);
+            try std.testing.expectEqual(expectedKind(host_layers, n_layers), kind);
+            if (kind == .hybrid) {
+                try std.testing.expect(host_layers >= 1);
+                try std.testing.expect(host_layers < n_layers);
+            }
+        }
+
+        // A pinned count of GPU layers leaves the rest on the host.
+        var n_gpu: u32 = 1;
+        while (n_gpu <= n_layers) : (n_gpu += 1) {
+            try std.testing.expectEqual(
+                expectedKind(n_layers - n_gpu, n_layers),
+                placementKindFor(.{ .count = n_gpu }, n_layers - n_gpu, n_layers),
+            );
+        }
+    }
 }
 
 test "hybridSlots: the qwen placement inherits the eight-slot ceiling" {

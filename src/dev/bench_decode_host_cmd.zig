@@ -199,11 +199,11 @@ fn benchFamily(comptime Family: type, b: *const Bench) !void {
     const kv_dtype = boot_resources.kvDtypeFor(b.opt.kv_dtype, b.model);
 
     const vram_free = boot_resources.vramFigure(b.ctxp);
-    const caps = try Family.kvCaps(ctx.gpa, b.loaded, b.ceiling, vram_free, 1, kv_dtype);
+    const caps = Family.Fused.kvCaps(b.loaded, b.ceiling, vram_free, 1, kv_dtype);
     const cost = Family.Fused.kvCostModel(card, kv_dtype);
     const plan = try kv_budget.kvPlan(caps, cost, .{ .window = b.window, .slots = 1, .batch = 1 });
 
-    const runner = try Family.initFused(ctx.gpa, b.ctxp, b.loaded, plan, kv_dtype);
+    const runner = try Family.Fused.init(ctx.gpa, b.ctxp, b.loaded, plan, kv_dtype);
     defer runner.deinit();
 
     return benchOne(Family.Fused, runner, b);
@@ -376,7 +376,7 @@ fn gapProbe(
     }
 
     // Raise the ring for the timed steps. It writes the start and end stamps at `submit` and above.
-    const level = runner.decode.level();
+    const level = runner.commands.decode.level();
 
     if (level == .off) {
         try runner.setDecodeLevel(.submit);
@@ -385,7 +385,7 @@ fn gapProbe(
     defer if (level == .off) runner.setDecodeLevel(.off) catch unreachable;
 
     // Run the timed steps and keep the stamps of each.
-    runner.host = .{};
+    runner.commands.host = .{};
     var ticks: [2 * reps_max]u64 = undefined;
     var period: f64 = 0;
     const t_all = Io.Clock.Timestamp.now(io, .awake);
@@ -429,10 +429,10 @@ fn gapProbe(
     inline for (std.meta.fields(step_stats.DecodeHost)) |f| {
         if (f.type != step_stats.Stat) continue;
         if (comptime std.mem.eql(u8, f.name, "argmax")) continue;
-        try printStat(w, "host " ++ f.name, @field(runner.host, f.name));
+        try printStat(w, "host " ++ f.name, @field(runner.commands.host, f.name));
     }
 
-    const r = runner.host.ring;
+    const r = runner.commands.host.ring;
     try w.print(
         "  record ring     hits={d}  misses={d}  speculated={d}  wasted={d}\n",
         .{ r.hits, r.misses, r.speculated, r.wasted },

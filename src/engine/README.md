@@ -59,9 +59,9 @@ The runner comes from a family row:
 ```
   loader.card.arch --> switch (arch) { inline else => |a| family.Of(a) }
                                    |
-                                   +--> Cpu     runtime/llama_runner, qwen_runner
-                                   +--> Fused   runtime/llama_fused, qwen_fused
-                                   +--> Hybrid  runtime/llama_hybrid, qwen_hybrid
+                                   +--> Cpu     runtime/cpu_runner
+                                   +--> Fused   runtime/fused_runner
+                                   +--> Hybrid  runtime/hybrid_runner
 ```
 
 Inside the directory, `resolve` imports `device_placement`, and `device_placement` imports

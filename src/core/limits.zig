@@ -185,7 +185,7 @@ pub const span_threads_max: u32 = 64;
 /// counts it.
 pub const spans_per_thread: u32 = 1024 * 1024;
 
-/// The capacity of the GPU submit ring. A record and its ready flag cost 169 bytes.
+/// The capacity of the GPU submit ring. A record and its ready flag cost 281 bytes.
 pub const trace_gpu_records: u32 = 64 * 1024;
 
 /// The largest ring capacity that `trace_spans_env` sets. A thread allocates its ring at its first
@@ -294,9 +294,8 @@ pub const prompt_cache_disk_default: u64 = 16 << 30;
 /// error. `vkAllocateMemory` otherwise runs out mid-init and removes the device.
 pub const vram_usable_num: u64 = 7;
 
-/// The 1/8 reserve absorbs what the plan omits: the upload staging buffer, allocator fragmentation,
-/// the activation scratch, and driver overhead. The Qwen runner drives that fragmentation with one
-/// device allocation per weight, about 200 of them.
+/// The 1/8 reserve absorbs what the plan omits: the upload staging buffer, the alignment padding of
+/// the weight arenas, and driver overhead.
 pub const vram_usable_den: u64 = 8;
 
 /// Usable share of the RAM that `MemAvailable` reports at boot. It covers anonymous memory: host

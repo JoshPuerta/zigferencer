@@ -33,7 +33,7 @@ const test_policy = @import("test_policy.zig");
 const loader = zigferencer.loader;
 const vocab_mod = zigferencer.vocab;
 const bpe = zigferencer.bpe;
-const LlamaRunner = zigferencer.llama_runner.LlamaRunner;
+const LlamaCpu = zigferencer.family.Of(.llama).Cpu;
 const Sessions = zigferencer.session.Sessions;
 const limits = zigferencer.limits;
 const http_server = zigferencer.serve_openai_http;
@@ -50,7 +50,7 @@ const long_message = "the quick brown fox jumps over the lazy dog " ** 20;
 /// the window before the model can stop.
 const near_full_message = "the quick brown fox jumps over the lazy dog " ** 9;
 
-const OpenAiServer = http_server.Server(Sessions(LlamaRunner));
+const OpenAiServer = http_server.Server(Sessions(LlamaCpu));
 const map = zigferencer.serve_openai_map;
 
 /// A sampled row in both modes. SmolLM2 has no card, so the test supplies one.
@@ -71,8 +71,8 @@ const Fixture = struct {
     loaded: loader.Loaded,
     vocab: vocab_mod.Vocab,
     cpu_pool: test_policy.Pool,
-    runner: LlamaRunner,
-    sessions: Sessions(LlamaRunner),
+    runner: LlamaCpu,
+    sessions: Sessions(LlamaCpu),
     codec: RawCodec,
     server: OpenAiServer,
     run_future: std.Io.Future(void),
@@ -108,16 +108,14 @@ const Fixture = struct {
         try test_policy.startPool(&fx.cpu_pool, io, policy);
         errdefer fx.cpu_pool.deinit();
 
-        fx.runner = try LlamaRunner.init(
-            arena,
-            &fx.loaded,
-            zigferencer.kv_budget.pinned(4, max_seq),
-            0,
-            &fx.cpu_pool,
-            policy,
-            .f32,
-        );
-        fx.sessions = try Sessions(LlamaRunner).init(arena, &fx.runner);
+        fx.runner = try LlamaCpu.init(arena, &fx.loaded, .{
+            .plan = zigferencer.kv_budget.pinned(4, max_seq),
+            .max_rows = 0,
+            .pool = &fx.cpu_pool,
+            .policy = policy,
+            .kv_dtype = .f32,
+        });
+        fx.sessions = try Sessions(LlamaCpu).init(arena, &fx.runner);
         fx.codec = .{
             .vocab = &fx.vocab,
             .pieces = pieces,

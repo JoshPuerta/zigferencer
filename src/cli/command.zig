@@ -67,6 +67,7 @@ pub const dev_names = [_][]const u8{
     "gpu-selftest",
     "tokens",
     "serve-demo",
+    "dispatch-list",
 };
 
 // -- types ------------------------------------------------------------------

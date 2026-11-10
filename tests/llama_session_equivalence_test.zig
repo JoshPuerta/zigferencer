@@ -42,7 +42,7 @@ const test_policy = @import("test_policy.zig");
 const loader = zigferencer.loader;
 const vocab_mod = zigferencer.vocab;
 const bpe = zigferencer.bpe;
-const LlamaRunner = zigferencer.llama_runner.LlamaRunner;
+const LlamaCpu = zigferencer.family.Of(.llama).Cpu;
 const Sessions = zigferencer.session.Sessions;
 
 // -- fixtures ---------------------------------------------------------------
@@ -57,7 +57,7 @@ const Stream = struct {
     logits_hash: [n_tokens]u64,
 };
 
-fn hashLogitsRow(runner: *const LlamaRunner, row: usize) u64 {
+fn hashLogitsRow(runner: *const LlamaCpu, row: usize) u64 {
     const vocab = runner.logits.len / runner.n_slots;
     return std.hash.Fnv1a_64.hash(std.mem.sliceAsBytes(runner.logits[row * vocab ..][0..vocab]));
 }
@@ -92,16 +92,14 @@ test "llama batched and chunk-fed decode are bit-identical to single-session run
     // -- pass a: each prompt alone on a fresh 1-slot runner -----------------
     var reference: [n_prompts]Stream = undefined;
     for (prompt_ids, 0..) |ids, p| {
-        var runner = try LlamaRunner.init(
-            arena,
-            &loaded,
-            zigferencer.kv_budget.pinned(1, max_seq),
-            0,
-            &cpu_pool,
-            cfg,
-            .f32,
-        );
-        var pool = try Sessions(LlamaRunner).init(arena, &runner);
+        var runner = try LlamaCpu.init(arena, &loaded, .{
+            .plan = zigferencer.kv_budget.pinned(1, max_seq),
+            .max_rows = 0,
+            .pool = &cpu_pool,
+            .policy = cfg,
+            .kv_dtype = .f32,
+        });
+        var pool = try Sessions(LlamaCpu).init(arena, &runner);
         const sid = try pool.create(0, .{});
         reference[p].tokens[0] = (try pool.feed(sid, ids, true)).?;
         reference[p].logits_hash[0] = hashLogitsRow(&runner, (ids.len - 1) % runner.n_slots);
@@ -115,16 +113,14 @@ test "llama batched and chunk-fed decode are bit-identical to single-session run
 
     // -- pass b: one 3-slot runner, whole prompts, batched ticks ------------
     {
-        var runner = try LlamaRunner.init(
-            arena,
-            &loaded,
-            zigferencer.kv_budget.pinned(n_prompts, max_seq),
-            0,
-            &cpu_pool,
-            cfg,
-            .f32,
-        );
-        var pool = try Sessions(LlamaRunner).init(arena, &runner);
+        var runner = try LlamaCpu.init(arena, &loaded, .{
+            .plan = zigferencer.kv_budget.pinned(n_prompts, max_seq),
+            .max_rows = 0,
+            .pool = &cpu_pool,
+            .policy = cfg,
+            .kv_dtype = .f32,
+        });
+        var pool = try Sessions(LlamaCpu).init(arena, &runner);
         var sids: [n_prompts]u32 = undefined;
         for (prompt_ids, 0..) |ids, p| {
             sids[p] = try pool.create(0, .{});
@@ -145,16 +141,14 @@ test "llama batched and chunk-fed decode are bit-identical to single-session run
 
     // -- pass c: chunk-fed prefill, 1 token, then 2 tokens, then the rest ---
     {
-        var runner = try LlamaRunner.init(
-            arena,
-            &loaded,
-            zigferencer.kv_budget.pinned(n_prompts, max_seq),
-            0,
-            &cpu_pool,
-            cfg,
-            .f32,
-        );
-        var pool = try Sessions(LlamaRunner).init(arena, &runner);
+        var runner = try LlamaCpu.init(arena, &loaded, .{
+            .plan = zigferencer.kv_budget.pinned(n_prompts, max_seq),
+            .max_rows = 0,
+            .pool = &cpu_pool,
+            .policy = cfg,
+            .kv_dtype = .f32,
+        });
+        var pool = try Sessions(LlamaCpu).init(arena, &runner);
         var sids: [n_prompts]u32 = undefined;
         for (prompt_ids, 0..) |ids, p| {
             sids[p] = try pool.create(0, .{});
@@ -185,16 +179,14 @@ test "llama batched and chunk-fed decode are bit-identical to single-session run
     // Prompt 2 arrives late and prefills through `advance` chunks that share the decode ticks.
     // The decode rows must stay exactly the solo streams.
     {
-        var runner = try LlamaRunner.init(
-            arena,
-            &loaded,
-            zigferencer.kv_budget.pinned(n_prompts, max_seq),
-            0,
-            &cpu_pool,
-            cfg,
-            .f32,
-        );
-        var pool = try Sessions(LlamaRunner).init(arena, &runner);
+        var runner = try LlamaCpu.init(arena, &loaded, .{
+            .plan = zigferencer.kv_budget.pinned(n_prompts, max_seq),
+            .max_rows = 0,
+            .pool = &cpu_pool,
+            .policy = cfg,
+            .kv_dtype = .f32,
+        });
+        var pool = try Sessions(LlamaCpu).init(arena, &runner);
         var sids: [2]u32 = undefined;
         for (0..2) |p| {
             sids[p] = try pool.create(0, .{});
@@ -257,16 +249,14 @@ test "llama batched and chunk-fed decode are bit-identical to single-session run
     // The greedy continuation of the fork must equal the solo stream of the source.
     // The source must stay undisturbed.
     {
-        var runner = try LlamaRunner.init(
-            arena,
-            &loaded,
-            zigferencer.kv_budget.pinned(2, max_seq),
-            0,
-            &cpu_pool,
-            cfg,
-            .f32,
-        );
-        var pool = try Sessions(LlamaRunner).init(arena, &runner);
+        var runner = try LlamaCpu.init(arena, &loaded, .{
+            .plan = zigferencer.kv_budget.pinned(2, max_seq),
+            .max_rows = 0,
+            .pool = &cpu_pool,
+            .policy = cfg,
+            .kv_dtype = .f32,
+        });
+        var pool = try Sessions(LlamaCpu).init(arena, &runner);
         const source = try pool.create(0, .{});
         try std.testing.expectEqual(
             reference[0].tokens[0],
@@ -297,16 +287,14 @@ test "llama batched and chunk-fed decode are bit-identical to single-session run
         try test_policy.startPool(&par_cpu_pool, io, cfg_par);
         defer par_cpu_pool.deinit();
 
-        var runner = try LlamaRunner.init(
-            arena,
-            &loaded,
-            zigferencer.kv_budget.pinned(n_prompts, max_seq),
-            0,
-            &par_cpu_pool,
-            cfg_par,
-            .f32,
-        );
-        var pool = try Sessions(LlamaRunner).init(arena, &runner);
+        var runner = try LlamaCpu.init(arena, &loaded, .{
+            .plan = zigferencer.kv_budget.pinned(n_prompts, max_seq),
+            .max_rows = 0,
+            .pool = &par_cpu_pool,
+            .policy = cfg_par,
+            .kv_dtype = .f32,
+        });
+        var pool = try Sessions(LlamaCpu).init(arena, &runner);
         var sids: [n_prompts]u32 = undefined;
         for (prompt_ids, 0..) |ids, p| {
             sids[p] = try pool.create(0, .{});
@@ -349,16 +337,14 @@ test "llama CPU prefix restore: a warm-restored prefix continues bit-exactly" {
     std.debug.assert(ids.len >= 2); // the split needs a prefix row and a suffix row
     const n: u32 = @intCast(ids.len - 1);
 
-    var runner = try LlamaRunner.init(
-        arena,
-        &loaded,
-        zigferencer.kv_budget.pinned(2, max_seq),
-        0,
-        &cpu_pool,
-        cfg,
-        .f32,
-    );
-    var pool = try Sessions(LlamaRunner).init(arena, &runner);
+    var runner = try LlamaCpu.init(arena, &loaded, .{
+        .plan = zigferencer.kv_budget.pinned(2, max_seq),
+        .max_rows = 0,
+        .pool = &cpu_pool,
+        .policy = cfg,
+        .kv_dtype = .f32,
+    });
+    var pool = try Sessions(LlamaCpu).init(arena, &runner);
 
     // Cold: feed the prefix without logits, snapshot those rows, then feed the suffix.
     var cold_stream: [n_tokens]u32 = undefined;

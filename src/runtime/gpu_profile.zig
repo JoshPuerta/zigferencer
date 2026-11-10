@@ -2,14 +2,17 @@
 //! one `GpuProfile`: the two decode ring buffers, the batch and prefill buffer of each runner, and
 //! the one-shot staging buffer (through `vulkan_ctx.Context.staging_query_pool`).
 //!
-//! Comptime. `inline for` walks the `Phase` fields, and `core_log.hot` removes the trace code
-//! from builds without hot tracing.
+//! Comptime. `core_log.hot` removes the trace code from builds without hot tracing, and the mark
+//! bound comes from the limits.
 //!
 //! Levels. The level comes from `$ZIGFERENCER_TRACE_GPU` (`span.gpuLevel`). At `off`, the default,
 //! `begin`, `mark`, and `end` emit no command, so the command stream is byte-identical to an
 //! unprofiled one. At `submit`, a buffer writes two timestamps, start and end. At `phases`, it
-//! writes every `mark` of the record functions, and `report` buckets the intervals by `Phase`.
+//! writes every `mark` of the record functions, and `collect` sums the intervals by `OpKey`.
 //! `mark` also carries the `.dispatch` hot trace, which `-Dtrace` gates at build time.
+//!
+//! Marks. A mark closes the interval of one op set, or of one pass of a split op. `report` groups
+//! the sums by `OpClass`, then by op, and it prints each pass under its op.
 //!
 //! Query rules. `begin` resets every slot the buffer can write, in the same command buffer, before
 //! the first write. `collect` reads the pool only after the wait that the submit path already does,
@@ -19,37 +22,62 @@
 //! one blocking call for each query. A result that is not ready yet counts in `not_ready` and
 //! reads again with the flag.
 //!
-//! Full bound. `prof_max` bounds the marks of one submit. `dropped` counts the marks past it, and
-//! `report` prints the count, so a full pool never deflates the per-phase percentages in silence.
-//! Each profile warns once, which keeps a long run from writing one line per record.
+//! Full bound. `prof_max` bounds the marks of one submit: the attention of the widest prefill
+//! chunk marks two passes per record group. `dropped` counts the marks past it, and `report`
+//! prints the count, so a full pool never deflates the percentages in silence. Each profile warns
+//! once, which keeps a long run from writing one line per record.
 
 const std = @import("std");
 const vk = @import("vulkan");
 const vulkan_ctx = @import("vulkan_ctx.zig");
 const core_log = @import("../core/log.zig");
+const layer_op = @import("../core/layer_op.zig");
+const limits = @import("../core/limits.zig");
 const span = @import("../core/span.zig");
 const record_ring = @import("../core/record_ring.zig");
+
+const OpClass = layer_op.OpClass;
+const OpKey = layer_op.OpKey;
+const OpPart = layer_op.OpPart;
+const OpSet = layer_op.OpSet;
+const assert = std.debug.assert;
 
 const log_dispatch = std.log.scoped(.dispatch);
 const log = std.log.scoped(.gpu);
 
 // -- constants --------------------------------------------------------------
 
-/// Bound on timestamps per profiled submit (64 layers x ~14 marks + tail).
-pub const prof_max: u32 = 1024;
+/// The most record groups of the split attention in one step: the widest prefill chunk, with at
+/// least `attn_split_rows` split rows in each group.
+const attn_groups_max: u32 = std.math.divCeil(
+    u32,
+    limits.max_prefill_chunk,
+    limits.attn_split_rows,
+) catch unreachable;
+
+/// The most marks of one layer: one per op of the list, a second pass of the KV commit and of the
+/// GDN, and the split mark and the merge mark of each attention record group.
+const layer_marks_max: u32 = layer_op.op_count + 2 + 2 * attn_groups_max;
+
+/// The input copy, the final norm, the lm_head, and the readback.
+const head_marks = 4;
+
+/// Bound on timestamps per profiled submit: the start, the marks of `limits.max_layers` layers,
+/// and the marks of the input copy and of the head.
+pub const prof_max: u32 = 1 + limits.max_layers * layer_marks_max + head_marks;
+
 /// Stdout buffer of one `report`.
-const report_buffer_bytes = 1024;
-/// The longest row label of `report`: a phase name plus its indent.
-const report_label_bytes = 24;
+const report_buffer_bytes = 4096;
+
+/// The deepest indent of a `report` row: a pass under its op under its class.
+const report_indent_max = 4;
+
+/// The longest row label of `report`: the longest key name plus the deepest indent.
+const report_label_bytes = report_indent_max + keyNameMax();
 
 // -- types ------------------------------------------------------------------
 
 pub const Level = span.GpuLevel;
-
-/// Op-group labels. The Llama runner uses no `gdn_*`, no `matmul_gdn_in`, and
-/// no `qknorm`. The Qwen decode step runs conv and scan in one kernel and
-/// books it under `gdn_scan`.
-pub const Phase = span.GpuPhase;
 
 pub const RecordOpts = record_ring.RecordOpts;
 pub const DecodeKey = record_ring.DecodeKey;
@@ -63,8 +91,8 @@ pub const Readout = struct {
     dropped: u32,
     /// The intervals where the device counter stepped back (see `span.tickSpan`).
     backsteps: u32,
-    /// The interval sums by phase, at the `phases` level only.
-    phase_ns: ?[span.gpu_phase_count]f64,
+    /// The interval sums by op key, at the `phases` level only.
+    op_ns: ?[OpKey.count]f64,
 
     /// The GPU record of this readout for the span recorder.
     pub fn record(
@@ -84,21 +112,21 @@ pub const Readout = struct {
             .host_wait_ns = span.tsNs(wait),
             .backsteps = self.backsteps,
         };
-        if (self.phase_ns) |ph| {
-            var out: [span.gpu_phase_count]u64 = undefined;
-            for (ph, &out) |ns, *o| {
+        if (self.op_ns) |sums| {
+            var out: [OpKey.count]u64 = undefined;
+            for (sums, &out) |ns, *o| {
                 o.* = @intFromFloat(ns);
             }
 
-            rec.phases = out;
+            rec.op_ns = out;
         }
 
         return rec;
     }
 
-    /// Print the per-`Phase` table on stdout, because the output of an opt-in profiler is program
-    /// output. `hdr` labels the run, as in "[qwen prefill warmup] b=411". The two host times are
-    /// the record step and the submit-plus-wait step.
+    /// Print the table of the op sums on stdout, because the output of an opt-in profiler is
+    /// program output. `hdr` labels the run, as in "[qwen prefill warmup] b=411". The two host
+    /// times are the record step and the submit-plus-wait step. A row with no time stays out.
     pub fn report(
         self: Readout,
         io: std.Io,
@@ -108,7 +136,7 @@ pub const Readout = struct {
         wait_ms: f64,
     ) !void {
         // Print the run line.
-        const bucket = self.phase_ns.?;
+        const sums = &self.op_ns.?;
         const total_ns = @as(f64, @floatFromInt(self.gpu_end - self.gpu_start)) * self.period_ns;
 
         var buf: [report_buffer_bytes]u8 = undefined;
@@ -121,43 +149,9 @@ pub const Readout = struct {
             .{ self.marks, self.dropped, self.backsteps, total_ns / 1e6, record_ms, wait_ms },
         );
 
-        // Sum the group totals. The summary lines `matmul` and `gdn` keep their names for scripts.
-        var matmul_ns: f64 = 0;
-        var gdn_ns: f64 = 0;
-        inline for (std.meta.fields(Phase)) |fld| {
-            const ph = @field(Phase, fld.name);
-            if (isMatmul(ph)) {
-                matmul_ns += bucket[@intFromEnum(ph)];
-            }
-
-            if (isGdn(ph)) {
-                gdn_ns += bucket[@intFromEnum(ph)];
-            }
-        }
-
-        // Print each group total, then its indented parts.
-        try printLine(w, "matmul", matmul_ns, total_ns, 0);
-        inline for (std.meta.fields(Phase)) |fld| {
-            const ph = @field(Phase, fld.name);
-            if (comptime isMatmul(ph)) {
-                try printLine(w, fld.name, bucket[@intFromEnum(ph)], total_ns, 2);
-            }
-        }
-
-        try printLine(w, "gdn", gdn_ns, total_ns, 0);
-        inline for (std.meta.fields(Phase)) |fld| {
-            const ph = @field(Phase, fld.name);
-            if (comptime isGdn(ph)) {
-                try printLine(w, fld.name, bucket[@intFromEnum(ph)], total_ns, 2);
-            }
-        }
-
-        // Print the phases outside both groups.
-        inline for (std.meta.fields(Phase)) |fld| {
-            const ph = @field(Phase, fld.name);
-            if (comptime !isMatmul(ph) and !isGdn(ph)) {
-                try printLine(w, fld.name, bucket[@intFromEnum(ph)], total_ns, 0);
-            }
+        // Print each class, then its ops, then the passes of each op.
+        for (std.enums.values(OpClass)) |class| {
+            try printClass(w, sums, class, total_ns);
         }
 
         try w.flush();
@@ -183,7 +177,8 @@ pub const GpuProfile = struct {
     warned_full: bool = false,
     /// Readbacks that found a result not ready after the wait and read again with the wait flag.
     not_ready: u32 = 0,
-    labels: [prof_max]Phase = undefined,
+    /// The key of the interval that each timestamp closes. Index 0 closes none.
+    labels: [prof_max]OpKey = undefined,
 
     /// A profile at `level`. Its pool holds the slots of `pool_for`, or of `level` when that is
     /// larger, so a later `setLevel` up to `pool_for` creates no pool. `off` and `pool_for == .off`
@@ -196,7 +191,7 @@ pub const GpuProfile = struct {
             .level = level,
         };
         // `Context.init` drops the level to off on a device that cannot time.
-        if (level != .off) std.debug.assert(self.canTime());
+        if (level != .off) assert(self.canTime());
 
         try self.ensurePool(@max(slotsFor(level), slotsFor(pool_for)));
         return self;
@@ -225,7 +220,7 @@ pub const GpuProfile = struct {
         }
 
         try self.ensurePool(slotsFor(level));
-        std.debug.assert(self.capacity >= slotsFor(level));
+        assert(self.capacity >= slotsFor(level));
     }
 
     /// True when the queue can time a command buffer.
@@ -235,7 +230,7 @@ pub const GpuProfile = struct {
 
     /// Change the level within the pool. The next record writes at it.
     pub fn setLevel(self: *GpuProfile, level: Level) void {
-        std.debug.assert(slotsFor(level) <= self.capacity);
+        assert(slotsFor(level) <= self.capacity);
 
         self.level = level;
         self.n = 0;
@@ -247,24 +242,25 @@ pub const GpuProfile = struct {
         if (self.level == .off) return;
 
         const slots = slotsFor(self.level);
-        std.debug.assert(slots <= self.capacity);
+        assert(slots <= self.capacity);
         self.ctx.vkd.cmdResetQueryPool(cb, self.query_pool, 0, slots);
         self.ctx.vkd.cmdWriteTimestamp(cb, .{ .top_of_pipe_bit = true }, self.query_pool, 0);
-        self.labels[0] = .copy;
         self.n = 1;
         self.dropped = 0;
     }
 
-    /// Tag the interval that just ended with its `Phase`. The `.dispatch` trace
-    /// fires on every record pass. The timestamp writes only at `phases`.
-    pub fn mark(self: *GpuProfile, cb: vk.CommandBuffer, phase: Phase) void {
+    /// Close the interval that just ended on `ops`, or on the pass `part` of the one op of
+    /// `ops`. The `.dispatch` trace fires on every record pass. The timestamp writes only at
+    /// `phases`.
+    pub fn mark(self: *GpuProfile, cb: vk.CommandBuffer, ops: OpSet, part: ?OpPart) void {
+        const key: OpKey = .of(ops, part);
         if (comptime core_log.hot) {
-            log_dispatch.debug("mark: {t}", .{phase});
+            log_dispatch.debug("mark: {s}", .{key.name()});
         }
 
         if (self.level != .phases) return;
 
-        std.debug.assert(self.n >= 1);
+        assert(self.n >= 1);
         if (self.n >= prof_max) {
             if (!self.warned_full) {
                 log_dispatch.warn(
@@ -280,7 +276,7 @@ pub const GpuProfile = struct {
             return;
         }
 
-        self.labels[self.n] = phase;
+        self.labels[self.n] = key;
         self.ctx.vkd.cmdWriteTimestamp(
             cb,
             .{ .bottom_of_pipe_bit = true },
@@ -296,7 +292,7 @@ pub const GpuProfile = struct {
         switch (self.level) {
             .off => {},
             .submit => {
-                std.debug.assert(self.n == 1);
+                assert(self.n == 1);
 
                 self.ctx.vkd.cmdWriteTimestamp(
                     cb,
@@ -306,7 +302,7 @@ pub const GpuProfile = struct {
                 );
                 self.n = 2;
             },
-            .phases => std.debug.assert(self.n >= 2),
+            .phases => assert(self.n >= 2),
         }
     }
 
@@ -316,14 +312,14 @@ pub const GpuProfile = struct {
         if (self.n == 0) return null;
 
         const n = self.n;
-        std.debug.assert(n >= 2);
-        std.debug.assert(n <= self.capacity);
+        assert(n >= 2);
+        assert(n <= self.capacity);
         self.n = 0;
 
         var ts: [prof_max]u64 = undefined;
         try self.readAll(ts[0..n]);
 
-        // Turn the ticks into intervals, and bucket the intervals at `phases`.
+        // Turn the ticks into intervals, and sum the intervals by key at `phases`.
         var deltas: [prof_max - 1]u64 = undefined;
         const t = span.tickSpan(ts[0..n], self.tick_mask, deltas[0 .. n - 1]);
         var r: Readout = .{
@@ -333,15 +329,15 @@ pub const GpuProfile = struct {
             .marks = n,
             .dropped = self.dropped,
             .backsteps = t.backsteps,
-            .phase_ns = null,
+            .op_ns = null,
         };
         if (self.level == .phases) {
-            var bucket: [span.gpu_phase_count]f64 = @splat(0);
-            for (deltas[0 .. n - 1], self.labels[1..n]) |dt, label| {
-                bucket[@intFromEnum(label)] += @as(f64, @floatFromInt(dt)) * self.period_ns;
+            var sums: [OpKey.count]f64 = @splat(0);
+            for (deltas[0 .. n - 1], self.labels[1..n]) |dt, key| {
+                sums[@intFromEnum(key)] += @as(f64, @floatFromInt(dt)) * self.period_ns;
             }
 
-            r.phase_ns = bucket;
+            r.op_ns = sums;
         }
 
         return r;
@@ -378,13 +374,13 @@ pub const GpuProfile = struct {
         }
 
         const again = try self.readTicks(ts, true);
-        std.debug.assert(again == .success);
+        assert(again == .success);
     }
 
     /// Read the first `ts.len` slots. With `wait`, the driver blocks until each result is ready.
     fn readTicks(self: *GpuProfile, ts: []u64, wait: bool) !vk.Result {
-        std.debug.assert(ts.len >= 2);
-        std.debug.assert(ts.len <= self.capacity);
+        assert(ts.len >= 2);
+        assert(ts.len <= self.capacity);
 
         const n: u32 = @intCast(ts.len);
         return self.ctx.vkd.getQueryPoolResults(
@@ -419,7 +415,7 @@ pub const decodeKey = record_ring.decodeKey;
 
 /// The mask of the valid bits of a tick. Zero bits give a zero mask.
 pub fn tickMask(valid_bits: u32) u64 {
-    std.debug.assert(valid_bits <= 64);
+    assert(valid_bits <= 64);
 
     if (valid_bits == 64) return std.math.maxInt(u64);
     return (@as(u64, 1) << @intCast(valid_bits)) - 1;
@@ -436,61 +432,125 @@ pub fn slotsFor(level: Level) u32 {
 
 // -- helpers ----------------------------------------------------------------
 
-/// True when the phase counts toward the `matmul` summary line.
-fn isMatmul(ph: Phase) bool {
-    return switch (ph) {
-        .matmul_gdn_in, .matmul_attn_in, .matmul_out, .matmul_ffn_up, .matmul_ffn_down => true,
-        else => false,
-    };
+/// The sum of every key of `class`.
+fn classNs(sums: *const [OpKey.count]f64, class: OpClass) f64 {
+    var ns: f64 = 0;
+    for (sums, 0..) |key_ns, i| {
+        const key: OpKey = @enumFromInt(i);
+        if (key.class() == class) {
+            ns += key_ns;
+        }
+    }
+
+    return ns;
 }
 
-/// True when the phase counts toward the `gdn` summary line.
-fn isGdn(ph: Phase) bool {
-    return ph == .gdn_conv or ph == .gdn_scan;
+/// The row of an op key: its own sum, plus the sum of each pass of its op.
+fn rowNs(sums: *const [OpKey.count]f64, key: OpKey) f64 {
+    assert(key.part() == null);
+
+    var ns = sums[@intFromEnum(key)];
+    if (key.ops().count() > 1) return ns;
+
+    for (std.enums.values(OpPart)) |p| {
+        if (p.op() == key.op()) {
+            ns += sums[@intFromEnum(OpKey.of(key.ops(), p))];
+        }
+    }
+
+    return ns;
 }
 
-/// One report row. A part row sits `indent` spaces in and keeps the columns.
+/// The rows of `class` in a report: the class, each op with time, and each pass with time.
+fn printClass(
+    w: *std.Io.Writer,
+    sums: *const [OpKey.count]f64,
+    class: OpClass,
+    total_ns: f64,
+) !void {
+    const class_ns = classNs(sums, class);
+    if (class_ns == 0) return;
+
+    try printLine(w, @tagName(class), class_ns, total_ns, 0);
+    for (0..OpKey.count) |i| {
+        const key: OpKey = @enumFromInt(i);
+        if (key.part() != null or key.class() != class) continue;
+
+        const row_ns = rowNs(sums, key);
+        if (row_ns == 0) continue;
+
+        try printLine(w, key.name(), row_ns, total_ns, 2);
+        if (key.ops().count() > 1) continue;
+
+        for (std.enums.values(OpPart)) |p| {
+            if (p.op() != key.op()) continue;
+
+            const ns = sums[@intFromEnum(OpKey.of(key.ops(), p))];
+            if (ns > 0) {
+                try printLine(w, @tagName(p), ns, total_ns, 4);
+            }
+        }
+    }
+}
+
+/// The longest key name, which sizes the label of a report row.
+fn keyNameMax() usize {
+    var most: usize = 0;
+    for (0..OpKey.count) |i| {
+        const key: OpKey = @enumFromInt(i);
+        most = @max(most, key.name().len);
+    }
+
+    return most;
+}
+
+/// One report row. A nested row sits `indent` spaces in and keeps the columns.
 fn printLine(w: *std.Io.Writer, name: []const u8, ns: f64, total_ns: f64, indent: usize) !void {
-    var label: [report_label_bytes]u8 = undefined;
-    std.debug.assert(indent + name.len <= label.len);
-    @memset(label[0..indent], ' ');
+    assert(indent <= report_indent_max);
+    assert(indent + name.len <= report_label_bytes);
+
+    var label: [report_label_bytes]u8 = @splat(' ');
     @memcpy(label[indent..][0..name.len], name);
-    try w.print(
-        "  {s:<18} {d:>8.2} ms  ({d:>5.1}%)\n",
-        .{ label[0 .. indent + name.len], ns / 1e6, 100.0 * ns / total_ns },
-    );
+    try w.print("  {s} {d:>8.2} ms  ({d:>5.1}%)\n", .{ &label, ns / 1e6, 100.0 * ns / total_ns });
 }
 
 // -- tests ------------------------------------------------------------------
 
-test "every phase counts in at most one report group" {
-    var matmul: usize = 0;
-    var gdn: usize = 0;
-    inline for (std.meta.fields(Phase)) |fld| {
-        const ph = @field(Phase, fld.name);
-        if (isMatmul(ph)) {
-            matmul += 1;
-        }
-
-        if (isGdn(ph)) {
-            gdn += 1;
-        }
-
-        try std.testing.expect(!(isMatmul(ph) and isGdn(ph)));
-    }
-
-    try std.testing.expectEqual(@as(usize, 5), matmul);
-    try std.testing.expectEqual(@as(usize, 2), gdn);
+test "rowNs: an op row sums the op and each of its passes, and a class sums its keys" {
+    var sums: [OpKey.count]f64 = @splat(0);
+    const attention: OpSet = .initOne(.attention);
+    sums[@intFromEnum(OpKey.ofOp(.attention))] = 1;
+    sums[@intFromEnum(OpKey.of(attention, .split))] = 2;
+    sums[@intFromEnum(OpKey.of(attention, .merge))] = 4;
+    sums[@intFromEnum(OpKey.of(.initOne(.gdn), .conv))] = 8;
+    sums[@intFromEnum(OpKey.ofOp(.attn_proj))] = 16;
+    try std.testing.expectEqual(@as(f64, 7), rowNs(&sums, .ofOp(.attention)));
+    try std.testing.expectEqual(@as(f64, 8), rowNs(&sums, .ofOp(.gdn)));
+    try std.testing.expectEqual(@as(f64, 7), classNs(&sums, .attention));
+    try std.testing.expectEqual(@as(f64, 8), classNs(&sums, .recurrent));
+    try std.testing.expectEqual(@as(f64, 16), classNs(&sums, .matmul));
+    try std.testing.expectEqual(@as(f64, 0), classNs(&sums, .norm));
 }
 
-test "a part row keeps the summary columns" {
-    var buf: [128]u8 = undefined;
+test "prof_max: the widest prefill chunk of the deepest stack fits one submit" {
+    // The richest layer is a Qwen full-attention layer at a narrow KV dtype: twelve ops of one
+    // pass, the two KV passes, the resident rows, and two marks per attention record group.
+    const richest_layer = 12 + 2 + 1 + 2 * attn_groups_max;
+    try std.testing.expectEqual(@as(u32, 64), attn_groups_max);
+    try std.testing.expect(layer_marks_max >= richest_layer);
+    try std.testing.expect(prof_max >= 1 + limits.max_layers * richest_layer + head_marks);
+}
+
+test "a nested row keeps the columns of its class row" {
+    var buf: [256]u8 = undefined;
     var w: std.Io.Writer = .fixed(&buf);
-    try printLine(&w, "matmul", 2e6, 4e6, 0);
-    try printLine(&w, "matmul_out", 1e6, 4e6, 2);
+    try printLine(&w, "attention", 2e6, 4e6, 0);
+    try printLine(&w, "attention", 2e6, 4e6, 2);
+    try printLine(&w, "split", 1e6, 4e6, 4);
     try std.testing.expectEqualStrings(
-        "  matmul                 2.00 ms  ( 50.0%)\n" ++
-            "    matmul_out           1.00 ms  ( 25.0%)\n",
+        "  attention                2.00 ms  ( 50.0%)\n" ++
+            "    attention              2.00 ms  ( 50.0%)\n" ++
+            "      split                1.00 ms  ( 25.0%)\n",
         w.buffered(),
     );
 }

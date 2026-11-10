@@ -14,17 +14,21 @@
 //! worker share ends the flow of its own index. A flow id is the epoch word above the worker index.
 //!
 //! Args. Bit 0 of `Span.flags` marks a set arg, so an arg of 0 still reads as a value.
+//!
+//! Ops. An op span takes a `Name` past the tags, one for each `OpKey`, and its slice reads the key
+//! name. A GPU slice carries one `<key>_ns` arg for each op key with time.
 
 const std = @import("std");
 const limits = @import("limits.zig");
 const gpu_record = @import("gpu_record.zig");
+const layer_op = @import("layer_op.zig");
 const perfetto = @import("perfetto.zig");
 
+const OpKey = layer_op.OpKey;
+const OpSet = layer_op.OpSet;
 const assert = std.debug.assert;
 
 // -- constants --------------------------------------------------------------
-
-const gpu_phase_count = gpu_record.gpu_phase_count;
 
 const trace_sequence: u32 = 1;
 const process_name = "zigferencer";
@@ -41,18 +45,24 @@ const ring_shift = 32;
 
 const gpu_track_name_bytes = 32;
 
-/// The args of one GPU slice: the device time, the host submit and wait, and each phase sum.
-const gpu_args_max = 3 + gpu_phase_count;
+/// The args of one GPU slice: the device time, the host submit and wait, and each op sum.
+const gpu_args_max = 3 + OpKey.count;
 
-const name_count = std.meta.fields(Name).len;
+/// The span names: the tags, then one op name per key.
+const name_count = Name.op_base + OpKey.count;
 const label_count = std.meta.fields(GpuLabel).len;
 const key_count = std.meta.fields(ArgKey).len;
 
-/// The interned event names: the span names (iid = tag + 1), the GPU labels, and `trace_meta`.
+/// The interned event names: the span names (iid = value + 1), the GPU labels, and `trace_meta`.
 const event_names = blk: {
     var out: [name_count + label_count + 1][]const u8 = undefined;
     for (std.meta.fields(Name), 0..) |f, i| {
         out[i] = f.name;
+    }
+
+    for (0..OpKey.count) |k| {
+        const key: OpKey = @enumFromInt(k);
+        out[Name.op_base + k] = key.name();
     }
 
     for (std.meta.fields(GpuLabel), 0..) |f, i| {
@@ -65,15 +75,16 @@ const event_names = blk: {
 
 const meta_iid: u64 = name_count + label_count + 1;
 
-/// The interned arg names: the `ArgKey` tags (iid = tag + 1), then one `<phase>_ns` per phase.
+/// The interned arg names: the `ArgKey` tags (iid = tag + 1), then one `<key>_ns` per op key.
 const arg_names = blk: {
-    var out: [key_count + gpu_phase_count][]const u8 = undefined;
+    var out: [key_count + OpKey.count][]const u8 = undefined;
     for (std.meta.fields(ArgKey), 0..) |f, i| {
         out[i] = f.name;
     }
 
-    for (std.meta.fields(GpuPhase), 0..) |f, i| {
-        out[key_count + i] = f.name ++ "_ns";
+    for (0..OpKey.count) |k| {
+        const key: OpKey = @enumFromInt(k);
+        out[key_count + k] = key.name() ++ "_ns";
     }
 
     break :blk out;
@@ -90,7 +101,8 @@ comptime {
 
 // -- types ------------------------------------------------------------------
 
-/// The closed span vocabulary. The interned event name is the tag name.
+/// The closed span vocabulary. The interned event name is the tag name. An op span takes the
+/// value `op_base` plus its `OpKey`, and its event name reads as the key.
 pub const Name = enum(u16) {
     model_load,
     tokenize,
@@ -113,33 +125,35 @@ pub const Name = enum(u16) {
     run_share,
     layer_forward,
     host_prefix,
-    // The op names, which `cpu_profile` groups by family.
-    op_embed,
-    op_rmsnorm,
-    op_gdn_proj,
-    op_gdn_step,
-    op_gdn_out,
-    op_qkv_proj,
-    op_attn_proj,
-    op_rope,
-    op_qk_norm_rope,
-    op_kv_commit,
-    op_attention,
-    op_attn_gate,
-    op_o_proj,
-    op_gate_up_proj,
-    op_swiglu,
-    op_down_proj,
-    op_residual,
-    op_lm_head,
     worker_spin,
     worker_sleep,
     gpu_collect,
+    _,
 
-    /// True for the `op_*` names, the names that a `Sums` counts.
-    pub fn isOp(self: Name) bool {
+    /// The value of the first op span: one past the last tag.
+    pub const op_base: u16 = std.meta.fields(Name).len;
+
+    /// The name of a span over `ops`.
+    pub fn ofOps(ops: OpSet) Name {
+        return ofKey(.of(ops, null));
+    }
+
+    pub fn ofKey(key: OpKey) Name {
+        return @enumFromInt(op_base + @as(u16, @intFromEnum(key)));
+    }
+
+    /// The key of an op span. Null for a tag.
+    pub fn opKey(self: Name) ?OpKey {
         const n = @intFromEnum(self);
-        return n >= @intFromEnum(Name.op_embed) and n <= @intFromEnum(Name.op_lm_head);
+        if (n < op_base) return null;
+
+        assert(n - op_base < OpKey.count);
+        return @enumFromInt(n - op_base);
+    }
+
+    /// True for an op span, the span that a `Sums` counts.
+    pub fn isOp(self: Name) bool {
+        return self.opKey() != null;
     }
 
     /// The shape of a part span: a `pool_run` of 2 or more participants, or a worker share.
@@ -175,7 +189,6 @@ pub const Span = extern struct {
 const GpuLevel = gpu_record.GpuLevel;
 const GpuRunner = gpu_record.GpuRunner;
 const GpuLabel = gpu_record.GpuLabel;
-const GpuPhase = gpu_record.GpuPhase;
 const GpuRecord = gpu_record.GpuRecord;
 
 /// One thread track of the trace. `spans` must be sorted by `lessThan`.
@@ -226,7 +239,7 @@ pub const TraceInput = struct {
     meta: Meta,
 };
 
-/// The interned arg names. The writer appends one `<phase>_ns` per GPU phase.
+/// The interned arg names. The writer appends one `<key>_ns` per op key.
 const ArgKey = enum(u8) {
     epoch,
     layer,
@@ -313,10 +326,8 @@ fn argOf(key: ArgKey, value: u64) perfetto.Arg {
     return .{ .name_iid = @as(u64, @intFromEnum(key)) + 1, .value = value };
 }
 
-fn phaseArg(phase: usize, ns: u64) perfetto.Arg {
-    assert(phase < gpu_phase_count);
-
-    return .{ .name_iid = key_count + phase + 1, .value = ns };
+fn opArg(key: OpKey, ns: u64) perfetto.Arg {
+    return .{ .name_iid = key_count + @as(u64, @intFromEnum(key)) + 1, .value = ns };
 }
 
 /// The label of the span arg. An op or a `run_share` carries the epoch word only as a worker share.
@@ -481,10 +492,10 @@ fn gpuArgs(rec: GpuRecord, buf: *[gpu_args_max]perfetto.Arg) []const perfetto.Ar
     buf[1] = argOf(.host_submit_ns, rec.host_submit_ns);
     buf[2] = argOf(.host_wait_ns, rec.host_wait_ns);
     var n: usize = 3;
-    if (rec.phases) |ph| {
-        for (ph, 0..) |ns, p| {
+    if (rec.op_ns) |sums| {
+        for (sums, 0..) |ns, k| {
             if (ns == 0) continue;
-            buf[n] = phaseArg(p, ns);
+            buf[n] = opArg(@enumFromInt(k), ns);
             n += 1;
         }
     }
@@ -537,17 +548,28 @@ test "name: partFits accepts a pool run of 2 or more parts and a worker share on
     try testing.expect(Name.run_share.partFits(0));
     try testing.expect(Name.run_share.partFits(max - 1));
     try testing.expect(!Name.run_share.partFits(max));
-    try testing.expect(Name.op_attention.partFits(1));
-    try testing.expect(!Name.op_attention.partFits(0));
-    try testing.expect(!Name.op_attention.partFits(max));
+    const attention: Name = .ofOps(.initOne(.attention));
+    try testing.expect(attention.partFits(1));
+    try testing.expect(!attention.partFits(0));
+    try testing.expect(!attention.partFits(max));
     try testing.expect(!Name.decode_step.partFits(1));
     try testing.expect(!Name.layer_forward.partFits(0));
 }
 
-test "name: the op names are exactly the op_ tags" {
+test "name: an op name follows the tags, maps back to its key, and reads as the key" {
     for (std.enums.values(Name)) |n| {
-        try testing.expectEqual(std.mem.startsWith(u8, @tagName(n), "op_"), n.isOp());
+        try testing.expect(!n.isOp());
     }
+
+    for (0..OpKey.count) |k| {
+        const key: OpKey = @enumFromInt(k);
+        const n: Name = .ofKey(key);
+        try testing.expect(n.isOp());
+        try testing.expectEqual(key, n.opKey().?);
+        try testing.expectEqualStrings(key.name(), event_names[nameIid(n) - 1]);
+    }
+
+    try testing.expectEqual(Name.ofKey(.ofOp(.rope)), Name.ofOps(.initOne(.rope)));
 }
 
 /// The bounds of a decoded test trace.
@@ -834,14 +856,14 @@ test "trace: a pool run starts one flow per worker share, and trace_meta states 
             .flags = Span.flag_arg,
         },
         .{ .start_ns = 1110, .end_ns = 1500, .name = .run_share, .arg = 7, .flags = Span.flag_arg },
-        .{ .start_ns = 1700, .end_ns = 1800, .name = .op_rmsnorm },
+        .{ .start_ns = 1700, .end_ns = 1800, .name = .ofOps(.initOne(.attn_norm)) },
         .{ .start_ns = 1900, .end_ns = 2100, .name = .sample },
     };
     var one = [_]Span{
         .{
             .start_ns = 1120,
             .end_ns = 1450,
-            .name = .op_attention,
+            .name = .ofOps(.initOne(.attention)),
             .arg = 7,
             .part = 1,
             .flags = Span.flag_arg,
@@ -852,7 +874,7 @@ test "trace: a pool run starts one flow per worker share, and trace_meta states 
         .{
             .start_ns = 1130,
             .end_ns = 1480,
-            .name = .op_attention,
+            .name = .ofOps(.initOne(.attention)),
             .arg = 7,
             .part = 2,
             .flags = Span.flag_arg,
@@ -919,7 +941,7 @@ test "trace: a pool run starts one flow per worker share, and trace_meta states 
     // A worker share names its worker and its epoch.
     var shares: u32 = 0;
     for (d.begins[0..d.n_begins]) |row| {
-        if (!std.mem.eql(u8, row.name, "op_attention")) continue;
+        if (!std.mem.eql(u8, row.name, "attention")) continue;
 
         shares += 1;
         try testing.expectEqual(@as(?u64, 7), d.argOfRow(row, "epoch"));

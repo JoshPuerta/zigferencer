@@ -67,8 +67,8 @@ gates skip the model and build synthetic inputs.
   core/test_fixtures.path --> loader.load --> Loaded         miss: skip, or fail when the
                               |                              model store is set
       load, tokenizer:        +--> ModelCard, Vocab --> bpe
-      snapshot, runners:      +--> LlamaRunner | QwenRunner | Sessions --> sampler
-      serve:                  +--> Server(Sessions(LlamaRunner)) <-- Client | libzmq | http client
+      snapshot, runners:      +--> family.Of(arch).Cpu | Sessions --> sampler
+      serve:                  +--> Server(Sessions(Cpu)) <-- Client | libzmq | http client
       GPU runners:            device probe --> fused or hybrid runner against the CPU runner
       kernel gates:           device probe --> one kernel against its CPU op, with no GGUF
 ```
@@ -105,9 +105,9 @@ values come from the llama.cpp reference and live in the file.
   `llama_vulkan_serve`, `qwen_vulkan_serve`, and `llama_hybrid_serve`. `vulkan_attention` is
   the one gate that states a relative tolerance of its own, `2e-3`, the same
   value the bench uses.
-- **Bytes are compared within one executor, tokens across two.** The equivalence
+- **Bytes are compared within one backend, tokens across two.** The equivalence
   files hash the raw logits rows with FNV-1a. They compare the hashes where both sides
-  ran on the same executor. Across executors the KV bits differ, because a GPU
+  ran on the same backend. Across backends the KV bits differ, because a GPU
   reduce kernel sums in a different order. Those gates compare greedy tokens
   instead.
 - **The values that cross in carry no hidden state.** A `ModelCard` and a `[]TensorRef` come from

@@ -46,7 +46,7 @@ const test_policy = @import("test_policy.zig");
 const loader = zigferencer.loader;
 const vocab_mod = zigferencer.vocab;
 const bpe = zigferencer.bpe;
-const QwenRunner = zigferencer.qwen_runner.QwenRunner;
+const QwenCpu = zigferencer.family.Of(.qwen35).Cpu;
 const Sessions = zigferencer.session.Sessions;
 const KvDtype = zigferencer.dtype.KvDtype;
 
@@ -61,7 +61,7 @@ const Stream = struct {
     logits_hash: [n_tokens]u64,
 };
 
-fn hashLogitsRow(runner: *const QwenRunner, row: usize) u64 {
+fn hashLogitsRow(runner: *const QwenCpu, row: usize) u64 {
     const vocab = runner.logits.len / runner.n_slots;
     return std.hash.Fnv1a_64.hash(std.mem.sliceAsBytes(runner.logits[row * vocab ..][0..vocab]));
 }
@@ -80,16 +80,14 @@ fn cpuRunner(
     n_slots: u32,
     kv_dtype: KvDtype,
     policy: test_policy.Policy,
-) !QwenRunner {
-    return QwenRunner.init(
-        arena,
-        loaded,
-        zigferencer.kv_budget.pinned(n_slots, zigferencer.test_fakes.test_window),
-        0,
-        cpu_pool,
-        policy,
-        kv_dtype,
-    );
+) !QwenCpu {
+    return QwenCpu.init(arena, loaded, .{
+        .plan = zigferencer.kv_budget.pinned(n_slots, zigferencer.test_fakes.test_window),
+        .max_rows = 0,
+        .pool = cpu_pool,
+        .policy = policy,
+        .kv_dtype = kv_dtype,
+    });
 }
 
 fn soloStream(
@@ -103,7 +101,7 @@ fn soloStream(
     defer cpu_pool.deinit();
 
     var runner = try cpuRunner(arena, &cpu_pool, loaded, 1, .f32, default_policy);
-    var pool = try Sessions(QwenRunner).init(arena, &runner);
+    var pool = try Sessions(QwenCpu).init(arena, &runner);
     const sid = try pool.create(0, .{});
     var s: Stream = undefined;
     s.tokens[0] = (try pool.feed(sid, ids, true)).?;
@@ -134,7 +132,7 @@ fn greedyProbe(
     defer cpu_pool.deinit();
 
     var runner = try cpuRunner(arena, &cpu_pool, loaded, 1, kv_dtype, default_policy);
-    var pool = try Sessions(QwenRunner).init(arena, &runner);
+    var pool = try Sessions(QwenCpu).init(arena, &runner);
     const sid = try pool.create(0, .{});
     out[0] = (try pool.feed(sid, ids, true)).?;
     for (1..out.len) |k| {
@@ -175,7 +173,7 @@ test "qwen time-sliced sessions are bit-identical to solo runs, and slot reuse s
     defer cpu_pool.deinit();
 
     var runner = try cpuRunner(arena, &cpu_pool, &loaded, prompts.len, .f32, default_policy);
-    var pool = try Sessions(QwenRunner).init(arena, &runner);
+    var pool = try Sessions(QwenCpu).init(arena, &runner);
     var sids: [prompts.len]u32 = undefined;
     for (prompt_ids, 0..) |ids, p| {
         sids[p] = try pool.create(0, .{});
@@ -317,7 +315,7 @@ test "qwen time-sliced sessions are bit-identical to solo runs, and slot reuse s
             .f32,
             forced,
         );
-        var par_pool = try Sessions(QwenRunner).init(arena, &par_runner);
+        var par_pool = try Sessions(QwenCpu).init(arena, &par_runner);
         var par_sids: [prompts.len]u32 = undefined;
         for (prompt_ids, 0..) |ids, p| {
             par_sids[p] = try par_pool.create(0, .{});
@@ -362,7 +360,7 @@ test "qwen prefix restore: a warm-restored prefix continues bit-exactly" {
     defer cpu_pool.deinit();
 
     var runner = try cpuRunner(arena, &cpu_pool, &loaded, 2, .f32, default_policy);
-    var pool = try Sessions(QwenRunner).init(arena, &runner);
+    var pool = try Sessions(QwenCpu).init(arena, &runner);
 
     // Cold: feed the prefix without logits, snapshot those rows, then feed the suffix.
     var cold_stream: [n_tokens]u32 = undefined;
@@ -420,7 +418,7 @@ test "qwen kv f16: the kv slab halves and the blob round-trips" {
 
     // The blob narrows its KV half only. The GDN state stays f32, so both blobs share it.
     const n_rows: u32 = @intCast(ids.len);
-    const per_step: u32 = wide.n_kv_heads * wide.head_dim;
+    const per_step: u32 = wide.card.n_kv_heads * wide.card.head_dim;
     const n_full: u32 = wide.kv_slots[0].n_layers;
     const kv_wide: u64 = @as(u64, 2) * n_full * n_rows * KvDtype.f32.rowBytes(per_step);
     const kv_narrow: u64 = @as(u64, 2) * n_full * n_rows * KvDtype.f16.rowBytes(per_step);
@@ -432,7 +430,7 @@ test "qwen kv f16: the kv slab halves and the blob round-trips" {
 
     // An evict, a restore and a second evict must reproduce the same bytes at
     // f16. A byte range that misframes the dtype shifts every region after it.
-    var pool = try Sessions(QwenRunner).init(arena, &narrow);
+    var pool = try Sessions(QwenCpu).init(arena, &narrow);
     const sid = try pool.create(0, .{});
     _ = try pool.feed(sid, ids, true);
     const first = try arena.alloc(u8, @intCast(bytes_narrow));

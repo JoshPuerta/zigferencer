@@ -1,10 +1,10 @@
 //! Batching gate for the qwen fused runner on the GPU. The greedy token streams that the multi-slot
-//! `stepBatch` produces must equal the CPU `QwenRunner` reference streams exactly.
+//! `stepBatch` produces must equal the reference streams of the CPU runner exactly.
 //!
 //! Equality. Greedy tokens are exact across backends. The per-kernel numerics stay under the
 //! tolerance each kernel declares.
 //!
-//! Batched decode. Two sessions decode interleaved through `Sessions(QwenFusedRunner)`. This drives
+//! Batched decode. Two sessions decode interleaved through `Sessions(QwenFused)`. This drives
 //! the same-slot runs of chunked prefill through the per-run GDN dispatches and the per-row rope
 //! and attention. The test then clones one session. The fork must continue the stream of its
 //! source, which pins the device-side slot copy.
@@ -31,12 +31,12 @@ const test_policy = @import("test_policy.zig");
 const loader = zigferencer.loader;
 const vocab_mod = zigferencer.vocab;
 const bpe = zigferencer.bpe;
-const QwenRunner = zigferencer.qwen_runner.QwenRunner;
+const QwenCpu = zigferencer.family.Of(.qwen35).Cpu;
 const Sessions = zigferencer.session.Sessions;
 const Residency = zigferencer.serve_residency.Residency;
 const limits = zigferencer.limits;
 const vulkan_ctx = zigferencer.vulkan_ctx;
-const qwen_fused = zigferencer.qwen_fused;
+const QwenFused = zigferencer.family.Of(.qwen35).Fused;
 
 // -- fixtures ---------------------------------------------------------------
 
@@ -56,14 +56,14 @@ fn fusedPlan(
     const fakes = zigferencer.test_fakes;
     const window = if (n_slots <= 1) fakes.test_window else fakes.test_serve_window;
     return zigferencer.kv_budget.kvPlan(
-        qwen_fused.QwenFusedRunner.kvCaps(
+        QwenFused.kvCaps(
             loaded,
             limits.contextCeiling(loaded.card.context_length, null),
             0,
             n_slots,
             kv_dtype,
         ),
-        qwen_fused.QwenFusedRunner.kvCostModel(loaded.card, kv_dtype),
+        QwenFused.kvCostModel(loaded.card, kv_dtype),
         .{
             .window = @min(loaded.card.context_length, window),
             .slots = n_slots,
@@ -97,16 +97,14 @@ fn batchedDecodeGate(kv_dtype: zigferencer.dtype.KvDtype) !void {
         try test_policy.startPool(&cpu_pool, io, test_policy.policy());
         defer cpu_pool.deinit();
 
-        var runner = try QwenRunner.init(
-            arena,
-            &loaded,
-            zigferencer.kv_budget.pinned(1, zigferencer.test_fakes.test_window),
-            0,
-            &cpu_pool,
-            test_policy.policy(),
-            kv_dtype,
-        );
-        var pool = try Sessions(QwenRunner).init(arena, &runner);
+        var runner = try QwenCpu.init(arena, &loaded, .{
+            .plan = zigferencer.kv_budget.pinned(1, zigferencer.test_fakes.test_window),
+            .max_rows = 0,
+            .pool = &cpu_pool,
+            .policy = test_policy.policy(),
+            .kv_dtype = kv_dtype,
+        });
+        var pool = try Sessions(QwenCpu).init(arena, &runner);
         const sid = try pool.create(0, .{});
         reference[p].tokens[0] = (try pool.feed(sid, ids, true)).?;
         for (1..n_tokens) |k| {
@@ -121,7 +119,7 @@ fn batchedDecodeGate(kv_dtype: zigferencer.dtype.KvDtype) !void {
     ctxp.* = vulkan_ctx.Context.init(arena, .{}) catch return error.SkipZigTest;
     defer ctxp.deinit();
 
-    const fused = qwen_fused.QwenFusedRunner.init(
+    const fused = QwenFused.init(
         gpa,
         ctxp,
         &loaded,
@@ -131,7 +129,7 @@ fn batchedDecodeGate(kv_dtype: zigferencer.dtype.KvDtype) !void {
         return error.SkipZigTest;
     defer fused.deinit();
 
-    var pool = try Sessions(qwen_fused.QwenFusedRunner).init(arena, fused);
+    var pool = try Sessions(QwenFused).init(arena, fused);
 
     var sids: [prompts.len]u32 = undefined;
     for (prompt_ids, 0..) |ids, p| {
@@ -202,16 +200,14 @@ test "qwen GPU residency over-subscription: 2 sessions, 1 VRAM slot, streams mat
         try test_policy.startPool(&cpu_pool, io, test_policy.policy());
         defer cpu_pool.deinit();
 
-        var runner = try QwenRunner.init(
-            arena,
-            &loaded,
-            zigferencer.kv_budget.pinned(1, zigferencer.test_fakes.test_window),
-            0,
-            &cpu_pool,
-            test_policy.policy(),
-            .f32,
-        );
-        var pool = try Sessions(QwenRunner).init(arena, &runner);
+        var runner = try QwenCpu.init(arena, &loaded, .{
+            .plan = zigferencer.kv_budget.pinned(1, zigferencer.test_fakes.test_window),
+            .max_rows = 0,
+            .pool = &cpu_pool,
+            .policy = test_policy.policy(),
+            .kv_dtype = .f32,
+        });
+        var pool = try Sessions(QwenCpu).init(arena, &runner);
         const sid = try pool.create(0, .{});
         reference[p].tokens[0] = (try pool.feed(sid, ids, true)).?;
         for (1..n_tokens) |k| {
@@ -226,7 +222,7 @@ test "qwen GPU residency over-subscription: 2 sessions, 1 VRAM slot, streams mat
     ctxp.* = vulkan_ctx.Context.init(arena, .{}) catch return error.SkipZigTest;
     defer ctxp.deinit();
 
-    const fused = qwen_fused.QwenFusedRunner.init(
+    const fused = QwenFused.init(
         gpa,
         ctxp,
         &loaded,
@@ -236,9 +232,9 @@ test "qwen GPU residency over-subscription: 2 sessions, 1 VRAM slot, streams mat
         return error.SkipZigTest;
     defer fused.deinit();
 
-    var sessions = try Sessions(qwen_fused.QwenFusedRunner).init(arena, fused);
+    var sessions = try Sessions(QwenFused).init(arena, fused);
     var res = try Residency(
-        Sessions(qwen_fused.QwenFusedRunner),
+        Sessions(QwenFused),
     ).init(arena, gpa, &sessions, 2, null);
     defer res.deinit();
 
@@ -282,7 +278,7 @@ test "qwen GPU prefix restore: a warm-restored prefix continues bit-exactly" {
     ctxp.* = vulkan_ctx.Context.init(arena, .{}) catch return error.SkipZigTest;
     defer ctxp.deinit();
 
-    const fused = qwen_fused.QwenFusedRunner.init(
+    const fused = QwenFused.init(
         gpa,
         ctxp,
         &loaded,
@@ -292,7 +288,7 @@ test "qwen GPU prefix restore: a warm-restored prefix continues bit-exactly" {
         return error.SkipZigTest;
     defer fused.deinit();
 
-    var pool = try Sessions(qwen_fused.QwenFusedRunner).init(arena, fused);
+    var pool = try Sessions(QwenFused).init(arena, fused);
 
     // Cold: feed the prefix without logits, snapshot those rows, then feed the suffix.
     var cold_stream: Stream = undefined;

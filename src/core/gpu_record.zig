@@ -1,5 +1,5 @@
 //! The GPU submit records: their vocabulary, their mapping onto the host clock, and the folded
-//! stacks of their phase sums. Pure functions only. `span.zig` holds the ring and the writer.
+//! stacks of their op sums. Pure functions only. `span.zig` holds the ring and the writer.
 //!
 //! Comptime. An assert pins the size of `GpuRecord`, which prices the GPU ring.
 //!
@@ -17,15 +17,18 @@
 //! Device ticks. A stamp delta wraps at the valid bits of the queue, so `tickSpan` masks each
 //! delta. A masked delta above `mask / 2` is a step back of the counter, not a near-full wrap. It
 //! counts as zero ticks and as one backstep. The end is the start plus the sum of the deltas, so
-//! `end - start` and the phase sums agree. A sum past `u64` saturates.
+//! `end - start` and the op sums agree. A sum past `u64` saturates.
+//!
+//! Folded. A stack reads runner, label, class, op, then the pass of a split op, so a flame graph
+//! nests each pass under its op.
 
 const std = @import("std");
+const layer_op = @import("layer_op.zig");
 
+const OpKey = layer_op.OpKey;
 const assert = std.debug.assert;
 
 // -- constants --------------------------------------------------------------
-
-pub const gpu_phase_count = std.meta.fields(GpuPhase).len;
 
 /// Records that the local offset of one record reads: itself and the records after it.
 pub const anchor_window: u32 = 16;
@@ -33,7 +36,7 @@ pub const anchor_window: u32 = 16;
 // -- types ------------------------------------------------------------------
 
 /// The GPU timestamp level, from `$ZIGFERENCER_TRACE_GPU`. `submit` writes a start and an end
-/// stamp per command buffer. `phases` also writes every phase mark of the record functions.
+/// stamp per command buffer. `phases` also writes every op mark of the record functions.
 pub const GpuLevel = enum(u8) { off, submit, phases };
 
 /// The runner that recorded a GPU command buffer. `staging` is `kernels.submitOnce`, which no
@@ -42,29 +45,6 @@ pub const GpuRunner = enum(u8) { llama_fused, qwen_fused, llama_hybrid, qwen_hyb
 
 /// What a GPU command buffer did. The last four are the labels of `kernels.SubmitLabel`.
 pub const GpuLabel = enum(u8) { decode, decode_batch, prefill_chunk, copy, fill, clone, dispatch };
-
-/// The op groups of the GPU phase marks. Each matmul phase names its projection group.
-pub const GpuPhase = enum(u8) {
-    /// GDN input projections: qkv, z, alpha, beta.
-    matmul_gdn_in,
-    /// Attention input projections: q, k, v.
-    matmul_attn_in,
-    /// Output projections: ssm_out and o.
-    matmul_out,
-    /// FFN gate and up.
-    matmul_ffn_up,
-    /// FFN down.
-    matmul_ffn_down,
-    gdn_conv,
-    gdn_scan,
-    qknorm,
-    rope,
-    attn,
-    elementwise,
-    norm,
-    lmhead,
-    copy,
-};
 
 /// One GPU command buffer, read back after the wait its path already does. The device ticks stay
 /// raw, and `period_ns` converts them. The host times are `.awake` nanoseconds at submit and wait.
@@ -76,15 +56,15 @@ pub const GpuRecord = struct {
     period_ns: f64,
     host_submit_ns: u64,
     host_wait_ns: u64,
-    /// The phase sums of a `phases` record. A `submit` record has none.
-    phases: ?[gpu_phase_count]u64 = null,
+    /// The sums by op key of a `phases` record. A `submit` record has none.
+    op_ns: ?[OpKey.count]u64 = null,
     /// The intervals where the device counter stepped back. Each counts as zero ticks.
     backsteps: u32 = 0,
 
     comptime {
-        // The ring stores one ready flag beside each record, so an entry costs 169 bytes.
+        // The ring stores one ready flag beside each record, so an entry costs 281 bytes.
         // `docs/profiling.md` prices the GPU ring with it.
-        assert(@sizeOf(GpuRecord) == 168);
+        assert(@sizeOf(GpuRecord) == 280);
     }
 
     pub fn gpuStartNs(self: GpuRecord) i64 {
@@ -173,39 +153,37 @@ pub fn tickSpan(ts: []const u64, mask: u64, deltas: ?[]u64) TickSpan {
     return out;
 }
 
-/// Write one folded-stack line per runner kind, label, and phase with the summed nanoseconds, for
+/// Write one folded-stack line per runner kind, label, and op key with the summed nanoseconds, for
 /// `flamegraph.pl`. A `submit` record adds its whole span to its runner and label line.
 pub fn writeFolded(w: *std.Io.Writer, records: []const GpuRecord) std.Io.Writer.Error!void {
     const n_runner = std.meta.fields(GpuRunner).len;
     const n_label = std.meta.fields(GpuLabel).len;
-    // The last phase column holds the records without phases.
-    var sum: [n_runner][n_label][gpu_phase_count + 1]u64 = @splat(@splat(@splat(0)));
+    // The last key column holds the records without op sums.
+    var sum: [n_runner][n_label][OpKey.count + 1]u64 = @splat(@splat(@splat(0)));
     for (records) |rec| {
         const cell = &sum[@intFromEnum(rec.runner)][@intFromEnum(rec.label)];
-        if (rec.phases) |ph| {
-            for (ph, 0..) |ns, p| {
-                cell[p] += ns;
+        if (rec.op_ns) |sums| {
+            for (sums, 0..) |ns, k| {
+                cell[k] += ns;
             }
         } else {
-            cell[gpu_phase_count] += @intCast(rec.gpuEndNs() - rec.gpuStartNs());
+            cell[OpKey.count] += @intCast(rec.gpuEndNs() - rec.gpuStartNs());
         }
     }
 
     for (sum, 0..) |per_runner, ri| {
         for (per_runner, 0..) |cell, li| {
-            for (cell, 0..) |ns, p| {
+            for (cell, 0..) |ns, k| {
                 if (ns == 0) continue;
 
                 const runner: GpuRunner = @enumFromInt(ri);
                 const label: GpuLabel = @enumFromInt(li);
-                if (p == gpu_phase_count) {
-                    try w.print("{t};{t} {d}\n", .{ runner, label, ns });
-                } else {
-                    try w.print(
-                        "{t};{t};{t} {d}\n",
-                        .{ runner, label, @as(GpuPhase, @enumFromInt(p)), ns },
-                    );
+                try w.print("{t};{t}", .{ runner, label });
+                if (k < OpKey.count) {
+                    try writeKeyFrames(w, @enumFromInt(k));
                 }
+
+                try w.print(" {d}\n", .{ns});
             }
         }
     }
@@ -216,6 +194,17 @@ pub fn ticksToNs(ticks: u64, period_ns: f64) i64 {
     assert(period_ns > 0);
 
     return @intFromFloat(@as(f64, @floatFromInt(ticks)) * period_ns);
+}
+
+// -- helpers ----------------------------------------------------------------
+
+/// The frames of one op key: the class, the op or the fused set, then the pass of a split op.
+fn writeKeyFrames(w: *std.Io.Writer, key: OpKey) std.Io.Writer.Error!void {
+    if (key.part()) |p| {
+        try w.print(";{t};{t};{t}", .{ key.class(), key.op(), p });
+    } else {
+        try w.print(";{t};{s}", .{ key.class(), key.name() });
+    }
 }
 
 // -- tests ------------------------------------------------------------------
@@ -311,10 +300,11 @@ test "anchor: each record sits in its host window and follows a drifting device 
     );
 }
 
-test "folded: one line per runner, label, and phase with the summed time" {
-    var ph: [gpu_phase_count]u64 = @splat(0);
-    ph[@intFromEnum(GpuPhase.attn)] = 300;
-    ph[@intFromEnum(GpuPhase.lmhead)] = 50;
+test "folded: one line per runner, label, and op key with the summed time" {
+    var ph: [OpKey.count]u64 = @splat(0);
+    ph[@intFromEnum(OpKey.ofOp(.attention))] = 300;
+    ph[@intFromEnum(OpKey.of(.initOne(.attention), .split))] = 20;
+    ph[@intFromEnum(OpKey.ofOp(.lm_head))] = 50;
     const recs = [_]GpuRecord{
         .{
             .runner = .llama_fused,
@@ -324,7 +314,7 @@ test "folded: one line per runner, label, and phase with the summed time" {
             .period_ns = 1,
             .host_submit_ns = 1,
             .host_wait_ns = 400,
-            .phases = ph,
+            .op_ns = ph,
         },
         .{
             .runner = .llama_fused,
@@ -334,7 +324,7 @@ test "folded: one line per runner, label, and phase with the summed time" {
             .period_ns = 1,
             .host_submit_ns = 1,
             .host_wait_ns = 800,
-            .phases = ph,
+            .op_ns = ph,
         },
         .{
             .runner = .staging,
@@ -350,8 +340,9 @@ test "folded: one line per runner, label, and phase with the summed time" {
     var w: std.Io.Writer = .fixed(&buf);
     try writeFolded(&w, &recs);
     try testing.expectEqualStrings(
-        "llama_fused;decode;attn 600\n" ++
-            "llama_fused;decode;lmhead 100\n" ++
+        "llama_fused;decode;attention;attention 600\n" ++
+            "llama_fused;decode;matmul;lm_head 100\n" ++
+            "llama_fused;decode;attention;attention;split 40\n" ++
             "staging;copy 80\n",
         w.buffered(),
     );

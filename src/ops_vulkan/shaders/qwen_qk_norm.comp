@@ -3,7 +3,7 @@
 // What
 //   The kernel fuses the norm with the de-interleave of the query|gate projection. The fusion is
 //   why this variant exists: a separate de-interleave pass reads and writes the whole projection
-//   again. It mirrors `fullMixer` in runtime/qwen_runner.zig.
+//   again. It serves the `qkNorm` op of the Qwen full-attention layer in runtime/qwen_layer.zig.
 //
 // Math
 //   For head h and head index d, with inbase = in_off + h * in_stride:

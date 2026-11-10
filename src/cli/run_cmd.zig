@@ -316,15 +316,13 @@ fn runHost(
 
     // Build the runner. One prompt chunk of slot 0 is the most rows a step holds.
     const t_init = Io.Clock.Timestamp.now(ctx.io, .awake);
-    var runner = try Family.Cpu.init(
-        ctx.arena,
-        b.loaded,
-        plan,
-        limits.cpu_prefill_chunk,
-        t.pool,
-        b.policy,
-        b.kvDtype(),
-    );
+    var runner = try Family.Cpu.init(ctx.arena, b.loaded, .{
+        .plan = plan,
+        .max_rows = limits.cpu_prefill_chunk,
+        .pool = t.pool,
+        .policy = b.policy,
+        .kv_dtype = b.kvDtype(),
+    });
     log.info("{s} cpu runner ready in {d:.0} ms", .{ Family.name, msSince(ctx.io, t_init) });
 
     return prefillAndStream(&runner, t);
@@ -360,7 +358,7 @@ fn runFusedOn(
         logLayerSplit(report);
     }
 
-    const runner = try Family.initFused(ctx.gpa, ctxp, b.loaded, f.plan, kv_dtype);
+    const runner = try Family.Fused.init(ctx.gpa, ctxp, b.loaded, f.plan, kv_dtype);
     defer runner.deinit();
 
     log.info("{s} gpu runner ready in {d:.0} ms", .{ Family.name, msSince(ctx.io, t_init) });
@@ -467,10 +465,12 @@ fn runHybrid(
         ctx.gpa,
         ctxp,
         b.loaded,
-        layer_split,
-        t.pool,
-        b.policy,
-        b.kvDtype(),
+        .{
+            .plan = layer_split,
+            .pool = t.pool,
+            .policy = b.policy,
+            .kv_dtype = b.kvDtype(),
+        },
     );
     defer hybrid.deinit();
 

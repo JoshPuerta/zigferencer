@@ -1,7 +1,6 @@
 //! The split path of `bench-model`: `--gpu-layers` names a count or `auto`, the
-//! real planner prices the split, and the real hybrid runner runs it.
-//! `--force-hybrid` also builds at a degenerate split, which production selection
-//! never does. That forced construction is the cross-runner token gate.
+//! real planner prices the split, and the real hybrid runner runs it. A split that resolves to
+//! zero or all host layers refuses, because a whole-model runner serves it.
 //!
 //! Comptime. Generic over the model family. A block rejects a non-fused build.
 
@@ -44,20 +43,6 @@ pub fn bench(comptime Family: type, b: *const Bench) !void {
     const opt = b.opt;
     const kv_dtype = b.kvDtype();
 
-    // Refuse a forced split on a family without one.
-    if (comptime !Family.forced_split) {
-        if (opt.force_hybrid) {
-            return args.fail(
-                ctx.io,
-                "--force-hybrid is llama-family only. " ++
-                    "The qwen hybrid holds no degenerate split, " ++
-                    "so its cross-runner gate compares the fused " ++
-                    "and CPU runners against a real split",
-                .{},
-            );
-        }
-    }
-
     // Refuse a bad pin, then start the pool and the device.
     try refuseOverLayerCount(b);
 
@@ -78,10 +63,12 @@ pub fn bench(comptime Family: type, b: *const Bench) !void {
         ctx.gpa,
         ctxp,
         b.loaded,
-        plan,
-        &pool,
-        b.policy,
-        kv_dtype,
+        .{
+            .plan = plan,
+            .pool = &pool,
+            .policy = b.policy,
+            .kv_dtype = kv_dtype,
+        },
     );
     defer runner.deinit();
 
@@ -106,10 +93,8 @@ pub fn bench(comptime Family: type, b: *const Bench) !void {
     return exec.runSeries(runner, b, turn, plan_info, true);
 }
 
-// -- helpers ----------------------------------------------------------------
-
 /// A pin past the layer count costs no device, so it refuses before the context.
-fn refuseOverLayerCount(b: *const Bench) error{UsageError}!void {
+pub fn refuseOverLayerCount(b: *const Bench) error{UsageError}!void {
     const gpu_layers = b.opt.engine.gpu_layers.?.pin() orelse return;
     const n_layers = b.loaded.card.n_layers;
 
@@ -120,7 +105,7 @@ fn refuseOverLayerCount(b: *const Bench) error{UsageError}!void {
 }
 
 /// Resolve the split on the context, and log the placement and its price.
-fn resolveSplit(b: *const Bench, ctxp: *vulkan_ctx_mod.Context) !device_placement.Hybrid {
+pub fn resolveSplit(b: *const Bench, ctxp: *vulkan_ctx_mod.Context) !device_placement.Hybrid {
     const io = b.ctx.io;
     const name = b.model.pub_name;
 

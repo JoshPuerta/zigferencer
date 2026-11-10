@@ -13,8 +13,8 @@
 //!   slots of the CPU placement  1                 the structural slots      1
 //!   residency priced in RAM     no                yes                       no
 //!   prefix default (no Y)       none              the serve default         none
-//!   whole-model split           falls through     the placement it selects  refuses unless
-//!                               to the placement                            --force-hybrid
+//!   whole-model split           falls through     the placement it selects  refuses
+//!                               to the placement
 //!   thinking refusals           `on`              `on` and a budget         none (auto)
 //!   per-op vulkan refusals      f16 KV            every boot                f16 KV
 //!
@@ -88,8 +88,6 @@ pub const Input = struct {
     /// `run --prompt-cache`. The qwen fused placement prices the cache in its RAM
     /// quote.
     prompt_cache: bool = false,
-    /// `bench-model --force-hybrid`.
-    force_hybrid: bool = false,
 };
 
 /// What the CLI measures once per boot.
@@ -164,6 +162,8 @@ pub const Refusal = union(enum) {
     /// The structural slot count a pinned `--vram-slots` asks of a split.
     hybrid_slots: u32,
     layer_split_vram: struct { kind: Kind, n_gpu: u32, spend: u64, usable: u64 },
+    /// The pinned GPU layer count of a split whose GPU layers hold no KV layer.
+    layer_split_no_kv: u32,
     /// The pin of a bench split that keeps the whole model on one tier. Null
     /// is the auto pin.
     whole_model_split: ?u32,
@@ -1026,7 +1026,8 @@ const kv_vram512: Input = gpu4(.{ .batch = 2, .kv_vram_bytes = 512 * mib });
 const kv_vram1: Input = gpu4(.{ .batch = 2, .kv_vram_bytes = 1 * mib });
 const auto_in: Input = .{ .engine = auto };
 const gl0_in: Input = .{ .engine = gl0 };
-const forced0: Input = .{ .engine = gl0, .force_hybrid = true };
+const glall30_in: Input = .{ .engine = .{ .gpu_layers = .{ .count = 30 } } };
+const glall24_in: Input = .{ .engine = .{ .gpu_layers = .{ .count = 24 } } };
 
 /// Row fields that name the storage range or the VRAM budget of a capture.
 const range_1gib = .{ .storage_range = 1 << 30 };
@@ -1099,8 +1100,8 @@ const device_rows =
         .{ "f16", .{ .engine = f16kv }, fused(1, 8192, 180) },
         .{ "gl0", gl0_in, refused(.whole_model_split), .{ .host_layers = 30 } },
         .{ "gl6", .{ .engine = gl6 }, hybrid(1, 8192, 288), .{ .host_layers = 24 } },
+        .{ "glall", glall30_in, refused(.whole_model_split), .{ .host_layers = 0 } },
         .{ "glauto", auto_in, refused(.whole_model_split), .{ .host_layers = 0 } },
-        .{ "gl0-force-hybrid", forced0, hybrid(1, 8192, 360), .{ .host_layers = 30 } },
     }) ++
     deviceRows(.run, qwen, .{
         .{ "default", .{}, fused(1, 131072, 1555), .{ .clamped = true } },
@@ -1146,6 +1147,12 @@ const device_rows =
             .{ .engine = gl6 },
             hybrid(1, 131072, 1038),
             .{ .host_layers = 18, .clamped = true },
+        },
+        .{
+            "glall",
+            glall24_in,
+            refused(.whole_model_split),
+            .{ .host_layers = 0, .clamped = true },
         },
         .{ "glauto", auto_in, refused(.whole_model_split), .{ .host_layers = 0, .clamped = true } },
     });

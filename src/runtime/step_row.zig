@@ -78,6 +78,25 @@ pub fn validateRows(
     return n_logits;
 }
 
+/// The rows of a prompt chunk on slot 0: `tokens` at `start_pos` onward, with logits for the last
+/// row only. `out` must hold `tokens.len` rows.
+pub fn chunkRows(out: []StepRow, tokens: []const u32, start_pos: u32) []const StepRow {
+    std.debug.assert(tokens.len >= 1);
+    std.debug.assert(tokens.len <= out.len);
+
+    // A position past the `u32` range saturates, so `validateRows` refuses it as past the window.
+    for (tokens, out[0..tokens.len], 0..) |token, *r, i| {
+        r.* = .{
+            .slot = 0,
+            .token = token,
+            .pos = start_pos +| @as(u32, @intCast(i)),
+            .want_logits = i == tokens.len - 1,
+        };
+    }
+
+    return out[0..tokens.len];
+}
+
 /// Start of the `want_logits` suffix. The lm_head runs for that suffix only, so the prompt rows of
 /// a prefill chunk skip the costliest matmul in the model.
 pub fn wantLogitsFirst(rows: []const StepRow) u32 {
@@ -119,4 +138,18 @@ test "validateRows: a row count past the cap is a typed error" {
     };
     try std.testing.expectError(error.TooManyRows, validateRows(&rows, 1, 1, 16));
     try std.testing.expectEqual(@as(u32, 1), try validateRows(&rows, 1, 2, 16));
+}
+
+test "chunkRows: a chunk past the window is a typed error, at the u32 ceiling too" {
+    var buf: [4]StepRow = undefined;
+    const tokens = [_]u32{ 7, 8, 9 };
+    const rows = chunkRows(&buf, &tokens, 13);
+    try std.testing.expectEqual(@as(u32, 1), try validateRows(rows, 1, 4, 16));
+    try std.testing.expectEqual(@as(u32, 15), rows[2].pos);
+    try std.testing.expect(!rows[1].want_logits);
+    try std.testing.expect(rows[2].want_logits);
+
+    try std.testing.expectError(error.PositionOutOfRange, validateRows(rows, 1, 4, 15));
+    const top = chunkRows(&buf, &tokens, std.math.maxInt(u32) - 1);
+    try std.testing.expectError(error.PositionOutOfRange, validateRows(top, 1, 4, 16));
 }

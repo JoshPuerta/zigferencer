@@ -10,6 +10,7 @@ const bench_decode_host_cmd = @import("bench_decode_host_cmd.zig");
 const bench_model_cmd = @import("bench_model/bench_model_cmd.zig");
 const bench_serve_cmd = @import("bench_serve_cmd.zig");
 const bench_swap_cmd = @import("bench_swap_cmd.zig");
+const dispatch_list_cmd = @import("dispatch_list_cmd.zig");
 const gpu_selftest_cmd = @import("gpu_selftest/gpu_selftest_cmd.zig");
 const serve_demo_cmd = @import("serve_demo_cmd.zig");
 const tokens_cmd = @import("tokens_cmd.zig");
@@ -27,6 +28,7 @@ const dev = [_]command.Subcommand{
     row("gpu-selftest", "Bit-check a GPU kernel vs its CPU reference", gpu_selftest_cmd.run),
     row("tokens", "Print a prompt's token ids", tokens_cmd.run),
     row("serve-demo", "Demo the serve connector end-to-end", serve_demo_cmd.run),
+    row("dispatch-list", "Write the Vulkan commands of six sections", dispatch_list_cmd.run),
 };
 
 comptime {

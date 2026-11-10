@@ -557,6 +557,7 @@ test "pool: each worker share names the open op and links to the pool_run word" 
     defer cap.deinit();
 
     const parts = 3;
+    const gate_up: span.Name = .ofOps(.initOne(.gate_up_proj));
     var runs: [32]std.atomic.Value(u32) = undefined;
     const counts: Counts = .{ .runs = &runs };
     {
@@ -565,7 +566,7 @@ test "pool: each worker share names the open op and links to the pool_run word" 
         defer pool.deinit();
 
         counts.reset();
-        const outer = span.begin(.op_gate_up_proj);
+        const outer = span.begin(gate_up);
         pool.run(Counts, &counts, Counts.unit, runs.len, parts);
         outer.end();
     }
@@ -590,7 +591,7 @@ test "pool: each worker share names the open op and links to the pool_run word" 
 
         const w = try std.fmt.parseInt(u8, t.name["zf-pool-".len..], 10);
         for (t.spans) |s| {
-            if (s.name != .op_gate_up_proj) continue;
+            if (s.name != gate_up) continue;
 
             try testing.expectEqual(w, s.part);
             try testing.expectEqual(word.?, s.arg);

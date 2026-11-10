@@ -5,10 +5,10 @@
 //!
 //! Kernel set. The recorder knows no backend. It records through an attention kernel set, a type
 //! with a fixed method set: `recordResident`, `recordResidentRun`, `recordSplit`, `recordMerge`,
-//! and `recordBarrier`. A kernel set also declares two values: `order`, the class of its summation
-//! order, and `tolerance`, its declared error against the CPU reference. A kernel set names its
-//! command handle `Cmd` and its per-layer bindings `Binding`. The build selects the Vulkan kernel
-//! set with `-Dattn-kernel`.
+//! `recordBarrier`, and `recordMark`. A kernel set also declares two values: `order`, the class of
+//! its summation order, and `tolerance`, its declared error against the CPU reference. A kernel set
+//! names its command handle `Cmd` and its per-layer bindings `Binding`. The build selects the
+//! Vulkan kernel set with `-Dattn-kernel`.
 //!
 //! Comptime. `assertKernels` checks the kernel set when the recorder is built, so a backend that
 //! lacks a method fails the build.
@@ -22,13 +22,20 @@
 //!   3. A barrier before each group after the first, because its split passes write the scratch
 //!      rows that the merges before it read.
 //! The caller records the barrier after the last merge.
+//!
+//! Marks. A plan with record groups marks each pass, so a profile can time the passes apart: the
+//! resident rows before the first group, each split pass after its barrier, and the merges of a
+//! group after the barrier of the next group. The caller marks the merges of the last group after
+//! its barrier. A mark records no command at the profile level `off`.
 
 const std = @import("std");
 const attn_split = @import("../core/attn_split.zig");
 const limits = @import("../core/limits.zig");
+const layer_op = @import("../core/layer_op.zig");
 const prop = @import("../core/prop.zig");
 const step_row = @import("step_row.zig");
 
+const OpPart = layer_op.OpPart;
 const assert = std.debug.assert;
 
 // -- api --------------------------------------------------------------------
@@ -62,6 +69,10 @@ pub fn record(
     plan.assertValid();
     for (plan.residentRows()) |r| {
         kernels.recordResident(cmd, binding, r);
+    }
+
+    if (plan.resident_count > 0 and plan.group_count > 0) {
+        kernels.recordMark(cmd, null);
     }
 
     recordGroups(Kernels, kernels, cmd, plan, binding);
@@ -98,6 +109,9 @@ pub fn recordPrefill(
         // The run ends at or before S, the bound of the resident kernel.
         assert(start_pos + count <= limits.attn_split_len);
         kernels.recordResidentRun(cmd, binding, start_pos, count);
+        if (plan.group_count > 0) {
+            kernels.recordMark(cmd, null);
+        }
     }
 
     recordGroups(Kernels, kernels, cmd, plan, binding);
@@ -115,6 +129,7 @@ fn recordGroups(
     for (plan.recordGroups(), 0..) |g, gi| {
         if (gi > 0) {
             kernels.recordBarrier(cmd);
+            kernels.recordMark(cmd, .merge);
         }
 
         const rows = plan.rowsOf(g);
@@ -123,6 +138,7 @@ fn recordGroups(
         }
 
         kernels.recordBarrier(cmd);
+        kernels.recordMark(cmd, .split);
         for (rows, 0..) |r, k| {
             kernels.recordMerge(cmd, binding, r, @intCast(k), g.stride);
         }
@@ -137,6 +153,7 @@ fn assertKernels(comptime Kernels: type) void {
         "recordSplit",
         "recordMerge",
         "recordBarrier",
+        "recordMark",
         "order",
         "tolerance",
         "Cmd",
@@ -168,6 +185,7 @@ const LogKernels = struct {
         split: struct { row: u32, scratch: u32, stride: u32 },
         merge: struct { row: u32, scratch: u32, stride: u32 },
         barrier,
+        mark: ?OpPart,
     };
 
     const Log = struct {
@@ -231,6 +249,12 @@ const LogKernels = struct {
 
         self.log.add(.barrier);
     }
+
+    pub fn recordMark(self: LogKernels, cmd: Cmd, part: ?OpPart) void {
+        assert(cmd == 7);
+
+        self.log.add(.{ .mark = part });
+    }
 };
 
 /// Replay a log against a model of the scratch: the row each scratch row holds, whether a barrier
@@ -251,7 +275,11 @@ fn checkLog(
     var cells = [_]Cell{.{}} ** attn_split.max_plan_rows;
     // A merge since the last barrier marks a read that a later split must wait for.
     var read_since_barrier = false;
+    var prev: ?LogKernels.Event = null;
+    // The pass that the last barrier closed: the splits or the merges of a group.
+    var closed: ?OpPart = null;
     for (log.events[0..log.len]) |e| {
+        defer prev = e;
         switch (e) {
             .resident => |row| {
                 try testing.expect(t_lens[row] <= S);
@@ -268,6 +296,7 @@ fn checkLog(
                 }
             },
             .split => |s| {
+                closed = .split;
                 try testing.expect(t_lens[s.row] > S);
                 try testing.expect(attn_split.splitCount(t_lens[s.row]) <= s.stride);
                 try testing.expect((@as(u64, s.scratch) + 1) * s.stride <= budget);
@@ -282,6 +311,7 @@ fn checkLog(
                 };
             },
             .merge => |m| {
+                closed = .merge;
                 const cell = &cells[m.scratch];
                 try testing.expectEqual(@as(?u32, m.row), cell.row);
                 try testing.expectEqual(cell.stride, m.stride);
@@ -299,12 +329,36 @@ fn checkLog(
 
                 read_since_barrier = false;
             },
+            // A pass mark follows the barrier that closes its pass. The resident mark follows the
+            // resident rows, before the first split.
+            .mark => |part| if (part) |p| {
+                try testing.expect(prev.? == .barrier);
+                try testing.expectEqual(p, closed.?);
+            } else {
+                try testing.expect(prev.? == .resident or prev.? == .resident_run);
+            },
         }
     }
 
     for (cells) |c| {
         try testing.expect(c.merged);
     }
+}
+
+/// One mark per split pass, one per merge pass but the last, and one for the resident rows when a
+/// group follows them.
+fn expectMarks(log: *const LogKernels.Log, plan: *const attn_split.AttnPlan) !void {
+    var marks: u32 = 0;
+    for (log.events[0..log.len]) |e| {
+        if (e == .mark) {
+            marks += 1;
+        }
+    }
+
+    const groups = plan.group_count;
+    const resident: u32 = @intFromBool(plan.resident_count > 0 and groups > 0);
+    const merges: u32 = if (groups > 0) groups - 1 else 0;
+    try testing.expectEqual(resident + groups + merges, marks);
 }
 
 fn checkRecordMerge(_: void, c: prop.Trial) anyerror!void {
@@ -330,6 +384,7 @@ fn checkRecordMerge(_: void, c: prop.Trial) anyerror!void {
     var resident_seen = [_]bool{false} ** attn_split.max_plan_rows;
     var merged_seen = [_]bool{false} ** attn_split.max_plan_rows;
     try checkLog(&log, t_lens[0..n], plan.budget, &resident_seen, &merged_seen);
+    try expectMarks(&log, &plan);
     // Every row ran exactly one of the two paths.
     for (t_lens[0..n], 0..) |t, i| {
         try testing.expectEqual(t <= S, resident_seen[i]);
@@ -387,6 +442,7 @@ fn checkRecordPrefill(_: void, c: prop.Trial) anyerror!void {
     var resident_seen = [_]bool{false} ** attn_split.max_plan_rows;
     var merged_seen = [_]bool{false} ** attn_split.max_plan_rows;
     try checkLog(&log, t_lens[0..b], plan.budget, &resident_seen, &merged_seen);
+    try expectMarks(&log, &plan);
     for (t_lens[0..b], 0..) |t, i| {
         try testing.expectEqual(t <= S, resident_seen[i]);
         try testing.expectEqual(t > S, merged_seen[i]);
@@ -403,18 +459,19 @@ test "recordPrefill: one resident run for the prefix, then the split groups, eve
     );
 }
 
-test "record: a decode row past one split records its split, one barrier, and its merge" {
+test "record: a decode row past one split records its split, a barrier, a mark, its merge" {
     var log: LogKernels.Log = .{};
     const plan = attn_split.planDecode(S + 1);
     record(LogKernels, .{ .log = &log }, 7, &plan, {});
-    try testing.expectEqual(@as(u32, 3), log.len);
+    try testing.expectEqual(@as(u32, 4), log.len);
     try testing.expectEqual(
         LogKernels.Event{ .split = .{ .row = 0, .scratch = 0, .stride = 2 } },
         log.events[0],
     );
     try testing.expectEqual(LogKernels.Event.barrier, log.events[1]);
+    try testing.expectEqual(LogKernels.Event{ .mark = .split }, log.events[2]);
     try testing.expectEqual(
         LogKernels.Event{ .merge = .{ .row = 0, .scratch = 0, .stride = 2 } },
-        log.events[2],
+        log.events[3],
     );
 }

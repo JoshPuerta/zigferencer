@@ -1,5 +1,5 @@
 //! Serve gate for the llama hybrid runner under the real serve stack. The engine type is
-//! `Residency(Sessions(LlamaHybridRunner))`, the same type `serve_boot` builds for `--gpu-layers
+//! `Residency(Sessions(LlamaHybrid))`, the same type `serve_boot` builds for `--gpu-layers
 //! N`. The driver is the reference client over an in-process server on an ephemeral TCP port.
 //!
 //! Claim. The load-bearing assertion is the one `serve_integration_test` makes of the CPU runner,
@@ -37,14 +37,13 @@ const server_mod = zigferencer.serve_server;
 const tensor_lookup = zigferencer.tensor_lookup;
 const vocab_mod = zigferencer.vocab;
 const vulkan_ctx = zigferencer.vulkan_ctx;
-const llama_fused = zigferencer.llama_fused;
 
 const Client = zigferencer.serve_client.Client;
-const LlamaHybridRunner = zigferencer.llama_hybrid.LlamaHybridRunner;
+const LlamaHybrid = zigferencer.family.Of(.llama).Hybrid;
 const Residency = zigferencer.serve_residency.Residency;
 const Sessions = zigferencer.session.Sessions;
 
-const Engine = Residency(Sessions(LlamaHybridRunner));
+const Engine = Residency(Sessions(LlamaHybrid));
 const HybridServer = server_mod.Server(Engine, event.Codec);
 
 // -- fixtures ---------------------------------------------------------------
@@ -93,12 +92,11 @@ fn initHybrid(
     loaded: *const loader.Loaded,
     cpu_pool: *test_policy.Pool,
     kv_dtype: dtype.KvDtype,
-) !*LlamaHybridRunner {
+) !*LlamaHybrid {
     const card = loaded.card;
     const n_layers: u32 = card.n_layers;
     std.debug.assert(n_layers >= 2); // a mid split needs a layer on each side
-    const caps = try llama_fused.LlamaFusedRunner.kvCaps(
-        gpa,
+    const caps = zigferencer.family.Of(.llama).Fused.kvCaps(
         loaded,
         limits.contextCeiling(loaded.card.context_length, null),
         ctxp.deviceLocalAvailableBytes(),
@@ -121,14 +119,16 @@ fn initHybrid(
         .{ .ram_split = .{ .blobs = 0, .prefix = 0 }, .residency = true },
         n_layers / 2,
     ) catch return error.SkipZigTest;
-    const hybrid = LlamaHybridRunner.init(
+    const hybrid = LlamaHybrid.init(
         gpa,
         ctxp,
         loaded,
-        plan,
-        cpu_pool,
-        cpu_cfg,
-        kv_dtype,
+        .{
+            .plan = plan,
+            .pool = cpu_pool,
+            .policy = cpu_cfg,
+            .kv_dtype = kv_dtype,
+        },
     ) catch |e| switch (e) {
         error.VramBudgetExceeded => return error.SkipZigTest,
         else => return e,
@@ -271,7 +271,7 @@ fn overSubscribedRoundTrip(kv_dtype: dtype.KvDtype) !void {
 
     // Three logical sessions over two VRAM slots: the third forces a swap on every tick.
     // The blob budget funds the evicted session plus the transient blob of a rotation.
-    var sessions = try Sessions(LlamaHybridRunner).init(arena, hybrid);
+    var sessions = try Sessions(LlamaHybrid).init(arena, hybrid);
     const blob_budget: u64 = 2 * hybrid.evictSlotBytesFor(hybrid.max_seq);
     var engine = try Engine.init(arena, gpa, &sessions, prompts.len, blob_budget);
     defer engine.deinit();
@@ -362,7 +362,7 @@ test "llama hybrid serve: an interleaved turn matches its solo stream" {
     defer hybrid.deinit();
 
     // Full residency: no swap can run, so the batched pass alone answers for the streams.
-    var sessions = try Sessions(LlamaHybridRunner).init(arena, hybrid);
+    var sessions = try Sessions(LlamaHybrid).init(arena, hybrid);
     var engine = try Engine.init(arena, gpa, &sessions, 2, null);
     defer engine.deinit();
 

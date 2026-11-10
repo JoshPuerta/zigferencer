@@ -19,7 +19,7 @@
 //! Scopes. `begin` and `beginArg` save the innermost open name of the thread and set their own.
 //! `end` restores it, so `current` names the innermost open `begin` scope. `beginPart` leaves it.
 //! Only the end of a `begin` scope with an op name adds to the `Sums` of its thread, so a pool
-//! share never counts an op twice.
+//! share never counts an op twice. An op name names an `OpKey`: `Name.ofOps` makes it.
 //!
 //! Storage. It is the dynamic shell of this module. Nothing is allocated when the recorder stays
 //! off. Each thread claims one fixed ring from a table bounded by `limits.span_threads_max` and
@@ -58,8 +58,10 @@ const builtin = @import("builtin");
 const limits = @import("limits.zig");
 const core_log = @import("log.zig");
 const gpu_record = @import("gpu_record.zig");
+const layer_op = @import("layer_op.zig");
 const trace_file = @import("trace_file.zig");
 
+const OpKey = layer_op.OpKey;
 const assert = std.debug.assert;
 const log = std.log.scoped(.span);
 
@@ -67,8 +69,6 @@ const log = std.log.scoped(.span);
 
 /// True under `-Dtrace`. Without it, every site entry is an empty inline body.
 pub const compiled: bool = core_log.hot;
-
-pub const gpu_phase_count = gpu_record.gpu_phase_count;
 
 /// The gate bit of a recording recorder, and the gate step of one installed `Sums`.
 const gate_record: u32 = 1;
@@ -84,13 +84,22 @@ const write_buffer_bytes = 1 << 20;
 pub const Name = trace_file.Name;
 pub const Span = trace_file.Span;
 
-/// The nanoseconds per op name of one thread, filled by `installSums`.
-pub const Sums = std.EnumArray(Name, u64);
+/// The nanoseconds per op key of one thread, filled by `installSums`.
+pub const Sums = struct {
+    ns: [OpKey.count]u64 = @splat(0),
+
+    pub fn get(self: *const Sums, key: OpKey) u64 {
+        return self.ns[@intFromEnum(key)];
+    }
+
+    fn add(self: *Sums, key: OpKey, ns: u64) void {
+        self.ns[@intFromEnum(key)] += ns;
+    }
+};
 
 pub const GpuLevel = gpu_record.GpuLevel;
 pub const GpuRunner = gpu_record.GpuRunner;
 pub const GpuLabel = gpu_record.GpuLabel;
-pub const GpuPhase = gpu_record.GpuPhase;
 pub const GpuRecord = gpu_record.GpuRecord;
 
 const ThreadTrack = trace_file.ThreadTrack;
@@ -177,9 +186,9 @@ const live = struct {
             if (self.kind == .begin) {
                 assert(tl_current == self.name);
                 tl_current = self.prev;
-                if (self.name.isOp()) {
+                if (self.name.opKey()) |key| {
                     if (tl_sums) |sums| {
-                        sums.getPtr(self.name).* += end_ns - self.start_ns;
+                        sums.add(key, end_ns - self.start_ns);
                     }
                 }
             }
@@ -979,7 +988,9 @@ test "ring: an overflow counts the drop and keeps every kept span intact" {
 }
 
 test "scopes: current follows begin and end, and only op begin scopes add to the sums" {
-    var sums: Sums = .initFill(0);
+    var sums: Sums = .{};
+    const norm: Name = .ofOps(.initOne(.attn_norm));
+    const attention: Name = .ofOps(.initOne(.attention));
     live.installSums(&sums);
     {
         defer live.installSums(null);
@@ -987,25 +998,30 @@ test "scopes: current follows begin and end, and only op begin scopes add to the
         try testing.expect(live.current() == null);
         const outer = live.begin(.decode_step);
         try testing.expectEqual(Name.decode_step, live.current().?);
-        const op = live.beginArg(.op_rmsnorm, 3);
-        try testing.expectEqual(Name.op_rmsnorm, live.current().?);
+        const op = live.beginArg(norm, 3);
+        try testing.expectEqual(norm, live.current().?);
         // A share keeps the open name and never counts its op.
-        const share = live.beginPart(.op_attention, 7, 2);
-        try testing.expectEqual(Name.op_rmsnorm, live.current().?);
+        const share = live.beginPart(attention, 7, 2);
+        try testing.expectEqual(norm, live.current().?);
         share.endAt(share.start_ns + 40);
-        try testing.expectEqual(Name.op_rmsnorm, live.current().?);
+        try testing.expectEqual(norm, live.current().?);
         op.endAt(op.start_ns + 50);
         try testing.expectEqual(Name.decode_step, live.current().?);
         outer.endAt(outer.start_ns + 90);
         try testing.expect(live.current() == null);
     }
 
-    try testing.expectEqual(@as(u64, 50), sums.get(.op_rmsnorm));
-    try testing.expectEqual(@as(u64, 0), sums.get(.op_attention));
-    try testing.expectEqual(@as(u64, 0), sums.get(.decode_step));
+    // Only the op scope counts, and only under its own key.
+    var total: u64 = 0;
+    for (sums.ns) |ns| {
+        total += ns;
+    }
+
+    try testing.expectEqual(@as(u64, 50), sums.get(.ofOp(.attn_norm)));
+    try testing.expectEqual(@as(u64, 50), total);
     // The removal gives the gate back, so a later scope is inert.
     try testing.expectEqual(@as(u32, 0), active.load(.acquire));
-    try testing.expectEqual(@as(u64, 0), live.begin(.op_rope).start_ns);
+    try testing.expectEqual(@as(u64, 0), live.begin(.ofOps(.initOne(.rope))).start_ns);
 }
 
 /// Set or clear the recording bit by hand, as `setup` and `flush` do. No recorder exists, so a
@@ -1030,14 +1046,14 @@ test "gate: a scope that the flush outlives restores current and pushes nothing"
 }
 
 test "gate: an inert scope ended after the gate rises does nothing" {
-    var sums: Sums = .initFill(0);
-    const s = live.begin(.op_rope);
+    var sums: Sums = .{};
+    const s = live.begin(.ofOps(.initOne(.rope)));
     try testing.expectEqual(@as(u64, 0), s.start_ns);
     live.installSums(&sums);
     s.end();
     live.installSums(null);
     try testing.expect(live.current() == null);
-    try testing.expectEqual(@as(u64, 0), sums.get(.op_rope));
+    try testing.expectEqual(@as(u64, 0), sums.get(.ofOp(.rope)));
     try testing.expectEqual(@as(u32, 0), active.load(.acquire));
 }
 
@@ -1046,12 +1062,12 @@ test "gate: a sink installed between the open and the end counts the span" {
     _ = active.fetchAdd(gate_sink, .acq_rel);
     defer _ = active.fetchSub(gate_sink, .acq_rel);
 
-    var sums: Sums = .initFill(0);
-    const s = live.begin(.op_swiglu);
+    var sums: Sums = .{};
+    const s = live.begin(.ofOps(.initOne(.swiglu)));
     live.installSums(&sums);
     s.endAt(s.start_ns + 30);
     live.installSums(null);
-    try testing.expectEqual(@as(u64, 30), sums.get(.op_swiglu));
+    try testing.expectEqual(@as(u64, 30), sums.get(.ofOp(.swiglu)));
     try testing.expect(live.current() == null);
 }
 
@@ -1083,7 +1099,7 @@ test "off: every entry compiles with a runtime name and holds no state" {
     try testing.expectEqual(GpuLevel.off, off.gpuLevel());
     off.setGpuLevel(.submit);
     try testing.expectEqual(GpuLevel.off, off.gpuLevel());
-    var sums: Sums = .initFill(0);
+    var sums: Sums = .{};
     off.installSums(&sums);
     off.installSums(null);
     try off.setFromEnv(testing.io, .{});

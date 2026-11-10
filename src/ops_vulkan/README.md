@@ -10,6 +10,7 @@ plain slice goes in, a caller-owned `[]f32` comes out, and no device handle esca
 | File | Holds |
 | --- | --- |
 | `kernels.zig` | One struct per compute shader, each with a `Pipeline`, and the buffer helpers. |
+| `dispatch_list.zig` | `DispatchList`, the command lists and the device loader of a trace build. |
 | `stream_ring.zig` | `StreamRing`, the double-buffered host-to-device upload ring. |
 | `wrap.zig` | The op-API facade that maps the CPU op signatures onto kernels. |
 | [`shaders/`](./shaders/README.md) | The GLSL compute sources. |
@@ -25,8 +26,8 @@ the per-op path. Both sit on a `Context`.
 | `Runner` | `runtime/vulkan_runner` | A `Context` and the per-op kernel structs | `wrap.initBackend` | `wrap.zig` |
 | `Pipeline` | `kernels.zig` | The shader module, the set layout, the pipeline layout, and the handle | Each kernel `init` | The same kernel |
 | Kernel struct | `kernels.zig` | A `Pipeline` and a `record` or `run` method, such as `LinearQ80` or `Attention` | `Runner`, the fused runners | `wrap.zig`, `runtime/attn_record`, the fused runners |
-| `KvStore` | `kernels.zig` | The device KV regions, one per layer and tensor | `LlamaFusedRunner`, `QwenFusedRunner`, `LlamaHybridRunner` | The same runners |
-| `VramArena` | `kernels.zig` | Aligned views of one device allocation for the weights | `LlamaFusedRunner`, `LlamaHybridRunner` | The same runners |
+| `KvStore` | `kernels.zig` | The device KV regions, one per layer and tensor | `FusedRunner` | The same runner |
+| `VramArena` | `kernels.zig` | Aligned views of a few device allocations for the weights | `FusedRunner` | The same runner |
 | `StreamRing` | `stream_ring.zig` | Two upload segments, their fences, and a command pool | `tests/vulkan_stream_ring_test` | The same test |
 
 The per-op path runs from a CPU op signature to a submit.
@@ -47,7 +48,7 @@ The per-op path runs from a CPU op signature to a submit.
 The fused path records a whole token into one command buffer instead.
 
 ```
-  LlamaFusedRunner / QwenFusedRunner            (runtime/)
+  FusedRunner(Family)                           (runtime/)
       |  KvStore + VramArena bind the weights and the KV
       |  attn_record walks an attn_split.AttnPlan through kernels.AttnKernels
       v
@@ -57,10 +58,10 @@ The fused path records a whole token into one command buffer instead.
 ```
 
 `KvStore` puts the KV regions of `core/kv_index.zig` in device allocations. `VramArena` hands out
-aligned views and never frees one. A one-shot submit, such as an upload or a slot fill, goes through
-`submitOnce` on the staging command buffer of the `Context`. `StreamRing` stays outside both paths.
-It owns fences and a command pool, and `core/ring_fsm.zig` holds its slot table. No runner drives
-it.
+aligned views and never frees one. A plan from a dry run of the upload sizes each allocation to its
+views. A one-shot submit, such as an upload or a slot fill, goes through `submitOnce` on the staging
+command buffer of the `Context`. `StreamRing` stays outside both paths. It owns fences and a command
+pool, and `core/ring_fsm.zig` holds its slot table. No runner drives it.
 
 ## Rules
 
@@ -80,8 +81,8 @@ it.
   and `AttentionBatch.recordInto` asserts that the prefix ends at or before the split length.
 - **One attention kernel set per build.** `AttnKernels` is the set that `-Dattn-kernel` selects.
   `SplitAttnKernels` is the only one. A kernel set has the method set `recordResident`,
-  `recordResidentRun`, `recordSplit`, `recordMerge`, and `recordBarrier`, and it declares its
-  summation order class and its tolerance. The fused and hybrid runners record each attention layer
+  `recordResidentRun`, `recordSplit`, `recordMerge`, `recordBarrier`, and `recordMark`, and it
+  declares its summation order class and its tolerance. The fused and hybrid runners record each attention layer
   through `runtime/attn_record.zig`, which walks an `attn_split.AttnPlan`. A new kernel is one
   kernel set struct and one entry in the build enum.
 - **A kernel needs a stable `Context` address.** Every kernel captures `*const Context` at `init`.

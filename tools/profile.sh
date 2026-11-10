@@ -119,9 +119,9 @@ sudo_perf() { sudo env -u PERF_EXEC_PATH "$PERF_BIN" "$@"; }
 
 # Zig names a generic instance after its type arguments, with full module paths, and names an
 # anonymous instance `__anon_N`. Inside the parentheses only the type names stay, so
-# `Sessions(runtime.llama_fused.LlamaFusedRunner)` becomes `Sessions(LlamaFusedRunner)`. The module
-# path of the frame itself stays, because it names the layer: `ops.`, `runtime.`, `serve.`,
-# `core.`.
+# `Sessions(runtime.fused_runner.FusedRunner(runtime.llama_layer))` becomes
+# `Sessions(FusedRunner(llama_layer))`. The module path of the frame itself stays, because it
+# names the layer: `ops.`, `runtime.`, `serve.`, `core.`.
 shorten_names() {
     perl -pe '
         s/__anon_\d+//g;
@@ -290,8 +290,8 @@ cmd_report() {
     run_perf script -i "$dir/perf.data" "${sym[@]}" -F +pid >"$dir/samples.perf" 2>/dev/null
 
     if [ -s "$dir/trace.pftrace.gpu.folded" ]; then
-        note "GPU phases"
-        "$fg/flamegraph.pl" --title "$title" --subtitle "GPU time by runner, label, and phase" \
+        note "GPU ops"
+        "$fg/flamegraph.pl" --title "$title" --subtitle "GPU time by runner, label, class, and op" \
             --countname ns --colors aqua "$dir/trace.pftrace.gpu.folded" >"$dir/flame-gpu.svg"
     fi
     note "done: $dir/flame.svg"

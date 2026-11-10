@@ -71,51 +71,10 @@ fn validate(vector: kv_budget.KvCostVector, card: loader.ModelCard, kv_dtype: dt
 
 // -- tests ------------------------------------------------------------------
 
-/// A Llama-3.1-8B-shaped card: 32 layers of 8 KV heads x 128 head_dim.
-fn llamaCard() loader.ModelCard {
-    return .{
-        .arch = .llama,
-        .architecture = "llama",
-        .n_layers = 32,
-        .n_heads = 32,
-        .n_kv_heads = 8,
-        .head_dim = 128,
-        .embedding_length = 4096,
-        .feed_forward_length = 14336,
-        .context_length = 131072,
-        .vocab_size = 128256,
-        .rope_freq_base = 500000.0,
-        .rope_dim_count = 128,
-        .rms_norm_eps = 1e-5,
-        .bos_token_id = 128000,
-        .eos_token_id = 128009,
-        .chat_template = "",
-    };
-}
-
-/// A Qwen3.5-2B-shaped card: 24 layers at interval 4, so 18 GDN layers and 6
-/// full-attention layers.
-fn qwenCard() loader.ModelCard {
-    var card = llamaCard();
-    card.arch = .qwen35;
-    card.architecture = "qwen3.5";
-    card.n_layers = 24;
-    card.n_heads = 16;
-    card.n_kv_heads = 2;
-    card.head_dim = 256;
-    card.gdn = .{
-        .conv_kernel = 4,
-        .state_size = 128,
-        .group_count = 16,
-        .inner_size = 2048,
-        .time_step_rank = 16,
-        .full_attention_interval = 4,
-    };
-    return card;
-}
+const testCard = @import("test_fakes.zig").testCard;
 
 test "costVector: the 8B card charges 4096 f16 bytes a token on every layer" {
-    const vector = costVector(llamaCard(), .f16);
+    const vector = costVector(testCard(.llama), .f16);
     try std.testing.expectEqual(@as(u32, 32), vector.n_layers);
     for (vector.layers()) |entry| {
         try std.testing.expectEqual(@as(u32, 4_096), entry.kv_bytes_per_token);
@@ -125,13 +84,13 @@ test "costVector: the 8B card charges 4096 f16 bytes a token on every layer" {
     // f32 doubles the token price.
     try std.testing.expectEqual(
         @as(u64, 2 * 32 * 4_096),
-        costVector(llamaCard(), .f32).total().kv_bytes_per_token,
+        costVector(testCard(.llama), .f32).total().kv_bytes_per_token,
     );
 }
 
 test "costVector: the 2B card prices attention and GDN apart, and the dtype moves only tokens" {
     for ([_]dtype.KvDtype{ .f32, .f16 }) |kv_dtype| {
-        const vector = costVector(qwenCard(), kv_dtype);
+        const vector = costVector(testCard(.qwen35), kv_dtype);
         const attn_bytes: u64 = 2 * kv_dtype.rowBytes(2 * 256);
         for (vector.layers(), 0..) |entry, i| {
             if ((i + 1) % 4 == 0) {

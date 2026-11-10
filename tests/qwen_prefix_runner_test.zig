@@ -19,7 +19,7 @@ const std = @import("std");
 const zigferencer = @import("zigferencer");
 const test_policy = @import("test_policy.zig");
 const loader = zigferencer.loader;
-const QwenRunner = zigferencer.qwen_runner.QwenRunner;
+const QwenCpu = zigferencer.family.Of(.qwen35).Cpu;
 const StepRow = zigferencer.step_row.StepRow;
 const KvDtype = zigferencer.dtype.KvDtype;
 
@@ -50,24 +50,21 @@ fn prefixRunner(
     n_layers: u32,
     n_slots: u32,
     kv_dtype: KvDtype,
-) !QwenRunner {
-    return QwenRunner.initPrefix(
-        arena,
-        loaded,
-        zigferencer.kv_budget.pinned(n_slots, window),
-        n_layers,
-        0,
-        cpu_pool,
-        serial,
-        kv_dtype,
-    );
+) !QwenCpu {
+    return QwenCpu.initPrefix(arena, loaded, n_layers, .{
+        .plan = zigferencer.kv_budget.pinned(n_slots, window),
+        .max_rows = 0,
+        .pool = cpu_pool,
+        .policy = serial,
+        .kv_dtype = kv_dtype,
+    });
 }
 
 /// Drive one row through the first `k` layers of a runner from the outside. `embedLookup` is the
 /// naive function on every op backend, so this is the exact call `stepBatch` makes.
-fn driveRow(runner: *QwenRunner, k: u32, row: StepRow) !void {
-    const d = runner.hidden;
-    zigferencer.ops.embedLookup(runner.embed.*, row.token, d, runner.x[0..d]);
+fn driveRow(runner: *QwenCpu, k: u32, row: StepRow) !void {
+    const d = runner.card.embedding_length;
+    zigferencer.ops.embedLookup(runner.embed.*, row.token, d, runner.scratch.get(.x)[0..d]);
     var layer: u32 = 0;
     while (layer < k) : (layer += 1) {
         runner.layerForward(layer, &.{row});
@@ -75,8 +72,19 @@ fn driveRow(runner: *QwenRunner, k: u32, row: StepRow) !void {
 }
 
 /// Row 0 of the residual stream, as bytes, so the comparison is bitwise.
-fn residual(runner: *const QwenRunner) []const u8 {
-    return std.mem.sliceAsBytes(runner.x[0..runner.hidden]);
+fn residual(runner: *const QwenCpu) []const u8 {
+    return std.mem.sliceAsBytes(runner.scratch.get(.x)[0..runner.card.embedding_length]);
+}
+
+/// The GDN shape of the card, derived here, so the slab sizes have a check outside the runner.
+fn gdnDims(card: loader.ModelCard) zigferencer.gdn.Dims {
+    const g = card.gdn.?;
+    return .{
+        .n_k_heads = g.group_count,
+        .n_v_heads = g.time_step_rank,
+        .head_dim = g.state_size,
+        .conv_kernel = g.conv_kernel,
+    };
 }
 
 // -- tests ------------------------------------------------------------------
@@ -103,15 +111,13 @@ test "qwen initPrefix reproduces the whole-model layers, KV, and GDN state" {
         std.debug.assert(k < n_layers); // a prefix test needs a layer left over
 
         // Each split gets a fresh pair, because the GDN state is a running accumulator.
-        var full = try QwenRunner.init(
-            arena,
-            &loaded,
-            zigferencer.kv_budget.pinned(1, window),
-            0,
-            &cpu_pool,
-            serial,
-            .f32,
-        );
+        var full = try QwenCpu.init(arena, &loaded, .{
+            .plan = zigferencer.kv_budget.pinned(1, window),
+            .max_rows = 0,
+            .pool = &cpu_pool,
+            .policy = serial,
+            .kv_dtype = .f32,
+        });
         var prefix = try prefixRunner(arena, &cpu_pool, &loaded, k, 1, .f32);
         try std.testing.expectEqual(@as(usize, n_layers), full.layers.len);
         try std.testing.expectEqual(@as(usize, k), prefix.layers.len);
@@ -154,7 +160,7 @@ test "qwen initPrefix reproduces the whole-model layers, KV, and GDN state" {
     }
 }
 
-test "qwen prefix shapes: KV height, GDN slabs, and the compacted kv_slot" {
+test "qwen prefix shapes: KV height, GDN slabs, and the compacted kv_index" {
     const io = std.testing.io;
     var cpu_pool: test_policy.Pool = undefined;
     try test_policy.startPool(&cpu_pool, io, serial);
@@ -177,7 +183,7 @@ test "qwen prefix shapes: KV height, GDN slabs, and the compacted kv_slot" {
 
     const k: u32 = 6;
     const n_slots: u32 = 2;
-    var prefix = try prefixRunner(arena, &cpu_pool, &loaded, k, n_slots, .f32);
+    const prefix = try prefixRunner(arena, &cpu_pool, &loaded, k, n_slots, .f32);
 
     try std.testing.expectEqual(@as(usize, n_slots), prefix.kv_slots.len);
     try std.testing.expectEqual(@as(u32, 1), prefix.kv_slots[0].n_layers);
@@ -186,33 +192,30 @@ test "qwen prefix shapes: KV height, GDN slabs, and the compacted kv_slot" {
 
     var n_gdn: usize = 0;
     for (0..k) |li| {
-        switch (prefix.layers[li].kind) {
-            .gdn => {
-                n_gdn += 1;
-                for (0..n_slots) |s| {
-                    try std.testing.expectEqual(
-                        prefix.gdn_dims.stateLen(),
-                        prefix.gdn_state[s * k + li].len,
-                    );
-                    try std.testing.expectEqual(
-                        prefix.gdn_dims.convStateLen(),
-                        prefix.gdn_conv_state[s * k + li].len,
-                    );
-                }
-            },
-            .full => |w| {
-                // Layer 3 is the only full-attention layer in the range, and it
-                // takes the only index in the cache.
-                try std.testing.expectEqual(@as(usize, 3), li);
-                try std.testing.expectEqual(@as(u32, 0), w.kv_slot);
-                for (0..n_slots) |s| {
-                    try std.testing.expectEqual(@as(usize, 0), prefix.gdn_state[s * k + li].len);
-                    try std.testing.expectEqual(
-                        @as(usize, 0),
-                        prefix.gdn_conv_state[s * k + li].len,
-                    );
-                }
-            },
+        if (prefix.kv_index[li]) |index| {
+            // Layer 3 is the only full-attention layer in the range, and it
+            // takes the only index in the cache.
+            try std.testing.expectEqual(@as(usize, 3), li);
+            try std.testing.expectEqual(@as(u32, 0), index);
+            for (0..n_slots) |s| {
+                try std.testing.expectEqual(@as(usize, 0), prefix.gdn_state[s * k + li].len);
+                try std.testing.expectEqual(
+                    @as(usize, 0),
+                    prefix.gdn_conv_state[s * k + li].len,
+                );
+            }
+        } else {
+            n_gdn += 1;
+            for (0..n_slots) |s| {
+                try std.testing.expectEqual(
+                    gdnDims(prefix.card).stateLen(),
+                    prefix.gdn_state[s * k + li].len,
+                );
+                try std.testing.expectEqual(
+                    gdnDims(prefix.card).convStateLen(),
+                    prefix.gdn_conv_state[s * k + li].len,
+                );
+            }
         }
     }
 
@@ -242,7 +245,7 @@ test "qwen prefix below the attention interval holds no KV and still steps" {
     var prefix = try prefixRunner(arena, &cpu_pool, &loaded, k, 2, .f32);
     try std.testing.expectEqual(@as(usize, 0), prefix.kv_slots.len);
     for (0..k) |li| {
-        try std.testing.expect(std.meta.activeTag(prefix.layers[li].kind) == .gdn);
+        try std.testing.expectEqual(@as(?u32, null), prefix.kv_index[li]);
     }
 
     for (tokens, 0..) |token, pos| {
@@ -255,9 +258,8 @@ test "qwen prefix below the attention interval holds no KV and still steps" {
 
     // The blob is pure GDN state, so its size does not move with the position
     // count, and it round-trips.
-    const per_gdn: u64 = (prefix.gdn_dims.stateLen() + prefix.gdn_dims.convStateLen()) * @sizeOf(
-        f32,
-    );
+    const dims = gdnDims(prefix.card);
+    const per_gdn: u64 = (dims.stateLen() + dims.convStateLen()) * @sizeOf(f32);
     try std.testing.expectEqual(@as(u64, k) * per_gdn, prefix.evictSlotBytesFor(1));
     try std.testing.expectEqual(@as(u64, k) * per_gdn, prefix.evictSlotBytesFor(tokens.len));
     const first = try arena.alloc(u8, @intCast(prefix.evictSlotBytesFor(1)));
@@ -386,7 +388,7 @@ test "qwen prefix init refuses a non-qwen model before it sizes anything" {
     // The arch gate stays ahead of the range asserts, so a llama card reaches a
     // typed error and never the layer walk.
     try std.testing.expectError(
-        error.NotQwen,
+        error.UnsupportedArchitecture,
         prefixRunner(arena, &cpu_pool, &loaded, 1, 1, .f32),
     );
 }

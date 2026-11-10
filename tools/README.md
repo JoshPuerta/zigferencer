@@ -67,7 +67,7 @@ run `zigferencer-dev bench-model`, and the profiler runs any command of that bin
 | --- | --- | --- | --- |
 | `backends` | naive, simd, simd_pf, vulkan | the first row | `--cpu` needs no GPU |
 | `threads` | 1, 2, 4, 8 threads | the first row | no GPU |
-| `hybrid` | cpu, fused, k=L, k=0, mid | the first row | a GPU |
+| `hybrid` | cpu, fused, k=1, mid, k=L-1 | the first row | a GPU |
 | `deep` | 2B and SmolLM2, CPU and fused | the hash on record | `--cpu` needs no GPU |
 
 A DIFF in `backends` can come from the SIMD attention. It differs from naive in bits inside a

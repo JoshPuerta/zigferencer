@@ -16,8 +16,9 @@ holds no path back, so the release binary cannot hold a file of this directory.
 | `bench_serve_cmd.zig` | `bench-serve`: concurrent sessions over loopback. |
 | `bench_swap_cmd.zig` | `bench-swap`: the cost of a KV eviction and restore. |
 | `bench_decode_host_cmd.zig` | `bench-decode-host`: the host steps of one decode step. |
+| `dispatch_list_cmd.zig` | `dispatch-list`: the Vulkan commands of six runner sections. |
 | `bench_model/bench_model_cmd.zig` | `bench-model`: the flags, the load, and the choice of path. |
-| `bench_model/bench_model_common.zig` | `Options`, `Bench`, `RunResult`, and the other shared values. |
+| `bench_model/bench_model_common.zig` | `Options`, `Bench`, `loadAndRun`, and the other shared values. |
 | `bench_model/bench_model_host.zig` | The path of the CPU backends and the per-op Vulkan backend. |
 | `bench_model/bench_model_fused.zig` | The path of the whole model on the GPU. |
 | `bench_model/bench_model_hybrid.zig` | The path of a CPU and GPU split. |

@@ -99,7 +99,7 @@ pub fn resolveLoaded(
     entry: resolve_mod.Entry,
     loaded: *const loader.Loaded,
 ) !LoadedBoot {
-    const model_needs = try modelNeeds(ctx.gpa, loaded);
+    const model_needs = modelNeeds(loaded);
     const ram_free = hostRamFree(ctx.io);
     const resources: resolve_mod.Resources = .{ .ram_free = ram_free, .model = model_needs };
     const values = switch (resolve_mod.resolve(kind, input, entry, loaded.card, resources)) {
@@ -150,7 +150,7 @@ pub fn fusedOn(io: Io, boot: *const DeviceBoot, ctxp: anytype) !device_placement
 
 /// The weight census of one model and the reservations of its fused runner. A build without the
 /// fused ops measures the census only.
-pub fn modelNeeds(gpa: std.mem.Allocator, loaded: *const loader.Loaded) !resolve_mod.ModelNeeds {
+pub fn modelNeeds(loaded: *const loader.Loaded) resolve_mod.ModelNeeds {
     const card = loaded.card;
     var m: resolve_mod.ModelNeeds = .{
         .n_layers = card.n_layers,
@@ -161,7 +161,7 @@ pub fn modelNeeds(gpa: std.mem.Allocator, loaded: *const loader.Loaded) !resolve
 
     if (comptime fused_build) {
         switch (card.arch) {
-            inline else => |arch| try measureFused(family.Of(arch), gpa, loaded, &m),
+            inline else => |arch| measureFused(family.Of(arch), loaded, &m),
         }
     }
 
@@ -226,18 +226,17 @@ pub fn vramFigure(ctxp: anytype) u64 {
 /// Measure the fused runner of `Family`. The runner caps and the resolve caps must agree.
 fn measureFused(
     comptime Family: type,
-    gpa: std.mem.Allocator,
     loaded: *const loader.Loaded,
     m: *resolve_mod.ModelNeeds,
-) !void {
+) void {
     const card = loaded.card;
-    m.weights = try Family.fusedWeightBytes(gpa, loaded);
+    m.weights = Family.Fused.weightsVramBytes(loaded);
     m.logits_row = Family.Fused.logitsVramBytes(card.vocab_size, 1);
 
     const ceiling = @min(card.context_length, limits.max_model_ctx);
     for (std.enums.values(dtype.KvDtype)) |d| {
         m.scratch.set(d, Family.Fused.scratchVramBytes(card, d));
-        const runner_caps = try Family.kvCaps(gpa, loaded, ceiling, 0, 1, d);
+        const runner_caps = Family.Fused.kvCaps(loaded, ceiling, 0, 1, d);
         const resolve_caps = resolve_mod.caps(card, m.*, 0, ceiling, 1, d);
         std.debug.assert(std.meta.eql(resolve_caps, runner_caps));
     }

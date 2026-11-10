@@ -19,7 +19,7 @@ const std = @import("std");
 const zigferencer = @import("zigferencer");
 const test_policy = @import("test_policy.zig");
 const loader = zigferencer.loader;
-const LlamaRunner = zigferencer.llama_runner.LlamaRunner;
+const LlamaCpu = zigferencer.family.Of(.llama).Cpu;
 const StepRow = zigferencer.step_row.StepRow;
 
 // -- fixtures ---------------------------------------------------------------
@@ -31,9 +31,9 @@ const window: u32 = 16;
 /// Drive one row through a runner from the outside. The call does the
 /// embedding and then every layer the runner holds. `embedLookup` is the naive
 /// function on every op backend, so this is the exact call `stepBatch` makes.
-fn driveRow(runner: *LlamaRunner, row: StepRow) !void {
+fn driveRow(runner: *LlamaCpu, row: StepRow) !void {
     const d = runner.card.embedding_length;
-    zigferencer.ops.embedLookup(runner.embed.*, row.token, d, runner.x[0..d]);
+    zigferencer.ops.embedLookup(runner.embed.*, row.token, d, runner.scratch.get(.x)[0..d]);
     var layer: u32 = 0;
     while (layer < runner.n_layers) : (layer += 1) {
         runner.layerForward(layer, &.{row});
@@ -41,8 +41,8 @@ fn driveRow(runner: *LlamaRunner, row: StepRow) !void {
 }
 
 /// Row 0 of the residual stream, as bytes, so the comparison is bitwise.
-fn residual(runner: *const LlamaRunner) []const u8 {
-    return std.mem.sliceAsBytes(runner.x[0..runner.card.embedding_length]);
+fn residual(runner: *const LlamaCpu) []const u8 {
+    return std.mem.sliceAsBytes(runner.scratch.get(.x)[0..runner.card.embedding_length]);
 }
 
 // -- tests ------------------------------------------------------------------
@@ -66,17 +66,20 @@ test "llama initPrefix at the full layer count reproduces the whole-model residu
 
     const plan = zigferencer.kv_budget.pinned(1, window);
 
-    var full = try LlamaRunner.init(arena, &loaded, plan, 0, &cpu_pool, policy, .f32);
-    var prefix = try LlamaRunner.initPrefix(
-        arena,
-        &loaded,
-        plan,
-        loaded.card.n_layers,
-        0,
-        &cpu_pool,
-        policy,
-        .f32,
-    );
+    var full = try LlamaCpu.init(arena, &loaded, .{
+        .plan = plan,
+        .max_rows = 0,
+        .pool = &cpu_pool,
+        .policy = policy,
+        .kv_dtype = .f32,
+    });
+    var prefix = try LlamaCpu.initPrefix(arena, &loaded, loaded.card.n_layers, .{
+        .plan = plan,
+        .max_rows = 0,
+        .pool = &cpu_pool,
+        .policy = policy,
+        .kv_dtype = .f32,
+    });
     try std.testing.expectEqual(loaded.card.n_layers, full.n_layers);
     try std.testing.expectEqual(full.n_layers, prefix.n_layers);
 
@@ -113,20 +116,23 @@ test "llama initPrefix sizes the weight slices and the KV to its own layer count
     std.debug.assert(n_layers >= 2); // the split needs a layer on each side
 
     const half: u32 = n_layers / 2;
-    var full = try LlamaRunner.init(arena, &loaded, plan, 0, &cpu_pool, policy, .f32);
-    var short = try LlamaRunner.initPrefix(
-        arena,
-        &loaded,
-        plan,
-        half,
-        0,
-        &cpu_pool,
-        policy,
-        .f32,
-    );
+    var full = try LlamaCpu.init(arena, &loaded, .{
+        .plan = plan,
+        .max_rows = 0,
+        .pool = &cpu_pool,
+        .policy = policy,
+        .kv_dtype = .f32,
+    });
+    var short = try LlamaCpu.initPrefix(arena, &loaded, half, .{
+        .plan = plan,
+        .max_rows = 0,
+        .pool = &cpu_pool,
+        .policy = policy,
+        .kv_dtype = .f32,
+    });
     try std.testing.expectEqual(half, short.n_layers);
-    try std.testing.expectEqual(@as(usize, half), short.attn_q_w.len);
-    try std.testing.expectEqual(@as(usize, half), short.ffn_down_w.len);
+    try std.testing.expectEqual(@as(usize, half), short.layers.len);
+    try std.testing.expectEqual(@as(usize, half), short.kv_index.len);
 
     // A KV blob holds the layers the runner executes, so a half-height runner
     // carries a proportional share of the whole-model blob.

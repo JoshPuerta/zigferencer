@@ -5,7 +5,8 @@
 //! from this `Context`. Initialization is one shot, and teardown reverses it
 //! in order.
 //!
-//! Comptime. A build gate stops the compiler when a non-Vulkan build includes this file.
+//! Comptime. A build gate stops the compiler when a non-Vulkan build includes this file. A trace
+//! build loads the device functions through the dispatch list loader, and no other build holds it.
 //!
 //! The module compiles only under `-Druntime=vulkan`. The runtime is a
 //! build-time axis, gated by `build_options.use_vulkan` and the conditional
@@ -54,6 +55,8 @@ const limits = @import("../core/limits.zig");
 const span = @import("../core/span.zig");
 const kv_index = @import("../core/kv_index.zig");
 const attn_split = @import("../core/attn_split.zig");
+const core_log = @import("../core/log.zig");
+const dispatch_list = if (core_log.hot) @import("../ops_vulkan/dispatch_list.zig") else void;
 
 const log = std.log.scoped(.gpu);
 
@@ -303,7 +306,10 @@ pub const Context = struct {
         };
         const device = try vki.createDevice(picked.device, &device_info, null);
 
-        const vkd = vk.DeviceWrapper.load(device, vki.dispatch.vkGetDeviceProcAddr.?);
+        const vkd = if (comptime core_log.hot) blk: {
+            dispatch_list.setRealLoader(vki.dispatch.vkGetDeviceProcAddr.?);
+            break :blk vk.DeviceWrapper.load(device, dispatch_list.loader);
+        } else vk.DeviceWrapper.load(device, vki.dispatch.vkGetDeviceProcAddr.?);
         if (vkd.dispatch.vkDestroyDevice == null) return error.DeviceFunctionsMissing;
 
         errdefer vkd.destroyDevice(device, null);
