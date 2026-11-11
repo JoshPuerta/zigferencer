@@ -48,6 +48,11 @@ read.
 
 ## Rules
 
+- **A file holds one type or one state machine.** A Zig file is a struct, so a self-contained type
+  gets its own file. The size rule is the cap on the length of a function, not a line count of the
+  file. One state machine stays in one file, however long it is. The tests of a leaf type sit in
+  its file. A parent file such as `ops_vulkan/kernels.zig` re-exports the names of its child
+  files, so each caller keeps one import.
 - Add a tests to the `test {}` block, or its tests never run. The
   compiler stays silent, because an unreferenced module is dead code. A file under
   `dev/` goes in the block of `dev/dev_main.zig`, because the test binary of each

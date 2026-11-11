@@ -3,7 +3,7 @@
 The GPU kernels of zigferencer target the AMD Radeon RX 6800 XT
 (Navi 21, `gfx1030`, RDNA2), through Vulkan compute. This page introduces the parts
 of that GPU that decide how fast a kernel runs. The header of each shader in `src/ops_vulkan/shaders/` and
-of `src/ops_vulkan/kernels.zig` holds the details. Another RDNA2 or RDNA3 card
+of each file in `src/ops_vulkan/kernels/` holds the details. Another RDNA2 or RDNA3 card
 changes the numbers, but ideally not the method.
 
 Take this as a condensed material from investigations while writting the kernels.
@@ -142,7 +142,7 @@ How the kernels use this:
 An RDNA SIMD unit runs a wave of 32 lanes natively. A wave64 instruction issues
 twice, once for each half of the wave. A driver can still compile a compute shader
 for wave64, and RADV, the Mesa driver, does so by default. The engine therefore pins every compute pipeline to a subgroup
-size of 32 through `VK_EXT_subgroup_size_control` (`kernels.zig`,
+size of 32 through `VK_EXT_subgroup_size_control` (`kernels/pipeline.zig`,
 `runtime/vulkan_ctx.zig`). On a SmolLM2 decode the pin cut the inter-token latency by
 31 % and its standard deviation by a factor of 4.
 
@@ -229,7 +229,7 @@ A Q8_0 block holds 32 signed 8-bit values and one f16 scale, 34 bytes in all. Th
 driver class of the reference setup is Vulkan on D3D12. It exposes 16-bit storage
 and f16 arithmetic, but no 8-bit storage and no 8-bit integer type in shaders. At
 load the engine therefore splits the blocks of each weight into two arrays. One
-array holds the f16 scales, and one holds the 8-bit values (`kernels.zig`). A shader reads the 8-bit array
+array holds the f16 scales, and one holds the 8-bit values (`kernels/weights.zig`). A shader reads the 8-bit array
 as 32-bit words and takes each value out with `bitfieldExtract(int(word), (i & 3) *
 8, 8)`. A Q4_0 shader takes its two 4-bit values out of each byte with a shift and a
 mask.

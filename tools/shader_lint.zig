@@ -14,7 +14,8 @@
 //!
 //! A count follows the last finding. A passing run prints nothing.
 //!
-//! Usage: `shader_lint <shader dir> <kernels.zig>`. The exit code is 1 when a finding exists.
+//! Usage: `shader_lint <shader dir> <kernel wrapper dir>`. The exit code is 1 when a finding
+//! exists. The tool reads every `.zig` file of the wrapper directory as one text.
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
@@ -208,7 +209,7 @@ pub fn main(init: std.process.Init) !void {
     if (args.len != 3) return error.Usage;
 
     const cwd = std.Io.Dir.cwd();
-    const kernels_zig = try cwd.readFileAlloc(io, args[2], arena, .limited(file_bytes_max * 8));
+    const kernels_zig = try readWrappers(io, arena, cwd, args[2]);
 
     var buffer: [output_buffer_bytes]u8 = undefined;
     var stderr_writer: Io.File.Writer = .initStreaming(.stderr(), io, &buffer);
@@ -260,6 +261,30 @@ pub fn main(init: std.process.Init) !void {
 
 fn nameLessThan(_: void, a: []const u8, b: []const u8) bool {
     return std.mem.lessThan(u8, a, b);
+}
+
+/// Join the `.zig` files of the wrapper directory in name order, so a run reads the same text.
+fn readWrappers(io: Io, arena: Allocator, cwd: std.Io.Dir, path: []const u8) ![]const u8 {
+    var dir = try cwd.openDir(io, path, .{ .iterate = true });
+    defer dir.close(io);
+
+    var names: std.ArrayList([]const u8) = .empty;
+    var iterator = dir.iterate();
+    while (try iterator.next(io)) |entry| {
+        if (entry.kind != .file or !std.mem.endsWith(u8, entry.name, ".zig")) continue;
+
+        try names.append(arena, try arena.dupe(u8, entry.name));
+    }
+
+    std.mem.sort([]const u8, names.items, {}, nameLessThan);
+
+    var text: std.ArrayList(u8) = .empty;
+    for (names.items) |name| {
+        const source = try dir.readFileAlloc(io, name, arena, .limited(file_bytes_max * 8));
+        try text.appendSlice(arena, source);
+    }
+
+    return text.items;
 }
 
 fn classify(arena: Allocator, source: []const u8) ![]const Line {
@@ -755,7 +780,7 @@ fn toleranceRule(arena: Allocator, shader: *const Shader, flat: []const u8, repo
     const needle = try std.fmt.allocPrint(arena, "pub const {s} = struct", .{wrapper});
     const kernels = shader.input.kernels_zig;
     const struct_at = std.mem.indexOf(u8, kernels, needle) orelse {
-        try report.add(.tolerance, 1, "no wrapper `{s}` in kernels.zig", .{wrapper});
+        try report.add(.tolerance, 1, "no wrapper `{s}` in the kernel files", .{wrapper});
         return;
     };
 

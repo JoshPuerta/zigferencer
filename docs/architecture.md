@@ -323,7 +323,7 @@ the lessons from digital design in VHDL I had many years ago.
 | [`src/core/`](../src/core/README.md) | The shared values and helpers. | `tensor.zig`, `dtype.zig`, `limits.zig` (every bound), `kv_budget.zig` (the plans), `registry.zig` (the model table), `tokenizer/` |
 | [`src/io/`](../src/io/README.md) | Files and the network. | `gguf/parser.zig`, `gguf/loader.zig`, `mmap.zig`, `download.zig` |
 | [`src/ops/`](../src/ops/README.md) | The CPU kernels. | `naive.zig` (the reference), `simd_pf.zig` (the default), `gdn.zig` |
-| [`src/ops_vulkan/`](../src/ops_vulkan/README.md) | The GPU kernels. | `shaders/`, `kernels.zig` (one pipeline for each shader), `wrap.zig` (the per-op GPU backend) |
+| [`src/ops_vulkan/`](../src/ops_vulkan/README.md) | The GPU kernels. | `shaders/`, `kernels.zig` and `kernels/` (one pipeline for each shader), `wrap.zig` (the per-op GPU backend) |
 | [`src/runtime/`](../src/runtime/README.md) | The runners and their state. | `cpu_runner.zig`, `fused_runner.zig`, `hybrid_runner.zig`, `session.zig`, `sampler.zig`, `parallel.zig` |
 | [`src/serve/`](../src/serve/README.md) | The server. | `scheduler.zig`, `engine.zig`, `protocol.zig`, `server.zig`, `openai/`, `residency.zig`, `prefix_manager.zig` |
 | [`tests/`](../tests/README.md) | The integration tests against real model files. | `snapshot_smollm2_test.zig`, the `*_equivalence_test.zig` files |

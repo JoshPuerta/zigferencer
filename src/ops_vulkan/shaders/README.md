@@ -3,7 +3,7 @@
 This directory holds the GLSL compute sources. Each one transforms activation and weight buffers and
 holds no host state. Each mirrors a scalar op in `ops/naive.zig` or `ops/gdn.zig`, and none calls
 another. The build compiles each source to a SPIR-V blob with `glslc` and embeds it with
-`@embedFile`. A `Pipeline` in [`../kernels.zig`](../kernels.zig) wraps each blob.
+`@embedFile`. A `Pipeline` in [`../kernels/pipeline.zig`](../kernels/pipeline.zig) wraps each blob.
 
 ## Files
 
@@ -89,7 +89,7 @@ changes. In `attention_batch` the rows share one cache and differ by causal `t_l
   reduction order and marks every accumulator `precise`. Then the device compiler cannot fuse `a*b +
   c` into an `fma`. The bit-exact kernels are `vec_add`, `residual_add`, `linear_q8_0`, and
   `kv_commit_f16`. A kernel that reorders a reduction, or that reads a GPU transcendental, declares
-  a measured `.relative` value on its `Pipeline` wrapper in `../kernels.zig`. The `Numerics` section
+  a measured `.relative` value on its `Pipeline` wrapper in `../kernels/`. The `Numerics` section
   of each header names the value its wrapper declares. `tools/bench.zig` prints the relative error
   per variant and fails the row on drift. `qwen_qk_norm.comp` is the one kernel whose wrapper
   declares no tolerance, and the token-hash gates cover it.

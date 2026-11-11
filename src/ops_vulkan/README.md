@@ -9,7 +9,17 @@ plain slice goes in, a caller-owned `[]f32` comes out, and no device handle esca
 
 | File | Holds |
 | --- | --- |
-| `kernels.zig` | One struct per compute shader, each with a `Pipeline`, and the buffer helpers. |
+| `kernels.zig` | The table of contents of `kernels/`: it re-exports each public name. |
+| `kernels/spirv.zig` | The SPIR-V blob of each shader, and `spv_names`. |
+| `kernels/pipeline.zig` | `Pipeline`, and the descriptor and command-buffer helpers. |
+| `kernels/memory.zig` | `HostBuffer`, `DeviceBuffer`, `KvStore`, and `VramArena`. |
+| `kernels/submit.zig` | `OneShot`, `submitOnce`, the staging copies, and `walkStage`. |
+| `kernels/weights.zig` | `Q80Weight`, `UploadStage`, and the repack of the GGUF blocks. |
+| `kernels/elementwise.zig` | The adds, the output gate, the RMS norms, SwiGLU, and `QwenQkNorm`. |
+| `kernels/rope.zig` | `Rope`, `RopeMulti`, and `RopeMultiBatch`. |
+| `kernels/attention.zig` | The attention kernels, `SplitAttnKernels`, and `KvCommitF16`. |
+| `kernels/linear.zig` | The Q8_0 and Q4_0 linear kernels, decode and batch. |
+| `kernels/gdn.zig` | `GdnDecode` and `GdnChunkParallel`. |
 | `dispatch_list.zig` | `DispatchList`, the command lists and the device loader of a trace build. |
 | `stream_ring.zig` | `StreamRing`, the double-buffered host-to-device upload ring. |
 | `wrap.zig` | The op-API facade that maps the CPU op signatures onto kernels. |
@@ -24,10 +34,10 @@ the per-op path. Both sit on a `Context`.
 | --- | --- | --- | --- | --- |
 | `Context` | `runtime/vulkan_ctx` | The device, the queue, the command pool, and the staging buffer | `runtime/vulkan_runner`, `cli/boot/boot_resources` | Every kernel |
 | `Runner` | `runtime/vulkan_runner` | A `Context` and the per-op kernel structs | `wrap.initBackend` | `wrap.zig` |
-| `Pipeline` | `kernels.zig` | The shader module, the set layout, the pipeline layout, and the handle | Each kernel `init` | The same kernel |
-| Kernel struct | `kernels.zig` | A `Pipeline` and a `record` or `run` method, such as `LinearQ80` or `Attention` | `Runner`, the fused runners | `wrap.zig`, `runtime/attn_record`, the fused runners |
-| `KvStore` | `kernels.zig` | The device KV regions, one per layer and tensor | `FusedRunner` | The same runner |
-| `VramArena` | `kernels.zig` | Aligned views of a few device allocations for the weights | `FusedRunner` | The same runner |
+| `Pipeline` | `kernels/pipeline.zig` | The shader module, the set layout, the pipeline layout, and the handle | Each kernel `init` | The same kernel |
+| Kernel struct | `kernels/` | A `Pipeline` and a `record` or `run` method, such as `LinearQ80` or `Attention` | `Runner`, the fused runners | `wrap.zig`, `runtime/attn_record`, the fused runners |
+| `KvStore` | `kernels/memory.zig` | The device KV regions, one per layer and tensor | `FusedRunner` | The same runner |
+| `VramArena` | `kernels/memory.zig` | Aligned views of a few device allocations for the weights | `FusedRunner` | The same runner |
 | `StreamRing` | `stream_ring.zig` | Two upload segments, their fences, and a command pool | `tests/vulkan_stream_ring_test` | The same test |
 
 The per-op path runs from a CPU op signature to a submit.
@@ -72,8 +82,9 @@ pool, and `core/ring_fsm.zig` holds its slot table. No runner drives it.
 - **A shader header owns its kernel.** The header of each shader holds the math, the schedule, the
   memory table, and the bindings. A wrapper states what the host owes: a precondition or a
   tolerance.
-- **Build guard.** All three Zig files raise `@compileError` when `build_options.use_vulkan` is
-  false. The backend is unreachable outside `-Druntime=vulkan`.
+- **Build guard.** `kernels.zig`, `dispatch_list.zig`, `stream_ring.zig`, and `wrap.zig` raise
+  `@compileError` when `build_options.use_vulkan` is false. The files of `kernels/` load only
+  through `kernels.zig`. The backend is unreachable outside `-Druntime=vulkan`.
 - **The split length bounds the resident attention kernels.** `Attention`, `AttentionMultiStream`,
   and `AttentionBatch` hold every score of a row in shared memory of `limits.attn_split_len`
   positions. A decode row or a prefill row past that length runs the split pass and the merge pass

@@ -848,7 +848,7 @@ fn addShaderLint(b: *std.Build, config: Config, test_step: *Step) void {
 
     const run_lint = b.addRunArtifact(lint_exe);
     run_lint.addDirectoryArg(b.path("src/ops_vulkan/shaders"));
-    run_lint.addFileArg(b.path("src/ops_vulkan/kernels.zig"));
+    run_lint.addDirectoryArg(b.path("src/ops_vulkan/kernels"));
     run_lint.expectExitCode(0);
     lint_step.dependOn(&run_lint.step);
     test_step.dependOn(&run_lint.step);
