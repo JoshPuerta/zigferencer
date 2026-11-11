@@ -63,9 +63,17 @@ const assert = std.debug.assert;
 /// the slot of its last connection waits for the engine.
 pub const slots_per_connection = 2;
 
+/// The counters that tell a binary reader that its connection is idle, in the order it loads
+/// them. The engine stores `sessions` and then lowers `requests_open`. So a reader that loads
+/// `requests_open` first and reads zero also reads the new `sessions`, and an opening session
+/// never looks idle.
+pub const idle_load_order = [2]IdleCounter{ .requests_open, .sessions };
+
 // -- types ------------------------------------------------------------------
 
 pub const State = enum(u8) { free, live, closing, swept, reclaimable };
+
+pub const IdleCounter = enum { requests_open, sessions };
 
 /// One slot. Every field is atomic, because three threads read it.
 pub const Slot = struct {
@@ -310,8 +318,6 @@ const Rules = struct {
     writer_closes_queue: bool = true,
     /// `claim` honors the cap.
     cap: bool = true,
-    /// The checks that only the harness can break.
-    check_requests: bool = true,
 };
 
 /// A model table with the rules of `rules`. It keeps the states of the real table, but plain
@@ -320,7 +326,6 @@ fn ModelSlots(comptime rules: Rules) type {
     return struct {
         const Self = @This();
         const slot_count = schedule_cap * slots_per_connection;
-        const checks_requests = rules.check_requests;
         const checks_init = rules.check_init;
         const reader_closes = rules.reader_closes_queue;
         const writer_closes = rules.writer_closes_queue;
@@ -441,7 +446,6 @@ fn ModelSlots(comptime rules: Rules) type {
 /// settle, so the schedule can move the other side between them.
 const RealSlots = struct {
     const slot_count = schedule_cap * slots_per_connection;
-    const checks_requests = true;
     const checks_init = true;
     const reader_closes = false;
     const writer_closes = true;
@@ -881,7 +885,7 @@ fn Schedule(comptime Table: type) type {
                 .owner => if (self.table.find(0) != null) return error.OwnerFound,
                 .wake => {},
                 .data => {
-                    if (Table.checks_requests and self.conns[req.conn].swept) {
+                    if (self.conns[req.conn].swept) {
                         return error.RequestAfterSweep;
                     }
                     self.owners.set(req.conn);
@@ -1015,9 +1019,9 @@ test "conn_slots: no schedule breaks a slot rule, and every slot comes back" {
     try prop.forAll(.{ .site = 0x434f_4e4e_0001 }, {}, ScheduleCase, genSchedule, checkReal);
 }
 
-/// The count of fixed-seed schedules under `rules` that end in `want`. The seeds do not depend
-/// on the test seed, so the count is fixed.
-fn tripCount(comptime rules: Rules, want: Violation) u32 {
+/// The count of fixed-seed schedules under `rules` that end in `want`, or in any violation when
+/// `want` is null. The seeds do not depend on the test seed, so the count is fixed.
+fn tripCount(comptime rules: Rules, want: ?Violation) u32 {
     const cases = 512;
     var hits: u32 = 0;
     var prng = std.Random.DefaultPrng.init(0x434f_4e4e_0002);
@@ -1025,7 +1029,7 @@ fn tripCount(comptime rules: Rules, want: Violation) u32 {
     while (i < cases) : (i += 1) {
         const case = genSchedule({}, prng.random(), @min(i, 64));
         Schedule(ModelSlots(rules)).run(case.seed, case.steps) catch |err| {
-            if (err == want) {
+            if (want == null or err == want.?) {
                 hits += 1;
             }
         };
@@ -1035,8 +1039,8 @@ fn tripCount(comptime rules: Rules, want: Violation) u32 {
 }
 
 test "conn_slots: each check of the schedule trips under one broken rule" {
-    // The model table with the real rules passes, so each variant below changes one rule.
-    try testing.expectEqual(@as(u32, 0), tripCount(.{}, error.SlotStuck));
+    // The model table with the real rules trips no check, so each variant below changes one rule.
+    try testing.expectEqual(@as(u32, 0), tripCount(.{}, null));
 
     const old: Rules = .{ .exit_reclaims = true, .find_live_only = true };
     try testing.expect(tripCount(old, error.InitUnderFind) > 0);
@@ -1052,6 +1056,55 @@ test "conn_slots: each check of the schedule trips under one broken rule" {
     try testing.expect(tripCount(.{ .exit_reclaims = true }, error.ClosedSlotLost) > 0);
     try testing.expect(tripCount(.{ .cap = false }, error.CapExceeded) > 0);
     try testing.expect(tripCount(.{ .writer_closes_queue = false }, error.SlotStuck) > 0);
+}
+
+/// The count of interleavings, of one idle check that loads in `order` with the two engine writes
+/// of a session open, that read zero from both counters. The connection holds a request or a
+/// session at every point, so a correct order gives zero.
+fn idleMisreads(order: [2]IdleCounter) u32 {
+    // Bit i of a schedule gives step i to the reader (1) or to the engine (0). Each side takes
+    // two steps, so a schedule has two set bits of four.
+    const steps = 4;
+    var misreads: u32 = 0;
+    for (0..1 << steps) |schedule| {
+        if (@popCount(schedule) != 2) continue;
+
+        var sessions: u32 = 0;
+        var requests_open: u32 = 1;
+        var engine_step: u32 = 0;
+        var reader_step: u32 = 0;
+        var zeros: u32 = 0;
+        for (0..steps) |i| {
+            if ((schedule >> @intCast(i)) & 1 == 1) {
+                const value = switch (order[reader_step]) {
+                    .requests_open => requests_open,
+                    .sessions => sessions,
+                };
+                if (value == 0) {
+                    zeros += 1;
+                }
+                reader_step += 1;
+            } else {
+                switch (engine_step) {
+                    0 => sessions = 1,
+                    1 => requests_open = 0,
+                    else => unreachable,
+                }
+                engine_step += 1;
+            }
+        }
+        if (zeros == 2) {
+            misreads += 1;
+        }
+    }
+
+    return misreads;
+}
+
+test "conn_slots: an idle check never reads an opening session as idle" {
+    try testing.expectEqual(@as(u32, 0), idleMisreads(idle_load_order));
+    // The other order misreads, so the count detects a swap.
+    try testing.expect(idleMisreads(.{ idle_load_order[1], idle_load_order[0] }) > 0);
 }
 
 test "conn_slots: a settle from a read that the other side made stale retries once" {

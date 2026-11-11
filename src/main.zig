@@ -380,6 +380,7 @@ test {
     _ = @import("serve/conn_slots.zig");
     _ = @import("serve/timed_stream.zig");
     _ = @import("serve/openai/map.zig");
+    _ = @import("serve/openai/body.zig");
     _ = serve_zmtp;
     _ = ops_simd;
     _ = ops_simd_pf;

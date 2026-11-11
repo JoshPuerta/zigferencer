@@ -33,7 +33,9 @@
 //! Idle. A binary reader closes a connection that holds no session and no request in the engine
 //! after one `--io-timeout` with no frame. `sessions` and `requests_open` of a `Conn` tell it: the
 //! engine thread alone writes `sessions`, the reader adds to `requests_open` before each request,
-//! and the engine subtracts after it handles the request.
+//! and the engine subtracts after it handles the request. The engine stores `sessions` before it
+//! subtracts, so the reader loads `requests_open` first (`conn_slots.idle_load_order`). A zero
+//! there comes after the store, and the load of `sessions` then reads the new count.
 //!
 //! Socket close. Exactly one actor closes the socket of a connection. The first to claim it owns
 //! the close. The claim is `live -> task` when the last task exits, or `live -> teardown` when
@@ -272,8 +274,8 @@ pub fn ServeEngine(comptime Engine: type, comptime CodecT: type, comptime Adapte
             const result = self.sched.handle(req, sink);
 
             // Only these requests attach a session to a connection or take one from it. The
-            // count comes before the request leaves `requests_open`, so an idle reader never
-            // sees zero of both while a session opens.
+            // count comes before the request leaves `requests_open`, so a reader that loads
+            // `requests_open` first never sees zero of both while a session opens.
             switch (req.body) {
                 .session_open, .session_clone, .session_resume, .session_close => {
                     self.countSessions();
@@ -419,7 +421,15 @@ pub fn ServeEngine(comptime Engine: type, comptime CodecT: type, comptime Adapte
         /// it at its idle deadline.
         pub fn connIdle(self: *const Self, conn: *const Conn) bool {
             _ = self;
-            return conn.sessions.load(.acquire) == 0 and conn.requests_open.load(.acquire) == 0;
+            inline for (conn_slots.idle_load_order) |counter| {
+                const value = switch (counter) {
+                    .requests_open => conn.requests_open.load(.acquire),
+                    .sessions => conn.sessions.load(.acquire),
+                };
+                if (value != 0) return false;
+            }
+
+            return true;
         }
 
         /// Wake an idle engine so its next tick retries a parked event. A full request queue

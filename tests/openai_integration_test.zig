@@ -43,6 +43,20 @@
 //! Hang-up. A buffered request whose client hangs up frees its session at the first token. The
 //! session count is one, so the next request opens only after that session closes.
 //!
+//! Framing. Each framing rule of a head and each chunk framing error gets its one reply and then
+//! the close, from raw bytes on a socket. A second client then gets its reply, so no refusal stops
+//! the server. A chunk size past 64 bits, which overflows the std decoder, gets a 400. A POST with
+//! no length gets its 400 at once, with no deadline set. A body shorter than its length runs no
+//! turn. `Expect` gets no interim reply on a refusal, a 417 for an unknown value, and the interim
+//! reply before an accepted body. A field line with a space before its colon or a bare LF, and a
+//! trailer that is a request line, each get a 400, so a proxy and the server read one request. An
+//! HTTP/1.0 client gets no interim reply and no chunked reply. A client that sends its body after
+//! a 413 sees the reply and a clean end of stream. A chunked request on a kept connection and a
+//! pipelined request behind it both get their replies in order.
+//!
+//! Routes. A method off its route gets 405 with `allow`, and an unknown method gets 501. HEAD on
+//! a GET route gets the GET reply with no body.
+//!
 //! Fixture. The test reads the canonical SmolLM2 Q8_0 from `test_fixtures.path`.
 
 const std = @import("std");
@@ -1377,12 +1391,40 @@ test "openai request: a stop string ends the reply just before it, buffered and 
 /// Send `requests` in one write on a new socket, read until the server closes, and return the
 /// count of replies. A server that keeps the socket open fails with `error.NotClosed`.
 fn repliesBeforeClose(fx: *const Fixture, arena: std.mem.Allocator, requests: []const u8) !usize {
+    const got = try rawReplies(fx, arena, requests);
+    return std.mem.count(u8, got, "HTTP/1.1 ");
+}
+
+/// Send `requests` in one write on a new socket, and return the bytes that come back before the
+/// server closes. The server can refuse and close before it reads every byte, so a failed write
+/// is no error.
+fn rawReplies(fx: *const Fixture, arena: std.mem.Allocator, requests: []const u8) ![]const u8 {
+    return rawRepliesThen(fx, arena, requests, .keep_open);
+}
+
+/// As `rawReplies`, and `.shut_send` closes the send side after the requests. A server that
+/// drops the input of a refused request then sees its end at once. A buffered chat request
+/// must keep the send side open, because the server reads a half-close as a hang-up.
+fn rawRepliesThen(
+    fx: *const Fixture,
+    arena: std.mem.Allocator,
+    requests: []const u8,
+    then: enum { keep_open, shut_send },
+) ![]const u8 {
     const stream = try connectRaw(fx);
     defer stream.close(fx.io);
 
     var w = stream.writer(fx.io, &.{});
-    try w.interface.writeAll(requests);
+    w.interface.writeAll(requests) catch {};
+    if (then == .shut_send) {
+        stream.shutdown(fx.io, .send) catch {};
+    }
+    return readToClose(stream, arena);
+}
 
+/// Read until the server closes. A server that keeps the socket open fails with
+/// `error.NotClosed`.
+fn readToClose(stream: std.Io.net.Stream, arena: std.mem.Allocator) ![]const u8 {
     const posix = std.posix;
     const fd = stream.socket.handle;
     var got: std.ArrayList(u8) = .empty;
@@ -1401,7 +1443,7 @@ fn repliesBeforeClose(fx: *const Fixture, arena: std.mem.Allocator, requests: []
         try got.appendSlice(arena, buf[0..n]);
     }
 
-    return std.mem.count(u8, got.items, "HTTP/1.1 ");
+    return got.items;
 }
 
 fn chatRequest(
@@ -1455,4 +1497,383 @@ test "openai close: a POST that asks for close ends the connection after its rep
         get_models_close,
     });
     try std.testing.expectEqual(@as(usize, 2), try repliesBeforeClose(&fx, arena, kept));
+}
+
+// -- body framing -----------------------------------------------------------
+
+const chat_head = "POST /v1/chat/completions HTTP/1.1\r\nHost: test\r\n" ++
+    "Content-Type: application/json\r\n";
+const chunked_head = chat_head ++ "Transfer-Encoding: chunked\r\n\r\n";
+const short_chat = "{\"messages\":[{\"role\":\"user\",\"content\":\"Hi\"}],\"max_tokens\":1," ++
+    "\"temperature\":0}";
+
+/// The status of the one reply in `replies`. A second reply, such as an interim one, fails.
+fn onlyStatus(replies: []const u8) !u16 {
+    const prefix = "HTTP/1.1 ";
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, replies, prefix));
+    try std.testing.expect(std.mem.startsWith(u8, replies, prefix));
+    try std.testing.expect(replies.len >= prefix.len + 3);
+    return std.fmt.parseInt(u16, replies[prefix.len..][0..3], 10);
+}
+
+/// Send `request`, and require one reply of `status`, then the close. A second client then gets
+/// its reply, so the refusal left the server up.
+fn expectRefused(fx: *const Fixture, request: []const u8, status: u16) !void {
+    var arena_state = std.heap.ArenaAllocator.init(fx.gpa);
+    defer arena_state.deinit();
+
+    const replies = try rawRepliesThen(fx, arena_state.allocator(), request, .shut_send);
+    try std.testing.expectEqual(status, try onlyStatus(replies));
+    try std.testing.expectEqual(@as(u16, 200), try rawExchange(fx, get_models_close));
+}
+
+test "openai framing: a chunk size of a letter past f gets 400" {
+    var fx: Fixture = undefined;
+    try fx.setUp();
+    defer fx.tearDown();
+
+    // The std parser reads `g` as sixteen, so a body padded to a multiple of sixteen bytes
+    // parses there and gets a reply.
+    const sixteens = (short_chat.len + 15) / 16;
+    const padded = short_chat ++ " " ** (sixteens * 16 - short_chat.len);
+    const size = std.fmt.comptimePrint("{x}g", .{sixteens - 1});
+    try expectRefused(&fx, chunked_head ++ size ++ "\r\n" ++ padded ++ "\r\n0\r\n\r\n", 400);
+}
+
+test "openai framing: a size line that ends with a bare LF gets 400" {
+    var fx: Fixture = undefined;
+    try fx.setUp();
+    defer fx.tearDown();
+
+    const size = std.fmt.comptimePrint("{x}", .{short_chat.len});
+    try expectRefused(&fx, chunked_head ++ size ++ "\n" ++ short_chat ++ "\r\n0\r\n\r\n", 400);
+}
+
+test "openai framing: a chunk extension past its bound gets 400 at once" {
+    var fx: Fixture = undefined;
+    try fx.setUp();
+    defer fx.tearDown();
+
+    const ext = "a" ** (limits.openai_max_chunk_ext_bytes + 1);
+    try expectRefused(&fx, chunked_head ++ "2;" ++ ext, 400);
+}
+
+test "openai framing: a chunk size past the cap gets 413 before its data" {
+    var fx: Fixture = undefined;
+    try fx.setUp();
+    defer fx.tearDown();
+
+    const size = std.fmt.comptimePrint("{x}", .{limits.openai_max_request_bytes + 1});
+    try expectRefused(&fx, chunked_head ++ size ++ "\r\n{\"m", 413);
+}
+
+test "openai framing: Content-Length with Transfer-Encoding gets 400" {
+    var fx: Fixture = undefined;
+    try fx.setUp();
+    defer fx.tearDown();
+
+    const size = std.fmt.comptimePrint("{x}", .{short_chat.len});
+    const both = chat_head ++ "Content-Length: 7\r\nTransfer-Encoding: chunked\r\n\r\n" ++
+        size ++ "\r\n" ++ short_chat ++ "\r\n0\r\n\r\n";
+    try expectRefused(&fx, both, 400);
+}
+
+test "openai framing: a transfer coding other than chunked gets 501" {
+    var fx: Fixture = undefined;
+    try fx.setUp();
+    defer fx.tearDown();
+
+    try expectRefused(&fx, chat_head ++ "Transfer-Encoding: gzip\r\n\r\n" ++ short_chat, 501);
+}
+
+test "openai framing: a Content-Length with a sign or two values gets 400" {
+    var fx: Fixture = undefined;
+    try fx.setUp();
+    defer fx.tearDown();
+
+    const signed = std.fmt.comptimePrint("Content-Length: +{d}\r\n\r\n", .{short_chat.len});
+    try expectRefused(&fx, chat_head ++ signed ++ short_chat, 400);
+
+    // The std head parser refuses a second length, and the server answers that head with 400.
+    const twice = std.fmt.comptimePrint(
+        "Content-Length: {d}\r\nContent-Length: {d}\r\n\r\n",
+        .{ short_chat.len, short_chat.len },
+    );
+    try expectRefused(&fx, chat_head ++ twice ++ short_chat, 400);
+}
+
+test "openai framing: a head past its cap gets 431" {
+    var fx: Fixture = undefined;
+    try fx.setUp();
+    defer fx.tearDown();
+
+    const filler = "X-Filler: " ++ "a" ** limits.openai_max_header_bytes ++ "\r\n";
+    try expectRefused(&fx, chat_head ++ filler ++ "\r\n", 431);
+}
+
+test "openai framing: a POST with no length has an empty body and gets 400 at once" {
+    var fx: Fixture = undefined;
+    try fx.setUp();
+    defer fx.tearDown();
+
+    // No deadline is set, so a server that waits for the end of the stream fails the test.
+    try expectRefused(&fx, chat_head ++ "\r\n", 400);
+}
+
+test "openai framing: a GET with a body gets 400, and the next request in the stream no reply" {
+    var fx: Fixture = undefined;
+    try fx.setUp();
+    defer fx.tearDown();
+
+    const get_body = "GET /v1/models HTTP/1.1\r\nHost: test\r\nContent-Length: " ++
+        std.fmt.comptimePrint("{d}", .{get_models_keep.len}) ++ "\r\n\r\n";
+    try expectRefused(&fx, get_body ++ get_models_keep ++ get_models_keep, 400);
+}
+
+test "openai framing: a body shorter than its Content-Length runs no turn" {
+    var fx: Fixture = undefined;
+    try fx.setUp();
+    defer fx.tearDown();
+
+    var arena_state = std.heap.ArenaAllocator.init(fx.gpa);
+    defer arena_state.deinit();
+
+    // The body is valid JSON, so only the length check can refuse it.
+    const stream = try connectRaw(&fx);
+    defer stream.close(fx.io);
+
+    var w = stream.writer(fx.io, &.{});
+    const length = std.fmt.comptimePrint("Content-Length: {d}\r\n\r\n", .{short_chat.len + 8});
+    try w.interface.writeAll(chat_head ++ length ++ short_chat);
+    try stream.shutdown(fx.io, .send);
+    const replies = try readToClose(stream, arena_state.allocator());
+    try std.testing.expectEqual(@as(u16, 400), try onlyStatus(replies));
+
+    fx.stopServer();
+    try std.testing.expectEqual(@as(u64, 0), fx.server.sched.tokens_generated_total);
+}
+
+test "openai framing: Expect on a refused head sends no interim reply" {
+    var fx: Fixture = undefined;
+    try fx.setUp();
+    defer fx.tearDown();
+
+    const big = std.fmt.comptimePrint(
+        "Content-Length: {d}\r\nExpect: 100-continue\r\n\r\n",
+        .{limits.openai_max_request_bytes + 1},
+    );
+    try expectRefused(&fx, chat_head ++ big, 413);
+}
+
+test "openai framing: an Expect other than 100-continue gets 417" {
+    var fx: Fixture = undefined;
+    try fx.setUp();
+    defer fx.tearDown();
+
+    const length = std.fmt.comptimePrint("Content-Length: {d}\r\n", .{short_chat.len});
+    try expectRefused(&fx, chat_head ++ length ++ "Expect: foo\r\n\r\n" ++ short_chat, 417);
+}
+
+test "openai framing: Expect 100-continue gets the interim reply, then the body is served" {
+    var fx: Fixture = undefined;
+    try fx.setUp();
+    defer fx.tearDown();
+
+    var arena_state = std.heap.ArenaAllocator.init(fx.gpa);
+    defer arena_state.deinit();
+
+    const stream = try connectRaw(&fx);
+    defer stream.close(fx.io);
+
+    var w = stream.writer(fx.io, &.{});
+    const length = std.fmt.comptimePrint("Content-Length: {d}\r\n", .{short_chat.len});
+    try w.interface.writeAll(chat_head ++ length ++
+        "Expect: 100-continue\r\nConnection: close\r\n\r\n");
+
+    // The client sends the body only after the interim reply, as curl does.
+    const interim = "HTTP/1.1 100 Continue\r\n\r\n";
+    var got: [interim.len]u8 = undefined;
+    var have: usize = 0;
+    const posix = std.posix;
+    while (have < got.len) {
+        const fd = stream.socket.handle;
+        var fds = [_]posix.pollfd{.{ .fd = fd, .events = posix.POLL.IN, .revents = 0 }};
+        if (try posix.poll(&fds, harness.close_wait_ms) == 0) return error.NoInterimReply;
+        const n = try posix.read(fd, got[have..]);
+        if (n == 0) return error.NoInterimReply;
+        have += n;
+    }
+    try std.testing.expectEqualStrings(interim, &got);
+
+    try w.interface.writeAll(short_chat);
+    const replies = try readToClose(stream, arena_state.allocator());
+    try std.testing.expectEqual(@as(u16, 200), try onlyStatus(replies));
+}
+
+test "openai framing: a field line with a space before its colon or a bare LF gets 400" {
+    var fx: Fixture = undefined;
+    try fx.setUp();
+    defer fx.tearDown();
+
+    // A proxy that honors the length reads one request. A server that ignores the line reads two.
+    const length = std.fmt.comptimePrint("{d}", .{get_models_close.len});
+    const spaced = "GET /v1/models HTTP/1.1\r\nContent-Length : " ++ length ++ "\r\n\r\n";
+    try expectRefused(&fx, spaced ++ get_models_close, 400);
+    const folded = "GET /v1/models HTTP/1.1\r\nX: a\nContent-Length: " ++ length ++ "\r\n\r\n";
+    try expectRefused(&fx, folded ++ get_models_close, 400);
+}
+
+test "openai framing: a trailer that is no field line gets 400" {
+    var fx: Fixture = undefined;
+    try fx.setUp();
+    defer fx.tearDown();
+
+    const size = std.fmt.comptimePrint("{x}", .{short_chat.len});
+    const smuggled = "0\r\nGET /v1/models HTTP/1.1\r\nHost: a\r\n\r\n";
+    try expectRefused(&fx, chunked_head ++ size ++ "\r\n" ++ short_chat ++ "\r\n" ++ smuggled, 400);
+}
+
+test "openai framing: an HTTP/1.0 request gets no interim reply and no chunked reply" {
+    var fx: Fixture = undefined;
+    try fx.setUp();
+    defer fx.tearDown();
+
+    var arena_state = std.heap.ArenaAllocator.init(fx.gpa);
+    defer arena_state.deinit();
+
+    const arena = arena_state.allocator();
+    const head_10 = "POST /v1/chat/completions HTTP/1.0\r\nContent-Type: application/json\r\n";
+    const length = std.fmt.comptimePrint("Content-Length: {d}\r\n", .{short_chat.len});
+    const expect = head_10 ++ length ++ "Expect: 100-continue\r\n\r\n" ++ short_chat;
+    const buffered = try rawReplies(&fx, arena, expect);
+    try std.testing.expectEqual(@as(u16, 200), try onlyStatus(buffered));
+    try expectSized(buffered);
+
+    const wrong = "{\"model\":\"nope\",\"messages\":[{\"role\":\"user\",\"content\":\"Hi\"}]}";
+    const wrong_length = std.fmt.comptimePrint("Content-Length: {d}\r\n\r\n", .{wrong.len});
+    const refused = try rawReplies(&fx, arena, head_10 ++ wrong_length ++ wrong);
+    try std.testing.expectEqual(@as(u16, 404), try onlyStatus(refused));
+    try expectSized(refused);
+
+    // A stream to an HTTP/1.0 client ends at the close.
+    const streamed_body = "{\"messages\":[{\"role\":\"user\",\"content\":\"Hi\"}]," ++
+        "\"max_tokens\":2,\"temperature\":0,\"stream\":true}";
+    const stream_length = std.fmt.comptimePrint(
+        "Content-Length: {d}\r\n\r\n",
+        .{streamed_body.len},
+    );
+    const streamed = try rawReplies(&fx, arena, head_10 ++ stream_length ++ streamed_body);
+    try std.testing.expectEqual(@as(u16, 200), try onlyStatus(streamed));
+    try std.testing.expect(std.ascii.findIgnoreCase(streamed, "transfer-encoding") == null);
+    try std.testing.expect(std.mem.endsWith(u8, streamed, "data: [DONE]\n\n"));
+}
+
+/// The reply carries a length and no chunked coding, the form an HTTP/1.0 client reads.
+fn expectSized(reply: []const u8) !void {
+    try std.testing.expect(std.ascii.findIgnoreCase(reply, "transfer-encoding") == null);
+    try std.testing.expect(std.ascii.findIgnoreCase(reply, "content-length: ") != null);
+}
+
+test "openai framing: a client still sending after a 413 gets the reply and a clean close" {
+    var fx: Fixture = undefined;
+    try fx.setUp();
+    defer fx.tearDown();
+
+    const stream = try connectRaw(&fx);
+    defer stream.close(fx.io);
+
+    var w = stream.writer(fx.io, &.{});
+    const big = std.fmt.comptimePrint(
+        "Content-Length: {d}\r\n\r\n",
+        .{limits.openai_max_request_bytes + 1},
+    );
+    try w.interface.writeAll(chat_head ++ big);
+
+    // Read the whole refusal first, so the body below reaches a server that has already replied.
+    const posix = std.posix;
+    const fd = stream.socket.handle;
+    var got: [4096]u8 = undefined;
+    var have: usize = 0;
+    while (std.mem.find(u8, got[0..have], "}}") == null) {
+        var fds = [_]posix.pollfd{.{ .fd = fd, .events = posix.POLL.IN, .revents = 0 }};
+        if (try posix.poll(&fds, harness.close_wait_ms) == 0) return error.NoReply;
+        const n = try posix.read(fd, got[have..]);
+        if (n == 0) return error.NoReply;
+        have += n;
+    }
+    try std.testing.expectEqual(@as(u16, 413), try onlyStatus(got[0..have]));
+
+    // The body stays below the drain bound, so the server reads all of it and closes with no
+    // reset: the client sees a clean end of stream.
+    const body_bytes = limits.close_drain_bytes / 2;
+    const chunk: [4096]u8 = @splat('x');
+    for (0..body_bytes / chunk.len) |_| {
+        try w.interface.writeAll(&chunk);
+    }
+    try stream.shutdown(fx.io, .send);
+    var fds = [_]posix.pollfd{.{ .fd = fd, .events = posix.POLL.IN, .revents = 0 }};
+    if (try posix.poll(&fds, harness.close_wait_ms) == 0) return error.NotClosed;
+    try std.testing.expectEqual(@as(usize, 0), try posix.read(fd, &got));
+}
+
+test "openai framing: a chunked request on a kept connection, then a pipelined request" {
+    var fx: Fixture = undefined;
+    try fx.setUp();
+    defer fx.tearDown();
+
+    var arena_state = std.heap.ArenaAllocator.init(fx.gpa);
+    defer arena_state.deinit();
+
+    const size = std.fmt.comptimePrint("{x}", .{short_chat.len});
+    const both = chunked_head ++ size ++ "\r\n" ++ short_chat ++ "\r\n0\r\n\r\n" ++
+        get_models_close;
+    const replies = try rawReplies(&fx, arena_state.allocator(), both);
+    try std.testing.expectEqual(@as(usize, 2), std.mem.count(u8, replies, "HTTP/1.1 200"));
+    const chat_at = std.mem.find(u8, replies, "chat.completion").?;
+    const models_at = std.mem.find(u8, replies, "\"object\":\"list\"").?;
+    try std.testing.expect(chat_at < models_at);
+}
+
+test "openai routes: a method off its route gets 405 with allow, an unknown method 501" {
+    var fx: Fixture = undefined;
+    try fx.setUp();
+    defer fx.tearDown();
+
+    var arena_state = std.heap.ArenaAllocator.init(fx.gpa);
+    defer arena_state.deinit();
+
+    const arena = arena_state.allocator();
+    const put = try rawReplies(&fx, arena, "PUT /v1/models HTTP/1.1\r\nHost: t\r\n\r\n");
+    try std.testing.expectEqual(@as(u16, 405), try onlyStatus(put));
+    try std.testing.expect(std.ascii.findIgnoreCase(put, "allow: GET, HEAD\r\n") != null);
+    const get_chat = "GET /v1/chat/completions HTTP/1.1\r\nHost: t\r\n\r\n";
+    const wrong = try rawReplies(&fx, arena, get_chat);
+    try std.testing.expectEqual(@as(u16, 405), try onlyStatus(wrong));
+    try std.testing.expect(std.ascii.findIgnoreCase(wrong, "allow: POST\r\n") != null);
+    try expectRefused(&fx, "BREW /v1/models HTTP/1.1\r\nHost: t\r\n\r\n", 501);
+}
+
+test "openai routes: HEAD on a GET route answers as GET with no body" {
+    var fx: Fixture = undefined;
+    try fx.setUp();
+    defer fx.tearDown();
+
+    var arena_state = std.heap.ArenaAllocator.init(fx.gpa);
+    defer arena_state.deinit();
+
+    const head = "HEAD /v1/models HTTP/1.1\r\nHost: t\r\n\r\n";
+    const replies = try rawReplies(&fx, arena_state.allocator(), head ++ get_models_close);
+    try std.testing.expectEqual(@as(usize, 2), std.mem.count(u8, replies, "HTTP/1.1 200"));
+    // Only the GET reply carries the list.
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, replies, "\"object\":\"list\""));
+}
+
+// The std chunk decoder panics on this size in a safe build, so this test runs last: a
+// failure before the fix stops the binary only after the other tests ran.
+test "openai framing: a chunk size past 64 bits gets 400, and the server stays up" {
+    var fx: Fixture = undefined;
+    try fx.setUp();
+    defer fx.tearDown();
+
+    try expectRefused(&fx, chunked_head ++ "ffffffffffffffff\r\n{}\r\n0\r\n\r\n", 400);
 }

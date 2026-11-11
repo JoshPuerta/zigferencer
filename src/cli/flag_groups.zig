@@ -129,9 +129,10 @@ pub const ServeFlags = struct {
             .group = "sessions",
             .value = "S",
             .text = std.fmt.comptimePrint(
-                "seconds one socket read or write can wait, cap {d}.\n" ++
-                    "0 = no deadline. Linux only. A binary client that\n" ++
-                    "holds a session keeps its connection when idle",
+                "The seconds that one socket read or write can wait,\n" ++
+                    "cap {d}. 0 sets no deadline. The deadline works on\n" ++
+                    "Linux only. A binary client that holds a session\n" ++
+                    "keeps its connection when idle.",
                 .{limits.max_io_timeout_s},
             ),
         },

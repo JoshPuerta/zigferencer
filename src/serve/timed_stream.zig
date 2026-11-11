@@ -224,13 +224,56 @@ pub fn sendOnce(io: Io, stream: net.Stream, bytes: []const u8) void {
     _ = sendNow(stream, bytes);
 }
 
-/// Close a refused socket. A close over unread input sends a reset, and a reset can drop the
-/// refusal. So the send side shuts first, the input that has arrived drains, and the close comes
-/// last.
+/// Close a refused socket in the order of `endOutput`.
 pub fn closeRefused(io: Io, stream: *net.Stream) void {
-    stream.shutdown(io, .send) catch {};
-    drainNow(stream.*);
+    endOutput(io, stream.*);
     stream.close(io);
+}
+
+/// Shut the send side, then drop at most `limits.close_drain_bytes` of arrived input, with no
+/// wait. Call it before the close, because a close over unread input sends a reset that can drop
+/// the last reply. Input that arrives later can still cause the reset.
+pub fn endOutput(io: Io, stream: net.Stream) void {
+    stream.shutdown(io, .send) catch {};
+    drainNow(stream);
+}
+
+/// Drop at most `limits.close_drain_bytes` of arrived input, with no wait and no shutdown. Call it
+/// before a close that must send its end of stream only at the close itself.
+pub fn dropArrived(stream: net.Stream) void {
+    drainNow(stream);
+}
+
+/// Shut the send side, then read and drop input until the end of the stream, until
+/// `limits.close_drain_bytes`, or for `wait_ms`, whichever comes first. A connection task calls it
+/// after a refusal, because the client can still be sending its request.
+pub fn lingerOutput(io: Io, stream: net.Stream, wait_ms: u32) void {
+    stream.shutdown(io, .send) catch {};
+    if (!has_deadline) return;
+
+    const linux = std.os.linux;
+    const deadline = deadlineAfter(io, wait_ms);
+    const fd = stream.socket.handle;
+    var buf: [4096]u8 = undefined;
+    var dropped: usize = 0;
+    // A pass drops at least one byte, or it finds no byte after a wake. The byte bound and the
+    // deadline end the loop, and the pass bound also ends a storm of empty wakes.
+    const passes_max = limits.close_drain_bytes + 64;
+    for (0..passes_max) |_| {
+        if (dropped >= limits.close_drain_bytes) return;
+        if (waitReady(io, stream, .readable, deadline) != .ready) return;
+
+        const want = @min(buf.len, limits.close_drain_bytes - dropped);
+        const rc = linux.recvfrom(fd, &buf, want, linux.MSG.DONTWAIT, null, null);
+        switch (linux.errno(rc)) {
+            .SUCCESS => {
+                if (rc == 0) return;
+                dropped += rc;
+            },
+            .AGAIN, .INTR => {},
+            else => return,
+        }
+    }
 }
 
 // -- helpers ----------------------------------------------------------------
@@ -241,8 +284,8 @@ fn drainNow(stream: net.Stream) void {
     if (!has_deadline) return;
 
     const linux = std.os.linux;
-    var buf: [1024]u8 = undefined;
-    const reads_max = 4;
+    var buf: [4096]u8 = undefined;
+    const reads_max = (limits.close_drain_bytes + buf.len - 1) / buf.len;
     for (0..reads_max) |_| {
         const fd = stream.socket.handle;
         const rc = linux.recvfrom(fd, &buf, buf.len, linux.MSG.DONTWAIT, null, null);

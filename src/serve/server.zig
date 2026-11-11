@@ -303,7 +303,12 @@ fn readHandshake(r: *Io.Reader, body_buf: []u8) HandshakeError![]const u8 {
 fn fatalFrame(engine: anytype, conn: anytype, code: protocol.ErrorCode, detail: []const u8) void {
     log.debug("frame: conn {d} closed, {t}: {s}", .{ engine.connId(conn), code, detail });
     const ev = OutEvent.fail(0, 0, code, detail);
-    _ = conn.out_q.put(engine.io, &.{ev}, 0) catch {};
+    const queued = conn.out_q.put(engine.io, &.{ev}, 0) catch 0;
+    if (queued == 0) {
+        log.debug("frame: conn {d}, the error frame dropped, the out-queue is full or closed", .{
+            engine.connId(conn),
+        });
+    }
 }
 
 fn decodeErrorCode(e: protocol.DecodeError) protocol.ErrorCode {

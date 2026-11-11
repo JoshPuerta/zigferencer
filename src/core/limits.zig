@@ -253,12 +253,32 @@ pub const max_token_text_bytes: usize = 256;
 /// client sends a longer history in several frames.
 pub const max_append_pairs: u16 = 64;
 
-pub const openai_max_request_bytes: usize = 256 * 1024; // POST body cap (413 past it)
+/// The largest body of an HTTP request. A larger body gets 413.
+pub const openai_max_request_bytes: usize = 256 * 1024;
 
-pub const openai_max_header_bytes: usize = 16 * 1024; // http.Server head buffer (431 past it)
+/// The head buffer of the HTTP server. A larger head gets 431.
+pub const openai_max_header_bytes: usize = 16 * 1024;
+/// The longest chunk extension in bytes, white space and semicolon included. The decoder skips
+/// an extension. The bound refuses a size line that never ends, so a client cannot hold the
+/// reader with extension bytes below the body cap.
+pub const openai_max_chunk_ext_bytes: usize = 1024;
+/// The most framing bytes of one chunked body: size lines, extensions, line ends, and trailers.
+/// With this bound equal to the body cap, a chunked body costs at most twice the cap on the
+/// wire. A body of chunks of 16 bytes or more, with no extension, passes it at any size.
+pub const openai_max_chunk_overhead_bytes: usize = openai_max_request_bytes;
+/// The most input that a close drops. A close over unread input sends a reset, and a reset can
+/// drop the last reply. The bound holds the largest request the HTTP frontend reads: a head, and
+/// a chunked body of the cap with the most framing bytes. That is more than one binary message.
+pub const close_drain_bytes: usize = openai_max_header_bytes + openai_max_request_bytes +
+    openai_max_chunk_overhead_bytes;
+/// The longest wait for the input of a refused HTTP request to end. The value follows the nginx
+/// default `lingering_timeout` of 5 seconds, its wait for more input in a lingering close. Here
+/// it bounds the whole drain, so a refused client holds its slot at most this long.
+pub const close_linger_ms: u32 = 5_000;
 /// The most messages in one rendered conversation. A render holds one plain range per message.
 pub const max_chat_messages: usize = 64;
-pub const openai_max_messages: usize = max_chat_messages; // messages[] length cap
+/// The most messages in one OpenAI request, equal to the render bound.
+pub const openai_max_messages: usize = max_chat_messages;
 /// The most content parts in one message. It bounds the loop that joins the parts. A client splits
 /// a text message into a few parts, and the body cap bounds the bytes, so the count needs no more.
 pub const openai_max_content_parts: usize = 64;
@@ -269,11 +289,22 @@ pub const openai_max_stops: usize = 4;
 /// and keeps the holdback below `max_token_text_bytes`.
 pub const openai_max_stop_bytes: usize = 64;
 
-/// The TCP keepalive of an accepted socket. A peer that vanishes with no close is found after the
-/// idle time plus `keepalive_probes` unanswered probes, `keepalive_interval_s` apart: 60 + 6 * 10
-/// = 120 seconds. Then the next socket read fails, and the slot frees.
+// The TCP keepalive of an accepted socket. A peer that vanishes with no close is found after the
+// idle time plus `keepalive_probes` unanswered probes, `keepalive_interval_s` apart: 60 + 6 * 10
+// = 120 seconds. Then the next socket read fails, and the slot frees. The kernel sends a probe
+// only while no output waits for an acknowledgment. The Linux defaults (`tcp_keepalive_time`
+// 7200, `tcp_keepalive_intvl` 75, `tcp_keepalive_probes` 9, in the kernel document
+// `Documentation/networking/ip-sysctl.rst`) find a dead peer after more than two hours. A dead
+// peer holds a connection slot until then, so each value replaces its default.
+
+/// The silence before the first probe. One minute keeps the probes of an idle live client to one
+/// small packet per minute.
 pub const keepalive_idle_s: c_int = 60;
+/// The wait between two unanswered probes. A probe that the path drops gets its retry within ten
+/// seconds.
 pub const keepalive_interval_s: c_int = 10;
+/// The unanswered probes that end a connection. Six probes over one minute let a live client
+/// pass a short loss of its path and keep its connection.
 pub const keepalive_probes: c_int = 6;
 
 /// The `max_tokens` of a request that omits it. 0 is the whole window.
