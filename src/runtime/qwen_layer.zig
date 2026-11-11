@@ -2,7 +2,8 @@
 //! that a runner reads to hold and bind the layer. The file holds no state.
 //!
 //! Comptime. `forward` takes the kernel set type and checks it with `assertLayerKernels`.
-//! `tensorName` takes the role at comptime, because `findByFmt` takes a comptime format.
+//! `tensorName` takes the role at comptime, because `tensor_lookup.roleName` takes a comptime
+//! format.
 //!
 //! Mixer. A layer is full attention or Gated DeltaNet (GDN). The kind is a property of the model,
 //! so every rule takes the model index of the layer, and `forward` passes it to each call.
@@ -190,6 +191,37 @@ pub fn activationWidth(card: *const loader.ModelCard, act: Activation) u32 {
         .alpha, .beta => g.time_step_rank,
         .ffn_gate, .ffn_up => card.feed_forward_length,
         .ffn_down => 0,
+    };
+}
+
+/// The dims that the card requires of a layer weight, in the order of the GGUF shape: the input
+/// width, then the output width. A vector holds 0 as its second entry. Zero: no such weight.
+pub fn weightDims(card: *const loader.ModelCard, weight: Weight) [2]u32 {
+    assert(card.arch == .qwen35);
+
+    const g = card.gdn.?;
+    const emb = card.embedding_length;
+    const q_dim = activationWidth(card, .q);
+    const kv_dim = activationWidth(card, .k);
+    const qkv = activationWidth(card, .qkv);
+    const value_dim = activationWidth(card, .z);
+    const ffn = card.feed_forward_length;
+    return switch (weight) {
+        .attn_norm, .ffn_norm => .{ emb, 0 },
+        .attn_q => .{ emb, activationWidth(card, .q_gate) },
+        .attn_k, .attn_v => .{ emb, kv_dim },
+        .attn_q_norm, .attn_k_norm => .{ card.head_dim, 0 },
+        .attn_o => .{ q_dim, emb },
+        .ssm_qkv => .{ emb, qkv },
+        .ssm_z => .{ emb, value_dim },
+        .ssm_alpha, .ssm_beta => .{ emb, g.time_step_rank },
+        .ssm_out => .{ value_dim, emb },
+        // The conv weight holds the taps of one channel next to each other.
+        .ssm_conv1d => .{ g.conv_kernel, qkv },
+        .ssm_a, .ssm_dt => .{ g.time_step_rank, 0 },
+        .ssm_norm => .{ g.state_size, 0 },
+        .ffn_gate, .ffn_up => .{ emb, ffn },
+        .ffn_down => .{ ffn, emb },
     };
 }
 

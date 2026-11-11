@@ -602,11 +602,13 @@ fn prefillCachedAndStream(runner: anytype, t: *const Turn) !void {
     var prefilled: Prefilled = .{ .pos = 0, .last_logits = undefined };
     if (cache) |*c| {
         if (c.lookup(cache_key, ids)) |hit| {
-            prefilled.pos = try runner.restoreFromBytes(hit.blob, hit.n);
-            prefilled.last_logits = hit.last_logits;
-            log.info("prompt-cache HIT ({s}): skipped prefill of {d} tokens", .{
-                if (c.last_hit_from_disk) "disk" else "ram", ids.len,
-            });
+            if (snapshotFits(runner, hit)) {
+                prefilled.pos = try runner.restoreFromBytes(hit.blob, hit.n);
+                prefilled.last_logits = hit.last_logits;
+                log.info("prompt-cache HIT ({s}): skipped prefill of {d} tokens", .{
+                    if (c.last_hit_from_disk) "disk" else "ram", ids.len,
+                });
+            }
         }
     }
 
@@ -623,6 +625,19 @@ fn prefillCachedAndStream(runner: anytype, t: *const Turn) !void {
     }
 
     return streamDecode(runner, t, prefilled, t_start);
+}
+
+/// Whether `runner` can restore the cache entry `hit`. A disk entry is file input, so a mismatch
+/// logs one line and reads as a miss.
+fn snapshotFits(runner: anytype, hit: anytype) bool {
+    prompt_cache_mod.checkRows(hit.n, runner.max_seq) catch return false;
+    prompt_cache_mod.checkSizes(
+        hit.blob.len,
+        runner.snapshotBytes(hit.n),
+        hit.last_logits.len,
+        runner.card.vocab_size,
+    ) catch return false;
+    return true;
 }
 
 /// Snapshot the prefilled prompt into the cache. `t0` starts the prefill that the cache weighs.

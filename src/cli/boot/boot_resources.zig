@@ -14,6 +14,7 @@ const build_options = @import("build_options");
 const context = @import("../context.zig");
 const args = @import("../args.zig");
 const family = @import("../../engine/family.zig");
+const weight_check = @import("../../runtime/weight_check.zig");
 const resolve_mod = @import("../../engine/resolve.zig");
 const dtype = @import("../../core/dtype.zig");
 const hwinfo = @import("../../core/hwinfo.zig");
@@ -99,6 +100,7 @@ pub fn resolveLoaded(
     entry: resolve_mod.Entry,
     loaded: *const loader.Loaded,
 ) !LoadedBoot {
+    try checkLoaded(loaded);
     const model_needs = modelNeeds(loaded);
     const ram_free = hostRamFree(ctx.io);
     const resources: resolve_mod.Resources = .{ .ram_free = ram_free, .model = model_needs };
@@ -118,6 +120,18 @@ pub fn resolveLoaded(
             .ram = .{ .read = ram_free },
         },
     };
+}
+
+/// Refuse a weight that the card does not describe, before any measure or allocation. Every boot
+/// calls it right after the load.
+pub fn checkLoaded(loaded: *const loader.Loaded) weight_check.Error!void {
+    switch (loaded.card.arch) {
+        inline else => |arch| try weight_check.checkWeights(
+            family.Of(arch).Layer,
+            &loaded.card,
+            loaded.tensors,
+        ),
+    }
 }
 
 /// The registry values `resolve` reads.

@@ -64,6 +64,7 @@
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 const sampler = @import("sampler.zig");
+const prompt_cache = @import("prompt_cache.zig");
 const StepRow = @import("step_row.zig").StepRow;
 const runner_surface = @import("runner_surface.zig");
 const core_log = @import("../core/log.zig");
@@ -242,7 +243,9 @@ pub fn Sessions(comptime RunnerT: type) type {
             const s = &self.table[id];
             std.debug.assert(s.state == .feeding);
             std.debug.assert(s.pos == 0);
-            std.debug.assert(blob.len == @as(usize, @intCast(self.snapshotBytesFor(n_rows))));
+            // A cache file supplies the blob, so a mismatch is a miss, not a broken invariant.
+            try prompt_cache.checkRows(n_rows, self.runner.max_seq);
+            try prompt_cache.checkSizes(blob.len, self.snapshotBytesFor(n_rows), 0, 0);
             try self.runner.restoreSlot(id, n_rows, blob);
             s.pos = n_rows;
             log.debug("engine restore prefix: id {d}, slot {d}, {d} rows", .{ id, id, n_rows });
@@ -260,12 +263,17 @@ pub fn Sessions(comptime RunnerT: type) type {
         ) !u32 {
             if (comptime !can_snapshot) @compileError("runner cannot snapshot slot state");
 
-            std.debug.assert(logits.len == self.vocab);
+            try prompt_cache.checkSizes(0, 0, logits.len, self.vocab);
             try self.restorePrefix(id, n_rows, blob);
             const s = &self.table[id];
             std.debug.assert(s.state == .feeding);
             std.debug.assert(s.pos == n_rows);
-            s.token_pending = sampler.sample(logits, s.params, s.rng.random(), self.sample_scratch);
+            s.token_pending = try sampler.sample(
+                logits,
+                s.params,
+                s.rng.random(),
+                self.sample_scratch,
+            );
             s.state = .ready;
             log.debug(
                 "engine restore ready: id {d}, {d} rows, first {d}",
@@ -468,13 +476,24 @@ pub fn Sessions(comptime RunnerT: type) type {
             const vocab = self.vocab;
             const base: usize = if (feed_chunk) |fc| (if (fc.final) @as(usize, 1) else 0) else 0;
             var first: ?u32 = null;
+
+            // Refuse a non-finite row before any session moves, so a failed call leaves no half
+            // step. The scheduler then fails the turns of the call.
+            for (0..base + ids.len) |row| {
+                sampler.checkLogits(self.runner.logits[row * vocab ..][0..vocab]) catch |err| {
+                    log.err("the logits of a step hold a NaN, a +inf, or no finite value, " ++
+                        "so a model weight holds a non-finite value", .{});
+                    return err;
+                };
+            }
+
             // Sample the first token of a final chunk.
             if (feed_chunk) |fc| {
                 const s = &self.table[fc.id];
                 s.pos += @intCast(fc.tokens.len);
                 if (fc.final) {
                     const logits = self.runner.logits[0..vocab];
-                    s.token_pending = sampler.sample(
+                    s.token_pending = try sampler.sample(
                         logits,
                         s.params,
                         s.rng.random(),
@@ -496,7 +515,7 @@ pub fn Sessions(comptime RunnerT: type) type {
                 const s = &self.table[id];
                 s.pos += 1;
                 const logits = self.runner.logits[(base + i) * vocab ..][0..vocab];
-                s.token_pending = sampler.sample(
+                s.token_pending = try sampler.sample(
                     logits,
                     s.params,
                     s.rng.random(),

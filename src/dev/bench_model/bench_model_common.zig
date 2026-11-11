@@ -249,6 +249,7 @@ pub fn loadAndRun(
     var loaded = try loader.load(ctx.io, ctx.arena, path);
     defer loaded.close();
 
+    try boot_resources.checkLoaded(&loaded);
     const model_needs = boot_resources.modelNeeds(&loaded);
     const ram_free = boot_resources.hostRamFree(ctx.io);
     const resources: resolve_mod.Resources = .{ .ram_free = ram_free, .model = model_needs };

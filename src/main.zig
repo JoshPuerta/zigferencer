@@ -217,14 +217,42 @@ fn isUserError(err: anyerror) bool {
         error.UnexpectedEncoding,
         error.DownloadTruncated,
         error.NotAGguf,
-        // Load failures: the loader logged the file and the tensor.
+        // Load failures: the loader logged the file and the key or the tensor.
+        loader.LoadError.MissingKey,
+        loader.LoadError.WrongKeyType,
+        loader.LoadError.UnsupportedArchitecture,
+        loader.LoadError.BadKeyValue,
+        loader.LoadError.TooManyLayers,
+        loader.LoadError.VocabTooLarge,
         loader.LoadError.UnsupportedTensorDtype,
-        // The runner init logged the tensor and the dtype no kernel reads.
-        error.UnsupportedWeightDtype,
         loader.LoadError.BadTensorShape,
         loader.LoadError.TensorSizeOverflow,
+        loader.LoadError.TensorDataUnaligned,
+        loader.LoadError.TensorDataOverlap,
         loader.LoadError.NotEnoughBytes,
         loader.LoadError.UnsupportedRopeScaling,
+        // Parse failures: the loader or `inspect` logged the file and the fault.
+        parser.Error.Truncated,
+        parser.Error.BadValueType,
+        parser.Error.NestedArray,
+        parser.Error.NameTooLong,
+        parser.Error.BadAlignment,
+        parser.Error.BadTensorDims,
+        parser.Error.CountExceedsFile,
+        parser.Error.TensorOffsetsUnordered,
+        parser.Error.TensorOffsetUnaligned,
+        // The runner init logged the tensor and the dtype no kernel reads.
+        error.UnsupportedWeightDtype,
+        // The weight check logged the name of the absent tensor.
+        error.MissingTensor,
+        // The decode loop logged the non-finite logits of a step.
+        error.NonFiniteLogits,
+        // The tokenizer build logged the key, the merge, the count, or the special id.
+        error.MissingTokenizerKey,
+        error.WrongTokenizerKeyType,
+        error.InvalidMerge,
+        error.TokenStringTooLong,
+        error.BadTokenizerValue,
         // Backend and architecture refusals.
         error.UnsupportedServeBackend,
         error.UnsupportedArchForBackend,
@@ -239,10 +267,12 @@ fn isUserError(err: anyerror) bool {
         error.BlobRamBudgetTooSmall,
         error.WindowExceedsCeiling,
         error.KvRegionPastDeviceLimit,
+        error.StepBufferPastDeviceLimit,
         error.AttentionScratchPastDeviceLimit,
         error.AttentionHeadDimUnsupported,
         error.GdnHeadDimUnsupported,
         error.GdnHeadsUnsupported,
+        error.HeadsPastDispatchLimit,
         error.QwenHeadDimUnsupported,
         error.NoKvLayerInRange,
         // Configuration refusals.
@@ -330,6 +360,8 @@ test {
     _ = @import("runtime/generate.zig");
     _ = tensor_lookup;
     _ = @import("runtime/linear_dispatch.zig");
+    _ = @import("runtime/weight_check.zig");
+    _ = @import("runtime/dispatch_guard.zig");
     _ = parallel;
     _ = pool;
     _ = hwinfo;

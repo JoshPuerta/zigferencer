@@ -30,6 +30,7 @@ comes in, and token ids go out.
 | `pool.zig` | `Pool`, the fork-join pool of the CPU ops, and the spans of its work. |
 | `linear_dispatch.zig` | `linearBatchDispatch`, the batched linear by weight dtype. |
 | `tensor_lookup.zig` | The lookup of a weight by name over a `TensorRef` list. |
+| `weight_check.zig` | `checkWeights`, the check of every weight against the card. |
 | `cpu_profile.zig` | The per-op CPU decode profile, summed from the op spans. |
 | `attn_record.zig` | The attention recorder of the fused and hybrid runners. |
 | `decode_ring.zig` | `DecodeRing`, the two decode command buffers of a GPU runner. |
@@ -37,7 +38,9 @@ comes in, and token ids go out.
 | `vulkan_ctx.zig` | `Context`, the owning handle of the Vulkan device. |
 | `vulkan_runner.zig` | `Runner`, the `Context` and the per-op kernel bundle. |
 | `qwen_gpu_guard.zig` | The load gate of the Qwen3.5 GPU kernels. |
+| `dispatch_guard.zig` | The gate of the head counts that a fused kernel dispatches. |
 | `test_fakes.zig` | The shared test windows and the canned-logits fakes. |
+| `test_gguf.zig` | A tiny valid GGUF file of each family, written in memory for the tests. |
 
 ## How the pieces fit
 

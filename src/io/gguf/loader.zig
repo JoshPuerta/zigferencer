@@ -36,6 +36,15 @@ const log = std.log.scoped(.gguf);
 /// The tensor that holds the llama3 RoPE frequency factors.
 pub const rope_freqs_tensor = "rope_freqs.weight";
 
+/// The token embedding table. A model without `head_tensor` reads it as its lm_head too.
+pub const embed_tensor = "token_embd.weight";
+
+/// The lm_head of a model that does not tie it to the embedding table.
+pub const head_tensor = "output.weight";
+
+/// The norm before the lm_head.
+pub const output_norm_tensor = "output_norm.weight";
+
 // -- types ------------------------------------------------------------------
 
 pub const Error = error{
@@ -52,6 +61,8 @@ pub const Error = error{
     TensorSizeOverflow,
     /// A tensor starts at an address that breaks the alignment of its element type.
     TensorDataUnaligned,
+    /// A tensor starts inside the data of the tensor before it.
+    TensorDataOverlap,
 } || parser.Error;
 
 /// What `load` and `loadWith` return: a refused file, or a failed map of the file.
@@ -69,7 +80,8 @@ pub const GdnParams = struct {
     state_size: u32,
     /// Number of GDN heads (= 16 on the 2B).
     group_count: u32,
-    /// Width of each of q, k, v after projection (= group_count * state_size).
+    /// Width of v, z, and the readout: time_step_rank * state_size. The loader refuses another
+    /// value, and only `inspect` reads it.
     inner_size: u32,
     /// Rank of the dt (time-step) projection feeding the decay gate (= 16).
     time_step_rank: u32,
@@ -144,12 +156,95 @@ pub const LoadOptions = struct {
     /// Prefault all pages at map time, so the decode loop takes no page faults. Turn it off for
     /// a metadata-only reader such as `inspect`.
     prefault: bool = true,
-    /// Suppress the `loading...` and `loaded...` info logs, for a caller that reads many models.
+    /// Suppress the `loading...` and `loaded...` info logs and log each refusal at `debug`, for a
+    /// caller that reads many models and lists a bad file without its numbers.
     quiet: bool = false,
 };
 
 /// One dimension of the model card, named by its key after the arch prefix.
 const Dim = struct { key: []const u8, value: u32 };
+
+/// The KV reads of one card. Each refusal logs the file name and the key once.
+const Keys = struct {
+    parsed: parser.Parsed,
+    file: []const u8,
+    level: std.log.Level,
+
+    fn fail(self: Keys, comptime format: []const u8, args: anytype) void {
+        switch (self.level) {
+            inline else => |level| refuse(level, "{s}: " ++ format, .{self.file} ++ args),
+        }
+    }
+
+    fn value(self: Keys, key: []const u8) Error!*const parser.Value {
+        return lookupKv(self.parsed, key) orelse {
+            self.fail("the key {s} is missing", .{key});
+            return error.MissingKey;
+        };
+    }
+
+    fn wrongType(self: Keys, key: []const u8, v: *const parser.Value) Error {
+        self.fail("the key {s} holds a value of type {t}", .{ key, v.* });
+        return error.WrongKeyType;
+    }
+
+    fn string(self: Keys, key: []const u8) Error![]const u8 {
+        const v = try self.value(key);
+        return switch (v.*) {
+            .string => |s| s,
+            else => self.wrongType(key, v),
+        };
+    }
+
+    fn strings(self: Keys, key: []const u8) Error![]const []const u8 {
+        const v = try self.value(key);
+        return switch (v.*) {
+            .array => |a| switch (a) {
+                .strings => |s| s,
+                else => self.wrongType(key, v),
+            },
+            else => self.wrongType(key, v),
+        };
+    }
+
+    /// A value that does not fit a `u32` is a bad value, not a narrowing cast.
+    fn int(self: Keys, key: []const u8) Error!u32 {
+        const v = try self.value(key);
+        const wide: i128 = switch (v.*) {
+            .u32_val => |u| u,
+            .u64_val => |u| u,
+            .i32_val => |i| i,
+            .i64_val => |i| i,
+            else => return self.wrongType(key, v),
+        };
+
+        return std.math.cast(u32, wide) orelse {
+            self.fail("the key {s} holds {d}, which is not a 32-bit count", .{ key, wide });
+            return error.BadKeyValue;
+        };
+    }
+
+    /// The value of an optional key. Only an absent key takes `default`. A bad value fails.
+    fn intOr(self: Keys, key: []const u8, default: u32) Error!u32 {
+        if (lookupKv(self.parsed, key) == null) return default;
+        return self.int(key);
+    }
+
+    fn float(self: Keys, key: []const u8) Error!f32 {
+        const v = try self.value(key);
+        return switch (v.*) {
+            .f32_val => |x| x,
+            .f64_val => |x| @floatCast(x),
+            else => self.wrongType(key, v),
+        };
+    }
+
+    /// The value of an optional key. Only an absent key takes `default`. A wrong type fails.
+    fn floatOr(self: Keys, key: []const u8, default: f32) Error!f32 {
+        if (lookupKv(self.parsed, key) == null) return default;
+        return self.float(key);
+    }
+};
 
 // -- api --------------------------------------------------------------------
 
@@ -169,8 +264,9 @@ pub fn loadWith(
     defer sp.end();
 
     // Map the file. The prefault is the visible wait, so the announce comes first.
+    const file = std.Io.Dir.path.basename(path);
     if (!opts.quiet) {
-        log.info("loading {s}...", .{std.Io.Dir.path.basename(path)});
+        log.info("loading {s}...", .{file});
     }
 
     const t_start = Io.Clock.Timestamp.now(io, .awake);
@@ -186,114 +282,171 @@ pub fn loadWith(
 
     // Parse the bytes.
     const parsed = parser.parse(arena, bytes) catch |err| {
-        log.err(
-            "{s}: the GGUF file is not valid: {s}",
-            .{ std.Io.Dir.path.basename(path), @errorName(err) },
-        );
+        if (opts.quiet) {
+            log.debug("{s}: the GGUF file is not valid: {t}", .{ file, err });
+        } else {
+            log.err("{s}: the GGUF file is not valid: {t}", .{ file, err });
+        }
+
         return err;
     };
     const t_parsed = Io.Clock.Timestamp.now(io, .awake);
 
+    // Build the card.
+    const card = if (opts.quiet)
+        try cardFromParsed(parsed, file, .debug)
+    else
+        try cardFromParsed(parsed, file, .err);
+
+    // Bind the tensors and log the timings.
+    const refs = if (opts.quiet)
+        try bindTensors(arena, parsed, bytes, file, .debug)
+    else
+        try bindTensors(arena, parsed, bytes, file, .err);
+
+    const t_done = Io.Clock.Timestamp.now(io, .awake);
+    if (!opts.quiet) {
+        log.info("loaded {s}: {d} tensors, ctx {d}, {d:.0} MiB in {d:.0} ms", .{
+            card.architecture,
+            refs.len,
+            card.context_length,
+            mibOf(bytes.len),
+            elapsedMs(t_start, t_done),
+        });
+    }
+
+    log.debug("  timings: mmap {d:.1} ms | parse {d:.1} ms | build {d:.1} ms", .{
+        elapsedMs(t_start, t_mapped), elapsedMs(t_mapped, t_parsed), elapsedMs(t_parsed, t_done),
+    });
+
+    return .{
+        .map = map,
+        .parsed = parsed,
+        .card = card,
+        .tensors = refs,
+    };
+}
+
+/// The card of a parsed file, or the typed refusal of a card value. The function reads no file.
+/// A refusal logs the file name once, at `refusal_level`.
+pub fn cardFromParsed(
+    parsed: parser.Parsed,
+    file: []const u8,
+    comptime refusal_level: std.log.Level,
+) Error!ModelCard {
+    const keys: Keys = .{ .parsed = parsed, .file = file, .level = refusal_level };
+
     // Read the architecture and the shape keys.
-    const arch_str = try lookupString(parsed, "general.architecture");
+    const arch_str = try keys.string("general.architecture");
     const arch: Arch = if (std.mem.eql(u8, arch_str, "llama"))
         .llama
     else if (std.mem.eql(u8, arch_str, "qwen35"))
         .qwen35
-    else
+    else {
+        keys.fail("the architecture {s} is not supported", .{arch_str});
         return error.UnsupportedArchitecture;
+    };
 
     // One key buffer is safe because each lookup consumes its key before the next write.
     var kb: [96]u8 = undefined;
-    const n_layers = try lookupU32(parsed, pk(&kb, arch_str, ".block_count"));
-    const n_heads = try lookupU32(parsed, pk(&kb, arch_str, ".attention.head_count"));
+    const n_layers = try keys.int(pk(&kb, arch_str, ".block_count"));
+    const n_heads = try keys.int(pk(&kb, arch_str, ".attention.head_count"));
     // The head count divides the embedding width below.
-    if (n_heads == 0) return error.BadKeyValue;
+    if (n_heads == 0) {
+        keys.fail("the card value attention.head_count is 0", .{});
+        return error.BadKeyValue;
+    }
 
-    const n_kv_heads = try lookupU32Or(
-        parsed,
-        pk(&kb, arch_str, ".attention.head_count_kv"),
-        n_heads,
-    );
-    const embedding_length = try lookupU32(parsed, pk(&kb, arch_str, ".embedding_length"));
-    const ffn_length = try lookupU32(parsed, pk(&kb, arch_str, ".feed_forward_length"));
-    const ctx_declared = try lookupU32(parsed, pk(&kb, arch_str, ".context_length"));
+    const n_kv_heads = try keys.intOr(pk(&kb, arch_str, ".attention.head_count_kv"), n_heads);
+    const embedding_length = try keys.int(pk(&kb, arch_str, ".embedding_length"));
+    const ffn_length = try keys.int(pk(&kb, arch_str, ".feed_forward_length"));
+    const ctx_declared = try keys.int(pk(&kb, arch_str, ".context_length"));
 
-    const head_dim_explicit = try lookupU32Or(
-        parsed,
+    // A file without the key derives the head width, so a refusal names the source it read.
+    const key_length_held = lookupKv(parsed, pk(&kb, arch_str, ".attention.key_length")) != null;
+    const head_dim_source = if (key_length_held)
+        "attention.key_length"
+    else
+        "embedding_length / attention.head_count";
+    const head_dim_explicit = try keys.intOr(
         pk(&kb, arch_str, ".attention.key_length"),
         embedding_length / n_heads,
     );
-    const rope_dim_count = try lookupU32Or(
-        parsed,
+    const rope_dim_count = try keys.intOr(
         pk(&kb, arch_str, ".rope.dimension_count"),
         head_dim_explicit,
     );
-    const rope_freq_base = try lookupF32Or(parsed, pk(&kb, arch_str, ".rope.freq_base"), 10000.0);
-    const rms_norm_eps = try lookupF32(
-        parsed,
-        pk(&kb, arch_str, ".attention.layer_norm_rms_epsilon"),
-    );
+    const rope_freq_base = try keys.floatOr(pk(&kb, arch_str, ".rope.freq_base"), 10000.0);
+    const rms_norm_eps = try keys.float(pk(&kb, arch_str, ".attention.layer_norm_rms_epsilon"));
 
     // Read the Gated-DeltaNet keys, which only qwen35 has.
     const gdn: ?GdnParams = if (arch == .qwen35) GdnParams{
-        .conv_kernel = try lookupU32(parsed, pk(&kb, arch_str, ".ssm.conv_kernel")),
-        .state_size = try lookupU32(parsed, pk(&kb, arch_str, ".ssm.state_size")),
-        .group_count = try lookupU32(parsed, pk(&kb, arch_str, ".ssm.group_count")),
-        .inner_size = try lookupU32(parsed, pk(&kb, arch_str, ".ssm.inner_size")),
-        .time_step_rank = try lookupU32(parsed, pk(&kb, arch_str, ".ssm.time_step_rank")),
-        .full_attention_interval = try lookupU32(
-            parsed,
-            pk(&kb, arch_str, ".full_attention_interval"),
-        ),
+        .conv_kernel = try keys.int(pk(&kb, arch_str, ".ssm.conv_kernel")),
+        .state_size = try keys.int(pk(&kb, arch_str, ".ssm.state_size")),
+        .group_count = try keys.int(pk(&kb, arch_str, ".ssm.group_count")),
+        .inner_size = try keys.int(pk(&kb, arch_str, ".ssm.inner_size")),
+        .time_step_rank = try keys.int(pk(&kb, arch_str, ".ssm.time_step_rank")),
+        .full_attention_interval = try keys.int(pk(&kb, arch_str, ".full_attention_interval")),
     } else null;
 
-    const tokens = try lookupStringArray(parsed, "tokenizer.ggml.tokens");
+    const tokens = try keys.strings("tokenizer.ggml.tokens");
 
     // Check the bounds. A typed error here keeps a file from sizing past `core/limits.zig`.
-    if (n_layers > limits.max_layers) return error.TooManyLayers;
-    if (tokens.len > limits.max_vocab) return error.VocabTooLarge;
+    if (n_layers > limits.max_layers) {
+        keys.fail("{d} layers pass the limit of {d}", .{ n_layers, limits.max_layers });
+        return error.TooManyLayers;
+    }
+    if (tokens.len > limits.max_vocab) {
+        keys.fail("{d} tokens pass the limit of {d}", .{ tokens.len, limits.max_vocab });
+        return error.VocabTooLarge;
+    }
 
     const vocab_size: u32 = @intCast(tokens.len);
     // A zero context leaves no window to plan.
-    if (ctx_declared == 0) return error.BadKeyValue;
+    if (ctx_declared == 0) {
+        keys.fail("the card value context_length is 0", .{});
+        return error.BadKeyValue;
+    }
 
     const dims = [_]Dim{
         .{ .key = "block_count", .value = n_layers },
         .{ .key = "attention.head_count_kv", .value = n_kv_heads },
         .{ .key = "embedding_length", .value = embedding_length },
         .{ .key = "feed_forward_length", .value = ffn_length },
-        .{ .key = "attention.key_length", .value = head_dim_explicit },
+        .{ .key = head_dim_source, .value = head_dim_explicit },
     };
     if (zeroDim(&dims, gdn)) |key| {
-        log.err("{s}: the card value {s} is 0", .{ std.Io.Dir.path.basename(path), key });
+        keys.fail("the card value {s} is 0", .{key});
         return error.BadKeyValue;
     }
 
     // Check the head grouping: each KV head serves a whole group of query heads.
     if (n_heads % n_kv_heads != 0) {
-        log.err(
-            "{s}: {d} attention heads do not split into groups over {d} KV heads",
-            .{ std.Io.Dir.path.basename(path), n_heads, n_kv_heads },
+        keys.fail(
+            "{d} attention heads do not split into groups over {d} KV heads",
+            .{ n_heads, n_kv_heads },
         );
         return error.BadKeyValue;
     }
 
-    // Cap the context. The file loads with the bound, and the log names both numbers.
+    // Cap the context. The file loads with the bound, and the log names both numbers. A test
+    // that refuses at `debug` also notes the cap at `debug`.
     const ctx_length = limits.contextCeiling(ctx_declared, null);
     if (ctx_length < ctx_declared) {
-        log.warn(
-            "{s}: the file declares a context of {d} positions, and the engine caps it at {d}",
-            .{
-                std.Io.Dir.path.basename(path), ctx_declared, ctx_length,
-            },
-        );
+        const format = "{s}: the file declares a context of {d} positions, " ++
+            "and the engine caps it at {d}";
+        const args = .{ file, ctx_declared, ctx_length };
+        if (refusal_level == .debug) {
+            log.debug(format, args);
+        } else {
+            log.warn(format, args);
+        }
     }
 
     // Refuse RoPE scaling that the engine does not apply, because nothing downstream detects it.
     const scaling_key = pk(&kb, arch_str, ".rope.scaling.type");
     const scaling_type: ?[]const u8 = if (lookupKv(parsed, scaling_key) != null)
-        try lookupString(parsed, scaling_key)
+        try keys.string(scaling_key)
     else
         null;
 
@@ -302,19 +455,17 @@ pub fn loadWith(
     if (!ropeScalingSupported(scaling_type, applies_rope_freqs)) {
         std.debug.assert(scaling_type != null);
 
-        log.err(
-            "{s}: RoPE scaling type {s} is not supported. The engine applies only the " ++
+        keys.fail(
+            "RoPE scaling type {s} is not supported. The engine applies only the " ++
                 "llama3 factors of a " ++ rope_freqs_tensor ++ " tensor",
-            .{
-                std.Io.Dir.path.basename(path), scaling_type.?,
-            },
+            .{scaling_type.?},
         );
         return error.UnsupportedRopeScaling;
     }
 
     // Read the special tokens and build the card. BOS is optional: ChatML models omit it.
-    const bos = try lookupU32Or(parsed, "tokenizer.ggml.bos_token_id", 0);
-    const eos = try lookupU32(parsed, "tokenizer.ggml.eos_token_id");
+    const bos = try keys.intOr("tokenizer.ggml.bos_token_id", 0);
+    const eos = try keys.int("tokenizer.ggml.eos_token_id");
     const chat = lookupStringOptional(parsed, "tokenizer.chat_template") orelse "";
 
     const name = lookupStringOptional(parsed, "general.name");
@@ -339,27 +490,8 @@ pub fn loadWith(
         .chat_template = chat,
         .gdn = gdn,
     };
-
-    // Bind the tensors and log the timings.
-    const refs = try bindTensors(arena, parsed, bytes, std.Io.Dir.path.basename(path), .err);
-
-    const t_done = Io.Clock.Timestamp.now(io, .awake);
-    if (!opts.quiet) {
-        log.info("loaded {s}: {d} tensors, ctx {d}, {d:.0} MiB in {d:.0} ms", .{
-            arch_str, refs.len, ctx_length, mibOf(bytes.len), elapsedMs(t_start, t_done),
-        });
-    }
-
-    log.debug("  timings: mmap {d:.1} ms | parse {d:.1} ms | build {d:.1} ms", .{
-        elapsedMs(t_start, t_mapped), elapsedMs(t_mapped, t_parsed), elapsedMs(t_parsed, t_done),
-    });
-
-    return .{
-        .map = map,
-        .parsed = parsed,
-        .card = card,
-        .tensors = refs,
-    };
+    try checkCard(card, file, refusal_level);
+    return card;
 }
 
 /// Turn each tensor descriptor into a `Tensor` that borrows its bytes from `bytes`.
@@ -373,6 +505,8 @@ pub fn bindTensors(
     comptime refusal_level: std.log.Level,
 ) Error![]const TensorRef {
     const refs = try arena.alloc(TensorRef, parsed.tensors.len);
+    // The parser proves the starts in table order, so each tensor must start past the previous end.
+    var prev_end: u64 = parsed.data_offset;
     for (parsed.tensors, refs) |ti, *ref| {
         std.debug.assert(ti.n_dims >= 1 and ti.n_dims <= 4);
 
@@ -474,6 +608,17 @@ pub fn bindTensors(
             );
             return error.NotEnoughBytes;
         }
+        if (start < prev_end) {
+            refuse(
+                refusal_level,
+                "{s}: tensor {s} starts at byte {d}, inside the tensor before it, " ++
+                    "which ends at byte {d}",
+                .{ file, ti.name, start, prev_end },
+            );
+            return error.TensorDataOverlap;
+        }
+
+        prev_end = end;
 
         // Check the address alignment of the view.
         const data = bytes[@intCast(start)..@intCast(end)];
@@ -527,6 +672,175 @@ pub fn ropeScalingSupported(scaling_type: ?[]const u8, has_rope_freqs: bool) boo
 
 // -- helpers ----------------------------------------------------------------
 
+/// Refuse a card value that a runner turns into an index past its buffer. The zero and head
+/// grouping checks run first.
+fn checkCard(card: ModelCard, file: []const u8, comptime refusal_level: std.log.Level) Error!void {
+    std.debug.assert(card.n_heads >= 1);
+    std.debug.assert(card.n_kv_heads >= 1);
+
+    // RoPE rotates pairs of the first `rope_dim_count` lanes of each head. The GPU binds a
+    // factor buffer of one entry per pair, so the count holds one pair at least.
+    const rope = card.rope_dim_count;
+    if (rope < 2 or rope % 2 != 0 or rope > card.head_dim) {
+        refuse(
+            refusal_level,
+            "{s}: the RoPE dimension count {d} is not an even count in 2..{d}, the head width",
+            .{ file, rope, card.head_dim },
+        );
+        return error.BadKeyValue;
+    }
+
+    // The norm divides by a root that holds the epsilon, and RoPE takes a power of the base.
+    const floats = [_]struct { key: []const u8, value: f32 }{
+        .{ .key = "attention.layer_norm_rms_epsilon", .value = card.rms_norm_eps },
+        .{ .key = "rope.freq_base", .value = card.rope_freq_base },
+    };
+    for (floats) |f| {
+        if (!std.math.isFinite(f.value) or !(f.value > 0)) {
+            refuse(
+                refusal_level,
+                "{s}: the card value {s} is {d}, and it must be finite and above 0",
+                .{ file, f.key, f.value },
+            );
+            return error.BadKeyValue;
+        }
+    }
+
+    // The logits row holds one value per token, and the special ids index the token list.
+    if (card.vocab_size == 0) {
+        refuse(refusal_level, "{s}: the token list is empty", .{file});
+        return error.BadKeyValue;
+    }
+    if (card.bos_token_id >= card.vocab_size or card.eos_token_id >= card.vocab_size) {
+        refuse(
+            refusal_level,
+            "{s}: the BOS id {d} or the EOS id {d} is not below the token count {d}",
+            .{ file, card.bos_token_id, card.eos_token_id, card.vocab_size },
+        );
+        return error.BadKeyValue;
+    }
+
+    // The layer files compute these widths as u32.
+    const q_dim = try cardProduct(file, refusal_level, "head_count * key_length", .{
+        card.n_heads, card.head_dim,
+    });
+    const kv_row = try cardProduct(file, refusal_level, "head_count_kv * key_length", .{
+        card.n_kv_heads, card.head_dim,
+    });
+    if (kv_row > limits.max_kv_row_elems) {
+        refuse(
+            refusal_level,
+            "{s}: the KV row of {d} elements passes the limit of {d}",
+            .{ file, kv_row, limits.max_kv_row_elems },
+        );
+        return error.BadKeyValue;
+    }
+
+    const g = card.gdn orelse return;
+    try checkGdn(card, g, q_dim, file, refusal_level);
+}
+
+/// The Qwen3.5 rules: the GDN state fits the scratch of the kernels, the conv ring holds at least
+/// one past step, and every GDN width fits a u32.
+fn checkGdn(
+    card: ModelCard,
+    g: GdnParams,
+    q_dim: u32,
+    file: []const u8,
+    comptime refusal_level: std.log.Level,
+) Error!void {
+    std.debug.assert(card.arch == .qwen35);
+    std.debug.assert(q_dim >= 1);
+
+    if (g.state_size > limits.gdn_head_dim) {
+        refuse(
+            refusal_level,
+            "{s}: the GDN state size {d} passes the limit of {d}",
+            .{ file, g.state_size, limits.gdn_head_dim },
+        );
+        return error.BadKeyValue;
+    }
+    if (g.conv_kernel < 2) {
+        refuse(
+            refusal_level,
+            "{s}: the GDN conv kernel {d} is less than 2",
+            .{ file, g.conv_kernel },
+        );
+        return error.BadKeyValue;
+    }
+
+    // The q projection interleaves q and the attention gate per head.
+    _ = try cardProduct(file, refusal_level, "2 * head_count * key_length", .{ 2, q_dim });
+    const key_dim = try cardProduct(file, refusal_level, "group_count * state_size", .{
+        g.group_count, g.state_size,
+    });
+    const value_dim = try cardProduct(file, refusal_level, "time_step_rank * state_size", .{
+        g.time_step_rank, g.state_size,
+    });
+    if (g.inner_size != value_dim) {
+        refuse(
+            refusal_level,
+            "{s}: the GDN inner size {d} differs from time_step_rank * state_size, {d}",
+            .{ file, g.inner_size, value_dim },
+        );
+        return error.BadKeyValue;
+    }
+
+    const qkv_wide = 2 * @as(u64, key_dim) + value_dim;
+    const qkv = std.math.cast(u32, qkv_wide) orelse {
+        refuse(
+            refusal_level,
+            "{s}: the GDN qkv width {d} passes 32 bits",
+            .{ file, qkv_wide },
+        );
+        return error.BadKeyValue;
+    };
+    const state = try cardProduct(file, refusal_level, "time_step_rank * state_size^2", .{
+        value_dim, g.state_size,
+    });
+    const conv = try cardProduct(file, refusal_level, "(conv_kernel - 1) * qkv width", .{
+        g.conv_kernel - 1, qkv,
+    });
+
+    // The planner prices the GDN state of one slot under the two ceilings of `limits.zig`.
+    const layer_bytes = (@as(u64, state) + conv) * @sizeOf(f32);
+    const n_gdn: u64 = card.n_layers - card.n_layers / g.full_attention_interval;
+    if (layer_bytes > limits.max_fixed_state_bytes_per_layer or
+        n_gdn * layer_bytes > limits.max_fixed_state_bytes)
+    {
+        refuse(
+            refusal_level,
+            "{s}: the GDN state of one slot is {d} bytes on each of {d} layers, past the " ++
+                "limits of {d} bytes a layer and {d} bytes in all",
+            .{
+                file,
+                layer_bytes,
+                n_gdn,
+                limits.max_fixed_state_bytes_per_layer,
+                limits.max_fixed_state_bytes,
+            },
+        );
+        return error.BadKeyValue;
+    }
+}
+
+/// The product of two card values, or a refusal when it passes 32 bits.
+fn cardProduct(
+    file: []const u8,
+    comptime refusal_level: std.log.Level,
+    comptime what: []const u8,
+    factors: [2]u32,
+) Error!u32 {
+    return std.math.mul(u32, factors[0], factors[1]) catch {
+        refuse(
+            refusal_level,
+            "{s}: the card product " ++ what ++ " of {d} and {d} passes 32 bits",
+            .{ file, factors[0], factors[1] },
+        );
+        return error.BadKeyValue;
+    };
+}
+
 /// Log one refusal at `level`.
 fn refuse(comptime level: std.log.Level, comptime format: []const u8, args: anytype) void {
     switch (level) {
@@ -576,14 +890,6 @@ fn lookupKv(p: parser.Parsed, key: []const u8) ?*const parser.Value {
     return null;
 }
 
-fn lookupString(p: parser.Parsed, key: []const u8) Error![]const u8 {
-    const v = lookupKv(p, key) orelse return error.MissingKey;
-    return switch (v.*) {
-        .string => |s| s,
-        else => error.WrongKeyType,
-    };
-}
-
 fn lookupStringOptional(p: parser.Parsed, key: []const u8) ?[]const u8 {
     const v = lookupKv(p, key) orelse return null;
     return switch (v.*) {
@@ -604,56 +910,6 @@ fn zeroDim(dims: []const Dim, gdn: ?GdnParams) ?[]const u8 {
     }
 
     return null;
-}
-
-/// A value that does not fit a `u32` is a bad value, not a narrowing cast.
-fn lookupU32(p: parser.Parsed, key: []const u8) Error!u32 {
-    const v = lookupKv(p, key) orelse return error.MissingKey;
-    const value: ?u32 = switch (v.*) {
-        .u32_val => |u| u,
-        .u64_val => |u| std.math.cast(u32, u),
-        .i32_val => |i| std.math.cast(u32, i),
-        .i64_val => |i| std.math.cast(u32, i),
-        else => return error.WrongKeyType,
-    };
-
-    return value orelse error.BadKeyValue;
-}
-
-/// The value of an optional key. Only an absent key takes `default`. A bad value fails.
-fn lookupU32Or(p: parser.Parsed, key: []const u8, default: u32) Error!u32 {
-    return lookupU32(p, key) catch |err| switch (err) {
-        error.MissingKey => default,
-        else => err,
-    };
-}
-
-fn lookupF32(p: parser.Parsed, key: []const u8) Error!f32 {
-    const v = lookupKv(p, key) orelse return error.MissingKey;
-    return switch (v.*) {
-        .f32_val => |x| x,
-        .f64_val => |x| @floatCast(x),
-        else => error.WrongKeyType,
-    };
-}
-
-/// The value of an optional key. Only an absent key takes `default`. A wrong type fails.
-fn lookupF32Or(p: parser.Parsed, key: []const u8, default: f32) Error!f32 {
-    return lookupF32(p, key) catch |err| switch (err) {
-        error.MissingKey => default,
-        else => err,
-    };
-}
-
-fn lookupStringArray(p: parser.Parsed, key: []const u8) Error![]const []const u8 {
-    const v = lookupKv(p, key) orelse return error.MissingKey;
-    return switch (v.*) {
-        .array => |a| switch (a) {
-            .strings => |s| s,
-            else => error.WrongKeyType,
-        },
-        else => error.WrongKeyType,
-    };
 }
 
 // -- tests ------------------------------------------------------------------
@@ -698,25 +954,26 @@ test "load and loadWith name their error set" {
     comptime std.debug.assert(returnedSet(@TypeOf(loadWith)) == LoadError);
 }
 
-test "lookupF32Or: an absent key takes the default, and a wrong type refuses" {
+test "Keys.floatOr: an absent key takes the default, and a wrong type refuses" {
     const key = "llama.rope.freq_base";
-    const parsedFrom = struct {
-        fn of(kvs: []const parser.Kv) parser.Parsed {
-            return .{
+    const keysOf = struct {
+        fn of(kvs: []const parser.Kv) Keys {
+            const parsed: parser.Parsed = .{
                 .header = undefined,
                 .kvs = kvs,
                 .tensors = &.{},
                 .data_offset = 0,
                 .alignment = 1,
             };
+            return .{ .parsed = parsed, .file = "case.gguf", .level = .debug };
         }
     }.of;
-    const absent = parsedFrom(&.{});
-    const value = parsedFrom(&.{.{ .key = key, .value = .{ .f32_val = 2.5 } }});
-    const wrong = parsedFrom(&.{.{ .key = key, .value = .{ .string = "2.5" } }});
-    try std.testing.expectEqual(7.0, try lookupF32Or(absent, key, 7.0));
-    try std.testing.expectEqual(2.5, try lookupF32Or(value, key, 7.0));
-    try std.testing.expectError(error.WrongKeyType, lookupF32Or(wrong, key, 7.0));
+    const absent = keysOf(&.{});
+    const value = keysOf(&.{.{ .key = key, .value = .{ .f32_val = 2.5 } }});
+    const wrong = keysOf(&.{.{ .key = key, .value = .{ .string = "2.5" } }});
+    try std.testing.expectEqual(7.0, try absent.floatOr(key, 7.0));
+    try std.testing.expectEqual(2.5, try value.floatOr(key, 7.0));
+    try std.testing.expectError(error.WrongKeyType, wrong.floatOr(key, 7.0));
 }
 
 test "ropeScalingSupported: the engine loads only the scaling it applies" {
@@ -732,6 +989,268 @@ test "ropeScalingSupported: the engine loads only the scaling it applies" {
     try std.testing.expect(!ropeScalingSupported("yarn", true));
     try std.testing.expect(!ropeScalingSupported("linear", false));
     try std.testing.expect(!ropeScalingSupported("linear", true));
+}
+
+/// A small card of each family that every card rule accepts.
+fn smallCard(comptime arch: Arch) ModelCard {
+    var card: ModelCard = .{
+        .arch = arch,
+        .architecture = @tagName(arch),
+        .n_layers = 4,
+        .n_heads = 4,
+        .n_kv_heads = 2,
+        .head_dim = 16,
+        .embedding_length = 32,
+        .feed_forward_length = 64,
+        .context_length = 64,
+        .vocab_size = card_tokens.len,
+        .rope_freq_base = 10000.0,
+        .rope_dim_count = 8,
+        .rms_norm_eps = 1e-6,
+        .bos_token_id = 1,
+        .eos_token_id = 2,
+        .chat_template = "",
+    };
+    if (arch == .qwen35) {
+        card.gdn = .{
+            .conv_kernel = 4,
+            .state_size = 16,
+            .group_count = 2,
+            .inner_size = 32,
+            .time_step_rank = 2,
+            .full_attention_interval = 4,
+        };
+    }
+
+    return card;
+}
+
+const card_tokens = [_][]const u8{ "a", "b", "c", "d", "e", "f", "g", "h" };
+
+/// The KVs of `card` as a file holds them. The token list sets the vocab size.
+fn cardKvs(comptime arch: Arch, card: ModelCard, out: *[24]parser.Kv) []const parser.Kv {
+    std.debug.assert(card.arch == arch);
+    std.debug.assert(card.vocab_size <= card_tokens.len);
+
+    const p = @tagName(arch);
+    const u = struct {
+        fn of(x: u32) parser.Value {
+            return .{ .u32_val = x };
+        }
+    }.of;
+    const common = [_]parser.Kv{
+        .{ .key = "general.architecture", .value = .{ .string = p } },
+        .{ .key = p ++ ".block_count", .value = u(card.n_layers) },
+        .{ .key = p ++ ".attention.head_count", .value = u(card.n_heads) },
+        .{ .key = p ++ ".attention.head_count_kv", .value = u(card.n_kv_heads) },
+        .{ .key = p ++ ".embedding_length", .value = u(card.embedding_length) },
+        .{ .key = p ++ ".feed_forward_length", .value = u(card.feed_forward_length) },
+        .{ .key = p ++ ".context_length", .value = u(card.context_length) },
+        .{ .key = p ++ ".attention.key_length", .value = u(card.head_dim) },
+        .{ .key = p ++ ".rope.dimension_count", .value = u(card.rope_dim_count) },
+        .{
+            .key = p ++ ".attention.layer_norm_rms_epsilon",
+            .value = .{ .f32_val = card.rms_norm_eps },
+        },
+        .{ .key = p ++ ".rope.freq_base", .value = .{ .f32_val = card.rope_freq_base } },
+        .{
+            .key = "tokenizer.ggml.tokens",
+            .value = .{ .array = .{ .strings = card_tokens[0..card.vocab_size] } },
+        },
+        .{ .key = "tokenizer.ggml.bos_token_id", .value = u(card.bos_token_id) },
+        .{ .key = "tokenizer.ggml.eos_token_id", .value = u(card.eos_token_id) },
+    };
+    @memcpy(out[0..common.len], &common);
+    const g = card.gdn orelse return out[0..common.len];
+
+    const ssm = [_]parser.Kv{
+        .{ .key = p ++ ".ssm.conv_kernel", .value = u(g.conv_kernel) },
+        .{ .key = p ++ ".ssm.state_size", .value = u(g.state_size) },
+        .{ .key = p ++ ".ssm.group_count", .value = u(g.group_count) },
+        .{ .key = p ++ ".ssm.inner_size", .value = u(g.inner_size) },
+        .{ .key = p ++ ".ssm.time_step_rank", .value = u(g.time_step_rank) },
+        .{ .key = p ++ ".full_attention_interval", .value = u(g.full_attention_interval) },
+    };
+    @memcpy(out[common.len..][0..ssm.len], &ssm);
+    return out[0 .. common.len + ssm.len];
+}
+
+/// Keep the GDN inner size equal to the value width after a change of its factors.
+fn matchInnerSize(c: *ModelCard) void {
+    const g = &c.gdn.?;
+    g.inner_size = g.time_step_rank *% g.state_size;
+}
+
+/// One card field change and its expected result. Null: the card loads.
+const CardCase = struct {
+    arch: Arch,
+    edit: *const fn (*ModelCard) void,
+    want: ?Error,
+};
+
+fn expectCardCase(c: CardCase) !void {
+    var card = switch (c.arch) {
+        inline else => |a| smallCard(a),
+    };
+    c.edit(&card);
+    var buf: [24]parser.Kv = undefined;
+    const kvs = switch (c.arch) {
+        inline else => |a| cardKvs(a, card, &buf),
+    };
+    const parsed: parser.Parsed = .{
+        .header = undefined,
+        .kvs = kvs,
+        .tensors = &.{},
+        .data_offset = 0,
+        .alignment = 1,
+    };
+
+    const got = cardFromParsed(parsed, "case.gguf", .debug);
+    if (c.want) |err| return std.testing.expectError(err, got);
+
+    const loaded = try got;
+    try std.testing.expectEqual(card.head_dim, loaded.head_dim);
+    try std.testing.expectEqual(card.vocab_size, loaded.vocab_size);
+}
+
+test "cardFromParsed: each card rule refuses a file value that breaks it" {
+    const E = struct {
+        fn none(_: *ModelCard) void {}
+        fn ropeOdd(c: *ModelCard) void {
+            c.rope_dim_count = 7;
+        }
+        fn ropePastHead(c: *ModelCard) void {
+            c.rope_dim_count = c.head_dim + 2;
+        }
+        fn vocabEmpty(c: *ModelCard) void {
+            c.vocab_size = 0;
+            c.bos_token_id = 0;
+            c.eos_token_id = 0;
+        }
+        fn bosPastVocab(c: *ModelCard) void {
+            c.bos_token_id = c.vocab_size;
+        }
+        fn eosPastVocab(c: *ModelCard) void {
+            c.eos_token_id = c.vocab_size;
+        }
+        fn kvRowPastLimit(c: *ModelCard) void {
+            c.head_dim = limits.max_kv_row_elems;
+        }
+        fn qWidthPast32Bits(c: *ModelCard) void {
+            c.n_heads = 1 << 13;
+            c.n_kv_heads = 1;
+            c.head_dim = 1 << 19;
+        }
+        fn qGatePast32Bits(c: *ModelCard) void {
+            c.n_heads = 1 << 12;
+            c.n_kv_heads = 1;
+            c.head_dim = 1 << 19;
+        }
+        fn stateSizePastLimit(c: *ModelCard) void {
+            c.gdn.?.state_size = limits.gdn_head_dim * 2;
+            matchInnerSize(c);
+        }
+        fn convKernelOne(c: *ModelCard) void {
+            c.gdn.?.conv_kernel = 1;
+        }
+        fn keyWidthPast32Bits(c: *ModelCard) void {
+            c.gdn.?.group_count = 1 << 28;
+            matchInnerSize(c);
+        }
+        fn qkvWidthPast32Bits(c: *ModelCard) void {
+            c.gdn.?.state_size = limits.gdn_head_dim;
+            c.gdn.?.group_count = 1 << 24;
+            matchInnerSize(c);
+        }
+        fn statePast32Bits(c: *ModelCard) void {
+            c.gdn.?.time_step_rank = 1 << 24;
+            matchInnerSize(c);
+        }
+        fn convRingPast32Bits(c: *ModelCard) void {
+            c.gdn.?.conv_kernel = 1 << 30;
+        }
+        fn innerSizeOff(c: *ModelCard) void {
+            c.gdn.?.inner_size += 1;
+        }
+        fn ropeZero(c: *ModelCard) void {
+            c.rope_dim_count = 0;
+        }
+        fn epsZero(c: *ModelCard) void {
+            c.rms_norm_eps = 0;
+        }
+        fn epsNegative(c: *ModelCard) void {
+            c.rms_norm_eps = -1e-6;
+        }
+        fn epsNan(c: *ModelCard) void {
+            c.rms_norm_eps = std.math.nan(f32);
+        }
+        fn epsInf(c: *ModelCard) void {
+            c.rms_norm_eps = std.math.inf(f32);
+        }
+        fn freqBaseZero(c: *ModelCard) void {
+            c.rope_freq_base = 0;
+        }
+        fn freqBaseNegative(c: *ModelCard) void {
+            c.rope_freq_base = -10000;
+        }
+        fn freqBaseNan(c: *ModelCard) void {
+            c.rope_freq_base = std.math.nan(f32);
+        }
+        fn freqBaseInf(c: *ModelCard) void {
+            c.rope_freq_base = std.math.inf(f32);
+        }
+        fn stateBytesPastLayerLimit(c: *ModelCard) void {
+            c.gdn.?.time_step_rank = 1 << 21;
+            matchInnerSize(c);
+        }
+        fn stateBytesPastModelLimit(c: *ModelCard) void {
+            c.n_layers = 64;
+            c.gdn.?.time_step_rank = 1 << 13;
+            c.gdn.?.state_size = limits.gdn_head_dim / 2;
+            matchInnerSize(c);
+        }
+    };
+    const bad = error.BadKeyValue;
+    const cases = [_]CardCase{
+        .{ .arch = .llama, .edit = &E.none, .want = null },
+        .{ .arch = .qwen35, .edit = &E.none, .want = null },
+        .{ .arch = .llama, .edit = &E.ropeOdd, .want = bad },
+        .{ .arch = .llama, .edit = &E.ropePastHead, .want = bad },
+        .{ .arch = .llama, .edit = &E.vocabEmpty, .want = bad },
+        .{ .arch = .llama, .edit = &E.bosPastVocab, .want = bad },
+        .{ .arch = .qwen35, .edit = &E.eosPastVocab, .want = bad },
+        .{ .arch = .llama, .edit = &E.kvRowPastLimit, .want = bad },
+        .{ .arch = .llama, .edit = &E.qWidthPast32Bits, .want = bad },
+        .{ .arch = .qwen35, .edit = &E.qGatePast32Bits, .want = bad },
+        .{ .arch = .qwen35, .edit = &E.stateSizePastLimit, .want = bad },
+        .{ .arch = .qwen35, .edit = &E.convKernelOne, .want = bad },
+        .{ .arch = .qwen35, .edit = &E.keyWidthPast32Bits, .want = bad },
+        .{ .arch = .qwen35, .edit = &E.qkvWidthPast32Bits, .want = bad },
+        .{ .arch = .qwen35, .edit = &E.statePast32Bits, .want = bad },
+        .{ .arch = .qwen35, .edit = &E.convRingPast32Bits, .want = bad },
+        .{ .arch = .qwen35, .edit = &E.stateBytesPastLayerLimit, .want = bad },
+        .{ .arch = .qwen35, .edit = &E.stateBytesPastModelLimit, .want = bad },
+        .{ .arch = .llama, .edit = &E.ropeZero, .want = bad },
+        .{ .arch = .qwen35, .edit = &E.innerSizeOff, .want = bad },
+        .{ .arch = .llama, .edit = &E.epsZero, .want = bad },
+        .{ .arch = .qwen35, .edit = &E.epsNegative, .want = bad },
+        .{ .arch = .llama, .edit = &E.epsNan, .want = bad },
+        .{ .arch = .llama, .edit = &E.epsInf, .want = bad },
+        .{ .arch = .llama, .edit = &E.freqBaseZero, .want = bad },
+        .{ .arch = .qwen35, .edit = &E.freqBaseNegative, .want = bad },
+        .{ .arch = .llama, .edit = &E.freqBaseNan, .want = bad },
+        .{ .arch = .llama, .edit = &E.freqBaseInf, .want = bad },
+    };
+    // Every row runs, so one failure does not hide the next.
+    var failed: u32 = 0;
+    for (cases, 0..) |c, i| {
+        expectCardCase(c) catch {
+            std.debug.print("card case {d} failed\n", .{i});
+            failed += 1;
+        };
+    }
+
+    try std.testing.expectEqual(@as(u32, 0), failed);
 }
 
 const BindCase = struct {
@@ -808,6 +1327,40 @@ test "bindTensors: a descriptor binds inside the file at its row stride, or fail
     };
     for (cases) |c| {
         try checkBind(c);
+    }
+}
+
+test "bindTensors: a tensor that starts inside the tensor before it refuses" {
+    var file: [bind_capacity]u8 align(16) = @splat(0);
+    // The second tensor starts at byte `at` of the data, and the first ends at byte 32.
+    const Case = struct { at: u64, want: ?Error };
+    const cases = [_]Case{
+        .{ .at = 32, .want = null },
+        .{ .at = 16, .want = error.TensorDataOverlap },
+        .{ .at = 0, .want = error.TensorDataOverlap },
+    };
+    const shape: [4]u64 = .{ 8, 1, 1, 1 };
+    for (cases) |c| {
+        const infos = [_]parser.TensorInfo{
+            .{ .name = "a", .dtype = .f32, .n_dims = 1, .shape = shape, .offset_in_data = 0 },
+            .{ .name = "b", .dtype = .f32, .n_dims = 1, .shape = shape, .offset_in_data = c.at },
+        };
+        const parsed: parser.Parsed = .{
+            .header = .{ .version = 3, .tensor_count = 2, .kv_count = 0 },
+            .kvs = &.{},
+            .tensors = &infos,
+            .data_offset = 0,
+            .alignment = 1,
+        };
+        var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+        defer arena.deinit();
+
+        const got = bindTensors(arena.allocator(), parsed, &file, "case.gguf", .debug);
+        if (c.want) |err| {
+            try std.testing.expectError(err, got);
+        } else {
+            try std.testing.expectEqual(@as(usize, 2), (try got).len);
+        }
     }
 }
 

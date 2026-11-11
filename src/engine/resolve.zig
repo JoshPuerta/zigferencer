@@ -234,8 +234,11 @@ pub fn resolve(
         .refused => |r| return .{ .refused = r },
     };
 
-    // Size the base window.
-    const ceiling = limits.contextCeiling(card.context_length, entry.context_limit);
+    // Size the base window. The KV slab of one layer bounds it below the context.
+    const ceiling = @min(
+        limits.contextCeiling(card.context_length, entry.context_limit),
+        limits.kvSlabWindowMax(card.kvShape().kv_row_elems),
+    );
     const cost = kv_budget.costModel(card.kvShape(), e.kv_dtype);
     const session_bytes = if (kind == .serve)
         limits.serve_session_kv_bytes
@@ -772,6 +775,30 @@ test "resolve: a RAM figure below the host KV refuses with the host tag" {
     try std.testing.expect(
         resolve(.run, .{}, qwen_entry, qwenCard(), .{ .ram_free = null }) == .ok,
     );
+}
+
+test "resolve: a window past the 32-bit index of one KV layer slab refuses, and the default fits" {
+    if (comptime build_options.use_vulkan_ops or build_options.use_vulkan_fused_ops) {
+        return error.SkipZigTest;
+    }
+
+    // A KV row of the loader limit leaves room for 4095 positions in one slab of a layer.
+    var card = smollm2Card();
+    card.n_heads = 4;
+    card.n_kv_heads = 4;
+    card.head_dim = limits.max_kv_row_elems / 4;
+    const slab_window: u32 = std.math.maxInt(u32) / limits.max_kv_row_elems;
+    const resources: Resources = .{ .ram_free = null };
+
+    const flagged = resolve(.run, .{ .engine = seq1024 }, smollm2_entry, card, resources);
+    try std.testing.expect(flagged == .ok);
+
+    const past: Input = .{ .engine = .{ .max_seq = slab_window + 1 } };
+    const cut = resolve(.run, past, smollm2_entry, card, resources);
+    try std.testing.expectEqual(slab_window, cut.refused.window_out_of_range);
+
+    const default = resolve(.run, .{}, smollm2_entry, card, resources);
+    try std.testing.expect(default.ok.window.base <= slab_window);
 }
 
 const Case = struct {

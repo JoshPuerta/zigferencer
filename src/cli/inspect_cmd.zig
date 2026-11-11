@@ -17,6 +17,8 @@ const mmap = @import("../io/mmap.zig");
 const parser = @import("../io/gguf/parser.zig");
 const Tensor = @import("../core/tensor.zig").Tensor;
 
+const log = std.log.scoped(.gguf);
+
 // -- types ------------------------------------------------------------------
 
 /// A block tensor's layer index and role, split out of `blk.<n>.<role>`.
@@ -153,7 +155,10 @@ fn dumpRaw(ctx: context.Context, path: []const u8) !void {
     var map = try mmap.openReadOnlyLazy(ctx.io, path);
     defer map.close();
 
-    const parsed = try parser.parse(ctx.arena, map.bytes());
+    const parsed = parser.parse(ctx.arena, map.bytes()) catch |err| {
+        log.err("{s}: the GGUF file is not valid: {t}", .{ std.Io.Dir.path.basename(path), err });
+        return err;
+    };
 
     // Print the header.
     const w = &ctx.stdout.interface;

@@ -63,11 +63,13 @@
 //! sub-chunked GPU port is a free choice under bounded shared memory, not a numerical need.
 
 const std = @import("std");
+const limits = @import("../core/limits.zig");
 
 // -- constants --------------------------------------------------------------
 
-/// Largest per-head state dimension that the stack scratch accepts. Qwen3.5 uses 128.
-const max_head_dim: usize = 128;
+/// Largest per-head state dimension that the stack scratch accepts. The loader refuses a larger
+/// state size.
+const max_head_dim: usize = limits.gdn_head_dim;
 
 // -- types ------------------------------------------------------------------
 

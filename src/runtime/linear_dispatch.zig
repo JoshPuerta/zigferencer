@@ -63,9 +63,9 @@ const block_f32_ends = [_][]const u8{
     ".ssm_conv1d.weight",
 };
 
-pub const embed_name = "token_embd.weight";
-pub const head_name = "output.weight";
-const output_norm_name = "output_norm.weight";
+const embed_name = loader.embed_tensor;
+const head_name = loader.head_tensor;
+const output_norm_name = loader.output_norm_tensor;
 
 /// The refusal line: the tensor name, then the dtype.
 pub const refusal_fmt = "tensor {s}: no kernel reads dtype {t} in this build";

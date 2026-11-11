@@ -83,6 +83,7 @@ const gpu_profile = @import("gpu_profile.zig");
 const kv_cost = @import("kv_cost.zig");
 const layer_kernels = @import("layer_kernels.zig");
 const linear_dispatch = @import("linear_dispatch.zig");
+const weight_check = @import("weight_check.zig");
 const step_row = @import("step_row.zig");
 const tensor_lookup = @import("tensor_lookup.zig");
 
@@ -104,7 +105,6 @@ const barrierTransferToShader = fused_commands.barrierTransferToShader;
 const barrierShaderToTransfer = fused_commands.barrierShaderToTransfer;
 const findOptional = tensor_lookup.find;
 const findTensor = tensor_lookup.findRequired;
-const findByFmt = tensor_lookup.findByFmt;
 
 const log = std.log.scoped(.runner);
 const log_kv = std.log.scoped(.kv);
@@ -117,9 +117,6 @@ comptime {
 }
 
 // -- constants --------------------------------------------------------------
-
-/// Fits every `blk.{d}.*` tensor name of both families.
-const tensor_name_bytes_max = 80;
 
 /// The row count where the tiled GEMM wins. The layer kernel set reads the same threshold.
 const gemm_min_batch = fused_layer_kernels.gemm_min_batch;
@@ -251,6 +248,8 @@ const Buffers = struct {
 /// One weight that init uploads, and where its view goes. `uploadOrder` lists them in upload order.
 const Upload = struct {
     site: Site,
+    /// The GGUF name of the tensor, for the refusal line.
+    name: []const u8,
     tensor: *const Tensor,
 
     const Site = union(enum) {
@@ -287,6 +286,11 @@ const Upload = struct {
         };
     }
 };
+
+/// Log the refusal of a weight that no fused kernel reads, in the line of the CPU dispatch.
+fn refuseDtype(name: []const u8, d: dtype.GgmlType) void {
+    log.err(linear_dispatch.refusal_fmt, .{ name, d });
+}
 
 /// The bytes of one upload in the small arena and in the quants arena.
 const ArenaBytes = struct {
@@ -375,13 +379,27 @@ const WeightMemory = struct {
     }
 
     /// Upload one matmul weight in the form of `quant`. A weight of another dtype is refused.
-    fn matrix(self: *WeightMemory, quant: WeightQuant, t: *const Tensor) !kernels.Q80Weight {
+    fn matrix(
+        self: *WeightMemory,
+        quant: WeightQuant,
+        name: []const u8,
+        t: *const Tensor,
+    ) !kernels.Q80Weight {
         const held: WeightQuant = switch (t.dtype) {
             .q8_0 => .q8_0,
             .q4_0 => .q4_0,
-            else => return error.UnsupportedWeightDtype,
+            else => {
+                refuseDtype(name, t.dtype);
+                return error.UnsupportedWeightDtype;
+            },
         };
-        if (held != quant) return error.UnsupportedWeightDtype;
+        if (held != quant) {
+            log.err(
+                "tensor {s}: dtype {t} differs from the dtype {t} of the other matrices",
+                .{ name, t.dtype, quant },
+            );
+            return error.UnsupportedWeightDtype;
+        }
 
         // The first dimension is the input features, and the second the output features.
         const n_in: usize = @intCast(t.shape[0]);
@@ -399,8 +417,11 @@ const WeightMemory = struct {
     }
 
     /// Upload one f32 weight into the small arena through a transient host buffer.
-    fn vector(self: *WeightMemory, t: *const Tensor) !vk.DescriptorBufferInfo {
-        if (t.dtype != .f32) return error.UnsupportedWeightDtype;
+    fn vector(self: *WeightMemory, name: []const u8, t: *const Tensor) !vk.DescriptorBufferInfo {
+        if (t.dtype != .f32) {
+            refuseDtype(name, t.dtype);
+            return error.UnsupportedWeightDtype;
+        }
 
         var staging: kernels.HostBuffer = .{ .ctx = self.ctx };
         defer staging.deinit();
@@ -544,7 +565,8 @@ pub fn FusedRunner(comptime Family: type) type {
         /// Rows of one step: the size of the scratch and the descriptor bindings.
         pub const prefill_rows_max: u32 = Family.fused_rows_max;
 
-        pub const InitError = Allocator.Error || error{
+        pub const InitError = Allocator.Error || weight_check.Error || error{
+            StepBufferPastDeviceLimit,
             UnsupportedArchitecture,
             UnsupportedWeightDtype,
             VramBudgetExceeded,
@@ -1276,13 +1298,14 @@ pub fn FusedRunner(comptime Family: type) type {
 
         // -- helpers: init --------------------------------------------------
 
-        /// Refuse a card of another family, a weight that no kernel reads, and a shape past the
-        /// shader arrays. Returns the quant of the matmul weights.
+        /// Refuse a card of another family, a weight that no kernel reads or that the card does
+        /// not describe, and a shape past the shader arrays. Returns the quant of the matmul
+        /// weights.
         fn checkModel(loaded: *const loader.Loaded) InitError!WeightQuant {
             const card = &loaded.card;
-            if (card.arch != Family.arch) return error.UnsupportedArchitecture;
-
+            try weight_check.requireFamily(Family, card);
             try linear_dispatch.requireWeights(loaded.tensors, card.n_layers);
+            try weight_check.checkWeights(Family, card, loaded.tensors);
             try kernels.AttentionSplit.guardHeadDim(card.head_dim);
             try Family.fusedGuard(card);
             return detectQuant(loaded);
@@ -1294,14 +1317,20 @@ pub fn FusedRunner(comptime Family: type) type {
             for (Family.layerWeights(&loaded.card, 0)) |role| {
                 if (!role.isMatrix()) continue;
 
-                const t = try findRole(loaded.tensors, role, 0);
-                const quant: WeightQuant = switch (t.dtype) {
+                const ref = try tensor_lookup.findRole(Family, loaded.tensors, role, 0);
+                const quant: WeightQuant = switch (ref.tensor.dtype) {
                     .q8_0 => .q8_0,
                     .q4_0 => .q4_0,
-                    else => return error.UnsupportedWeightDtype,
+                    else => {
+                        refuseDtype(ref.name, ref.tensor.dtype);
+                        return error.UnsupportedWeightDtype;
+                    },
                 };
                 const known = std.mem.indexOfScalar(WeightQuant, Family.fused_quants, quant);
-                if (known == null) return error.UnsupportedWeightDtype;
+                if (known == null) {
+                    refuseDtype(ref.name, ref.tensor.dtype);
+                    return error.UnsupportedWeightDtype;
+                }
 
                 return quant;
             }
@@ -1347,6 +1376,20 @@ pub fn FusedRunner(comptime Family: type) type {
                 kv_dtype,
             );
             try ctx.guardKvLayout(layout);
+
+            // The kernels index the recurrent slabs and the activation rows with 32-bit products.
+            if (comptime has_recurrent_state) {
+                const slot = Family.recurrentElems(card);
+                try ctx.guardStepBuffer("GDN state slab", plan.n_slots, slot.state);
+                try ctx.guardStepBuffer("GDN conv slab", plan.n_slots, slot.conv);
+            }
+
+            var widest: u32 = 0;
+            for (std.enums.values(layer_kernels.Activation)) |act| {
+                widest = @max(widest, Family.activationWidth(card, act));
+            }
+            try ctx.guardStepBuffer("activation scratch", prefill_rows_max, widest);
+
             const records = attnSplitScratch(card.*);
             assert(attn_split.splitCount(plan.window) <= records.max_splits);
             try ctx.guardAttnSplitScratch(records);
@@ -1412,7 +1455,7 @@ pub fn FusedRunner(comptime Family: type) type {
             quant: WeightQuant,
         ) InitError!Self {
             const card = range.loaded.card;
-            const embed = try findTensor(range.loaded.tensors, "token_embd.weight");
+            const embed = try findTensor(range.loaded.tensors, loader.embed_tensor);
             const tag = if (range.first == 0) Family.fused_gpu_runner else Family.hybrid_gpu_runner;
             return .{
                 .gpa = gpa,
@@ -1630,19 +1673,26 @@ pub fn FusedRunner(comptime Family: type) type {
                     for (roles) |role| {
                         if (role.isMatrix() != matrices) continue;
 
+                        const ref = try tensor_lookup.findRole(Family, refs, role, layer);
                         list.appendAssumeCapacity(.{
                             .site = .{ .layer = .{ .index = index, .role = role } },
-                            .tensor = try findRole(refs, role, layer),
+                            .name = ref.name,
+                            .tensor = &ref.tensor,
                         });
                     }
                 }
             }
 
             // A tied model reuses the embedding table as the lm_head.
-            const output = findOptional(refs, "output.weight") orelse self.embed;
-            const norm = try findTensor(refs, "output_norm.weight");
-            list.appendAssumeCapacity(.{ .site = .output_norm, .tensor = norm });
-            list.appendAssumeCapacity(.{ .site = .lm_head, .tensor = output });
+            const output = findOptional(refs, loader.head_tensor);
+            const norm_name = loader.output_norm_tensor;
+            const norm = try findTensor(refs, norm_name);
+            list.appendAssumeCapacity(.{ .site = .output_norm, .name = norm_name, .tensor = norm });
+            list.appendAssumeCapacity(.{
+                .site = .lm_head,
+                .name = if (output == null) loader.embed_tensor else loader.head_tensor,
+                .tensor = output orelse self.embed,
+            });
             return list.toOwnedSlice(self.gpa);
         }
 
@@ -1651,7 +1701,7 @@ pub fn FusedRunner(comptime Family: type) type {
         fn upload(self: *Self, u: Upload) InitError!void {
             const bytes = u.arenaBytes(self.quant);
             if (!u.isMatrix()) {
-                const view = try self.memory.vector(u.tensor);
+                const view = try self.memory.vector(u.name, u.tensor);
                 assert(view.range == bytes.small);
                 switch (u.site) {
                     .layer => |at| self.layers[at.index].vectors.set(at.role, view),
@@ -1662,8 +1712,8 @@ pub fn FusedRunner(comptime Family: type) type {
             }
 
             const weight = switch (u.site) {
-                .lm_head => try self.uploadLmHead(u.tensor),
-                else => try self.memory.matrix(self.quant, u.tensor),
+                .lm_head => try self.uploadLmHead(u.name, u.tensor),
+                else => try self.memory.matrix(self.quant, u.name, u.tensor),
             };
             assert(weight.scales.range == bytes.small);
             assert(weight.quants.range == bytes.quants);
@@ -1675,9 +1725,13 @@ pub fn FusedRunner(comptime Family: type) type {
         }
 
         /// Upload the lm_head: `output.weight`, or the embedding table that a tied model reuses.
-        fn uploadLmHead(self: *Self, output: *const Tensor) InitError!kernels.Q80Weight {
+        fn uploadLmHead(
+            self: *Self,
+            name: []const u8,
+            output: *const Tensor,
+        ) InitError!kernels.Q80Weight {
             if (output.dtype != .q6_k or self.quant != .q4_0) {
-                return self.memory.matrix(self.quant, output);
+                return self.memory.matrix(self.quant, name, output);
             }
 
             // The lm_head is a small part of the weight stream of a step, so a throughput run
@@ -1695,7 +1749,7 @@ pub fn FusedRunner(comptime Family: type) type {
                 .data = q40_bytes,
             };
             t40.assertValid();
-            return self.memory.matrix(.q4_0, &t40);
+            return self.memory.matrix(.q4_0, name, &t40);
         }
 
         /// Allocate the zeroed recurrent slabs of each layer without KV. The caller frees a partial
@@ -2338,24 +2392,6 @@ pub fn FusedRunner(comptime Family: type) type {
         }
 
         // -- helpers: rules -------------------------------------------------
-
-        /// The tensor of `role` in the model layer `layer`, found by the GGUF name of the role.
-        fn findRole(
-            refs: []const loader.TensorRef,
-            role: Weight,
-            layer: u32,
-        ) tensor_lookup.Error!*const Tensor {
-            var name_buf: [tensor_name_bytes_max]u8 = undefined;
-            switch (role) {
-                inline else => |r| {
-                    if (comptime Family.tensorName(r)) |fmt| {
-                        return findByFmt(refs, &name_buf, fmt, .{layer});
-                    }
-
-                    unreachable; // Every role of `layerWeights` has a GGUF name.
-                },
-            }
-        }
 
         /// The KV layers of the range `[first, L)`. The KV store and the attention plan of a step
         /// need one, so a range without one is refused.

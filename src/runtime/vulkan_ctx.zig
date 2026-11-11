@@ -473,6 +473,27 @@ pub const Context = struct {
         return 0;
     }
 
+    /// Refuse a step buffer of `n` blocks of `block_elems` f32 elements that breaks a device buffer
+    /// limit, before any allocation. `what` names the buffer in the log line.
+    pub fn guardStepBuffer(
+        self: *const Context,
+        what: []const u8,
+        n: u32,
+        block_elems: u32,
+    ) error{StepBufferPastDeviceLimit}!void {
+        const lim = self.buffer_limits;
+        const verdict = limits.blocksFit(n, block_elems, lim);
+        if (verdict == .fits) return;
+
+        const limit = kv_index.limitOf(verdict, lim);
+        log.err(
+            "The {s} holds {d} blocks of {d} f32 elements, past the {s} of {d} {t}. " ++
+                "Run this model on a CPU build",
+            .{ what, n, block_elems, limit.name, limit.value, limit.unit },
+        );
+        return error.StepBufferPastDeviceLimit;
+    }
+
     /// Refuse a KV layout whose region breaks a device buffer limit, before any allocation.
     /// The log line names the limit, the region size, and the widest window that fits.
     pub fn guardKvLayout(

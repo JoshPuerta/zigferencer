@@ -23,8 +23,11 @@
 //! lowercase contractions, single-digit runs, and simpler whitespace.
 
 const std = @import("std");
+const builtin = @import("builtin");
 const Allocator = std.mem.Allocator;
 const parser = @import("../../io/gguf/parser.zig");
+
+const log = std.log.scoped(.gguf);
 
 // -- constants --------------------------------------------------------------
 
@@ -32,6 +35,9 @@ const parser = @import("../../io/gguf/parser.zig");
 const token_type_control: i32 = 3;
 
 const token_type_user_defined: i32 = 4;
+
+/// The test runner fails a test that logs an error, and a refusal test expects these lines.
+const refusal_level: std.log.Level = if (builtin.is_test) .debug else .err;
 
 /// Fixed bijection: byte 0..255 to its GPT-2 byte-level codepoint and the UTF-8 bytes of it.
 const gpt2_byte_table: [256]ByteEntry = blk: {
@@ -69,6 +75,8 @@ pub const Error = error{
     WrongTokenizerKeyType,
     InvalidMerge,
     TokenStringTooLong,
+    /// A tokenizer value disagrees with the token list: a count or a special id.
+    BadTokenizerValue,
 } || Allocator.Error;
 
 pub const Special = struct {
@@ -138,11 +146,28 @@ pub fn buildFromParsed(arena: Allocator, p: parser.Parsed) Error!Vocab {
     const eos = try lookupU32(p, "tokenizer.ggml.eos_token_id");
     const add_bos = addBos(p);
     const pre = preType(p);
+    if (pre == .default) {
+        if (lookupString(p, "tokenizer.ggml.pre")) |name| {
+            log.info("the tokenizer pre-type {s} is not known, so the encoder splits no " ++
+                "pre-tokens and merges each span between specials whole", .{name});
+        }
+    }
     // llama.cpp enables ignore_merges for the llama3 pre-tokenizer.
     const ignore_merges = (pre == .llama3);
 
-    std.debug.assert(tokens.len == token_types.len);
-    std.debug.assert(tokens.len > 0);
+    // Dev tools call this function directly, so it checks the file values the loader also checks.
+    if (tokens.len == 0 or tokens.len != token_types.len) {
+        refuse("the tokenizer holds {d} tokens and {d} token types", .{
+            tokens.len, token_types.len,
+        });
+        return error.BadTokenizerValue;
+    }
+    if (bos >= tokens.len or eos >= tokens.len) {
+        refuse("the BOS id {d} or the EOS id {d} is not below the token count {d}", .{
+            bos, eos, tokens.len,
+        });
+        return error.BadTokenizerValue;
+    }
 
     // Map each token string to its id.
     var string_to_id = std.StringHashMap(u32).init(arena);
@@ -169,18 +194,23 @@ pub fn buildFromParsed(arena: Allocator, p: parser.Parsed) Error!Vocab {
 
     var key_buf: [512]u8 = undefined;
     for (merges, 0..) |m, rank| {
-        const space = std.mem.findScalar(u8, m, ' ') orelse return error.InvalidMerge;
+        const space = std.mem.findScalar(u8, m, ' ') orelse return invalidMerge(rank);
         const left_str = m[0..space];
         const right_str = m[space + 1 ..];
-        const left_id = string_to_id.get(left_str) orelse return error.InvalidMerge;
-        const right_id = string_to_id.get(right_str) orelse return error.InvalidMerge;
+        const left_id = string_to_id.get(left_str) orelse return invalidMerge(rank);
+        const right_id = string_to_id.get(right_str) orelse return invalidMerge(rank);
 
         const total = left_str.len + right_str.len;
-        if (total > key_buf.len) return error.TokenStringTooLong;
+        if (total > key_buf.len) {
+            refuse("merge {d} joins {d} bytes, past the limit of {d}", .{
+                rank, total, key_buf.len,
+            });
+            return error.TokenStringTooLong;
+        }
 
         @memcpy(key_buf[0..left_str.len], left_str);
         @memcpy(key_buf[left_str.len..total], right_str);
-        const merged_id = string_to_id.get(key_buf[0..total]) orelse return error.InvalidMerge;
+        const merged_id = string_to_id.get(key_buf[0..total]) orelse return invalidMerge(rank);
 
         const key = pairKey(left_id, right_id);
         merge_rank.putAssumeCapacity(key, @intCast(rank));
@@ -219,8 +249,7 @@ pub fn buildFromParsed(arena: Allocator, p: parser.Parsed) Error!Vocab {
 
     std.sort.pdq(Special, specials, {}, lenDescLessThan);
 
-    std.debug.assert(bos < tokens.len);
-    std.debug.assert(eos < tokens.len);
+    std.debug.assert(specials.len <= tokens.len);
 
     return .{
         .tokens = tokens,
@@ -267,6 +296,13 @@ fn preType(p: parser.Parsed) PreType {
     return .default;
 }
 
+fn refuse(comptime format: []const u8, args: anytype) void {
+    switch (refusal_level) {
+        .err => log.err(format, args),
+        else => log.debug(format, args),
+    }
+}
+
 fn lenDescLessThan(_: void, a: Special, b: Special) bool {
     return a.bytes.len > b.bytes.len;
 }
@@ -279,25 +315,43 @@ fn lookupKv(p: parser.Parsed, key: []const u8) ?*const parser.Value {
     return null;
 }
 
+/// A merge that is not two tokens of the list whose join is a token of the list.
+fn invalidMerge(rank: usize) Error {
+    refuse("merge {d} is not two tokens that join to a token", .{rank});
+    return error.InvalidMerge;
+}
+
+fn requiredKv(p: parser.Parsed, key: []const u8) Error!*const parser.Value {
+    return lookupKv(p, key) orelse {
+        refuse("the tokenizer key {s} is missing", .{key});
+        return error.MissingTokenizerKey;
+    };
+}
+
+fn wrongType(key: []const u8, v: *const parser.Value) Error {
+    refuse("the tokenizer key {s} holds a value of type {t}", .{ key, v.* });
+    return error.WrongTokenizerKeyType;
+}
+
 fn lookupStringArray(p: parser.Parsed, key: []const u8) Error![]const []const u8 {
-    const v = lookupKv(p, key) orelse return error.MissingTokenizerKey;
+    const v = try requiredKv(p, key);
     return switch (v.*) {
         .array => |a| switch (a) {
             .strings => |s| s,
-            else => error.WrongTokenizerKeyType,
+            else => wrongType(key, v),
         },
-        else => error.WrongTokenizerKeyType,
+        else => wrongType(key, v),
     };
 }
 
 fn lookupI32Array(p: parser.Parsed, key: []const u8) Error![]const i32 {
-    const v = lookupKv(p, key) orelse return error.MissingTokenizerKey;
+    const v = try requiredKv(p, key);
     return switch (v.*) {
         .array => |a| switch (a) {
             .i32s => |s| s,
-            else => error.WrongTokenizerKeyType,
+            else => wrongType(key, v),
         },
-        else => error.WrongTokenizerKeyType,
+        else => wrongType(key, v),
     };
 }
 
@@ -317,24 +371,28 @@ fn lookupString(p: parser.Parsed, key: []const u8) ?[]const u8 {
     };
 }
 
+/// A value that does not fit a `u32` is a bad value, not a narrowing cast.
 fn lookupU32(p: parser.Parsed, key: []const u8) Error!u32 {
-    const v = lookupKv(p, key) orelse return error.MissingTokenizerKey;
-    return switch (v.*) {
+    const v = try requiredKv(p, key);
+    const wide: i128 = switch (v.*) {
         .u32_val => |u| u,
-        .u64_val => |u| std.math.cast(u32, u) orelse error.WrongTokenizerKeyType,
-        .i32_val => |i| std.math.cast(u32, i) orelse error.WrongTokenizerKeyType,
-        .i64_val => |i| std.math.cast(u32, i) orelse error.WrongTokenizerKeyType,
-        else => error.WrongTokenizerKeyType,
+        .u64_val => |u| u,
+        .i32_val => |i| i,
+        .i64_val => |i| i,
+        else => return wrongType(key, v),
+    };
+
+    return std.math.cast(u32, wide) orelse {
+        refuse("the tokenizer key {s} holds {d}, which is not a 32-bit id", .{ key, wide });
+        return error.BadTokenizerValue;
     };
 }
 
 /// The value of an optional key. Only an absent key takes `default`, so a key of the wrong
 /// type fails and does not fall back in silence.
 fn lookupU32Or(p: parser.Parsed, key: []const u8, default: u32) Error!u32 {
-    return lookupU32(p, key) catch |err| switch (err) {
-        error.MissingTokenizerKey => default,
-        else => err,
-    };
+    if (lookupKv(p, key) == null) return default;
+    return lookupU32(p, key);
 }
 
 // -- tests ------------------------------------------------------------------
@@ -348,7 +406,7 @@ test "pairKey packs left/right into u64" {
     try std.testing.expectEqual(@as(u64, (0xFF << 32) | 0xAB), pairKey(0xFF, 0xAB));
 }
 
-test "buildFromParsed: an absent BOS key takes 0, and a BOS key of the wrong type refuses" {
+test "buildFromParsed: an absent BOS key takes 0, and a bad BOS key refuses" {
     var arena_state: std.heap.ArenaAllocator = .init(std.testing.allocator);
     defer arena_state.deinit();
 
@@ -376,9 +434,49 @@ test "buildFromParsed: an absent BOS key takes 0, and a BOS key of the wrong typ
         .{ .key = "tokenizer.ggml.bos_token_id", .value = .{ .i32_val = -1 } },
     };
     try std.testing.expectError(
-        error.WrongTokenizerKeyType,
+        error.BadTokenizerValue,
         buildFromParsed(arena, parsedWithKvs(&negative)),
     );
+}
+
+test "buildFromParsed: a token type count or a special id that the token list breaks refuses" {
+    var arena_state: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena_state.deinit();
+
+    const arena = arena_state.allocator();
+    const two = [_][]const u8{ "a", "b" };
+    const Case = struct {
+        tokens: []const []const u8 = &two,
+        types: []const i32 = &.{ 1, 1 },
+        bos: u32 = 0,
+        eos: u32 = 1,
+        want: ?Error = null,
+    };
+    const bad = error.BadTokenizerValue;
+    const cases = [_]Case{
+        .{},
+        .{ .types = &.{1}, .want = bad },
+        .{ .types = &.{ 1, 1, 1 }, .want = bad },
+        .{ .tokens = &.{}, .types = &.{}, .eos = 0, .want = bad },
+        .{ .bos = 2, .want = bad },
+        .{ .eos = 2, .want = bad },
+    };
+    for (cases, 0..) |c, i| {
+        const kvs = [_]parser.Kv{
+            .{ .key = "tokenizer.ggml.tokens", .value = .{ .array = .{ .strings = c.tokens } } },
+            .{ .key = "tokenizer.ggml.merges", .value = .{ .array = .{ .strings = &.{} } } },
+            .{ .key = "tokenizer.ggml.token_type", .value = .{ .array = .{ .i32s = c.types } } },
+            .{ .key = "tokenizer.ggml.bos_token_id", .value = .{ .u32_val = c.bos } },
+            .{ .key = "tokenizer.ggml.eos_token_id", .value = .{ .u32_val = c.eos } },
+        };
+        const got = buildFromParsed(arena, parsedWithKvs(&kvs));
+        errdefer std.debug.print("vocab case {d} failed\n", .{i});
+        if (c.want) |err| {
+            try std.testing.expectError(err, got);
+        } else {
+            _ = try got;
+        }
+    }
 }
 
 test "addBos: llama3-family pre defaults true, an explicit key wins, else false" {

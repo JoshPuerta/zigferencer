@@ -12,6 +12,7 @@ const std = @import("std");
 const builtin = @import("builtin");
 const limits = @import("../core/limits.zig");
 const loader = @import("../io/gguf/loader.zig");
+const dispatch_guard = @import("dispatch_guard.zig");
 
 const log = std.log.scoped(.runner);
 
@@ -32,13 +33,18 @@ const refusal_level: std.log.Level = if (builtin.is_test) .debug else .err;
 
 // -- types ------------------------------------------------------------------
 
-pub const Error = error{ GdnHeadsUnsupported, QwenHeadDimUnsupported, GdnHeadDimUnsupported };
+pub const Error = error{
+    GdnHeadsUnsupported,
+    QwenHeadDimUnsupported,
+    GdnHeadDimUnsupported,
+} || dispatch_guard.Error;
 
 // -- api --------------------------------------------------------------------
 
 /// Refuse a shape that the Qwen GPU kernels cannot take, with one log line of both values.
 /// The card must hold GDN parameters.
 pub fn requireShape(card: *const loader.ModelCard) Error!void {
+    try dispatch_guard.requireHeads(card);
     const g = card.gdn.?;
     if (!gdnHeadsFit(g.group_count, g.time_step_rank)) {
         refuse(heads_fmt, .{ g.group_count, g.time_step_rank, limits.gdn_max_v_per_k });

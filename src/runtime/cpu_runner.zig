@@ -73,6 +73,7 @@ const parallel = @import("parallel.zig");
 const Pool = @import("pool.zig").Pool;
 const step_row = @import("step_row.zig");
 const linear_dispatch = @import("linear_dispatch.zig");
+const weight_check = @import("weight_check.zig");
 const tensor_lookup = @import("tensor_lookup.zig");
 const layer_kernels = @import("layer_kernels.zig");
 const CpuLayerKernels = @import("cpu_layer_kernels.zig").CpuLayerKernels;
@@ -87,7 +88,6 @@ const assert = std.debug.assert;
 const fp32View = tensor_lookup.fp32View;
 const findTensor = tensor_lookup.findRequired;
 const findOptional = tensor_lookup.find;
-const findByFmt = tensor_lookup.findByFmt;
 
 /// The op backend that the build resolved. The header describes the choices.
 const ops = if (build_options.use_vulkan_ops)
@@ -171,7 +171,7 @@ pub fn CpuRunner(comptime Family: type) type {
             kv_dtype: dtype.KvDtype,
         };
 
-        pub const Error = step_row.Error || error{UnsupportedArchitecture};
+        pub const Error = step_row.Error || weight_check.Error;
 
         /// A reused slot inherits the previous conversation unless it is scrubbed. The session
         /// surface reads this marker and then needs `resetSlotState` and `cloneSlotState`.
@@ -212,7 +212,8 @@ pub fn CpuRunner(comptime Family: type) type {
             parts: enum { with_head, no_head },
         ) Error!Self {
             const with_head = parts == .with_head;
-            // Check the limits, and refuse a card of another family or a dtype no kernel reads.
+            // Check the limits. Refuse a card of another family, a dtype no kernel reads, and a
+            // weight that the card does not describe.
             const plan = options.plan;
             const n_slots: u32 = plan.n_slots;
             assert(n_slots >= 1);
@@ -220,12 +221,13 @@ pub fn CpuRunner(comptime Family: type) type {
             assert(options.pool.threads() == @max(options.policy.n_threads, 1));
 
             const c = loaded.card;
-            if (c.arch != Family.arch) return error.UnsupportedArchitecture;
+            try weight_check.requireFamily(Family, &c);
 
             assert(n_layers >= 1);
             assert(n_layers <= c.n_layers);
             if (with_head) assert(n_layers == c.n_layers);
             try linear_dispatch.requireWeights(loaded.tensors, n_layers);
+            try weight_check.checkWeights(Family, &c, loaded.tensors);
 
             // The row scratch holds the widest stepBatch, and never fewer rows than the slots.
             const rows_cap: u32 = @max(n_slots, options.max_rows);
@@ -233,8 +235,9 @@ pub fn CpuRunner(comptime Family: type) type {
 
             // Find the weights that no layer owns, then the weights of each layer.
             const refs = loaded.tensors;
-            const embed = try findTensor(refs, "token_embd.weight");
-            const output_norm = if (with_head) try findTensor(refs, "output_norm.weight") else null;
+            const embed = try findTensor(refs, loader.embed_tensor);
+            const norm_name = loader.output_norm_tensor;
+            const output_norm = if (with_head) try findTensor(refs, norm_name) else null;
             const layers = try arena.alloc(LayerTensors, n_layers);
             const kv_index = try arena.alloc(?u32, n_layers);
             const n_kv = try findLayers(refs, &c, layers, kv_index);
@@ -255,7 +258,7 @@ pub fn CpuRunner(comptime Family: type) type {
                 .policy = options.policy,
                 .embed = embed,
                 .output_norm = if (output_norm) |t| fp32View(t.*) else &.{},
-                .output = if (with_head) findOptional(refs, "output.weight") orelse embed else null,
+                .output = if (with_head) headOf(refs, embed) else null,
                 .rope_factors = ropeFactors(refs, &c),
                 .n_layers = n_layers,
                 .layers = layers,
@@ -579,7 +582,8 @@ pub fn CpuRunner(comptime Family: type) type {
                 const layer: u32 = @intCast(li);
                 tensors.* = .initFill(null);
                 for (Family.layerWeights(card, layer)) |role| {
-                    tensors.set(role, try findRole(refs, role, layer));
+                    const ref = try tensor_lookup.findRole(Family, refs, role, layer);
+                    tensors.set(role, &ref.tensor);
                 }
 
                 index.* = Family.kvIndex(card, 0, layer);
@@ -592,18 +596,9 @@ pub fn CpuRunner(comptime Family: type) type {
             return n_kv;
         }
 
-        /// The tensor of `role` in the model layer `layer`, found by the GGUF name of the role.
-        fn findRole(refs: []const loader.TensorRef, role: Weight, layer: u32) Error!*const Tensor {
-            var name_buf: [80]u8 = undefined;
-            switch (role) {
-                inline else => |r| {
-                    if (comptime Family.tensorName(r)) |fmt| {
-                        return findByFmt(refs, &name_buf, fmt, .{layer});
-                    }
-
-                    unreachable; // Every role of `layerWeights` has a GGUF name.
-                },
-            }
+        /// The lm_head: `output.weight`, or the embedding table of a model that ties its head.
+        fn headOf(refs: []const loader.TensorRef, embed: *const Tensor) *const Tensor {
+            return findOptional(refs, loader.head_tensor) orelse embed;
         }
 
         /// One KV slab of `n_kv` layers per slot. No KV layer means no slot vector, because

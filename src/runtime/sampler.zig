@@ -50,6 +50,12 @@
 //! mass. The mass above `skip` therefore passes the target with room, so the cut lies above
 //! `skip`, and a skipped weight never survives.
 //!
+//! Non-finite logits. A NaN or a +inf weight in a model file reaches the logits, and the loader
+//! cannot refuse it without a scan of every weight. `sample` therefore refuses a row with a NaN, a
+//! +inf, or no finite logit, with `error.NonFiniteLogits`, before any other read. A -inf logit is a
+//! masked id and stays valid. After the check, the row maximum is finite, so the asserts on the
+//! weight sums hold.
+//!
 //! Pool selection. `samplePool` stays `noinline`. Its selection loop is branchy, and inlined into a
 //! caller it measured 107 us or 155 us per Qwen row with the caller layout alone changed. Out of
 //! line it measured 107 us in both layouts.
@@ -91,6 +97,8 @@ comptime {
 
 /// Per-session sampling settings. The zero value is greedy decoding, so the
 /// default keeps every determinism gate.
+pub const Error = error{NonFiniteLogits};
+
 pub const Params = struct {
     /// 0 = greedy (argmax, no RNG draw). Higher flattens.
     temperature: f32 = 0,
@@ -211,11 +219,12 @@ pub fn greedy(logits: []const f32) u32 {
 
 /// Draw one token. The same logits, params, and RNG state give the same token on one build.
 /// `scratch` holds `scratchLen(logits.len)` floats that the draw can overwrite.
-pub fn sample(logits: []const f32, params: Params, random: std.Random, scratch: []f32) u32 {
+pub fn sample(logits: []const f32, params: Params, random: std.Random, scratch: []f32) Error!u32 {
     const sp = span.begin(.sample);
     defer sp.end();
 
     assert(logits.len > 0);
+    try checkLogits(logits);
     assert(params.temperature >= 0);
     assert(params.top_p > 0);
     assert(params.top_p <= 1);
@@ -239,6 +248,34 @@ pub fn sample(logits: []const f32, params: Params, random: std.Random, scratch: 
     const id = pick(row, params, random, scratch);
     assert(id < logits.len);
     return id;
+}
+
+/// Refuse a row that holds a NaN or a +inf, or that holds no logit above -inf. The loop runs
+/// `row.len / lanes` times, then once per tail element.
+pub fn checkLogits(row: []const f32) Error!void {
+    assert(row.len > 0);
+
+    const inf: Vec = @splat(std.math.inf(f32));
+    const zero: Vec = @splat(0);
+    const one: Vec = @splat(1);
+    var bad: Vec = zero;
+    var m_v: Vec = -inf;
+    var i: usize = 0;
+    while (i + lanes <= row.len) : (i += lanes) {
+        const v: Vec = row[i..][0..lanes].*;
+        bad += @select(f32, v != v, one, zero) + @select(f32, v == inf, one, zero);
+        m_v = @max(m_v, v);
+    }
+
+    var flagged = @reduce(.Add, bad) != 0;
+    var m = @reduce(.Max, m_v);
+    while (i < row.len) : (i += 1) {
+        const x = row[i];
+        flagged = flagged or std.math.isNan(x) or x == std.math.inf(f32);
+        m = @max(m, x);
+    }
+
+    if (flagged or m == -std.math.inf(f32)) return error.NonFiniteLogits;
 }
 
 /// Copy `source` into `target` and apply the penalties to every id that the sets mark.
@@ -935,6 +972,36 @@ fn TestScratch(comptime vocab: usize) type {
     return [scratchLen(vocab)]f32;
 }
 
+test "sample refuses a row with a NaN, a +inf, or no finite logit, on every path" {
+    const nan = std.math.nan(f32);
+    const inf = std.math.inf(f32);
+    const rows = [_][4]f32{
+        .{ 1, nan, 0, 2 },
+        .{ 1, inf, 0, 2 },
+        .{ -inf, -inf, -inf, -inf },
+    };
+    const shapes = [_]Params{
+        .{},
+        .{ .temperature = 1 },
+        .{ .temperature = 1, .top_k = 2 },
+        .{ .temperature = 1, .top_p = 0.5 },
+    };
+    var scratch: TestScratch(4) = undefined;
+    var prng = std.Random.DefaultPrng.init(7);
+    for (rows) |row| {
+        for (shapes) |p| {
+            try std.testing.expectError(
+                error.NonFiniteLogits,
+                sample(&row, p, prng.random(), &scratch),
+            );
+        }
+    }
+
+    // A masked id at -inf stays a valid logit.
+    const masked = [_]f32{ 1, -inf, 0, 2 };
+    try std.testing.expectEqual(@as(u32, 3), try sample(&masked, .{}, prng.random(), &scratch));
+}
+
 test "greedy picks the max index" {
     const x = [_]f32{ -1, 5, 3, 5.1, 0 };
     try std.testing.expectEqual(@as(u32, 3), greedy(&x));
@@ -945,7 +1012,7 @@ test "sample with temperature 0 is greedy and never draws" {
     var scratch: TestScratch(x.len) = undefined;
     var prng = std.Random.DefaultPrng.init(42);
     const before = prng;
-    const id = sample(&x, .{}, prng.random(), &scratch);
+    const id = try sample(&x, .{}, prng.random(), &scratch);
     try std.testing.expectEqual(greedy(&x), id);
     // `sample` leaves the RNG state untouched, so a greedy session draws nothing.
     try std.testing.expectEqual(before.s, prng.s);
@@ -956,7 +1023,7 @@ test "sample with top_k 1 is greedy at any temperature" {
     var scratch: TestScratch(x.len) = undefined;
     var prng = std.Random.DefaultPrng.init(7);
     for (0..16) |_| {
-        const id = sample(&x, .{ .temperature = 1.3, .top_k = 1 }, prng.random(), &scratch);
+        const id = try sample(&x, .{ .temperature = 1.3, .top_k = 1 }, prng.random(), &scratch);
         try std.testing.expectEqual(greedy(&x), id);
     }
 }
@@ -966,7 +1033,7 @@ test "top_k restricts draws to the k most likely tokens" {
     var scratch: TestScratch(x.len) = undefined;
     var prng = std.Random.DefaultPrng.init(99);
     for (0..64) |_| {
-        const id = sample(&x, .{ .temperature = 1.0, .top_k = 2 }, prng.random(), &scratch);
+        const id = try sample(&x, .{ .temperature = 1.0, .top_k = 2 }, prng.random(), &scratch);
         try std.testing.expect(id == 0 or id == 1);
     }
 }
@@ -976,9 +1043,9 @@ test "tiny top_p collapses to the most likely token" {
     var scratch: TestScratch(x.len) = undefined;
     var prng = std.Random.DefaultPrng.init(5);
     for (0..32) |_| {
-        const id = sample(&x, .{ .temperature = 1.0, .top_p = 0.01 }, prng.random(), &scratch);
+        const id = try sample(&x, .{ .temperature = 1.0, .top_p = 0.01 }, prng.random(), &scratch);
         try std.testing.expectEqual(@as(u32, 0), id);
-        const pooled = sample(
+        const pooled = try sample(
             &x,
             .{ .temperature = 1.0, .top_k = 4, .top_p = 0.01 },
             prng.random(),
@@ -994,7 +1061,7 @@ test "full-vocab temperature sampling overwhelmingly picks a dominant logit" {
     var prng = std.Random.DefaultPrng.init(2026);
     var hits: u32 = 0;
     for (0..100) |_| {
-        if (sample(&x, .{ .temperature = 1.0 }, prng.random(), &scratch) == 1) {
+        if (try sample(&x, .{ .temperature = 1.0 }, prng.random(), &scratch) == 1) {
             hits += 1;
         }
     }
@@ -1018,17 +1085,17 @@ test "presence penalty: greedy moves off a present id and leaves the logits" {
     // 5 - 1 = 4 < 4.5, so the argmax moves to id 2. A smaller penalty keeps 1.
     try std.testing.expectEqual(
         @as(u32, 2),
-        sample(&x, .{ .presence_penalty = 1, .presence = &set }, prng.random(), &scratch),
+        try sample(&x, .{ .presence_penalty = 1, .presence = &set }, prng.random(), &scratch),
     );
     try std.testing.expectEqual(
         @as(u32, 1),
-        sample(&x, .{ .presence_penalty = 0.25, .presence = &set }, prng.random(), &scratch),
+        try sample(&x, .{ .presence_penalty = 0.25, .presence = &set }, prng.random(), &scratch),
     );
     // A negative penalty favors a present id: 4.5 + 2 passes 5.
     const low = testSet(x.len, &.{2});
     try std.testing.expectEqual(
         @as(u32, 2),
-        sample(&x, .{ .presence_penalty = -2, .presence = &low }, prng.random(), &scratch),
+        try sample(&x, .{ .presence_penalty = -2, .presence = &low }, prng.random(), &scratch),
     );
     try std.testing.expectEqualSlices(f32, &before, &x);
 }
@@ -1040,14 +1107,14 @@ test "presence penalty: the pool and the full vocab never draw a heavily penaliz
     var prng = std.Random.DefaultPrng.init(77);
     for (0..64) |_| {
         // 10 - 2 = 8 is still a candidate in a pool of two. At low temperature id 1 holds the mass.
-        const pooled = sample(
+        const pooled = try sample(
             &x,
             .{ .temperature = 0.05, .top_k = 2, .presence_penalty = 2, .presence = &set },
             prng.random(),
             &scratch,
         );
         try std.testing.expectEqual(@as(u32, 1), pooled);
-        const full = sample(
+        const full = try sample(
             &x,
             .{ .temperature = 0.05, .presence_penalty = 2, .presence = &set },
             prng.random(),
@@ -1082,9 +1149,9 @@ test "neutral penalties equal the plain path draw for draw" {
         var b = std.Random.DefaultPrng.init(9);
         var c = std.Random.DefaultPrng.init(9);
         for (0..32) |_| {
-            const want = sample(&x, base, a.random(), &scratch);
-            try std.testing.expectEqual(want, sample(&x, zero, b.random(), &scratch));
-            try std.testing.expectEqual(want, sample(&x, empty, c.random(), &scratch));
+            const want = try sample(&x, base, a.random(), &scratch);
+            try std.testing.expectEqual(want, try sample(&x, zero, b.random(), &scratch));
+            try std.testing.expectEqual(want, try sample(&x, empty, c.random(), &scratch));
         }
     }
 }
@@ -1169,7 +1236,7 @@ fn checkGreedyInvariance(_: void, seed: u64) anyerror!void {
         @memset(&scratch, std.math.nan(f32));
         var rng = std.Random.DefaultPrng.init(r.int(u64));
         const before = rng.s;
-        try std.testing.expectEqual(greedy(&row), sample(&row, p, rng.random(), &scratch));
+        try std.testing.expectEqual(greedy(&row), try sample(&row, p, rng.random(), &scratch));
         try std.testing.expectEqual(before, rng.s);
         for (scratch) |v| {
             try std.testing.expect(std.math.isNan(v));
@@ -1203,8 +1270,8 @@ fn checkSeedReproducibility(_: void, case_seed: u64) anyerror!void {
         // each path is fixed: none for greedy, one for a draw.
         var twin = std.Random.DefaultPrng.init(seed);
         for (0..8) |_| {
-            const ia = sample(&row, p, a.random(), &scratch);
-            const ib = sample(&row, p, b.random(), &scratch);
+            const ia = try sample(&row, p, a.random(), &scratch);
+            const ib = try sample(&row, p, b.random(), &scratch);
             try std.testing.expectEqual(ia, ib);
             if (p.temperature > 0) {
                 _ = twin.random().float(f32);
@@ -1280,8 +1347,8 @@ fn checkFixupEquivalence(_: void, c: prop.Trial) anyerror!void {
         var a = std.Random.DefaultPrng.init(seed);
         var b = std.Random.DefaultPrng.init(seed);
         for (0..8) |_| {
-            const want = sample(&viewed, bare, a.random(), &scratch);
-            try std.testing.expectEqual(want, sample(&row, plain, b.random(), &scratch));
+            const want = try sample(&viewed, bare, a.random(), &scratch);
+            try std.testing.expectEqual(want, try sample(&row, plain, b.random(), &scratch));
         }
     }
 }
@@ -1462,15 +1529,15 @@ test "the draw at the edges of u: 0 takes the first positive weight, near 1 the 
         .{ .temperature = 1, .min_p = 0.5 },
     };
     for (shapes) |p| {
-        try std.testing.expectEqual(@as(u32, 5), sample(&row, p, zero.random(), &scratch));
+        try std.testing.expectEqual(@as(u32, 5), try sample(&row, p, zero.random(), &scratch));
         const last: u32 = if (p.top_p < 1) cutLast(prop_vocab - 8, p.top_p) + 5 else prop_vocab - 4;
-        try std.testing.expectEqual(last, sample(&row, p, one.random(), &scratch));
+        try std.testing.expectEqual(last, try sample(&row, p, one.random(), &scratch));
     }
 
     // The pool walks its own CDF, and the edges hold there too.
     const pool: Params = .{ .temperature = 1, .top_k = 50 };
-    try std.testing.expectEqual(@as(u32, 5), sample(&row, pool, zero.random(), &scratch));
-    try std.testing.expectEqual(@as(u32, 54), sample(&row, pool, one.random(), &scratch));
+    try std.testing.expectEqual(@as(u32, 5), try sample(&row, pool, zero.random(), &scratch));
+    try std.testing.expectEqual(@as(u32, 54), try sample(&row, pool, one.random(), &scratch));
 }
 
 /// The index of the last id that a top_p cut keeps among `n` equal weights.
@@ -1546,7 +1613,7 @@ test "full-vocab draw: every id has a positive weight and the frequencies follow
     var counts: [hot.len]u32 = @splat(0);
     const draws = 20_000;
     for (0..draws) |_| {
-        const id = sample(&row, .{ .temperature = 1 }, r, &scratch);
+        const id = try sample(&row, .{ .temperature = 1 }, r, &scratch);
         const j = std.mem.indexOfScalar(u32, &hot, id) orelse return error.TestUnexpectedResult;
         counts[j] += 1;
     }
@@ -1695,7 +1762,7 @@ fn checkMinPFull(_: void, seed: u64) anyerror!void {
     try std.testing.expect(n >= 1);
     var rng = std.Random.DefaultPrng.init(r.int(u64));
     for (0..16) |_| {
-        const id = sample(&row, .{ .temperature = t, .min_p = m }, rng.random(), &scratch);
+        const id = try sample(&row, .{ .temperature = t, .min_p = m }, rng.random(), &scratch);
         try std.testing.expect(weights[id] >= m);
     }
 }

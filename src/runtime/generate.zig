@@ -99,7 +99,7 @@ pub fn decode(
 
     // Sample and emit the first token.
     var last_logits = last_logits_in;
-    var id = timedGreedy(last_logits, io, &argmax);
+    var id = try timedGreedy(last_logits, io, &argmax);
     const t_first = Io.Clock.Timestamp.now(io, .awake);
     var t_mark = t_first;
     try sink.onToken(id);
@@ -132,7 +132,7 @@ pub fn decode(
             break; // Budget reached. The step above already committed it.
         }
 
-        id = timedGreedy(last_logits, io, &argmax);
+        id = try timedGreedy(last_logits, io, &argmax);
         try sink.onToken(id);
         n += 1;
     }
@@ -170,8 +170,15 @@ fn nsBetween(t0: Io.Clock.Timestamp, t1: Io.Clock.Timestamp) u64 {
     return @intCast(t0.durationTo(t1).raw.toNanoseconds());
 }
 
-/// Greedy argmax with its wall time folded into `stat`.
-fn timedGreedy(logits: []const f32, io: Io, stat: *step_stats.Stat) u32 {
+/// Greedy argmax with its wall time folded into `stat`. A row with a NaN, a +inf, or no finite
+/// logit ends the turn with an error, because argmax over it names no real token.
+fn timedGreedy(logits: []const f32, io: Io, stat: *step_stats.Stat) sampler.Error!u32 {
+    sampler.checkLogits(logits) catch |err| {
+        log.err("the logits of a step hold a NaN, a +inf, or no finite value, " ++
+            "so a model weight holds a non-finite value", .{});
+        return err;
+    };
+
     const t0 = Io.Clock.Timestamp.now(io, .awake);
     const id = sampler.greedy(logits);
     const t1 = Io.Clock.Timestamp.now(io, .awake);

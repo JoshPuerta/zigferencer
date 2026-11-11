@@ -312,6 +312,20 @@ pub const ram_usable_den: u64 = 8;
 /// product of a KV layout inside a `u64`.
 pub const max_kv_row_elems: u32 = 1 << 20;
 
+/// Ceiling on one layer's declared fixed per-slot cost, one recurrent state slab of a hybrid
+/// model. A GDN layer holds `(time_step_rank * state_size^2 + (conv_kernel - 1) * qkv) * 4` bytes:
+/// `(16 * 128^2 + 3 * 6144) * 4 = 1122304` on the Qwen3.5-2B and `(32 * 128^2 + 3 * 8192) * 4 =
+/// 2195456` on the 9B, so this sits far above either. The loader refuses a card past it.
+pub const max_fixed_state_bytes_per_layer: u64 = 1 << 30;
+
+/// Ceiling on the whole model's fixed per-slot cost, every layer's slab summed. It keeps every
+/// byte product of the planner inside a `u64`. The loader refuses a card past it.
+pub const max_fixed_state_bytes: u64 = 1 << 32;
+
+/// The workgroup count of one grid axis that needs no device query. The Vulkan required limits
+/// table sets 65535 as the minimum of `maxComputeWorkGroupCount` on each axis.
+pub const max_workgroups: u32 = 65535;
+
 /// Elements one KV region can hold. The shaders index KV with a 32-bit value, and SPIR-V reads that
 /// index as signed. So the last index of a region must stay below 2^31.
 pub const max_kv_index_elems: u64 = 1 << 31;
@@ -406,6 +420,32 @@ pub fn bufferFits(elems: u64, bytes: u64, lim: BufferLimits) BufferVerdict {
     if (bytes % lim.offset_alignment != 0) return .misaligned;
 
     return .fits;
+}
+
+/// The widest window whose KV slab of one layer keeps a 32-bit element index. The CPU KV cache
+/// addresses a layer slab with a `u32`. The loader bounds the row by `max_kv_row_elems`.
+pub fn kvSlabWindowMax(kv_row_elems: u32) u32 {
+    std.debug.assert(kv_row_elems >= 1);
+    std.debug.assert(kv_row_elems <= max_kv_row_elems);
+
+    const window = @min(max_model_ctx, std.math.maxInt(u32) / kv_row_elems);
+    std.debug.assert(window >= 1);
+    std.debug.assert(@as(u64, window) * kv_row_elems <= std.math.maxInt(u32));
+    return window;
+}
+
+/// The first device limit that one f32 buffer of `n` blocks of `block_elems` elements breaks. A
+/// kernel indexes the buffer with a 32-bit product of a block index and the block width, and binds
+/// it whole at offset 0, so the verdict is never `.misaligned`.
+pub fn blocksFit(n: u32, block_elems: u32, lim: BufferLimits) BufferVerdict {
+    const elems = @as(u64, n) * block_elems;
+    const bytes = elems * @sizeOf(f32);
+    var unaligned = lim;
+    unaligned.offset_alignment = 1;
+    const verdict = bufferFits(elems, bytes, unaligned);
+    std.debug.assert(verdict != .misaligned);
+    if (verdict == .fits) std.debug.assert(elems <= std.math.maxInt(u32));
+    return verdict;
 }
 
 /// `n` rounded down to a whole number of `window_granule` positions.
@@ -702,6 +742,30 @@ test "bufferFits: the first broken limit in check order wins" {
         BufferVerdict.past_storage_range,
         bufferFits(1 << 20, (128 << 20) + 1, lim),
     );
+}
+
+test "blocksFit: the 32-bit index, the allocation, and the range each bound the blocks" {
+    const wide: BufferLimits = .{
+        .storage_range = 1 << 40,
+        .allocation_size = 1 << 40,
+        .offset_alignment = 256,
+    };
+    const block: u32 = 1 << 20;
+    const index_max: u32 = @intCast(max_kv_index_elems / block);
+    try std.testing.expectEqual(BufferVerdict.fits, blocksFit(index_max, block, wide));
+    const past = blocksFit(index_max + 1, block, wide);
+    try std.testing.expectEqual(BufferVerdict.index_past_31_bits, past);
+    // The GDN state of 128 slots of the 9B, 32 heads of 128 by 128, fits the index.
+    try std.testing.expectEqual(BufferVerdict.fits, blocksFit(128, 32 * 128 * 128, wide));
+
+    var small = wide;
+    small.allocation_size = 4 * block;
+    try std.testing.expectEqual(BufferVerdict.fits, blocksFit(1, block, small));
+    try std.testing.expectEqual(BufferVerdict.past_allocation_size, blocksFit(2, block, small));
+
+    var narrow = wide;
+    narrow.storage_range = 4 * block;
+    try std.testing.expectEqual(BufferVerdict.past_storage_range, blocksFit(2, block, narrow));
 }
 
 test "parseSoftwareDevice: only 1 and 0 name a choice" {

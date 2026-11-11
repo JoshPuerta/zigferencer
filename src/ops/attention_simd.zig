@@ -481,8 +481,9 @@ inline fn foldScores(row: *[tile]f32, tile_n: usize, first: bool, m_run: *f32, l
 
     // Add the tile sum to the running sum.
     const l = l_run.* + transposeAdd(1, .{sum_v})[0];
-    // The term at the maximum adds exp(0) = 1, and no term is negative.
-    assert(l >= 1);
+    // The term at the maximum adds exp(0) = 1, and no term is negative. A non-finite score from a
+    // model weight breaks it, so only a safety build checks it.
+    if (std.debug.runtime_safety) assert(l >= 1);
     l_run.* = l;
     return factor;
 }

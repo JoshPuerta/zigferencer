@@ -2,7 +2,8 @@
 //! that a runner reads to hold and bind the layer. The file holds no state.
 //!
 //! Comptime. `forward` takes the kernel set type and checks it with `assertLayerKernels`.
-//! `tensorName` takes the role at comptime, because `findByFmt` takes a comptime format.
+//! `tensorName` takes the role at comptime, because `tensor_lookup.roleName` takes a comptime
+//! format.
 //!
 //! Layer. Every layer holds the same nine weights: grouped-query attention with adjacent-pair
 //! rope, then the SwiGLU FFN. The o projection writes `x_norm`, because no op of the layer reads
@@ -23,6 +24,7 @@ const std = @import("std");
 const loader = @import("../io/gguf/loader.zig");
 const layer_kernels = @import("layer_kernels.zig");
 const cpu_profile = @import("cpu_profile.zig");
+const dispatch_guard = @import("dispatch_guard.zig");
 
 const Activation = layer_kernels.Activation;
 const GpuRunner = @import("../core/span.zig").GpuRunner;
@@ -154,6 +156,37 @@ pub fn activationWidth(card: *const loader.ModelCard, act: Activation) u32 {
     };
 }
 
+/// The dims that the card requires of a layer weight, in the order of the GGUF shape: the input
+/// width, then the output width. A vector holds 0 as its second entry. Zero: no such weight.
+pub fn weightDims(card: *const loader.ModelCard, weight: Weight) [2]u32 {
+    assert(card.arch == .llama);
+
+    const emb = card.embedding_length;
+    const q_dim = activationWidth(card, .q);
+    const kv_dim = activationWidth(card, .k);
+    const ffn = card.feed_forward_length;
+    return switch (weight) {
+        .attn_norm, .ffn_norm => .{ emb, 0 },
+        .attn_q => .{ emb, q_dim },
+        .attn_k, .attn_v => .{ emb, kv_dim },
+        .attn_o => .{ q_dim, emb },
+        .ffn_gate, .ffn_up => .{ emb, ffn },
+        .ffn_down => .{ ffn, emb },
+        .attn_q_norm,
+        .attn_k_norm,
+        .ssm_qkv,
+        .ssm_z,
+        .ssm_alpha,
+        .ssm_beta,
+        .ssm_out,
+        .ssm_conv1d,
+        .ssm_a,
+        .ssm_dt,
+        .ssm_norm,
+        => .{ 0, 0 },
+    };
+}
+
 /// The KV region of the model layer `layer` in a runner of the layers from `first`.
 pub fn kvIndex(card: *const loader.ModelCard, first: u32, layer: u32) ?u32 {
     assert(first <= layer);
@@ -169,10 +202,12 @@ pub fn recurrentElems(card: *const loader.ModelCard) layer_kernels.RecurrentElem
     return .{ .state = 0, .conv = 0 };
 }
 
-/// The fused kernels take every Llama shape that the checks of all families pass, so the guard
-/// refuses none.
-pub fn fusedGuard(card: *const loader.ModelCard) error{}!void {
+/// Refuse a head count past one axis of a fused dispatch. The fused kernels take every other
+/// Llama shape that the checks of all families pass.
+pub fn fusedGuard(card: *const loader.ModelCard) dispatch_guard.Error!void {
     assert(card.arch == .llama);
+
+    return dispatch_guard.requireHeads(card);
 }
 
 // -- tests ------------------------------------------------------------------

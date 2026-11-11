@@ -51,14 +51,9 @@ const prop = @import("prop.zig");
 /// a `u64`.
 const max_kv_bytes_per_token: u64 = 1 << 30;
 
-/// Ceiling on one layer's declared fixed per-slot cost, one recurrent state
-/// slab of a hybrid model. The Qwen3.5-2B GDN layer declares 1122304 bytes and
-/// the 9B layer 2195456, so this sits far above either.
-const max_fixed_state_bytes_per_layer: u64 = 1 << 30;
+const max_fixed_state_bytes_per_layer = limits.max_fixed_state_bytes_per_layer;
 
-/// Ceiling on the whole model's fixed per-slot cost, every layer's slab
-/// summed. Bounded for the same reason as `max_kv_bytes_per_token`.
-const max_fixed_state_bytes: u64 = 1 << 32;
+const max_fixed_state_bytes = limits.max_fixed_state_bytes;
 
 /// Ceiling on a declared per-layer weight byte count. A model at this ceiling on
 /// every one of `limits.max_layers` layers still sums far inside a `u64`. The

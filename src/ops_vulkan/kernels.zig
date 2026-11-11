@@ -88,10 +88,9 @@ const q4_0_block_elems: usize = 32;
 const q4_0_packed_bytes: usize = 16; // 32 weights at 4 bits = 16 bytes
 pub const q4_0_block_bytes: usize = 2 + q4_0_packed_bytes; // f16 scale + 16 packed
 
-/// The largest workgroup count in one dimension that needs no device query, because Vulkan
-/// guarantees at least this in `maxComputeWorkGroupCount[0]`. The narrowing kernels assert against
-/// it, because their grid follows an element count that the caller supplies.
-const max_workgroups_x: u32 = 65535;
+/// The largest workgroup count in one dimension that needs no device query. The narrowing kernels
+/// assert against it, because their grid follows an element count that the caller supplies.
+const max_workgroups_x: u32 = limits.max_workgroups;
 
 // One blob per shader, in the form that "SPIR-V embeds" in the header states.
 const vec_add_spv: [

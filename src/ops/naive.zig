@@ -900,8 +900,9 @@ pub fn attentionPartTyped(
                         l += s.*;
                     }
 
-                    // The term at the maximum adds exp(0) = 1, and no term is negative.
-                    std.debug.assert(l >= 1);
+                    // The term at the maximum adds exp(0) = 1, and no term is negative. A
+                    // non-finite score breaks it, so only a safety build checks it.
+                    if (std.debug.runtime_safety) std.debug.assert(l >= 1);
                     l_run[g] = l;
                 }
 

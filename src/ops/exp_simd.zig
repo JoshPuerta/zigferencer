@@ -50,7 +50,8 @@ pub const Vec = @Vector(lanes, f32);
 
 // -- api --------------------------------------------------------------------
 
-/// `exp(x)` in each lane, for `x <= 0`. No NaN arrives.
+/// `exp(x)` in each lane, for `x <= 0`. A NaN lane fails the safety check. A release build clamps
+/// it to the cut, because `@max` returns the other operand, so every index stays defined.
 /// The result is within `exp_ulp_tol` ulps of the f64 `exp`.
 pub inline fn expNeg(x: Vec) Vec {
     const Int = @Vector(lanes, i32);

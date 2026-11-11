@@ -162,6 +162,8 @@ pub const LogKernels = struct {
         weights: std.EnumSet(Weight) = .initEmpty(),
         /// The weights that a `project` call multiplies.
         projected: std.EnumSet(Weight) = .initEmpty(),
+        /// The input and the output buffer of each projected weight.
+        projections: std.EnumArray(Weight, ?[2]Activation) = .initFill(null),
         acts: std.EnumSet(Activation) = .initEmpty(),
         rope_style: ?naive.RopeStyle = null,
         /// The output of the last projection call, and the count of residuals that added it.
@@ -213,6 +215,7 @@ pub const LogKernels = struct {
         for (outs) |p| {
             self.log.touch(&.{p.weight}, &.{p.out});
             self.log.projected.insert(p.weight);
+            self.log.projections.set(p.weight, .{ in, p.out });
         }
 
         self.log.last_out = outs[outs.len - 1].out;
@@ -307,6 +310,7 @@ pub fn assertFamily(comptime F: type) void {
         .{ "tensorName", fn (comptime Weight) ?[]const u8 },
         .{ "layerWeights", fn (Card, u32) []const Weight },
         .{ "activationWidth", fn (Card, Activation) u32 },
+        .{ "weightDims", fn (Card, Weight) [2]u32 },
         .{ "kvIndex", fn (Card, u32, u32) ?u32 },
         .{ "recurrentElems", fn (Card) RecurrentElems },
     });

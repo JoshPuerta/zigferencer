@@ -1,7 +1,8 @@
 //! Tensor-by-name lookup over a `loader.TensorRef` list. Every forward pass shares it to resolve
 //! the weights of a loaded GGUF model.
 //!
-//! Comptime. `findByFmt` takes the name format at comptime, so a bad format fails the build.
+//! Comptime. `roleName` and `findRole` take the layer family at comptime, because the family names
+//! each weight role with a comptime format, so a bad format fails the build.
 //!
 //! Absence. One home keeps the four runners (CPU Llama, CPU Qwen, GPU Llama, GPU Qwen) on one
 //! found/not-found rule. An absence is either an optional (`find`) or an `error.MissingTensor`
@@ -17,6 +18,12 @@ const std = @import("std");
 const Tensor = @import("../core/tensor.zig").Tensor;
 const limits = @import("../core/limits.zig");
 const loader = @import("../io/gguf/loader.zig");
+const Weight = @import("layer_kernels.zig").Weight;
+
+// -- constants --------------------------------------------------------------
+
+/// Fits every `blk.{d}.*` tensor name of both families at every layer of `limits.max_layers`.
+pub const role_name_bytes_max = 80;
 
 // -- types ------------------------------------------------------------------
 
@@ -26,8 +33,14 @@ pub const Error = error{MissingTensor};
 
 /// The tensor named `name`, or null. A call site with a legitimate absence uses it directly.
 pub fn find(refs: []const loader.TensorRef, name: []const u8) ?*const Tensor {
+    const ref = findRef(refs, name) orelse return null;
+    return &ref.tensor;
+}
+
+/// The entry named `name`, or null. Its name outlives a formatted lookup key.
+pub fn findRef(refs: []const loader.TensorRef, name: []const u8) ?*const loader.TensorRef {
     for (refs) |*r| {
-        if (std.mem.eql(u8, r.name, name)) return &r.tensor;
+        if (std.mem.eql(u8, r.name, name)) return r;
     }
 
     return null;
@@ -38,16 +51,37 @@ pub fn findRequired(refs: []const loader.TensorRef, name: []const u8) Error!*con
     return find(refs, name) orelse error.MissingTensor;
 }
 
-/// `findRequired` with the name formatted into `buf` (e.g. `"blk.{d}.attn_q.weight"`).
-/// A `bufPrint` overflow is a miss, because a name that cannot fit cannot exist.
-pub fn findByFmt(
+/// The GGUF name of `role` in the model layer `layer`, written into `buf`. Every role of
+/// `Family.layerWeights` has a name.
+pub fn roleName(
+    comptime Family: type,
+    buf: *[role_name_bytes_max]u8,
+    role: Weight,
+    layer: u32,
+) []const u8 {
+    std.debug.assert(layer < limits.max_layers);
+
+    switch (role) {
+        inline else => |r| {
+            if (comptime Family.tensorName(r)) |fmt| {
+                // The longest format plus the widest layer index fits the buffer.
+                return std.fmt.bufPrint(buf, fmt, .{layer}) catch unreachable;
+            }
+
+            unreachable; // Every role of `layerWeights` has a GGUF name.
+        },
+    }
+}
+
+/// The entry of `role` in the model layer `layer`, or `error.MissingTensor`.
+pub fn findRole(
+    comptime Family: type,
     refs: []const loader.TensorRef,
-    buf: []u8,
-    comptime fmt: []const u8,
-    args: anytype,
-) Error!*const Tensor {
-    const name = std.fmt.bufPrint(buf, fmt, args) catch return error.MissingTensor;
-    return findRequired(refs, name);
+    role: Weight,
+    layer: u32,
+) Error!*const loader.TensorRef {
+    var buf: [role_name_bytes_max]u8 = undefined;
+    return findRef(refs, roleName(Family, &buf, role, layer)) orelse error.MissingTensor;
 }
 
 /// The weight bytes of each transformer block. `out` holds one entry per layer, and the result
@@ -60,8 +94,7 @@ pub fn layerWeightBytes(refs: []const loader.TensorRef, n_layers: u32, out: []u6
     @memset(out[0..n_layers], 0);
     for (refs) |*r| {
         const idx = blockIndex(r.name) orelse continue;
-        // A higher index means a malformed model. A release build skips it instead of overrunning.
-        std.debug.assert(idx < n_layers);
+        // The index comes from a file name, so the walk skips a block past the declared layers.
         if (idx >= n_layers) continue;
 
         out[idx] += r.tensor.data.len;
@@ -73,11 +106,11 @@ pub fn layerWeightBytes(refs: []const loader.TensorRef, n_layers: u32, out: []u6
 /// The weight bytes outside the per-layer split: the final norm plus the lm_head.
 pub fn headWeightBytes(refs: []const loader.TensorRef) u64 {
     var total: u64 = 0;
-    if (find(refs, "output_norm.weight")) |t| {
+    if (find(refs, loader.output_norm_tensor)) |t| {
         total += t.data.len;
     }
 
-    const head = find(refs, "output.weight") orelse find(refs, "token_embd.weight");
+    const head = find(refs, loader.head_tensor) orelse find(refs, loader.embed_tensor);
     if (head) |t| {
         total += t.data.len;
     }
@@ -106,7 +139,7 @@ pub fn fp32View(t: Tensor) []const f32 {
 
 // -- tests ------------------------------------------------------------------
 
-test "find / findRequired / findByFmt resolve and report misses" {
+test "find / findRequired / findRole resolve and report misses" {
     const data align(@alignOf(f32)) = [_]u8{0} ** 16;
     const t: Tensor = .{
         .dtype = .f32,
@@ -123,12 +156,10 @@ test "find / findRequired / findByFmt resolve and report misses" {
     try std.testing.expect(find(&refs, "absent") == null);
     try std.testing.expectError(error.MissingTensor, findRequired(&refs, "absent"));
 
-    var buf: [64]u8 = undefined;
-    _ = try findByFmt(&refs, &buf, "blk.{d}.attn_q.weight", .{0});
-    try std.testing.expectError(
-        error.MissingTensor,
-        findByFmt(&refs, &buf, "blk.{d}.attn_q.weight", .{9}),
-    );
+    const llama = @import("llama_layer.zig");
+    const ref = try findRole(llama, &refs, .attn_q, 0);
+    try std.testing.expectEqualStrings("blk.0.attn_q.weight", ref.name);
+    try std.testing.expectError(error.MissingTensor, findRole(llama, &refs, .attn_q, 9));
     try std.testing.expectEqual(@as(usize, 4), fp32View(t).len);
 }
 
@@ -160,6 +191,11 @@ test "layerWeightBytes: sums each block and leaves the non-layer tensors out" {
     // A declared layer with no tensor of its own weighs nothing.
     const three = layerWeightBytes(&refs, 3, &table);
     try std.testing.expectEqual(@as(u64, 0), three[2]);
+
+    // The walk skips a block past the declared layers, and the sum of block 0 holds.
+    const one = layerWeightBytes(&refs, 1, &table);
+    try std.testing.expectEqual(@as(usize, 1), one.len);
+    try std.testing.expectEqual(@as(u64, 32), one[0]);
 }
 
 test "headWeightBytes: the final norm plus the lm_head, tied and untied" {

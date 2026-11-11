@@ -45,6 +45,7 @@ const Llama = struct {
     pub const Cpu = CpuRunner(llama_layer);
     pub const Fused = if (fused_build) fused_runner.FusedRunner(llama_layer) else void;
     pub const Hybrid = if (fused_build) hybrid_runner.HybridRunner(@This()) else void;
+    pub const Layer = llama_layer;
     pub const profile_family = llama_layer.profile_family;
 
     // A build that names the row checks its runners. The llama runners hold no recurrent state.
@@ -106,6 +107,7 @@ const Qwen = struct {
     pub const Cpu = CpuRunner(qwen_layer);
     pub const Fused = if (fused_build) fused_runner.FusedRunner(qwen_layer) else void;
     pub const Hybrid = if (fused_build) hybrid_runner.HybridRunner(@This()) else void;
+    pub const Layer = qwen_layer;
     pub const profile_family = qwen_layer.profile_family;
 
     // A build that names the row checks its runners. The qwen runners hold the GDN state.

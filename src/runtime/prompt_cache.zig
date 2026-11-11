@@ -63,6 +63,9 @@ const prop = @import("../core/prop.zig");
 
 const log = std.log.scoped(.cache);
 
+/// The test runner prints a warn line, and a mismatch test expects these lines.
+const mismatch_level: std.log.Level = if (@import("builtin").is_test) .debug else .warn;
+
 // -- constants --------------------------------------------------------------
 
 /// Environment variable that relocates the cache directory. A relative path resolves from the
@@ -83,6 +86,17 @@ const model_cap = 32;
 const model_tokens_max = 6;
 
 // -- types ------------------------------------------------------------------
+
+/// Why a snapshot image does not parse.
+pub const ImageError = error{ ImageTruncated, ImageForeign, ImageSizeOverflow, ImageTorn };
+
+/// The views of one snapshot image into its bytes.
+const Image = struct {
+    n_tokens: u32,
+    tokens: []const u8,
+    logits: []const u8,
+    blob: []const u8,
+};
 
 const DiskHeader = extern struct {
     magic: u32,
@@ -534,34 +548,15 @@ pub const PromptCache = struct {
         var mapped = mmap.openReadOnly(io, path) catch return null; // not found => miss
         defer mapped.close();
 
-        // Validate the header and the length.
+        // Validate the image, then the collision guard.
         const bytes = mapped.bytes();
-        if (bytes.len < @sizeOf(DiskHeader)) return self.dropDisk(key);
-
-        var hdr: DiskHeader = undefined;
-        @memcpy(std.mem.asBytes(&hdr), bytes[0..@sizeOf(DiskHeader)]);
-        if (hdr.magic != magic or hdr.version != version or hdr.model_fp != self.model_fp) {
+        const image = parseImage(bytes, self.model_fp) catch |err| {
+            log.warn("disk cache: {x:0>16}.zkv is not a valid snapshot ({t}), so it is a miss", .{
+                key, err,
+            });
             return self.dropDisk(key);
-        }
-
-        const tok_bytes: usize = @as(usize, hdr.n_tokens) * @sizeOf(u32);
-        const log_bytes: usize = @as(usize, hdr.n_logits) * @sizeOf(f32);
-        const need = @sizeOf(DiskHeader) + tok_bytes + log_bytes + hdr.blob_len;
-        if (bytes.len < need) return self.dropDisk(key);
-
-        // Check the payload FNV and the collision guard.
-        var off: usize = @sizeOf(DiskHeader);
-        const tok_slice = bytes[off..][0..tok_bytes];
-        off += tok_bytes;
-        const log_slice = bytes[off..][0..log_bytes];
-        off += log_bytes;
-        const blob_slice = bytes[off..][0..@intCast(hdr.blob_len)];
-        var h = std.hash.Fnv1a_64.init();
-        h.update(tok_slice);
-        h.update(log_slice);
-        h.update(blob_slice);
-        if (h.final() != hdr.payload_fnv) return self.dropDisk(key);
-        if (!std.mem.eql(u8, tok_slice, std.mem.sliceAsBytes(tokens))) {
+        };
+        if (!std.mem.eql(u8, image.tokens, std.mem.sliceAsBytes(tokens))) {
             return null; // collision: different prompt
         }
 
@@ -569,16 +564,16 @@ pub const PromptCache = struct {
         const e_tokens = try self.gpa.dupe(u32, tokens);
         errdefer self.gpa.free(e_tokens);
 
-        const e_logits = try self.gpa.alloc(f32, hdr.n_logits);
+        const e_logits = try self.gpa.alloc(f32, image.logits.len / @sizeOf(f32));
         errdefer self.gpa.free(e_logits);
 
-        @memcpy(std.mem.sliceAsBytes(e_logits), log_slice);
-        const e_blob = try self.gpa.dupe(u8, blob_slice);
-        log.debug("disk restore: {x:0>16}.zkv, {d} bytes read", .{ key, need });
+        @memcpy(std.mem.sliceAsBytes(e_logits), image.logits);
+        const e_blob = try self.gpa.dupe(u8, image.blob);
+        log.debug("disk restore: {x:0>16}.zkv, {d} bytes read", .{ key, bytes.len });
         return Entry{
             .key = key,
             .tokens = e_tokens,
-            .n = hdr.n_tokens,
+            .n = image.n_tokens,
             .blob = e_blob,
             .last_logits = e_logits,
             .last_used = 0,
@@ -796,6 +791,79 @@ const CacheModel = struct {
 // -- api --------------------------------------------------------------------
 
 /// Apply the default to a raw env value. The CLI reads the variable once at startup.
+/// Parse the bytes of one `.zkv` file of the namespace `model_fp`. The file is input, so every size
+/// sum is checked and every view lies inside `bytes`.
+pub fn parseImage(bytes: []const u8, model_fp: u64) ImageError!Image {
+    if (bytes.len < @sizeOf(DiskHeader)) return error.ImageTruncated;
+
+    var hdr: DiskHeader = undefined;
+    @memcpy(std.mem.asBytes(&hdr), bytes[0..@sizeOf(DiskHeader)]);
+    if (hdr.magic != magic or hdr.version != version or hdr.model_fp != model_fp) {
+        return error.ImageForeign;
+    }
+
+    // Size the three parts in u64, then check each sum.
+    const tok_bytes: u64 = @as(u64, hdr.n_tokens) * @sizeOf(u32);
+    const log_bytes: u64 = @as(u64, hdr.n_logits) * @sizeOf(f32);
+    const after_tokens = std.math.add(u64, @sizeOf(DiskHeader), tok_bytes) catch unreachable;
+    const after_logits = std.math.add(u64, after_tokens, log_bytes) catch unreachable;
+    const need = std.math.add(u64, after_logits, hdr.blob_len) catch {
+        return error.ImageSizeOverflow;
+    };
+    if (bytes.len < need) return error.ImageTruncated;
+
+    // Check the payload FNV.
+    const image: Image = .{
+        .n_tokens = hdr.n_tokens,
+        .tokens = bytes[@sizeOf(DiskHeader)..@intCast(after_tokens)],
+        .logits = bytes[@intCast(after_tokens)..@intCast(after_logits)],
+        .blob = bytes[@intCast(after_logits)..@intCast(need)],
+    };
+    var h = std.hash.Fnv1a_64.init();
+    h.update(image.tokens);
+    h.update(image.logits);
+    h.update(image.blob);
+    if (h.final() != hdr.payload_fnv) return error.ImageTorn;
+
+    return image;
+}
+
+/// Refuse a snapshot of no rows, or of more rows than a runner of `max_rows` positions holds. A
+/// cache file can hold either, so the caller treats the refusal as a miss. Call it before the
+/// caller prices the blob of `n_rows` rows.
+pub fn checkRows(n_rows: u32, max_rows: u32) error{SnapshotMismatch}!void {
+    if (n_rows >= 1 and n_rows <= max_rows) return;
+
+    const format = "prompt cache: a snapshot of {d} rows does not fit a runner of {d} rows, " ++
+        "so it is a miss";
+    if (mismatch_level == .debug) {
+        log.debug(format, .{ n_rows, max_rows });
+    } else {
+        log.warn(format, .{ n_rows, max_rows });
+    }
+    return error.SnapshotMismatch;
+}
+
+/// Refuse a snapshot whose blob or logits differ in length from what the runner restores.
+pub fn checkSizes(
+    blob_len: usize,
+    want_blob_len: u64,
+    logits_len: usize,
+    want_logits_len: usize,
+) error{SnapshotMismatch}!void {
+    if (blob_len == want_blob_len and logits_len == want_logits_len) return;
+
+    const format = "prompt cache: a snapshot of {d} blob bytes and {d} logits differs from " ++
+        "the {d} bytes and {d} logits of this runner, so it is a miss";
+    const args = .{ blob_len, logits_len, want_blob_len, want_logits_len };
+    if (mismatch_level == .debug) {
+        log.debug(format, args);
+    } else {
+        log.warn(format, args);
+    }
+    return error.SnapshotMismatch;
+}
+
 pub fn resolveCacheDir(env_value: ?[]const u8) []const u8 {
     const v = env_value orelse return default_cache_dir;
     return if (v.len == 0) default_cache_dir else v;
@@ -1449,4 +1517,135 @@ test "property: the RAM tier matches a linear-scan model, and best-prefix is the
         prop.genSeed(void),
         checkPromptCache,
     );
+}
+
+/// A valid image of a 3-token prefix, 8 logits, and a blob of `zkv_blob_len(3)` bytes, with the
+/// offset of each header field.
+const ZkvImage = struct {
+    bytes: [zkv_image_len]u8 align(8),
+    const fields = [_]struct { offset: usize, width: u8 }{
+        .{ .offset = @offsetOf(DiskHeader, "magic"), .width = 4 },
+        .{ .offset = @offsetOf(DiskHeader, "version"), .width = 4 },
+        .{ .offset = @offsetOf(DiskHeader, "model_fp"), .width = 8 },
+        .{ .offset = @offsetOf(DiskHeader, "n_tokens"), .width = 4 },
+        .{ .offset = @offsetOf(DiskHeader, "n_logits"), .width = 4 },
+        .{ .offset = @offsetOf(DiskHeader, "blob_len"), .width = 8 },
+        .{ .offset = @offsetOf(DiskHeader, "payload_fnv"), .width = 8 },
+    };
+};
+
+const zkv_fp: u64 = 0xF00D;
+const zkv_rows_max: u32 = 16;
+const zkv_vocab: u32 = 8;
+
+/// The blob bytes of the test runner at `n` rows: 24 bytes a row and a fixed 40.
+fn zkvBlobLen(n: u32) u64 {
+    return @as(u64, n) * 24 + 40;
+}
+
+const zkv_image_len = @sizeOf(DiskHeader) + 3 * 4 + zkv_vocab * 4 + 3 * 24 + 40;
+
+fn validZkv() ZkvImage {
+    var img: ZkvImage = .{ .bytes = undefined };
+    var payload: [zkv_image_len - @sizeOf(DiskHeader)]u8 = undefined;
+    for (&payload, 0..) |*b, i| {
+        b.* = @truncate(i * 7);
+    }
+
+    const hdr: DiskHeader = .{
+        .magic = magic,
+        .version = version,
+        .model_fp = zkv_fp,
+        .n_tokens = 3,
+        .n_logits = zkv_vocab,
+        .blob_len = zkvBlobLen(3),
+        .payload_fnv = std.hash.Fnv1a_64.hash(&payload),
+    };
+    @memcpy(img.bytes[0..@sizeOf(DiskHeader)], std.mem.asBytes(&hdr));
+    @memcpy(img.bytes[@sizeOf(DiskHeader)..], &payload);
+    return img;
+}
+
+/// Parse `bytes` and check the snapshot against the test runner. A typed error at any stage is
+/// a miss. A parsed image lies inside the bytes.
+fn loadZkv(bytes: []const u8) !void {
+    const image = parseImage(bytes, zkv_fp) catch return;
+    const lo = @intFromPtr(bytes.ptr);
+    for ([_][]const u8{ image.tokens, image.logits, image.blob }) |view| {
+        try std.testing.expect(@intFromPtr(view.ptr) >= lo);
+        try std.testing.expect(@intFromPtr(view.ptr) + view.len <= lo + bytes.len);
+    }
+
+    checkRows(image.n_tokens, zkv_rows_max) catch return;
+    checkSizes(image.blob.len, zkvBlobLen(image.n_tokens), image.logits.len / 4, zkv_vocab) catch
+        return;
+}
+
+test "parseImage: the valid image parses and fits the test runner" {
+    const img = validZkv();
+    const image = try parseImage(&img.bytes, zkv_fp);
+    try std.testing.expectEqual(@as(u32, 3), image.n_tokens);
+    try checkRows(image.n_tokens, zkv_rows_max);
+    try checkSizes(image.blob.len, zkvBlobLen(3), image.logits.len / 4, zkv_vocab);
+    try std.testing.expectError(error.ImageForeign, parseImage(&img.bytes, zkv_fp + 1));
+    try std.testing.expectError(error.ImageTruncated, parseImage(img.bytes[0..20], zkv_fp));
+}
+
+/// One header change. `rehash` writes the FNV of the payload the new header names, as a writer
+/// that emits a consistent file does, so the case reaches the shape checks.
+const ZkvMutation = struct { field: usize, op: u3, cut: ?usize, rehash: bool };
+
+fn genZkv(_: void, r: std.Random, size: u32) ZkvMutation {
+    _ = size;
+    return .{
+        .field = r.uintLessThan(usize, ZkvImage.fields.len),
+        .op = r.uintLessThan(u3, 6),
+        .cut = if (r.uintLessThan(u8, 4) == 0) r.uintAtMost(usize, zkv_image_len) else null,
+        .rehash = r.boolean(),
+    };
+}
+
+fn checkZkv(_: void, m: ZkvMutation) anyerror!void {
+    var img = validZkv();
+    const f = ZkvImage.fields[m.field];
+    const at = img.bytes[f.offset..];
+    const old: u64 = switch (f.width) {
+        4 => std.mem.readInt(u32, at[0..4], .little),
+        else => std.mem.readInt(u64, at[0..8], .little),
+    };
+    const max: u64 = if (f.width == 4) std.math.maxInt(u32) else std.math.maxInt(u64);
+    const value: u64 = switch (m.op) {
+        0 => 0,
+        1 => 1,
+        2 => if (old == 0) max else old - 1,
+        3 => @min(old +| 1, max),
+        4 => @min(old *| 2, max),
+        else => max,
+    };
+    if (f.width == 4) {
+        std.mem.writeInt(u32, at[0..4], @intCast(value), .little);
+    } else {
+        std.mem.writeInt(u64, at[0..8], value, .little);
+    }
+
+    if (m.rehash) {
+        rehashZkv(&img);
+    }
+    try loadZkv(img.bytes[0 .. m.cut orelse zkv_image_len]);
+}
+
+/// Write the FNV of the payload that the header of `img` names, when the payload fits the image.
+fn rehashZkv(img: *ZkvImage) void {
+    var hdr: DiskHeader = undefined;
+    @memcpy(std.mem.asBytes(&hdr), img.bytes[0..@sizeOf(DiskHeader)]);
+    const len = @as(u128, hdr.n_tokens) * 4 + @as(u128, hdr.n_logits) * 4 + hdr.blob_len;
+    if (len > zkv_image_len - @sizeOf(DiskHeader)) return;
+
+    const payload = img.bytes[@sizeOf(DiskHeader)..][0..@intCast(len)];
+    hdr.payload_fnv = std.hash.Fnv1a_64.hash(payload);
+    @memcpy(img.bytes[0..@sizeOf(DiskHeader)], std.mem.asBytes(&hdr));
+}
+
+test "property: a .zkv image with one changed header field or a cut loads as a miss or fits" {
+    try prop.forAll(.{ .site = 0x2C0B_EC01, .cases = 600 }, {}, ZkvMutation, genZkv, checkZkv);
 }
