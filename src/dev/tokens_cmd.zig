@@ -47,12 +47,11 @@ pub fn run(ctx: context.Context) !void {
     defer loaded.close();
 
     var v = try vocab_mod.buildFromParsed(ctx.arena, loaded.parsed);
-    const text = if (flags.chat)
-        try chat_mod.wrapAlloc(ctx.arena, model.chat_template_kind, flags.prompt)
-    else
-        flags.prompt;
-
-    const ids = try bpe.encodeAlloc(&v, ctx.arena, text, true);
+    // The chat form encodes as the server does. A raw prompt keeps its special tokens.
+    const ids = if (flags.chat) blk: {
+        const p = try chat_mod.promptAlloc(ctx.arena, model.chat_template_kind, flags.prompt);
+        break :blk try bpe.encodePromptAlloc(&v, ctx.arena, p.text, p.plain(), true);
+    } else try bpe.encodeAlloc(&v, ctx.arena, flags.prompt, true);
 
     const w = &ctx.stdout.interface;
 

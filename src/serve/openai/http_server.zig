@@ -60,6 +60,8 @@ const sse_body_bytes = 4096;
 /// One turn as the request resolved it.
 const TurnInput = struct {
     rendered: []const u8,
+    /// The byte ranges of `rendered` that came from the request, in the request arena.
+    plain: []const chat.PlainRange,
     max_tokens: u32,
     /// The request's thinking mode leaves the block open at the end of the
     /// rendered prompt.
@@ -301,8 +303,10 @@ fn HttpTasks(comptime Eng: type) type {
             ) catch |e| {
                 return respondError(request, map.reqErrorToHttp(e, .{}));
             };
+            const prompt = try chat.promptMessagesAlloc(arena, mode.kind, req.messages);
             const input: TurnInput = .{
-                .rendered = try chat.wrapMessagesAlloc(arena, mode.kind, req.messages),
+                .rendered = prompt.text,
+                .plain = try arena.dupe(chat.PlainRange, prompt.plain()),
                 .max_tokens = req.max_tokens,
                 .think_open = chat.thinkOpen(mode.kind),
                 .think_budget = mode.think_budget,
@@ -407,16 +411,22 @@ fn HttpTasks(comptime Eng: type) type {
         ) !Turn {
             // Submit the generate request.
             const text = try engine.gpa.dupe(u8, input.rendered);
+            const plain = engine.gpa.dupe(chat.PlainRange, input.plain) catch |e| {
+                engine.gpa.free(text);
+                return e;
+            };
             engine.submit(.{ .conn = c.id, .request_id = 2, .session_id = sid, .body = .{
                 .generate = .{
                     .max_tokens = input.max_tokens,
                     .sampling = null,
                     .text = text,
+                    .plain = plain,
                     .think_open = input.think_open,
                     .think_budget = input.think_budget,
                 },
             } }) catch {
                 engine.gpa.free(text);
+                engine.gpa.free(plain);
                 return error.SubmitFailed;
             };
 
@@ -445,7 +455,7 @@ fn HttpTasks(comptime Eng: type) type {
                         };
                     },
                     .err => |e| return .{
-                        .failed = try turnError(engine, arena, e.code, input.rendered),
+                        .failed = try turnError(engine, arena, e.code, input),
                     },
                     // Only the binary reader task produces these, in its own queue.
                     .zmtp_pong, .zmtp_error => unreachable,
@@ -475,7 +485,7 @@ fn HttpTasks(comptime Eng: type) type {
             };
 
             // Build the response.
-            const prompt_tokens = countPrompt(engine, input.rendered);
+            const prompt_tokens = countPrompt(engine, input);
             const message: types.RespMessage = .{
                 .content = sink.content.items,
                 .reasoning_content = if (sink.reasoning.items.len > 0)
@@ -551,11 +561,12 @@ fn HttpTasks(comptime Eng: type) type {
 
         /// Prompt-token count for `usage`: re-tokenize the rendered prompt. This costs little next
         /// to a decode, and it keeps the count exact without a path back through the wire.
-        fn countPrompt(engine: *Eng, rendered: []const u8) u32 {
+        fn countPrompt(engine: *Eng, input: TurnInput) u32 {
             const ids = engine.codec.turnTokens(
                 engine.gpa,
                 .open_first,
-                rendered,
+                input.rendered,
+                input.plain,
                 false,
             ) catch return 0;
             defer engine.gpa.free(ids);
@@ -569,12 +580,12 @@ fn HttpTasks(comptime Eng: type) type {
             engine: *Eng,
             arena: Allocator,
             code: protocol.ErrorCode,
-            rendered: []const u8,
+            input: TurnInput,
         ) !map.HttpError {
             return switch (code) {
                 .turn_too_long => try map.exceedContextError(
                     arena,
-                    countPrompt(engine, rendered),
+                    countPrompt(engine, input),
                     engine.codec.max_seq,
                 ),
                 .sessions_exhausted, .session_busy => .{

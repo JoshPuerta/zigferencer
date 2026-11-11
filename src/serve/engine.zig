@@ -432,7 +432,10 @@ pub fn acceptNext(listener: *net.Server, io: Io) ?net.Stream {
 pub fn freeRequestText(gpa: Allocator, req: Request) void {
     switch (req.body) {
         .session_open => |m| gpa.free(m.system_prompt),
-        .generate => |m| gpa.free(m.text),
+        .generate => |m| {
+            gpa.free(m.text);
+            gpa.free(m.plain);
+        },
         .session_append => |m| gpa.free(m.bytes),
         else => {},
     }

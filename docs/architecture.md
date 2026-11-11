@@ -1130,6 +1130,7 @@ main -> entry(init, dispatchRelease) -> dispatchOver(argv)   main.zig, cli/comma
     resolve.resolve(.run, flags, card, resources)          engine/resolve.zig: window, KvPlan, RAM quote
     parallel.initPool(policy)                              runtime/parallel.zig: the worker threads
     vocab.buildFromParsed, bpe.encodeAlloc(prompt)         core/tokenizer/: the prompt ids
+      --chat: chat.promptAlloc, bpe.encodePromptAlloc      the prompt text stays plain
     runHost
       CpuRunner(llama_layer).init(loaded, plan, pool)      runtime/cpu_runner.zig: weight views, KV slab
       prefillAndStream(runner, ids)                        cli/run_cmd.zig
@@ -1235,7 +1236,7 @@ reader task: readerLoop(conn)                              serve/server.zig
   toRequest -> Request{ .generate }                        serve/event.zig
   engine.submit(req) -> the request queue                  serve/engine.zig
 engine thread: scheduler.handle(req) -> handleGenerate     serve/scheduler.zig
-  codec.turnTokens: the chat wrap, bpe.encodeAlloc
+  codec.turnTokens: chat.prompt*Alloc, bpe.encodePromptAlloc  request text stays plain
   startPrefill(slot, tokens) -> tryRestorePrefix           the prefix cache
 engine thread, each tick: scheduler.tick -> runComposedStep
   pick the decode rows and one prompt chunk
@@ -1254,7 +1255,7 @@ writer task: take an event -> writeEvent -> protocol.encodeServerMsg -> a zmtp f
 acceptorTask -> HttpAdapter.onAccept                       serve/openai/http_server.zig: one task for each connection
   serveConn: receiveHead -> handleRequest -> handleChat
     map.parseChatRequest(body) -> messages, stream, sampling    serve/openai/map.zig
-    chat.wrapMessagesAlloc(messages) -> the prompt text    core/chat.zig
+    chat.promptMessagesAlloc(messages) -> text, plain ranges  core/chat.zig
     openSession -> submit(.session_open), wait for session_opened
     streamChat -> runTurn -> submit(.generate)
       the engine runs the turn as on the binary frontend

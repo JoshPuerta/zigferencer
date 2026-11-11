@@ -474,10 +474,12 @@ const FakeCodec = struct {
         gpa: Allocator,
         turn: event.TurnKind,
         text: []const u8,
+        plain: []const chat.PlainRange,
         open: bool,
     ) ![]u32 {
         _ = self;
         _ = turn;
+        _ = plain;
         _ = open;
         const ids = try gpa.alloc(u32, text.len);
         for (text, 0..) |b, i| {

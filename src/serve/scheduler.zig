@@ -472,6 +472,7 @@ pub fn Scheduler(comptime Engine: type, comptime CodecT: type) type {
                 .session_clone => |m| self.handleClone(req, m.sampling, sink),
                 .generate => |m| {
                     defer self.gpa.free(m.text);
+                    defer self.gpa.free(m.plain);
 
                     self.handleGenerate(req, m, sink);
                 },
@@ -748,6 +749,7 @@ pub fn Scheduler(comptime Engine: type, comptime CodecT: type) type {
                 self.gpa,
                 .system,
                 system_prompt,
+                &.{},
                 self.cfg.think.open_default,
             ) catch {
                 self.dropSlot(slot);
@@ -855,7 +857,7 @@ pub fn Scheduler(comptime Engine: type, comptime CodecT: type) type {
             if (m.reseed) std.debug.assert(m.sampling != null);
 
             // Encode the turn, with any carried token first.
-            const tokens = self.encodeTurn(req, slot, m.text, open, sink) orelse return;
+            const tokens = self.encodeTurn(req, slot, m.text, m.plain, open, sink) orelse return;
 
             // Every refusal is behind, so a refused turn leaves the sampler
             // of the session unchanged.
@@ -897,11 +899,12 @@ pub fn Scheduler(comptime Engine: type, comptime CodecT: type) type {
             req: Request,
             slot: *Slot,
             text: []const u8,
+            plain: []const chat.PlainRange,
             open: bool,
             sink: anytype,
         ) ?[]u32 {
             const turn = turnKind(slot.has_system_prompt, slot.turns_done);
-            const encoded = self.codec.turnTokens(self.gpa, turn, text, open) catch {
+            const encoded = self.codec.turnTokens(self.gpa, turn, text, plain, open) catch {
                 self.refuse(req, sink, .internal, "tokenize failed");
                 return null;
             };
@@ -2741,8 +2744,10 @@ const FakeCodec = struct {
         gpa: Allocator,
         turn: event.TurnKind,
         text: []const u8,
+        plain: []const chat.PlainRange,
         open: bool,
     ) ![]u32 {
+        _ = plain;
         if (self.kinds) |k| {
             k.add(turn);
         }

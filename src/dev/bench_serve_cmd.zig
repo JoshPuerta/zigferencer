@@ -224,7 +224,7 @@ pub fn run(ctx: context.Context) !void {
         try textOfTokens(ctx.arena, &v, flags.prompt, n)
     else
         flags.prompt;
-    const prompt_tokens = (try bpe.encodeAlloc(&v, ctx.arena, prompt, true)).len;
+    const prompt_tokens = (try plainIds(ctx.arena, &v, prompt, true)).len;
 
     const w = &ctx.stdout.interface;
     try printIntro(w, model.pub_name, policy, prompt_tokens, flags.max_tokens);
@@ -275,17 +275,28 @@ fn checkFlags(io: Io, flags: *const Flags) !void {
     }
 }
 
+/// The ids of `text` as the server encodes request text, as plain text with no special token.
+fn plainIds(
+    arena: Allocator,
+    v: *const vocab_mod.Vocab,
+    text: []const u8,
+    sequence_start: bool,
+) ![]u32 {
+    const whole: []const bpe.PlainRange = &.{.{ .start = 0, .end = text.len }};
+    return bpe.encodePromptAlloc(v, arena, text, whole, sequence_start);
+}
+
 /// A text that the server encodes to `n` tokens: `seed` repeated, then cut at a token. A cut can
 /// move a token boundary, so the text encodes once more, and a miss fails the bench, because a
 /// wrong prompt length is not the measurement.
 fn textOfTokens(arena: Allocator, v: *const vocab_mod.Vocab, seed: []const u8, n: u32) ![]const u8 {
     std.debug.assert(n >= 1);
 
-    const seed_tokens = (try bpe.encodeAlloc(v, arena, seed, false)).len;
+    const seed_tokens = (try plainIds(arena, v, seed, false)).len;
     if (seed_tokens == 0) return error.EmptyPrompt;
 
     // Repeat past `n` tokens, and leave room for the start of the sequence.
-    const start_tokens: u32 = @intCast((try bpe.encodeAlloc(v, arena, "", true)).len);
+    const start_tokens: u32 = @intCast((try plainIds(arena, v, "", true)).len);
     if (n <= start_tokens) return error.PromptTokensMissed;
 
     const repeats = n / seed_tokens + 2;
@@ -295,12 +306,12 @@ fn textOfTokens(arena: Allocator, v: *const vocab_mod.Vocab, seed: []const u8, n
         try long.append(arena, ' ');
     }
 
-    const ids = try bpe.encodeAlloc(v, arena, long.items, false);
+    const ids = try plainIds(arena, v, long.items, false);
     const keep = n - start_tokens;
     if (ids.len < keep) return error.PromptTokensMissed;
 
     const text = try bpe.decodeAlloc(v, arena, ids[0..keep]);
-    const back = try bpe.encodeAlloc(v, arena, text, true);
+    const back = try plainIds(arena, v, text, true);
     if (back.len != n) return error.PromptTokensMissed;
 
     return text;
@@ -729,7 +740,7 @@ test "textOfTokens: the server encoding of the text holds the asked count" {
         var v = try vocab_mod.buildFromParsed(arena, loaded.parsed);
         for ([_]u32{ 2, 16, 512 }) |n| {
             const text = try textOfTokens(arena, &v, seed, n);
-            const ids = try bpe.encodeAlloc(&v, arena, text, true);
+            const ids = try plainIds(arena, &v, text, true);
             try std.testing.expectEqual(@as(usize, n), ids.len);
         }
     }

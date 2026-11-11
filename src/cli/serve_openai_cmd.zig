@@ -12,7 +12,6 @@ const args = @import("args.zig");
 const flags_mod = @import("flag_groups.zig");
 const codec_parts = @import("boot/codec_parts.zig");
 const serve_boot = @import("boot/serve_boot.zig");
-const chat = @import("../core/chat.zig");
 const limits = @import("../core/limits.zig");
 const http_server = @import("../serve/openai/http_server.zig");
 const map = @import("../serve/openai/map.zig");
@@ -63,18 +62,6 @@ const OpenAiLauncher = struct {
             defaults, codec.defaults.think.temperature, codec.defaults.plain.temperature,
         });
 
-        // Wrap each preload text into a system block, so it tokenizes to the prefix of a
-        // conversation that opens with that system message. `RawCodec` encodes raw text.
-        var cfg = sched_cfg;
-        if (cfg.cache.preload.len > 0) {
-            const wrapped = try ctx.arena.alloc([]const u8, cfg.cache.preload.len);
-            for (cfg.cache.preload, wrapped) |raw, *w| {
-                w.* = try chat.wrapSystemAlloc(ctx.arena, parts.kind, raw);
-            }
-
-            cfg.cache.preload = wrapped;
-        }
-
         // Bind, announce, and run.
         var server = try http_server.Server(EngineT).init(
             ctx.arena,
@@ -82,7 +69,7 @@ const OpenAiLauncher = struct {
             ctx.io,
             engine,
             &codec,
-            cfg,
+            sched_cfg,
             .{ .tcp = .{ .host = self.host, .port = self.port } },
         );
         try serve_boot.printReadyTcp(&ctx.stdout.interface, server.boundAddress());

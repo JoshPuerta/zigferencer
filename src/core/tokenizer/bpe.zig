@@ -7,6 +7,12 @@
 //! `pending` through `vocab.byte_to_id[b]`. The flush at the end repeatedly merges the lowest-rank
 //! adjacent pair until none remain.
 //!
+//! Plain ranges. `encodePromptAlloc` takes the byte ranges of the text that came from a request. A
+//! special token matches only when its whole span lies outside every plain range, so request text
+//! encodes as ordinary bytes. With no range, the cursor matches exactly what `matchSpecial`
+//! matches, and `encodeAlloc` is that case. A merge or a whole pre-token never yields a special
+//! id, so a special id comes only from a match.
+//!
 //! Decode. It concatenates the bytes of each token, walking codepoint by codepoint to undo the
 //! GPT-2 byte-level mapping.
 //!
@@ -40,7 +46,37 @@ const Vocab = vocab_mod.Vocab;
 
 pub const EncodeError = error{UntokenizableByte} || Allocator.Error;
 
+/// A byte range `[start, end)` of a text in which no special token can match.
+pub const PlainRange = struct { start: usize, end: usize };
+
 const Match = struct { id: u32, len: usize };
+
+/// The cursor of one encode over its plain ranges. The position of a call never decreases, so
+/// the cursor passes each range once.
+const Specials = struct {
+    plain: []const PlainRange,
+    next: usize = 0,
+
+    /// The longest special token at `pos` whose span lies outside every plain range.
+    fn match(self: *Specials, vocab: *const Vocab, text: []const u8, pos: usize) ?Match {
+        std.debug.assert(pos < text.len);
+
+        while (self.next < self.plain.len) : (self.next += 1) {
+            const r = self.plain[self.next];
+            if (r.start < r.end and r.end > pos) break;
+        }
+
+        if (self.next == self.plain.len) return matchSpecial(vocab, text, pos);
+
+        // A special must end at or before the start of the next plain range.
+        const r = self.plain[self.next];
+        if (r.start <= pos) return null;
+
+        const m = matchSpecial(vocab, text[0..r.start], pos) orelse return null;
+        std.debug.assert(pos + m.len <= r.start);
+        return m;
+    }
+};
 
 const CpClass = struct { letter: bool, number: bool, whitespace: bool, cr_or_lf: bool };
 
@@ -57,13 +93,32 @@ pub fn encodeAlloc(
     text: []const u8,
     sequence_start: bool,
 ) EncodeError![]u32 {
+    return encodePromptAlloc(vocab, gpa, text, &.{}, sequence_start);
+}
+
+/// Encode `text` to token ids, and match no special token that touches a plain range. The ranges
+/// must be sorted and disjoint. With no range, every special that `matchSpecial` finds matches.
+pub fn encodePromptAlloc(
+    vocab: *const Vocab,
+    gpa: Allocator,
+    text: []const u8,
+    plain: []const PlainRange,
+    sequence_start: bool,
+) EncodeError![]u32 {
     const sp = span.begin(.tokenize);
     defer sp.end();
 
     std.debug.assert(vocab.tokens.len > 0);
+    for (plain, 0..) |r, i| {
+        std.debug.assert(r.start <= r.end);
+        std.debug.assert(r.end <= text.len);
+        if (i > 0) std.debug.assert(plain[i - 1].end <= r.start);
+    }
+
     // Take the pre-split path for a non-default tokenizer.
+    var specials: Specials = .{ .plain = plain };
     if (vocab.pre != .default) {
-        const pre_ids = try encodePreSplit(vocab, gpa, text, sequence_start);
+        const pre_ids = try encodePreSplit(vocab, gpa, text, &specials, sequence_start);
         if (std.debug.runtime_safety) {
             for (pre_ids) |id| {
                 std.debug.assert(id < vocab.tokens.len);
@@ -86,7 +141,7 @@ pub fn encodeAlloc(
 
     var pos: usize = 0;
     while (pos < text.len) {
-        const matched = matchSpecial(vocab, text, pos);
+        const matched = specials.match(vocab, text, pos);
         if (matched) |m| {
             try flushSegment(vocab, gpa, &pending, &ids);
             try ids.append(gpa, m.id);
@@ -213,6 +268,7 @@ fn encodePreSplit(
     vocab: *const Vocab,
     gpa: Allocator,
     text: []const u8,
+    specials: *Specials,
     sequence_start: bool,
 ) EncodeError![]u32 {
     // Open the output with the BOS token.
@@ -232,13 +288,13 @@ fn encodePreSplit(
     // Walk the text one pre-token at a time.
     var pos: usize = 0;
     while (pos < text.len) {
-        if (matchSpecial(vocab, text, pos)) |m| {
+        if (specials.match(vocab, text, pos)) |m| {
             try ids.append(gpa, m.id);
             pos += m.len;
             continue;
         }
 
-        const seg = capAtSpecial(vocab, text, pos, preTokenLen(vocab, text, pos));
+        const seg = capAtSpecial(vocab, text, specials.*, pos, preTokenLen(vocab, text, pos));
         const bytes = text[pos..][0..seg];
 
         // Emit a whole pre-token that the vocabulary holds.
@@ -248,8 +304,10 @@ fn encodePreSplit(
                 try mapped.appendSlice(gpa, vocab_mod.byteLevel(b));
             }
 
-            if (vocab.token_to_id.get(mapped.items)) |id| {
-                try ids.append(gpa, id);
+            // A special spelled by a pre-token can come only from a plain range, so it stays bytes.
+            const hit = vocab.token_to_id.get(mapped.items);
+            if (hit != null and !vocab.is_special[hit.?]) {
+                try ids.append(gpa, hit.?);
                 pos += seg;
                 continue;
             }
@@ -269,12 +327,20 @@ fn encodePreSplit(
     return ids.toOwnedSlice(gpa);
 }
 
-/// The pre-token length `seg`, cut at the first special that starts strictly inside it.
-fn capAtSpecial(vocab: *const Vocab, text: []const u8, from: usize, seg: usize) usize {
+/// The pre-token length `seg`, cut at the first special that starts strictly inside it. The
+/// cursor is a copy, so the scan ahead leaves the cursor of the caller at `from`.
+fn capAtSpecial(
+    vocab: *const Vocab,
+    text: []const u8,
+    specials: Specials,
+    from: usize,
+    seg: usize,
+) usize {
+    var ahead = specials;
     var q = from + 1;
     const end = from + seg;
     while (q < end) : (q += 1) {
-        if (matchSpecial(vocab, text, q) != null) return q - from;
+        if (ahead.match(vocab, text, q) != null) return q - from;
     }
 
     return seg;
@@ -499,7 +565,8 @@ const parser = @import("../../io/gguf/parser.zig");
 const prop = @import("../prop.zig");
 
 /// The merges of the synthetic vocab, in rank order, as byte-level strings. They cover letters, a
-/// leading space (U+0120), digits, the two bytes of U+00E9, and a newline pair (U+010A).
+/// leading space (U+0120), digits, the two bytes of U+00E9, and a newline pair (U+010A). The last
+/// merge spells the special `<s`, so it adds no token of its own.
 const test_merges = [_][]const u8{
     "a b",
     "ab ab",
@@ -508,10 +575,21 @@ const test_merges = [_][]const u8{
     "1 2",
     "\u{C3} \u{A9}",
     "\u{10A} \u{10A}",
+    "< s",
 };
-const test_specials = [_][]const u8{ "<|s|>", "<think>" };
+const test_merge_tokens = test_merges.len - 1;
 
-/// A vocab of the 256 byte-level characters, one token per merge, and two
+/// Longest first, as the naive model reads them. `<|s` is a prefix of `<|s|>`, and `<s` is one
+/// pre-token under the llama rules.
+const test_specials = [_][]const u8{ "<think>", "<|s|>", "<|s", "<s" };
+const test_special_types = [_]i32{ 4, 3, 3, 3 };
+
+fn testSpecialId(i: usize) u32 {
+    std.debug.assert(i < test_specials.len);
+    return @intCast(256 + test_merge_tokens + i);
+}
+
+/// A vocab of the 256 byte-level characters, one token per merge, and the
 /// specials, built through the GGUF key path with no model file.
 fn testVocab(arena: Allocator, pre: []const u8) !Vocab {
     var tokens: std.ArrayList([]const u8) = .empty;
@@ -532,13 +610,13 @@ fn testVocab(arena: Allocator, pre: []const u8) !Vocab {
         try types.append(arena, 1);
     }
 
-    for (test_merges) |m| {
+    for (test_merges[0..test_merge_tokens]) |m| {
         const space = std.mem.findScalar(u8, m, ' ').?;
         try tokens.append(arena, try std.mem.concat(arena, u8, &.{ m[0..space], m[space + 1 ..] }));
         try types.append(arena, 1);
     }
 
-    for (test_specials, [_]i32{ 3, 4 }) |s, t| {
+    for (test_specials, test_special_types) |s, t| {
         try tokens.append(arena, s);
         try types.append(arena, t);
     }
@@ -558,6 +636,16 @@ fn testVocab(arena: Allocator, pre: []const u8) !Vocab {
 
 const TestVocabs = [4]Vocab;
 
+/// The synthetic vocab under each pre-split family, in the order of `PreType`.
+fn testVocabs(arena: Allocator) !TestVocabs {
+    var vocabs: TestVocabs = undefined;
+    for (&vocabs, [_][]const u8{ "", "llama-bpe", "qwen2", "smollm" }) |*vocab, pre| {
+        vocab.* = try testVocab(arena, pre);
+    }
+
+    return vocabs;
+}
+
 /// Text pieces that hit the merges, the specials, the pre-split classes, and
 /// invalid UTF-8: a lone lead byte, a cut 3-byte sequence, and 0xFF.
 const test_pieces = [_][]const u8{
@@ -574,6 +662,7 @@ const test_pieces = [_][]const u8{
     "<|s|>",
     "<think>",
     "<|s",
+    "<s",
     "'s",
     "\t",
     "!",
@@ -624,15 +713,11 @@ test "property: decode(encode(s)) == s over random byte strings for every pre-sp
     var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena_state.deinit();
 
-    const arena = arena_state.allocator();
-    var vocabs: TestVocabs = undefined;
-    for (&vocabs, [_][]const u8{ "", "llama-bpe", "qwen2", "smollm" }) |*vocab, pre| {
-        vocab.* = try testVocab(arena, pre);
-    }
+    const vocabs = try testVocabs(arena_state.allocator());
 
     for (vocabs, [_]vocab_mod.PreType{ .default, .llama3, .qwen, .smollm }) |vocab, pre| {
         try std.testing.expectEqual(pre, vocab.pre);
-        try std.testing.expectEqual(@as(usize, 2), vocab.specials_sorted.len);
+        try std.testing.expectEqual(test_specials.len, vocab.specials_sorted.len);
         for (vocab.byte_to_id) |id| {
             try std.testing.expect(id != vocab_mod.no_token);
         }
@@ -693,6 +778,7 @@ fn naiveId(table: *const [256]ByteLevel, symbol: []const u8) u32 {
         if (symbol.len == left.len + right.len and
             std.mem.startsWith(u8, symbol, left) and std.mem.endsWith(u8, symbol, right))
         {
+            std.debug.assert(rank < test_merge_tokens);
             return @intCast(256 + rank);
         }
     }
@@ -747,7 +833,7 @@ fn naiveEncode(arena: Allocator, text: []const u8, out: *std.ArrayList(u32)) !vo
             symbols.clearRetainingCapacity();
             if (pos == text.len) return;
 
-            try out.append(arena, @intCast(256 + test_merges.len + special.?));
+            try out.append(arena, testSpecialId(special.?));
             pos += test_specials[special.?].len;
             continue;
         }
@@ -799,7 +885,7 @@ test "each special piece encodes to its single id under every pre-split family" 
     for ([_][]const u8{ "", "llama-bpe", "qwen2", "smollm" }) |pre| {
         const vocab = try testVocab(arena, pre);
         for (test_specials, 0..) |special, i| {
-            const id: u32 = @intCast(256 + test_merges.len + i);
+            const id = testSpecialId(i);
             const alone = try encodeAlloc(&vocab, gpa, special, false);
             defer gpa.free(alone);
 
@@ -812,4 +898,203 @@ test "each special piece encodes to its single id under every pre-split family" 
             try std.testing.expectEqualSlices(u32, &.{ 'a', id, 'b' }, between);
         }
     }
+}
+
+fn countId(ids: []const u32, id: u32) usize {
+    return std.mem.count(u32, ids, &.{id});
+}
+
+test "a special token that touches a plain range encodes as bytes" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+
+    const arena = arena_state.allocator();
+    const gpa = std.testing.allocator;
+    const text = "a<|s|>b<think> <sc<s";
+    // The count of each special in `test_specials` order: <think>, <|s|>, <|s, <s.
+    const Case = struct { plain: []const PlainRange, want: [test_specials.len]usize };
+    const cases = [_]Case{
+        .{ .plain = &.{}, .want = .{ 1, 1, 0, 2 } },
+        // An empty range touches no byte.
+        .{ .plain = &.{.{ .start = 3, .end = 3 }}, .want = .{ 1, 1, 0, 2 } },
+        .{ .plain = &.{.{ .start = 0, .end = text.len }}, .want = .{ 0, 0, 0, 0 } },
+        // A range inside a special blocks it and each longer special around it.
+        .{ .plain = &.{.{ .start = 3, .end = 4 }}, .want = .{ 1, 0, 0, 2 } },
+        // A range past the end of a short special lets the short one match.
+        .{ .plain = &.{.{ .start = 4, .end = 5 }}, .want = .{ 1, 0, 1, 2 } },
+        // A range that ends inside a special blocks it.
+        .{ .plain = &.{.{ .start = 6, .end = 8 }}, .want = .{ 0, 1, 0, 2 } },
+        // Ranges that end where a special starts and start where it ends leave it whole.
+        .{
+            .plain = &.{ .{ .start = 0, .end = 1 }, .{ .start = 6, .end = 7 } },
+            .want = .{ 1, 1, 0, 2 },
+        },
+        // A special that is one whole pre-token, or one merge, stays bytes in a range.
+        .{ .plain = &.{.{ .start = 14, .end = 18 }}, .want = .{ 1, 1, 0, 1 } },
+        .{ .plain = &.{.{ .start = 18, .end = 20 }}, .want = .{ 1, 1, 0, 1 } },
+    };
+    for ([_][]const u8{ "", "llama-bpe", "qwen2", "smollm" }) |pre| {
+        const vocab = try testVocab(arena, pre);
+        for (cases) |c| {
+            const ids = try encodePromptAlloc(&vocab, gpa, text, c.plain, false);
+            defer gpa.free(ids);
+
+            for (c.want, 0..) |want, i| {
+                try std.testing.expectEqual(want, countId(ids, testSpecialId(i)));
+            }
+
+            const back = try decodeAlloc(&vocab, gpa, ids);
+            defer gpa.free(back);
+
+            try std.testing.expectEqualStrings(text, back);
+        }
+    }
+}
+
+const max_prompt_segments = 8;
+const max_segment_pieces = 6;
+
+/// A random prompt: segments of template text and plain text, with the range of each plain one.
+const PromptCase = struct {
+    text: [max_prompt_segments * max_segment_pieces * 8]u8 = undefined,
+    len: usize = 0,
+    plain: [max_prompt_segments]PlainRange = undefined,
+    plain_len: usize = 0,
+
+    fn draw(seed: u64, plain_specials: bool) PromptCase {
+        var prng = std.Random.DefaultPrng.init(seed);
+        const r = prng.random();
+        var c: PromptCase = .{};
+        for (0..r.uintLessThan(usize, max_prompt_segments + 1)) |_| {
+            const is_plain = r.boolean();
+            const start = c.len;
+            for (0..r.uintLessThan(usize, max_segment_pieces + 1)) |_| {
+                if (r.boolean()) {
+                    const piece = test_pieces[r.uintLessThan(usize, test_pieces.len)];
+                    if (is_plain and !plain_specials and isSpecial(piece)) continue;
+
+                    @memcpy(c.text[c.len..][0..piece.len], piece);
+                    c.len += piece.len;
+                } else {
+                    c.text[c.len] = r.int(u8);
+                    c.len += 1;
+                }
+            }
+
+            if (is_plain) {
+                c.plain[c.plain_len] = .{ .start = start, .end = c.len };
+                c.plain_len += 1;
+            }
+        }
+
+        return c;
+    }
+
+    /// True when some special string overlaps a plain range, so the two encodes can differ.
+    fn touched(c: *const PromptCase) bool {
+        for (test_specials) |sp| {
+            var at: usize = 0;
+            while (std.mem.findPos(u8, c.text[0..c.len], at, sp)) |i| : (at = i + 1) {
+                for (c.plain[0..c.plain_len]) |r| {
+                    if (r.start < r.end and r.start < i + sp.len and i < r.end) return true;
+                }
+            }
+        }
+
+        return false;
+    }
+};
+
+fn isSpecial(piece: []const u8) bool {
+    for (test_specials) |sp| {
+        if (std.mem.eql(u8, sp, piece)) return true;
+    }
+
+    return false;
+}
+
+/// With no special string in or across a plain range, the prompt encode equals `encodeAlloc`.
+fn checkPromptEqualsPlainEncode(vocabs: *const TestVocabs, seed: u64) anyerror!void {
+    const c = PromptCase.draw(seed, false);
+    if (c.touched()) return;
+
+    const gpa = std.testing.allocator;
+    for (vocabs) |*vocab| {
+        const want = try encodeAlloc(vocab, gpa, c.text[0..c.len], true);
+        defer gpa.free(want);
+
+        const plain = c.plain[0..c.plain_len];
+        const got = try encodePromptAlloc(vocab, gpa, c.text[0..c.len], plain, true);
+        defer gpa.free(got);
+
+        try std.testing.expectEqualSlices(u32, want, got);
+    }
+}
+
+/// Every special id of a prompt encode spans bytes outside every plain range, and the ids decode
+/// to the text.
+fn checkPromptPlainHoldsNoSpecial(vocabs: *const TestVocabs, seed: u64) anyerror!void {
+    const c = PromptCase.draw(seed, true);
+    const text = c.text[0..c.len];
+    const gpa = std.testing.allocator;
+    for (vocabs) |*vocab| {
+        const ids = try encodePromptAlloc(vocab, gpa, text, c.plain[0..c.plain_len], false);
+        defer gpa.free(ids);
+
+        const back = try decodeAlloc(vocab, gpa, ids);
+        defer gpa.free(back);
+
+        try std.testing.expectEqualSlices(u8, text, back);
+
+        // Walk the ids with their byte offsets in the text.
+        var at: usize = 0;
+        for (ids) |id| {
+            const bytes = try decodeAlloc(vocab, gpa, &.{id});
+            defer gpa.free(bytes);
+
+            const is_special = for (vocab.specials_sorted) |sp| {
+                if (sp.id == id) break true;
+            } else false;
+            if (is_special) {
+                for (c.plain[0..c.plain_len]) |r| {
+                    try std.testing.expect(r.start == r.end or at + bytes.len <= r.start or
+                        r.end <= at);
+                }
+            }
+
+            at += bytes.len;
+        }
+
+        try std.testing.expectEqual(text.len, at);
+    }
+}
+
+test "property: a prompt with no special in a plain range encodes as encodeAlloc does" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+
+    const vocabs = try testVocabs(arena_state.allocator());
+
+    try prop.forAll(
+        .{ .site = 0xB9E0_0003, .cases = 600 },
+        @as(*const TestVocabs, &vocabs),
+        u64,
+        prop.genSeed(*const TestVocabs),
+        checkPromptEqualsPlainEncode,
+    );
+}
+
+test "property: no special id comes from a plain range, and the ids decode to the text" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+
+    const vocabs = try testVocabs(arena_state.allocator());
+
+    try prop.forAll(
+        .{ .site = 0xB9E0_0004, .cases = 600 },
+        @as(*const TestVocabs, &vocabs),
+        u64,
+        prop.genSeed(*const TestVocabs),
+        checkPromptPlainHoldsNoSpecial,
+    );
 }

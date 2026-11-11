@@ -22,7 +22,7 @@ the host details from `/proc`, and `registry.locate` checks a path on disk.
 | `op_requires.zig` | What a backend needs from the target, and its tolerance. |
 | `hwinfo.zig` | The host hardware card. |
 | `registry.zig` | The table of known models and the paths of the model store. |
-| `chat.zig` | The chat wrap of each model family. |
+| `chat.zig` | The chat wrap of each model family, as a `Prompt` with its plain ranges. |
 | `log.zig` | The process log, gated at run time. |
 | `span.zig` | The trace sites, the per-thread span logs, and the flush. |
 | `trace_file.zig` | The layout of the trace: names, tracks, slices, flows, and args. |

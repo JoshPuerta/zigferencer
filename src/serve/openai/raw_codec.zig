@@ -1,6 +1,12 @@
-//! The OpenAI frontend's codec: the scheduler's text-to-token boundary, without chat scaffolding.
-//! The HTTP map already rendered the whole conversation with `chat.wrapMessagesAlloc`, so this
-//! only tokenizes (BOS on the prefill turn).
+//! The OpenAI frontend's codec: the scheduler's text-to-token boundary. The HTTP task already
+//! rendered the whole conversation with `chat.promptMessagesAlloc`, so a turn only tokenizes, with
+//! BOS on the prefill turn. The plain ranges of the render ride with the text, so the request text
+//! encodes as plain text.
+//!
+//! System text. A session opens with no system text, except for a `--preload` text. The codec
+//! wraps that text in the system block itself. For a template kind, a control token follows the
+//! block in a live request, so no merge crosses its end, and its ids are a prefix of a live request
+//! that opens with the same system message. Kind `none` has no such token, so this can fail there.
 //!
 //! Model view. The codec is the frontend's whole view of the model. It carries the vocab, the
 //! pieces, and the metadata that the HTTP task needs: id, kind, think tags, and budgets.
@@ -20,7 +26,7 @@ pub const RawCodec = struct {
     vocab: *const vocab_mod.Vocab,
     pieces: []const []const u8,
     eos_id: u32,
-    kind: chat.Kind, // for the HTTP map's wrapMessagesAlloc
+    kind: chat.Kind, // for the render of the HTTP task and the system block
     /// The think tags of a `chatml_qwen` kind, null for every other kind.
     think_ids: ?chat.ThinkIds,
     model_id: []const u8, // for response JSON + /v1/models
@@ -31,18 +37,27 @@ pub const RawCodec = struct {
     /// True when the scheduler holds a forced think close, so a budget above 0 can close the block.
     think_forced_close: bool = false,
 
-    /// Tokenize a turn's text without a chat wrap. The map rendered the wrap and the think tail,
-    /// so `open` changes nothing. The vocab BOS opens the prefill turn.
+    /// Tokenize a turn's text. A `system` text gets the system block. Any other text is a render
+    /// with its plain ranges, so `open` changes nothing. The vocab BOS opens the prefill turn.
     pub fn turnTokens(
         self: *const RawCodec,
         gpa: Allocator,
         turn: event.TurnKind,
         text: []const u8,
+        plain: []const chat.PlainRange,
         open: bool,
     ) ![]u32 {
         _ = open;
         const sequence_start = turn == .system or turn == .open_first;
-        return bpe.encodeAlloc(self.vocab, gpa, text, sequence_start);
+        if (turn != .system) {
+            return bpe.encodePromptAlloc(self.vocab, gpa, text, plain, sequence_start);
+        }
+
+        std.debug.assert(plain.len == 0);
+        const prompt = try chat.promptSystemAlloc(gpa, self.kind, text);
+        defer gpa.free(prompt.text);
+
+        return bpe.encodePromptAlloc(self.vocab, gpa, prompt.text, prompt.plain(), sequence_start);
     }
 
     pub fn pairTokens(

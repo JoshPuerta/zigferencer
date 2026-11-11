@@ -65,12 +65,10 @@ pub fn promptIds(b: *const Bench, v: *const vocab_mod.Vocab, max_seq: u32) ![]co
         try common.requireSequenceFits(ctx.io, n, opt.max_tokens, max_seq);
         break :blk try common.synthPromptIds(ctx.arena, n, b.loaded.card.vocab_size);
     } else blk: {
-        const text = if (opt.chat)
-            try chat_mod.wrapAlloc(ctx.arena, b.model.chat_template_kind, opt.prompt)
-        else
-            opt.prompt;
+        if (!opt.chat) break :blk try bpe.encodeAlloc(v, ctx.arena, opt.prompt, true);
 
-        break :blk try bpe.encodeAlloc(v, ctx.arena, text, true);
+        const p = try chat_mod.promptAlloc(ctx.arena, b.model.chat_template_kind, opt.prompt);
+        break :blk try bpe.encodePromptAlloc(v, ctx.arena, p.text, p.plain(), true);
     };
 
     if (ids.len == 0) {

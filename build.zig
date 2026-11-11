@@ -134,6 +134,7 @@ const cpu_integration_tests = [_][]const u8{
     "tests/tokenizer_smollm2_test.zig",
     "tests/tokenizer_llama3_test.zig",
     "tests/tokenizer_qwen_test.zig",
+    "tests/chat_prompt_test.zig",
     "tests/snapshot_smollm2_test.zig",
     "tests/llama_session_equivalence_test.zig",
     "tests/llama_prefix_runner_test.zig",

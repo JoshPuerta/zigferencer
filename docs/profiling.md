@@ -215,7 +215,7 @@ Every span compiles only under `-Dtrace=true`.
 | Span | Where |
 | --- | --- |
 | `model_load` | `loader.loadWith` |
-| `tokenize` | `bpe.encodeAlloc` |
+| `tokenize` | `bpe.encodePromptAlloc`, which `bpe.encodeAlloc` calls |
 | `prefill_chunk` | one prefill chunk of `run` and `bench-model` |
 | `decode_step` | one runner step of the decode loop |
 | `sample` | one sampler pick |

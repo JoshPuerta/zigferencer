@@ -100,6 +100,8 @@ pub const Vocab = struct {
     codepoint_to_byte: std.AutoHashMap(u21, u8),
     /// Special tokens sorted by length DESC for longest-first greedy match.
     specials_sorted: []const Special,
+    /// id -> true for a control or user-defined token, the tokens in `specials_sorted`.
+    is_special: []const bool,
 
     bos_id: u32,
     eos_id: u32,
@@ -211,6 +213,9 @@ pub fn buildFromParsed(arena: Allocator, p: parser.Parsed) Error!Vocab {
         @memcpy(key_buf[0..left_str.len], left_str);
         @memcpy(key_buf[left_str.len..total], right_str);
         const merged_id = string_to_id.get(key_buf[0..total]) orelse return invalidMerge(rank);
+        // A merge never makes a special. Outside a plain range the encoder matches the special
+        // before any merge, so only a plain range can reach such a merge, and it must stay bytes.
+        if (is_special[merged_id]) continue;
 
         const key = pairKey(left_id, right_id);
         merge_rank.putAssumeCapacity(key, @intCast(rank));
@@ -258,6 +263,7 @@ pub fn buildFromParsed(arena: Allocator, p: parser.Parsed) Error!Vocab {
         .byte_to_id = byte_to_id,
         .codepoint_to_byte = codepoint_to_byte,
         .specials_sorted = specials,
+        .is_special = is_special,
         .bos_id = bos,
         .eos_id = eos,
         .add_bos = add_bos,

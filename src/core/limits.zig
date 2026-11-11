@@ -246,7 +246,9 @@ pub const max_append_pairs: u16 = 64;
 pub const openai_max_request_bytes: usize = 256 * 1024; // POST body cap (413 past it)
 
 pub const openai_max_header_bytes: usize = 16 * 1024; // http.Server head buffer (431 past it)
-pub const openai_max_messages: usize = 64; // messages[] length cap
+/// The most messages in one rendered conversation. A render holds one plain range per message.
+pub const max_chat_messages: usize = 64;
+pub const openai_max_messages: usize = max_chat_messages; // messages[] length cap
 
 /// The `max_tokens` of a request that omits it. 0 is the whole window.
 pub const openai_default_max_tokens: u32 = 0;

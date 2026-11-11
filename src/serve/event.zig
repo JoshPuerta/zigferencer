@@ -47,6 +47,9 @@ pub const Request = struct {
             max_tokens: u32,
             sampling: ?protocol.Sampling,
             text: []u8,
+            /// The byte ranges of `text` that came from a request, for a text that a frontend
+            /// rendered. The reader dupes them into the gpa with the text.
+            plain: []const chat.PlainRange = &.{},
             /// Whether the turn opens inside the think block. Null takes the server-wide mode.
             think_open: ?bool = null,
             /// Think tokens before the forced close, 0 unbounded. Null takes the server value.
@@ -207,26 +210,37 @@ pub const Codec = struct {
         gpa: Allocator,
         turn: TurnKind,
         text: []const u8,
+        plain: []const chat.PlainRange,
         open: bool,
     ) ![]u32 {
+        // The binary reader passes the raw text of a client, never a rendered one.
+        std.debug.assert(plain.len == 0);
+
         const kind = renderKind(self.kind, open);
-        const wrapped = switch (turn) {
-            .system => try chat.wrapSystemAlloc(gpa, kind, text),
-            .open_first => try chat.wrapAlloc(gpa, kind, text),
-            .first_after_system => try chat.wrapFirstTurnAlloc(gpa, kind, text),
-            .continuation => try chat.wrapContinuationAlloc(gpa, kind, text),
+        const prompt = switch (turn) {
+            .system => try chat.promptSystemAlloc(gpa, kind, text),
+            .open_first => try chat.promptAlloc(gpa, kind, text),
+            .first_after_system => try chat.promptFirstTurnAlloc(gpa, kind, text),
+            .continuation => try chat.promptContinuationAlloc(gpa, kind, text),
         };
 
-        defer gpa.free(wrapped);
+        defer gpa.free(prompt.text);
 
         const sequence_start = turn == .system or turn == .open_first;
-        const ids = try bpe.encodeAlloc(self.vocab, gpa, wrapped, sequence_start);
+        const ids = try bpe.encodePromptAlloc(
+            self.vocab,
+            gpa,
+            prompt.text,
+            prompt.plain(),
+            sequence_start,
+        );
         log.debug("encode: {t} turn, {d} B -> {d} tokens", .{ turn, text.len, ids.len });
         return ids;
     }
 
-    /// Tokenize one kept pair at `order`. The user wrap and the reply encode apart, as a live turn
-    /// feeds the wrap and then samples the reply. The caller owns the ids.
+    /// Tokenize one kept pair at `order`, the user wrap and the reply apart. The reply encodes as
+    /// plain text, so a sampled control token in it gets other ids than the live turn sampled.
+    /// The caller owns the ids.
     pub fn pairTokens(
         self: *const Codec,
         gpa: Allocator,
@@ -234,13 +248,15 @@ pub const Codec = struct {
         user: []const u8,
         assistant: []const u8,
     ) ![]u32 {
-        const wrapped = try chat.wrapPairUserAlloc(gpa, self.kind, order, user);
-        defer gpa.free(wrapped);
+        const prompt = try chat.promptPairUserAlloc(gpa, self.kind, order, user);
+        defer gpa.free(prompt.text);
 
-        const head = try bpe.encodeAlloc(self.vocab, gpa, wrapped, order == .open_first);
+        const start = order == .open_first;
+        const head = try bpe.encodePromptAlloc(self.vocab, gpa, prompt.text, prompt.plain(), start);
         defer gpa.free(head);
 
-        const reply = try bpe.encodeAlloc(self.vocab, gpa, assistant, false);
+        const whole: []const chat.PlainRange = &.{.{ .start = 0, .end = assistant.len }};
+        const reply = try bpe.encodePromptAlloc(self.vocab, gpa, assistant, whole, false);
         defer gpa.free(reply);
 
         const ids = try std.mem.concat(gpa, u32, &.{ head, reply });
@@ -287,24 +303,24 @@ test "renderKind: the switch picks the think tail of the turn wrap" {
         for ([_]bool{ true, false }) |open| {
             const kind = renderKind(server, open);
             try std.testing.expectEqual(open, chat.thinkOpen(kind));
-            const want = try chat.wrapFirstTurnAlloc(gpa, if (open) qwen_on else qwen_off, "hi");
-            defer gpa.free(want);
+            const want = try chat.promptFirstTurnAlloc(gpa, if (open) qwen_on else qwen_off, "hi");
+            defer gpa.free(want.text);
 
-            const got = try chat.wrapFirstTurnAlloc(gpa, kind, "hi");
-            defer gpa.free(got);
+            const got = try chat.promptFirstTurnAlloc(gpa, kind, "hi");
+            defer gpa.free(got.text);
 
-            try std.testing.expectEqualStrings(want, got);
+            try std.testing.expectEqualStrings(want.text, got.text);
         }
     }
 
     // The open tail differs from the closed tail, so the switch is visible.
-    const open_text = try chat.wrapContinuationAlloc(gpa, renderKind(qwen_off, true), "x");
-    defer gpa.free(open_text);
+    const open_text = try chat.promptContinuationAlloc(gpa, renderKind(qwen_off, true), "x");
+    defer gpa.free(open_text.text);
 
-    const closed_text = try chat.wrapContinuationAlloc(gpa, renderKind(qwen_on, false), "x");
-    defer gpa.free(closed_text);
+    const closed_text = try chat.promptContinuationAlloc(gpa, renderKind(qwen_on, false), "x");
+    defer gpa.free(closed_text.text);
 
-    try std.testing.expect(!std.mem.eql(u8, open_text, closed_text));
+    try std.testing.expect(!std.mem.eql(u8, open_text.text, closed_text.text));
     // A family with no thinking mode renders one way.
     try std.testing.expectEqual(chat.Kind.chatml_smollm2, renderKind(.chatml_smollm2, false));
     try std.testing.expectEqual(chat.Kind.llama3, renderKind(.llama3, true));

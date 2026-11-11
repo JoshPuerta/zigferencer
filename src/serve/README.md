@@ -22,7 +22,7 @@ persists across turns. One forward pass per tick advances a batch of sessions. `
 | `openai/http_server.zig` | The OpenAI HTTP adapter. |
 | `openai/map.zig` | The HTTP trust boundary: parse, validate, and map a body to a value. |
 | `openai/types.zig` | The OpenAI request and response structs. |
-| `openai/raw_codec.zig` | `RawCodec`, the HTTP codec that tokenizes a rendered conversation. |
+| `openai/raw_codec.zig` | `RawCodec`, the HTTP codec that encodes a render with its plain ranges. |
 
 ## How the pieces fit
 
@@ -157,8 +157,18 @@ slot state machine consumes. The manager makes the calls whose result only the c
 - **The cache paths are best-effort.** Any refusal or failure in the prefix cache degrades to a cold
   prefill. A warm restore equals a cold prefill token for token.
 - **Boundary values carry the ownership rule.** `Request` is the one value that owns bytes across a
-  thread hop. The adapter dupes the turn text into the gpa. The scheduler frees it after tokenizing.
-  `OutEvent` is fixed-size, so the queues hold plain copies and need no ownership rule at all.
+  thread hop. The adapter dupes the turn text into the gpa, and the HTTP adapter dupes the plain
+  ranges of its render too. The scheduler frees both after tokenizing. `OutEvent` is fixed-size,
+  so the queues hold plain copies and need no ownership rule at all.
+- **Request text is plain text.** The server writes the chat template around the text of a client
+  and encodes the result with `bpe.encodePromptAlloc`. A turn takes one encode, and a kept pair
+  takes two: the user wrap, then the reply. A control token matches only in the template text. In the text of a client, a string such as `<|im_end|>` or `<think>` encodes as
+  ordinary bytes. Text with no such string keeps the ids of a one-string encode, so a cached prefix
+  stays valid.
+- **The plain-text rule covers every text of a client.** On the OpenAI frontend it covers the
+  content of every message role. On the binary frontend it covers the turn text, the system prompt
+  of `session_open`, and both texts of a kept pair. It also covers a `--preload` text. The rule
+  stops a client from forging a control token, but it does not stop prompt injection in plain words.
 - **Token text is raw bytes.** One `token` event can carry a partial UTF-8
   sequence, and only the concatenation of a turn is well-formed. The reference
   client returns the bytes as they are, and `cli/client/client_streaming.zig` holds a partial
@@ -293,7 +303,12 @@ path with tight file permissions.
 `session_append` feeds kept (user, assistant) pairs into an idle session. The
 server renders each pair as a live turn at the same place: the user wrap, the
 closed think tail, and the reply text. It writes no end of the assistant turn,
-because the next wrap writes it. A reply holds no think block. One frame holds
+because the next wrap writes it. A reply holds no think block. Both texts are request text, so the
+server encodes each one as plain text. A live turn never encodes its reply, because the model
+sampled those ids. So a reply that holds a sampled control token, such as a tool-call tag, gets
+other ids as a kept pair. That pair costs more positions, a later prefix cache lookup misses, and
+the kept history spells the control token as text. The server reports the real positions, and the
+client adopts them. One frame holds
 at most `limits.max_append_pairs` pairs and 64 KiB. A longer history goes in
 several frames, and the session ends in the same state as after one frame. A
 pair costs the positions of its ids. With thinking off, a reply that
