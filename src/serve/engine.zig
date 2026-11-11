@@ -12,10 +12,28 @@
 //! Comptime. Generic over the engine, the codec, and the adapter, so each transport builds its own
 //! engine type.
 //!
-//! Bounds. `Config.max_connections` live connections (at most `limits.max_connections`), one
-//! `request_queue_capacity` request queue, and one `out_queue_capacity` event queue per
-//! connection. The engine never blocks on a client. Emission is non-blocking, and a full output
+//! Bounds. `Config.max_connections` live connections (at most `limits.max_connections`) in a table
+//! of `conn_slots.slots_per_connection` slots per allowed connection, one `request_queue_capacity`
+//! request queue, and one `out_queue_capacity` event queue per slot. The engine never blocks on a
+//! client. Emission is non-blocking, and a full output
 //! queue parks the event in the cell of the session while the draining task signals a `wakeup`.
+//!
+//! Connection slots. `conn_slots.zig` holds the state of each slot and the rules that keep the
+//! engine thread away from a slot that the acceptor rewrites. Slot i of that table owns `conns[i]`.
+//!
+//! Close order. The reader task submits `conn_closed` when it stops, after its last request. The
+//! engine handles the requests in order, so the reply that a request gets while the engine
+//! handles it is in the out-queue before `conn_closed`. Then the engine closes the out-queue,
+//! sweeps the sessions of the connection, and releases the slot. The sweep ends each turn in
+//! flight, so a client that closes its send side ends its turns. A writer task drains the queue,
+//! flushes, and exits. A writer that stops early closes the queue, so a reader that waits on a
+//! full queue wakes. The slot returns to the acceptor after the release and the last task exit,
+//! in either order.
+//!
+//! Idle. A binary reader closes a connection that holds no session and no request in the engine
+//! after one `--io-timeout` with no frame. `sessions` and `requests_open` of a `Conn` tell it: the
+//! engine thread alone writes `sessions`, the reader adds to `requests_open` before each request,
+//! and the engine subtracts after it handles the request.
 //!
 //! Socket close. Exactly one actor closes the socket of a connection. The first to claim it owns
 //! the close. The claim is `live -> task` when the last task exits, or `live -> teardown` when
@@ -24,14 +42,17 @@
 //!
 //! Adapter surface. All methods are duck-typed over the engine and a `*Conn`:
 //!   - `pub const ConnExt`            per-connection state the adapter owns
-//!   - `onAccept(engine, conn) bool`  set `conn.tasks_live`, spawn the task(s)
-//!                                    into `conn.ext`. False (with the stream
-//!                                    closed) if spawning failed
+//!   - `pub const conn_tasks: u8`     the task count of one connection. One of
+//!                                    them is the reader, which submits requests
+//!   - `onAccept(engine, conn) bool`  spawn the task(s) into `conn.ext`. False
+//!                                    (with the stream closed and the started
+//!                                    tasks awaited) if spawning failed
 //!   - `beginClose(engine, conn)`     unblock the task(s) at teardown. Close
-//!                                    the out-queue, and whatever else the task
-//!                                    blocks on (a request reader's socket)
+//!                                    the out-queue, and shut the socket down
+//!                                    so a blocked read or write returns
 //!   - `awaitConn(engine, conn)`      await the task futures in `conn.ext`
-//!   - `refuse(io, *Stream)`          reject a connection when no slot is free
+//!   - `refuse(io, *Stream)`          reject a connection at the cap with one
+//!                                    send that does not wait
 
 const std = @import("std");
 const span = @import("../core/span.zig");
@@ -41,6 +62,8 @@ const Allocator = std.mem.Allocator;
 const limits = @import("../core/limits.zig");
 const event = @import("event.zig");
 const scheduler_mod = @import("scheduler.zig");
+const conn_slots = @import("conn_slots.zig");
+const timed_stream = @import("timed_stream.zig");
 const Request = event.Request;
 const OutEvent = event.OutEvent;
 
@@ -55,16 +78,15 @@ pub const out_queue_capacity: usize = 256;
 /// `EMFILE` true, so a retry with no wait spins.
 const accept_backoff_ms: i64 = 100;
 
-const conn_free: u8 = 0;
-const conn_live: u8 = 1;
-const conn_reclaimable: u8 = 2;
-
 // The actor that closes the socket of a connection.
 const fin_live: u8 = 0;
 const fin_task: u8 = 1;
 const fin_teardown: u8 = 2;
 
 // -- types ------------------------------------------------------------------
+
+/// The part of a connection task in the close order. The reader submits the requests.
+pub const TaskRole = enum { reader, writer };
 
 /// Where to bind. Generic across adapters. Both speak TCP or a unix socket.
 pub const Endpoint = union(enum) {
@@ -90,9 +112,9 @@ pub fn ServeEngine(comptime Engine: type, comptime CodecT: type, comptime Adapte
         const SchedulerT = scheduler_mod.Scheduler(Engine, CodecT);
 
         /// A connection slot: the fields the engine and sink touch, plus the adapter state (`ext`).
+        /// `slots` holds its state and its connection id.
         pub const Conn = struct {
-            state: std.atomic.Value(u8) = .init(conn_free),
-            id: u32 = 0,
+            index: u32,
             stream: net.Stream = undefined,
             out_q: Io.Queue(OutEvent) = undefined,
             out_buf: [out_queue_capacity]OutEvent = undefined,
@@ -100,7 +122,10 @@ pub fn ServeEngine(comptime Engine: type, comptime CodecT: type, comptime Adapte
             /// Single-owner guard for closing `stream` (see `fin_*`).
             fin: std.atomic.Value(u8) = .init(fin_live),
             parked_hint: std.atomic.Value(bool) = .init(false),
-            tasks_live: std.atomic.Value(u8) = .init(0),
+            /// The sessions attached to the connection, as the engine thread last counted them.
+            sessions: std.atomic.Value(u32) = .init(0),
+            /// The requests that the reader submitted and the engine has not handled yet.
+            requests_open: std.atomic.Value(u32) = .init(0),
             ext: Adapter.ConnExt = .{},
         };
 
@@ -112,8 +137,12 @@ pub fn ServeEngine(comptime Engine: type, comptime CodecT: type, comptime Adapte
         codec: *const CodecT,
         listener: net.Server,
         conns: []Conn,
+        slots: conn_slots.ConnSlots,
         request_q: Io.Queue(Request),
-        next_conn_id: u32 = 1, // acceptor-owned, and ids are never reused
+        /// The id of the last accepted connection. Only the acceptor reads and writes it.
+        last_conn_id: u32 = 0,
+        /// The deadline of one socket read or write. It never changes, so any task reads it.
+        io_timeout_ms: u32,
         acceptor_future: ?Io.Future(void) = null,
 
         /// Binds the endpoint, so `boundAddress` is valid before `run`, and wires the scheduler.
@@ -146,10 +175,19 @@ pub fn ServeEngine(comptime Engine: type, comptime CodecT: type, comptime Adapte
                 sched_cfg.max_sessions,
                 sched_cfg.max_seq,
             });
-            const conns = try arena.alloc(Conn, sched_cfg.max_connections);
-            for (conns) |*c| {
-                c.* = .{};
+            const slot_count = sched_cfg.max_connections * conn_slots.slots_per_connection;
+            const conns = try arena.alloc(Conn, slot_count);
+            for (conns, 0..) |*c, i| {
+                c.* = .{ .index = @intCast(i) };
             }
+            const slots = try arena.alloc(conn_slots.Slot, slot_count);
+            @memset(slots, .{});
+            const slot_bytes = @sizeOf(Conn) + @sizeOf(conn_slots.Slot);
+            log.debug("listen: {d} connection slots of {d} bytes, {d} bytes in all", .{
+                slot_count,
+                slot_bytes,
+                slot_count * slot_bytes,
+            });
 
             const request_buf = try arena.alloc(Request, request_queue_capacity);
             var self: Self = .{
@@ -159,6 +197,8 @@ pub fn ServeEngine(comptime Engine: type, comptime CodecT: type, comptime Adapte
                 .codec = codec,
                 .listener = listener,
                 .conns = conns,
+                .slots = .init(slots, sched_cfg.max_connections),
+                .io_timeout_ms = sched_cfg.io_timeout_ms,
                 .request_q = .init(request_buf),
             };
             // Warm the caches here, single-threaded, before any connection exists.
@@ -209,15 +249,55 @@ pub fn ServeEngine(comptime Engine: type, comptime CodecT: type, comptime Adapte
         }
 
         fn dispatch(self: *Self, req: Request, sink: *Sink) scheduler_mod.HandleResult {
-            // A dropped connection must end its tasks. Closing the out-queue is the engine half of
-            // conn_closed, and the scheduler half sweeps the sessions.
-            if (req.body == .conn_closed) {
-                if (self.findConn(req.conn)) |conn| {
-                    self.closeOutput(conn);
-                }
+            if (req.body != .conn_closed) return self.dispatchRequest(req, sink);
+
+            // Only this thread releases a slot, and it releases one only here. So the slot of the
+            // reader that submitted this request is still `live` or `closing`.
+            const index = self.slots.find(req.conn).?;
+            // Every reply of the connection is in the queue, so the close loses none. The writer
+            // task drains the queue and exits.
+            self.closeOutput(&self.conns[index]);
+            const result = self.sched.handle(req, sink);
+            std.debug.assert(result == .ok);
+            // The sweep left no session of the connection, so no later event names it.
+            self.slots.release(index);
+            return result;
+        }
+
+        fn dispatchRequest(self: *Self, req: Request, sink: *Sink) scheduler_mod.HandleResult {
+            // A counted request comes before the conn_closed of its reader, so its slot is still
+            // `live` or `closing`.
+            const counted = req.conn != 0 and req.body != .wakeup;
+            const from: ?u32 = if (counted) self.slots.find(req.conn).? else null;
+            const result = self.sched.handle(req, sink);
+
+            // Only these requests attach a session to a connection or take one from it. The
+            // count comes before the request leaves `requests_open`, so an idle reader never
+            // sees zero of both while a session opens.
+            switch (req.body) {
+                .session_open, .session_clone, .session_resume, .session_close => {
+                    self.countSessions();
+                },
+                else => {},
             }
 
-            return self.sched.handle(req, sink);
+            if (from) |index| {
+                const prev = self.conns[index].requests_open.fetchSub(1, .acq_rel);
+                std.debug.assert(prev >= 1);
+            }
+
+            return result;
+        }
+
+        /// Store the attached sessions of every `live` slot. A resume can take a session from
+        /// another connection, so the count covers every slot.
+        fn countSessions(self: *Self) void {
+            for (self.conns) |*conn| {
+                if (self.slots.stateOf(conn.index) != .live) continue;
+
+                const n = self.sched.sessionsOf(self.slots.idOf(conn.index));
+                conn.sessions.store(n, .release);
+            }
         }
 
         fn teardown(self: *Self) void {
@@ -228,17 +308,20 @@ pub fn ServeEngine(comptime Engine: type, comptime CodecT: type, comptime Adapte
                 f.cancel(self.io);
             }
 
-            // Unblock the tasks. A reclaimable connection already closed its stream.
+            // Unblock the tasks. Only a `live` or `swept` slot has a task.
             self.listener.deinit(self.io);
             for (self.conns) |*conn| {
-                if (conn.state.load(.acquire) == conn_live) {
-                    Adapter.beginClose(self, conn);
+                switch (self.slots.stateOf(conn.index)) {
+                    .live, .swept => Adapter.beginClose(self, conn),
+                    .free, .closing, .reclaimable => {},
                 }
             }
 
-            // Await the tasks, and close the sockets that teardown claimed.
+            // Await the tasks, and close the sockets that teardown claimed. The request queue is
+            // closed and its requests are freed, so a slot can stay closing with its conn_closed
+            // lost.
             for (self.conns) |*conn| {
-                if (conn.state.load(.acquire) == conn_free) continue;
+                if (self.slots.stateOf(conn.index) == .free) continue;
 
                 Adapter.awaitConn(self, conn);
                 std.debug.assert(conn.fin.load(.acquire) != fin_live);
@@ -247,7 +330,7 @@ pub fn ServeEngine(comptime Engine: type, comptime CodecT: type, comptime Adapte
                     conn.stream.close(self.io);
                 }
 
-                conn.state.store(conn_free, .release);
+                self.slots.reset(conn.index);
             }
 
             // Free the text of the requests that never reached the scheduler.
@@ -268,8 +351,9 @@ pub fn ServeEngine(comptime Engine: type, comptime CodecT: type, comptime Adapte
         const Sink = struct {
             engine: *Self,
 
-            /// This never blocks. A missing or closed connection swallows the event. A full queue
-            /// reports false so the scheduler parks, and flags the draining task to send a wakeup.
+            /// This never blocks. A missing or closed connection swallows the event. The engine
+            /// closed the queue of a missing connection at its conn_closed. A full queue reports
+            /// false so the scheduler parks, and flags the draining task to send a wakeup.
             pub fn emit(s: *Sink, conn_id: u32, ev: OutEvent) bool {
                 const conn = s.engine.findConn(conn_id) orelse return true;
                 const n = conn.out_q.put(s.engine.io, &.{ev}, 0) catch return true;
@@ -285,12 +369,17 @@ pub fn ServeEngine(comptime Engine: type, comptime CodecT: type, comptime Adapte
             }
         };
 
+        /// Only the engine thread calls this. The result stays valid until this thread handles the
+        /// conn_closed of the connection.
         pub fn findConn(self: *Self, conn_id: u32) ?*Conn {
-            for (self.conns) |*conn| {
-                if (conn.state.load(.acquire) == conn_live and conn.id == conn_id) return conn;
-            }
+            const index = self.slots.find(conn_id) orelse return null;
+            return &self.conns[index];
+        }
 
-            return null;
+        /// The connection id of a slot. A connection task calls this for its own slot, and
+        /// `beginClose` calls it at teardown for a slot that still has a task.
+        pub fn connId(self: *const Self, conn: *const Conn) u32 {
+            return self.slots.idOf(conn.index);
         }
 
         /// Idempotent: exactly one close reaches the queue. The draining task then drains what is
@@ -307,10 +396,30 @@ pub fn ServeEngine(comptime Engine: type, comptime CodecT: type, comptime Adapte
             return conn.fin.cmpxchgStrong(fin_live, fin_teardown, .acq_rel, .acquire) == null;
         }
 
-        /// A connection task submits a `Request` to the engine. The call blocks.
+        /// The owner of the process submits a `Request` to the engine. The call blocks.
         /// A closed queue means teardown is underway.
         pub fn submit(self: *Self, req: Request) !void {
+            std.debug.assert(req.conn == 0);
             try self.request_q.putOne(self.io, req);
+        }
+
+        /// The reader task of `conn` submits a `Request`. The call blocks. A closed queue means
+        /// teardown is underway.
+        pub fn submitFrom(self: *Self, conn: *Conn, req: Request) !void {
+            std.debug.assert(req.conn == self.slots.idOf(conn.index));
+            std.debug.assert(req.body != .wakeup and req.body != .conn_closed);
+            _ = conn.requests_open.fetchAdd(1, .acq_rel);
+            self.request_q.putOne(self.io, req) catch |err| {
+                _ = conn.requests_open.fetchSub(1, .acq_rel);
+                return err;
+            };
+        }
+
+        /// True when `conn` holds no session and no request in the engine, so a reader can close
+        /// it at its idle deadline.
+        pub fn connIdle(self: *const Self, conn: *const Conn) bool {
+            _ = self;
+            return conn.sessions.load(.acquire) == 0 and conn.requests_open.load(.acquire) == 0;
         }
 
         /// Wake an idle engine so its next tick retries a parked event. A full request queue
@@ -325,18 +434,33 @@ pub fn ServeEngine(comptime Engine: type, comptime CodecT: type, comptime Adapte
             }}, 0) catch {};
         }
 
-        /// The last task out of a connection closes the socket and marks the slot reclaimable.
-        /// The acceptor or teardown awaits the futures.
-        pub fn taskExit(self: *Self, conn: *Conn) void {
-            const prev = conn.tasks_live.fetchSub(1, .acq_rel);
-            std.debug.assert(prev >= 1); // never exit more tasks than were spawned
-            if (prev == 1) {
-                // Close the socket unless teardown claimed it. Teardown closes it after the await.
-                if (conn.fin.cmpxchgStrong(fin_live, fin_task, .acq_rel, .acquire) == null) {
-                    conn.stream.close(self.io);
-                }
+        /// The reader submits conn_closed after its last request, and a writer closes the queue.
+        /// The last task out closes the socket. The acceptor or teardown awaits the futures.
+        pub fn taskExit(self: *Self, conn: *Conn, role: TaskRole) void {
+            // A writer that stops can send nothing more, so the close loses no reply. It wakes a
+            // reader that waits to put into the full queue.
+            if (role == .writer) {
+                self.closeOutput(conn);
+            }
 
-                conn.state.store(conn_reclaimable, .release);
+            if (role == .reader) {
+                // The engine must hear about the drop exactly once, even when the queue is
+                // briefly full, so a cancel must not end the wait. Only a closed queue loses the
+                // request, and then teardown frees the slot.
+                const id = self.slots.idOf(conn.index);
+                self.request_q.putOneUncancelable(self.io, .{
+                    .conn = id,
+                    .request_id = 0,
+                    .session_id = 0,
+                    .body = .conn_closed,
+                }) catch {};
+            }
+
+            if (!self.slots.exitTask(conn.index)) return;
+
+            // Close the socket unless teardown claimed it. Teardown closes it after the await.
+            if (conn.fin.cmpxchgStrong(fin_live, fin_task, .acq_rel, .acquire) == null) {
+                conn.stream.close(self.io);
             }
         }
 
@@ -345,39 +469,35 @@ pub fn ServeEngine(comptime Engine: type, comptime CodecT: type, comptime Adapte
         fn acceptorTask(self: *Self) void {
             while (true) {
                 var stream = acceptNext(&self.listener, self.io) orelse return;
-                const conn = self.claimConnSlot() orelse {
+                const claim = self.slots.claim() orelse {
+                    // A cancel signals once. If a refusal write took it, the next accept blocks
+                    // for good. So the cancel waits for the accept.
+                    const protect = self.io.swapCancelProtection(.blocked);
+                    defer _ = self.io.swapCancelProtection(protect);
+
                     Adapter.refuse(self.io, &stream);
                     continue;
                 };
-                conn.id = self.next_conn_id;
-                self.next_conn_id += 1;
+                timed_stream.enableKeepalive(stream);
+                const conn = &self.conns[claim.index];
+                if (claim.reused) {
+                    Adapter.awaitConn(self, conn);
+                }
+
                 conn.stream = stream;
                 conn.out_q = .init(&conn.out_buf);
                 conn.out_closed.store(false, .release);
                 conn.fin.store(fin_live, .release);
                 conn.parked_hint.store(false, .release);
-                conn.state.store(conn_live, .release);
+                conn.sessions.store(0, .release);
+                conn.requests_open.store(0, .release);
+                self.last_conn_id = self.slots.nextId(self.last_conn_id);
+                self.slots.open(claim.index, self.last_conn_id, Adapter.conn_tasks);
                 if (!Adapter.onAccept(self, conn)) {
                     // onAccept left the stream closed. Reclaim the slot.
-                    conn.state.store(conn_free, .release);
+                    self.slots.abandon(claim.index);
                 }
             }
-        }
-
-        fn claimConnSlot(self: *Self) ?*Conn {
-            for (self.conns) |*conn| {
-                switch (conn.state.load(.acquire)) {
-                    conn_free => return conn,
-                    conn_reclaimable => {
-                        Adapter.awaitConn(self, conn);
-                        conn.state.store(conn_free, .release);
-                        return conn;
-                    },
-                    else => {},
-                }
-            }
-
-            return null;
         }
     };
 }

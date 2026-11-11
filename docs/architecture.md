@@ -285,7 +285,7 @@ parts that only matter when many conversations share one model:
 | `--threads`, `--min-parallel-flops`, `--spin-us` | flag | 8 |
 | `--max-seq`, `--kv-dtype` | flag | 9 |
 | `--kv-vram`, `--vram-slots`, `--kv-ram`, `--prefix-disk`, `--preload` | flag of `serve` and `serve-openai` | 9, 10 |
-| `--max-sessions`, `--max-batch`, `--prefill-chunk` | flag of `serve` and `serve-openai` | 10 |
+| `--max-sessions`, `--max-batch`, `--prefill-chunk`, `--io-timeout` | flag of `serve` and `serve-openai` | 10 |
 | `--max-connections`, `--sessions-per-connection`, `--allow-shutdown`, `--resume-ttl` | flag of `serve` (`--max-connections` also of `serve-openai`) | 10 |
 | `--thinking`, `--thinking-budget`, and the sampling fields | flag, and a field of each turn | 10 |
 | `$ZIGFERENCER_VK_STORAGE_RANGE` | environment variable | 9 |
@@ -1062,6 +1062,7 @@ frontend takes them as `chat_template_kwargs.enable_thinking` and
 | Requests in the queue of the engine | `serve/engine.zig` |
 | Events in the queue of one connection | `serve/engine.zig` |
 | Live connections | `--max-connections`, at most `limits.max_connections` |
+| Wait of one socket read or write | `--io-timeout`, at most `limits.max_io_timeout_s` (Linux only) |
 | Size of one binary frame | a 20-byte header and at most 64 KiB of payload (`serve/protocol.zig`) |
 | Sessions | `--max-sessions`, at most `limits.max_batch` on a CPU build. A fused GPU build allows up to `limits.max_logical_sessions` when `--vram-slots` or `--kv-vram` enables the KV tiers |
 | Decode rows in one step | `--max-batch`, at most `limits.max_batch` |

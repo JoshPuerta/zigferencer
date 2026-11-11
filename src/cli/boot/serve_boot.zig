@@ -240,6 +240,7 @@ fn schedulerConfig(
         .max_step_rows = 0, // set by `launch`
         .prefill = checked.cpu_prefill,
         .max_connections = b.flags.max_connections,
+        .io_timeout_ms = b.flags.io_timeout * std.time.ms_per_s,
         .allow_shutdown = wire.allow_shutdown,
         .resume_ttl_max_ms = wire.resume_ttl_ms,
         .model_name = model.pub_name,

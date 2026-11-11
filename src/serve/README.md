@@ -11,6 +11,8 @@ persists across turns. One forward pass per tick advances a batch of sessions. `
 | --- | --- |
 | `scheduler.zig` | `Scheduler`, the control unit: the session table and the composed tick. |
 | `engine.zig` | `ServeEngine`, the engine thread, the queues, and the connection lifecycle. |
+| `conn_slots.zig` | `ConnSlots`, the connection slot table and the steps of each thread. |
+| `timed_stream.zig` | The socket reader and writer with a deadline, and the hang-up probe. |
 | `event.zig` | `Request`, `OutEvent`, and `Codec`, the values across the two boundaries. |
 | `prefill_chunk.zig` | The pure rule for the prefill rows of one pass. |
 | `residency.zig` | `Residency`, the optional tiered KV pool. |
@@ -94,9 +96,10 @@ slot state machine consumes. The manager makes the calls whose result only the c
   returns a typed error the adapter maps to an error frame or a 4xx.
 - **Bounded everything.** `--max-connections` sets the live connections, 8 by
   default and 64 at most (`core/limits.zig`). A binary connection costs two
-  worker threads, one payload buffer of 20 bytes plus 64 KiB, and one
+  worker threads. The table holds two slots per allowed connection, and a
+  binary slot holds one payload buffer of 20 bytes plus 64 KiB and one
   out-queue. `engine.zig` fixes `request_queue_capacity` at 64 and
-  `out_queue_capacity` at 256 events per connection. `--max-sessions` caps at 8
+  `out_queue_capacity` at 256 events per slot. `--max-sessions` caps at 8
   on a CPU build, and at 128 on a fused-GPU build once `--vram-slots` or
   `--kv-vram` enables the KV tier. `--vram-slots` reaches 128 and `--max-batch`
   reaches 8 (`core/limits.zig`). `--max-seq` sets the session window, from 1 to
@@ -125,8 +128,8 @@ slot state machine consumes. The manager makes the calls whose result only the c
   no event, and no request reaches it. A resume with the token attaches the slot to the new
   connection within its share, and the token rotates. The newest holder wins, so a resume also takes
   an attached slot. A resume of a slot that is not idle waits in the slot and ends at the moment the
-  slot becomes idle. Until then, the session answers `session_busy` to a generate, an append, a clone, a cancel,
-  a keep, or a close. The client has no `resumed` reply yet. The scheduler frees a
+  slot becomes idle. Until then, the session answers `session_busy` to a generate, an append, a
+  clone, a cancel, a keep, or a close. The client has no `resumed` reply yet. The scheduler frees a
   detached slot at its deadline. It scans lazily at the tick head and at each admission, with one
   clock read per scan. A live open with no free slot takes the detached slot with the earliest
   deadline, so a lease never blocks a live client. An expiry and a yield stop a prefill in flight
@@ -162,9 +165,9 @@ slot state machine consumes. The manager makes the calls whose result only the c
   so the queues hold plain copies and need no ownership rule at all.
 - **Request text is plain text.** The server writes the chat template around the text of a client
   and encodes the result with `bpe.encodePromptAlloc`. A turn takes one encode, and a kept pair
-  takes two: the user wrap, then the reply. A control token matches only in the template text. In the text of a client, a string such as `<|im_end|>` or `<think>` encodes as
-  ordinary bytes. Text with no such string keeps the ids of a one-string encode, so a cached prefix
-  stays valid.
+  takes two: the user wrap, then the reply. A control token matches only in the template text. In
+  the text of a client, a string such as `<|im_end|>` or `<think>` encodes as ordinary bytes.
+  Text with no such string keeps the ids of a one-string encode, so a cached prefix stays valid.
 - **The plain-text rule covers every text of a client.** On the OpenAI frontend it covers the
   content of every message role. On the binary frontend it covers the turn text, the system prompt
   of `session_open`, and both texts of a kept pair. It also covers a `--preload` text. The rule
@@ -189,9 +192,61 @@ slot state machine consumes. The manager makes the calls whose result only the c
   sessions, and the scheduler. `run` drains the request queue, calls `sched.handle` for each
   request, and calls `sched.tick` until it returns `.idle`. It then blocks on the request queue, so
   an idle server uses no CPU.
+- **A connection slot changes hands in a fixed order.** A slot is `free`, `live`, `closing`,
+  `swept`, or `reclaimable` (`conn_slots.zig`). The acceptor writes a slot only in `free` or
+  `reclaimable`. The engine thread reads a slot only in `live` or `closing`. The reader task
+  submits `conn_closed` after its last request. The reply that a request gets while the engine
+  handles it, such as a `pong` or `session_closed`, is then in the out-queue. The engine closes
+  the queue, sweeps the sessions of the connection, and releases the slot. The writer task drains
+  the queue and exits. A writer that stops early closes the queue, so its reader cannot wait on a
+  full queue for good. The slot is `reclaimable` after the release and the last task exit, in
+  either order. So an event never reaches the queue of a later connection. An event for a
+  connection that holds no slot is dropped, because the engine closed its queue. At shutdown the
+  request queue closes, so a `conn_closed` can be lost. Teardown then awaits the tasks and frees
+  the slot.
+- **A half-close is a hang-up.** A client that closes its send side ends its turns on both
+  frontends. The sweep cancels a turn in flight, drops a parked event, and ends a waiting resume.
+  A reply that the engine made before the sweep still arrives. A buffered HTTP reply that is
+  complete when the probe runs still goes out. A binary frame error queues its error frame, and
+  the replies to the earlier requests of the connection follow it before the close.
+- **A slot that waits for the engine does not refuse a client.** `--max-connections` counts the
+  `live` slots, where a task runs and the engine has not handled `conn_closed`. The table holds
+  two slots per allowed connection, so a client can connect while the slot of an ended
+  connection waits for the engine. A client that finds every spare slot waiting gets the refusal
+  of the cap. A slot costs `@sizeOf(Conn)` of its frontend plus the slot record, so the table
+  costs twice that per allowed connection. The debug line `listen: N connection slots of B
+  bytes` of the engine prints the sum at boot.
+- **A refusal never waits.** The refusal of a client past the cap is one send that does not
+  wait. The server then shuts its send side, drops the input that has arrived, and closes, so the
+  refusal does not turn into a reset where the client has sent little.
+- **A socket wait has a deadline.** `--io-timeout` sets the longest wait of one socket read or
+  write, 600 seconds by default (the default of the llama.cpp server `--timeout`). 0 sets no
+  deadline. Each read of an HTTP request head and body waits at most the deadline, which covers
+  the idle wait between two requests on one connection. A client that sends one byte per
+  deadline can still hold its connection. The deadline also bounds each read of the binary
+  handshake and of a binary frame after its first byte, and each write that the client does not
+  read. At the deadline the task exits, so the slot and the sessions of the connection free as
+  after a hang-up. Only Linux has the deadline. On other platforms a socket wait has no bound.
+- **An idle binary connection closes when it holds nothing.** A binary reader waits for the first
+  byte of a frame with no bound while its connection holds a session or a request in the engine,
+  because an idle session is normal. A connection with neither closes after one deadline with no
+  frame. So only a client that keeps a session open holds a slot with no traffic. The TCP
+  keepalive of an accepted socket finds a peer that vanished with no close after the time that
+  `limits.zig` states, on Linux.
+- **A buffered reply sees a hang-up at the next token.** A buffered HTTP reply writes nothing
+  before the turn ends. So at each token event of the turn the task probes the socket for a
+  hang-up, and a hang-up ends the turn and closes the session. The probe skips the `done`, so a
+  complete reply still goes out. A request that the client sends before it reads the reply is no
+  hang-up. A prefill emits no event, so the probe waits for the first token. A streamed reply sees
+  a hang-up as a write error. Only Linux has the probe.
+- **An HTTP reply that says close ends the connection.** An error reply, and a request with
+  `Connection: close` or HTTP/1.0 without keep-alive, end the connection after the reply. A
+  request that the client sent after it is not answered.
 - **The two transports serve two kinds of traffic.** The binary wire serves embedded interactive
-  traffic. That means many short, low-latency sessions that often share a prefilled prefix. The HTTP frontend
-  serves general interop, so existing clients, SDKs, and evaluation tools work unchanged.
+  traffic. That means many short, low-latency sessions that often share a prefilled prefix. The
+  HTTP frontend serves general interop. A client that sends the request shapes of the field table
+  in "The OpenAI HTTP front" works with no change. The server ignores the other fields and logs
+  each name once.
 
 ## The client surface
 
@@ -403,7 +458,9 @@ curl -N http://127.0.0.1:8080/v1/chat/completions -H 'Content-Type: application/
 
 | Field | Rule |
 | --- | --- |
-| `messages`, `model`, `stream`, `max_tokens`, `max_completion_tokens`, `n` | honored. `n` above 1 gets a 400. A `model` that is not the served id gets a 404 |
+| `messages` | honored, at most 64 messages. A `content` is a string, an array of `text` parts, or null on an assistant message. The texts of the parts join in order with no separator. A part of another type, for example `image_url`, gets a 400 that names the type, because the model takes text only. A message holds at most 64 parts |
+| `model`, `stream`, `max_tokens`, `max_completion_tokens`, `n` | honored. `n` above 1 gets a 400. A `model` that is not the served id gets a 404 |
+| `stop` | honored, a string or an array of at most 4 strings of 1 to 64 bytes. The reply ends just before the first stop string in the reply text, and `finish_reason` is `stop`. A stop string in the reasoning text does nothing. A stream holds back at most 63 bytes that can still start a stop string. `usage.completion_tokens` also counts the tokens that the model made after the match and before the cancel landed |
 | `temperature` | honored, finite and 0 or more. 0 is greedy |
 | `top_k` | honored, 0 to 256. 0 and -1 are off. A value past 256 gets a 400 |
 | `top_p` | honored, more than 0 and at most 1 |
@@ -414,15 +471,20 @@ curl -N http://127.0.0.1:8080/v1/chat/completions -H 'Content-Type: application/
 | `seed` | honored. Without it, the server draws a seed from the secure random source per request |
 | `thinking_token_budget` | -1 or absent takes `--thinking-budget`. 0 turns thinking off. N from 1 to 262144 closes the block after N think tokens |
 | `chat_template_kwargs.enable_thinking` | true is on, false is off, absent is the server mode |
-| any other field | ignored, for example `stop`, `tools`, and `logprobs` |
+| any other field | ignored, and the server logs each name once. Examples: `tools`, `tool_choice`, `logprobs`, `response_format`, `stream_options`, `logit_bias`, and `user` |
 
 Every refusal is a 400 of type `invalid_request_error`, and its message names
 the field and the accepted range. A model with no think tags accepts only the
 closed modes. `enable_thinking: true` or a budget above 0 gets a 400. A
 budget of 0 or -1 passes. A model with think tags and no forced close also
 refuses a budget above 0. A budget of 0 wins over `enable_thinking: true`.
-A field with the wrong JSON type, for example a string for `top_k`, gets
-the generic 400 `malformed JSON body`, and that message names no field.
+A field with a value of the wrong JSON type, for example a string for
+`top_k`, gets a 400 that names the field (`error.BadField` in `map.zig`).
+
+The body can come with `Content-Length` or with chunked transfer coding. A body
+past 256 KiB gets a 413. A declared length past the cap gets it before the
+server reads the body, and a chunked body gets it at the byte that passes the
+cap.
 
 An omitted sampling field takes a default. Under `--sampling model`,
 the default, it takes the field of the registry card row of the resolved

@@ -79,6 +79,7 @@ pub const serve_engine = @import("serve/engine.zig");
 pub const serve_server = @import("serve/server.zig");
 pub const serve_client = @import("serve/client.zig");
 pub const serve_openai_http = @import("serve/openai/http_server.zig");
+pub const serve_timed_stream = @import("serve/timed_stream.zig");
 pub const serve_openai_map = @import("serve/openai/map.zig");
 pub const serve_openai_raw_codec = @import("serve/openai/raw_codec.zig");
 pub const client_transcript = @import("cli/client/client_transcript.zig");
@@ -376,6 +377,8 @@ test {
     _ = serve_scheduler;
     _ = serve_prefill_chunk;
     _ = serve_server;
+    _ = @import("serve/conn_slots.zig");
+    _ = @import("serve/timed_stream.zig");
     _ = @import("serve/openai/map.zig");
     _ = serve_zmtp;
     _ = ops_simd;

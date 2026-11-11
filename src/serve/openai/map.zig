@@ -10,7 +10,7 @@
 //!
 //! Parse. `parseChatRequest` rejects the input the server cannot answer correctly, such as
 //! `n > 1`, a sampling field out of its range, or a frequency penalty. It ignores the other
-//! fields it does not support (stop, tools), so a generic OpenAI client works, and it logs each
+//! fields it does not support (tools, logprobs), so a generic OpenAI client works, and it logs each
 //! ignored name once per process. The `model` string passes through for the shell to check. A
 //! known field with a value of the wrong type is `error.BadField`, and `diag` names it. Each
 //! sampling guard reads as the range it accepts, so a NaN fails it. The ranges are the binary
@@ -25,6 +25,14 @@
 //! the stream, and a tag never straddles two events. It drops the tags and the newlines that lead
 //! the reply after a close. A close outside the block is plain reply text, so a turn that opens
 //! closed and never sees `<think>` keeps every byte as content.
+//!
+//! Content. A message `content` is a string, an array of text parts, or null on an assistant
+//! message. The parse joins the texts of the parts in order with no separator, so the joined text
+//! renders as one plain range, as a string does. A part of another type gets a 400 that names it.
+//!
+//! Stop. `StopMatcher` cuts the reply text before the first stop string. It holds back the longest
+//! tail that can still start a stop string, at most `limits.openai_max_stop_bytes - 1` bytes, so no
+//! emitted byte belongs to a later match.
 //!
 //! UTF-8. A streamed token can be a partial multi-byte sequence (byte-fallback tokens, emoji). A
 //! JSON string must be valid UTF-8, so the shell emits the prefix that `completeUtf8Len` returns
@@ -81,6 +89,12 @@ pub const ReqError = error{
     ThinkingUnsupported,
     BudgetUnsupported,
     BudgetNoForcedClose,
+    /// `stop` is not a string or an array of short strings.
+    BadStop,
+    /// A message holds more content parts than `limits.openai_max_content_parts`.
+    TooManyParts,
+    /// A content part is not text. `Diag.detail` names its type.
+    ContentPartUnsupported,
     OutOfMemory,
 };
 
@@ -91,6 +105,8 @@ pub const ChatField = std.meta.FieldEnum(types.ChatRequest);
 pub const Diag = struct {
     /// Set with `error.BadField`, null otherwise.
     field: ?ChatField = null,
+    /// The arena-owned message of `error.ContentPartUnsupported`, null otherwise.
+    detail: ?[]const u8 = null,
 };
 
 /// The set of unknown top-level field names the server has reported. A name
@@ -223,6 +239,8 @@ pub const Request = struct {
     /// `enable_thinking`: true is `on`, false is `off`, absent or null is `auto`.
     thinking: chat.ThinkingFlag,
     think_budget: ThinkBudget,
+    /// At most `limits.openai_max_stops` strings, each 1 to `limits.openai_max_stop_bytes` long.
+    stop: []const []const u8,
 };
 
 pub const HttpError = struct {
@@ -283,6 +301,87 @@ pub const ReasoningSplit = struct {
     }
 };
 
+/// Cuts the content text of one turn before the first stop string. Feed each content piece in
+/// order, and emit what `feed` returns. At the natural end of the turn, emit what `finish`
+/// returns. The returned text borrows the matcher until the next call.
+pub const StopMatcher = struct {
+    const hold_max = limits.openai_max_stop_bytes - 1;
+
+    stops: []const []const u8,
+    /// `buf[start..len]` holds the bytes held back, and `buf[0..start]` the text of the last call.
+    buf: [hold_max + limits.max_token_text_bytes]u8 = undefined,
+    start: usize = 0,
+    len: usize = 0,
+    done: bool = false,
+
+    pub const Out = struct {
+        text: []const u8,
+        /// The text ends just before a stop string, so the turn must stop.
+        stopped: bool,
+    };
+
+    pub fn init(stops: []const []const u8) StopMatcher {
+        std.debug.assert(stops.len <= limits.openai_max_stops);
+        for (stops) |stop| {
+            std.debug.assert(stop.len >= 1 and stop.len <= limits.openai_max_stop_bytes);
+        }
+
+        return .{ .stops = stops };
+    }
+
+    pub fn feed(self: *StopMatcher, piece: []const u8) Out {
+        std.debug.assert(!self.done);
+        std.debug.assert(piece.len <= limits.max_token_text_bytes);
+
+        // Move the held bytes to the front, and append the piece.
+        const held = self.len - self.start;
+        std.debug.assert(held <= hold_max);
+        std.mem.copyForwards(u8, self.buf[0..held], self.buf[self.start..self.len]);
+        @memcpy(self.buf[held..][0..piece.len], piece);
+        self.len = held + piece.len;
+        const text = self.buf[0..self.len];
+
+        // The earliest start of any stop string wins.
+        var cut: ?usize = null;
+        for (self.stops) |stop| {
+            const at = std.mem.find(u8, text, stop) orelse continue;
+            if (cut == null or at < cut.?) {
+                cut = at;
+            }
+        }
+
+        if (cut) |at| {
+            self.done = true;
+            self.start = 0;
+            self.len = 0;
+            return .{ .text = text[0..at], .stopped = true };
+        }
+
+        // Hold back the longest tail that is a proper prefix of a stop string.
+        var keep: usize = 0;
+        for (self.stops) |stop| {
+            var k = @min(stop.len - 1, text.len);
+            while (k > keep) : (k -= 1) {
+                if (std.mem.endsWith(u8, text, stop[0..k])) {
+                    keep = k;
+                    break;
+                }
+            }
+        }
+
+        std.debug.assert(keep <= hold_max);
+        self.start = text.len - keep;
+        return .{ .text = text[0..self.start], .stopped = false };
+    }
+
+    /// The held bytes at the natural end of the turn. No stop string can complete them.
+    pub fn finish(self: *StopMatcher) []const u8 {
+        std.debug.assert(!self.done);
+        self.done = true;
+        return self.buf[self.start..self.len];
+    }
+};
+
 // -- state ------------------------------------------------------------------
 
 var unknown_fields: UnknownFields = .{};
@@ -340,6 +439,8 @@ pub fn reqErrorToHttp(e: ReqError, diag: Diag) HttpError {
     // Check that the diagnostic matches the error.
     if (e == error.BadField) std.debug.assert(diag.field != null);
     if (e != error.BadField) std.debug.assert(diag.field == null);
+    if (e == error.ContentPartUnsupported) std.debug.assert(diag.detail != null);
+    if (e != error.ContentPartUnsupported) std.debug.assert(diag.detail == null);
 
     // Pick the message of the error.
     const message: []const u8 = switch (e) {
@@ -372,6 +473,15 @@ pub fn reqErrorToHttp(e: ReqError, diag: Diag) HttpError {
         error.ThinkingUnsupported => thinking_unsupported_message,
         error.BudgetUnsupported => budget_unsupported_message,
         error.BudgetNoForcedClose => budget_no_forced_close_message,
+        error.BadStop => std.fmt.comptimePrint(
+            "stop must be a string or an array of at most {d} strings, each of 1 to {d} bytes",
+            .{ limits.openai_max_stops, limits.openai_max_stop_bytes },
+        ),
+        error.TooManyParts => std.fmt.comptimePrint(
+            "a message content holds more than {d} parts",
+            .{limits.openai_max_content_parts},
+        ),
+        error.ContentPartUnsupported => diag.detail.?,
         error.OutOfMemory => return .{
             .status = 500,
             .type = "server_error",
@@ -551,8 +661,11 @@ fn parseChatRequestWith(
 
     const msgs = try arena.alloc(chat.Message, req.messages.len);
     for (req.messages, msgs) |src, *dst| {
-        dst.* = .{ .role = parseRole(src.role), .content = src.content };
+        const role = parseRole(src.role);
+        dst.* = .{ .role = role, .content = try messageText(arena, role, src.content, diag) };
     }
+
+    const stop = try parseStop(arena, req.stop);
 
     // Resolve the sampling, the budgets, and the thinking switch.
     const sampling = try parseSampling(req);
@@ -576,6 +689,7 @@ fn parseChatRequestWith(
         .stream = req.stream,
         .thinking = thinking,
         .think_budget = think_budget,
+        .stop = stop,
     };
 }
 
@@ -653,6 +767,82 @@ fn parseThinkBudget(raw: ?i64) ReqError!ThinkBudget {
     return .{ .tokens = @intCast(n) };
 }
 
+/// The text of one message `content`: a string, the joined texts of an array of text parts, or
+/// the empty text of a null on an assistant message.
+fn messageText(
+    arena: Allocator,
+    role: chat.Role,
+    content: std.json.Value,
+    diag: *Diag,
+) ReqError![]const u8 {
+    switch (content) {
+        .string => |text| return text,
+        .null => if (role == .assistant) return "",
+        .array => |parts| {
+            if (parts.items.len > limits.openai_max_content_parts) return error.TooManyParts;
+
+            var text: std.ArrayList(u8) = .empty;
+            for (parts.items) |part| {
+                const fields = switch (part) {
+                    .object => |o| o,
+                    else => return badMessages(diag),
+                };
+                const kind = switch (fields.get("type") orelse return badMessages(diag)) {
+                    .string => |k| k,
+                    else => return badMessages(diag),
+                };
+                if (!std.mem.eql(u8, kind, "text")) {
+                    diag.detail = try std.fmt.allocPrint(
+                        arena,
+                        "content part type \"{f}\" is not supported, because this model " ++
+                            "takes text only",
+                        .{unknownName(kind)},
+                    );
+                    return error.ContentPartUnsupported;
+                }
+
+                switch (fields.get("text") orelse return badMessages(diag)) {
+                    .string => |t| try text.appendSlice(arena, t),
+                    else => return badMessages(diag),
+                }
+            }
+
+            return text.items;
+        },
+        else => {},
+    }
+
+    return badMessages(diag);
+}
+
+fn badMessages(diag: *Diag) ReqError {
+    diag.field = .messages;
+    return error.BadField;
+}
+
+/// The stop strings of `value`: none for null, one for a string, or each string of an array.
+fn parseStop(arena: Allocator, value: std.json.Value) ReqError![]const []const u8 {
+    const items: []const std.json.Value = switch (value) {
+        .null => return &.{},
+        .string => (try arena.dupe(std.json.Value, &.{value})),
+        .array => |a| a.items,
+        else => return error.BadStop,
+    };
+    if (items.len > limits.openai_max_stops) return error.BadStop;
+
+    const stops = try arena.alloc([]const u8, items.len);
+    for (items, stops) |item, *dst| {
+        const text = switch (item) {
+            .string => |t| t,
+            else => return error.BadStop,
+        };
+        if (text.len == 0 or text.len > limits.openai_max_stop_bytes) return error.BadStop;
+        dst.* = text;
+    }
+
+    return stops;
+}
+
 fn parseRole(s: []const u8) chat.Role {
     if (std.mem.eql(u8, s, "system")) return .system;
     if (std.mem.eql(u8, s, "assistant")) return .assistant;
@@ -674,6 +864,7 @@ const ParseWant = struct {
     sampling: ?SamplingFields = null,
     think_budget: ?ThinkBudget = null,
     thinking: ?chat.ThinkingFlag = null,
+    stops: ?usize = null,
 };
 
 const ParseCase = struct {
@@ -764,6 +955,10 @@ fn checkParse(c: ParseCase) !void {
 
     if (w.thinking) |v| {
         try std.testing.expectEqual(v, r.thinking);
+    }
+
+    if (w.stops) |v| {
+        try std.testing.expectEqual(v, r.stop.len);
     }
 }
 
@@ -1411,6 +1606,8 @@ fn refusedField(e: ReqError, diag: Diag) []const u8 {
         error.BudgetNoForcedClose,
         => "thinking_token_budget",
         error.ThinkingUnsupported => "enable_thinking",
+        error.BadStop => "stop",
+        error.TooManyParts, error.ContentPartUnsupported => "content",
         error.OutOfMemory => unreachable,
     };
 }
@@ -1584,4 +1781,147 @@ test "property: a mutated body is a 400 that names its field, or a request all r
         prop.genSeed(void),
         checkChatMutation,
     );
+}
+
+/// Feed `pieces` and return the emitted text, whether a stop cut it, and the held bytes that a
+/// natural end flushes.
+const MatchRun = struct { text: []const u8, stopped: bool };
+
+fn runMatcher(arena: Allocator, stops: []const []const u8, pieces: []const []const u8) !MatchRun {
+    var m: StopMatcher = .init(stops);
+    var out: std.ArrayList(u8) = .empty;
+    for (pieces) |piece| {
+        const o = m.feed(piece);
+        try out.appendSlice(arena, o.text);
+        if (o.stopped) return .{ .text = out.items, .stopped = true };
+    }
+
+    try out.appendSlice(arena, m.finish());
+    return .{ .text = out.items, .stopped = false };
+}
+
+test "StopMatcher: the reply ends just before the first stop string, in every split" {
+    const Case = struct {
+        stops: []const []const u8,
+        pieces: []const []const u8,
+        text: []const u8,
+        stopped: bool,
+    };
+    const cases = [_]Case{
+        // Inside one piece, across two, and across three.
+        .{ .stops = &.{"END"}, .pieces = &.{"abcENDxyz"}, .text = "abc", .stopped = true },
+        .{ .stops = &.{"END"}, .pieces = &.{ "abcE", "NDxyz" }, .text = "abc", .stopped = true },
+        .{ .stops = &.{"END"}, .pieces = &.{ "abE", "N", "Dx" }, .text = "ab", .stopped = true },
+        // Overlapping candidates: the first "aab" fails, the second one matches.
+        .{ .stops = &.{"aab"}, .pieces = &.{ "xa", "a", "aab" }, .text = "xaa", .stopped = true },
+        // Two stop strings: the earlier position wins, whatever the list order.
+        .{ .stops = &.{ "yz", "bc" }, .pieces = &.{"abcxyz"}, .text = "a", .stopped = true },
+        // A stop string that is a prefix of another one.
+        .{ .stops = &.{ "abc", "ab" }, .pieces = &.{ "xa", "bc" }, .text = "x", .stopped = true },
+        // A two-byte code point split at the boundary, inside a stop string.
+        .{
+            .stops = &.{"\u{e9}t"},
+            .pieces = &.{ "caf\xc3", "\xa9t!" },
+            .text = "caf",
+            .stopped = true,
+        },
+        // A held prefix that never completes flushes at the end.
+        .{ .stops = &.{"END"}, .pieces = &.{ "abcE", "N" }, .text = "abcEN", .stopped = false },
+        .{ .stops = &.{"END"}, .pieces = &.{ "abcE", "Nx" }, .text = "abcENx", .stopped = false },
+        // No stop string passes every byte at once.
+        .{ .stops = &.{}, .pieces = &.{ "ab", "c" }, .text = "abc", .stopped = false },
+    };
+    for (cases, 0..) |c, i| {
+        errdefer std.debug.print("StopMatcher case {d}\n", .{i});
+
+        var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+        defer arena_state.deinit();
+
+        const got = try runMatcher(arena_state.allocator(), c.stops, c.pieces);
+        try std.testing.expectEqualStrings(c.text, got.text);
+        try std.testing.expectEqual(c.stopped, got.stopped);
+    }
+}
+
+test "StopMatcher: a held tail stays below the longest stop string" {
+    var m: StopMatcher = .init(&.{"abcd"});
+    // Every byte can start the stop string, so each call holds the longest matching tail.
+    try std.testing.expectEqualStrings("", m.feed("a").text);
+    try std.testing.expectEqualStrings("", m.feed("b").text);
+    try std.testing.expectEqualStrings("", m.feed("c").text);
+    // "abca" holds no stop string, and only its last "a" can still start one.
+    try std.testing.expectEqualStrings("abc", m.feed("a").text);
+    try std.testing.expectEqualStrings("a", m.finish());
+}
+
+test "parseChatRequest: content forms and stop strings" {
+    const cases = [_]ParseCase{
+        // Text parts join in order with no separator.
+        .{
+            .body = "{\"messages\":[{\"role\":\"user\",\"content\":[" ++
+                "{\"type\":\"text\",\"text\":\"ab\"},{\"type\":\"text\",\"text\":\"c\"}]}]}",
+            .want = .{ .first_content = "abc" },
+        },
+        // Null on an assistant message is the empty text, and absent content is too.
+        .{
+            .body = "{\"messages\":[{\"role\":\"assistant\",\"content\":null}]}",
+            .want = .{ .first_content = "" },
+        },
+        .{
+            .body = "{\"messages\":[{\"role\":\"user\"}]}",
+            .want = .{ .first_content = "" },
+        },
+        // Null on a user message, a number, and a malformed part keep the wrong-type 400.
+        .{
+            .body = "{\"messages\":[{\"role\":\"user\",\"content\":null}]}",
+            .want = .{ .err = error.BadField, .field = .messages },
+        },
+        .{
+            .body = "{\"messages\":[{\"role\":\"user\",\"content\":7}]}",
+            .want = .{ .err = error.BadField, .field = .messages },
+        },
+        .{
+            .body = "{\"messages\":[{\"role\":\"user\",\"content\":[{\"text\":\"x\"}]}]}",
+            .want = .{ .err = error.BadField, .field = .messages },
+        },
+        .{
+            .body = "{\"messages\":[{\"role\":\"user\",\"content\":[" ++
+                "{\"type\":\"input_audio\"}]}]}",
+            .want = .{ .err = error.ContentPartUnsupported },
+        },
+        .{
+            .body = "{\"messages\":[{\"role\":\"user\",\"content\":[" ++
+                ("{\"type\":\"text\",\"text\":\"x\"}," ** 64) ++
+                "{\"type\":\"text\",\"text\":\"x\"}]}]}",
+            .want = .{ .err = error.TooManyParts },
+        },
+        // Stop: a string, an array, and each edge.
+        .{ .body = withExtra(",\"stop\":\"x\""), .want = .{ .stops = 1 } },
+        .{ .body = withExtra(",\"stop\":[\"a\",\"b\",\"c\",\"d\"]"), .want = .{ .stops = 4 } },
+        .{ .body = withExtra(",\"stop\":null"), .want = .{ .stops = 0 } },
+        refuse(",\"stop\":[\"a\",\"b\",\"c\",\"d\",\"e\"]", error.BadStop),
+        refuse(",\"stop\":\"\"", error.BadStop),
+        refuse(",\"stop\":[1]", error.BadStop),
+        refuse(",\"stop\":7", error.BadStop),
+        refuse(",\"stop\":\"" ++ "x" ** 65 ++ "\"", error.BadStop),
+        .{ .body = withExtra(",\"stop\":\"" ++ "x" ** 64 ++ "\""), .want = .{ .stops = 1 } },
+    };
+    for (cases, 0..) |c, i| {
+        errdefer std.debug.print("content and stop case {d}\n", .{i});
+        try checkParse(c);
+    }
+}
+
+test "reqErrorToHttp: a content part of another type is a 400 that names the type" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+
+    var diag: Diag = .{};
+    const body = "{\"messages\":[{\"role\":\"user\",\"content\":[{\"type\":\"image_url\"}]}]}";
+    const got = parseChatRequest(arena_state.allocator(), body, 8, 64, &diag);
+    try std.testing.expectError(error.ContentPartUnsupported, got);
+    const http = reqErrorToHttp(error.ContentPartUnsupported, diag);
+    try std.testing.expectEqual(@as(u16, 400), http.status);
+    try std.testing.expect(std.mem.find(u8, http.message, "\"image_url\"") != null);
+    try std.testing.expect(std.mem.find(u8, http.message, "text only") != null);
 }

@@ -87,6 +87,8 @@ pub const ServeFlags = struct {
     engine: EngineFlags = .{},
     max_sessions: u16 = 4,
     max_connections: u32 = 8,
+    /// The default is the default of the llama.cpp server option `--timeout`.
+    io_timeout: u32 = 600,
     max_batch: ?u16 = null,
     prefill_chunk: ?u32 = null,
     vram_slots: ?u16 = null,
@@ -121,6 +123,16 @@ pub const ServeFlags = struct {
             .text = std.fmt.comptimePrint(
                 "live client connections, cap {d}",
                 .{limits.max_connections},
+            ),
+        },
+        .io_timeout = Doc{
+            .group = "sessions",
+            .value = "S",
+            .text = std.fmt.comptimePrint(
+                "seconds one socket read or write can wait, cap {d}.\n" ++
+                    "0 = no deadline. Linux only. A binary client that\n" ++
+                    "holds a session keeps its connection when idle",
+                .{limits.max_io_timeout_s},
             ),
         },
         .max_batch = Doc{
@@ -258,6 +270,7 @@ test "ServeFlags: every shared serve flag reaches its field" {
     const argv = [_][]const u8{
         "--max-sessions",    "6",
         "--max-connections", "9",
+        "--io-timeout",      "30",
         "--max-batch",       "3",
         "--prefill-chunk",   "0",
         "--vram-slots",      "2",
@@ -279,6 +292,7 @@ test "ServeFlags: every shared serve flag reaches its field" {
     const p = cmd.serve;
     try std.testing.expectEqual(@as(u16, 6), p.max_sessions);
     try std.testing.expectEqual(@as(u32, 9), p.max_connections);
+    try std.testing.expectEqual(@as(u32, 30), p.io_timeout);
     try std.testing.expectEqual(@as(?u16, 3), p.max_batch);
     try std.testing.expectEqual(@as(?u32, 0), p.prefill_chunk);
     try std.testing.expectEqual(@as(?u16, 2), p.vram_slots);
@@ -293,6 +307,23 @@ test "ServeFlags: every shared serve flag reaches its field" {
     try std.testing.expectEqual(@as(?u32, 2), p.engine.threads.threads);
     try std.testing.expectEqual(chat.ThinkingFlag.off, p.engine.thinking);
     try std.testing.expectEqual(@as(u32, 7), p.engine.thinking_budget);
+}
+
+test "ServeFlags: the help names the io deadline, its cap, and the llama.cpp default" {
+    const Probe = struct {
+        serve: ServeFlags = .{},
+        pub const help: args.Help = .{ .usage = "probe", .about = "" };
+    };
+    const body = comptime args.helpBody(Probe);
+
+    try std.testing.expect(std.mem.find(u8, body, "--io-timeout S") != null);
+    const cap = std.fmt.comptimePrint("cap {d}", .{limits.max_io_timeout_s});
+    try std.testing.expect(std.mem.find(u8, body, cap) != null);
+    try std.testing.expect(std.mem.find(u8, body, "Linux only") != null);
+    const flag = std.mem.find(u8, body, "--io-timeout S").?;
+    const default = std.mem.find(u8, body[flag..], "[default: 600]").?;
+    // The default closes the entry of the flag, before the next flag starts.
+    try std.testing.expect(std.mem.find(u8, body[flag..][0..default], "\n  --") == null);
 }
 
 test "groupDigits: groups of three from the right, as the Zig source writes them" {

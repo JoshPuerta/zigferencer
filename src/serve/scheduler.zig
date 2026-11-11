@@ -155,6 +155,9 @@ pub const Config = struct {
     prefill: prefill_chunk.Rule = .spare_rows,
     /// Live client connections, in 1..limits.max_connections. Only the engine reads it.
     max_connections: u32 = 8,
+    /// The deadline of one socket read or write of a connection task. 0 sets no deadline. Only
+    /// the engine reads it, and it hands the value to the connection tasks.
+    io_timeout_ms: u32 = 0,
     /// A wire client can stop the server with a `shutdown` request.
     allow_shutdown: bool = false,
     /// Lifetime must cover the scheduler's. Must be <= limits.max_model_name_bytes.
@@ -1436,6 +1439,12 @@ pub fn Scheduler(comptime Engine: type, comptime CodecT: type) type {
                 slot.owner = .{ .detached = deadline };
                 log.info("detach: session {d}, lease {d} ms", .{ slot.proto_id, lease.ttl_ms });
             }
+
+            // Postcondition: no session is attached to the connection. The loop above frees or
+            // detaches each one, and an emit names only an attached session or a request sender.
+            for (self.slots) |*slot| {
+                std.debug.assert(slot.state == .free or !attachedTo(slot, conn));
+            }
         }
 
         /// The lazy expiry scan at `now`. It frees every detached slot at or
@@ -1569,6 +1578,19 @@ pub fn Scheduler(comptime Engine: type, comptime CodecT: type) type {
             }
 
             return best;
+        }
+
+        /// The sessions attached to connection `conn`. The engine thread calls it after a request
+        /// that attaches a session or takes one away.
+        pub fn sessionsOf(self: *const Self, conn: u32) u32 {
+            var n: u32 = 0;
+            for (self.slots) |*slot| {
+                if (slot.state != .free and attachedTo(slot, conn)) {
+                    n += 1;
+                }
+            }
+
+            return n;
         }
 
         fn attachedTo(slot: *const Slot, conn: u32) bool {

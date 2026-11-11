@@ -778,6 +778,237 @@ test "a hang-up mid-turn sweeps only its own sessions" {
     try std.testing.expectEqual(@as(u16, 2), (try b.stats()).sessions_open);
 }
 
+test "a binary connection that never sends its handshake closes at the deadline" {
+    var h = try Harness.boot(std.testing.allocator, std.testing.io, .tcp, .{
+        .max_connections = 1,
+        .io_timeout_ms = harness.test_io_timeout_ms,
+    });
+    defer h.deinit();
+
+    // The server sends its greeting and READY, then waits for the handshake until the deadline.
+    const silent = try h.connectRaw();
+    defer silent.close(h.io);
+    try std.testing.expect(try harness.awaitServerClose(silent) > 0);
+
+    // The one slot serves again. No order joins the release of the slot and this connect, so the
+    // loop retries a refusal, and the bound turns a slot that never frees into a failure.
+    const connect_attempts_max = 64;
+    for (0..connect_attempts_max) |_| {
+        var c = try h.connect();
+        defer c.deinit();
+
+        c.ping() catch |err| {
+            if (err != error.ServerError) return err;
+            try std.testing.expectEqual(
+                protocol.ErrorCode.connections_exhausted,
+                c.last_error.?.code,
+            );
+            continue;
+        };
+        h.stop(&c);
+        return;
+    }
+
+    std.debug.print("no slot freed within {d} connects\n", .{connect_attempts_max});
+    return error.TestUnexpectedResult;
+}
+
+test "a binary client that holds a session keeps its connection past the idle deadline" {
+    var h = try Harness.boot(std.testing.allocator, std.testing.io, .tcp, .{
+        .io_timeout_ms = harness.test_io_timeout_ms,
+    });
+    defer h.deinit();
+
+    var c = try h.connect();
+    defer c.deinit();
+    defer h.stop(&c);
+
+    _ = try openGreedy(&c);
+    // A silent socket closes at the deadline, so its close marks a wait past the deadline.
+    const silent = try h.connectRaw();
+    defer silent.close(h.io);
+    _ = try harness.awaitServerClose(silent);
+    try c.ping();
+}
+
+/// Connect clients until one gets a pong. A slot frees after the engine handles the end of the
+/// last connection, and no order joins that and this connect, so the loop retries a refusal. The
+/// bound turns a slot that never frees into a failure.
+fn expectSlotServes(h: *Harness) !void {
+    const connect_attempts_max = 64;
+    for (0..connect_attempts_max) |_| {
+        // A refusal can reset the connection before the handshake ends.
+        var c = h.connect() catch continue;
+        defer c.deinit();
+
+        c.ping() catch |err| {
+            if (err != error.ServerError) continue;
+            try std.testing.expectEqual(
+                protocol.ErrorCode.connections_exhausted,
+                c.last_error.?.code,
+            );
+            continue;
+        };
+        return;
+    }
+
+    std.debug.print("no slot freed within {d} connects\n", .{connect_attempts_max});
+    return error.TestUnexpectedResult;
+}
+
+test "a binary client with no session that stays silent is closed at the idle deadline" {
+    var h = try Harness.boot(std.testing.allocator, std.testing.io, .tcp, .{
+        .max_connections = 1,
+        .io_timeout_ms = harness.test_io_timeout_ms,
+    });
+    defer h.deinit();
+
+    var silent = try h.connect();
+    defer silent.deinit();
+    try silent.ping();
+    _ = try harness.awaitServerClose(silent.stream);
+
+    try expectSlotServes(&h);
+}
+
+test "a binary client that floods PING and never reads frees its slot" {
+    var h = try Harness.boot(std.testing.allocator, std.testing.io, .tcp, .{
+        .max_connections = 1,
+        .io_timeout_ms = harness.test_io_timeout_ms,
+    });
+    defer h.deinit();
+
+    {
+        var stalled = try h.connect();
+        defer stalled.deinit();
+
+        const fd = stalled.stream.socket.handle;
+        const rcvbuf: c_int = 4096;
+        const posix = std.posix;
+        try posix.setsockopt(fd, posix.SOL.SOCKET, posix.SO.RCVBUF, std.mem.asBytes(&rcvbuf));
+
+        // The writer meets its deadline on the full socket, and the reader waits on the full
+        // queue. The flood stops at its own write deadline, once the reader stops reading.
+        const body = [_]u8{ 4, 'P', 'I', 'N', 'G', 0, 0 } ++ [_]u8{'x'} ** 16;
+        var head: [zigferencer.serve_zmtp.long_head_bytes]u8 = undefined;
+        const head_len = zigferencer.serve_zmtp.encodeFrameHead(body.len, true, &head);
+        var write_buf: [4096]u8 = undefined;
+        const Writer = zigferencer.serve_timed_stream.Writer;
+        var w: Writer = .init(stalled.stream, h.io, &write_buf, 1_000);
+        // The pongs of the bound pass the loopback buffers many times over.
+        const pings_max = 1 << 20;
+        var pings: u32 = 0;
+        while (pings < pings_max) : (pings += 1) {
+            w.interface.writeAll(head[0..head_len]) catch break;
+            w.interface.writeAll(&body) catch break;
+        }
+    }
+
+    try expectSlotServes(&h);
+}
+
+test "a client that half-closes during a turn ends the turn, and gets no done" {
+    var h = try Harness.boot(std.testing.allocator, std.testing.io, .tcp, .{});
+    defer h.deinit();
+
+    var c = try h.connect();
+    defer c.deinit();
+
+    const sid = try openGreedy(&c);
+    _ = try c.generate(sid, prompts[0], long_turn_tokens, null);
+    try c.stream.shutdown(h.io, .send);
+    // The sweep at conn_closed ends the turn, so the stream ends before any `done`.
+    const events_max = long_turn_tokens + 1;
+    for (0..events_max) |_| {
+        const ev = c.next() catch |err| {
+            try std.testing.expectEqual(error.EndOfStream, err);
+            return;
+        };
+        try std.testing.expect(ev.msg != .done);
+    }
+
+    return error.TestUnexpectedResult;
+}
+
+test "a client that half-closes after a request still gets the reply" {
+    var h = try Harness.boot(std.testing.allocator, std.testing.io, .tcp, .{});
+    defer h.deinit();
+
+    var c = try h.connect();
+    defer c.deinit();
+
+    // The reader reads the request and then the end of the stream. The reply must still come,
+    // and the server closes after it.
+    _ = try c.send(.ping, 0);
+    try c.stream.shutdown(h.io, .send);
+    const ev = try c.next();
+    try std.testing.expect(ev.msg == .pong);
+    try std.testing.expectError(error.EndOfStream, c.next());
+}
+
+test "a stop while the acceptor refuses a client returns" {
+    const opts: harness.Options = .{ .max_connections = 1 };
+    var h = try Harness.boot(std.testing.allocator, std.testing.io, .tcp, opts);
+    defer h.deinit();
+
+    var a = try h.connect();
+    defer a.deinit();
+
+    try a.ping();
+    // Each refused client keeps the acceptor busy in a refusal while the stop arrives.
+    const refused_max = 8;
+    var refused: [refused_max]Client = undefined;
+    var n: usize = 0;
+    defer for (refused[0..n]) |*r| r.deinit();
+    while (n < refused_max) : (n += 1) {
+        refused[n] = try h.connect();
+    }
+
+    h.stop(&a);
+    try std.testing.expect(!h.running);
+}
+
+test "a stop while a binary client does not read returns before the io deadline" {
+    // The deadline is far longer than the bound below, so only the teardown can end the write.
+    const io_timeout_ms = 30_000;
+    const stop_bound_ms = 5_000;
+    var h = try Harness.boot(std.testing.allocator, std.testing.io, .tcp, .{
+        .io_timeout_ms = io_timeout_ms,
+    });
+    defer h.deinit();
+
+    var stalled = try h.connect();
+    defer stalled.deinit();
+
+    // A small receive buffer keeps the window small, so the server send buffer fills early.
+    const fd = stalled.stream.socket.handle;
+    const rcvbuf: c_int = 4096;
+    const posix = std.posix;
+    try posix.setsockopt(fd, posix.SOL.SOCKET, posix.SO.RCVBUF, std.mem.asBytes(&rcvbuf));
+
+    // The reader answers a ZMTP PING with a PONG in the out-queue and waits while the queue is
+    // full. So once the writer blocks on the full socket, the reader stops reading, and the
+    // flood stops at its own write deadline.
+    const body = [_]u8{ 4, 'P', 'I', 'N', 'G', 0, 0 } ++ [_]u8{'x'} ** 16;
+    var head: [zigferencer.serve_zmtp.long_head_bytes]u8 = undefined;
+    const head_len = zigferencer.serve_zmtp.encodeFrameHead(body.len, true, &head);
+    var write_buf: [4096]u8 = undefined;
+    var w: zigferencer.serve_timed_stream.Writer = .init(stalled.stream, h.io, &write_buf, 1_000);
+    // The pongs of the bound pass the loopback buffers many times over.
+    const pings_max = 1 << 20;
+    var pings: u32 = 0;
+    while (pings < pings_max) : (pings += 1) {
+        w.interface.writeAll(head[0..head_len]) catch break;
+        w.interface.writeAll(&body) catch break;
+    }
+    try std.testing.expect(w.timed_out);
+
+    const start = std.Io.Clock.Timestamp.now(h.io, .awake);
+    h.stopFromOwner();
+    const took = start.durationTo(std.Io.Clock.Timestamp.now(h.io, .awake));
+    try std.testing.expect(took.raw.toMilliseconds() < stop_bound_ms);
+}
+
 test "a connection past its session share gets sessions_exhausted" {
     var h = try Harness.boot(
         std.testing.allocator,

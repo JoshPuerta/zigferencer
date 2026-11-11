@@ -3,8 +3,10 @@
 //! body, and `std.json.Stringify` serializes the rest back.
 //!
 //! Parse. Every optional field has a default, so a minimal request parses. The parse drops
-//! unknown fields (`ParseOptions.ignore_unknown_fields`), so a full OpenAI client with tools and
-//! stop strings still round-trips. The map layer logs each unknown field name once per process.
+//! unknown fields (`ParseOptions.ignore_unknown_fields`), so a full OpenAI client with tools still
+//! round-trips. The map layer logs each unknown field name once per process. A field that takes
+//! more than one JSON form (`content`, `stop`) parses as a `std.json.Value`, and the map layer
+//! checks the form.
 //!
 //! Sampling. Every sampling field is a named field here, so no sampling value drops in silence.
 //!
@@ -12,12 +14,15 @@
 //! A streamed `Delta` carries `{role}` first, then `{reasoning_content}` chunks for a think block
 //! and `{content}` chunks for the reply. The final chunk carries `{}` plus a `finish_reason`.
 
+const std = @import("std");
+
 // -- types ------------------------------------------------------------------
 
 /// One message as the client sends it. The map layer narrows the free string `role` to `chat.Role`.
 pub const ChatMessage = struct {
     role: []const u8,
-    content: []const u8 = "",
+    /// A string, an array of content parts, or null. An absent field is the empty string.
+    content: std.json.Value = .{ .string = "" },
 };
 
 pub const ChatRequest = struct {
@@ -38,6 +43,8 @@ pub const ChatRequest = struct {
     /// The vLLM field: -1 takes the server value, 0 turns thinking off.
     thinking_token_budget: ?i64 = null,
     n: ?u32 = null,
+    /// A string or an array of strings. Null and an absent field set no stop string.
+    stop: std.json.Value = .null,
     chat_template_kwargs: ?ChatTemplateKwargs = null,
 };
 

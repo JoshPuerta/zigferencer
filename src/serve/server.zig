@@ -29,6 +29,7 @@ const zmtp = @import("zmtp.zig");
 const event = @import("event.zig");
 const chat = @import("../core/chat.zig");
 const engine_mod = @import("engine.zig");
+const timed_stream = @import("timed_stream.zig");
 const Request = event.Request;
 const OutEvent = event.OutEvent;
 
@@ -57,12 +58,13 @@ const BinaryAdapter = struct {
         writer_future: Io.Future(void) = undefined,
     };
 
+    pub const conn_tasks: u8 = 2;
+
     /// Spawn the writer then the reader, and store their futures in `conn.ext`. A spawn failure
     /// leaves the stream closed and returns false, so the engine reclaims the slot.
     pub fn onAccept(engine: anytype, conn: anytype) bool {
-        log.debug("accept: conn {d}", .{conn.id});
+        log.debug("accept: conn {d}", .{engine.connId(conn)});
         const Tasks = BinaryTasks(@TypeOf(engine.*));
-        conn.tasks_live.store(2, .release);
         conn.ext.writer_future = engine.io.concurrent(Tasks.writer, .{ engine, conn }) catch {
             conn.stream.close(engine.io);
             return false;
@@ -77,11 +79,14 @@ const BinaryAdapter = struct {
         return true;
     }
 
-    /// Close the out-queue. The writer drains it and shuts the stream down, which wakes the
-    /// reader, and both tasks exit.
+    /// Close the out-queue, and shut the socket down. A writer blocked on a client that does not
+    /// read and a reader blocked on a silent client then return at once.
     pub fn beginClose(engine: anytype, conn: anytype) void {
-        log.debug("close: conn {d}", .{conn.id});
+        log.debug("close: conn {d}", .{engine.connId(conn)});
         engine.closeOutput(conn);
+        if (engine.claimStreamForTeardown(conn)) {
+            conn.stream.shutdown(engine.io, .both) catch {};
+        }
     }
 
     pub fn awaitConn(engine: anytype, conn: anytype) void {
@@ -89,24 +94,21 @@ const BinaryAdapter = struct {
         conn.ext.writer_future.await(engine.io);
     }
 
-    /// Sends the greeting and READY of the ROUTER side, then the refusal as one message, and
-    /// closes. It reads nothing, so a silent peer cannot stall the acceptor.
+    /// Sends the greeting and READY of the ROUTER side, then the refusal as one message, in one
+    /// send that does not wait, and closes. A silent peer cannot stall the acceptor.
     pub fn refuse(io: Io, stream: *net.Stream) void {
         log.debug("refuse: connection slots full", .{});
         const ev = OutEvent.fail(0, 0, .connections_exhausted, "connection slots full");
         var frame: [writer_frame_bytes]u8 = undefined;
-        var write_buf: [zmtp.greeting_bytes + 2 * writer_frame_bytes]u8 = undefined;
-        var w = stream.writer(io, &write_buf);
+        var bytes: [zmtp.greeting_bytes + 2 * writer_frame_bytes]u8 = undefined;
+        var w: Io.Writer = .fixed(&bytes);
         send: {
-            writeOpening(&w.interface, &frame) catch break :send;
-            writeEvent(&w.interface, &frame, &ev) catch break :send;
-            w.interface.flush() catch break :send;
+            writeOpening(&w, &frame) catch break :send;
+            writeEvent(&w, &frame, &ev) catch break :send;
+            timed_stream.sendOnce(io, stream.*, w.buffered());
         }
 
-        // A close over the unread peer handshake resets the connection. Shut the send side first,
-        // so the peer reads the refusal and then the end of the stream.
-        stream.shutdown(io, .send) catch {};
-        stream.close(io);
+        timed_stream.closeRefused(io, stream);
     }
 };
 
@@ -121,27 +123,24 @@ fn BinaryTasks(comptime Eng: type) type {
         fn reader(engine: *Eng, conn: *Eng.Conn) void {
             span.nameThread("zf-read");
             readerLoop(engine, conn);
-            // The engine must hear about the drop exactly once, even when the queue is briefly
-            // full. A closed queue means teardown already runs.
-            engine.submit(.{
-                .conn = conn.id,
-                .request_id = 0,
-                .session_id = 0,
-                .body = .conn_closed,
-            }) catch {};
-            engine.taskExit(conn);
+            engine.taskExit(conn, .reader);
         }
 
         fn writer(engine: *Eng, conn: *Eng.Conn) void {
             span.nameThread("zf-write");
             var write_buf: [4096]u8 = undefined;
-            var w = conn.stream.writer(engine.io, &write_buf);
+            const timeout_ms = engine.io_timeout_ms;
+            var w: timed_stream.Writer = .init(conn.stream, engine.io, &write_buf, timeout_ms);
+            defer if (w.timed_out) {
+                log.debug("write: conn {d} closed at the io deadline", .{engine.connId(conn)});
+            };
+
             var frame: [writer_frame_bytes]u8 = undefined;
             send: {
                 // Send the opening first.
                 writeOpening(&w.interface, &frame) catch break :send;
                 w.interface.flush() catch break :send;
-                log.debug("handshake: conn {d} sent greeting and READY", .{conn.id});
+                log.debug("handshake: conn {d} sent greeting and READY", .{engine.connId(conn)});
                 while (true) {
                     const ev = conn.out_q.getOne(engine.io) catch break;
                     const sp = span.begin(.socket_write);
@@ -150,29 +149,50 @@ fn BinaryTasks(comptime Eng: type) type {
                     writeEvent(&w.interface, &frame, &ev) catch break;
                     w.interface.flush() catch break;
                     if (conn.parked_hint.swap(false, .acq_rel)) {
-                        engine.wake(conn.id);
+                        engine.wake(engine.connId(conn));
                     }
                 }
             }
 
             conn.stream.shutdown(engine.io, .both) catch {};
-            engine.taskExit(conn);
+            engine.taskExit(conn, .writer);
         }
     };
 }
 
 // -- helpers ----------------------------------------------------------------
 
+/// Wait for the first byte of the next frame. False ends the reader: a closed socket, or the
+/// deadline of a connection that holds no session and no request. A connection that holds one
+/// waits again, because a client can hold a session with no traffic. So the loop has no bound.
+fn awaitFrame(engine: anytype, conn: anytype, r: *timed_stream.Reader) bool {
+    while (true) {
+        _ = r.interface.peekByte() catch {
+            if (!r.timed_out) return false;
+            if (engine.connIdle(conn)) return false;
+
+            r.timed_out = false;
+            continue;
+        };
+        return true;
+    }
+}
+
 fn readerLoop(engine: anytype, conn: anytype) void {
     // Read the peer handshake, or refuse it with a ZMTP ERROR.
     var read_buf: [4096]u8 = undefined;
-    var r = conn.stream.reader(engine.io, &read_buf);
+    var r: timed_stream.Reader = .init(conn.stream, engine.io, &read_buf, engine.io_timeout_ms);
+    defer if (r.timed_out) {
+        log.debug("read: conn {d} closed at the io deadline", .{engine.connId(conn)});
+    };
+
     const peer = readHandshake(&r.interface, &conn.ext.payload_buf) catch |e| {
         const reason: []const u8 = switch (e) {
             error.ReadFailed, error.EndOfStream => return,
             // A peer that is not ZMTP 3 cannot read an ERROR command.
             error.BadSignature, error.UnsupportedVersion => {
-                log.debug("handshake: conn {d} closed on the greeting, {t}", .{ conn.id, e });
+                const id = engine.connId(conn);
+                log.debug("handshake: conn {d} closed on the greeting, {t}", .{ id, e });
                 return;
             },
             error.MechanismUnsupported => "NULL only",
@@ -182,11 +202,13 @@ fn readerLoop(engine: anytype, conn: anytype) void {
 
         return fatalHandshake(engine, conn, reason);
     };
-    log.debug("handshake: conn {d} accepted peer type '{s}'", .{ conn.id, peer });
+    log.debug("handshake: conn {d} accepted peer type '{s}'", .{ engine.connId(conn), peer });
 
     // Read one frame per pass. A command body holds at most `zmtp.max_ready_bytes`, and a message
     // at most `zmtp.max_message_bytes`.
     while (true) {
+        if (!awaitFrame(engine, conn, &r)) return;
+
         const head = zmtp.readFrameHead(&r.interface) catch |e| switch (e) {
             error.ReadFailed, error.EndOfStream => return,
             else => return fatalFrame(engine, conn, .malformed_frame, "bad frame head"),
@@ -243,11 +265,11 @@ fn readerLoop(engine: anytype, conn: anytype) void {
         const msg = protocol.decodeClientPayload(h.msg_type, payload) catch |e| {
             return fatalFrame(engine, conn, decodeErrorCode(e), @errorName(e));
         };
-        const req = toRequest(engine.gpa, conn.id, h, msg) catch |err| {
-            log.debug("conn {d}: request failed: {t}", .{ conn.id, err });
+        const req = toRequest(engine.gpa, engine.connId(conn), h, msg) catch |err| {
+            log.debug("conn {d}: request failed: {t}", .{ engine.connId(conn), err });
             return;
         };
-        engine.submit(req) catch {
+        engine.submitFrom(conn, req) catch {
             engine_mod.freeRequestText(engine.gpa, req);
             return;
         };
@@ -275,12 +297,13 @@ fn readHandshake(r: *Io.Reader, body_buf: []u8) HandshakeError![]const u8 {
     return ready.socket_type;
 }
 
-/// Codes 1-4: reply, then close THAT connection. The process never dies on input.
+/// Codes 1-4: reply, then close THAT connection. The process never dies on input. The reader then
+/// exits, so the engine still replies to the earlier requests of the connection before it closes
+/// the queue. Those replies follow the error frame.
 fn fatalFrame(engine: anytype, conn: anytype, code: protocol.ErrorCode, detail: []const u8) void {
-    log.debug("frame: conn {d} closed, {t}: {s}", .{ conn.id, code, detail });
+    log.debug("frame: conn {d} closed, {t}: {s}", .{ engine.connId(conn), code, detail });
     const ev = OutEvent.fail(0, 0, code, detail);
     _ = conn.out_q.put(engine.io, &.{ev}, 0) catch {};
-    engine.closeOutput(conn);
 }
 
 fn decodeErrorCode(e: protocol.DecodeError) protocol.ErrorCode {
@@ -294,9 +317,8 @@ fn decodeErrorCode(e: protocol.DecodeError) protocol.ErrorCode {
 
 /// A refused handshake answers with one ZMTP ERROR, then closes THAT connection.
 fn fatalHandshake(engine: anytype, conn: anytype, reason: []const u8) void {
-    log.debug("handshake: conn {d} refused, {s}", .{ conn.id, reason });
+    log.debug("handshake: conn {d} refused, {s}", .{ engine.connId(conn), reason });
     _ = conn.out_q.put(engine.io, &.{OutEvent.zmtpError(reason)}, 0) catch {};
-    engine.closeOutput(conn);
 }
 
 /// Writes the greeting and the READY command of the ROUTER side. `frame` holds the READY frame.

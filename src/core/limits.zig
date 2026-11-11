@@ -208,9 +208,14 @@ pub const trace_spans_env = "ZIGFERENCER_TRACE_SPANS";
 pub const max_logical_sessions: u32 = 128;
 
 /// Ceiling on live serve connections, the clients one server holds at once. A binary connection
-/// costs two worker threads and one payload buffer of 64 KiB. Every connection holds one queue of
-/// 256 events. `cli/boot/serve_checks.zig` refuses a count past it.
+/// costs two worker threads. The slot table holds two slots per allowed connection, and each slot
+/// holds one queue of 256 events and, on the binary wire, one payload buffer of 64 KiB.
+/// `cli/boot/serve_checks.zig` refuses a count past it.
 pub const max_connections: u32 = 64;
+
+/// Ceiling on `--io-timeout`, one hour, the lease ceiling below. A longer wait holds a connection
+/// slot for a client that sends nothing.
+pub const max_io_timeout_s: u32 = 3_600;
 
 /// Ceiling on the time to live of a session lease, one hour. A detached session holds a slot until
 /// its lease deadline, so this bounds that hold.
@@ -254,6 +259,22 @@ pub const openai_max_header_bytes: usize = 16 * 1024; // http.Server head buffer
 /// The most messages in one rendered conversation. A render holds one plain range per message.
 pub const max_chat_messages: usize = 64;
 pub const openai_max_messages: usize = max_chat_messages; // messages[] length cap
+/// The most content parts in one message. It bounds the loop that joins the parts. A client splits
+/// a text message into a few parts, and the body cap bounds the bytes, so the count needs no more.
+pub const openai_max_content_parts: usize = 64;
+/// The most stop strings in one request, the limit of the OpenAI API.
+pub const openai_max_stops: usize = 4;
+/// The longest stop string in bytes. It bounds the stream holdback to one byte less. A stop string
+/// is a short marker, such as the end tag of a chat format, so the cap passes the usual markers
+/// and keeps the holdback below `max_token_text_bytes`.
+pub const openai_max_stop_bytes: usize = 64;
+
+/// The TCP keepalive of an accepted socket. A peer that vanishes with no close is found after the
+/// idle time plus `keepalive_probes` unanswered probes, `keepalive_interval_s` apart: 60 + 6 * 10
+/// = 120 seconds. Then the next socket read fails, and the slot frees.
+pub const keepalive_idle_s: c_int = 60;
+pub const keepalive_interval_s: c_int = 10;
+pub const keepalive_probes: c_int = 6;
 
 /// The `max_tokens` of a request that omits it. 0 is the whole window.
 pub const openai_default_max_tokens: u32 = 0;
@@ -670,6 +691,11 @@ comptime {
     // The sum stays a 64-bit count of nanoseconds, far from the clock range.
     std.debug.assert(max_resume_ttl_ms >= 1);
     std.debug.assert(@as(u64, max_resume_ttl_ms) * std.time.ns_per_ms <= std.math.maxInt(i64));
+    std.debug.assert(openai_max_stop_bytes < max_token_text_bytes);
+    // The keepalive doc states the detection time.
+    std.debug.assert(keepalive_idle_s + keepalive_probes * keepalive_interval_s == 120);
+    // The serve config holds the deadline in milliseconds in a u32.
+    std.debug.assert(@as(u64, max_io_timeout_s) * std.time.ms_per_s <= std.math.maxInt(u32));
 }
 
 // -- tests ------------------------------------------------------------------

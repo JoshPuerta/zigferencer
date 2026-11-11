@@ -15,6 +15,9 @@
 //! `test_fixtures.path`. `boot` returns `error.SkipZigTest` only when that function does. A load
 //! failure or a bind failure fails the test.
 //!
+//! Close waits. `awaitServerClose` reads a raw socket until the server closes it. Each read waits
+//! at most `close_wait_ms`, so a server with no deadline fails a test and does not hang it.
+//!
 //! Chat template. The kind defaults to `.none`, because template wrapping has its own unit tests
 //! and the reference comparison holds for any template. A test of the turn wraps names its kind.
 
@@ -43,6 +46,12 @@ pub const turn_tokens_max: u32 = 12;
 
 pub const prompts = [_][]const u8{ "The dragon flew over", "Tell me a story about" };
 
+/// The longest wait of one read in `awaitServerClose`. The deadlines of the tests are far below it.
+pub const close_wait_ms: i32 = 10_000;
+
+/// The server deadline of the deadline tests. It is short, so those tests wait little.
+pub const test_io_timeout_ms: u32 = 250;
+
 // -- types ------------------------------------------------------------------
 
 pub const Endpoint = enum { tcp, unix };
@@ -51,6 +60,8 @@ pub const Options = struct {
     max_sessions: u16 = 3,
     max_batch: u16 = 3,
     max_connections: u32 = 8,
+    /// The deadline of one socket read or write. 0 sets none.
+    io_timeout_ms: u32 = 0,
     sessions_per_connection: u16 = 0,
     allow_shutdown: bool = true,
     /// The longest lease a client can keep. 0 keeps resumption off.
@@ -205,6 +216,7 @@ pub fn HarnessFor(comptime Runner: type) type {
                 .max_step_rows = runner.maxStepRows(),
                 .prefill = opts.prefill,
                 .max_connections = opts.max_connections,
+                .io_timeout_ms = opts.io_timeout_ms,
                 .allow_shutdown = opts.allow_shutdown,
                 .resume_ttl_max_ms = opts.resume_ttl_max_ms,
                 .model_name = "fixture",
@@ -243,6 +255,12 @@ pub fn HarnessFor(comptime Runner: type) type {
                 .tcp => try Client.connectTcp(self.gpa, self.io, self.address),
                 .unix => try Client.connectUnix(self.gpa, self.io, self.path_buf[0..self.path_len]),
             };
+        }
+
+        /// A raw TCP socket to the server, for a test that writes bytes the client never sends.
+        pub fn connectRaw(self: *Self) !Io.net.Stream {
+            std.debug.assert(self.endpoint == .tcp);
+            return self.address.connect(self.io, .{ .mode = .stream });
         }
 
         /// Stop the server over the wire, then wait for the engine loop to return.
@@ -313,6 +331,31 @@ pub fn oneTurn(client: *Client, sid: u32, prompt: []const u8) !Stream {
     s.n = @min(t.n_tokens, s.ids.len);
     s.reason = t.finish_reason;
     return s;
+}
+
+/// Read until the server closes `stream`, and return the count of bytes read. A reset counts as a
+/// close. Each read waits at most `close_wait_ms`, and a longer wait returns `error.NotClosed`.
+pub fn awaitServerClose(stream: Io.net.Stream) !usize {
+    const posix = std.posix;
+    const fd = stream.socket.handle;
+    var buf: [4096]u8 = undefined;
+    var total: usize = 0;
+    // The tests read at most a few MiB before the close, so the bound has a wide margin.
+    const reads_max = 1 << 16;
+    var reads: u32 = 0;
+    while (reads < reads_max) : (reads += 1) {
+        var fds = [_]posix.pollfd{.{ .fd = fd, .events = posix.POLL.IN, .revents = 0 }};
+        if (try posix.poll(&fds, close_wait_ms) == 0) return error.NotClosed;
+
+        const n = posix.read(fd, &buf) catch |err| switch (err) {
+            error.ConnectionResetByPeer => return total,
+            else => return err,
+        };
+        if (n == 0) return total;
+        total += n;
+    }
+
+    return error.NotClosed;
 }
 
 /// The serving invariant for one turn: the same token ids and the same

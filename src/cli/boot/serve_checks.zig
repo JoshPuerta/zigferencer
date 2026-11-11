@@ -122,6 +122,9 @@ fn checkSessions(io: Io, serve: *const flags_mod.ServeFlags, wire: Wire) !u16 {
     if (serve.max_connections == 0 or serve.max_connections > limits.max_connections) {
         return args.fail(io, "--max-connections must be in 1..{d}", .{limits.max_connections});
     }
+    if (serve.io_timeout > limits.max_io_timeout_s) {
+        return args.fail(io, "--io-timeout must be in 0..{d} s", .{limits.max_io_timeout_s});
+    }
     if (wire.resume_ttl_ms > limits.max_resume_ttl_ms) {
         return args.fail(
             io,

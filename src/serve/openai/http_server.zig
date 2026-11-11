@@ -20,6 +20,11 @@
 //! field completes it. An error after the head becomes one error event and then the `[DONE]`
 //! event, the llama.cpp shape. It never reads as a finish.
 //!
+//! Stop. A request with stop strings passes the reply text through `StopMatcher` first. The
+//! matcher holds back a tail that can still start a stop string, and the UTF-8 hold acts on what it
+//! releases. So no emitted byte belongs to a later match, and no chunk ends inside a codepoint. A
+//! match cancels the turn, and the task drains the events up to its `done`.
+//!
 //! Teardown. The task can block in `receiveHead` or while it drains its out-queue. `beginClose`
 //! closes the queue and shuts the socket down to wake a blocked read. It shuts down only after it
 //! claims the fd. If the task already exited and claimed it, the task closes the fd itself, and a
@@ -33,6 +38,7 @@ const http = std.http;
 const span = @import("../../core/span.zig");
 
 const engine_mod = @import("../engine.zig");
+const timed_stream = @import("../timed_stream.zig");
 const protocol = @import("../protocol.zig");
 const chat = @import("../../core/chat.zig");
 const limits = @import("../../core/limits.zig");
@@ -68,7 +74,12 @@ const TurnInput = struct {
     think_open: bool,
     /// Null takes the server budget.
     think_budget: ?u32,
+    /// The stop strings of the request, in the request arena.
+    stop: []const []const u8,
 };
+
+/// What a reply leaves the connection in. An error reply says `connection: close`.
+const Verdict = enum { keep, close };
 
 /// One task per connection. Request and response are half-duplex, so a single
 /// task reads, drives the engine, and writes.
@@ -77,9 +88,10 @@ const HttpAdapter = struct {
         task_future: Io.Future(void) = undefined,
     };
 
+    pub const conn_tasks: u8 = 1;
+
     pub fn onAccept(engine: anytype, conn: anytype) bool {
         const Tasks = HttpTasks(@TypeOf(engine.*));
-        conn.tasks_live.store(1, .release);
         conn.ext.task_future = engine.io.concurrent(Tasks.conn, .{ engine, conn }) catch {
             conn.stream.close(engine.io);
             return false;
@@ -99,14 +111,14 @@ const HttpAdapter = struct {
         conn.ext.task_future.await(engine.io);
     }
 
+    /// One send that does not wait, so a client that does not read cannot stall the acceptor.
     pub fn refuse(io: Io, stream: *net.Stream) void {
-        var buf: [128]u8 = undefined;
-        var w = stream.writer(io, &buf);
-        w.interface.writeAll(
+        timed_stream.sendOnce(
+            io,
+            stream.*,
             "HTTP/1.1 503 Service Unavailable\r\ncontent-length: 0\r\nconnection: close\r\n\r\n",
-        ) catch {};
-        w.interface.flush() catch {};
-        stream.close(io);
+        );
+        timed_stream.closeRefused(io, stream);
     }
 };
 
@@ -146,7 +158,8 @@ const SseSink = struct {
         }
 
         // Join the held tail and the piece, and keep any new split codepoint.
-        var buf: [4 + limits.max_token_text_bytes]u8 = undefined;
+        // A piece is one token text, or a matcher release that adds the held stop prefix.
+        var buf: [4 + limits.max_token_text_bytes + limits.openai_max_stop_bytes]u8 = undefined;
         @memcpy(buf[0..self.pending_len], self.pending[0..self.pending_len]);
         @memcpy(buf[self.pending_len..][0..piece.len], piece);
         const all = buf[0 .. self.pending_len + piece.len];
@@ -191,29 +204,35 @@ fn HttpTasks(comptime Eng: type) type {
         fn conn(engine: *Eng, c: *Conn) void {
             span.nameThread("zf-http");
             serveConn(engine, c);
-            // Tell the engine the connection dropped, so it sweeps any open session.
-            engine.submit(
-                .{ .conn = c.id, .request_id = 0, .session_id = 0, .body = .conn_closed },
-            ) catch {};
-            engine.taskExit(c);
+            engine.taskExit(c, .reader);
         }
 
         fn serveConn(engine: *Eng, c: *Conn) void {
             var read_buf: [limits.openai_max_header_bytes]u8 = undefined;
             var write_buf: [16 * 1024]u8 = undefined;
-            var sr = c.stream.reader(engine.io, &read_buf);
-            var sw = c.stream.writer(engine.io, &write_buf);
+            const timeout_ms = engine.io_timeout_ms;
+            var sr: timed_stream.Reader = .init(c.stream, engine.io, &read_buf, timeout_ms);
+            var sw: timed_stream.Writer = .init(c.stream, engine.io, &write_buf, timeout_ms);
+            defer if (sr.timed_out or sw.timed_out) {
+                log.debug("conn {d}: closed at the io deadline", .{engine.connId(c)});
+            };
+
             var server = http.Server.init(&sr.interface, &sw.interface);
             while (true) {
                 var request = server.receiveHead() catch return;
-                handleRequest(engine, c, &request) catch |err| {
-                    log.debug("conn {d}: request failed: {t}", .{ c.id, err });
+                // Read the switch before the body, because the body read can move the head.
+                const keep_asked = request.head.keep_alive;
+                const verdict = handleRequest(engine, c, &request) catch |err| {
+                    log.debug("conn {d}: request failed: {t}", .{ engine.connId(c), err });
                     return;
                 };
+                // The std server still waits for a next head after a reply that said
+                // `connection: close`, so the task ends the connection here.
+                if (verdict == .close or !keep_asked) return;
             }
         }
 
-        fn handleRequest(engine: *Eng, c: *Conn, request: *http.Server.Request) !void {
+        fn handleRequest(engine: *Eng, c: *Conn, request: *http.Server.Request) !Verdict {
             var arena_state = std.heap.ArenaAllocator.init(engine.gpa);
             defer arena_state.deinit();
 
@@ -231,7 +250,8 @@ fn HttpTasks(comptime Eng: type) type {
                 target,
                 "/v1/health",
             ))) {
-                return request.respond("{\"status\":\"ok\"}", .{ .extra_headers = &json_headers });
+                try request.respond("{\"status\":\"ok\"}", .{ .extra_headers = &json_headers });
+                return .keep;
             }
             if (method == .POST and std.mem.eql(u8, target, "/v1/chat/completions")) {
                 return handleChat(engine, c, request, arena);
@@ -248,19 +268,20 @@ fn HttpTasks(comptime Eng: type) type {
             c: *Conn,
             request: *http.Server.Request,
             arena: Allocator,
-        ) !void {
+        ) !Verdict {
             const sp = span.begin(.http_chat);
             defer sp.end();
 
-            // Read the request body under the size cap.
+            // Read the request body under the size cap. A declared length past the cap is refused
+            // before any read, and a chunked body at the byte that passes it.
             const codec = engine.codec;
-            const clen = request.head.content_length orelse 0;
-            if (clen > limits.openai_max_request_bytes) {
-                return respondError(request, .{
-                    .status = 413,
-                    .type = "invalid_request_error",
-                    .message = "request body too large",
-                });
+            const too_large: map.HttpError = .{
+                .status = 413,
+                .type = "invalid_request_error",
+                .message = "request body too large",
+            };
+            if (request.head.content_length) |n| {
+                if (n > limits.openai_max_request_bytes) return respondError(request, too_large);
             }
 
             var body_rbuf: [4096]u8 = undefined;
@@ -271,8 +292,13 @@ fn HttpTasks(comptime Eng: type) type {
                     .message = "bad request body",
                 });
             };
-            const body = try arena.alloc(u8, @intCast(clen));
-            reader.readSliceAll(body) catch return error.BodyReadFailed;
+            // The limit counts the byte past the cap, so a body of exactly the cap passes.
+            const limit: Io.Limit = .limited(limits.openai_max_request_bytes + 1);
+            const body = reader.allocRemaining(arena, limit) catch |err| switch (err) {
+                error.StreamTooLong => return respondError(request, too_large),
+                error.OutOfMemory => return error.OutOfMemory,
+                error.ReadFailed => return error.BodyReadFailed,
+            };
 
             // Parse the request and refuse a model that this server does not serve.
             var diag: map.Diag = .{};
@@ -310,6 +336,7 @@ fn HttpTasks(comptime Eng: type) type {
                 .max_tokens = req.max_tokens,
                 .think_open = chat.thinkOpen(mode.kind),
                 .think_budget = mode.think_budget,
+                .stop = req.stop,
             };
             const seed = req.sampling.seed orelse drawSeed(engine.io) orelse {
                 return respondError(request, .{
@@ -351,9 +378,9 @@ fn HttpTasks(comptime Eng: type) type {
             const id_str = std.fmt.bufPrint(&id_buf, "chatcmpl-{d}", .{sid}) catch "chatcmpl-0";
 
             if (req.stream) {
-                try streamChat(engine, c, request, arena, sid, input, id_str);
+                return streamChat(engine, c, request, arena, sid, input, id_str);
             } else {
-                try bufferChat(engine, c, request, arena, sid, input, id_str);
+                return bufferChat(engine, c, request, arena, sid, input, id_str);
             }
         }
 
@@ -361,7 +388,8 @@ fn HttpTasks(comptime Eng: type) type {
         /// protocol id, or null when the pool is exhausted or the connection dropped.
         fn openSession(engine: *Eng, c: *Conn, sampling: protocol.Sampling) ?u32 {
             const system_prompt = engine.gpa.dupe(u8, "") catch return null;
-            engine.submit(.{ .conn = c.id, .request_id = 1, .session_id = 0, .body = .{
+            const id = engine.connId(c);
+            engine.submitFrom(c, .{ .conn = id, .request_id = 1, .session_id = 0, .body = .{
                 .session_open = .{ .sampling = sampling, .system_prompt = system_prompt },
             } }) catch {
                 engine.gpa.free(system_prompt);
@@ -381,15 +409,26 @@ fn HttpTasks(comptime Eng: type) type {
                 }
 
                 if (c.parked_hint.swap(false, .acq_rel)) {
-                    engine.wake(c.id);
+                    engine.wake(engine.connId(c));
                 }
             }
         }
 
+        /// End the turn after a stop match. The scheduler then emits the `done` of the turn.
+        fn cancelTurn(engine: *Eng, c: *Conn, sid: u32) !void {
+            const id = engine.connId(c);
+            engine.submitFrom(
+                c,
+                .{ .conn = id, .request_id = 4, .session_id = sid, .body = .cancel },
+            ) catch return error.ConnClosed;
+        }
+
         fn closeSession(engine: *Eng, c: *Conn, sid: u32) void {
             log.debug("session close: {d}", .{sid});
-            engine.submit(
-                .{ .conn = c.id, .request_id = 3, .session_id = sid, .body = .session_close },
+            const id = engine.connId(c);
+            engine.submitFrom(
+                c,
+                .{ .conn = id, .request_id = 3, .session_id = sid, .body = .session_close },
             ) catch {};
         }
 
@@ -415,7 +454,8 @@ fn HttpTasks(comptime Eng: type) type {
                 engine.gpa.free(text);
                 return e;
             };
-            engine.submit(.{ .conn = c.id, .request_id = 2, .session_id = sid, .body = .{
+            const id = engine.connId(c);
+            engine.submitFrom(c, .{ .conn = id, .request_id = 2, .session_id = sid, .body = .{
                 .generate = .{
                     .max_tokens = input.max_tokens,
                     .sampling = null,
@@ -430,27 +470,59 @@ fn HttpTasks(comptime Eng: type) type {
                 return error.SubmitFailed;
             };
 
-            // Drain the events until the turn ends.
+            // Drain the events until the turn ends. A stop match cancels the turn, and the events
+            // up to its `done` then drop.
             var split: map.ReasoningSplit = .init(engine.codec.think_ids, input.think_open);
+            var matcher: map.StopMatcher = .init(input.stop);
+            var stopped = false;
             while (true) {
                 const ev = c.out_q.getOne(engine.io) catch return error.ConnClosed;
+                // A buffered reply writes nothing before the end, so only a probe sees a hang-up.
+                // A streamed reply sees it as a write error. The `done` completes the reply, so
+                // the probe skips it, and a client that closed its send side still gets it.
+                const probe = @TypeOf(sink) == *BufSink and ev.body != .done;
+                if (probe and timed_stream.peerClosed(c.stream)) {
+                    log.debug("turn: session {d}, the client hung up", .{sid});
+                    return error.ConnClosed;
+                }
+
                 switch (ev.body) {
                     // The scheduler emits the terminal EOS token. OpenAI content omits it.
-                    .token => |t| if (t.token_id != engine.codec.eos_id) {
+                    .token => |t| if (!stopped and t.token_id != engine.codec.eos_id) {
                         if (split.route(t.token_id, t.text[0..t.text_len])) |p| {
-                            try sink.onPiece(p.field, p.text);
+                            // A stop string matches the reply text, and never the reasoning.
+                            if (p.field == .reasoning or input.stop.len == 0) {
+                                try sink.onPiece(p.field, p.text);
+                            } else {
+                                const out = matcher.feed(p.text);
+                                if (out.text.len > 0) {
+                                    try sink.onPiece(.content, out.text);
+                                }
+                                if (out.stopped) {
+                                    stopped = true;
+                                    try cancelTurn(engine, c, sid);
+                                }
+                            }
                         }
                     },
                     .done => |d| {
                         log.debug(
-                            "turn: session {d}, {d} tokens, finish {t}",
-                            .{ sid, d.gen_tokens, d.finish_reason },
+                            "turn: session {d}, {d} tokens, finish {t}, stop matched {}",
+                            .{ sid, d.gen_tokens, d.finish_reason, stopped },
                         );
+                        // A held tail that no stop string completed belongs to the reply.
+                        if (!stopped and input.stop.len > 0) {
+                            const rest = matcher.finish();
+                            if (rest.len > 0) {
+                                try sink.onPiece(.content, rest);
+                            }
+                        }
+
                         return .{
                             .done = .{
                                 .n = d.gen_tokens,
                                 .reasoning = d.reasoning_tokens,
-                                .finish = finishStr(d.finish_reason),
+                                .finish = if (stopped) "stop" else finishStr(d.finish_reason),
                             },
                         };
                     },
@@ -463,7 +535,7 @@ fn HttpTasks(comptime Eng: type) type {
                 }
 
                 if (c.parked_hint.swap(false, .acq_rel)) {
-                    engine.wake(c.id);
+                    engine.wake(engine.connId(c));
                 }
             }
         }
@@ -476,7 +548,7 @@ fn HttpTasks(comptime Eng: type) type {
             sid: u32,
             input: TurnInput,
             id_str: []const u8,
-        ) !void {
+        ) !Verdict {
             // Run the turn into a buffer.
             var sink: BufSink = .{ .arena = arena };
             const turn = switch (try runTurn(engine, c, arena, sid, input, &sink)) {
@@ -515,6 +587,7 @@ fn HttpTasks(comptime Eng: type) type {
             );
             try std.json.Stringify.value(resp, json_opts, &rbody.writer);
             try rbody.end();
+            return .keep;
         }
 
         /// Stream a chat reply. An error after the head becomes an error event.
@@ -526,7 +599,7 @@ fn HttpTasks(comptime Eng: type) type {
             sid: u32,
             input: TurnInput,
             id_str: []const u8,
-        ) !void {
+        ) !Verdict {
             var sink: SseSink = .{
                 .request = request,
                 .id = id_str,
@@ -538,16 +611,18 @@ fn HttpTasks(comptime Eng: type) type {
                     try writeChunk(body, id_str, engine.codec.model_id, .{}, turn.finish);
                     try body.writer.writeAll("data: [DONE]\n\n");
                     try body.end();
+                    return .keep;
                 },
                 .failed => |he| {
                     const body = if (sink.body) |*b| b else return respondError(request, he);
                     try writeErrorEvent(&body.writer, he);
                     try body.end();
+                    return .keep;
                 },
             }
         }
 
-        fn respondModels(engine: *Eng, request: *http.Server.Request) !void {
+        fn respondModels(engine: *Eng, request: *http.Server.Request) !Verdict {
             const data = [_]types.ModelEntry{.{ .id = engine.codec.model_id }};
             const list: types.ModelsList = .{ .data = &data };
             var sbuf: [1024]u8 = undefined;
@@ -557,6 +632,7 @@ fn HttpTasks(comptime Eng: type) type {
             );
             try std.json.Stringify.value(list, json_opts, &rbody.writer);
             try rbody.end();
+            return .keep;
         }
 
         /// Prompt-token count for `usage`: re-tokenize the rendered prompt. This costs little next
@@ -651,7 +727,7 @@ fn stripQuery(target: []const u8) []const u8 {
     return if (std.mem.findScalar(u8, target, '?')) |i| target[0..i] else target;
 }
 
-fn respondError(request: *http.Server.Request, e: map.HttpError) !void {
+fn respondError(request: *http.Server.Request, e: map.HttpError) !Verdict {
     log.debug("http error {d}: {s}", .{ e.status, e.message });
     var sbuf: [1024]u8 = undefined;
     var rbody = try request.respondStreaming(&sbuf, .{ .respond_options = .{
@@ -661,6 +737,7 @@ fn respondError(request: *http.Server.Request, e: map.HttpError) !void {
     } });
     try std.json.Stringify.value(map.errorObject(e), json_opts, &rbody.writer);
     try rbody.end();
+    return .close;
 }
 
 fn statusEnum(code: u16) http.Status {
