@@ -67,7 +67,11 @@ pub const DeviceBoot = struct {
         const resources: resolve_mod.Resources = .{
             .ram_free = self.ramFree(io),
             .model = self.model,
-            .device = .{ .vram = vramFigure(ctxp), .buffer_limits = ctxp.buffer_limits },
+            .device = .{
+                .vram = vramFigure(ctxp),
+                .driver = ctxp.driver,
+                .buffer_limits = ctxp.buffer_limits,
+            },
         };
         const result = resolve_mod.resolve(self.kind, self.input, self.entry, self.card, resources);
         return switch (result) {
@@ -250,8 +254,8 @@ fn measureFused(
     const ceiling = @min(card.context_length, limits.max_model_ctx);
     for (std.enums.values(dtype.KvDtype)) |d| {
         m.scratch.set(d, Family.Fused.scratchVramBytes(card, d));
-        const runner_caps = Family.Fused.kvCaps(loaded, ceiling, 0, 1, d);
-        const resolve_caps = resolve_mod.caps(card, m.*, 0, ceiling, 1, d);
+        const runner_caps = Family.Fused.kvCaps(loaded, ceiling, 0, .other, 1, d);
+        const resolve_caps = resolve_mod.caps(card, m.*, 0, .other, ceiling, 1, d);
         std.debug.assert(std.meta.eql(resolve_caps, runner_caps));
     }
 }

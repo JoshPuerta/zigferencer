@@ -41,12 +41,36 @@ This driver path sets most of the limits that the kernels and the planners respe
 | Vulkan 1.2, no 8-bit storage, no 8-bit integers in shaders | The engine splits Q8_0 into an f16 scale array and packed 8-bit words (section 9). |
 | 32 KiB of shared memory for each workgroup | The attention kernels fit their LDS into 32 KiB, and a compile-time assert checks it (section 10). |
 | A storage-buffer range of 128 MiB, the Vulkan minimum | The KV cache uses one region for each layer, a default window shrinks to fit, and `$ZIGFERENCER_VK_STORAGE_RANGE` states a checked range ([architecture.md](architecture.md), section 9). |
-| An allocation overhead that runs out of memory before the 16 GB card is full | The VRAM preflight keeps 1/8 of the free VRAM in reserve. A plan of more than about 12.5 GB is not safe. |
+| An allocation overhead that runs out of memory before the 16 GB card is full | On this driver the VRAM preflight keeps 1/4 of the free VRAM in reserve, against 1/8 on other drivers (`limits.vram_shares`). The 1/4 is a heuristic from this setup. The preflight refuses a plan that cannot fit. A plan under the line can still fail on a driver whose budget does not show its host-visible staging or its residency. |
 | A device loss under memory pressure, which stays until the virtual machine restarts | Run one large GPU job at a time, with time between runs. `pkill -x 'zigferencer\|zigferencer-dev'` ends a process that stays. |
 | Windows stops a GPU submit that runs longer than its timeout (2 s by default) | A large-model prefill needs a longer `TdrDelay` in the Windows registry. |
 | A GPU timestamp counter that is not a stable clock across submits | The trace maps each GPU record by its own host window ([profiling.md](profiling.md)). |
 | Host-visible memory at about 30 GB/s over the bus of the virtual machine | The weights, the KV, and the scratch live in device-local memory. |
 | No view of the shader ISA, the registers, or the occupancy, and no hardware counters | Tuning uses measured time only. |
+
+### Device loss during the weight upload
+
+Two failures set the line and the messages of this driver.
+
+- A Llama-8B plan of 13524 MiB (9086 MiB of weights and 4438 MiB of KV) passed the 7/8
+  line and lost the device during the weight upload. A plan of about 11.1 GB then ran in
+  the same virtual machine. The usual budget of the card is 15568 MiB, and 3/4 of it is
+  11676 MiB, between the two plans. So the Vulkan-on-D3D12 row of `limits.vram_shares` is
+  3/4. This row is a heuristic from this one setup. Another setup, for example a native
+  Linux driver, uses the default row of 7/8 and can plan more of the card.
+- A Llama-8B Q8_0 fused run at a plan of 9737 MiB lost the device once during the
+  weight upload. The same run passed when it ran again, and the cause is not proven.
+  This plan is under both lines, so the 3/4 row does not explain it.
+
+What changed after these failures:
+
+- The weight upload creates one host buffer pair for all tensors, not a pair for each
+  tensor. The pair holds one swap chunk at most, and a larger tensor goes in passes.
+- `ZIGFERENCER_LOG=runner` prints the budget and the usage of each memory heap before
+  and after the weight upload.
+- A device loss or a refused allocation during the init of a fused runner stops with a
+  message that names the retry, and a restart of the virtual machine first
+  (`wsl --shutdown` under WSL2) when the log shows a device removal.
 
 A native Linux driver such as RADV removes most of these limits. It reports 64 KiB
 of shared memory and the real storage range, and the vendor profilers work with it.
@@ -174,7 +198,9 @@ How the kernels use this:
 - The decode matrix-vector kernel `linear_q8_0_reduce` gives one workgroup to each
   output row. Lane `L` reads the quant blocks `L`, `L + 32`, `L + 64`, and so on, so
   the lanes of the wave read adjacent blocks. Lane 0 then adds the 32 partial sums
-  in LDS.
+  in LDS. Vulkan guarantees only 65535 workgroups on each grid axis, and an lm_head
+  has up to 248320 outputs. So the outputs past `limits.reduce_grid_x` (32768) fold
+  onto the y axis of the grid.
 - Split attention loads K in 16-byte vectors, eight loads for each 128-byte line.
 - One counter-example stays on purpose. The resident decode attention gives each
   lane its own K row, so the K reads do not coalesce across the wave. Its V pass

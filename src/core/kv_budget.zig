@@ -101,6 +101,8 @@ pub const vram_refusal_text_max: usize = 512;
 /// value, because each is a per-model value that the caller derives.
 pub const Caps = struct {
     vram_free: u64,
+    /// The driver of the device, which picks the usable share of `vram_free`.
+    driver: limits.Driver = .other,
     weights: u64,
     logits: u64,
     /// Device bytes of the activation scratch. Named, so the budget and the preflight count it.
@@ -551,6 +553,8 @@ pub const VramRefusal = struct {
     planned: u64,
     /// The live device-local budget. The text also names its usable share.
     available: u64,
+    /// The driver of the device, which picks the usable share.
+    driver: limits.Driver,
     weights: u64,
     kv: u64,
     /// The recurrent state of a hybrid family. Null for a family whose every
@@ -703,7 +707,7 @@ pub fn pinned(n_slots: u32, window: u32) KvPlan {
 pub fn planFits(caps: Caps, plan: KvPlan) bool {
     // Saturation refuses an absurd reservation rather than wrapping past it.
     const planned = plan.vram.weights +| plan.vram.kv +| plan.vram.logits +| plan.vram.scratch;
-    return limits.vramPlanFits(planned, caps.vram_free);
+    return limits.vramPlanFits(caps.driver, planned, caps.vram_free);
 }
 
 /// The price the planner charges for one slot under `req`. A refusal message
@@ -811,9 +815,10 @@ pub fn fitWindow(caps: Caps, cost: KvCostModel, n_slots: u32, window: u32) u32 {
 }
 
 /// The widest window under a refused `window` whose plan for `n_slots` slots fits the usable
-/// share of `available` beside `reserved`. Null means that no window in
+/// share of `available` on `driver` beside `reserved`. Null means that no window in
 /// `min_kv_window..window-1` fits, or that the model has no per-token cost.
 pub fn largestFittingWindow(
+    driver: limits.Driver,
     available: u64,
     reserved: u64,
     cost: KvCostModel,
@@ -832,7 +837,7 @@ pub fn largestFittingWindow(
 
     // `w` fits when `n_slots * (w * kv + fixed) <= usable - reserved`, and the
     // floor divisions below solve that for the largest `w`.
-    const share = (limits.vramUsable(available) -| reserved) / n_slots;
+    const share = (limits.vramUsable(driver, available) -| reserved) / n_slots;
     const affordable = (share -| cost.fixed_state_bytes_per_slot) / cost.kv_bytes_per_token;
     const widest = @min(affordable, @as(u64, window - 1));
     if (widest < limits.min_kv_window) return null;
@@ -840,9 +845,9 @@ pub fn largestFittingWindow(
     const fit: u32 = @intCast(widest);
     std.debug.assert(fit >= limits.min_kv_window);
     std.debug.assert(fit < window);
-    std.debug.assert(windowFits(available, reserved, cost, n_slots, fit));
+    std.debug.assert(windowFits(driver, available, reserved, cost, n_slots, fit));
     if (fit + 1 < window) {
-        std.debug.assert(!windowFits(available, reserved, cost, n_slots, fit + 1));
+        std.debug.assert(!windowFits(driver, available, reserved, cost, n_slots, fit + 1));
     }
 
     return fit;
@@ -1346,9 +1351,7 @@ pub fn formatVramRefusal(buf: []u8, r: VramRefusal) []const u8 {
             "but only {d} MiB of the {d} MiB free are usable. It holds {d} MiB of {s}weights",
         .{
             r.planned / mib,
-            limits.vramUsable(
-                r.available,
-            ) / mib,
+            limits.vramUsable(r.driver, r.available) / mib,
             r.available / mib,
             r.weights / mib,
             if (r.suffix) "suffix " else "",
@@ -1538,7 +1541,7 @@ fn slotWord(n: u32) []const u8 {
 /// The share of the device budget a plan can occupy. It is the share
 /// `limits.vramPlanFits` reads, which the preflight calls.
 fn usable(caps: Caps) u64 {
-    return limits.vramUsable(caps.vram_free);
+    return limits.vramUsable(caps.driver, caps.vram_free);
 }
 
 /// The default ceiling: the model ceiling under the `run` default. The money
@@ -1553,9 +1556,16 @@ fn perSlotBytes(cost: KvCostModel, window: u32) u64 {
 
 /// Whether `n_slots` slots at `window` fit beside `reserved`. Saturation
 /// refuses an absurd reservation rather than wrapping past it.
-fn windowFits(available: u64, reserved: u64, cost: KvCostModel, n_slots: u32, window: u32) bool {
+fn windowFits(
+    driver: limits.Driver,
+    available: u64,
+    reserved: u64,
+    cost: KvCostModel,
+    n_slots: u32,
+    window: u32,
+) bool {
     const kv = @as(u64, n_slots) *| perSlotBytes(cost, window);
-    return limits.vramPlanFits(reserved +| kv, available);
+    return limits.vramPlanFits(driver, reserved +| kv, available);
 }
 
 /// The window a pinned slot count affords under budget X: each slot's share of X, minus the fixed
@@ -1754,8 +1764,8 @@ fn deviceSpend(caps: Caps, weights: []const u64, head_bytes: u64, kv: KvStructur
         caps.logits + caps.scratch;
 }
 
-/// The preflight at one split. It reuses `usable`, so the 7/8 rule keeps one
-/// home for both planners.
+/// The preflight at one split. It reuses `usable`, so the usable share of the
+/// driver keeps one home for both planners.
 fn layerSplitFits(caps: Caps, weights: []const u64, head_bytes: u64, kv: KvStructure, k: u32) bool {
     return deviceSpend(caps, weights, head_bytes, kv, k) <= usable(caps);
 }
@@ -2652,7 +2662,7 @@ test "largestFittingWindow: the widest fit sits between the floor and the refuse
     const cost: KvCostModel = .{ .kv_bytes_per_token = 1000 };
     try std.testing.expectEqual(
         @as(?u32, 500),
-        largestFittingWindow(8_000_000, 6_500_000, cost, 1, 1000),
+        largestFittingWindow(.other, 8_000_000, 6_500_000, cost, 1, 1000),
     );
     // The fixed state comes off each slot's share first: 620000 over two
     // slots is 310000, and 300000 of it buys 300 tokens.
@@ -2662,34 +2672,61 @@ test "largestFittingWindow: the widest fit sits between the floor and the refuse
     };
     try std.testing.expectEqual(
         @as(?u32, 300),
-        largestFittingWindow(8_000_000, 6_380_000, hybrid, 2, 1000),
+        largestFittingWindow(.other, 8_000_000, 6_380_000, hybrid, 2, 1000),
     );
     // A budget past the refused window stops one under it.
-    try std.testing.expectEqual(@as(?u32, 999), largestFittingWindow(8_000_000, 0, cost, 1, 1000));
+    try std.testing.expectEqual(
+        @as(?u32, 999),
+        largestFittingWindow(.other, 8_000_000, 0, cost, 1, 1000),
+    );
     // The 8B at 1 GiB free agrees with `fitWindow`: 3584 tokens for one slot
     // and 1792 for two.
     try std.testing.expectEqual(
         @as(?u32, 3584),
-        largestFittingWindow(1 << 30, 0, llama_8b_cost, 1, 8192),
+        largestFittingWindow(.other, 1 << 30, 0, llama_8b_cost, 1, 8192),
     );
     try std.testing.expectEqual(
         @as(?u32, 1792),
-        largestFittingWindow(1 << 30, 0, llama_8b_cost, 2, 8192),
+        largestFittingWindow(.other, 1 << 30, 0, llama_8b_cost, 2, 8192),
     );
+}
+
+test "largestFittingWindow: the translation-layer row funds from three quarters of the budget" {
+    // 8000000 available bytes leave 6000000 usable on that row. A 5500000 reservation leaves
+    // 500000, which buys 500 tokens. The default row leaves 1500000, past the refused window.
+    const cost: KvCostModel = .{ .kv_bytes_per_token = 1000 };
+    try std.testing.expectEqual(
+        @as(?u32, 500),
+        largestFittingWindow(.vulkan_on_d3d12, 8_000_000, 5_500_000, cost, 1, 1000),
+    );
+    try std.testing.expectEqual(
+        @as(?u32, 999),
+        largestFittingWindow(.other, 8_000_000, 5_500_000, cost, 1, 1000),
+    );
+
+    // A plan under the default line and past the translation-layer line fits only the default
+    // caps.
+    var caps = llama8bCaps(8_000_000);
+    const plan = pinned(1, limits.min_kv_window);
+    var fitted = plan;
+    fitted.vram = .{ .weights = 6_500_000, .kv = 0, .logits = 0, .scratch = 0 };
+    try std.testing.expect(planFits(caps, fitted));
+    caps.driver = .vulkan_on_d3d12;
+    try std.testing.expect(!planFits(caps, fitted));
 }
 
 test "largestFittingWindow: a widest fit under the floor gives null" {
     // 100000 bytes buy 100 tokens, which fit but sit under the floor.
     const cost: KvCostModel = .{ .kv_bytes_per_token = 1000 };
-    try std.testing.expect(windowFits(8_000_000, 6_900_000, cost, 1, 100));
+    try std.testing.expect(windowFits(.other, 8_000_000, 6_900_000, cost, 1, 100));
     try std.testing.expectEqual(
         @as(?u32, null),
-        largestFittingWindow(8_000_000, 6_900_000, cost, 1, 1000),
+        largestFittingWindow(.other, 8_000_000, 6_900_000, cost, 1, 1000),
     );
     // The 8B at 16 MiB free buys 56 tokens.
     try std.testing.expectEqual(
         @as(?u32, null),
-        largestFittingWindow(16 << 20, 0, llama_8b_cost, 1, 8192),
+        largestFittingWindow(.other, 16 << 20, 0, llama_8b_cost, 1, 8192),
     );
 }
 
@@ -2697,20 +2734,20 @@ test "largestFittingWindow: a refused window at or under the floor gives null" {
     const cost: KvCostModel = .{ .kv_bytes_per_token = 1000 };
     try std.testing.expectEqual(
         @as(?u32, null),
-        largestFittingWindow(8_000_000, 6_900_000, cost, 1, limits.min_kv_window),
+        largestFittingWindow(.other, 8_000_000, 6_900_000, cost, 1, limits.min_kv_window),
     );
     try std.testing.expectEqual(
         @as(?u32, null),
-        largestFittingWindow(8_000_000, 6_900_000, cost, 1, 100),
+        largestFittingWindow(.other, 8_000_000, 6_900_000, cost, 1, 100),
     );
     try std.testing.expectEqual(
         @as(?u32, null),
-        largestFittingWindow(8_000_000, 0, cost, 1, limits.min_kv_window),
+        largestFittingWindow(.other, 8_000_000, 0, cost, 1, limits.min_kv_window),
     );
     // One past the floor leaves the floor itself to suggest.
     try std.testing.expectEqual(
         @as(?u32, limits.min_kv_window),
-        largestFittingWindow(8_000_000, 0, cost, 1, limits.min_kv_window + 1),
+        largestFittingWindow(.other, 8_000_000, 0, cost, 1, limits.min_kv_window + 1),
     );
 }
 
@@ -2719,13 +2756,13 @@ test "largestFittingWindow: null when no window fits" {
     // The reservation alone takes the usable share, or passes it.
     try std.testing.expectEqual(
         @as(?u32, null),
-        largestFittingWindow(8_000_000, 7_000_000, cost, 1, 1000),
+        largestFittingWindow(.other, 8_000_000, 7_000_000, cost, 1, 1000),
     );
     try std.testing.expectEqual(
         @as(?u32, null),
-        largestFittingWindow(8_000_000, 7_000_001, cost, 1, 1000),
+        largestFittingWindow(.other, 8_000_000, 7_000_001, cost, 1, 1000),
     );
-    try std.testing.expectEqual(@as(?u32, null), largestFittingWindow(0, 0, cost, 1, 1000));
+    try std.testing.expectEqual(@as(?u32, null), largestFittingWindow(.other, 0, 0, cost, 1, 1000));
     // The fixed state alone passes the share of one slot.
     const hybrid: KvCostModel = .{
         .kv_bytes_per_token = 1000,
@@ -2733,14 +2770,14 @@ test "largestFittingWindow: null when no window fits" {
     };
     try std.testing.expectEqual(
         @as(?u32, null),
-        largestFittingWindow(8_000_000, 6_500_000, hybrid, 1, 1000),
+        largestFittingWindow(.other, 8_000_000, 6_500_000, hybrid, 1, 1000),
     );
 }
 
 test "largestFittingWindow: a model with no per-token cost gives null" {
     try std.testing.expectEqual(
         @as(?u32, null),
-        largestFittingWindow(1 << 40, 0, .{ .kv_bytes_per_token = 0 }, 1, 8192),
+        largestFittingWindow(.other, 1 << 40, 0, .{ .kv_bytes_per_token = 0 }, 1, 8192),
     );
     const state_only: KvCostModel = .{
         .kv_bytes_per_token = 0,
@@ -2748,7 +2785,7 @@ test "largestFittingWindow: a model with no per-token cost gives null" {
     };
     try std.testing.expectEqual(
         @as(?u32, null),
-        largestFittingWindow(1 << 40, 0, state_only, 4, 8192),
+        largestFittingWindow(.other, 1 << 40, 0, state_only, 4, 8192),
     );
 }
 
@@ -2769,7 +2806,7 @@ fn checkLargestFit(_: void, seed: u64) anyerror!void {
         n_slots,
     ) * (420 * cost.kv_bytes_per_token + cost.fixed_state_bytes_per_slot);
     const available = r.intRangeAtMost(u64, 0, 2 * top);
-    const got = largestFittingWindow(available, reserved, cost, n_slots, window);
+    const got = largestFittingWindow(.other, available, reserved, cost, n_slots, window);
     if (cost.kv_bytes_per_token == 0) {
         try std.testing.expectEqual(@as(?u32, null), got);
         return;
@@ -2783,7 +2820,7 @@ fn checkLargestFit(_: void, seed: u64) anyerror!void {
             u64,
             n_slots,
         ) * (@as(u64, w) * cost.kv_bytes_per_token + cost.fixed_state_bytes_per_slot);
-        if (limits.vramPlanFits(reserved + kv, available)) {
+        if (limits.vramPlanFits(.other, reserved + kv, available)) {
             want = w;
             break;
         }
@@ -4254,6 +4291,7 @@ test "formatVramRefusal: the three families" {
     const whole: VramRefusal = .{
         .planned = 9000 * mib,
         .available = 8192 * mib,
+        .driver = .other,
         .weights = 8000 * mib,
         .kv = 1000 * mib,
         .n_slots = 4,
@@ -4325,6 +4363,7 @@ test "formatVramRefusal: the three families" {
     const widest: VramRefusal = .{
         .planned = wide,
         .available = wide,
+        .driver = .other,
         .weights = wide,
         .kv = wide,
         .recurrent_state = wide,

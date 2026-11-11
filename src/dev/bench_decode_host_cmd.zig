@@ -199,7 +199,7 @@ fn benchFamily(comptime Family: type, b: *const Bench) !void {
     const kv_dtype = boot_resources.kvDtypeFor(b.opt.kv_dtype, b.model);
 
     const vram_free = boot_resources.vramFigure(b.ctxp);
-    const caps = Family.Fused.kvCaps(b.loaded, b.ceiling, vram_free, 1, kv_dtype);
+    const caps = Family.Fused.kvCaps(b.loaded, b.ceiling, vram_free, b.ctxp.driver, 1, kv_dtype);
     const cost = Family.Fused.kvCostModel(card, kv_dtype);
     const plan = try kv_budget.kvPlan(caps, cost, .{ .window = b.window, .slots = 1, .batch = 1 });
 

@@ -100,6 +100,7 @@ fn initHybrid(
         loaded,
         limits.contextCeiling(loaded.card.context_length, null),
         ctxp.deviceLocalAvailableBytes(),
+        ctxp.driver,
         n_slots,
         kv_dtype,
     );

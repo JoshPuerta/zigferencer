@@ -579,7 +579,7 @@ checks the thread counts.
                     +-----------------------------------------+---------------------------+
                     v                                                                     v
     region check: one region (one layer, K or V,             VRAM preflight: weights + KV plan
-    every slot) fits the device buffer limits                + scratch + logits fit 7/8 of the free VRAM
+    every slot) fits the device buffer limits                + scratch + logits fit the usable free VRAM
 ```
 
 ### A worked example: Qwen3.5-2B
@@ -800,16 +800,20 @@ window that the VRAM budget can hold.
    shrinks to the widest multiple of 256 positions that passes. The `run` window of
    the example shrinks this way, from 174,592 to 131,072 positions.
 2. **The VRAM preflight.** A fused or hybrid runner adds up its plan: the weights,
-   the KV, the recurrent state, the logits, and the scratch. The plan must fit 7/8 of
-   the free VRAM. On the whole-model fused path, a default window first shrinks to
-   the widest window that fits. A plan that still does not fit stops with
+   the KV, the recurrent state, the logits, and the scratch. The plan must fit the
+   usable share of the free VRAM. `limits.vram_shares` holds one row for each
+   driver: 3/4 on a translation-layer Vulkan driver, a heuristic of the reference setup, and
+   7/8 on every other driver. On the whole-model fused path, a default window first
+   shrinks to the widest window that fits. A plan that still does not fit stops with
    `error.VramBudgetExceeded`. The message names the needed, free, and usable bytes,
    the largest window that fits, and the flags that lower the plan.
 
 The free VRAM comes from `VK_EXT_memory_budget`, because a desktop shares the card
-with other programs. Without that extension it is the heap size. The last eighth
-holds the upload staging buffer, the fragmentation of the allocator, and the
-overhead of the driver.
+with other programs. Without that extension it is the heap size. The reserve holds
+the upload stage, the fragmentation of the allocator, and the overhead of the
+driver. The preflight refuses a plan that cannot fit. A plan under the line can
+still fail on a driver whose budget does not show its host-visible staging or its
+residency.
 
 Some drivers report the minimum storage-buffer range of the Vulkan specification,
 128 MiB, and still read past it correctly. `$ZIGFERENCER_VK_STORAGE_RANGE` then
@@ -850,7 +854,8 @@ the ledger is full.
 ### Example: spend 14 GiB of VRAM and 28 GiB of RAM on `serve`
 
 This example asks how many Qwen3.5-2B sessions fit when 16 GiB of VRAM and 32 GiB
-of RAM are free. The 7/8 rule leaves 14 GiB of VRAM and 28 GiB of RAM. The planner
+of RAM are free, on a driver of the default row. The 7/8 rules leave 14 GiB of VRAM
+and 28 GiB of RAM. The planner
 computed every number below.
 
 Three limits decide the answer:
@@ -1278,8 +1283,9 @@ acceptorTask -> HttpAdapter.onAccept                       serve/openai/http_ser
 - **Use the compile-only steps on a host with no GPU.** `zig build check`,
   `test-build`, and `bench-build`, each with `-Druntime=vulkan`, compile the GPU code
   and run no kernel.
-- **Stay under the preflight.** A plan that passes the 7/8 preflight can still lose
-  the device near the limit under a translation-layer driver. After a device loss,
+- **Stay under the preflight.** The preflight refuses a plan that cannot fit. A plan
+  under the line can still fail on a driver whose budget does not show its
+  host-visible staging or its residency. After a device loss,
   end the process. `pkill -x 'zigferencer|zigferencer-dev'` ends a process that stays.
 - **Output.** stdout carries the program output. A reader that closes the pipe, as `head`
   does, ends the command with exit 1 and no message. A write that fails for another cause,

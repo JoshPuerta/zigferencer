@@ -424,6 +424,7 @@ fn fusedCurve(comptime Family: type, c: *const Curve) !void {
     const vram = @min(live, budget orelse live);
     const device: resolve_mod.DeviceCapacity = .{
         .vram = vram,
+        .driver = ctxp.driver,
         .buffer_limits = ctxp.buffer_limits,
     };
     const resources: resolve_mod.Resources = .{

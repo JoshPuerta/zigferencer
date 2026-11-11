@@ -60,6 +60,7 @@ fn fusedPlan(
             loaded,
             limits.contextCeiling(loaded.card.context_length, null),
             0,
+            .other,
             n_slots,
             kv_dtype,
         ),

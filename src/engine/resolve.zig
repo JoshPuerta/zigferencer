@@ -403,7 +403,7 @@ pub fn runHost(
     std.debug.assert(w.base <= w.ceiling);
 
     const m = model orelse return .{ .plan = kv_budget.pinned(1, w.base), .report = null };
-    const c = device_placement.caps(card, m, 0, w.ceiling, 1, kv_dtype);
+    const c = device_placement.caps(card, m, 0, .other, w.ceiling, 1, kv_dtype);
     const plan = if (comptime build_options.use_vulkan_fused_ops)
         kv_budget.kvPlan(
             c,
@@ -948,6 +948,7 @@ fn qwenModel() ModelNeeds {
 /// that funds every row stands for the live budget.
 const capture_device: DeviceCapacity = .{
     .vram = 12 << 30,
+    .driver = .other,
     .buffer_limits = .{
         .storage_range = 128 << 20,
         .allocation_size = 2 << 30,

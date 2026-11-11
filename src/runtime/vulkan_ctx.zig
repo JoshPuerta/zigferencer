@@ -43,6 +43,9 @@
 //! which sizes the multi-stream KV window to the hardware. When a driver lacks it,
 //! `deviceLocalBudget` returns null and the runner keeps its default window.
 //!
+//! Driver. `VK_KHR_driver_properties`, core since Vulkan 1.2, names the driver. A device older
+//! than 1.2 and without the extension reads as `other`. The VRAM line of `limits` reads the driver.
+//!
 //! One-shot submit. The translation layer makes a native command allocator for each command
 //! buffer, and the paravirtual driver leaks part of it when the buffer is freed. So a one-shot
 //! submit never allocates. It resets `staging_cmd`, and every submit waits before it returns, so
@@ -110,6 +113,7 @@ pub const InitError = error{
     BaseFunctionsMissing,
     InstanceFunctionsMissing,
     DeviceFunctionsMissing,
+    WorkgroupCountBelowMinimum,
 } ||
     vk.BaseWrapper.CreateInstanceError ||
     vk.InstanceWrapper.EnumeratePhysicalDevicesError ||
@@ -143,6 +147,11 @@ pub const Context = struct {
     has_memory_budget: bool,
     /// True on a CPU device. A pipeline then leaves the subgroup size to the driver.
     software: bool,
+    /// The driver, as far as a limit tells drivers apart.
+    driver: limits.Driver,
+    /// The workgroup count of each grid axis that the driver states. Init refuses a count under
+    /// `limits.max_workgroups`, so every grid of the kernels fits.
+    max_workgroup_count: [3]u32,
     /// The limits every buffer check reads. The storage range is the override when set.
     buffer_limits: limits.BufferLimits,
     /// The storage range the driver reports, kept for the boot log and `info`.
@@ -244,10 +253,15 @@ pub const Context = struct {
 
         var has_memory_budget = false;
         var has_maintenance4 = apiAtLeast13(picked.props.api_version);
+        var has_driver_properties = apiAtLeast12(picked.props.api_version);
         for (avail_exts) |*ext| {
             const name = std.mem.sliceTo(&ext.extension_name, 0);
             if (std.mem.eql(u8, name, vk.extensions.ext_memory_budget.name)) {
                 has_memory_budget = true;
+            }
+
+            if (std.mem.eql(u8, name, vk.extensions.khr_driver_properties.name)) {
+                has_driver_properties = true;
             }
 
             if (std.mem.eql(u8, name, vk.extensions.khr_maintenance_4.name)) {
@@ -259,6 +273,9 @@ pub const Context = struct {
             "ext: {d} available, memory_budget {}, maintenance4 {}",
             .{ avail_exts.len, has_memory_budget, has_maintenance4 },
         );
+
+        // Name the driver, which picks the usable share of the VRAM budget.
+        const driver = if (has_driver_properties) readDriver(vki, picked.device) else .other;
 
         // Read the buffer limits, and apply the storage-range override.
         const reported = try readBufferLimits(vki, picked.device, picked.props, has_maintenance4);
@@ -286,6 +303,21 @@ pub const Context = struct {
                 buffer_limits.offset_alignment,
             },
         );
+
+        // Refuse a device under the workgroup count that every grid of the kernels assumes.
+        const groups = picked.props.limits.max_compute_work_group_count;
+        log.debug("dispatch limits: workgroup count x {d}, y {d}, z {d}", .{
+            groups[0],
+            groups[1],
+            groups[2],
+        });
+        if (std.mem.min(u32, &groups) < limits.max_workgroups) {
+            const refusal = "device: the driver states a workgroup count of {d}, {d}, {d} on " ++
+                "the three axes, under the Vulkan minimum of {d}. " ++
+                "The kernels need a device that meets the Vulkan limits";
+            log.err(refusal, .{ groups[0], groups[1], groups[2], limits.max_workgroups });
+            return error.WorkgroupCountBelowMinimum;
+        }
 
         // Create the logical device.
         var ext_names: [2][*:0]const u8 = undefined;
@@ -380,6 +412,8 @@ pub const Context = struct {
             .mem_props = mem_props,
             .has_memory_budget = has_memory_budget,
             .software = options.software,
+            .driver = driver,
+            .max_workgroup_count = groups,
             .buffer_limits = buffer_limits,
             .reported_storage_range = reported.storage_range,
             .device = device,
@@ -681,6 +715,42 @@ pub fn pickHostType(mem_props: vk.PhysicalDeviceMemoryProperties, type_bits: u32
 // -- helpers ----------------------------------------------------------------
 
 /// True when a device reports Vulkan 1.3 or later, where `maxBufferSize` is core.
+fn apiAtLeast12(api_version: u32) bool {
+    const v: vk.Version = @bitCast(api_version);
+    return v.major > 1 or (v.major == 1 and v.minor >= 2);
+}
+
+/// Read the driver id and map it to a row of `limits.Driver`. The caller checks that the device
+/// is at Vulkan 1.2 or states `VK_KHR_driver_properties`.
+fn readDriver(vki: vk.InstanceWrapper, dev: vk.PhysicalDevice) limits.Driver {
+    var driver_props: vk.PhysicalDeviceDriverProperties = .{
+        .driver_id = undefined, // written by the query below
+        .driver_name = undefined,
+        .driver_info = undefined,
+        .conformance_version = undefined,
+    };
+    var props2: vk.PhysicalDeviceProperties2 = .{
+        .properties = undefined,
+        .p_next = @ptrCast(&driver_props),
+    };
+    vki.getPhysicalDeviceProperties2(dev, &props2);
+    const driver = driverRow(driver_props.driver_id);
+    log.debug("driver: {s} (id {d}), limits row {t}", .{
+        std.mem.sliceTo(&driver_props.driver_name, 0),
+        @intFromEnum(driver_props.driver_id),
+        driver,
+    });
+    return driver;
+}
+
+/// The one map from a Vulkan driver id to a row of `limits.Driver`.
+fn driverRow(id: vk.DriverId) limits.Driver {
+    return switch (id) {
+        .mesa_dozen => .vulkan_on_d3d12,
+        else => .other,
+    };
+}
+
 fn apiAtLeast13(api_version: u32) bool {
     const v: vk.Version = @bitCast(api_version);
     return v.major > 1 or (v.major == 1 and v.minor >= 3);
@@ -813,4 +883,11 @@ test "pickHostType: the cached type wins before and after a coherent-only type" 
     try std.testing.expectEqual(@as(?u32, 0), pickHostType(cached_first, all_types));
     const cached_last = fakeMemProps(&.{ 0x6, 0xe });
     try std.testing.expectEqual(@as(?u32, 1), pickHostType(cached_last, all_types));
+}
+
+test "driverRow: only the translation-layer driver id takes its row" {
+    try std.testing.expectEqual(limits.Driver.vulkan_on_d3d12, driverRow(.mesa_dozen));
+    try std.testing.expectEqual(limits.Driver.other, driverRow(.mesa_llvmpipe));
+    try std.testing.expectEqual(limits.Driver.other, driverRow(.amd_proprietary));
+    try std.testing.expectEqual(limits.Driver.other, driverRow(@enumFromInt(9999)));
 }

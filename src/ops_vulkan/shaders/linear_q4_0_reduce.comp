@@ -19,8 +19,9 @@
 //   Each block belongs to exactly one lane, so the partials cover the row once.
 //
 // Schedule
-//   grid       (n, 1, 1)
-//   workgroup  32 lanes. One workgroup owns one output j = gl_WorkGroupID.x.
+//   grid       (min(n, GRID_X), ceil(n / GRID_X), 1)
+//   workgroup  32 lanes. One workgroup owns one output j = gl_WorkGroupID.y * GRID_X +
+//              gl_WorkGroupID.x, so a vocabulary past one axis of the grid folds onto y.
 //   lane       Lane L owns the weight blocks L, L + 32, L + 64, ... of row j.
 //
 //     lane L sums blocks L, L+32, L+64, ...     (strided, so a wave reads one run)
@@ -40,8 +41,8 @@
 //   Waves: local_size_x = 32 is one wave32 wave, so a barrier waits for no other wave.
 //   Pass 1: Q4_0 reads about half the bytes of Q8_0: 16 packed bytes against 32 per 32-weight
 //   block, plus the same 2-byte scale. Adjacent lanes read adjacent weight blocks.
-//   Tails: the grid holds j < n. A workgroup past n still stores a zero partial and reaches the
-//   barrier, so every lane leaves through the same barrier.
+//   Tails: the last grid row can hold workgroups past n. Such a workgroup still stores a zero
+//   partial and reaches the barrier, so every lane leaves through the same barrier.
 //
 // Numerics
 //   Tolerance: `LinearQ40Reduce` declares `.relative = 2e-4`. The lane partials accumulate in lane
@@ -55,10 +56,19 @@
 //   2     readonly   uint  quants_packed[(k / 8) * n]
 //   3     writeonly  f32   out[n]
 //   push  uint k, uint n
+//
+// Defines
+//   GRID_X  workgroups on the x axis, from `limits.reduce_grid_x`
 
 #version 450
 #extension GL_EXT_shader_16bit_storage : require
 #extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+
+// -- configuration ----------------------------------------------------------
+// The shader table gives the same value to the host dispatch that sizes the grid.
+#ifndef GRID_X
+#error "GRID_X must come from the build (the vulkan_shaders table)"
+#endif
 
 layout(local_size_x = 32, local_size_y = 1, local_size_z = 1) in;
 
@@ -88,7 +98,7 @@ shared float lds_partials[32];
 
 // -- main -------------------------------------------------------------------
 void main() {
-    uint j = gl_WorkGroupID.x;
+    uint j = gl_WorkGroupID.y * GRID_X + gl_WorkGroupID.x;
     uint local = gl_LocalInvocationID.x;
     if (j >= params.n) {
         lds_partials[local] = 0.0;

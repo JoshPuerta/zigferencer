@@ -214,7 +214,14 @@ fn planFor(comptime Family: type, b: *const Bench) !kv_budget.KvPlan {
         break :blk budget.budget -| budget.usage;
     } else 0;
 
-    const caps = Family.Fused.kvCaps(b.loaded, b.ceiling, free, opt.streams, kv_dtype);
+    const caps = Family.Fused.kvCaps(
+        b.loaded,
+        b.ceiling,
+        free,
+        b.ctxp.driver,
+        opt.streams,
+        kv_dtype,
+    );
     const plan = try kv_budget.kvPlan(caps, Family.Fused.kvCostModel(b.loaded.card, kv_dtype), .{
         .x_bytes = if (opt.budget) kv_budget.derivedX(caps) else null,
         .slots = opt.streams,

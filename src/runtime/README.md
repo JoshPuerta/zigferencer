@@ -18,6 +18,7 @@ comes in, and token ids go out.
 | `cpu_layer_kernels.zig` | `CpuLayerKernels`, the kernel set that computes each layer op on the CPU. |
 | `fused_layer_kernels.zig` | `FusedLayerKernels`, the kernel set that records each layer op into a command buffer. |
 | `fused_commands.zig` | `FusedCommands`, the command buffers, stages, and barriers of a fused runner. |
+| `fused_weights.zig` | `WeightMemory`, the weight arenas of a fused runner and their upload through one host stage. |
 | `step_row.zig` | `StepRow`, the batch row every runner steps. |
 | `session.zig` | `Sessions(RunnerT)`, the conversation slots over the KV slots of a runner. |
 | `runner_surface.zig` | `requireSurface`, the build-time check of the functions and fields of a runner. |

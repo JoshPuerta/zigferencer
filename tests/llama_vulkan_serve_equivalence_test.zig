@@ -21,6 +21,9 @@
 //! `n`. Warm must equal cold. The batched decode test already pins the GPU stream against the CPU
 //! reference, so this test does not repeat it.
 //!
+//! Init. The weight upload goes through one host stage, so the host buffers of an init are a
+//! fixed count. A create and free of a host heap per tensor slows the upload of a large model.
+//!
 //! The test reads the canonical SmolLM2 Q8_0 from `test_fixtures.path`. It returns
 //! `error.SkipZigTest` without a Vulkan device.
 
@@ -51,6 +54,7 @@ fn fusedPlan(
         loaded,
         limits.contextCeiling(loaded.card.context_length, null),
         0,
+        .other,
         n_slots,
         .f32,
     );
@@ -294,4 +298,30 @@ test "llama GPU prefix restore: a warm-restored prefix continues bit-exactly" {
     }
 
     try std.testing.expectEqualSlices(u32, &cold_stream, &warm_stream);
+}
+
+test "llama GPU init: the host buffers of an init do not grow with the tensor count" {
+    const io = std.testing.io;
+    const gpa = std.testing.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(gpa);
+    defer arena_state.deinit();
+
+    const arena = arena_state.allocator();
+    const fixture = try zigferencer.test_fixtures.path(arena, "SmolLM2-135M-Instruct-Q8_0");
+
+    var loaded = try loader.load(io, arena, fixture);
+    defer loaded.close();
+
+    const ctxp = try arena.create(zigferencer.vulkan_ctx.Context);
+    ctxp.* = zigferencer.vulkan_ctx.Context.init(arena, .{}) catch return error.SkipZigTest;
+    defer ctxp.deinit();
+
+    const before = zigferencer.ops_vulkan.hostBufferCount();
+    const fused = try LlamaFused.init(gpa, ctxp, &loaded, try fusedPlan(&loaded, 1), .f32);
+    defer fused.deinit();
+
+    // The rope factors, the two step stages, and the two buffers of the upload stage. The model
+    // holds 272 tensors, so one stage per tensor exceeds this bound many times.
+    const created = zigferencer.ops_vulkan.hostBufferCount() - before;
+    try std.testing.expect(created <= 5);
 }

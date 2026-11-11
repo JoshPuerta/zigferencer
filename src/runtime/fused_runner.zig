@@ -30,11 +30,8 @@
 //! Sets. Vulkan sets persist, so init points each set at its buffers once. The bind pass of
 //! `fused_layer_kernels` makes the sets of every layer from a pool that its count pass sizes.
 //!
-//! Weights. Two arenas hold the weights in a few large segments, because one allocation per
-//! tensor runs a translation-layer driver out of memory on an 8B model. The upload order fixes the
-//! offset of each weight in an arena. A dry run of that order sizes each segment to its views, so
-//! the arenas hold the priced bytes plus their alignment padding. A Q6_K lm_head of a Q4_0 model
-//! converts to Q4_0, because no Q6_K kernel exists.
+//! Weights. `fused_weights` holds the weights in two arenas and uploads them through one host
+//! stage. The upload order of this file fixes the offset of each weight in an arena.
 //!
 //! Scratch. Every activation buffer holds `prefill_batch_max` rows, and decode reads row 0. The
 //! batch kernels read [b, width] through a push constant, so one set serves every entry.
@@ -78,6 +75,7 @@ const time = @import("../core/time.zig");
 const loader = @import("../io/gguf/loader.zig");
 const attn_record = @import("attn_record.zig");
 const fused_commands = @import("fused_commands.zig");
+const fused_weights = @import("fused_weights.zig");
 const fused_layer_kernels = @import("fused_layer_kernels.zig");
 const gpu_profile = @import("gpu_profile.zig");
 const kv_cost = @import("kv_cost.zig");
@@ -92,7 +90,10 @@ const Activation = layer_kernels.Activation;
 const FusedLayerKernels = fused_layer_kernels.FusedLayerKernels;
 const OpResources = fused_layer_kernels.OpResources;
 const StepRow = step_row.StepRow;
+const Upload = fused_weights.Upload;
 const Weight = layer_kernels.Weight;
+const WeightMemory = fused_weights.WeightMemory;
+const refuseDtype = fused_weights.refuseDtype;
 const WeightQuant = layer_kernels.WeightQuant;
 const assert = std.debug.assert;
 
@@ -245,202 +246,6 @@ const Buffers = struct {
     }
 };
 
-/// One weight that init uploads, and where its view goes. `uploadOrder` lists them in upload order.
-const Upload = struct {
-    site: Site,
-    /// The GGUF name of the tensor, for the refusal line.
-    name: []const u8,
-    tensor: *const Tensor,
-
-    const Site = union(enum) {
-        /// A weight of the layer at range index `index`.
-        layer: struct { index: u32, role: Weight },
-        output_norm,
-        lm_head,
-    };
-
-    fn isMatrix(self: Upload) bool {
-        return switch (self.site) {
-            .layer => |at| at.role.isMatrix(),
-            .output_norm => false,
-            .lm_head => true,
-        };
-    }
-
-    /// The bytes of the view in each arena. A matrix keeps the f16 scale of each block in the
-    /// small arena and the quants in the quants arena, both in the form of `quant`.
-    fn arenaBytes(self: Upload, quant: WeightQuant) ArenaBytes {
-        if (!self.isMatrix()) return .{ .small = self.tensor.data.len, .quants = 0 };
-
-        const form: dtype.GgmlType = switch (quant) {
-            .q8_0 => .q8_0,
-            .q4_0 => .q4_0,
-        };
-        const n_in: u64 = self.tensor.shape[0];
-        const n_out: u64 = self.tensor.shape[1];
-        const blocks = n_out * (n_in / dtype.blockSize(form));
-        const scale_bytes = @sizeOf(f16);
-        return .{
-            .small = blocks * scale_bytes,
-            .quants = blocks * (dtype.bytesPerBlock(form) - scale_bytes),
-        };
-    }
-};
-
-/// Log the refusal of a weight that no fused kernel reads, in the line of the CPU dispatch.
-fn refuseDtype(name: []const u8, d: dtype.GgmlType) void {
-    log.err(linear_dispatch.refusal_fmt, .{ name, d });
-}
-
-/// The bytes of one upload in the small arena and in the quants arena.
-const ArenaBytes = struct {
-    small: u64,
-    quants: u64,
-};
-
-/// The weights of a runner in two arenas: the f16 scales and the f32 vectors, then the i8 quants.
-/// An arena weight frees nothing, because its arena owns the memory.
-const WeightMemory = struct {
-    ctx: *const vulkan_ctx.Context,
-    small: kernels.VramArena,
-    quants: kernels.VramArena,
-
-    fn init(ctx: *const vulkan_ctx.Context, gpa: Allocator) WeightMemory {
-        const usage: vk.BufferUsageFlags = .{
-            .storage_buffer_bit = true,
-            .transfer_dst_bit = true,
-        };
-        return .{
-            .ctx = ctx,
-            .small = .init(ctx, gpa, usage, kernels.VramArena.seg_bytes_small),
-            .quants = .init(ctx, gpa, usage, kernels.VramArena.seg_bytes_quants),
-        };
-    }
-
-    fn deinit(self: *WeightMemory) void {
-        self.quants.deinit();
-        self.small.deinit();
-    }
-
-    /// Size each segment of both arenas to its fill in a dry run of `uploads`, before the first
-    /// upload. The dry run places each view as `alloc` does, so the upload fills every segment.
-    fn plan(
-        self: *WeightMemory,
-        uploads: []const Upload,
-        quant: WeightQuant,
-    ) Allocator.Error!void {
-        const Packing = kernels.VramArena.Packing;
-        const gpa = self.small.gpa;
-        var small: Packing = .init(self.small.packing.seg_capacity, self.small.packing.align_bytes);
-        defer small.deinit(gpa);
-
-        var quants: Packing = .init(
-            self.quants.packing.seg_capacity,
-            self.quants.packing.align_bytes,
-        );
-        defer quants.deinit(gpa);
-
-        for (uploads) |u| {
-            const bytes = u.arenaBytes(quant);
-            _ = try small.place(gpa, bytes.small);
-            if (u.isMatrix()) {
-                _ = try quants.place(gpa, bytes.quants);
-            }
-        }
-
-        try self.small.setPlan(&small);
-        try self.quants.setPlan(&quants);
-    }
-
-    /// The bytes of the segments of both arenas.
-    fn heldBytes(self: *const WeightMemory) u64 {
-        return self.small.packing.capacityBytes() + self.quants.packing.capacityBytes();
-    }
-
-    /// The bytes of the views of both arenas.
-    fn viewBytes(self: *const WeightMemory) u64 {
-        return self.small.packing.request_bytes + self.quants.packing.request_bytes;
-    }
-
-    /// The most padding that the views of both arenas can leave.
-    fn paddingBound(self: *const WeightMemory) u64 {
-        return self.small.packing.paddingBound() + self.quants.packing.paddingBound();
-    }
-
-    /// Check both arenas after the upload against `priced`, the weight bytes of the planner.
-    fn assertFull(self: *const WeightMemory, priced: u64) void {
-        self.small.packing.assertFull();
-        self.quants.packing.assertFull();
-
-        // Each tensor view pads at most the offset alignment (256 bytes by the Vulkan limits), so
-        // the padding stays under 1 MiB at `limits.max_layers`, inside the 1/8 preflight reserve.
-        assert(self.viewBytes() <= priced);
-        assert(self.heldBytes() <= priced + self.paddingBound());
-    }
-
-    /// Upload one matmul weight in the form of `quant`. A weight of another dtype is refused.
-    fn matrix(
-        self: *WeightMemory,
-        quant: WeightQuant,
-        name: []const u8,
-        t: *const Tensor,
-    ) !kernels.Q80Weight {
-        const held: WeightQuant = switch (t.dtype) {
-            .q8_0 => .q8_0,
-            .q4_0 => .q4_0,
-            else => {
-                refuseDtype(name, t.dtype);
-                return error.UnsupportedWeightDtype;
-            },
-        };
-        if (held != quant) {
-            log.err(
-                "tensor {s}: dtype {t} differs from the dtype {t} of the other matrices",
-                .{ name, t.dtype, quant },
-            );
-            return error.UnsupportedWeightDtype;
-        }
-
-        // The first dimension is the input features, and the second the output features.
-        const n_in: usize = @intCast(t.shape[0]);
-        const n_out: usize = @intCast(t.shape[1]);
-        const ctx = self.ctx;
-        const small = &self.small;
-        const quants = &self.quants;
-        const Q80Weight = kernels.Q80Weight;
-        const weight = switch (quant) {
-            .q8_0 => try Q80Weight.initInArenas(ctx, small, quants, t.data, n_in, n_out),
-            .q4_0 => try Q80Weight.initInArenasQ40(ctx, small, quants, t.data, n_in, n_out),
-        };
-        assert(weight.owned == null);
-        return weight;
-    }
-
-    /// Upload one f32 weight into the small arena through a transient host buffer.
-    fn vector(self: *WeightMemory, name: []const u8, t: *const Tensor) !vk.DescriptorBufferInfo {
-        if (t.dtype != .f32) {
-            refuseDtype(name, t.dtype);
-            return error.UnsupportedWeightDtype;
-        }
-
-        var staging: kernels.HostBuffer = .{ .ctx = self.ctx };
-        defer staging.deinit();
-
-        const bytes: vk.DeviceSize = t.data.len;
-        try staging.ensure(bytes);
-        @memcpy(staging.sliceTyped(u8, t.data.len), t.data);
-        const view = try self.small.alloc(bytes);
-        const copies = [_]kernels.Copy{.{
-            .src = staging.buffer,
-            .dst = view.buffer,
-            .size = bytes,
-            .dst_offset = view.offset,
-        }};
-        try kernels.runStagingCopies(self.ctx, &copies);
-        return view;
-    }
-};
-
 /// The weights and the recurrent state of one layer of the range. An empty entry frees nothing.
 const LayerStore = struct {
     /// The matmul weights, keyed by role. Null: the layer holds no such matrix.
@@ -575,6 +380,7 @@ pub fn FusedRunner(comptime Family: type) type {
             AttentionHeadDimUnsupported,
             BindCountMismatch,
             NoKvLayerInRange,
+            DeviceFailedAtInit,
         } || tensor_lookup.Error || GuardError || OpResources.InitError ||
             vulkan_ctx.InitError ||
             kernels.LinearQ80Reduce.InitError ||
@@ -662,12 +468,14 @@ pub fn FusedRunner(comptime Family: type) type {
             return @as(u64, n_slots) * vocab_size * @sizeOf(f32);
         }
 
-        /// The planner inputs of this model at `vram_free`, the measured free device-local bytes.
-        /// Zero keeps the planner off the budget. `logit_rows` must cover the rows of `init`.
+        /// The planner inputs of this model at `vram_free`, the measured free device-local bytes,
+        /// on `driver`. Zero keeps the planner off the budget. `logit_rows` must cover the rows of
+        /// `init`.
         pub fn kvCaps(
             loaded: *const loader.Loaded,
             ceiling: u32,
             vram_free: u64,
+            driver: limits.Driver,
             logit_rows: u32,
             kv_dtype: dtype.KvDtype,
         ) kv_budget.Caps {
@@ -677,6 +485,7 @@ pub fn FusedRunner(comptime Family: type) type {
             const windows = kv_budget.defaultWindows(kvCostModel(loaded.card, kv_dtype), ceiling);
             return .{
                 .vram_free = vram_free,
+                .driver = driver,
                 .weights = weightsVramBytes(loaded),
                 .logits = logitsVramBytes(loaded.card.vocab_size, logit_rows),
                 .scratch = scratchVramBytes(loaded.card, kv_dtype),
@@ -714,8 +523,23 @@ pub fn FusedRunner(comptime Family: type) type {
             return initRange(gpa, ctx, .{ .loaded = loaded, .first = first }, plan, kv_dtype);
         }
 
-        /// Every init funnels here, so one body sizes and frames every buffer.
+        /// Every init funnels here, so one place names the retry after a device failure.
         fn initRange(
+            gpa: Allocator,
+            ctx: *const vulkan_ctx.Context,
+            range: ModelRange,
+            plan: kv_budget.KvPlan,
+            kv_dtype: dtype.KvDtype,
+        ) InitError!*Self {
+            return buildRange(gpa, ctx, range, plan, kv_dtype) catch |err| {
+                const text = deviceFailureText(err) orelse return err;
+                log.err("{s}", .{text});
+                return error.DeviceFailedAtInit;
+            };
+        }
+
+        /// One body sizes and frames every buffer of every init.
+        fn buildRange(
             gpa: Allocator,
             ctx: *const vulkan_ctx.Context,
             range: ModelRange,
@@ -732,6 +556,8 @@ pub fn FusedRunner(comptime Family: type) type {
             errdefer gpa.destroy(self);
 
             self.* = try initFields(gpa, ctx, range, plan, kv_dtype, quant);
+            // Generic callers read the field, and the scratch and the bindings hold the constant.
+            assert(self.prefill_batch_max == prefill_rows_max);
             errdefer self.commands.deinit();
             errdefer self.memory.deinit();
 
@@ -1396,7 +1222,8 @@ pub fn FusedRunner(comptime Family: type) type {
 
             // Refuse a plan past the live device-local budget.
             const vram = vramOf(range, plan, layout, kv_dtype);
-            try fused_commands.preflightVram(plan, vram, ctx.deviceLocalAvailableBytes());
+            const available = ctx.deviceLocalAvailableBytes();
+            try fused_commands.preflightVram(plan, vram, ctx.driver, available);
             return layout;
         }
 
@@ -1636,14 +1463,23 @@ pub fn FusedRunner(comptime Family: type) type {
 
         /// Upload every weight of the range in the order of `uploadOrder`. A dry run of the same
         /// order sizes each arena segment first, so the arenas hold the views plus their padding.
+        /// One upload stage carries every weight. The stage frees its buffers before `allocSlabs`.
         fn uploadWeights(self: *Self, refs: []const loader.TensorRef) InitError!void {
             const uploads = try self.uploadOrder(refs);
             defer self.gpa.free(uploads);
 
-            try self.memory.plan(uploads, self.quant);
+            const largest = try self.memory.plan(uploads, self.quant);
+            const bytes = fused_weights.stageBytes(largest, self.commands.swap_chunk_bytes);
+            fused_weights.logHeaps(self.commands.ctx, "before");
+            var stage: kernels.UploadStage = .init(self.commands.ctx);
+            defer stage.deinit();
+
+            try stage.ensure(bytes.small, bytes.quants);
             for (uploads) |u| {
-                try self.upload(u);
+                try self.upload(&stage, u);
             }
+
+            fused_weights.logHeaps(self.commands.ctx, "after");
 
             const end = self.first_layer + self.n_layers;
             const priced = weightsVramBytesRange(refs, self.card.n_layers, self.first_layer, end);
@@ -1698,10 +1534,10 @@ pub fn FusedRunner(comptime Family: type) type {
 
         /// Upload one weight, and keep its view where the sets of its layer or of the head find
         /// it. Each view holds the bytes that the dry run of `WeightMemory.plan` placed for it.
-        fn upload(self: *Self, u: Upload) InitError!void {
+        fn upload(self: *Self, stage: *kernels.UploadStage, u: Upload) InitError!void {
             const bytes = u.arenaBytes(self.quant);
             if (!u.isMatrix()) {
-                const view = try self.memory.vector(u.name, u.tensor);
+                const view = try self.memory.vector(stage, u.name, u.tensor);
                 assert(view.range == bytes.small);
                 switch (u.site) {
                     .layer => |at| self.layers[at.index].vectors.set(at.role, view),
@@ -1712,8 +1548,8 @@ pub fn FusedRunner(comptime Family: type) type {
             }
 
             const weight = switch (u.site) {
-                .lm_head => try self.uploadLmHead(u.name, u.tensor),
-                else => try self.memory.matrix(self.quant, u.name, u.tensor),
+                .lm_head => try self.memory.lmHead(stage, self.gpa, self.quant, u.name, u.tensor),
+                else => try self.memory.matrix(stage, self.quant, u.name, u.tensor),
             };
             assert(weight.scales.range == bytes.small);
             assert(weight.quants.range == bytes.quants);
@@ -1722,34 +1558,6 @@ pub fn FusedRunner(comptime Family: type) type {
                 .lm_head => self.head.lm_head = weight,
                 .output_norm => unreachable, // The final norm is a vector.
             }
-        }
-
-        /// Upload the lm_head: `output.weight`, or the embedding table that a tied model reuses.
-        fn uploadLmHead(
-            self: *Self,
-            name: []const u8,
-            output: *const Tensor,
-        ) InitError!kernels.Q80Weight {
-            if (output.dtype != .q6_k or self.quant != .q4_0) {
-                return self.memory.matrix(self.quant, name, output);
-            }
-
-            // The lm_head is a small part of the weight stream of a step, so a throughput run
-            // accepts the loss of the requantization.
-            const q40_bytes = try convertQ6KtoQ40(self.gpa, output.*);
-            defer self.gpa.free(q40_bytes);
-
-            const in_features: usize = @intCast(output.shape[0]);
-            const row_bytes: u32 = @intCast((in_features / 32) * kernels.q4_0_block_bytes);
-            const t40: Tensor = .{
-                .dtype = .q4_0,
-                .n_dims = 2,
-                .shape = output.shape,
-                .byte_stride = .{ row_bytes, 0, 0, 0 },
-                .data = q40_bytes,
-            };
-            t40.assertValid();
-            return self.memory.matrix(.q4_0, name, &t40);
         }
 
         /// Allocate the zeroed recurrent slabs of each layer without KV. The caller frees a partial
@@ -2535,26 +2343,17 @@ fn stagedCopy(
     };
 }
 
-/// Convert a Q6_K tensor to new Q4_0 bytes, one 256-element superblock at a time through a small
-/// f32 scratch, so the conversion needs no f32 copy of the whole lm_head. The caller owns the
-/// result.
-fn convertQ6KtoQ40(gpa: Allocator, t: Tensor) ![]u8 {
-    assert(t.dtype == .q6_k);
-
-    const numel: usize = @as(usize, @intCast(t.shape[0])) * @as(usize, @intCast(t.shape[1]));
-    assert(numel % 256 == 0);
-    const n_super = numel / 256;
-    const out = try gpa.alloc(u8, (numel / 32) * kernels.q4_0_block_bytes);
-    errdefer gpa.free(out);
-
-    var scratch: [256]f32 = undefined;
-    for (0..n_super) |s| {
-        naive.dequantQ6K(t.data[s * 210 ..][0..210], &scratch);
-        // 256 elements are 8 Q4_0 blocks of 18 bytes.
-        naive.quantizeQ40(&scratch, out[s * 144 ..][0..144]);
-    }
-
-    return out;
+/// The refusal of a device failure during a fused init, or null for another error. The plan
+/// passed the preflight, so the text names the retry and not a smaller plan.
+fn deviceFailureText(err: anyerror) ?[]const u8 {
+    const retry = " during the init of the fused runner, after the plan passed the VRAM " ++
+        "preflight. Run the command again. When the log shows a device removal, " ++
+        "first restart the virtual machine of the driver, for example with `wsl --shutdown`";
+    return switch (err) {
+        error.DeviceLost => "device: the driver removed the device" ++ retry,
+        error.OutOfDeviceMemory => "device: the driver refused a device allocation" ++ retry,
+        else => null,
+    };
 }
 
 // -- tests ------------------------------------------------------------------
@@ -2792,4 +2591,15 @@ fn hasError(comptime E: type, comptime name: []const u8) bool {
     }
 
     return false;
+}
+
+test "a device failure at init names the retry, and another error names nothing" {
+    for ([_]anyerror{ error.DeviceLost, error.OutOfDeviceMemory }) |err| {
+        const text = deviceFailureText(err) orelse return error.TestExpectedText;
+        try testing.expect(std.mem.indexOf(u8, text, "Run the command again") != null);
+        try testing.expect(std.mem.indexOf(u8, text, "wsl --shutdown") != null);
+    }
+
+    try testing.expectEqual(@as(?[]const u8, null), deviceFailureText(error.OutOfMemory));
+    try testing.expectEqual(@as(?[]const u8, null), deviceFailureText(error.VramBudgetExceeded));
 }

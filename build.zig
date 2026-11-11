@@ -83,6 +83,11 @@ const gdn_scan_defines = [_][]const u8{
 };
 const subgroup_defines = [_][]const u8{
     print("LDS_CAPACITY={d}", .{limits.subgroup_lds_capacity}),
+    print("GRID_X={d}u", .{limits.reduce_grid_x}),
+};
+
+const reduce_defines = [_][]const u8{
+    print("GRID_X={d}u", .{limits.reduce_grid_x}),
 };
 
 // -- constants: shader table ------------------------------------------------
@@ -92,8 +97,8 @@ const subgroup_defines = [_][]const u8{
 const vulkan_shaders = [_]Shader{
     .{ .name = "vec_add" },
     .{ .name = "linear_q8_0" },
-    .{ .name = "linear_q8_0_reduce" },
-    .{ .name = "linear_q4_0_reduce" },
+    .{ .name = "linear_q8_0_reduce", .defines = &reduce_defines },
+    .{ .name = "linear_q4_0_reduce", .defines = &reduce_defines },
     .{ .name = "linear_q8_0_subgroup", .defines = &subgroup_defines },
     .{ .name = "linear_q8_0_batch", .defines = &q8_batch_defines },
     .{ .name = "linear_q8_0_gemm", .defines = &gemm_defines },

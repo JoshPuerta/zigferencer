@@ -97,6 +97,8 @@ pub const ModelNeeds = struct {
 pub const DeviceCapacity = struct {
     /// The live VRAM budget, or the heap size on a driver without the budget extension.
     vram: u64,
+    /// The driver, which picks the usable share of `vram`.
+    driver: limits.Driver,
     buffer_limits: limits.BufferLimits,
 };
 
@@ -223,6 +225,7 @@ pub fn caps(
     card: loader.ModelCard,
     m: ModelNeeds,
     vram: u64,
+    driver: limits.Driver,
     ceiling: u32,
     logit_rows: u32,
     kv_dtype: dtype.KvDtype,
@@ -236,6 +239,7 @@ pub fn caps(
     );
     return .{
         .vram_free = vram,
+        .driver = driver,
         .weights = m.weights,
         .logits = @as(u64, logit_rows) * m.logits_row,
         .scratch = m.scratch.get(kv_dtype),
@@ -414,7 +418,7 @@ fn servePlacement(
     // Plan the slots and the window the split prices.
     const slots = hybridSlots(shape.structural_slots, shape.slots_req != null) catch
         return .{ .placement = .{ .refused = .{ .hybrid_slots = shape.structural_slots } } };
-    const c = caps(card, m, d.vram, window.ceiling, slots, kv_dtype);
+    const c = caps(card, m, d.vram, d.driver, window.ceiling, slots, kv_dtype);
     const cost = kv_budget.costModel(card.kvShape(), kv_dtype);
     const clamped = clampDefault(
         slots,
@@ -524,7 +528,7 @@ fn serveFused(
         // Plan a VRAM budget. `--kv-vram` states X and buys the slots. `--vram-slots` pins the
         // count, and the VRAM left after the other reservations buys the window.
         const req_batch: u32 = @max(min_slots, @as(u32, shape.batch));
-        const c = caps(card, m, d.vram, window.ceiling, req_batch + 1, kv_dtype);
+        const c = caps(card, m, d.vram, d.driver, window.ceiling, req_batch + 1, kv_dtype);
         const slots: ?u32 = if (shape.slots_req) |s| @max(min_slots, @as(u32, s)) else null;
 
         const budgeted = switch (planBudgetOnDevice(c, cost, .{
@@ -551,7 +555,7 @@ fn serveFused(
         // Plan one slot per session at the base window.
         const n_slots: u32 = @max(min_slots, @as(u32, shape.structural_slots));
 
-        const c = caps(card, m, d.vram, window.ceiling, n_slots, kv_dtype);
+        const c = caps(card, m, d.vram, d.driver, window.ceiling, n_slots, kv_dtype);
         const clamped = clampDefault(
             n_slots,
             kv_row_elems,
@@ -632,7 +636,7 @@ fn sessionPlacement(
     }
 
     // Price the split at the window the device limits leave.
-    const c = caps(card, m, d.vram, window.ceiling, 1, kv_dtype);
+    const c = caps(card, m, d.vram, d.driver, window.ceiling, 1, kv_dtype);
     const clamped = clampSession(window, card, kv_dtype, d.buffer_limits);
     const kv: kv_budget.KvStructure = .{
         .n_slots = 1,
@@ -738,7 +742,7 @@ fn sessionFused(
 ) Fused {
     const m = resources.model.?;
     const d = resources.device.?;
-    const c = caps(card, m, d.vram, window.ceiling, 1, kv_dtype);
+    const c = caps(card, m, d.vram, d.driver, window.ceiling, 1, kv_dtype);
     const cost = kv_budget.costModel(card.kvShape(), kv_dtype);
     const clamped = clampSession(window, card, kv_dtype, d.buffer_limits);
     std.debug.assert(kv_budget.windowCeil(c) == window.ceiling);

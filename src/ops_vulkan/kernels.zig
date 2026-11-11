@@ -1384,6 +1384,7 @@ pub const AttentionSplit = struct {
         const groups_x = n_kv_heads * attn_split.queryGroups(n_heads / n_kv_heads);
         std.debug.assert(groups_x >= n_kv_heads);
         std.debug.assert(groups_x <= n_heads);
+        std.debug.assert(n_splits <= max_workgroups_x);
         self.ctx.vkd.cmdDispatch(cb, groups_x, n_splits, 1);
     }
 
@@ -2350,11 +2351,12 @@ pub const Q80Weight = struct {
         };
     }
 
-    /// Sub-allocate scales and quants from two caller-managed arenas and upload through staging.
+    /// Sub-allocate scales and quants from two caller-managed arenas and upload through `stage`.
     /// This weight stores views only, so `deinit` frees nothing for it. The arenas free everything
     /// at their own `deinit`.
     pub fn initInArenas(
         ctx: *const vulkan_ctx.Context,
+        stage: *UploadStage,
         scales_arena: *VramArena,
         quants_arena: *VramArena,
         weight_bytes: []const u8,
@@ -2368,35 +2370,13 @@ pub const Q80Weight = struct {
         const row_bytes = blocks_per_row * q8_0_block_bytes;
         if (weight_bytes.len < out_features * row_bytes) return error.WeightSizeMismatch;
 
-        // Repack the weight into host staging.
+        // Reserve the views, then repack and upload the rows into them.
         const scales_bytes: vk.DeviceSize = @intCast(out_features * blocks_per_row * 2);
         const quants_bytes: vk.DeviceSize = @intCast(out_features * in_features);
-
-        var staging_scales: HostBuffer = .{ .ctx = ctx };
-        defer staging_scales.deinit();
-
-        var staging_quants: HostBuffer = .{ .ctx = ctx };
-        defer staging_quants.deinit();
-
-        try staging_scales.ensure(scales_bytes);
-        try staging_quants.ensure(quants_bytes);
-        repackQ80ToScalesQuants(
-            weight_bytes,
-            in_features,
-            out_features,
-            staging_scales.sliceTyped(u8, @intCast(scales_bytes)),
-            staging_quants.sliceTyped(u8, @intCast(quants_bytes)),
-        );
-
-        // Upload the repacked bytes into the arenas.
         const scales_view = try scales_arena.alloc(scales_bytes);
         const quants_view = try quants_arena.alloc(quants_bytes);
-
-        const copies = [_]Copy{
-            copyToView(&staging_scales, scales_view),
-            copyToView(&staging_quants, quants_view),
-        };
-        try runStagingCopies(ctx, &copies);
+        const views: UploadStage.Views = .{ .scales = scales_view, .quants = quants_view };
+        try stage.uploadRows(ctx, .q8_0, weight_bytes, in_features, out_features, views);
 
         return .{
             .ctx = ctx,
@@ -2412,6 +2392,7 @@ pub const Q80Weight = struct {
     /// holds 16 bytes of 4-bit nibbles per block. `weight_bytes` is a Q4_0 tensor.
     pub fn initInArenasQ40(
         ctx: *const vulkan_ctx.Context,
+        stage: *UploadStage,
         scales_arena: *VramArena,
         quants_arena: *VramArena,
         weight_bytes: []const u8,
@@ -2425,35 +2406,13 @@ pub const Q80Weight = struct {
         const row_bytes = blocks_per_row * q4_0_block_bytes;
         if (weight_bytes.len < out_features * row_bytes) return error.WeightSizeMismatch;
 
-        // Repack the weight into host staging.
+        // Reserve the views, then repack and upload the rows into them.
         const scales_bytes: vk.DeviceSize = @intCast(out_features * blocks_per_row * 2);
         const quants_bytes: vk.DeviceSize = @intCast(out_features * (in_features / 2));
-
-        var staging_scales: HostBuffer = .{ .ctx = ctx };
-        defer staging_scales.deinit();
-
-        var staging_quants: HostBuffer = .{ .ctx = ctx };
-        defer staging_quants.deinit();
-
-        try staging_scales.ensure(scales_bytes);
-        try staging_quants.ensure(quants_bytes);
-        repackQ40ToScalesQuants(
-            weight_bytes,
-            in_features,
-            out_features,
-            staging_scales.sliceTyped(u8, @intCast(scales_bytes)),
-            staging_quants.sliceTyped(u8, @intCast(quants_bytes)),
-        );
-
-        // Upload the repacked bytes into the arenas.
         const scales_view = try scales_arena.alloc(scales_bytes);
         const quants_view = try quants_arena.alloc(quants_bytes);
-
-        const copies = [_]Copy{
-            copyToView(&staging_scales, scales_view),
-            copyToView(&staging_quants, quants_view),
-        };
-        try runStagingCopies(ctx, &copies);
+        const views: UploadStage.Views = .{ .scales = scales_view, .quants = quants_view };
+        try stage.uploadRows(ctx, .q4_0, weight_bytes, in_features, out_features, views);
 
         return .{
             .ctx = ctx,
@@ -2473,15 +2432,107 @@ pub const Q80Weight = struct {
             self.owned = null;
         }
     }
+};
 
-    /// The copy that fills a whole arena view from the start of a staging buffer.
-    fn copyToView(staging: *const HostBuffer, view: VramArena.View) Copy {
-        return .{
-            .src = staging.buffer,
-            .dst = view.buffer,
-            .size = view.range,
-            .dst_offset = view.offset,
+/// The one host buffer pair of a bulk weight upload. `small` stages the f16 scales and the f32
+/// vectors, and `quants` stages the quants. The caller sizes the pair once and frees it after the
+/// last weight. A matrix past the pair uploads in passes of whole rows.
+pub const UploadStage = struct {
+    small: HostBuffer,
+    quants: HostBuffer,
+
+    /// The two arena views of one matrix.
+    const Views = struct {
+        scales: VramArena.View,
+        quants: VramArena.View,
+    };
+
+    /// The block form of a repacked matrix.
+    const Form = enum { q8_0, q4_0 };
+
+    pub fn init(ctx: *const vulkan_ctx.Context) UploadStage {
+        return .{ .small = .{ .ctx = ctx }, .quants = .{ .ctx = ctx } };
+    }
+
+    pub fn deinit(self: *UploadStage) void {
+        self.quants.deinit();
+        self.small.deinit();
+    }
+
+    /// Create both buffers. A failure leaves `deinit` to free what it created.
+    pub fn ensure(self: *UploadStage, small_bytes: u64, quants_bytes: u64) !void {
+        std.debug.assert(small_bytes >= 1);
+        std.debug.assert(quants_bytes >= 1);
+
+        try self.small.ensure(small_bytes);
+        try self.quants.ensure(quants_bytes);
+    }
+
+    /// Repack the rows of one matrix into the pair and copy them to `views`, one submit per pass.
+    /// Row r of the repacked form starts at r times the row bytes in each view, so a pass of rows
+    /// lands at the offset of its first row, and the views get the bytes of a single pass.
+    fn uploadRows(
+        self: *UploadStage,
+        ctx: *const vulkan_ctx.Context,
+        comptime form: Form,
+        weight_bytes: []const u8,
+        in_features: usize,
+        out_features: usize,
+        views: Views,
+    ) SubmitError!void {
+        const block_bytes = switch (form) {
+            .q8_0 => q8_0_block_bytes,
+            .q4_0 => q4_0_block_bytes,
         };
+        const repack = switch (form) {
+            .q8_0 => repackQ80ToScalesQuants,
+            .q4_0 => repackQ40ToScalesQuants,
+        };
+        const quant_row: usize = switch (form) {
+            .q8_0 => in_features,
+            .q4_0 => in_features / 2,
+        };
+        // Both forms hold 32 weights in a block.
+        const blocks_per_row = in_features / q8_0_block_elems;
+        const src_row = blocks_per_row * block_bytes;
+        const scale_row = blocks_per_row * 2;
+        std.debug.assert(views.scales.range == out_features * scale_row);
+        std.debug.assert(views.quants.range == out_features * quant_row);
+
+        // A pass holds the most whole rows that both buffers fit.
+        const rows_max = @min(self.small.capacity / scale_row, self.quants.capacity / quant_row);
+        std.debug.assert(rows_max >= 1);
+
+        var walk = kv_budget.ChunkWalk.init(out_features, rows_max);
+        var passes: u64 = 0;
+        while (walk.next()) |rows| : (passes += 1) {
+            const first: usize = @intCast(rows.offset);
+            const n: usize = @intCast(rows.len);
+            repack(
+                weight_bytes[first * src_row ..][0 .. n * src_row],
+                in_features,
+                n,
+                self.small.sliceTyped(u8, n * scale_row),
+                self.quants.sliceTyped(u8, n * quant_row),
+            );
+            const copies = [_]Copy{
+                .{
+                    .src = self.small.buffer,
+                    .dst = views.scales.buffer,
+                    .size = n * scale_row,
+                    .dst_offset = views.scales.offset + first * scale_row,
+                },
+                .{
+                    .src = self.quants.buffer,
+                    .dst = views.quants.buffer,
+                    .size = n * quant_row,
+                    .dst_offset = views.quants.offset + first * quant_row,
+                },
+            };
+            try runStagingCopies(ctx, &copies);
+        }
+
+        std.debug.assert(passes == kv_budget.ChunkWalk.count(out_features, rows_max));
     }
 };
 
@@ -2591,6 +2642,7 @@ pub const LinearQ80 = struct {
             @ptrCast(&pc),
         );
         const group_count_x: u32 = (weight.out_features + 31) / 32;
+        std.debug.assert(group_count_x <= max_workgroups_x);
         self.ctx.vkd.cmdDispatch(self.oneshot.cmd_buffer, group_count_x, 1, 1);
         try self.ctx.vkd.endCommandBuffer(self.oneshot.cmd_buffer);
 
@@ -2697,7 +2749,7 @@ pub const LinearQ80Reduce = struct {
             @sizeOf(PushConsts),
             @ptrCast(&pc),
         );
-        self.ctx.vkd.cmdDispatch(cb, n, 1, 1);
+        recordReduceGrid(self.ctx, cb, n);
     }
 
     pub fn dispatch(
@@ -2751,8 +2803,7 @@ pub const LinearQ80Reduce = struct {
             @sizeOf(PushConsts),
             @ptrCast(&pc),
         );
-        const group_count_x: u32 = weight.out_features;
-        self.ctx.vkd.cmdDispatch(self.oneshot.cmd_buffer, group_count_x, 1, 1);
+        recordReduceGrid(self.ctx, self.oneshot.cmd_buffer, weight.out_features);
         try self.ctx.vkd.endCommandBuffer(self.oneshot.cmd_buffer);
 
         // Submit, wait, and read the result back.
@@ -2839,7 +2890,7 @@ pub const LinearQ40Reduce = struct {
             @sizeOf(PushConsts),
             @ptrCast(&pc),
         );
-        self.ctx.vkd.cmdDispatch(cb, n, 1, 1);
+        recordReduceGrid(self.ctx, cb, n);
     }
 
     pub fn dispatch(
@@ -2892,7 +2943,7 @@ pub const LinearQ40Reduce = struct {
             @sizeOf(PushConsts),
             @ptrCast(&pc),
         );
-        self.ctx.vkd.cmdDispatch(self.oneshot.cmd_buffer, weight.out_features, 1, 1);
+        recordReduceGrid(self.ctx, self.oneshot.cmd_buffer, weight.out_features);
         try self.ctx.vkd.endCommandBuffer(self.oneshot.cmd_buffer);
 
         // Submit, wait, and read the result back.
@@ -3008,8 +3059,7 @@ pub const LinearQ80Subgroup = struct {
             @sizeOf(PushConsts),
             @ptrCast(&pc),
         );
-        const group_count_x: u32 = weight.out_features;
-        self.ctx.vkd.cmdDispatch(self.oneshot.cmd_buffer, group_count_x, 1, 1);
+        recordReduceGrid(self.ctx, self.oneshot.cmd_buffer, weight.out_features);
         try self.ctx.vkd.endCommandBuffer(self.oneshot.cmd_buffer);
 
         // Submit, wait, and read the result back.
@@ -3089,6 +3139,8 @@ pub const LinearQ80Batch = struct {
         );
         const wg_n: u32 = (n + output_tile - 1) / output_tile;
         const wg_b: u32 = (b + batch_tile - 1) / batch_tile;
+        std.debug.assert(wg_n <= max_workgroups_x);
+        std.debug.assert(wg_b <= max_workgroups_x);
         self.ctx.vkd.cmdDispatch(cb, wg_n, wg_b, 1);
     }
 
@@ -3173,6 +3225,8 @@ pub const LinearQ80Gemm = struct {
         );
         const wg_n: u32 = (n + tile_n - 1) / tile_n;
         const wg_m: u32 = (b + tile_m - 1) / tile_m;
+        std.debug.assert(wg_n <= max_workgroups_x);
+        std.debug.assert(wg_m <= max_workgroups_x);
         self.ctx.vkd.cmdDispatch(cb, wg_n, wg_m, 1);
     }
 
@@ -3251,6 +3305,8 @@ pub const LinearQ40Batch = struct {
         );
         const wg_n: u32 = (n + output_tile - 1) / output_tile;
         const wg_b: u32 = (b + batch_tile - 1) / batch_tile;
+        std.debug.assert(wg_n <= max_workgroups_x);
+        std.debug.assert(wg_b <= max_workgroups_x);
         self.ctx.vkd.cmdDispatch(cb, wg_n, wg_b, 1);
     }
 };
@@ -4659,6 +4715,7 @@ pub const HostBuffer = struct {
         self.memory = memory;
         self.capacity = size;
         self.mapped = @ptrCast(mapped_opt.?);
+        _ = host_buffers_created.fetchAdd(1, .monotonic);
     }
 
     pub fn sliceTyped(self: *HostBuffer, comptime T: type, count: usize) []T {
@@ -5368,11 +5425,19 @@ var staging_busy: std.atomic.Value(bool) = .init(false);
 /// The error of a failed wait. Every later submit returns it.
 var staging_wait_error: ?SubmitError = null;
 
+/// Host buffers this process created. A test bounds the count of one runner init with it.
+var host_buffers_created: std.atomic.Value(u64) = .init(0);
+
 // -- api --------------------------------------------------------------------
 
 /// The number of one-shot submits this process started.
 pub fn stagingSubmitCount() u64 {
     return staging_submits.load(.monotonic);
+}
+
+/// The number of host buffers this process created.
+pub fn hostBufferCount() u64 {
+    return host_buffers_created.load(.monotonic);
 }
 
 /// Submit one command buffer of work on the staging buffer of `ctx`, and block until the queue is
@@ -5747,6 +5812,15 @@ fn repackQ40ToScalesQuants(
             );
         }
     }
+}
+
+/// Record the grid of a reduce matvec over `n` outputs, one workgroup per output. The shaders read
+/// the same width through their GRID_X define.
+fn recordReduceGrid(ctx: *const vulkan_ctx.Context, cb: vk.CommandBuffer, n: u32) void {
+    const grid = limits.reduceGrid(n);
+    std.debug.assert(grid.x <= max_workgroups_x);
+    std.debug.assert(grid.y <= max_workgroups_x);
+    ctx.vkd.cmdDispatch(cb, grid.x, grid.y, 1);
 }
 
 fn alignUp(value: vk.DeviceSize, alignment: vk.DeviceSize) vk.DeviceSize {

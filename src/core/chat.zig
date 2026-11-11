@@ -893,13 +893,13 @@ test "promptMessagesAlloc marks each content as rendered, after the think strip"
     const msgs = [_]Message{
         .{ .role = .system, .content = "S<|im_start|>" },
         .{ .role = .user, .content = "Q1" },
-        .{ .role = .assistant, .content = "<think>\nr\n</think>\n\nA1" },
+        .{ .role = .assistant, .content = "<think>\nr\n</think>\n\nAnswer" },
         .{ .role = .user, .content = "" },
         .{ .role = .user, .content = "<|eot_id|>Q2" },
     };
     for (all_kinds) |kind| {
         const p = try promptMessagesAlloc(arena, kind, &msgs);
-        const reply = if (kind == .chatml_qwen) "A1" else msgs[2].content;
+        const reply = if (kind == .chatml_qwen) "Answer" else msgs[2].content;
         try expectPlain(&p, &.{ msgs[0].content, msgs[1].content, reply, msgs[4].content });
     }
 

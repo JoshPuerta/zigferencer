@@ -17,11 +17,12 @@
 //   Each block belongs to exactly one lane, so the partials cover the row once.
 //
 // Schedule
-//   grid       (n, 1, 1)
-//   workgroup  32 lanes. One workgroup owns one output j = gl_WorkGroupID.x.
+//   grid       (min(n, GRID_X), ceil(n / GRID_X), 1)
+//   workgroup  32 lanes. One workgroup owns one output j = gl_WorkGroupID.y * GRID_X +
+//              gl_WorkGroupID.x, so a vocabulary past one axis of the grid folds onto y.
 //   lane       Lane L stages the input elements L, L + 32, ... and owns the blocks L, L + 32, ...
 //
-//   gl_WorkGroupID.x is uniform across the workgroup, so either every lane returns at the guard
+//   gl_WorkGroupID is uniform across the workgroup, so either every lane returns at the guard
 //   or none does. All lanes or no lanes reach the cooperative LDS load and the barrier.
 //
 //     pass 1  stage   each lane copies its strided input elements to LDS
@@ -65,6 +66,7 @@
 //
 // Defines
 //   LDS_CAPACITY  input elements in LDS, from `limits.subgroup_lds_capacity`
+//   GRID_X        workgroups on the x axis, from `limits.reduce_grid_x`
 
 #version 450
 #extension GL_EXT_shader_16bit_storage : require
@@ -75,6 +77,10 @@
 // The shader table gives the same value to the host dispatch that rejects a wider shape.
 #ifndef LDS_CAPACITY
 #error "LDS_CAPACITY must come from the build (the vulkan_shaders table)"
+#endif
+
+#ifndef GRID_X
+#error "GRID_X must come from the build (the vulkan_shaders table)"
 #endif
 
 layout(local_size_x = 32, local_size_y = 1, local_size_z = 1) in;
@@ -106,7 +112,7 @@ shared float input_lds[LDS_CAPACITY];
 // -- main -------------------------------------------------------------------
 void main() {
     uint local = gl_LocalInvocationID.x;
-    uint j = gl_WorkGroupID.x;
+    uint j = gl_WorkGroupID.y * GRID_X + gl_WorkGroupID.x;
     if (j >= params.n) return;
 
     uint k = params.k;

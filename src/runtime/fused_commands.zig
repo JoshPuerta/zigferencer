@@ -395,11 +395,13 @@ pub fn recordKvCommit(
     return commit.narrowed;
 }
 
-/// Refuse a plan past `available`, the live device-local budget, before the first allocation.
-/// The refusal names the largest window that fits, from the same budget and reservations.
+/// Refuse a plan past the usable share of `available`, the live device-local budget, on `driver`
+/// before the first allocation. The refusal names the largest window that fits, from the same
+/// budget and reservations.
 pub fn preflightVram(
     plan: kv_budget.KvPlan,
     vram: VramPreflight,
+    driver: limits.Driver,
     available: u64,
 ) error{VramBudgetExceeded}!void {
     // The plan states these reservations. Its logits figure can exceed the rows here: a budget
@@ -415,7 +417,7 @@ pub fn preflightVram(
     const planned: u64 = vram.weights + vram.kv + recurrent + vram.logits + vram.scratch;
     log.debug(
         "vram preflight: planned {d} MiB (weights {d}, kv {d}, recurrent state {d}, " ++
-            "scratch {d}), available {d} MiB",
+            "scratch {d}), available {d} MiB, usable {d} MiB ({t} row)",
         .{
             planned / mib,
             vram.weights / mib,
@@ -423,21 +425,25 @@ pub fn preflightVram(
             recurrent / mib,
             vram.scratch / mib,
             available / mib,
+            limits.vramUsable(driver, available) / mib,
+            driver,
         },
     );
-    if (limits.vramPlanFits(planned, available)) return;
+    if (limits.vramPlanFits(driver, planned, available)) return;
 
     const reserved: u64 = vram.weights + vram.logits + vram.scratch;
     var refusal_buf: [kv_budget.vram_refusal_text_max]u8 = undefined;
     log.err("{s}", .{kv_budget.formatVramRefusal(&refusal_buf, .{
         .planned = planned,
         .available = available,
+        .driver = driver,
         .weights = vram.weights,
         .kv = vram.kv,
         .recurrent_state = vram.recurrent_state,
         .n_slots = vram.n_slots,
         .window = vram.window,
         .fit = kv_budget.largestFittingWindow(
+            driver,
             available,
             reserved,
             vram.cost,
@@ -476,11 +482,14 @@ test "preflightVram accepts a plan at the usable share of the budget" {
     const t = testPreflight();
     const planned: u64 = 1000 + 2 * 64 * 4 + 100 + 50;
 
-    // The smallest budget whose usable share holds the plan.
-    const per_unit = std.math.divCeil(u64, planned, limits.vram_usable_num) catch unreachable;
-    const available: u64 = per_unit * limits.vram_usable_den;
-    try std.testing.expect(limits.vramPlanFits(planned, available));
-    try preflightVram(t.plan, t.vram, available);
+    // The smallest budget whose usable share holds the plan, on each driver.
+    for (std.enums.values(limits.Driver)) |driver| {
+        const share = limits.vram_shares.get(driver);
+        const per_unit = std.math.divCeil(u64, planned, share.num) catch unreachable;
+        const available: u64 = per_unit * share.den;
+        try std.testing.expect(limits.vramPlanFits(driver, planned, available));
+        try preflightVram(t.plan, t.vram, driver, available);
+    }
 }
 
 test "preflightVram counts the recurrent state on top of the KV regions" {
@@ -489,6 +498,6 @@ test "preflightVram counts the recurrent state on top of the KV regions" {
     t.plan.vram.kv += 300;
     const planned: u64 = 1000 + 2 * 64 * 4 + 300 + 100 + 50;
     const available: u64 = planned * 2;
-    try std.testing.expect(limits.vramPlanFits(planned, available));
-    try preflightVram(t.plan, t.vram, available);
+    try std.testing.expect(limits.vramPlanFits(.other, planned, available));
+    try preflightVram(t.plan, t.vram, .other, available);
 }

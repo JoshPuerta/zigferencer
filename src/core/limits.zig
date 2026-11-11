@@ -127,6 +127,11 @@ pub const qwen_qk_head_dim: u32 = 256;
 /// weight rather than corrupt memory.
 pub const subgroup_lds_capacity: u32 = 4096;
 
+/// Workgroups on the x axis of a reduce matvec grid, which gives one workgroup to each output.
+/// The build feeds GRID_X of the reduce shaders, and the outputs past it fold onto the y axis. It
+/// is a power of two under `max_workgroups`, so the launch holds on every conformant device.
+pub const reduce_grid_x: u32 = 32768;
+
 /// Largest decoder stack the engine allocates scratch for. SmolLM2-135M has 30, Llama-3.1-8B has
 /// 32, and Llama-3.1-70B has 80. 64 covers the 8B with headroom.
 pub const max_layers: u32 = 64;
@@ -290,15 +295,22 @@ pub const prompt_cache_ram_default: u64 = 4 << 30;
 /// The disk budget the `run` path's prompt cache uses.
 pub const prompt_cache_disk_default: u64 = 16 << 30;
 
-/// Usable share of the live device-local budget that `VK_EXT_memory_budget` reports: what the
-/// desktop leaves free, not the heap size. See "The GPU checks" in docs/architecture.md. The device
-/// destabilizes well before the heap is full, so a runner refuses over this line with a typed
-/// error. `vkAllocateMemory` otherwise runs out mid-init and removes the device.
-pub const vram_usable_num: u64 = 7;
+/// Usable share of the live device-local budget on most drivers. The 1/8 reserve absorbs what the
+/// plan omits: the upload stage, the alignment padding of the weight arenas, and driver overhead.
+pub const vram_share_default: VramShare = .{ .num = 7, .den = 8 };
 
-/// The 1/8 reserve absorbs what the plan omits: the upload staging buffer, the alignment padding of
-/// the weight arenas, and driver overhead.
-pub const vram_usable_den: u64 = 8;
+/// Usable share on a translation-layer Vulkan driver. This row is a heuristic from one measured
+/// setup: a plan under the default line lost the device there during the weight upload, and a
+/// smaller plan ran. Every other driver keeps the default row.
+pub const vram_share_vulkan_on_d3d12: VramShare = .{ .num = 3, .den = 4 };
+
+/// The usable share of each driver. The preflight refuses a plan that cannot fit under this line.
+/// A plan under the line can still fail on a driver whose budget does not show its host-visible
+/// staging or its residency.
+pub const vram_shares: std.EnumArray(Driver, VramShare) = .init(.{
+    .vulkan_on_d3d12 = vram_share_vulkan_on_d3d12,
+    .other = vram_share_default,
+});
 
 /// Usable share of the RAM that `MemAvailable` reports at boot. It covers anonymous memory: host
 /// KV, swap stages, blobs, and the prefix cache. An anonymous overrun crashes the process, so the
@@ -346,6 +358,22 @@ pub const software_device_env = "ZIGFERENCER_VK_SOFTWARE";
 
 // -- types ------------------------------------------------------------------
 
+/// The Vulkan driver of a device, as far as a limit tells drivers apart. A boot with no device and
+/// a test take `other`.
+pub const Driver = enum { vulkan_on_d3d12, other };
+
+/// The workgroup counts of a reduce matvec grid on the x and y axes.
+pub const ReduceGrid = struct {
+    x: u32,
+    y: u32,
+};
+
+/// A share of a budget: `num / den`, with a reserve that never empties.
+pub const VramShare = struct {
+    num: u64,
+    den: u64,
+};
+
 /// The device choices of the environment. Every command that opens a Vulkan context passes them.
 pub const DeviceOptions = struct {
     /// Replaces the reported `maxStorageBufferRange`. It comes from `storage_range_env`.
@@ -380,14 +408,33 @@ pub const GdnScanCell = struct { head: u32, column: u32 };
 
 // -- api --------------------------------------------------------------------
 
-/// The usable share of `available_bytes` of VRAM, rounded down.
-pub fn vramUsable(available_bytes: u64) u64 {
-    const usable = available_bytes / vram_usable_den * vram_usable_num;
+/// The usable share of `available_bytes` of VRAM on `driver`, rounded down.
+pub fn vramUsable(driver: Driver, available_bytes: u64) u64 {
+    const share = vram_shares.get(driver);
+    const usable = available_bytes / share.den * share.num;
     std.debug.assert(usable <= available_bytes);
     // The reserve is never empty, so a plan never takes the whole budget.
     if (available_bytes > 0) std.debug.assert(usable < available_bytes);
 
     return usable;
+}
+
+/// The grid of a reduce matvec over `n` outputs: at most `reduce_grid_x` workgroups on x, and
+/// the rows of that width on y. Output j runs in workgroup (j % x, j / x), and the last row can
+/// hold workgroups past `n`.
+pub fn reduceGrid(n: u32) ReduceGrid {
+    std.debug.assert(n >= 1);
+    std.debug.assert(n <= max_vocab);
+
+    const grid: ReduceGrid = .{
+        .x = @min(n, reduce_grid_x),
+        .y = std.math.divCeil(u32, n, reduce_grid_x) catch unreachable,
+    };
+    std.debug.assert(grid.x <= max_workgroups);
+    std.debug.assert(grid.y <= max_workgroups);
+    std.debug.assert(@as(u64, grid.x) * grid.y >= n);
+    std.debug.assert(@as(u64, grid.x) * (grid.y - 1) < n);
+    return grid;
 }
 
 /// The usable share of `available_bytes` of RAM, rounded down.
@@ -401,9 +448,9 @@ pub fn ramUsable(available_bytes: u64) u64 {
 }
 
 /// Whether a planned device-local footprint fits the usable share of `available`
-/// VRAM (the live budget, or the heap size when the budget extension is absent).
-pub fn vramPlanFits(planned_bytes: u64, available_bytes: u64) bool {
-    return planned_bytes <= vramUsable(available_bytes);
+/// VRAM (the live budget, or the heap size when the budget extension is absent) on `driver`.
+pub fn vramPlanFits(driver: Driver, planned_bytes: u64, available_bytes: u64) bool {
+    return planned_bytes <= vramUsable(driver, available_bytes);
 }
 
 /// Check a buffer of `elems` elements and `bytes` bytes against the device limits, in the
@@ -557,6 +604,19 @@ pub fn gdnScanCell(group: u32, lane: u32) GdnScanCell {
 }
 
 comptime {
+    // A power of two turns the row multiply of the reduce shaders into a shift, and one row fits
+    // the guaranteed count.
+    std.debug.assert(std.math.isPowerOfTwo(reduce_grid_x));
+    std.debug.assert(reduce_grid_x <= max_workgroups);
+    // The largest vocabulary folds into a grid inside the guaranteed count.
+    std.debug.assert(max_vocab / reduce_grid_x < max_workgroups);
+
+    // Every driver keeps a reserve, so a plan never takes the whole budget.
+    for (vram_shares.values) |share| {
+        std.debug.assert(share.num >= 1);
+        std.debug.assert(share.num < share.den);
+    }
+
     // A default window floors at `min_kv_window` and otherwise lands on a
     // granule, so the floor must sit inside the first granule.
     std.debug.assert(min_kv_window <= window_granule);
@@ -614,23 +674,79 @@ comptime {
 
 // -- tests ------------------------------------------------------------------
 
+test "reduceGrid: the rows of the grid cover every output once" {
+    const Row = struct { n: u32, x: u32, y: u32 };
+    const rows = [_]Row{
+        .{ .n = 1, .x = 1, .y = 1 },
+        .{ .n = 32767, .x = 32767, .y = 1 },
+        .{ .n = 32768, .x = 32768, .y = 1 },
+        .{ .n = 32769, .x = 32768, .y = 2 },
+        // The Llama-3.1 and the Qwen3.5 vocabularies.
+        .{ .n = 128256, .x = 32768, .y = 4 },
+        .{ .n = 248320, .x = 32768, .y = 8 },
+    };
+    for (rows) |row| {
+        const grid = reduceGrid(row.n);
+        try std.testing.expectEqual(row.x, grid.x);
+        try std.testing.expectEqual(row.y, grid.y);
+    }
+
+    // Over every count to the largest vocabulary, the grid holds each output, and the last row
+    // starts below `n`.
+    var n: u32 = 1;
+    while (n <= max_vocab) : (n += 1) {
+        const grid = reduceGrid(n);
+        try std.testing.expect(@as(u64, grid.x) * grid.y >= n);
+        try std.testing.expect(@as(u64, grid.x) * (grid.y - 1) < n);
+        try std.testing.expect(grid.x <= max_workgroups);
+        try std.testing.expect(grid.y <= max_workgroups);
+    }
+}
+
 test "vramPlanFits: leaves a reserve below the available budget" {
     // 8 GiB available -> 7 GiB usable.
-    try std.testing.expect(vramPlanFits(7 << 30, 8 << 30));
-    try std.testing.expect(!vramPlanFits((7 << 30) + 1, 8 << 30));
+    try std.testing.expect(vramPlanFits(.other, 7 << 30, 8 << 30));
+    try std.testing.expect(!vramPlanFits(.other, (7 << 30) + 1, 8 << 30));
     // A plan that wants the whole budget is refused, because the reserve is load-bearing.
-    try std.testing.expect(!vramPlanFits(8 << 30, 8 << 30));
+    try std.testing.expect(!vramPlanFits(.other, 8 << 30, 8 << 30));
     // Zero budget (e.g. a failed query) refuses any positive plan.
-    try std.testing.expect(!vramPlanFits(1, 0));
+    try std.testing.expect(!vramPlanFits(.other, 1, 0));
 }
 
 test "vramUsable: seven eighths of the budget, rounded down" {
-    try std.testing.expectEqual(@as(u64, 7 << 30), vramUsable(8 << 30));
-    try std.testing.expectEqual(@as(u64, 939_524_096), vramUsable(1 << 30));
+    try std.testing.expectEqual(@as(u64, 7 << 30), vramUsable(.other, 8 << 30));
+    try std.testing.expectEqual(@as(u64, 939_524_096), vramUsable(.other, 1 << 30));
     // The rounding happens on the eighth, so a budget under 8 bytes has none.
-    try std.testing.expectEqual(@as(u64, 0), vramUsable(7));
-    try std.testing.expectEqual(@as(u64, 7), vramUsable(15));
-    try std.testing.expectEqual(@as(u64, 0), vramUsable(0));
+    try std.testing.expectEqual(@as(u64, 0), vramUsable(.other, 7));
+    try std.testing.expectEqual(@as(u64, 7), vramUsable(.other, 15));
+    try std.testing.expectEqual(@as(u64, 0), vramUsable(.other, 0));
+}
+
+test "vramUsable: each driver row takes its share of the budget, rounded down" {
+    const Row = struct { driver: Driver, available: u64, usable: u64 };
+    const rows = [_]Row{
+        .{ .driver = .other, .available = 8 << 30, .usable = 7 << 30 },
+        .{ .driver = .other, .available = 15, .usable = 7 },
+        .{ .driver = .vulkan_on_d3d12, .available = 8 << 30, .usable = 6 << 30 },
+        // The usual budget of a 16 GB card under a translation-layer driver leaves 11676 MiB.
+        .{ .driver = .vulkan_on_d3d12, .available = 15568 << 20, .usable = 11676 << 20 },
+        .{ .driver = .vulkan_on_d3d12, .available = 7, .usable = 3 },
+        .{ .driver = .vulkan_on_d3d12, .available = 0, .usable = 0 },
+    };
+    for (rows) |row| {
+        try std.testing.expectEqual(row.usable, vramUsable(row.driver, row.available));
+    }
+}
+
+test "vramPlanFits: a plan under the default line can be past the translation-layer line" {
+    const budget: u64 = 15568 << 20;
+    // The plan that lost the device at upload, and the plan that then ran.
+    const lost: u64 = 13524 << 20;
+    const ran: u64 = 11100 << 20;
+    try std.testing.expect(vramPlanFits(.other, lost, budget));
+    try std.testing.expect(!vramPlanFits(.vulkan_on_d3d12, lost, budget));
+    try std.testing.expect(vramPlanFits(.vulkan_on_d3d12, ran, budget));
+    try std.testing.expect(!vramPlanFits(.vulkan_on_d3d12, 1, 0));
 }
 
 test "ramUsable: seven eighths of the free RAM, rounded down, with a reserve that never empties" {

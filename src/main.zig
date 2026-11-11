@@ -275,9 +275,13 @@ fn isUserError(err: anyerror) bool {
         error.HeadsPastDispatchLimit,
         error.QwenHeadDimUnsupported,
         error.NoKvLayerInRange,
+        // The fused init logged the device failure and the retry.
+        error.DeviceFailedAtInit,
         // Configuration refusals.
         error.InvalidStorageRange,
         error.InvalidSoftwareDevice,
+        // The context logged the workgroup counts of the device.
+        error.WorkgroupCountBelowMinimum,
         // The profile logged the timestamp bits and the period.
         error.TimestampsUnsupported,
         // Client errors.
@@ -395,6 +399,7 @@ test {
     if (build_options.use_vulkan_fused_ops) {
         // The fused runner tests are device-free and run only through this pull.
         _ = fused_runner;
+        _ = @import("runtime/fused_weights.zig");
         // The hybrid tests are device-free and run only through this pull.
         _ = hybrid_runner;
         // These methods reach production only through comptime branches, so take their addresses.
