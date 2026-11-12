@@ -180,6 +180,14 @@ slot state machine consumes. The manager makes the calls whose result only the c
   client returns the bytes as they are, and `cli/client/client_streaming.zig` holds a partial
   codepoint back until the next token. The HTTP adapter holds a partial
   codepoint back too, so every SSE delta is valid UTF-8.
+- **A control token sends no text.** `cli/boot/codec_parts.zig` gives each token of the GGUF type
+  CONTROL the empty piece, as llama.cpp does by default. Examples are `<|im_end|>`, `<|eot_id|>`,
+  and `<|python_tag|>`. A user-defined token, such as `<think>` or `<tool_call>` in the Qwen3.5
+  files, keeps its text. The id, the count, and the position of a control token stay as they are,
+  and a turn still ends at the EOS id. Only the text of its event is empty. So a `stop` string
+  cannot match a control token. A model can sample an end token that is not the EOS id of its
+  file, for example `<|eom_id|>` in the Llama 3.1 files. The turn then runs on, as before, and the
+  client does not see that token.
 - **The per-op GPU backend cannot serve.** `cli/boot/boot_lines.zig` returns
   `error.UnsupportedServeBackend` for it. The CPU runners, the fused runners, and
   the hybrids all serve.
@@ -285,9 +293,11 @@ or `collectTurn`. A terminal-wait method writes one frame, consumes frames until
 the terminal message of that request, and returns the reply as a value.
 Terminal-wait methods assume one request in flight on the connection.
 
-The server sends the end-of-sequence token as a token frame too. `hello`
-records its id, `collectTurn` skips its text, and a client that renders text
-skips the token whose id equals `eos_id` from `hello_ack`.
+Each `token` frame carries its id. The frame of a control token carries no text, and it still
+counts in `gen_tokens`. The server sends the end-of-sequence token as a token frame too. In the
+SmolLM2, Qwen3.5, and Llama-3.1 files that token is a control token, so its frame carries no text.
+`hello` records its id, `collectTurn` skips its text, and a client that renders text skips the
+token whose id equals `eos_id` from `hello_ack`.
 
 The wire is `protocol_version` 3. The server refuses a header of any other version, version 2
 included, with `unsupported_version` and closes the connection. Each `token` frame carries a channel
@@ -387,10 +397,12 @@ server renders each pair as a live turn at the same place: the user wrap, the
 closed think tail, and the reply text. It writes no end of the assistant turn,
 because the next wrap writes it. A reply holds no think block. Both texts are request text, so the
 server encodes each one as plain text. A live turn never encodes its reply, because the model
-sampled those ids. So a reply that holds a sampled control token, such as a tool-call tag, gets
-other ids as a kept pair. That pair costs more positions, a later prefix cache lookup misses, and
-the kept history spells the control token as text. The server reports the real positions, and the
-client adopts them. One frame holds
+sampled those ids. A sampled control token sends no text to the client, so a kept reply does not
+hold it. The text on both sides of that token then encodes as one plain text, so the kept pair
+costs fewer positions than the live turn. A sampled user-defined token, such as a tool-call tag,
+sends its text, and that text encodes as plain text in the kept pair, so the pair costs more
+positions. In both cases the pair gets other ids than the live turn, and a later prefix cache
+lookup misses. The server reports the real positions, and the client adopts them. One frame holds
 at most `limits.max_append_pairs` pairs and 64 KiB. A longer history goes in
 several frames, and the session ends in the same state as after one frame. A
 pair costs the positions of its ids. With thinking off, a reply that
@@ -565,6 +577,10 @@ gives the pure greedy stream.
 
 The buffered reply adds `usage.completion_tokens_details.reasoning_tokens`
 when the turn has think tokens.
+
+A control token adds no text to `content` or `reasoning_content`, and a stream sends no chunk for
+it. `usage.completion_tokens` still counts it. A user-defined token, such as `<tool_call>`, keeps
+its text in the reply.
 
 ## Policy points
 

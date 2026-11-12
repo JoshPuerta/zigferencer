@@ -199,7 +199,8 @@ pub const TurnKind = enum { system, open_first, first_after_system, continuation
 pub const Codec = struct {
     vocab: *const vocab_mod.Vocab,
     kind: chat.Kind,
-    /// id -> displayable bytes, built at server start. Each piece fits the token text bound.
+    /// id -> displayable bytes, built at server start. Each piece fits the token text bound, and
+    /// the piece of a control token is empty.
     pieces: []const []const u8,
     eos_id: u32,
 
@@ -239,8 +240,8 @@ pub const Codec = struct {
     }
 
     /// Tokenize one kept pair at `order`, the user wrap and the reply apart. The reply encodes as
-    /// plain text, so a sampled control token in it gets other ids than the live turn sampled.
-    /// The caller owns the ids.
+    /// plain text, so a sampled user-defined tag in it gets other ids than the live turn sampled.
+    /// A sampled control token sent no text, so the reply holds none. The caller owns the ids.
     pub fn pairTokens(
         self: *const Codec,
         gpa: Allocator,

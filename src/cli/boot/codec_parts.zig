@@ -10,6 +10,7 @@ const std = @import("std");
 const bpe = @import("../../core/tokenizer/bpe.zig");
 const chat = @import("../../core/chat.zig");
 const limits = @import("../../core/limits.zig");
+const parser = @import("../../io/gguf/parser.zig");
 const vocab_mod = @import("../../core/tokenizer/vocab.zig");
 const scheduler_mod = @import("../../serve/scheduler.zig");
 
@@ -38,10 +39,19 @@ pub const ThinkTags = struct {
 // -- api --------------------------------------------------------------------
 
 /// Decode the displayable bytes of every id once at startup. A piece past the serve cap fails the
-/// boot, never a silent truncation.
+/// boot, never a silent truncation. A control token gets the empty piece, as llama.cpp
+/// `llama_token_to_piece` gives with `special` false. A user-defined token keeps its text.
 pub fn buildPieces(arena: std.mem.Allocator, v: *const vocab_mod.Vocab) ![]const []const u8 {
+    std.debug.assert(v.is_control.len == v.tokens.len);
+
     const pieces = try arena.alloc([]const u8, v.tokens.len);
-    for (pieces, 0..) |*piece, id| {
+    for (pieces, v.is_control, 0..) |*piece, control, id| {
+        if (control) {
+            std.debug.assert(v.is_special[id]);
+            piece.* = "";
+            continue;
+        }
+
         piece.* = try bpe.decodeAlloc(v, arena, &[_]u32{@intCast(id)});
         if (piece.len > limits.max_token_text_bytes) {
             log.err("token {d} decodes to {d} bytes (serve cap {d})", .{
@@ -180,4 +190,39 @@ test "thinkTagsFrom: one id per tag, the close first, and no end-of-sequence id"
     // The bound itself is legal.
     const widest = try thinkTagsFrom(&open, &close, &.{ 248069, sep, sep, sep }, eos);
     try std.testing.expectEqual(limits.think_force_ids_max, widest.force_len);
+}
+
+test "buildPieces: a control token has the empty piece, and every other token has its text" {
+    var arena_state: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena_state.deinit();
+
+    const arena = arena_state.allocator();
+    const tokens = [_][]const u8{ "a", "<|end|>", "<tool>", "b", "<|ctl|>" };
+    // The GGUF token types: 1 normal, 3 control, 4 user-defined.
+    const types = [_]i32{ 1, 3, 4, 1, 3 };
+    const kvs = [_]parser.Kv{
+        .{ .key = "tokenizer.ggml.tokens", .value = .{ .array = .{ .strings = &tokens } } },
+        .{ .key = "tokenizer.ggml.merges", .value = .{ .array = .{ .strings = &.{} } } },
+        .{ .key = "tokenizer.ggml.token_type", .value = .{ .array = .{ .i32s = &types } } },
+        .{ .key = "tokenizer.ggml.eos_token_id", .value = .{ .u32_val = 1 } },
+    };
+    const v = try vocab_mod.buildFromParsed(arena, .{
+        .header = undefined,
+        .kvs = &kvs,
+        .tensors = &.{},
+        .data_offset = 0,
+        .alignment = 1,
+    });
+    const pieces = try buildPieces(arena, &v);
+    try std.testing.expectEqual(tokens.len, pieces.len);
+    try std.testing.expectEqualStrings("", pieces[1]);
+    try std.testing.expectEqualStrings("<tool>", pieces[2]);
+
+    // The piece is empty exactly when the token is a control token.
+    for (pieces, types, tokens) |piece, token_type, token| {
+        try std.testing.expectEqual(token_type == 3, piece.len == 0);
+        if (token_type != 3) {
+            try std.testing.expectEqualStrings(token, piece);
+        }
+    }
 }

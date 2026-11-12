@@ -57,7 +57,12 @@
 //! Routes. A method off its route gets 405 with `allow`, and an unknown method gets 501. HEAD on
 //! a GET route gets the GET reply with no body.
 //!
-//! Fixture. The test reads the canonical SmolLM2 Q8_0 from `test_fixtures.path`.
+//! Control tokens. One test runs the real codec over the control vocab of the harness and needs no
+//! model file. A control token adds no text to a buffered or a streamed reply, and no chunk goes
+//! out for it. The usage still counts it.
+//!
+//! Fixture. The other tests read the canonical SmolLM2 Q8_0 from `test_fixtures.path`. The fixture
+//! builds its pieces with the launcher's own builder.
 
 const std = @import("std");
 const zigferencer = @import("zigferencer");
@@ -145,11 +150,7 @@ const Fixture = struct {
 
         fx.vocab = try vocab_mod.buildFromParsed(arena, fx.loaded.parsed);
 
-        const pieces = try arena.alloc([]const u8, fx.vocab.tokens.len);
-        for (pieces, 0..) |*piece, id| {
-            piece.* = try bpe.decodeAlloc(&fx.vocab, arena, &[_]u32{@intCast(id)});
-            try std.testing.expect(piece.len <= limits.max_token_text_bytes);
-        }
+        const pieces = try zigferencer.codec_parts.buildPieces(arena, &fx.vocab);
 
         const policy = test_policy.policy();
         try test_policy.startPool(&fx.cpu_pool, io, policy);
@@ -281,10 +282,20 @@ fn runServerTask(server: *OpenAiServer) void {
 }
 
 fn post(fx: *const Fixture, arena: std.mem.Allocator, body: []const u8) !Reply {
-    var client: std.http.Client = .{ .allocator = fx.gpa, .io = fx.io };
+    return postTo(fx.gpa, fx.io, fx.uri, arena, body);
+}
+
+fn postTo(
+    gpa: std.mem.Allocator,
+    io: std.Io,
+    uri: std.Uri,
+    arena: std.mem.Allocator,
+    body: []const u8,
+) !Reply {
+    var client: std.http.Client = .{ .allocator = gpa, .io = io };
     defer client.deinit();
 
-    var req = try client.request(.POST, fx.uri, .{ .keep_alive = false });
+    var req = try client.request(.POST, uri, .{ .keep_alive = false });
     defer req.deinit();
 
     try req.sendBodyComplete(try arena.dupe(u8, body));
@@ -916,6 +927,133 @@ test "openai loopback: min_p and repetition_penalty reach the sampler" {
     // greedy count moves off its plain path.
     const penalized = try replyText(&fx, arena, prompt, greedy ++ ",\"repetition_penalty\":2");
     try std.testing.expect(!std.mem.eql(u8, plain, penalized));
+}
+
+// -- control tokens ---------------------------------------------------------
+
+const FakeEngine = Sessions(harness.FakeRunner);
+const FakeServer = http_server.Server(FakeEngine);
+
+fn runFakeServer(server: *FakeServer) void {
+    server.run() catch {};
+}
+
+test "openai loopback: a control token sends no text and still counts" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    var arena_state = std.heap.ArenaAllocator.init(gpa);
+    defer arena_state.deinit();
+
+    const arena = arena_state.allocator();
+
+    // The server runs the real codec over the control vocab and the canned-logits runner.
+    const vocab = try harness.controlVocab(arena);
+    const window = 16;
+    const codec: RawCodec = .{
+        .vocab = &vocab,
+        .pieces = try zigferencer.codec_parts.buildPieces(arena, &vocab),
+        .eos_id = vocab.eos_id,
+        .kind = .none,
+        .think_ids = null,
+        .model_id = "fake",
+        .max_seq = window,
+        .default_max_tokens = 8,
+    };
+    var runner: harness.FakeRunner = .{
+        .n_slots = 1,
+        .max_seq = window,
+        .logits = try arena.alloc(f32, vocab.tokens.len),
+    };
+    @memset(runner.logits, 0);
+    var engine = try FakeEngine.init(arena, &runner);
+    var server = try FakeServer.init(arena, gpa, io, &engine, &codec, .{
+        .max_sessions = 1,
+        .max_batch = 1,
+        .max_seq = window,
+        .max_step_rows = 1,
+        .allow_shutdown = true,
+        .model_name = "fake",
+        .vocab_size = @intCast(vocab.tokens.len),
+        .eos_id = vocab.eos_id,
+    }, .{ .tcp = .{} });
+    var run_future = try io.concurrent(runFakeServer, .{&server});
+    defer {
+        server.submit(.{ .conn = 0, .request_id = 0, .session_id = 0, .body = .shutdown }) catch {};
+        run_future.await(io);
+    }
+
+    var uri_buf: [128]u8 = undefined;
+    const uri = try std.Uri.parse(try std.fmt.bufPrint(
+        &uri_buf,
+        "http://{f}/v1/chat/completions",
+        .{server.boundAddress()},
+    ));
+
+    // The buffered reply holds the text of every token but the control ones, and the usage counts
+    // every sampled id.
+    const greedy = try chatBody(arena, "d", ",\"temperature\":0");
+    const buffered = try postTo(gpa, io, uri, arena, greedy);
+    try std.testing.expectEqual(std.http.Status.ok, buffered.status);
+    const completion = try std.json.parseFromSliceLeaky(
+        Completion,
+        arena,
+        buffered.body,
+        .{ .ignore_unknown_fields = true },
+    );
+    try std.testing.expectEqualStrings(
+        harness.control_reply_text,
+        completion.choices[0].message.content,
+    );
+    try std.testing.expectEqualStrings("stop", completion.choices[0].finish_reason);
+    try std.testing.expectEqual(
+        @as(u32, harness.control_reply_ids.len),
+        completion.usage.completion_tokens,
+    );
+
+    // The stream carries the same text, and no chunk carries an empty content delta.
+    const streamed = try postTo(
+        gpa,
+        io,
+        uri,
+        arena,
+        try chatBody(arena, "d", ",\"stream\":true,\"temperature\":0"),
+    );
+    try std.testing.expectEqual(std.http.Status.ok, streamed.status);
+    const end_event = "data: [DONE]\n\n";
+    try std.testing.expect(std.mem.endsWith(u8, streamed.body, end_event));
+
+    var text: std.ArrayList(u8) = .empty;
+    var n_events: usize = 0;
+    var events = std.mem.splitSequence(
+        u8,
+        streamed.body[0 .. streamed.body.len - end_event.len],
+        "\n\n",
+    );
+    // One event per chunk. The stream holds at most a role chunk, a chunk per token, and a finish.
+    while (events.next()) |event| {
+        if (event.len == 0) continue;
+
+        try std.testing.expect(std.mem.startsWith(u8, event, "data: "));
+        const chunk = try std.json.parseFromSliceLeaky(
+            ChunkReply,
+            arena,
+            event["data: ".len..],
+            .{ .ignore_unknown_fields = true },
+        );
+        const choice = chunk.choices[0];
+        if (n_events == 0) {
+            try std.testing.expectEqualStrings("assistant", choice.delta.role orelse "");
+        }
+
+        if (choice.delta.content) |content| {
+            try std.testing.expect(content.len > 0);
+            try text.appendSlice(arena, content);
+        }
+
+        n_events += 1;
+    }
+
+    try std.testing.expectEqualStrings(harness.control_reply_text, text.items);
 }
 
 // -- deadlines and hang-up --------------------------------------------------

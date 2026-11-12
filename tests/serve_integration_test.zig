@@ -39,7 +39,11 @@
 //! template encode as plain text. The `session_opened` and `appended` positions must equal the
 //! count of the prompt encode, which differs from the count of the one-string encode.
 //!
-//! Skips. Every test returns `error.SkipZigTest` when no fixture exists.
+//! Control tokens. One test runs the real codec over the control vocab of the harness and needs no
+//! model file. A control token frame carries its id and no text. The reply text and the kept reply
+//! hold the text of every other token, a user-defined tag included.
+//!
+//! Skips. Every test over a model returns `error.SkipZigTest` when no fixture exists.
 
 const std = @import("std");
 const zigferencer = @import("zigferencer");
@@ -48,6 +52,7 @@ const Client = zigferencer.serve_client.Client;
 const event = zigferencer.serve_event;
 const chat = zigferencer.chat;
 const bpe = zigferencer.bpe;
+const limits = zigferencer.limits;
 const serve_engine = zigferencer.serve_engine;
 const harness = @import("serve_harness.zig");
 const Harness = harness.Harness;
@@ -1169,4 +1174,111 @@ test "kept pairs give the ids of the live turns on SmolLM2" {
 
 test "kept pairs give the ids of the live turns on the qwen CPU runner, thinking off" {
     try keptPairsMatchLive(harness.QwenHarness, .{ .chatml_qwen = .off });
+}
+
+// -- control tokens ---------------------------------------------------------
+
+const FakeEngine = zigferencer.session.Sessions(harness.FakeRunner);
+const FakeServer = zigferencer.serve_server.Server(FakeEngine, event.Codec);
+
+/// The token frames of one turn, each with its id and its text.
+const FrameLog = struct {
+    ids: [8]u32 = undefined,
+    texts: [8][limits.max_token_text_bytes]u8 = undefined,
+    lens: [8]usize = undefined,
+    n: usize = 0,
+
+    pub fn onToken(self: *FrameLog, id: u32, channel: protocol.Channel, text: []const u8) void {
+        _ = channel;
+        std.debug.assert(self.n < self.ids.len);
+        self.ids[self.n] = id;
+        @memcpy(self.texts[self.n][0..text.len], text);
+        self.lens[self.n] = text.len;
+        self.n += 1;
+    }
+
+    fn textOf(self: *const FrameLog, i: usize) []const u8 {
+        return self.texts[i][0..self.lens[i]];
+    }
+};
+
+test "a control token frame carries its id and no text, and the kept reply holds none" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    var arena_state = std.heap.ArenaAllocator.init(gpa);
+    defer arena_state.deinit();
+
+    const arena = arena_state.allocator();
+
+    // The server runs the real codec over the control vocab and the canned-logits runner.
+    const vocab = try harness.controlVocab(arena);
+    const codec: event.Codec = .{
+        .vocab = &vocab,
+        .kind = .none,
+        .pieces = try zigferencer.codec_parts.buildPieces(arena, &vocab),
+        .eos_id = vocab.eos_id,
+    };
+    const window = 16;
+    var runner: harness.FakeRunner = .{
+        .n_slots = 1,
+        .max_seq = window,
+        .logits = try arena.alloc(f32, vocab.tokens.len),
+    };
+    @memset(runner.logits, 0);
+    var engine = try FakeEngine.init(arena, &runner);
+    var server = try FakeServer.init(arena, gpa, io, &engine, &codec, .{
+        .max_sessions = 1,
+        .max_batch = 1,
+        .max_seq = window,
+        .max_step_rows = 1,
+        .allow_shutdown = true,
+        .model_name = "fake",
+        .vocab_size = @intCast(vocab.tokens.len),
+        .eos_id = vocab.eos_id,
+    }, .{ .tcp = .{} });
+    var run_future = try io.concurrent(runFakeServer, .{&server});
+    // A failed check must not leave the test blocked on the server task.
+    defer {
+        server.submit(.{ .conn = 0, .request_id = 0, .session_id = 0, .body = .shutdown }) catch {};
+        run_future.await(io);
+    }
+
+    var client = try Client.connectTcp(gpa, io, server.boundAddress());
+    defer client.deinit();
+
+    _ = try client.hello();
+    const opened = try client.openSessionInfo("", protocol.Sampling.greedy);
+    _ = try client.generate(opened.id, "d", 8, null);
+    var frames: FrameLog = .{};
+    var ids: [8]u32 = undefined;
+    var text: [64]u8 = undefined;
+    const turn = try client.collectTurnWith(&ids, &text, &frames);
+
+    // Every sampled id goes out and counts. Only the text of a control token is empty.
+    try std.testing.expectEqual(protocol.FinishReason.eos, turn.finish_reason);
+    try std.testing.expectEqualSlices(u32, &harness.control_reply_ids, frames.ids[0..frames.n]);
+    try std.testing.expectEqual(@as(u32, harness.control_reply_ids.len), turn.gen_tokens);
+    try std.testing.expectEqualStrings("e", frames.textOf(0));
+    try std.testing.expectEqualStrings("", frames.textOf(1));
+    try std.testing.expectEqualStrings("<tool>", frames.textOf(2));
+    try std.testing.expectEqualStrings("", frames.textOf(3));
+    try std.testing.expectEqualStrings(harness.control_reply_text, text[0..turn.text_len]);
+
+    // The terminal client keeps the reply text of the frames, so the kept reply holds no control
+    // text and keeps the user-defined tag.
+    const t = try gpa.create(zigferencer.client_transcript.Transcript);
+    defer gpa.destroy(t);
+    t.init();
+    t.begin("d");
+    t.appendReply(text[0..turn.text_len]);
+    _ = t.finish(zigferencer.client_transcript.liveCost(
+        turn.kv_pos - opened.kv_pos,
+        turn.finish_reason,
+        turn.gen_tokens,
+    ));
+    try std.testing.expectEqualStrings(harness.control_reply_text, t.reply(0));
+}
+
+fn runFakeServer(server: *FakeServer) void {
+    server.run() catch {};
 }

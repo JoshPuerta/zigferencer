@@ -20,6 +20,13 @@
 //!
 //! Chat template. The kind defaults to `.none`, because template wrapping has its own unit tests
 //! and the reference comparison holds for any template. A test of the turn wraps names its kind.
+//!
+//! Pieces. The harness builds the token pieces with the launcher's own builder, so a control token
+//! sends no text, as on the shipped server.
+//!
+//! Control vocab. `controlVocab` and `FakeRunner` give a server with no model on disk. The runner
+//! samples a fixed chain, and the vocab gives that chain a control token, a user-defined tag, and a
+//! control end-of-sequence token.
 
 const std = @import("std");
 const Io = std.Io;
@@ -27,6 +34,7 @@ const Allocator = std.mem.Allocator;
 const zigferencer = @import("zigferencer");
 const test_policy = @import("test_policy.zig");
 const loader = zigferencer.loader;
+const parser = zigferencer.parser;
 const vocab_mod = zigferencer.vocab;
 const bpe = zigferencer.bpe;
 const LlamaCpu = zigferencer.family.Of(.llama).Cpu;
@@ -51,6 +59,24 @@ pub const close_wait_ms: i32 = 10_000;
 
 /// The server deadline of the deadline tests. It is short, so those tests wait little.
 pub const test_io_timeout_ms: u32 = 250;
+
+/// The vocab ids that the prompt "d" samples on the canned-logits runner, the end included.
+pub const control_reply_ids = [_]u32{ 4, 5, 6, control_eos };
+
+/// The reply text of `control_reply_ids`: the plain token and the user-defined tag.
+pub const control_reply_text = "e<tool>";
+
+pub const control_eos: u32 = 7;
+
+const control_tokens = [_][]const u8{ "a", "b", "c", "d", "e", "<|ctl|>", "<tool>", "<|end|>" };
+
+/// The GGUF token types: 1 normal, 3 control, 4 user-defined.
+const control_types = [_]i32{ 1, 1, 1, 1, 1, 3, 4, 3 };
+
+comptime {
+    std.debug.assert(control_tokens.len == zigferencer.test_fakes.vocab);
+    std.debug.assert(control_types.len == control_tokens.len);
+}
 
 // -- types ------------------------------------------------------------------
 
@@ -78,6 +104,21 @@ pub const Options = struct {
 };
 
 pub const ChatKind = @FieldType(event.Codec, "kind");
+
+/// The canned-logits runner of `test_fakes`. Its chain is `next = (token + 1) % 8`.
+pub const FakeRunner = struct {
+    n_slots: u32,
+    max_seq: u32,
+    logits: []f32,
+
+    pub fn maxStepRows(self: *const FakeRunner) u32 {
+        return self.n_slots;
+    }
+
+    pub fn stepBatch(self: *FakeRunner, rows: []const zigferencer.step_row.StepRow) !void {
+        zigferencer.test_fakes.writeCannedLogits(self.logits, rows);
+    }
+};
 
 pub const Stream = struct {
     ids: [turn_tokens_max]u32 = undefined,
@@ -151,11 +192,7 @@ pub fn HarnessFor(comptime Runner: type) type {
             const vocab = try arena.create(vocab_mod.Vocab);
             vocab.* = try vocab_mod.buildFromParsed(arena, loaded.parsed);
 
-            const pieces = try arena.alloc([]const u8, vocab.tokens.len);
-            for (pieces, 0..) |*piece, id| {
-                piece.* = try bpe.decodeAlloc(vocab, arena, &[_]u32{@intCast(id)});
-                try std.testing.expect(piece.len <= limits.max_token_text_bytes);
-            }
+            const pieces = try zigferencer.codec_parts.buildPieces(arena, vocab);
 
             const codec = try arena.create(event.Codec);
             codec.* = .{
@@ -363,4 +400,23 @@ pub fn awaitServerClose(stream: Io.net.Stream) !usize {
 pub fn expectSameStream(expected: Stream, actual: Stream) !void {
     try std.testing.expectEqual(expected.reason, actual.reason);
     try std.testing.expectEqualSlices(u32, expected.ids[0..expected.n], actual.ids[0..actual.n]);
+}
+
+/// The vocab of the canned-logits runner, built from GGUF values. The prompt "d" is id 3, so a
+/// greedy reply samples the plain "e", a control token, a user-defined tag, and the control end.
+pub fn controlVocab(arena: Allocator) !vocab_mod.Vocab {
+    const kvs = [_]parser.Kv{
+        .{ .key = "tokenizer.ggml.tokens", .value = .{ .array = .{ .strings = &control_tokens } } },
+        .{ .key = "tokenizer.ggml.merges", .value = .{ .array = .{ .strings = &.{} } } },
+        .{ .key = "tokenizer.ggml.token_type", .value = .{ .array = .{ .i32s = &control_types } } },
+        .{ .key = "tokenizer.ggml.eos_token_id", .value = .{ .u32_val = control_eos } },
+    };
+    const parsed: parser.Parsed = .{
+        .header = undefined,
+        .kvs = &kvs,
+        .tensors = &.{},
+        .data_offset = 0,
+        .alignment = 1,
+    };
+    return vocab_mod.buildFromParsed(arena, parsed);
 }

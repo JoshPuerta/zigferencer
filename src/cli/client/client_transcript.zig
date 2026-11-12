@@ -225,8 +225,8 @@ pub const Transcript = struct {
     }
 
     /// Commit the pending turn with its measured cost. The reply loses its leading newlines, as
-    /// the model template does after a think block. The server encodes a kept reply as plain text,
-    /// so a reply that holds a sampled control token costs more positions than the live turn.
+    /// after a think block. A sampled user-defined tag re-encodes as plain text and costs more
+    /// positions than the live turn. A sampled control token sends no text, so it costs fewer.
     pub fn finish(t: *Transcript, turn_cost: u32) Recorded {
         t.longest_cost = @max(t.longest_cost, turn_cost);
         const p = &t.pending.?;

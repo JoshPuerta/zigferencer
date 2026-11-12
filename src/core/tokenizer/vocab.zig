@@ -102,6 +102,8 @@ pub const Vocab = struct {
     specials_sorted: []const Special,
     /// id -> true for a control or user-defined token, the tokens in `specials_sorted`.
     is_special: []const bool,
+    /// id -> true for a control token only. The serve pieces give a control token no text.
+    is_control: []const bool,
 
     bos_id: u32,
     eos_id: u32,
@@ -184,8 +186,10 @@ pub fn buildFromParsed(arena: Allocator, p: parser.Parsed) Error!Vocab {
     // Flag the specials. The reference tokenizer matches user-defined added tokens such as
     // `<think>` as specials, so each one encodes to one id.
     const is_special = try arena.alloc(bool, tokens.len);
-    for (token_types, is_special) |tt, *b| {
-        b.* = (tt == token_type_control or tt == token_type_user_defined);
+    const is_control = try arena.alloc(bool, tokens.len);
+    for (token_types, is_special, is_control) |tt, *special, *control| {
+        special.* = (tt == token_type_control or tt == token_type_user_defined);
+        control.* = (tt == token_type_control);
     }
 
     // Record the rank and the merged id of each merge, in order.
@@ -264,6 +268,7 @@ pub fn buildFromParsed(arena: Allocator, p: parser.Parsed) Error!Vocab {
         .codepoint_to_byte = codepoint_to_byte,
         .specials_sorted = specials,
         .is_special = is_special,
+        .is_control = is_control,
         .bos_id = bos,
         .eos_id = eos,
         .add_bos = add_bos,
