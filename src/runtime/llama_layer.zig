@@ -18,7 +18,7 @@
 //!
 //! Tests. The logging kernel set of `layer_kernels` records the calls of `forward`. The tests check
 //! the op order, that each op occurs at most once in a layer, that each residual adds what the
-//! projection before it wrote, and that the ops charge the Llama categories of the CPU profile.
+//! projection before it wrote, and that the ops time the Llama categories of the CPU profile.
 
 const std = @import("std");
 const loader = @import("../io/gguf/loader.zig");
@@ -301,14 +301,14 @@ test "kvIndex: each layer of a range keeps its KV region at its range index" {
     }
 }
 
-test "recurrentElems: a Llama slot holds only the KV that the cost vector prices" {
+test "recurrentElems: a Llama slot holds only the KV that the cost vector sizes" {
     const card = test_fakes.testCard(.llama);
     const elems = recurrentElems(&card);
     try testing.expectEqual(@as(u32, 0), elems.state);
     try testing.expectEqual(@as(u32, 0), elems.conv);
     try testing.expect(!has_recurrent_state);
 
-    // Each layer prices one K row and one V row a token, and no fixed bytes.
+    // Each layer holds one K row and one V row a token, and no fixed bytes.
     const vector = kv_cost.llamaCostVector(card, .f32);
     const row_bytes: u64 = activationWidth(&card, .k) * @sizeOf(f32);
     for (vector.layers()) |entry| {

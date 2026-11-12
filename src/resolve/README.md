@@ -1,9 +1,9 @@
 # Resolve
 
 This directory resolves the flags and the measured host resources into a setup or a refusal. It
-holds the boot decisions as values and the family table. It does not hold the forward pass
-(`runtime/`) or the serve loop (`serve/`). A command measures the host once, passes the resources
-here, and gets back a plan or a refusal. Nothing here reads a clock, a file, or a
+holds the boot decisions and the family table. It does not hold the forward pass (`runtime/`) or
+the serve loop (`serve/`). A command measures the host once, passes the resources here, and gets
+back a plan or a refusal. Nothing here reads a clock, a file, or a
 device, and nothing logs, so a table test runs every boot shape with no GPU.
 
 ## Files
@@ -32,7 +32,7 @@ device, and nothing logs, so a table test runs every boot shape with no GPU.
 | `Placement` | `device_placement.zig` | The choice of one boot: fused, hybrid, or cpu, with its plan | `choosePlacement` | `cli/run_cmd`, `cli/boot/serve_boot`, `dev/bench_model` |
 | `PlacementKind` | `device_placement.zig` | The tag of `Placement` | `placementKindFor` | `device_placement`, `LayerChoice` |
 | `DevicePlacement` | `device_placement.zig` | A `LayerChoice` and a `Result(Placement)` | `choosePlacement` | `cli/boot/boot_resources`, `cli/run_cmd`, `cli/boot/serve_boot` |
-| `HostPlacement` | `resolve.zig` | The all-host choice: the plan and its RAM quote | `hostPlacement` | `cli/run_cmd`, `cli/boot/serve_boot`, `dev/bench_model` |
+| `HostPlacement` | `resolve.zig` | The all-host choice: the plan and its RAM plan | `hostPlacement` | `cli/run_cmd`, `cli/boot/serve_boot`, `dev/bench_model` |
 | `LayerChoice` | `device_placement.zig` | What a `--gpu-layers` boot chose, for its log lines | `choosePlacement` | `boot_lines.logLayerChoice` |
 | `Refusal` | `resolve.zig` | The reason a boot stops, one tag each | `early`, `resolve`, `device_placement` | `cli/boot/boot_lines.refuse` |
 | `family.Of(arch)` | `family.zig` | The `Cpu`, `Fused`, and `Hybrid` runner types and the few values that differ | A comptime switch on `loader.Arch` | every command that builds a runner |

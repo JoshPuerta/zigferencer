@@ -1,5 +1,6 @@
-//! `Vocab`, a boundary value derived from the GGUF tokenizer KVs. It is built once at load time and
-//! consumed by `bpe.encodeAlloc` and `bpe.decodeAlloc`, with storage on the caller's arena.
+//! `Vocab`, a boundary value derived from the GGUF tokenizer metadata. It is built once at load
+//! time and consumed by `bpe.encodeAlloc` and `bpe.decodeAlloc`, with storage on the caller's
+//! arena.
 //!
 //! Comptime. The GPT-2 byte table (`gpt2_byte_table`) is built at comptime.
 //!
@@ -316,9 +317,9 @@ fn lenDescLessThan(_: void, a: Special, b: Special) bool {
     return a.bytes.len > b.bytes.len;
 }
 
-fn lookupKv(p: parser.Parsed, key: []const u8) ?*const parser.Value {
-    for (p.kvs) |*kv| {
-        if (std.mem.eql(u8, kv.key, key)) return &kv.value;
+fn findMetadata(p: parser.Parsed, key: []const u8) ?*const parser.Value {
+    for (p.metadata) |*pair| {
+        if (std.mem.eql(u8, pair.key, key)) return &pair.value;
     }
 
     return null;
@@ -331,7 +332,7 @@ fn invalidMerge(rank: usize) Error {
 }
 
 fn requiredKv(p: parser.Parsed, key: []const u8) Error!*const parser.Value {
-    return lookupKv(p, key) orelse {
+    return findMetadata(p, key) orelse {
         refuse("the tokenizer key {s} is missing", .{key});
         return error.MissingTokenizerKey;
     };
@@ -365,7 +366,7 @@ fn lookupI32Array(p: parser.Parsed, key: []const u8) Error![]const i32 {
 }
 
 fn lookupBool(p: parser.Parsed, key: []const u8) ?bool {
-    const v = lookupKv(p, key) orelse return null;
+    const v = findMetadata(p, key) orelse return null;
     return switch (v.*) {
         .bool_val => |b| b,
         else => null,
@@ -373,7 +374,7 @@ fn lookupBool(p: parser.Parsed, key: []const u8) ?bool {
 }
 
 fn lookupString(p: parser.Parsed, key: []const u8) ?[]const u8 {
-    const v = lookupKv(p, key) orelse return null;
+    const v = findMetadata(p, key) orelse return null;
     return switch (v.*) {
         .string => |s| s,
         else => null,
@@ -400,14 +401,20 @@ fn lookupU32(p: parser.Parsed, key: []const u8) Error!u32 {
 /// The value of an optional key. Only an absent key takes `default`, so a key of the wrong
 /// type fails and does not fall back in silence.
 fn lookupU32Or(p: parser.Parsed, key: []const u8, default: u32) Error!u32 {
-    if (lookupKv(p, key) == null) return default;
+    if (findMetadata(p, key) == null) return default;
     return lookupU32(p, key);
 }
 
 // -- tests ------------------------------------------------------------------
 
-fn parsedWithKvs(kvs: []const parser.Kv) parser.Parsed {
-    return .{ .header = undefined, .kvs = kvs, .tensors = &.{}, .data_offset = 0, .alignment = 1 };
+fn parsedWithMetadata(metadata: []const parser.MetadataPair) parser.Parsed {
+    return .{
+        .header = undefined,
+        .metadata = metadata,
+        .tensors = &.{},
+        .data_offset = 0,
+        .alignment = 1,
+    };
 }
 
 test "pairKey packs left/right into u64" {
@@ -422,29 +429,29 @@ test "buildFromParsed: an absent BOS key takes 0, and a bad BOS key refuses" {
     const arena = arena_state.allocator();
     const tokens = [_][]const u8{ "a", "b" };
     const types = [_]i32{ 1, 1 };
-    const required = [_]parser.Kv{
+    const required = [_]parser.MetadataPair{
         .{ .key = "tokenizer.ggml.tokens", .value = .{ .array = .{ .strings = &tokens } } },
         .{ .key = "tokenizer.ggml.merges", .value = .{ .array = .{ .strings = &.{} } } },
         .{ .key = "tokenizer.ggml.token_type", .value = .{ .array = .{ .i32s = &types } } },
         .{ .key = "tokenizer.ggml.eos_token_id", .value = .{ .u32_val = 1 } },
     };
-    const vocab = try buildFromParsed(arena, parsedWithKvs(&required));
+    const vocab = try buildFromParsed(arena, parsedWithMetadata(&required));
     try std.testing.expectEqual(0, vocab.bos_id);
 
-    const wrong_type = required ++ [_]parser.Kv{
+    const wrong_type = required ++ [_]parser.MetadataPair{
         .{ .key = "tokenizer.ggml.bos_token_id", .value = .{ .string = "1" } },
     };
     try std.testing.expectError(
         error.WrongTokenizerKeyType,
-        buildFromParsed(arena, parsedWithKvs(&wrong_type)),
+        buildFromParsed(arena, parsedWithMetadata(&wrong_type)),
     );
 
-    const negative = required ++ [_]parser.Kv{
+    const negative = required ++ [_]parser.MetadataPair{
         .{ .key = "tokenizer.ggml.bos_token_id", .value = .{ .i32_val = -1 } },
     };
     try std.testing.expectError(
         error.BadTokenizerValue,
-        buildFromParsed(arena, parsedWithKvs(&negative)),
+        buildFromParsed(arena, parsedWithMetadata(&negative)),
     );
 }
 
@@ -471,14 +478,14 @@ test "buildFromParsed: a token type count or a special id that the token list br
         .{ .eos = 2, .want = bad },
     };
     for (cases, 0..) |c, i| {
-        const kvs = [_]parser.Kv{
+        const metadata = [_]parser.MetadataPair{
             .{ .key = "tokenizer.ggml.tokens", .value = .{ .array = .{ .strings = c.tokens } } },
             .{ .key = "tokenizer.ggml.merges", .value = .{ .array = .{ .strings = &.{} } } },
             .{ .key = "tokenizer.ggml.token_type", .value = .{ .array = .{ .i32s = c.types } } },
             .{ .key = "tokenizer.ggml.bos_token_id", .value = .{ .u32_val = c.bos } },
             .{ .key = "tokenizer.ggml.eos_token_id", .value = .{ .u32_val = c.eos } },
         };
-        const got = buildFromParsed(arena, parsedWithKvs(&kvs));
+        const got = buildFromParsed(arena, parsedWithMetadata(&metadata));
         errdefer std.debug.print("vocab case {d} failed\n", .{i});
         if (c.want) |err| {
             try std.testing.expectError(err, got);
@@ -489,18 +496,18 @@ test "buildFromParsed: a token type count or a special id that the token list br
 }
 
 test "addBos: llama3-family pre defaults true, an explicit key wins, else false" {
-    const llama = [_]parser.Kv{
+    const llama = [_]parser.MetadataPair{
         .{ .key = "tokenizer.ggml.pre", .value = .{ .string = "llama-bpe" } },
     };
-    const llama_explicit_off = [_]parser.Kv{
+    const llama_explicit_off = [_]parser.MetadataPair{
         .{ .key = "tokenizer.ggml.pre", .value = .{ .string = "llama-bpe" } },
         .{ .key = "tokenizer.ggml.add_bos_token", .value = .{ .bool_val = false } },
     };
-    const smollm = [_]parser.Kv{
+    const smollm = [_]parser.MetadataPair{
         .{ .key = "tokenizer.ggml.pre", .value = .{ .string = "smollm" } },
     };
-    try std.testing.expect(addBos(parsedWithKvs(&llama)));
-    try std.testing.expect(!addBos(parsedWithKvs(&llama_explicit_off)));
-    try std.testing.expect(!addBos(parsedWithKvs(&smollm)));
-    try std.testing.expect(!addBos(parsedWithKvs(&.{})));
+    try std.testing.expect(addBos(parsedWithMetadata(&llama)));
+    try std.testing.expect(!addBos(parsedWithMetadata(&llama_explicit_off)));
+    try std.testing.expect(!addBos(parsedWithMetadata(&smollm)));
+    try std.testing.expect(!addBos(parsedWithMetadata(&.{})));
 }

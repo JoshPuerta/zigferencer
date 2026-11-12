@@ -4,7 +4,7 @@
 //!
 //! Comptime. `inline else` turns the architecture into a family row once, so the rest is generic.
 //!
-//! Placement. `--gpu-layers 0` and an auto split that funds no GPU layer take the CPU runner, and
+//! Placement. `--gpu-layers 0` and an auto split that holds no GPU layer take the CPU runner, and
 //! only the first of them skips the device. Every other flag state opens the device, resolves the
 //! placement on it, and serves a fused or a hybrid placement. The context stays open until the
 //! launcher returns.
@@ -66,21 +66,21 @@ const mib = 1024 * 1024;
 /// Bytes of the widest family tag: the longest family name and the widest KV dtype suffix.
 const family_tag_buf_len: usize = "vulkan_fused".len + dtype.kv_tag_suffix_max;
 
-/// The refusal of a thinking budget that no turn can spend. It takes the budget and the window.
+/// The refusal of a thinking budget that no turn can use. It takes the budget and the window.
 const thinking_budget_past_window_fmt = "--thinking-budget {d} is at " ++
     "or past the window of {d} positions, so it can never close the block. " ++
     "Use a smaller budget or a larger --max-seq";
 
 // -- types ------------------------------------------------------------------
 
-/// The host bytes of the sampler state: two id sets per scheduler slot and one sample scratch.
+/// The host bytes of the sampler state: two id sets per session entry and one sample scratch.
 const SamplerRam = struct {
     sessions: u32,
-    per_slot: u64,
+    per_session: u64,
     scratch: u64,
 
     fn total(self: SamplerRam) u64 {
-        return @as(u64, self.sessions) * self.per_slot + self.scratch;
+        return @as(u64, self.sessions) * self.per_session + self.scratch;
     }
 };
 
@@ -364,13 +364,13 @@ fn serveHybrid(
     const kv_dtype = b.kvDtype();
     const n_layers = b.loaded.card.n_layers;
 
-    // Quote the RAM, and check the split.
-    const quote = switch (hybrid_placement.quote) {
+    // Plan the RAM, and check the split.
+    const ram_plan = switch (hybrid_placement.ram_plan) {
         .ok => |q| q,
         .refused => |r| return boot_lines.refuse(ctx.io, b.model.pub_name, r),
     };
 
-    boot_lines.logRamQuote(quote, b.kvRamNamed());
+    boot_lines.logRamPlan(ram_plan, b.kvRamNamed());
 
     const plan = hybrid_placement.plan.?;
     std.debug.assert(plan.host_layers > 0);
@@ -418,7 +418,7 @@ fn serveHybrid(
         .window = plan.window,
         .prefill_width = hybrid.maxStepRows(),
         .prefix_ram_bytes = plan.ram.prefix,
-        .tier = quote.tier,
+        .tier = ram_plan.tier,
     };
     return launch(Family.Hybrid, b, hybrid, fit, cfg, launcher);
 }
@@ -435,7 +435,7 @@ fn serveFused(
     const kv_dtype = b.kvDtype();
     const name = b.model.pub_name;
 
-    const quote = try boot_lines.logFused(ctx.io, name, f, false, b.kvRamNamed(), kv_dtype);
+    const ram_plan = try boot_lines.logFused(ctx.io, name, f, false, b.kvRamNamed(), kv_dtype);
 
     const plan = f.plan;
     const ceiling = b.resolved.window.ceiling;
@@ -458,7 +458,7 @@ fn serveFused(
         .window = plan.window,
         .prefill_width = fused.maxStepRows(),
         .prefix_ram_bytes = plan.ram.prefix,
-        .tier = quote.tier,
+        .tier = ram_plan.tier,
     };
     return launch(Family.Fused, b, fused, fit, cfg, launcher);
 }
@@ -474,7 +474,7 @@ fn serveCpu(
     const kv_dtype = b.kvDtype();
     const n_sessions = b.flags.max_sessions;
 
-    // Quote the CPU placement.
+    // Plan the RAM of the CPU placement.
     const placement = try logHostPlacement(
         ctx.io,
         b.model.pub_name,
@@ -513,13 +513,13 @@ fn serveCpu(
         .window = plan.window,
         .prefill_width = limits.cpu_prefill_chunk,
         .prefix_ram_bytes = plan.ram.prefix,
-        .tier = placement.quote.tier,
+        .tier = placement.ram_plan.tier,
     };
     return launch(Family.Cpu, b, &runner, fit, cfg, launcher);
 }
 
 /// Log the boot lines of the all-host serve placement: the prefix default, the plan, and the RAM
-/// quote. A refusal stops the boot and logs no line.
+/// RAM plan. A refusal stops the boot and logs no line.
 fn logHostPlacement(
     io: Io,
     name: []const u8,
@@ -537,7 +537,7 @@ fn logHostPlacement(
     }
 
     boot_lines.logPlan(placement.plan, kv_dtype);
-    boot_lines.logRamQuote(placement.quote, kv_ram_named);
+    boot_lines.logRamPlan(placement.ram_plan, kv_ram_named);
     return placement;
 }
 
@@ -643,15 +643,15 @@ fn samplerRam(vocab_size: u32, sessions: u32) SamplerRam {
 
     return .{
         .sessions = sessions,
-        .per_slot = scheduler_mod.slotSetBytes(vocab_size),
+        .per_session = scheduler_mod.sessionSetBytes(vocab_size),
         .scratch = sampler.scratchLen(vocab_size) * @sizeOf(f32),
     };
 }
 
-/// Log the sampler state, which sits outside the KV quote. Its size follows the vocab.
+/// Log the sampler state, which sits outside the RAM plan. Its size follows the vocab.
 fn logSamplerRam(s: SamplerRam) void {
     log.info("ram: sampler {d} KiB = {d} sessions x {d} KiB id sets + {d} KiB scratch", .{
-        s.total() / kib, s.sessions, s.per_slot / kib, s.scratch / kib,
+        s.total() / kib, s.sessions, s.per_session / kib, s.scratch / kib,
     });
 }
 
@@ -671,21 +671,21 @@ fn printReady(w: *Io.Writer, comptime fmt: []const u8, fmt_args: anytype) !void 
 
 // -- tests ------------------------------------------------------------------
 
-test "serve capacity: the resolved dtype prices the plan and the ledger" {
+test "serve capacity: the resolved dtype sizes the plan and the ledger" {
     // Llama-3.1-8B: 32 layers stepping 8 KV heads x 128 head_dim. The registry anchors 262144
     // and 131072 derive from this geometry.
     const n_layers: u32 = 32;
-    const per_step: u32 = 8 * 128;
+    const kv_row_elems: u32 = 8 * 128;
     const wide: kv_budget.KvCostModel = .{
-        .kv_bytes_per_token = @as(u64, 2) * n_layers * dtype.KvDtype.f32.rowBytes(per_step),
+        .kv_bytes_per_token = @as(u64, 2) * n_layers * dtype.KvDtype.f32.rowBytes(kv_row_elems),
     };
     const half: kv_budget.KvCostModel = .{
-        .kv_bytes_per_token = @as(u64, 2) * n_layers * dtype.KvDtype.f16.rowBytes(per_step),
+        .kv_bytes_per_token = @as(u64, 2) * n_layers * dtype.KvDtype.f16.rowBytes(kv_row_elems),
     };
     try std.testing.expectEqual(@as(u64, 262_144), wide.kv_bytes_per_token);
     try std.testing.expectEqual(@as(u64, 131_072), half.kv_bytes_per_token);
 
-    // `--kv-vram 1G` at the serve default window. Half the price buys twice the slots. Llama-8B
+    // `--kv-vram 1G` at the serve default window. Half the size holds twice the slots. Llama-8B
     // at f32 has default windows of 512 (serve) and 8192 (run).
     const budget_caps: kv_budget.Caps = .{
         .vram_free = 0,
@@ -715,18 +715,18 @@ test "serve capacity: the resolved dtype prices the plan and the ledger" {
         .serve_default = limits.min_kv_window,
         .default_ceil = limits.min_kv_window,
     };
-    // A serve placement prices both stages, and the layer split planner checks no RAM.
+    // A serve placement sizes both stages, and the layer split planner checks no RAM.
     const serve_host: kv_budget.HostRequest = .{
         .ram_split = .{ .blobs = 0, .prefix = 0 },
         .residency = true,
     };
     const wide_costs = kv_budget.KvCostVector.uniform(
         n_layers,
-        @as(u64, 2) * dtype.KvDtype.f32.rowBytes(per_step),
+        @as(u64, 2) * dtype.KvDtype.f32.rowBytes(kv_row_elems),
     );
     const half_costs = kv_budget.KvCostVector.uniform(
         n_layers,
-        @as(u64, 2) * dtype.KvDtype.f16.rowBytes(per_step),
+        @as(u64, 2) * dtype.KvDtype.f16.rowBytes(kv_row_elems),
     );
     var ledger: [2]kv_budget.LayerSplit = undefined;
     for (&ledger, [_]kv_budget.KvCostVector{ wide_costs, half_costs }) |*p, costs| {
@@ -760,7 +760,7 @@ test "thinkingBudgetFits: a budget must sit below the window, and zero is unboun
     try std.testing.expect(!thinkingBudgetFits(1, 1));
 }
 
-test "serve capacity: a qwen split prices each tier by the layers it holds" {
+test "serve capacity: a qwen split sizes each tier by the layers it holds" {
     // The 2B geometry: 24 layers, every fourth one full attention. The serve placement builds this
     // structure through `kv_cost.costVector`.
     const n_layers: u32 = 24;
@@ -785,7 +785,7 @@ test "serve capacity: a qwen split prices each tier by the layers it holds" {
         .serve_default = limits.min_kv_window,
         .default_ceil = limits.min_kv_window,
     };
-    // A serve placement prices both stages, and the layer split planner checks no RAM.
+    // A serve placement sizes both stages, and the layer split planner checks no RAM.
     const serve_host: kv_budget.HostRequest = .{
         .ram_split = .{ .blobs = 0, .prefix = 0 },
         .residency = true,
@@ -793,16 +793,16 @@ test "serve capacity: a qwen split prices each tier by the layers it holds" {
     const kv: kv_budget.KvStructure = .{ .n_slots = 4, .window = 512, .costs = costs };
 
     // Twelve GPU layers leave the split at 12. Each half holds three attention layers and nine
-    // recurrent ones, so both ledgers read equal. A uniform price cannot produce that.
+    // recurrent ones, so both ledgers read equal. A uniform size cannot produce that.
     const plan = try kv_budget.planLayerSplit(caps, &weights, head_bytes, kv, serve_host, 12);
     const half: u64 = @as(u64, kv.n_slots) * (@as(u64, kv.window) * 3 * 4_096 + 9 * 1_122_304);
     try std.testing.expectEqual(@as(u32, 12), plan.host_layers);
     try std.testing.expectEqual(half, plan.kv_vram);
     try std.testing.expectEqual(half, plan.ram.host_kv);
-    // The tied head goes with any non-zero suffix, so a split of one layer pays it whole.
+    // The tied head goes with any non-zero suffix, so a split of one layer needs it whole.
     const thin = try kv_budget.planLayerSplit(caps, &weights, head_bytes, kv, serve_host, 1);
     try std.testing.expectEqual(@as(u64, 62 * mib) + head_bytes, thin.weight_resident);
-    // Layers 0, 1, and 2 are all recurrent, so that prefix charges fixed slabs and no window price.
+    // Layers 0, 1, and 2 are all recurrent, so that prefix holds fixed slabs and no window bytes.
     const gdn_only = try kv_budget.planLayerSplit(
         caps,
         &weights,
@@ -815,11 +815,11 @@ test "serve capacity: a qwen split prices each tier by the layers it holds" {
     try std.testing.expectEqual(@as(u64, kv.n_slots) * 3 * 1_122_304, gdn_only.ram.host_kv);
 }
 
-test "samplerRam: the Qwen vocab prices two id sets per session and one scratch" {
+test "samplerRam: the Qwen vocab sizes two id sets per session and one scratch" {
     // 248320 ids fill 3880 words, so a set takes 31040 bytes. The scratch holds one row and 3880
     // block sums of f32.
     const s = samplerRam(248320, 4);
-    try std.testing.expectEqual(@as(u64, 2 * 31040), s.per_slot);
+    try std.testing.expectEqual(@as(u64, 2 * 31040), s.per_session);
     try std.testing.expectEqual(@as(u64, (248320 + 3880) * 4), s.scratch);
     try std.testing.expectEqual(@as(u64, 4 * 62080 + 1008800), s.total());
 }

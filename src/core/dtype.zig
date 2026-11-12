@@ -84,15 +84,15 @@ pub const KvDtype = enum {
     f32,
     f16,
 
-    /// Bytes one KV row of `per_step_elems` elements occupies. Every KV size derives from this
+    /// Bytes one KV row of `kv_row_elems` elements occupies. Every KV size derives from this
     /// product.
-    pub fn rowBytes(self: KvDtype, per_step_elems: u32) u64 {
+    pub fn rowBytes(self: KvDtype, kv_row_elems: u32) u64 {
         const t: GgmlType = switch (self) {
             .f32 => .f32,
             .f16 => .f16,
         };
 
-        return bytesForNumel(t, per_step_elems);
+        return bytesForNumel(t, kv_row_elems);
     }
 
     /// The component a backend provenance tag folds in. Empty at f32, so shipped blob namespaces

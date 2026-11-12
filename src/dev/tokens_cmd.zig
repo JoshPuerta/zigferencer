@@ -42,7 +42,7 @@ pub fn run(ctx: context.Context) !void {
     const model = try select.model(ctx, flags.pub_name);
     const path = try registry.resolveLoadPath(ctx.arena, ctx.io, ctx.models_root, model.*);
 
-    // Tokenizing reads only the header KVs, so the load skips the page prefault.
+    // Tokenizing reads only the header metadata, so the load skips the page prefault.
     var loaded = try loader.loadWith(ctx.io, ctx.arena, path, .{ .prefault = false });
     defer loaded.close();
 

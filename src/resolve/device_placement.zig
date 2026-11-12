@@ -1,7 +1,7 @@
-//! Role. The device placements of a boot as values: the fused fit, the VRAM budgets, and the
-//! hybrid placement. The CLI measures the device once (`ModelNeeds`, `DeviceCapacity`), `resolve`
-//! calls `choosePlacement`, and the CLI logs the value and constructs the runner it names. A table
-//! test runs every device row with no GPU.
+//! Role. The device placements of a boot: the fused fit, the VRAM budgets, and the hybrid
+//! placement. The CLI measures the device once (`ModelNeeds`, `DeviceCapacity`), `resolve` calls
+//! `choosePlacement`, and the CLI logs the value and constructs the runner it names. Nothing here
+//! reads a device or logs, so a table test runs every device row with no GPU.
 //!
 //! Log order. The value keeps the order of the boot lines. A `LayerChoice` value holds the lines
 //! before the split and the split itself. The placement holds the lines of the runner the split
@@ -9,12 +9,12 @@
 //! and then formats the refusal.
 //!
 //! VRAM budgets. One KV region holds every slot at the window, so the device buffer limits bound
-//! the product of the two. With pinned slots the money buys the window, so the clamp runs on the
-//! plan and a cut window replans at the same slot count. The money can still lower a named window,
+//! the product of the two. With pinned slots the budget holds the window, so the clamp runs on the
+//! plan and a cut window replans at the same slot count. The budget can still lower a named window,
 //! which is a cap there (`kv_budget.resolveWindow`).
 //!
 //! Unpinned budgets. The window is known first: the flag, or the serve default the limits leave for
-//! one slot. The money buys the slots, so the limits cap the slot count. The limits never shrink a
+//! one slot. The budget sets the slots, so the limits cap the slot count. The limits never shrink a
 //! named window, and a shape they refuse at any slot count reaches the runner, which refuses it
 //! with the numbers.
 //!
@@ -36,7 +36,7 @@
 //!                                                   (at least fused_min_slots)
 //!   default window fit            clamp, fit        clamp, fit                clamp, fit
 //!   VRAM budget                   none              --kv-vram, --vram-slots   none
-//!   residency priced in RAM       no                yes                       no
+//!   residency sized in RAM        no                yes                       no
 //!   whole-model split             falls through     the placement it selects  refuses
 //!                                 to the placement
 
@@ -147,24 +147,24 @@ pub const Fused = struct {
     /// True when no `--kv-ram` named a Y, so the prefix took the serve default.
     prefix_default: bool = false,
     plan: kv_budget.KvPlan,
-    quote: Result(kv_budget.RamQuote),
+    ram_plan: Result(kv_budget.RamPlan),
     /// The all-device split that `run` states for a llama model.
     report: ?kv_budget.LayerSplit = null,
 };
 
 /// The hybrid placement: a split with layers on both tiers.
 pub const Hybrid = struct {
-    /// The window the split prices.
+    /// The window the split sizes.
     window: Window,
-    quote: Result(kv_budget.RamQuote),
-    /// The split with its RAM quote, when the quote holds.
+    ram_plan: Result(kv_budget.RamPlan),
+    /// The split with its RAM plan, when the RAM plan accepts it.
     plan: ?kv_budget.LayerSplit,
 };
 
 pub const Placement = union(PlacementKind) {
     fused: Fused,
     hybrid: Hybrid,
-    /// An auto split that funds no GPU layer, or a serve split that keeps no
+    /// An auto split that holds no GPU layer, or a serve split that keeps no
     /// layer on the device.
     cpu: Result(resolve.HostPlacement),
 };
@@ -327,7 +327,7 @@ pub fn clampDefault(
     };
 }
 
-/// The window a whole-model fused placement plans at: the widest window the VRAM figure funds for
+/// The window a whole-model fused placement plans at: the widest window the VRAM figure holds for
 /// `n_slots` slots.
 pub fn fitDefault(
     c: kv_budget.Caps,
@@ -414,7 +414,7 @@ fn servePlacement(
         }
     }
 
-    // Plan the slots and the window the split prices.
+    // Plan the slots and the window the split sizes.
     const slots = hybridSlots(shape.structural_slots, shape.slots_req != null) catch
         return .{ .placement = .{ .refused = .{ .hybrid_slots = shape.structural_slots } } };
     const c = caps(card, m, d.vram, d.driver, window.ceiling, slots, kv_dtype);
@@ -450,7 +450,7 @@ fn servePlacement(
     layer_choice.window.base = clamped.window;
     layer_choice.window.device_clamped = clamped.clamp != null;
 
-    // Price the split. A residency pool moves blobs through both swap stages, so it prices both.
+    // Size the split. A residency pool moves blobs through both swap stages, so it sizes both.
     const kv: kv_budget.KvStructure = .{
         .n_slots = slots,
         .window = clamped.window,
@@ -482,7 +482,7 @@ fn servePlacement(
             std.debug.assert(split.host_layers > 0);
             std.debug.assert(split.host_layers < n_layers);
 
-            const q = quoteOf(
+            const q = ramPlanOf(
                 kv,
                 split.host_layers,
                 host,
@@ -494,8 +494,8 @@ fn servePlacement(
                 .ok = .{
                     .hybrid = .{
                         .window = layer_choice.window,
-                        .quote = q,
-                        .plan = pricedOf(split, q),
+                        .ram_plan = q,
+                        .plan = withRamPlanOf(split, q),
                     },
                 },
             };
@@ -503,7 +503,7 @@ fn servePlacement(
     } };
 }
 
-/// The whole-model serve placement. A budget flag spends a device budget. Otherwise every session
+/// The whole-model serve placement. A budget flag sets a device budget. Otherwise every session
 /// holds a slot at the base window, fitted as the header says.
 fn serveFused(
     input: Input,
@@ -524,8 +524,8 @@ fn serveFused(
     const kv_row_elems = card.kvShape().kv_row_elems;
     var out: Fused = undefined;
     if (shape.slots_req != null or shape.kv_vram_bytes != null or shape.kv_vram_rest) {
-        // Plan a VRAM budget. `--kv-vram` states X and buys the slots. `--vram-slots` pins the
-        // count, and the VRAM left after the other reservations buys the window.
+        // Plan a VRAM budget. `--kv-vram` states X, and X sets the slot count. `--vram-slots`
+        // pins the count, and the VRAM left after the other reservations sets the window.
         const req_batch: u32 = @max(min_slots, @as(u32, shape.batch));
         const c = caps(card, m, d.vram, d.driver, window.ceiling, req_batch + 1, kv_dtype);
         const slots: ?u32 = if (shape.slots_req) |s| @max(min_slots, @as(u32, s)) else null;
@@ -548,7 +548,7 @@ fn serveFused(
             .stranded = budgeted.stranded,
             .device_slots = budgeted.device_slots,
             .plan = budgeted.plan,
-            .quote = undefined,
+            .ram_plan = undefined,
         };
     } else {
         // Plan one slot per session at the base window.
@@ -576,18 +576,18 @@ fn serveFused(
                 .y_bytes = shape.kv_ram_bytes,
                 .n_logical = shape.max_sessions,
             }),
-            .quote = undefined,
+            .ram_plan = undefined,
         };
     }
 
-    // Quote the RAM that the plan needs.
+    // Plan the RAM that the VRAM plan needs.
     out.prefix_default = withPrefixDefault(&out.plan, shape.kv_ram_bytes);
     const kv: kv_budget.KvStructure = .{
         .n_slots = out.plan.n_slots,
         .window = out.plan.window,
         .costs = kv_cost.costVector(card, kv_dtype),
     };
-    out.quote = quoteOf(
+    out.ram_plan = ramPlanOf(
         kv,
         0,
         .{ .ram_split = out.plan.ram, .residency = true },
@@ -598,7 +598,7 @@ fn serveFused(
     return .{ .ok = out };
 }
 
-/// The `run` and `bench-model` placements: one stream. A split prices one slot at the window the
+/// The `run` and `bench-model` placements: one stream. A split sizes one slot at the window the
 /// device limits leave.
 fn sessionPlacement(
     kind: Kind,
@@ -615,7 +615,7 @@ fn sessionPlacement(
             .ok = .{ .fused = sessionFused(kind, input, card, kv_dtype, window, resources) },
         },
     };
-    // A zero count of `run` takes the host placement. The bench prices it, and the whole-model
+    // A zero count of `run` takes the host placement. The bench sizes it, and the whole-model
     // refusal stops it.
     if (kind == .run) std.debug.assert(!flag.isZeroCount());
 
@@ -634,7 +634,7 @@ fn sessionPlacement(
         }
     }
 
-    // Price the split at the window the device limits leave.
+    // Size the split at the window the device limits leave.
     const c = caps(card, m, d.vram, d.driver, window.ceiling, 1, kv_dtype);
     const clamped = clampSession(window, card, kv_dtype, d.buffer_limits);
     const kv: kv_budget.KvStructure = .{
@@ -642,7 +642,7 @@ fn sessionPlacement(
         .window = clamped.window.base,
         .costs = kv_cost.costVector(card, kv_dtype),
     };
-    // One stream holds no residency pool, so the stages price zero.
+    // One stream holds no residency pool, so the stages hold zero bytes.
     const host: kv_budget.HostRequest = .{
         .ram_split = .{ .blobs = 0, .prefix = 0 },
         .residency = false,
@@ -714,9 +714,9 @@ fn sessionPlacement(
         }
     }
 
-    // Quote the hybrid.
-    const q = quoteOf(kv, split.host_layers, host, 1, false, resources.ram_free);
-    const plan = pricedOf(split, q);
+    // Plan the RAM of the hybrid.
+    const q = ramPlanOf(kv, split.host_layers, host, 1, false, resources.ram_free);
+    const plan = withRamPlanOf(split, q);
     if (plan) |p| {
         std.debug.assert(p.host_layers >= 1);
         std.debug.assert(p.host_layers < n_layers);
@@ -725,7 +725,7 @@ fn sessionPlacement(
     return .{
         .layer_choice = layer_choice,
         .placement = .{
-            .ok = .{ .hybrid = .{ .window = clamped.window, .quote = q, .plan = plan } },
+            .ok = .{ .hybrid = .{ .window = clamped.window, .ram_plan = q, .plan = plan } },
         },
     };
 }
@@ -747,13 +747,13 @@ fn sessionFused(
     std.debug.assert(kv_budget.windowCeil(c) == window.ceiling);
     const fitted = fitDefault(c, cost, 1, clamped.window.base, clamped.window.flag);
     std.debug.assert(fitted.window <= clamped.window.base);
-    // The batch of one states the one slot, and the plan funds no RAM.
+    // The batch of one states the one slot, and the plan sizes no RAM.
     const row = rowValues(&card);
     const plan = planShape(c, cost, .{ .window = fitted.window, .batch = 1 });
     std.debug.assert(plan.n_slots == 1);
     std.debug.assert(plan.ram.blobs == 0);
     std.debug.assert(plan.ram.prefix == 0);
-    // The run quote of a family that honors the prompt cache prices its snapshots and stages.
+    // The run RAM plan of a family that honors the prompt cache sizes its snapshots and stages.
     const cache = kind == .run and row.prompt_cache and input.prompt_cache;
     const ram_split: kv_budget.KvPlan.Ram = .{
         .blobs = 0,
@@ -773,7 +773,7 @@ fn sessionFused(
         .window = clamped.window,
         .cut = fitted.cut,
         .plan = plan,
-        .quote = quoteOf(
+        .ram_plan = ramPlanOf(
             kv,
             0,
             .{ .ram_split = ram_split, .residency = cache },
@@ -809,8 +809,8 @@ fn clampSession(
     return .{ .window = out, .clamp = clamped.clamp };
 }
 
-/// A plan that buys no slot with money. The window lies under the ceiling, so the planner never
-/// refuses.
+/// A plan that derives no slot count from a budget. The window lies under the ceiling, so the
+/// planner never refuses.
 fn planShape(
     c: kv_budget.Caps,
     cost: kv_budget.KvCostModel,
@@ -823,7 +823,7 @@ fn planShape(
 }
 
 /// Zero-config serve keeps the prefix cache. With no `--kv-ram`, the prefix budget takes the serve
-/// default, and the RAM quote funds the full blob need beside it or refuses.
+/// default, and the RAM plan holds the full blob need beside it or refuses.
 fn withPrefixDefault(plan: *kv_budget.KvPlan, kv_ram_bytes: ?u64) bool {
     if (kv_ram_bytes != null) return false;
     plan.ram.prefix = limits.serve_prefix_ram_default;
@@ -859,8 +859,8 @@ fn planBudget(
             },
         },
         error.KvVramBudgetTooSmall => {
-            // The window resolved before the refusal, so the quote resolves the same one.
-            const q = kv_budget.quote(c, cost, r) catch unreachable;
+            // The window resolved before the refusal, so the RAM plan resolves the same one.
+            const q = kv_budget.slotSize(c, cost, r) catch unreachable;
             return .{ .refused = .{ .kv_vram_small = .{
                 .x_bytes = r.x_bytes.?,
                 .rows = @max(r.batch, r.slots orelse 0),
@@ -871,7 +871,7 @@ fn planBudget(
         },
     };
 
-    // Cap and signal: the ceiling cut the slot count, so the remainder buys nothing.
+    // Cap and signal: the ceiling cut the slot count, so the remainder holds nothing.
     var out: Budgeted = .{ .plan = plan, .clamp = clamp };
     if (plan.slots_clamped) {
         out.stranded = .{
@@ -894,7 +894,7 @@ fn planBudgetOnDevice(
     kv_dtype: dtype.KvDtype,
     lim: limits.BufferLimits,
 ) Result(Budgeted) {
-    // Pinned slots: the money buys the window, so the clamp runs on the plan.
+    // Pinned slots: the budget holds the window, so the clamp runs on the plan.
     if (req.slots != null) {
         const first = switch (planBudget(caps_in, cost, req, n_logical, null)) {
             .ok => |b| b,
@@ -980,16 +980,16 @@ fn deviceSlotsOf(
     return .{ .limit = kv_index.limitOf(verdict, lim), .slots = slots, .window = window };
 }
 
-/// The RAM quote of one placement at split `k`, or the refusal that names it.
-fn quoteOf(
+/// The RAM plan of one placement at split `k`, or the refusal that names it.
+fn ramPlanOf(
     kv: kv_budget.KvStructure,
     k: u32,
     host: kv_budget.HostRequest,
     n_logical: u32,
     named: bool,
     ram_free: ?u64,
-) Result(kv_budget.RamQuote) {
-    const q = kv_budget.quoteRam(kv, k, host, n_logical, named, ram_free) catch |err| switch (err) {
+) Result(kv_budget.RamPlan) {
+    const q = kv_budget.planRam(kv, k, host, n_logical, named, ram_free) catch |err| switch (err) {
         error.HostRamBudgetTooSmall => return .{
             .refused = .{ .host_ram = kv_budget.ramRefusal(kv, k, host, ram_free.?) },
         },
@@ -1000,17 +1000,17 @@ fn quoteOf(
     return .{ .ok = q };
 }
 
-fn pricedOf(
+fn withRamPlanOf(
     split: kv_budget.LayerSplit,
-    q: Result(kv_budget.RamQuote),
+    q: Result(kv_budget.RamPlan),
 ) ?kv_budget.LayerSplit {
     return switch (q) {
-        .ok => |v| split.priced(v),
+        .ok => |v| split.withRamPlan(v),
         .refused => null,
     };
 }
 
-/// A pinned split the VRAM figure cannot fund, with its cost. Only a count reaches it.
+/// A pinned split the VRAM figure cannot hold, with its cost. Only a count reaches it.
 fn layerSplitRefusal(
     kind: Kind,
     c: kv_budget.Caps,
@@ -1018,9 +1018,14 @@ fn layerSplitRefusal(
     kv: kv_budget.KvStructure,
     n_gpu: u32,
 ) Refusal {
-    const q = kv_budget.quoteLayerSplit(c, m.layers(), m.head_weights, kv, n_gpu);
+    const q = kv_budget.layerSplitNeed(c, m.layers(), m.head_weights, kv, n_gpu);
     return .{
-        .layer_split_vram = .{ .kind = kind, .n_gpu = n_gpu, .spend = q.spend, .usable = q.usable },
+        .layer_split_vram = .{
+            .kind = kind,
+            .n_gpu = n_gpu,
+            .vram_bytes = q.vram_bytes,
+            .usable = q.usable,
+        },
     };
 }
 
@@ -1072,11 +1077,11 @@ test "fitDefault: a named window never shrinks, and a default window shrinks to 
         .serve_default = 512,
         .default_ceil = 8192,
     };
-    // A zero budget funds nothing, so a named window stands and the preflight
+    // A zero budget holds nothing, so a named window stands and the preflight
     // refuses it, while a default window drops to the floor.
     try std.testing.expectEqual(@as(u32, 512), fitDefault(c, cost, 4, 512, 512).window);
     try std.testing.expectEqual(limits.min_kv_window, fitDefault(c, cost, 4, 512, null).window);
-    // A budget that funds the default leaves it whole.
+    // A budget that holds the default leaves it whole.
     c.vram_free = 16 << 30;
     try std.testing.expectEqual(@as(u32, 512), fitDefault(c, cost, 4, 512, null).window);
 }
@@ -1163,7 +1168,7 @@ test "clampSession: the cut is recorded once, and a named window passes" {
     try std.testing.expectEqual(named, clampSession(named, card, .f16, lim).window);
 }
 
-test "planBudgetOnDevice: pinned slots cut the window, and bought slots stop at the device limits" {
+test "planBudgetOnDevice: pinned slots cut the window, and budget slots stop at the device limits" {
     const lim = test_spec_min_limits;
     // Qwen3.5-2B at f16, with the run and serve defaults of its byte rule.
     const cost: kv_budget.KvCostModel = .{
@@ -1178,7 +1183,7 @@ test "planBudgetOnDevice: pinned slots cut the window, and bought slots stop at 
         .serve_default = 10_752,
         .default_ceil = 174_592,
     };
-    // Pinned slots: one slot of 4 GiB buys the default ceiling, which the
+    // Pinned slots: one slot of 4 GiB holds the default ceiling, which the
     // storage range cuts to 131072.
     const pinned = planBudgetOnDevice(
         c,
@@ -1192,10 +1197,10 @@ test "planBudgetOnDevice: pinned slots cut the window, and bought slots stop at 
     try std.testing.expectEqual(@as(u32, 1), pinned.n_slots);
     try std.testing.expectEqual(@as(u32, 131_072), pinned.window);
     try std.testing.expectEqual(@as(u64, 131_072) * 12_288 + 20_201_472, pinned.vram.kv);
-    // Bought slots: 16 GiB funds 112 slots at the serve default, but one
+    // Budget slots: 16 GiB holds 112 slots at the serve default, but one
     // region holds 12 of them under the range. The planner clamps the count
     // and keeps the window.
-    const bought = planBudgetOnDevice(
+    const budget_plan = planBudgetOnDevice(
         c,
         cost,
         .{ .x_bytes = 16 << 30, .batch = 1 },
@@ -1204,14 +1209,17 @@ test "planBudgetOnDevice: pinned slots cut the window, and bought slots stop at 
         .f16,
         lim,
     ).ok.plan;
-    try std.testing.expectEqual(@as(u32, 12), bought.n_slots);
-    try std.testing.expectEqual(@as(u32, 10_752), bought.window);
-    try std.testing.expect(bought.slots_clamped);
+    try std.testing.expectEqual(@as(u32, 12), budget_plan.n_slots);
+    try std.testing.expectEqual(@as(u32, 10_752), budget_plan.window);
+    try std.testing.expect(budget_plan.slots_clamped);
     try std.testing.expectEqual(
         limits.BufferVerdict.fits,
-        kv_index.fits(kv_index.Layout.init(bought.n_slots, bought.window, 512, 6, .f16), lim),
+        kv_index.fits(
+            kv_index.Layout.init(budget_plan.n_slots, budget_plan.window, 512, 6, .f16),
+            lim,
+        ),
     );
-    // A budget that funds fewer slots than the region holds is not clamped.
+    // A budget that holds fewer slots than the region holds is not clamped.
     const small = planBudgetOnDevice(
         c,
         cost,
@@ -1223,7 +1231,7 @@ test "planBudgetOnDevice: pinned slots cut the window, and bought slots stop at 
     ).ok.plan;
     try std.testing.expectEqual(@as(u32, 7), small.n_slots);
     try std.testing.expect(!small.slots_clamped);
-    // A named window never shrinks, pinned or bought, and it caps the slots.
+    // A named window never shrinks, pinned or from a budget, and it caps the slots.
     const named = planBudgetOnDevice(
         c,
         cost,
@@ -1234,7 +1242,7 @@ test "planBudgetOnDevice: pinned slots cut the window, and bought slots stop at 
         lim,
     ).ok.plan;
     try std.testing.expectEqual(@as(u32, 174_592), named.window);
-    const named_bought = planBudgetOnDevice(
+    const named_budget_plan = planBudgetOnDevice(
         c,
         cost,
         .{ .x_bytes = 16 << 30, .batch = 1, .window = 32_768 },
@@ -1243,8 +1251,8 @@ test "planBudgetOnDevice: pinned slots cut the window, and bought slots stop at 
         .f16,
         lim,
     ).ok.plan;
-    try std.testing.expectEqual(@as(u32, 32_768), named_bought.window);
-    try std.testing.expectEqual(@as(u32, 4), named_bought.n_slots);
+    try std.testing.expectEqual(@as(u32, 32_768), named_budget_plan.window);
+    try std.testing.expectEqual(@as(u32, 4), named_budget_plan.n_slots);
     // When one slot at the window already breaks a limit, the cap stays off
     // and the runner refuses the shape.
     const refused = planBudgetOnDevice(
@@ -1269,7 +1277,7 @@ test "placementKindFor: the flag and the resolved split select the runner" {
     const cases = [_]Case{
         // No flag keeps the whole-model path.
         .{ .flag = null, .host_layers = 0, .want = .fused },
-        // A funded count of every layer is the whole-model path again.
+        // A count of every layer that fits is the whole-model path again.
         .{ .flag = .{ .count = n }, .host_layers = 0, .want = .fused },
         .{ .flag = .{ .count = 16 }, .host_layers = 16, .want = .hybrid },
         // The boundary pins: a suffix of one layer, and a prefix of one.

@@ -29,7 +29,7 @@ pub const CodecParts = struct {
     think_ids: ?chat.ThinkIds = null,
 };
 
-/// The think tags as the scheduler reads them: the two tags and the ids that a spent budget forces.
+/// The think tags as the scheduler reads them: the two tags and the ids that a full budget forces.
 pub const ThinkTags = struct {
     ids: chat.ThinkIds,
     force: [limits.think_force_ids_max]u32,
@@ -200,7 +200,7 @@ test "buildPieces: a control token has the empty piece, and every other token ha
     const tokens = [_][]const u8{ "a", "<|end|>", "<tool>", "b", "<|ctl|>" };
     // The GGUF token types: 1 normal, 3 control, 4 user-defined.
     const types = [_]i32{ 1, 3, 4, 1, 3 };
-    const kvs = [_]parser.Kv{
+    const metadata = [_]parser.MetadataPair{
         .{ .key = "tokenizer.ggml.tokens", .value = .{ .array = .{ .strings = &tokens } } },
         .{ .key = "tokenizer.ggml.merges", .value = .{ .array = .{ .strings = &.{} } } },
         .{ .key = "tokenizer.ggml.token_type", .value = .{ .array = .{ .i32s = &types } } },
@@ -208,7 +208,7 @@ test "buildPieces: a control token has the empty piece, and every other token ha
     };
     const v = try vocab_mod.buildFromParsed(arena, .{
         .header = undefined,
-        .kvs = &kvs,
+        .metadata = &metadata,
         .tensors = &.{},
         .data_offset = 0,
         .alignment = 1,

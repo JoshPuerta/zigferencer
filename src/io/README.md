@@ -22,7 +22,7 @@ reads it. The values on the load path are these:
 | Value | File | Holds | Made by | Read by |
 | --- | --- | --- | --- | --- |
 | `Mapped` | `mmap.zig` | The bytes of the whole file | `openReadOnly`, `openReadOnlyLazy` | `loader`, `runtime/prompt_cache` |
-| `Parsed` | `gguf/parser.zig` | The header, the `Kv` pairs, the `TensorInfo` rows, the data offset | `parser.parse` | `loader`, `core/tokenizer/vocab` |
+| `Parsed` | `gguf/parser.zig` | The header, the `MetadataPair` values, the `TensorInfo` rows, the data offset | `parser.parse` | `loader`, `core/tokenizer/vocab` |
 | `ModelCard` | `gguf/loader.zig` | The dimensions, the token ids, the chat template, and the `GdnParams` of Qwen | `loader.load` | `resolve/resolve`, `runtime/`, `cli/` |
 | `TensorRef` | `gguf/loader.zig` | A tensor name and a `Tensor` that borrows the map | `loader.load` | `runtime/tensor_lookup`, the runners |
 | `Loaded` | `gguf/loader.zig` | The `Mapped`, the `Parsed`, the `ModelCard`, and the `[]TensorRef` | `loader.load` | `cli/`, `dev/`, `resolve/family` |
@@ -36,7 +36,7 @@ The load path:
                                mmap.openReadOnly[Lazy] --> Mapped
                                      |  bytes
                                      v
-                               parser.parse --> Parsed { header, kvs, tensors }
+                               parser.parse --> Parsed { header, metadata, tensors }
                                      |
                                      v  architecture keys, limits, dtype, shape
                                Loaded { map, parsed, card, tensors }
@@ -44,7 +44,7 @@ The load path:
               +----------------------+-----------------------+
               v                      v                       v
       resolve/resolve         runtime/ runners        core/tokenizer/vocab
-      (ModelCard)             (TensorRef)             (Parsed kvs --> Vocab)
+      (ModelCard)             (TensorRef)             (Parsed metadata --> Vocab)
 ```
 
 The fetch path:
@@ -83,6 +83,6 @@ the GGUF structure. `core/registry.zig` computes the path that both paths use. `
 - `Loaded` owns the map, and its `close` is the single teardown for the whole chain. Every
   `TensorRef.tensor.data` borrows into that region, so the references stay valid exactly as long as
   the `Loaded` value lives.
-- The values that cross out are `ModelCard`, `[]TensorRef`, and the `Parsed` KV pairs. All three
+- The values that cross out are `ModelCard`, `[]TensorRef`, and the `Parsed` metadata pairs. All three
   are plain immutable structs. The map is the one owned resource that crosses, and `Loaded` holds
   it.

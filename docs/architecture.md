@@ -28,7 +28,7 @@ This document explains how zigferencer works, from the build to a served token.
 | token | An integer id for a piece of text. The tokenizer turns text into tokens and tokens back into text. |
 | GGUF | The model file format. One file holds the metadata and every weight tensor. |
 | weights | The tensors of the model. A quantized weight stores blocks of 8-bit or 4-bit integers with one scale per block. |
-| layer | One block of the model. A model is a stack of layers, and each layer reads the output of the layer before it. |
+| layer | One decoder layer of the model. A model is a stack of layers, and each layer reads the output of the layer before it. |
 | forward pass | The computation of the model over a set of tokens. It ends in logits. |
 | logits | One score for each entry of the vocabulary. The sampler picks the next token from them. |
 | attention | The op that lets a token read all earlier positions. |
@@ -116,12 +116,6 @@ release binary.
   commands, and `src/main.zig` re-exports the engine modules under the package name.
 - The **dev module** roots at `src/dev/dev_main.zig`. It holds the developer commands.
   The build gives it the release module as the import `zigferencer`.
-
-The release module has no import of the dev module. A relative import across two module
-roots puts one file into two modules, and Zig rejects it. So no file of the release
-binary can reach a file of `src/dev/`. The release binary knows the developer commands by name only (`command.dev_names`), to
-print a hint. A comptime check in `src/dev/dev_command.zig` fails the build when those names
-differ from the dev table.
 
 The layers inside the tree point one way:
 
@@ -682,9 +676,9 @@ checks the thread counts.
 | slot | The KV of one session for a full window, plus the GDN state on Qwen3.5. |
 | region | One K or one V buffer of one layer, holding the KV rows of every slot. The device buffer limits apply to one region. |
 | KV row | The K or the V of one layer at one position, for every KV head. It is a different thing from a row of a step. |
-| budget | The bytes that a plan can spend: a VRAM budget, a RAM budget, or the default budget of one session. |
+| budget | The bytes that a plan can use: a VRAM budget, a RAM budget, or the default budget of one session. |
 | preflight | The check, before the first device allocation, that a plan fits the usable share of the free VRAM (`limits.vram_shares`). |
-| quote | The price of a placement in host RAM, checked before the runner allocates. |
+| RAM plan | The host RAM that a placement needs, checked before the runner allocates. |
 | blob | The RAM copy of the KV of a session that left its VRAM slot. It is the only copy of that session. |
 | ledger | The running total of blob bytes against the blob budget. |
 
@@ -722,13 +716,13 @@ values round down, as the boot log prints them.
 | KV bytes of one position | 12,288 B | 6 layers x 2 heads x 256 dimensions x 2 (K and V) x 2 bytes. The GDN layers store no KV. |
 | GDN state of one slot | 19.27 MiB | 18 layers x (16 heads x 128 x 128 + a convolution ring of 3 x 6144) x 4 bytes. It is f32 at every KV type, and it does not grow with the window. |
 | Model ceiling | 262,144 | The declared context, which is also `limits.max_model_ctx`. |
-| `run` window from the budget | 174,592 | The 2 GiB budget / 12,288 B = 174,762, rounded down to a multiple of 256. The budget buys KV rows only. |
-| `run` slot on the CPU | 2065 MiB of host RAM | 174,592 x 12,288 B = 2046 MiB of KV, plus the GDN state. The weights stay in the memory map, which the RAM quote does not count. |
+| `run` window from the budget | 174,592 | The 2 GiB budget / 12,288 B = 174,762, rounded down to a multiple of 256. The budget holds KV rows only. |
+| `run` slot on the CPU | 2065 MiB of host RAM | 174,592 x 12,288 B = 2046 MiB of KV, plus the GDN state. The weights stay in the memory map, which the RAM plan does not count. |
 | `run` window on the GPU | 131,072 | The region check cuts the window. One region holds the K or the V of one layer: 174,592 x 2 heads x 256 x 2 bytes = 178,782,208 B. The driver reports a storage-buffer range of 128 MiB, so the window shrinks to 134,217,728 B / 1024 B = 131,072. With a larger range, set by `$ZIGFERENCER_VK_STORAGE_RANGE`, the GPU window stays at 174,592. |
 | `run` VRAM plan | 3519 MiB | The weights (1908 MiB), the KV (131,072 x 12,288 B = 1536 MiB), the GDN state (19 MiB), the scratch (55 MiB), and the logits (1 MiB). The embedding table goes to VRAM once, as the lm_head. The embedding lookup reads the same tensor from the memory map. |
 | `serve` window | 10,752 | The 128 MiB budget / 12,288 B = 10,922, rounded down to a multiple of 256. One region is 4 x 10,752 x 1024 B = 42 MiB, inside the range. |
 | `serve` KV and GDN state, 4 sessions | 581 MiB of VRAM | 4 slots x (10,752 x 12,288 B + 19.27 MiB). The boot log calls it `vram kv`. |
-| `serve` host RAM quote | 1314 MiB | Two copy stages of one slot each (2 x 145 MiB) and the default prefix budget (1024 MiB). The prefix cache allocates each entry when it stores one. An entry holds its KV rows and the whole GDN state. |
+| `serve` host RAM plan | 1314 MiB | Two copy stages of one slot each (2 x 145 MiB) and the default prefix budget (1024 MiB). The prefix cache allocates each entry when it stores one. An entry holds its KV rows and the whole GDN state. |
 
 **Why the GPU `run` window is smaller.** VRAM is not the limit here, because the
 plan fits. The limit is the size of one binding. A shader reads a KV region through
@@ -895,7 +889,7 @@ case where whole-slot moves measure as not enough.
 
 The runtime sizes the weights, the KV slots, and the scratch once, from a plan,
 before the first step. The swap stages grow on the first swap, up to one chunk. The
-blobs and the prefix entries allocate when the server stores one. The plan prices
+blobs and the prefix entries allocate when the server stores one. The plan sizes
 these too. No buffer grows during a step.
 
 ### The window
@@ -916,8 +910,8 @@ refuses with a message. A silent smaller window breaks a client that sized its
 prompts for the named window. A default window is the choice of the engine, so
 the GPU checks below shrink it to fit. A refusal of a default punishes a user who
 asked for nothing. With `--vram-slots`, the slot count is the request, and the
-VRAM budget buys the window. A named window then caps that window, and the boot
-log warns when the budget buys less.
+VRAM budget holds the window. A named window then caps that window, and the boot
+log warns when the budget holds less.
 
 ### The GPU checks
 
@@ -965,30 +959,31 @@ workgroup, and its allocation overhead runs out of memory before the card is ful
 Under memory pressure it can lose the device. More info on [gpu-rdna2.md](gpu-rdna2.md).
 
 **Budgets for serve.** `--kv-vram MiB` gives the KV a VRAM budget, and the budget
-buys as many slots as it can at the window. `--vram-slots N` pins the slot count
-instead, and the window then follows from the budget. A `LayerSplit` prices a
+holds as many slots as it can at the window. `--vram-slots N` pins the slot count
+instead, and the window then follows from the budget. A `LayerSplit` sizes a
 hybrid: the CPU layers on one side and the GPU layers on the other. Each layer has
-its own price.
+its own size.
 
 ### Host RAM
 
-Every placement of `run`, `bench-model`, `serve`, and `serve-openai` quotes its host
-RAM through one function, `kv_budget.quoteRam`, before it allocates a runner. The
-quote holds the host KV, the swap stages, the blobs, and the prefix cache. A quote
-above 7/8 of the available RAM stops the boot, and the message names the numbers and
-a window that fits. The printed fit keeps a margin, because free RAM moves between
-two boots. A host that reports no available RAM gets no check, and the log says so.
+Every placement of `run`, `bench-model`, `serve`, and `serve-openai` plans its host
+RAM through one function, `kv_budget.planRam`, before it allocates a runner. The
+RAM plan holds the host KV, the swap stages, the blobs, and the prefix cache. A
+RAM plan above 7/8 of the available RAM stops the boot, and the message names the
+numbers and a window that fits. The printed fit keeps a margin, because free RAM
+moves between two boots. A host that reports no available RAM gets no check, and
+the log says so.
 
 A session that moves between VRAM and RAM passes through a swap stage, in chunks of
 `limits.swap_stage_chunk_bytes`. When `--vram-slots` is below `--max-sessions`, the
 blobs need room for one blob more than the sessions that the slots cannot hold. A
 swap holds the leaving blob and the arriving blob at the same time. With
-no `--kv-ram`, the plan funds that whole need or refuses the boot. A named
+no `--kv-ram`, the plan holds that whole need or refuses the boot. A named
 `--kv-ram` stays as named, and a value below the need logs a warning. The prefix
 cache gets the rest of the RAM budget. Section 10 tells what the scheduler does when
 the ledger is full.
 
-### Example: spend 14 GiB of VRAM and 28 GiB of RAM on `serve`
+### Example: use 14 GiB of VRAM and 28 GiB of RAM on `serve`
 
 This example asks how many Qwen3.5-2B sessions fit when 16 GiB of VRAM and 32 GiB
 of RAM are free, on a driver of the default row. The 7/8 rules leave 14 GiB of VRAM
@@ -997,7 +992,7 @@ computed every number below.
 
 Three limits decide the answer:
 
-1. **VRAM buys slots.** The weights, the scratch, and the logits take about 1970 MiB.
+1. **VRAM holds slots.** The weights, the scratch, and the logits take about 1970 MiB.
    That leaves about 12,364 MiB for slots. One slot at the `serve` window costs 145.3
    MiB, so the VRAM holds 85 slots.
 2. **One region limits slots x window.** One region holds every slot, at 1024 B for
@@ -1007,7 +1002,7 @@ Three limits decide the answer:
 3. **RAM holds the sessions that have no slot.** Each one needs a blob of up to
    145.3 MiB. `--max-sessions` stops at `limits.max_logical_sessions`, which is 128.
 
-| Goal | Range | Flags | Slots | Window | Sessions | VRAM plan | RAM quote |
+| Goal | Range | Flags | Slots | Window | Sessions | VRAM plan | RAM plan |
 | --- | --- | --- | --- | --- | --- | --- | --- |
 | Many short sessions | 128 MiB | `--max-sessions 128 --vram-slots 12 --max-seq 10752` | 12 | 10,752 | 128 | 3715 MiB | 18,310 MiB |
 | Many short sessions | 1 GiB | `--max-sessions 128 --kv-vram 12492` | 85 | 10,752 | 128 | 14,319 MiB | 7706 MiB |
@@ -1027,8 +1022,8 @@ The flags to set:
   slots share all the usable VRAM, and the window grows: 12 slots get 86,278
   positions at a 1 GiB range. The blobs grow with the window, so `--max-sessions 128`
   then stops at the RAM check.
-- `--kv-vram` sets a VRAM budget instead, and the budget buys slots at the window.
-- `--kv-ram` sizes the RAM tier. With no flag, the plan funds every blob and a prefix
+- `--kv-vram` sets a VRAM budget instead, and the budget holds slots at the window.
+- `--kv-ram` sizes the RAM tier. With no flag, the plan holds every blob and a prefix
   cache of 1024 MiB. A larger value gives the rest to the prefix cache. On the first
   row, `--kv-ram 21093` leaves 4 GiB for it.
 - `--max-connections` limits the clients (default 8). One connection can hold many
@@ -1104,8 +1099,8 @@ When the server is ready, it prints one line to stdout: `READY tcp <address>` or
               yields to a new open (from any state)
 ```
 
-- **open** gives a session a free slot. **clone** copies an idle session into a new
-  one.
+- **open** gives a session a free entry of the session table. **clone** copies an
+  idle session into a new one.
 - A **turn** (`generate`) tokenizes the prompt and moves to prefill. An **opening**
   prefills a system prompt. An **append** prefills earlier turns that a client sends
   back. An opening and an append produce no tokens. They end with a
@@ -1279,7 +1274,7 @@ main -> entry(init, dispatchRelease) -> dispatchOver(argv)   main.zig, cli/comma
     args.parseInto(Flags), select.model(name)              cli/args.zig, cli/select.zig
     resolve.early(.run, flags, entry)                      resolve/resolve.zig: refusals before the load
     loader.load(path)                                      io/gguf/loader.zig: mmap, parse, ModelCard, tensors
-    resolve.resolve(.run, flags, card, resources)          resolve/resolve.zig: window, KvPlan, RAM quote
+    resolve.resolve(.run, flags, card, resources)          resolve/resolve.zig: window, KvPlan, RAM plan
     parallel.initPool(policy)                              runtime/parallel.zig: the worker threads
     vocab.buildFromParsed, bpe.encodeAlloc(prompt)         core/tokenizer/: the prompt ids
       --chat: chat.promptAlloc, bpe.encodePromptAlloc      the prompt text stays plain
@@ -1389,13 +1384,13 @@ reader task: readerLoop(conn)                              serve/server.zig
   engine.submit(req) -> the request queue                  serve/engine.zig
 engine thread: scheduler.handle(req) -> handleGenerate     serve/scheduler.zig
   codec.turnTokens: chat.prompt*Alloc, bpe.encodePromptAlloc  request text stays plain
-  startPrefill(slot, tokens) -> tryRestorePrefix           the prefix cache
+  startPrefill(entry, tokens) -> tryRestorePrefix          the prefix cache
 engine thread, each tick: scheduler.tick -> runComposedStep
   pick the decode rows and one prompt chunk
   Residency.advance -> Sessions.advance                    a session out of VRAM moves back first
     runner.stepBatch(prompt rows + decode rows)
     sampler.sample(logits, params, rng), for each row that wants logits
-  acceptToken(slot, token) -> emitOrPark -> sink.emit      the event queue of the connection
+  acceptToken(entry, token) -> emitOrPark -> sink.emit     the event queue of the connection
 writer task: take an event -> writeEvent -> protocol.encodeServerMsg -> a zmtp frame -> the socket
 ```
 
@@ -1460,7 +1455,7 @@ acceptorTask -> HttpAdapter.onAccept                       serve/openai/http_ser
 4. **One step for prefill and decode.** A step is a batch of rows. A row in a
    batch gives the same result as the row alone.
 5. **Plans before allocations.** The window, the slots, the VRAM, and the RAM are
-   priced before the first large allocation. A boot that does not fit stops with the
+   sized before the first large allocation. A boot that does not fit stops with the
    numbers and a fit.
 6. **Continuous batching.** The scheduler fills the spare rows of each decode step
    with prompt rows, and it never waits for a client.

@@ -5,10 +5,10 @@
 //! Comptime. `Sessions` is generic over the runner. `@hasDecl` keeps each optional hook free for a
 //! runner without it, and a missing required hook stops the build.
 //!
-//! `Sessions` advances any subset of them one token per `decodeBatch` tick,
+//! `Sessions` advances any subset of them one token per `decodeBatch` step,
 //! which is the multi-session liveliness primitive. It feeds prompt turns
 //! through the same batched forward (`feed`), so chunked prefill and batched
-//! decode run one code path. Both are shells over `advance`, the composed tick
+//! decode run one code path. Both are shells over `advance`, the composed step
 //! that can fold one prefill chunk and a decode step into ONE forward call.
 //! That is the continuous-batching boundary of the serve scheduler, where the
 //! prefill rows use the weight pass of the decode rows.
@@ -18,9 +18,9 @@
 //! happens here, against the RNG of the session.
 //!
 //! The pending-token rule makes the turn boundary explicit. Every `decodeBatch`
-//! tick steps the token sampled before it, which commits the KV of that token,
+//! call steps the token sampled before it, which commits the KV of that token,
 //! and it samples a new one. The new token stays *uncommitted* until the next
-//! tick or feed. When the caller ends a turn, the pending token was therefore
+//! step or feed. When the caller ends a turn, the pending token was therefore
 //! never written into context. On a budget stop the caller saw the token, so it
 //! prepends the token to the `feed` of the next turn. On an EOS stop nothing is
 //! needed. The chat continuation templates already open with the turn-end
@@ -78,7 +78,7 @@ pub const State = enum { free, feeding, ready };
 
 /// One same-slot chunk of a turn's prompt tokens, for `advance`. It is the
 /// value a caller (the serve scheduler) passes to the engine to fold prefill
-/// rows into a decode tick. `final` marks the turn's last chunk: logits for
+/// rows into a decode step. `final` marks the turn's last chunk: logits for
 /// its last row, sample the first response token.
 pub const FeedChunk = struct {
     id: u32,
@@ -408,7 +408,7 @@ pub fn Sessions(comptime RunnerT: type) type {
             _ = try self.advance(null, ids, tokens_out);
         }
 
-        /// The composed tick under `feed` and `decodeBatch`: one prefill chunk plus a decode
+        /// The composed step under `feed` and `decodeBatch`: one prefill chunk plus a decode
         /// step for `ids` in one forward, so the chunk shares the weight pass. Rows are
         /// [chunk | decode]. Returns the first response token when the chunk is final.
         pub fn advance(
@@ -743,7 +743,7 @@ test "ContextFull is atomic: no step happens, state is unchanged" {
     try std.testing.expectEqual(@as(usize, 0), fake.calls);
     try std.testing.expectEqual(@as(u32, 0), pool.table[id].pos);
 
-    // Fill to the cap, then a decode tick must refuse before stepping.
+    // Fill to the cap, then a decode step must refuse before stepping.
     _ = try pool.feed(id, &.{ 1, 2, 3, 4 }, true);
     const calls_before = fake.calls;
     var out: [1]u32 = undefined;

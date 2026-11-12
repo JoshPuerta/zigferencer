@@ -1,5 +1,5 @@
 //! Role. Build a `ModelCard` and a tensor list from a GGUF file. The loader maps the file, calls
-//! the parser, and reads the architecture-specific KV keys. The card is the typed view of the
+//! the parser, and reads the architecture-specific metadata keys. The card is the typed view of the
 //! metadata the engine needs. Each `TensorRef` holds a `Tensor` whose `data` slices into the map.
 //!
 //! Comptime. The refusal level is a comptime parameter, and an assert pins the load errors to
@@ -70,7 +70,8 @@ pub const Error = error{
 pub const LoadError = Error || Allocator.Error || Io.File.OpenError || Io.File.LengthError ||
     Io.File.MemoryMap.CreateError;
 
-/// Architectures the engine understands. The `general.architecture` string is the KV-key prefix.
+/// Architectures the engine understands. The `general.architecture` string is the metadata key
+/// prefix.
 pub const Arch = enum { llama, qwen35 };
 
 /// Gated-DeltaNet (linear-attention) parameters, under `qwen35.ssm.*`. Present only for `.qwen35`.
@@ -121,7 +122,7 @@ pub const ModelCard = struct {
     /// Gated-DeltaNet params. Null for Llama.
     gdn: ?GdnParams = null,
 
-    /// The dimensions the KV price reads, as a plain value for the planner.
+    /// The dimensions that size the KV, as a plain value for the planner.
     pub fn kvShape(self: ModelCard) kv_budget.KvShape {
         return .{
             .n_layers = self.n_layers,
@@ -165,32 +166,32 @@ pub const LoadOptions = struct {
 /// One dimension of the model card, named by its key after the arch prefix.
 const Dim = struct { key: []const u8, value: u32 };
 
-/// The KV reads of one card. Each refusal logs one line with the file name, and the key or the
-/// value that it refuses.
-const Keys = struct {
+/// The metadata reads of one card. Each refusal logs one line with the file name, and the key or
+/// the value that it refuses.
+const MetadataReader = struct {
     parsed: parser.Parsed,
     file: []const u8,
     level: std.log.Level,
 
-    fn fail(self: Keys, comptime format: []const u8, args: anytype) void {
+    fn fail(self: MetadataReader, comptime format: []const u8, args: anytype) void {
         switch (self.level) {
             inline else => |level| refuse(level, "{s}: " ++ format, .{self.file} ++ args),
         }
     }
 
-    fn value(self: Keys, key: []const u8) Error!*const parser.Value {
-        return lookupKv(self.parsed, key) orelse {
+    fn value(self: MetadataReader, key: []const u8) Error!*const parser.Value {
+        return findMetadata(self.parsed, key) orelse {
             self.fail("the key {s} is missing", .{key});
             return error.MissingKey;
         };
     }
 
-    fn wrongType(self: Keys, key: []const u8, v: *const parser.Value) Error {
+    fn wrongType(self: MetadataReader, key: []const u8, v: *const parser.Value) Error {
         self.fail("the key {s} holds a value of type {t}", .{ key, v.* });
         return error.WrongKeyType;
     }
 
-    fn string(self: Keys, key: []const u8) Error![]const u8 {
+    fn string(self: MetadataReader, key: []const u8) Error![]const u8 {
         const v = try self.value(key);
         return switch (v.*) {
             .string => |s| s,
@@ -198,7 +199,7 @@ const Keys = struct {
         };
     }
 
-    fn strings(self: Keys, key: []const u8) Error![]const []const u8 {
+    fn strings(self: MetadataReader, key: []const u8) Error![]const []const u8 {
         const v = try self.value(key);
         return switch (v.*) {
             .array => |a| switch (a) {
@@ -210,7 +211,7 @@ const Keys = struct {
     }
 
     /// A value that does not fit a `u32` is a bad value, not a narrowing cast.
-    fn int(self: Keys, key: []const u8) Error!u32 {
+    fn int(self: MetadataReader, key: []const u8) Error!u32 {
         const v = try self.value(key);
         const wide: i128 = switch (v.*) {
             .u32_val => |u| u,
@@ -227,12 +228,12 @@ const Keys = struct {
     }
 
     /// The value of an optional key. Only an absent key takes `default`. A bad value fails.
-    fn intOr(self: Keys, key: []const u8, default: u32) Error!u32 {
-        if (lookupKv(self.parsed, key) == null) return default;
+    fn intOr(self: MetadataReader, key: []const u8, default: u32) Error!u32 {
+        if (findMetadata(self.parsed, key) == null) return default;
         return self.int(key);
     }
 
-    fn float(self: Keys, key: []const u8) Error!f32 {
+    fn float(self: MetadataReader, key: []const u8) Error!f32 {
         const v = try self.value(key);
         return switch (v.*) {
             .f32_val => |x| x,
@@ -242,8 +243,8 @@ const Keys = struct {
     }
 
     /// The value of an optional key. Only an absent key takes `default`. A wrong type fails.
-    fn floatOr(self: Keys, key: []const u8, default: f32) Error!f32 {
-        if (lookupKv(self.parsed, key) == null) return default;
+    fn floatOr(self: MetadataReader, key: []const u8, default: f32) Error!f32 {
+        if (findMetadata(self.parsed, key) == null) return default;
         return self.float(key);
     }
 };
@@ -338,77 +339,78 @@ pub fn cardFromParsed(
     file: []const u8,
     comptime refusal_level: std.log.Level,
 ) Error!ModelCard {
-    const keys: Keys = .{ .parsed = parsed, .file = file, .level = refusal_level };
+    const meta: MetadataReader = .{ .parsed = parsed, .file = file, .level = refusal_level };
 
     // Read the architecture and the shape keys.
-    const arch_str = try keys.string("general.architecture");
+    const arch_str = try meta.string("general.architecture");
     const arch: Arch = if (std.mem.eql(u8, arch_str, "llama"))
         .llama
     else if (std.mem.eql(u8, arch_str, "qwen35"))
         .qwen35
     else {
-        keys.fail("the architecture {s} is not supported", .{arch_str});
+        meta.fail("the architecture {s} is not supported", .{arch_str});
         return error.UnsupportedArchitecture;
     };
 
     // One key buffer is safe because each lookup consumes its key before the next write.
     var kb: [96]u8 = undefined;
-    const n_layers = try keys.int(pk(&kb, arch_str, ".block_count"));
-    const n_heads = try keys.int(pk(&kb, arch_str, ".attention.head_count"));
+    const n_layers = try meta.int(pk(&kb, arch_str, ".block_count"));
+    const n_heads = try meta.int(pk(&kb, arch_str, ".attention.head_count"));
     // The head count divides the embedding width below.
     if (n_heads == 0) {
-        keys.fail("the card value attention.head_count is 0", .{});
+        meta.fail("the card value attention.head_count is 0", .{});
         return error.BadKeyValue;
     }
 
-    const n_kv_heads = try keys.intOr(pk(&kb, arch_str, ".attention.head_count_kv"), n_heads);
-    const embedding_length = try keys.int(pk(&kb, arch_str, ".embedding_length"));
-    const ffn_length = try keys.int(pk(&kb, arch_str, ".feed_forward_length"));
-    const ctx_declared = try keys.int(pk(&kb, arch_str, ".context_length"));
+    const n_kv_heads = try meta.intOr(pk(&kb, arch_str, ".attention.head_count_kv"), n_heads);
+    const embedding_length = try meta.int(pk(&kb, arch_str, ".embedding_length"));
+    const ffn_length = try meta.int(pk(&kb, arch_str, ".feed_forward_length"));
+    const ctx_declared = try meta.int(pk(&kb, arch_str, ".context_length"));
 
     // A file without the key derives the head width, so a refusal names the source it read.
-    const key_length_held = lookupKv(parsed, pk(&kb, arch_str, ".attention.key_length")) != null;
+    const key_length_key = pk(&kb, arch_str, ".attention.key_length");
+    const key_length_held = findMetadata(parsed, key_length_key) != null;
     const head_dim_source = if (key_length_held)
         "attention.key_length"
     else
         "embedding_length / attention.head_count";
-    const head_dim_explicit = try keys.intOr(
+    const head_dim_explicit = try meta.intOr(
         pk(&kb, arch_str, ".attention.key_length"),
         embedding_length / n_heads,
     );
-    const rope_dim_count = try keys.intOr(
+    const rope_dim_count = try meta.intOr(
         pk(&kb, arch_str, ".rope.dimension_count"),
         head_dim_explicit,
     );
-    const rope_freq_base = try keys.floatOr(pk(&kb, arch_str, ".rope.freq_base"), 10000.0);
-    const rms_norm_eps = try keys.float(pk(&kb, arch_str, ".attention.layer_norm_rms_epsilon"));
+    const rope_freq_base = try meta.floatOr(pk(&kb, arch_str, ".rope.freq_base"), 10000.0);
+    const rms_norm_eps = try meta.float(pk(&kb, arch_str, ".attention.layer_norm_rms_epsilon"));
 
     // Read the Gated-DeltaNet keys, which only qwen35 has.
     const gdn: ?GdnParams = if (arch == .qwen35) GdnParams{
-        .conv_kernel = try keys.int(pk(&kb, arch_str, ".ssm.conv_kernel")),
-        .state_size = try keys.int(pk(&kb, arch_str, ".ssm.state_size")),
-        .group_count = try keys.int(pk(&kb, arch_str, ".ssm.group_count")),
-        .inner_size = try keys.int(pk(&kb, arch_str, ".ssm.inner_size")),
-        .time_step_rank = try keys.int(pk(&kb, arch_str, ".ssm.time_step_rank")),
-        .full_attention_interval = try keys.int(pk(&kb, arch_str, ".full_attention_interval")),
+        .conv_kernel = try meta.int(pk(&kb, arch_str, ".ssm.conv_kernel")),
+        .state_size = try meta.int(pk(&kb, arch_str, ".ssm.state_size")),
+        .group_count = try meta.int(pk(&kb, arch_str, ".ssm.group_count")),
+        .inner_size = try meta.int(pk(&kb, arch_str, ".ssm.inner_size")),
+        .time_step_rank = try meta.int(pk(&kb, arch_str, ".ssm.time_step_rank")),
+        .full_attention_interval = try meta.int(pk(&kb, arch_str, ".full_attention_interval")),
     } else null;
 
-    const tokens = try keys.strings("tokenizer.ggml.tokens");
+    const tokens = try meta.strings("tokenizer.ggml.tokens");
 
     // Check the bounds. A typed error here keeps a file from sizing past `core/limits.zig`.
     if (n_layers > limits.max_layers) {
-        keys.fail("{d} layers pass the limit of {d}", .{ n_layers, limits.max_layers });
+        meta.fail("{d} layers pass the limit of {d}", .{ n_layers, limits.max_layers });
         return error.TooManyLayers;
     }
     if (tokens.len > limits.max_vocab) {
-        keys.fail("{d} tokens pass the limit of {d}", .{ tokens.len, limits.max_vocab });
+        meta.fail("{d} tokens pass the limit of {d}", .{ tokens.len, limits.max_vocab });
         return error.VocabTooLarge;
     }
 
     const vocab_size: u32 = @intCast(tokens.len);
     // A zero context leaves no window to plan.
     if (ctx_declared == 0) {
-        keys.fail("the card value context_length is 0", .{});
+        meta.fail("the card value context_length is 0", .{});
         return error.BadKeyValue;
     }
 
@@ -420,13 +422,13 @@ pub fn cardFromParsed(
         .{ .key = head_dim_source, .value = head_dim_explicit },
     };
     if (zeroDim(&dims, gdn)) |key| {
-        keys.fail("the card value {s} is 0", .{key});
+        meta.fail("the card value {s} is 0", .{key});
         return error.BadKeyValue;
     }
 
     // Check the head grouping: each KV head serves a whole group of query heads.
     if (n_heads % n_kv_heads != 0) {
-        keys.fail(
+        meta.fail(
             "{d} attention heads do not split into groups over {d} KV heads",
             .{ n_heads, n_kv_heads },
         );
@@ -449,8 +451,8 @@ pub fn cardFromParsed(
 
     // Refuse RoPE scaling that the engine does not apply, because nothing downstream detects it.
     const scaling_key = pk(&kb, arch_str, ".rope.scaling.type");
-    const scaling_type: ?[]const u8 = if (lookupKv(parsed, scaling_key) != null)
-        try keys.string(scaling_key)
+    const scaling_type: ?[]const u8 = if (findMetadata(parsed, scaling_key) != null)
+        try meta.string(scaling_key)
     else
         null;
 
@@ -459,7 +461,7 @@ pub fn cardFromParsed(
     if (!ropeScalingSupported(scaling_type, applies_rope_freqs)) {
         std.debug.assert(scaling_type != null);
 
-        keys.fail(
+        meta.fail(
             "RoPE scaling type {s} is not supported. The engine applies only the " ++
                 "llama3 factors of a " ++ rope_freqs_tensor ++ " tensor",
             .{scaling_type.?},
@@ -468,8 +470,8 @@ pub fn cardFromParsed(
     }
 
     // Read the special tokens and build the card. BOS is optional: ChatML models omit it.
-    const bos = try keys.intOr("tokenizer.ggml.bos_token_id", 0);
-    const eos = try keys.int("tokenizer.ggml.eos_token_id");
+    const bos = try meta.intOr("tokenizer.ggml.bos_token_id", 0);
+    const eos = try meta.int("tokenizer.ggml.eos_token_id");
     const chat = lookupStringOptional(parsed, "tokenizer.chat_template") orelse "";
 
     const name = lookupStringOptional(parsed, "general.name");
@@ -806,7 +808,7 @@ fn checkGdn(
         g.conv_kernel - 1, qkv,
     });
 
-    // The planner prices the GDN state of one slot under the two ceilings of `limits.zig`.
+    // The planner sizes the GDN state of one slot under the two ceilings of `limits.zig`.
     const layer_bytes = (@as(u64, state) + conv) * @sizeOf(f32);
     const n_gdn: u64 = card.n_layers - card.n_layers / g.full_attention_interval;
     if (layer_bytes > limits.max_fixed_state_bytes_per_layer or
@@ -876,21 +878,21 @@ fn mibOf(bytes: usize) f64 {
     return @as(f64, @floatFromInt(bytes)) / (1024.0 * 1024.0);
 }
 
-/// Build a prefixed KV key such as `<arch>.block_count` into `buf`. The key always fits.
+/// Build a prefixed metadata key such as `<arch>.block_count` into `buf`. The key always fits.
 fn pk(buf: []u8, prefix: []const u8, suffix: []const u8) []const u8 {
     return std.fmt.bufPrint(buf, "{s}{s}", .{ prefix, suffix }) catch unreachable;
 }
 
-fn lookupKv(p: parser.Parsed, key: []const u8) ?*const parser.Value {
-    for (p.kvs) |*kv| {
-        if (std.mem.eql(u8, kv.key, key)) return &kv.value;
+fn findMetadata(p: parser.Parsed, key: []const u8) ?*const parser.Value {
+    for (p.metadata) |*pair| {
+        if (std.mem.eql(u8, pair.key, key)) return &pair.value;
     }
 
     return null;
 }
 
 fn lookupStringOptional(p: parser.Parsed, key: []const u8) ?[]const u8 {
-    const v = lookupKv(p, key) orelse return null;
+    const v = findMetadata(p, key) orelse return null;
     return switch (v.*) {
         .string => |s| s,
         else => null,
@@ -953,13 +955,13 @@ test "load and loadWith name their error set" {
     comptime std.debug.assert(returnedSet(@TypeOf(loadWith)) == LoadError);
 }
 
-test "Keys.floatOr: an absent key takes the default, and a wrong type refuses" {
+test "MetadataReader.floatOr: an absent key takes the default, and a wrong type refuses" {
     const key = "llama.rope.freq_base";
-    const keysOf = struct {
-        fn of(kvs: []const parser.Kv) Keys {
+    const readerOf = struct {
+        fn of(metadata: []const parser.MetadataPair) MetadataReader {
             const parsed: parser.Parsed = .{
                 .header = undefined,
-                .kvs = kvs,
+                .metadata = metadata,
                 .tensors = &.{},
                 .data_offset = 0,
                 .alignment = 1,
@@ -967,9 +969,9 @@ test "Keys.floatOr: an absent key takes the default, and a wrong type refuses" {
             return .{ .parsed = parsed, .file = "case.gguf", .level = .debug };
         }
     }.of;
-    const absent = keysOf(&.{});
-    const value = keysOf(&.{.{ .key = key, .value = .{ .f32_val = 2.5 } }});
-    const wrong = keysOf(&.{.{ .key = key, .value = .{ .string = "2.5" } }});
+    const absent = readerOf(&.{});
+    const value = readerOf(&.{.{ .key = key, .value = .{ .f32_val = 2.5 } }});
+    const wrong = readerOf(&.{.{ .key = key, .value = .{ .string = "2.5" } }});
     try std.testing.expectEqual(7.0, try absent.floatOr(key, 7.0));
     try std.testing.expectEqual(2.5, try value.floatOr(key, 7.0));
     try std.testing.expectError(error.WrongKeyType, wrong.floatOr(key, 7.0));
@@ -1026,8 +1028,12 @@ fn smallCard(comptime arch: Arch) ModelCard {
 
 const card_tokens = [_][]const u8{ "a", "b", "c", "d", "e", "f", "g", "h" };
 
-/// The KVs of `card` as a file holds them. The token list sets the vocab size.
-fn cardKvs(comptime arch: Arch, card: ModelCard, out: *[24]parser.Kv) []const parser.Kv {
+/// The metadata pairs of `card` as a file holds them. The token list sets the vocab size.
+fn cardMetadata(
+    comptime arch: Arch,
+    card: ModelCard,
+    out: *[24]parser.MetadataPair,
+) []const parser.MetadataPair {
     std.debug.assert(card.arch == arch);
     std.debug.assert(card.vocab_size <= card_tokens.len);
 
@@ -1037,7 +1043,7 @@ fn cardKvs(comptime arch: Arch, card: ModelCard, out: *[24]parser.Kv) []const pa
             return .{ .u32_val = x };
         }
     }.of;
-    const common = [_]parser.Kv{
+    const common = [_]parser.MetadataPair{
         .{ .key = "general.architecture", .value = .{ .string = p } },
         .{ .key = p ++ ".block_count", .value = u(card.n_layers) },
         .{ .key = p ++ ".attention.head_count", .value = u(card.n_heads) },
@@ -1062,7 +1068,7 @@ fn cardKvs(comptime arch: Arch, card: ModelCard, out: *[24]parser.Kv) []const pa
     @memcpy(out[0..common.len], &common);
     const g = card.gdn orelse return out[0..common.len];
 
-    const ssm = [_]parser.Kv{
+    const ssm = [_]parser.MetadataPair{
         .{ .key = p ++ ".ssm.conv_kernel", .value = u(g.conv_kernel) },
         .{ .key = p ++ ".ssm.state_size", .value = u(g.state_size) },
         .{ .key = p ++ ".ssm.group_count", .value = u(g.group_count) },
@@ -1092,13 +1098,13 @@ fn expectCardCase(c: CardCase) !void {
         inline else => |a| smallCard(a),
     };
     c.edit(&card);
-    var buf: [24]parser.Kv = undefined;
-    const kvs = switch (c.arch) {
-        inline else => |a| cardKvs(a, card, &buf),
+    var buf: [24]parser.MetadataPair = undefined;
+    const metadata = switch (c.arch) {
+        inline else => |a| cardMetadata(a, card, &buf),
     };
     const parsed: parser.Parsed = .{
         .header = undefined,
-        .kvs = kvs,
+        .metadata = metadata,
         .tensors = &.{},
         .data_offset = 0,
         .alignment = 1,
@@ -1280,8 +1286,8 @@ fn checkBind(c: BindCase) !void {
         .offset_in_data = c.offset_in_data,
     }};
     const parsed: parser.Parsed = .{
-        .header = .{ .version = 3, .tensor_count = 1, .kv_count = 0 },
-        .kvs = &.{},
+        .header = .{ .version = 3, .tensor_count = 1, .metadata_kv_count = 0 },
+        .metadata = &.{},
         .tensors = &infos,
         .data_offset = c.data_offset,
         .alignment = 1,
@@ -1345,8 +1351,8 @@ test "bindTensors: a tensor that starts inside the tensor before it refuses" {
             .{ .name = "b", .dtype = .f32, .n_dims = 1, .shape = shape, .offset_in_data = c.at },
         };
         const parsed: parser.Parsed = .{
-            .header = .{ .version = 3, .tensor_count = 2, .kv_count = 0 },
-            .kvs = &.{},
+            .header = .{ .version = 3, .tensor_count = 2, .metadata_kv_count = 0 },
+            .metadata = &.{},
             .tensors = &infos,
             .data_offset = 0,
             .alignment = 1,
@@ -1363,9 +1369,9 @@ test "bindTensors: a tensor that starts inside the tensor before it refuses" {
     }
 }
 
-/// A random mutation of the parser sample: byte writes in the header, the kvs, and the tensor
-/// table, one 8-byte edge value, and one cut. `parse` then `bindTensors` gives a typed error,
-/// or tensors that lie inside the bytes with a row stride that tiles the data and an aligned start.
+/// A random mutation of the parser sample: byte writes in the header, the metadata pairs, and the
+/// tensor table, one 8-byte edge value, and one cut. `parse` then `bindTensors` gives a typed
+/// error, or tensors inside the bytes with a row stride that tiles the data and an aligned start.
 fn checkParseBind(sample: *const parser.Sample, seed: u64) anyerror!void {
     var prng = std.Random.DefaultPrng.init(seed);
     const r = prng.random();

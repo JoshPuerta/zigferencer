@@ -36,7 +36,7 @@ const boot_lines = @import("boot_lines.zig");
 // -- types ------------------------------------------------------------------
 
 /// The outcome of a device attempt. `.all_host` hands the host placement back, because an auto
-/// split can fund no GPU layer.
+/// split can hold no GPU layer.
 pub const DeviceAttempt = union(enum) {
     done,
     all_host: resolve_mod.Result(resolve_mod.HostPlacement),
@@ -166,9 +166,9 @@ pub fn fusedOn(io: Io, boot: *const DeviceBoot, ctxp: anytype) !device_placement
     };
 }
 
-/// Log the RAM quote of the all-host placement, or refuse. A per-op vulkan boot resolved a device
+/// Log the RAM plan of the all-host placement, or refuse. A per-op vulkan boot resolved a device
 /// placement, so it resolves the host placement here.
-pub fn hostQuote(
+pub fn hostRamPlan(
     io: Io,
     boot: *const DeviceBoot,
     kv_dtype: dtype.KvDtype,
@@ -180,7 +180,7 @@ pub fn hostQuote(
     const result = placement orelse
         resolve_mod.hostPlacement(boot.kind, boot.input, boot.card, kv_dtype, window, resources);
     switch (result) {
-        .ok => |host| boot_lines.logRamQuote(host.quote, false),
+        .ok => |host| boot_lines.logRamPlan(host.ram_plan, false),
         .refused => |r| return boot_lines.refuse(io, boot.entry.pub_name, r),
     }
 }
@@ -216,7 +216,7 @@ pub fn modelNeeds(loaded: *const loader.Loaded) resolve_mod.ModelNeeds {
     return m;
 }
 
-/// `MemAvailable` at boot: the free RAM that every RAM quote checks against.
+/// `MemAvailable` at boot: the free RAM that every RAM plan checks against.
 pub fn hostRamFree(io: Io) ?u64 {
     const free = hwinfo.readMemAvailable(io);
     if (free == null) {
@@ -227,7 +227,7 @@ pub fn hostRamFree(io: Io) ?u64 {
     return free;
 }
 
-/// The KV dtype that one process frames every row at. Call it before any plan, price, or device,
+/// The KV dtype that one process frames every row at. Call it before any plan, size, or device,
 /// so no preflight assert meets a half-applied dtype.
 pub fn kvDtypeFor(flag: ?dtype.KvDtype, model: *const registry.Model) dtype.KvDtype {
     return flag orelse model.kv_dtype_default;
@@ -306,7 +306,7 @@ test "baseWindow: a named window must lie in 1..ceiling, and no flag takes the s
 }
 
 test "baseWindow: a ceiling below the session budget window is the default window" {
-    // Qwen3.5-2B at f16 costs 12288 bytes per position, so the budget buys 10752 positions.
+    // Qwen3.5-2B at f16 costs 12288 bytes per position, so the budget holds 10752 positions.
     // A ceiling of 4096 binds first.
     const cost: kv_budget.KvCostModel = .{ .kv_bytes_per_token = 12_288 };
     try std.testing.expectEqual(

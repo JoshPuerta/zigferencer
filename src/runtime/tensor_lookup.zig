@@ -10,9 +10,9 @@
 //! answer.
 //!
 //! Weight bytes. `layerWeightBytes` keys each block by its `blk.{i}.` prefix and leaves the
-//! non-layer tensors out. `headWeightBytes` charges the final norm plus the lm_head. A model that
-//! ties its lm_head to the embedding ships no `output.weight`, so the embedding table pays for the
-//! head. An absent tensor charges nothing.
+//! non-layer tensors out. `headWeightBytes` sums the final norm plus the lm_head. A model that
+//! ties its lm_head to the embedding ships no `output.weight`, so the embedding table covers the
+//! head. An absent tensor adds nothing.
 
 const std = @import("std");
 const Tensor = @import("../core/tensor.zig").Tensor;
@@ -224,7 +224,7 @@ test "headWeightBytes: the final norm plus the lm_head, tied and untied" {
         .data = &head_data,
     };
 
-    // Tied: no `output.weight`, so the embedding table pays for the lm_head.
+    // Tied: no `output.weight`, so the embedding table covers the lm_head.
     const tied = [_]loader.TensorRef{
         .{ .name = "token_embd.weight", .tensor = embed },
         .{ .name = "output_norm.weight", .tensor = norm },

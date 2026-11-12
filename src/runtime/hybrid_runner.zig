@@ -33,7 +33,7 @@
 //! the weight quant, and the KV dtype.
 //!
 //! Swap stages. A swap stage holds one chunk of the GPU half of a slot blob, or that whole half
-//! when it is smaller. A plan with residency prices two stages. A plan without residency prices
+//! when it is smaller. A plan with residency sizes two stages. A plan without residency sizes
 //! zero, and the runner never swaps.
 //!
 //! Tests. The tests below need no device: the blob arithmetic of both families. The equivalence
@@ -104,9 +104,9 @@ pub fn HybridRunner(comptime Family: type) type {
         /// Rows one `prefillBatch` accepts. The bench and the serve chunker read this field on
         /// every runner.
         prefill_batch_max: u32,
-        /// True when the plan priced both swap stages. A plan without them means this runner never
+        /// True when the plan sized both swap stages. A plan without them means this runner never
         /// swaps.
-        swap_priced: bool,
+        swap_planned: bool,
 
         /// The value of the CPU runner. A false value keeps the session surface free of the
         /// recurrent hooks.
@@ -144,8 +144,8 @@ pub fn HybridRunner(comptime Family: type) type {
             host_span: u64,
             /// Bytes one slot occupies on the GPU layers.
             device_span: u64,
-            /// True when the plan priced both swap stages.
-            swap_priced: bool,
+            /// True when the plan sized both swap stages.
+            swap_planned: bool,
         };
 
         /// What `init` takes beside the allocator, the context, and the model.
@@ -181,7 +181,7 @@ pub fn HybridRunner(comptime Family: type) type {
             errdefer gpa.destroy(self);
 
             // Build the fused runner first: its VRAM preflight refuses an over-budget placement
-            // before the CPU runner spends host memory.
+            // before the CPU runner uses host memory.
             const suffix = try Fused.initSuffix(
                 gpa,
                 ctx,
@@ -207,7 +207,7 @@ pub fn HybridRunner(comptime Family: type) type {
                 .n_slots = plan.n_slots,
                 .max_seq = plan.window,
                 .prefill_batch_max = suffix.maxStepRows(),
-                .swap_priced = checked.swap_priced,
+                .swap_planned = checked.swap_planned,
             };
             errdefer self.prefix_arena.deinit();
 
@@ -227,7 +227,7 @@ pub fn HybridRunner(comptime Family: type) type {
             return self;
         }
 
-        /// Each runner allocated what the planner priced for its layers: one slot at the window.
+        /// Each runner allocated what the planner sized for its layers: one slot at the window.
         /// A blob length that drifts from the plan is an error in every build mode.
         fn checkBuilt(self: *const Self, checked: PlanCheck) error{BlobLengthMismatch}!void {
             const window = self.max_seq;
@@ -297,15 +297,15 @@ pub fn HybridRunner(comptime Family: type) type {
             // The swap stages.
             const stage_one = blobSpanBytes(card, kv_dtype, plan.window, host_layers, n_layers);
             std.debug.assert(stage_one == device_span);
-            const swap_priced = plan.ram.swap_stages == 2 * kv_budget.stageBytes(stage_one);
-            std.debug.assert(swap_priced or plan.ram.swap_stages == 0);
+            const swap_planned = plan.ram.swap_stages == 2 * kv_budget.stageBytes(stage_one);
+            std.debug.assert(swap_planned or plan.ram.swap_stages == 0);
             std.debug.assert(plan.ram.swap_stages <= 2 * limits.swap_stage_chunk_bytes);
             std.debug.assert(plan.ram.swap_stages * plan.n_slots <= 2 * plan.kv_vram);
 
             return .{
                 .host_span = host_span,
                 .device_span = device_span,
-                .swap_priced = swap_priced,
+                .swap_planned = swap_planned,
             };
         }
 
@@ -464,8 +464,8 @@ pub fn HybridRunner(comptime Family: type) type {
         /// Copy the first `n_rows` positions of `slot` into `out`: the CPU runner writes the host
         /// half, then the fused runner appends the GPU half.
         pub fn evictSlot(self: *Self, slot: u32, n_rows: u32, out: []u8) !void {
-            // The GPU half moves through a stage that the plan must have priced.
-            std.debug.assert(self.swap_priced);
+            // The GPU half moves through a stage that the plan must have sized.
+            std.debug.assert(self.swap_planned);
             std.debug.assert(slot < self.n_slots);
             std.debug.assert(n_rows >= 1); // a blob must hold rows to restore from
             std.debug.assert(n_rows <= self.max_seq);
@@ -480,8 +480,8 @@ pub fn HybridRunner(comptime Family: type) type {
 
         /// Restore an evicted `n_rows`-row blob into `slot`, the mirror of `evictSlot`.
         pub fn restoreSlot(self: *Self, slot: u32, n_rows: u32, blob: []const u8) !void {
-            // The GPU half moves through a stage that the plan must have priced.
-            std.debug.assert(self.swap_priced);
+            // The GPU half moves through a stage that the plan must have sized.
+            std.debug.assert(self.swap_planned);
             std.debug.assert(slot < self.n_slots);
             std.debug.assert(n_rows >= 1); // a blob must hold rows to restore from
             std.debug.assert(n_rows <= self.max_seq);
@@ -601,14 +601,14 @@ fn testTensors(comptime n_layers: u32) [n_layers + 2]loader.TensorRef {
 /// dtype.
 const qwen_gdn_bytes: u64 = 1_122_304;
 
-test "hybrid qwen: the cost vector prices six attention layers and eighteen slabs" {
+test "hybrid qwen: the cost vector sizes six attention layers and eighteen slabs" {
     const card = testCard(.qwen35);
     // The slab of one GDN layer is the recurrent state plus the conv ring of the family rule.
     const elems = qwen_layer.recurrentElems(&card);
     const slab_bytes = (@as(u64, elems.state) + elems.conv) * @sizeOf(f32);
     try std.testing.expectEqual(qwen_gdn_bytes, slab_bytes);
 
-    // Layers 3, 7, 11, 15, 19, and 23 charge a KV row pair a token, and the other eighteen hold a
+    // Layers 3, 7, 11, 15, 19, and 23 hold a KV row pair a token, and the other eighteen hold a
     // fixed slab.
     for ([_]dtype.KvDtype{ .f32, .f16 }) |kv_dtype| {
         const row_pair: u64 = 2 * kv_dtype.rowBytes(card.n_kv_heads * card.head_dim);
@@ -626,14 +626,14 @@ test "hybrid qwen: the cost vector prices six attention layers and eighteen slab
             );
         }
 
-        // A uniform per-layer price charges a different number at every layer count, so the
+        // A uniform per-layer size gives a different number at every layer count, so the
         // divisibility accident on this model cannot stand in for the vector.
         try std.testing.expectEqual(6 * row_pair, costs.total().kv_bytes_per_token);
         try std.testing.expectEqual(18 * qwen_gdn_bytes, costs.total().fixed_state_bytes_per_slot);
     }
 }
 
-test "hybrid plan: every interior plan prices each tier by the blob span of its layers" {
+test "hybrid plan: every interior plan sizes each tier by the blob span of its layers" {
     inline for (test_arches) |arch| {
         const card = testCard(arch);
         const n_layers = card.n_layers;
@@ -665,7 +665,7 @@ test "hybrid plan: every interior plan prices each tier by the blob span of its 
                 .{ .ram_split = .{ .blobs = 0, .prefix = 0 }, .residency = true },
                 n_layers - host_layers,
             );
-            // The blob boundary at the window is the span the planner priced, which is the
+            // The blob boundary at the window is the span the planner sized, which is the
             // equality `init` asserts before it allocates.
             const host = blobSpanBytes(card, kv_dtype, kv.window, 0, host_layers);
             const device = blobSpanBytes(card, kv_dtype, kv.window, host_layers, n_layers);
@@ -682,8 +682,8 @@ test "hybrid plan: every interior plan prices each tier by the blob span of its 
             );
         }
 
-        // The closed form at the middle: Llama prices sixteen equal KV layers a side. Qwen
-        // prices three attention layers and nine slabs a side.
+        // The closed form at the middle: Llama sizes sixteen equal KV layers a side. Qwen
+        // sizes three attention layers and nine slabs a side.
         const half = blobSpanBytes(card, kv_dtype, kv.window, 0, n_layers / 2);
         const row_pair: u64 = 2 * kv_dtype.rowBytes(card.n_kv_heads * card.head_dim);
         const want: u64 = switch (arch) {
@@ -754,7 +754,7 @@ test "hybrid blob: a Llama blob is the row pairs of its layers" {
     }
 }
 
-test "hybrid blob: Qwen rows price the attention layers and never the slabs" {
+test "hybrid blob: Qwen rows size the attention layers and never the slabs" {
     const card = testCard(.qwen35);
     for ([_]dtype.KvDtype{ .f32, .f16 }) |kv_dtype| {
         const row_bytes: u64 = 2 * kv_dtype.rowBytes(card.n_kv_heads * card.head_dim);
@@ -771,7 +771,7 @@ test "hybrid blob: Qwen rows price the attention layers and never the slabs" {
             try std.testing.expectEqual(9 * qwen_gdn_bytes + 3 * n_rows * row_bytes, device);
         }
 
-        // The dtype halves the row-priced part and leaves the slabs equal.
+        // The dtype halves the row-sized part and leaves the slabs equal.
         try std.testing.expectEqual(
             18 * qwen_gdn_bytes + 6 * @as(u64, 512) * row_bytes,
             blobSpanBytes(card, kv_dtype, 512, 0, 24),

@@ -35,7 +35,7 @@
 //!
 //! Scratch. Every activation buffer holds `prefill_batch_max` rows, and decode reads row 0. The
 //! batch kernels read [b, width] through a push constant, so one set serves every entry.
-//! `scratchVramBytes` prices the buffers of `allocBuffers`, so the reservation of the planner is
+//! `scratchVramBytes` sizes the buffers of `allocBuffers`, so the reservation of the planner is
 //! the sum of the preflight.
 //!
 //! KV commit. At a narrower KV dtype, one dispatch per layer narrows the f32 K and V rows into the
@@ -313,7 +313,7 @@ pub fn FusedRunner(comptime Family: type) type {
         /// The layers of the range, `L - first_layer`.
         n_layers: u32,
         max_seq: u32,
-        /// Resident conversations. A KV budget buys breadth past the decode width.
+        /// Resident conversations. A KV budget holds breadth past the decode width.
         n_slots: u32,
         /// The most logits rows of one call. It sizes the logits buffer, `stage_out`, and `logits`.
         logit_rows_max: u32,
@@ -410,7 +410,7 @@ pub fn FusedRunner(comptime Family: type) type {
 
         // -- budgets --------------------------------------------------------
 
-        /// What one KV slot costs on this model. The planner states the price, so the CLI reads the
+        /// What one KV slot costs on this model. The planner states the size, so the CLI reads the
         /// same figure before a runner exists.
         pub fn kvCostModel(card: loader.ModelCard, kv_dtype: dtype.KvDtype) kv_budget.KvCostModel {
             assert(card.arch == Family.arch);
@@ -508,7 +508,7 @@ pub fn FusedRunner(comptime Family: type) type {
             return initRange(gpa, ctx, .{ .loaded = loaded, .first = 0 }, plan, kv_dtype);
         }
 
-        /// The runner of the model layers `[first..L)`: the GPU half of a hybrid. The plan prices
+        /// The runner of the model layers `[first..L)`: the GPU half of a hybrid. The plan sizes
         /// the range, and `n_streams = n_slots` lets every slot step in one tick.
         pub fn initSuffix(
             gpa: Allocator,
@@ -1227,7 +1227,7 @@ pub fn FusedRunner(comptime Family: type) type {
             return layout;
         }
 
-        /// The device bytes that init allocates for `range`. The slot price from the family rules
+        /// The device bytes that init allocates for `range`. The slot size from the family rules
         /// equals the span of the cost vector, so two derivations of one range agree.
         fn vramOf(
             range: ModelRange,
@@ -1235,7 +1235,7 @@ pub fn FusedRunner(comptime Family: type) type {
             layout: kv_index.Layout,
             kv_dtype: dtype.KvDtype,
         ) fused_commands.VramPreflight {
-            // Price one slot of the range two ways.
+            // Size one slot of the range two ways.
             const card = &range.loaded.card;
             const first = range.first;
             const end = card.n_layers;
@@ -1248,7 +1248,7 @@ pub fn FusedRunner(comptime Family: type) type {
             assert(per_slot.total() == kv_budget.slotSpanBytes(kv_struct, first, end));
             assert(per_slot.kv == layout.slotBytes());
 
-            // Every figure prices the range, so a suffix reserves what a suffix uploads.
+            // Every figure sizes the range, so a suffix reserves what a suffix uploads.
             const whole = weightsVramBytes(range.loaded);
             const weights = weightsVramBytesRange(range.loaded.tensors, end, first, end);
             if (range.first == 0) assert(weights == whole);
@@ -1381,7 +1381,7 @@ pub fn FusedRunner(comptime Family: type) type {
         }
 
         /// Allocate the device scratch at `prefill_batch_max` rows, the list that
-        /// `scratchVramBytes` prices, then the logits rows and the rope factors. The caller frees
+        /// `scratchVramBytes` sizes, then the logits rows and the rope factors. The caller frees
         /// a partial allocation.
         fn allocBuffers(self: *Self, refs: []const loader.TensorRef) InitError!void {
             const b = &self.buffers;
@@ -1482,8 +1482,8 @@ pub fn FusedRunner(comptime Family: type) type {
             fused_weights.logHeaps(self.commands.ctx, "after");
 
             const end = self.first_layer + self.n_layers;
-            const priced = weightsVramBytesRange(refs, self.card.n_layers, self.first_layer, end);
-            self.memory.assertFull(priced);
+            const planned = weightsVramBytesRange(refs, self.card.n_layers, self.first_layer, end);
+            self.memory.assertFull(planned);
         }
 
         /// Every weight of the range in upload order: each layer with its vectors, then its
@@ -1605,7 +1605,7 @@ pub fn FusedRunner(comptime Family: type) type {
             const m = &self.memory;
             log.debug(
                 "weight arenas: small {d} B in {d} segments, quants {d} B in {d} segments, " ++
-                    "held {d} B = views {d} B + padding {d} B (bound {d} B), priced {d} B, " ++
+                    "held {d} B = views {d} B + padding {d} B (bound {d} B), planned {d} B, " ++
                     "device memory {d} B",
                 .{
                     m.small.packing.capacityBytes(),
@@ -2151,7 +2151,7 @@ pub fn FusedRunner(comptime Family: type) type {
             for (self.layers, self.kv_index) |*store, index| {
                 if (index) |kv_layer| {
                     // One K and one V copy of the first `n` rows of the slot.
-                    for ([_]kv_index.Tensor{ .k, .v }) |t| {
+                    for ([_]kv_index.KvKind{ .k, .v }) |t| {
                         const dev = self.kv.rowAt(kv_layer, t, slot, 0);
                         out[c] = stagedCopy(to_host, stage, off, dev.buffer, dev.offset, kv_bytes);
                         c += 1;
@@ -2262,7 +2262,7 @@ pub fn FusedRunner(comptime Family: type) type {
             return widths;
         }
 
-        /// The split attention records of this model. The pricing and the allocation read this one
+        /// The split attention records of this model. The sizing and the allocation read this one
         /// value.
         fn attnSplitScratch(card: loader.ModelCard) attn_split.Scratch {
             return attn_split.Scratch.init(card.n_heads, card.head_dim, card.context_length);
@@ -2367,7 +2367,7 @@ const test_families = .{ llama_layer, qwen_layer };
 
 const testCard = @import("test_fakes.zig").testCard;
 
-test "kv cost: the price of a slot is the total of the cost vector of the family" {
+test "kv cost: the bytes of a slot are the total of the cost vector of the family" {
     inline for (test_families) |Family| {
         const Runner = FusedRunner(Family);
         const card = testCard(Family.arch);
@@ -2376,7 +2376,7 @@ test "kv cost: the price of a slot is the total of the cost vector of the family
             try testing.expectEqual(vector.total(), Runner.kvCostModel(card, kv_dtype));
         }
 
-        // A narrower dtype halves the token price and keeps the fixed state, so the planner
+        // A narrower dtype halves the token size and keeps the fixed state, so the planner
         // stays monotone in cost.
         const wide = Runner.kvCostModel(card, .f32);
         const half = Runner.kvCostModel(card, .f16);
@@ -2395,7 +2395,7 @@ test "kv cost: the price of a slot is the total of the cost vector of the family
     try testing.expectEqual(@as(u64, 20_201_472), qwen.fixed_state_bytes_per_slot);
 }
 
-test "range: the slot price of every range equals the span of the planner" {
+test "range: the slot bytes of every range equal the span of the planner" {
     inline for (test_families) |Family| {
         const Runner = FusedRunner(Family);
         const card = testCard(Family.arch);
@@ -2407,9 +2407,9 @@ test "range: the slot price of every range equals the span of the planner" {
                     .window = window,
                     .costs = kv_cost.costVector(card, kv_dtype),
                 };
-                try expectSuffixPrices(Runner, &card, kv, kv_dtype, row_elems);
+                try expectSuffixBytes(Runner, &card, kv, kv_dtype, row_elems);
 
-                // The two halves of every cut partition the slot price of the model.
+                // The two halves of every cut partition the slot size of the model.
                 const whole = Runner.rangeSlotBytes(&card, kv_dtype, window, 0, card.n_layers);
                 var cut: u32 = 0;
                 while (cut <= card.n_layers) : (cut += 1) {
@@ -2424,7 +2424,7 @@ test "range: the slot price of every range equals the span of the planner" {
 
 /// Check every suffix `[first, L)` against the planner span, the KV layout, and the blob of n
 /// rows.
-fn expectSuffixPrices(
+fn expectSuffixBytes(
     comptime Runner: type,
     card: *const loader.ModelCard,
     kv: kv_budget.KvStructure,
@@ -2433,12 +2433,12 @@ fn expectSuffixPrices(
 ) !void {
     var first: u32 = 0;
     while (first < card.n_layers) : (first += 1) {
-        // The family rules and the cost vector price one range alike.
+        // The family rules and the cost vector size one range alike.
         const slot = Runner.rangeSlotBytes(card, kv_dtype, kv.window, first, card.n_layers);
         try testing.expectEqual(kv_budget.slotSpanBytes(kv, first, card.n_layers), slot.total());
 
         // The KV half is what the regions of the range hold for one slot. A blob of n rows holds
-        // the KV half of the price at n rows.
+        // the KV half of the size at n rows.
         const n_kv = try Runner.countKvLayers(card, first);
         const layout = kv_index.Layout.init(kv.n_slots, kv.window, row_elems, n_kv, kv_dtype);
         try testing.expectEqual(layout.slotBytes(), slot.kv);
@@ -2498,7 +2498,7 @@ test "weights: the whole model is the range at first zero" {
     inline for (test_families) |Family| {
         const Runner = FusedRunner(Family);
 
-        // The tied head charges the embedding table, which init uploads as the lm_head. So the
+        // The tied head includes the embedding table, which init uploads as the lm_head. So the
         // figure is every tensor the model carries.
         const whole = Runner.weightsVramBytesRange(&tied, 4, 0, 4);
         try testing.expectEqual(@as(u64, 4 * 16 + 16 + 32), whole);
@@ -2517,7 +2517,7 @@ test "weights: the whole model is the range at first zero" {
             try testing.expectEqual(whole + head_bytes, halves);
         }
 
-        // Untied: `output.weight` is the head, and the embedding table on the host charges
+        // Untied: `output.weight` is the head, and the embedding table on the host adds
         // nothing.
         const untied_whole = Runner.weightsVramBytesRange(&untied, 4, 0, 4);
         try testing.expectEqual(@as(u64, 4 * 16 + 16 + 16), untied_whole);

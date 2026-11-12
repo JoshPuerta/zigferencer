@@ -10,7 +10,7 @@
 //! Attention grid. The attention section also walks a context-depth grid on the two qwen
 //! full-attention shapes, the last ten cases. Qwen3.5-2B states 8 query heads over 2 kv heads,
 //! and Qwen3.5-9B states 16 over 4, both at head_dim 256. Attention is the one per-token cost
-//! that grows with the context, so the grid prices the CPU against the GPU at depth. The f16
+//! that grows with the context, so the grid measures the CPU against the GPU at depth. The f16
 //! rows read the KV cache in the dtype that the qwen registry entries default to. The f16 caches
 //! hold the same values at storage precision, so the gap to the f32 row is the element type
 //! alone.
@@ -72,7 +72,7 @@ const atn_cases = [_]AtnCase{
     atnCase("attn 32h,8kv,d64,t512", 32, 8, 64, 512, false),
     atnCase("attn 32h,8kv,d128,t512", 32, 8, 128, 512, false),
     // This shape is the widest GQA group the kernel blocks for. No loaded
-    // model states it, so the row prices the block bound alone.
+    // model states it, so the row measures the block bound alone.
     atnCase("attn 16h,2kv,d256,t512 group 8", 16, 2, 256, 512, false),
     atnCase("attn 8h,2kv,d256,t512", 8, 2, 256, 512, true),
     atnCase("attn 8h,2kv,d256,t1024", 8, 2, 256, 1024, true),

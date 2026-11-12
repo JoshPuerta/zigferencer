@@ -166,14 +166,14 @@ fn dumpRaw(ctx: context.Context, path: []const u8) !void {
     try w.print("file:            {s}\n", .{path});
     try w.print("file size:       {d} bytes\n", .{map.bytes().len});
     try w.print("gguf version:    {d}\n", .{parsed.header.version});
-    try w.print("kv count:        {d}\n", .{parsed.header.kv_count});
+    try w.print("metadata pairs:  {d}\n", .{parsed.header.metadata_kv_count});
     try w.print("tensor count:    {d}\n", .{parsed.header.tensor_count});
 
-    // Print each KV.
-    try w.writeAll("\n=== metadata (KV) ===\n");
-    for (parsed.kvs) |kv| {
-        try w.print("  {s} = ", .{kv.key});
-        try printValue(w, kv.value);
+    // Print each metadata pair.
+    try w.writeAll("\n=== metadata ===\n");
+    for (parsed.metadata) |pair| {
+        try w.print("  {s} = ", .{pair.key});
+        try printValue(w, pair.value);
         try w.writeAll("\n");
     }
 

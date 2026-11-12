@@ -181,7 +181,7 @@ pub const Span = extern struct {
 
     comptime {
         assert(@sizeOf(Span) == 24);
-        // The ring ceiling in `limits` prices one thread ring at 96 MiB.
+        // The ring ceiling in `limits` sizes one thread ring at 96 MiB.
         assert(@as(u64, limits.spans_per_thread_max) * @sizeOf(Span) == 96 << 20);
     }
 };

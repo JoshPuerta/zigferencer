@@ -34,7 +34,7 @@
 //! 16-bit storage and float16 arithmetic, which are core in Vulkan 1.1 and 1.2, so a
 //! Vulkan11/12Features chain enables them. 8-bit storage and `shaderInt8` stay off, because the
 //! driver exposes neither on RDNA2. The kernels pack the quants four to a `uint` and decode them
-//! with `bitfieldExtract`, at the price of a few ALU ops. `VK_EXT_subgroup_size_control` pins a
+//! with `bitfieldExtract`, at the cost of a few ALU ops. `VK_EXT_subgroup_size_control` pins a
 //! required subgroup size of 32 on every compute pipeline. The driver reports 32 to 64, and
 //! without the pin its shader compiler can choose wave64. RDNA2 issues a wave64 vector op in two
 //! passes, so the pin forces the native wave32.
@@ -548,7 +548,7 @@ pub const Context = struct {
             const one_position = kv_index.Layout.init(
                 n_slots,
                 1,
-                layout.per_step,
+                layout.kv_row_elems,
                 layout.n_layers,
                 layout.kv_dtype,
             );
@@ -566,7 +566,7 @@ pub const Context = struct {
         }
 
         // Pick the advice, from the widest window that fits.
-        const fit = kv_index.maxGranuleWindow(n_slots, layout.per_step, layout.kv_dtype, lim);
+        const fit = kv_index.maxGranuleWindow(n_slots, layout.kv_row_elems, layout.kv_dtype, lim);
         std.debug.assert(fit < window);
         var advice_buf: [kv_advice_max]u8 = undefined;
         const range = verdict == .past_storage_range;

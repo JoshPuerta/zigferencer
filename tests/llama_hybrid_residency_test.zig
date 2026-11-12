@@ -82,7 +82,7 @@ fn initCtx(arena: std.mem.Allocator) !*vulkan_ctx.Context {
 
 /// Build a hybrid through the production planner, half the layers on each tier. A degenerate count
 /// lets a single-tier runner pass the swap gates, so the helper asserts the count. A device that
-/// cannot fund the placement skips the gate on its budget refusal.
+/// cannot hold the placement skips the gate on its budget refusal.
 fn initHybrid(
     gpa: std.mem.Allocator,
     ctxp: *const vulkan_ctx.Context,
@@ -113,7 +113,7 @@ fn initHybrid(
             .window = window,
             .costs = kv_costs,
         },
-        // These runners evict and restore, so the plan prices both swap
+        // These runners evict and restore, so the plan sizes both swap
         // stages. The RAM check stays off, because the test fixes no host.
         .{ .ram_split = .{ .blobs = 0, .prefix = 0 }, .residency = true },
         gpu_layers,

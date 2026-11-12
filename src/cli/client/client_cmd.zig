@@ -3,7 +3,7 @@
 //! is a command.
 //!
 //! Modes. The streaming mode runs two tasks that feed one queue: one reads stdin lines, and one
-//! reads server frames. The main task is the control unit. It takes one input at a time and steps
+//! reads server frames. It takes one input at a time and steps
 //! a state machine, so a `/cancel` typed while a turn streams reaches the server at once.
 //! `--no-stream` runs one blocking loop with no tasks. A streaming turn refuses a line that
 //! arrives during the turn, so piped input uses `--no-stream`.

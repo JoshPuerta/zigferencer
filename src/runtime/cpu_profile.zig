@@ -28,7 +28,7 @@ pub const CpuProfile = struct {
     sums: span.Sums = .{},
     steps: u64 = 0,
 
-    /// Nanoseconds charged to one op.
+    /// Nanoseconds attributed to one op.
     pub fn nsOf(self: *const CpuProfile, op: LayerOp) u64 {
         return self.sums.get(.ofOp(op));
     }
@@ -45,7 +45,7 @@ pub const CpuProfile = struct {
         return sum;
     }
 
-    /// Time spent in the ops that fan out on the pool.
+    /// Time in the ops that fan out on the pool.
     pub fn nsParallel(self: *const CpuProfile) u64 {
         var sum: u64 = 0;
         for (std.enums.values(LayerOp)) |op| {

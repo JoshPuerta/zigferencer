@@ -1,7 +1,7 @@
 //! The GPU submit records: their vocabulary, their mapping onto the host clock, and the folded
 //! stacks of their op sums. Pure functions only. `span.zig` holds the ring and the writer.
 //!
-//! Comptime. An assert pins the size of `GpuRecord`, which prices the GPU ring.
+//! Comptime. An assert pins the size of `GpuRecord`, which sizes the GPU ring.
 //!
 //! GPU clock. The true offset of a record, host time minus device time, lies at or below
 //! `host_wait - gpu_end` of that record. A device counter that pauses while the GPU idles only lets
@@ -63,7 +63,7 @@ pub const GpuRecord = struct {
 
     comptime {
         // The ring stores one ready flag beside each record, so an entry costs 281 bytes.
-        // `docs/profiling.md` prices the GPU ring with it.
+        // `docs/profiling.md` sizes the GPU ring with it.
         assert(@sizeOf(GpuRecord) == 280);
     }
 

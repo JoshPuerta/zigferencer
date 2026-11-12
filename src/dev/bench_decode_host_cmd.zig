@@ -1,5 +1,5 @@
 //! `zigferencer-dev bench-decode-host <pub_name>` splits the cost of one decode step
-//! into the host pieces the fused runners pay. A step records one command
+//! into the host pieces of the fused runners. A step records one command
 //! buffer, submits it, waits for the queue, copies the logits, and runs an
 //! argmax. The command times four questions apart:
 //!
@@ -359,7 +359,7 @@ fn syncFloor(ctxp: *vulkan_ctx_mod.Context, io: Io, reps: u32, w: *Io.Writer) !v
 }
 
 /// Run `reps` normal decode steps whose buffers carry two timestamps each. The
-/// loop includes the argmax between steps, because a real decode pays it.
+/// loop includes the argmax between steps, because a real decode runs it.
 fn gapProbe(
     comptime RunnerT: type,
     runner: *RunnerT,

@@ -205,7 +205,7 @@ pub const Codec = struct {
     eos_id: u32,
 
     /// Wrap `text` for its place in the conversation and tokenize. `open` is the think switch that
-    /// the scheduler resolved, so the wrap tail and the slot agree. The caller owns the ids.
+    /// the scheduler resolved, so the wrap tail and the entry agree. The caller owns the ids.
     pub fn turnTokens(
         self: *const Codec,
         gpa: Allocator,

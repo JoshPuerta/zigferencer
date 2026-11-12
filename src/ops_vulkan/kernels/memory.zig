@@ -170,7 +170,7 @@ pub const DeviceBuffer = struct {
     }
 };
 
-/// The device KV cache: one region per layer and tensor, in the order and the packing of
+/// The device KV cache: one region per layer and K or V, in the order and the packing of
 /// `kv_index`. Each segment holds whole regions, so the device limits bind one region and not the
 /// whole cache. The runner maps each `kv_index.fits` verdict to an error before `init`.
 pub const KvStore = struct {
@@ -248,8 +248,8 @@ pub const KvStore = struct {
         return sum;
     }
 
-    /// The binding of region `(layer, t)`: every slot of that tensor.
-    pub fn region(self: *const KvStore, layer: u32, t: kv_index.Tensor) vk.DescriptorBufferInfo {
+    /// The binding of region `(layer, t)`: every slot of that kind.
+    pub fn region(self: *const KvStore, layer: u32, t: kv_index.KvKind) vk.DescriptorBufferInfo {
         const base = self.regionAt(layer, t);
         const range = self.packing.region_bytes;
         std.debug.assert(range == self.layout.regionBytes());
@@ -261,7 +261,7 @@ pub const KvStore = struct {
     pub fn slotView(
         self: *const KvStore,
         layer: u32,
-        t: kv_index.Tensor,
+        t: kv_index.KvKind,
         slot: u32,
     ) vk.DescriptorBufferInfo {
         const base = self.regionAt(layer, t);
@@ -274,7 +274,7 @@ pub const KvStore = struct {
     }
 
     /// The address of the row at `(slot, pos)` in region `(layer, t)`.
-    pub fn rowAt(self: *const KvStore, layer: u32, t: kv_index.Tensor, slot: u32, pos: u32) Row {
+    pub fn rowAt(self: *const KvStore, layer: u32, t: kv_index.KvKind, slot: u32, pos: u32) Row {
         const base = self.regionAt(layer, t);
         const offset = base.offset + self.layout.rowByteOffset(slot, pos);
         std.debug.assert(offset >= base.offset + self.layout.slotByteOffset(slot));
@@ -296,7 +296,7 @@ pub const KvStore = struct {
         var total: u64 = 0;
         var layer: u32 = 0;
         while (layer < layout.n_layers) : (layer += 1) {
-            for ([_]kv_index.Tensor{ .k, .v }) |t| {
+            for ([_]kv_index.KvKind{ .k, .v }) |t| {
                 const from = self.rowAt(layer, t, source, 0);
                 const to = self.rowAt(layer, t, target, 0);
                 std.debug.assert(from.buffer == to.buffer);
@@ -339,7 +339,7 @@ pub const KvStore = struct {
         var c: usize = 0;
         var layer: u32 = 0;
         while (layer < layout.n_layers) : (layer += 1) {
-            for ([_]kv_index.Tensor{ .k, .v }) |t| {
+            for ([_]kv_index.KvKind{ .k, .v }) |t| {
                 const dev = self.rowAt(layer, t, slot, 0);
                 out[c] = if (to_host)
                     .{
@@ -369,7 +369,7 @@ pub const KvStore = struct {
     }
 
     /// The segment buffer of region `(layer, t)` and the byte where it starts.
-    fn regionAt(self: *const KvStore, layer: u32, t: kv_index.Tensor) Row {
+    fn regionAt(self: *const KvStore, layer: u32, t: kv_index.KvKind) Row {
         const index = self.layout.regionIndex(layer, t);
         const segment = self.segments[self.packing.segmentOf(index)];
         const offset = self.packing.offsetOf(index);
@@ -752,7 +752,7 @@ test "KvStore: every row of every region lands once inside one allocation" {
     var count: u32 = 0;
     for (0..layout.n_layers) |l| {
         const layer: u32 = @intCast(l);
-        for ([_]kv_index.Tensor{ .k, .v }) |t| {
+        for ([_]kv_index.KvKind{ .k, .v }) |t| {
             const whole = store.region(layer, t);
             try std.testing.expectEqual(layout.regionBytes(), whole.range);
             try std.testing.expectEqual(@as(u64, 0), whole.offset % lim.offset_alignment);
@@ -805,7 +805,7 @@ test "KvStore: two 2B sessions under the raised range start slot 1 at 128 MiB in
     try std.testing.expectEqual(@as(u32, 2), store.packing.n_segments);
     try std.testing.expectEqual(3072 * mib, store.deviceBytes());
 
-    const cases = [_]struct { layer: u32, t: kv_index.Tensor, segment: u64, offset: u64 }{
+    const cases = [_]struct { layer: u32, t: kv_index.KvKind, segment: u64, offset: u64 }{
         .{ .layer = 0, .t = .k, .segment = 0, .offset = 0 },
         .{ .layer = 5, .t = .k, .segment = 0, .offset = 1280 * mib },
         .{ .layer = 1, .t = .v, .segment = 0, .offset = 1792 * mib },

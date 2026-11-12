@@ -1,6 +1,5 @@
-//! Process logging: `std.log` routed to stderr, gated at runtime by `$ZIGFERENCER_LOG`. Quiet,
-//! louder, or per-subsystem is one env var away, with no rebuild. Diagnostics only: generated
-//! text stays on stdout.
+//! Process logging: `std.log` routed to stderr, directed at runtime by `$ZIGFERENCER_LOG`.
+//! Diagnostics only: generated text stays on stdout.
 //!
 //! Comptime. Scope and format are comptime arguments, and `hot` compiles the hot scopes out
 //! without `-Dtrace`.

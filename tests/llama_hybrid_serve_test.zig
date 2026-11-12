@@ -20,7 +20,7 @@
 //! Hardware. Every runner here builds at a true mid split, so a single-tier runner cannot pass this
 //! file. The tests need a Vulkan device and the canonical SmolLM2-135M-Instruct-Q8_0 fixture from
 //! `test_fixtures.path`. They return `error.SkipZigTest` when the device is absent, or when the
-//! device budget cannot fund the placement.
+//! device budget cannot hold the placement.
 
 const std = @import("std");
 const zigferencer = @import("zigferencer");
@@ -84,7 +84,7 @@ fn initCtx(arena: std.mem.Allocator) !*vulkan_ctx.Context {
 }
 
 /// Build a hybrid at a true mid split through the production planner. A budget refusal skips.
-/// The KV dtype prices the caps, the plan, and the runner together, because the runner preflight
+/// The KV dtype sizes the caps, the plan, and the runner together, because the runner preflight
 /// asserts that the plan states its own reservations.
 fn initHybrid(
     gpa: std.mem.Allocator,
@@ -115,7 +115,7 @@ fn initHybrid(
             .window = window,
             .costs = kv_costs,
         },
-        // These runners evict and restore, so the plan prices both swap
+        // These runners evict and restore, so the plan sizes both swap
         // stages. The RAM check stays off, because the test fixes no host.
         .{ .ram_split = .{ .blobs = 0, .prefix = 0 }, .residency = true },
         n_layers / 2,
@@ -271,7 +271,7 @@ fn overSubscribedRoundTrip(kv_dtype: dtype.KvDtype) !void {
     defer hybrid.deinit();
 
     // Three logical sessions over two VRAM slots: the third forces a swap on every tick.
-    // The blob budget funds the evicted session plus the transient blob of a rotation.
+    // The blob budget holds the evicted session plus the transient blob of a rotation.
     var sessions = try Sessions(LlamaHybrid).init(arena, hybrid);
     const blob_budget: u64 = 2 * hybrid.evictSlotBytesFor(hybrid.max_seq);
     var pool = try SessionPool.init(arena, gpa, &sessions, prompts.len, blob_budget);

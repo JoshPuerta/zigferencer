@@ -1,5 +1,5 @@
 //! The split path of `bench-model`: `--gpu-layers` names a count or `auto`, the
-//! real planner prices the split, and the real hybrid runner runs it. A split that resolves to
+//! real planner sizes the split, and the real hybrid runner runs it. A split that resolves to
 //! zero or all host layers refuses, because a whole-model runner serves it.
 //!
 //! Comptime. Generic over the model family. A block rejects a non-fused build.
@@ -93,7 +93,7 @@ pub fn bench(comptime Family: type, b: *const Bench) !void {
     return exec.runSeries(runner, b, turn, plan_info, true);
 }
 
-/// Resolve the split on the context, and log the placement and its price.
+/// Resolve the split on the context, and log the placement and its bytes.
 pub fn resolveSplit(b: *const Bench, ctxp: *vulkan_ctx_mod.Context) !device_placement.Hybrid {
     const io = b.ctx.io;
     const name = b.model.pub_name;
@@ -115,8 +115,8 @@ pub fn resolveSplit(b: *const Bench, ctxp: *vulkan_ctx_mod.Context) !device_plac
         .refused => |r| return boot_lines.refuse(io, name, r),
     };
 
-    switch (hybrid.quote) {
-        .ok => |quote| boot_lines.logRamQuote(quote, false),
+    switch (hybrid.ram_plan) {
+        .ok => |ram_plan| boot_lines.logRamPlan(ram_plan, false),
         .refused => |r| return boot_lines.refuse(io, name, r),
     }
 

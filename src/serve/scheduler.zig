@@ -11,11 +11,12 @@
 //! row keeps saturated decode from starving a waiting turn, and it can exceed `max_batch`. A long
 //! prefill never preempts a decoder. An empty tick returns `.idle`, and the server then blocks.
 //!
-//! Slot states. An open or a clone moves a slot from free to idle. A turn, an opening, or an append
-//! moves it from idle to prefill. A turn leaves prefill for decode at its first token or at a
-//! cancel, so the finalize emits `done`. An opening or an append leaves prefill for idle. A turn
-//! leaves decode for idle at its `done`. A close, a drop with no lease, an expiry, or a yield frees
-//! a slot from any state.
+//! Session phases. Each entry of the session table is one logical session, not a KV slot. Its
+//! `SessionPhase` is free, idle, prefill, or decode. An open or a clone moves an entry from free to
+//! idle. A turn, an opening, or an append moves it from idle to prefill. A turn leaves prefill for
+//! decode at its first token or at a cancel, so the finalize emits `done`. An opening or an append
+//! leaves prefill for idle. A turn leaves decode for idle at its `done`. A close, a drop with no
+//! lease, an expiry, or a yield frees an entry from any phase.
 //!
 //! Backpressure. The scheduler never blocks on a client. Every session event goes through a
 //! non-blocking sink. On a full queue the event parks in the single `pending_event` cell of the
@@ -23,12 +24,12 @@
 //! cell. A client that keeps sending requests with a full queue is broken, and the `disconnect`
 //! of the sink is the bounded answer.
 //!
-//! Parked turns. A tick parks a prefill when no slot can take it, or when the RAM tier cannot fund
-//! a victim. `fed` stays unchanged, so the next tick picks it again, and the decode rows run alone.
-//! A decode row parks too when its restore needs an eviction that the budget refuses. Its state
-//! stays intact, so a later credit admits it. A finished decoder frees a slot, and a closed
-//! session credits its blob. Only an external event does the rest. So a parked tick reports no
-//! work, because a report of work spins the engine loop. `parks` matches the park log lines.
+//! Parked turns. A tick parks a prefill when no KV slot can take it, or when the RAM tier cannot
+//! hold a victim. `fed` stays unchanged, so the next tick picks it again, and the decode rows run
+//! alone. A decode row parks too when its restore needs an eviction that the budget refuses. Its
+//! state stays intact, so a later blob removal admits it. A finished decoder frees a KV slot, and a
+//! closed session removes its blob. Only an external event does the rest. So a parked tick reports
+//! no work, because a report of work spins the engine loop. `parks` matches the park log lines.
 //!
 //! Stop rules. Stop discipline replicates `generate.decode`. The scheduler emits EOS and then ends
 //! the turn without stepping it. The token budget ends the turn with the last token sampled but
@@ -47,40 +48,41 @@
 //! at admission. It samples nothing, emits no token, inserts no prefix, and leaves the think state
 //! alone. It ends with one `appended` reply and moves `turns_done` by the pair count.
 //!
-//! Id sets. Each slot owns two id sets of `set_words` words at its slot index. The presence set
+//! Id sets. Each entry owns two id sets of `set_words` words at its entry index. The presence set
 //! holds the ids accepted since the turn began (the penalty counts this completion only, as OpenAI
 //! and vLLM do), and it clears at each admission. The context set
 //! holds every id fed to the session since it opened. The engine reads both through the sampling
-//! params, and the scheduler marks them. They live outside `Slot`, so a slot reset keeps them.
+//! params, and the scheduler marks them. They live outside `SessionEntry`, so a reset keeps them.
 //!
 //! Prefix cache. The cache is best-effort. Any failure counts a miss and the cold path proceeds.
 //! A `ready` plan finishes the prefill with zero forward rows, and the engine samples the first
 //! token from the stored logits. An append neither restores nor inserts a prefix, because its rows
 //! follow a live session.
 //!
-//! Leases. A lease lets a session outlive its connection. The owner of a slot is free, attached
+//! Leases. A lease lets a session outlive its connection. The owner of an entry is free, attached
 //! to a connection, or detached with a deadline. `keepLease` gives an attached session a token and
-//! a time to live, clamped to `Config.resume_ttl_max_ms`. At a drop, a leased slot detaches and
-//! every other slot frees. The drop cuts a turn by the cancel rule. An opening or append prefill
-//! runs on, and the events of a detached slot go. A maximum of 0 turns resumption off: no slot
+//! a time to live, clamped to `Config.resume_ttl_max_ms`. At a drop, a leased entry detaches and
+//! every other entry frees. The drop cuts a turn by the cancel rule. An opening or append prefill
+//! runs on, and the events of a detached entry go. A maximum of 0 turns resumption off: no entry
 //! holds a lease, every drop frees its sessions, and a keep with a positive time to live fails.
 //!
 //! Lease expiry. Every transition is a guarded write that keeps `checkLeases`. The expiry scan at
-//! the tick head and at each admission frees every detached slot at its deadline. A live open with
-//! no free slot takes the detached slot with the earliest deadline. Both stop a prefill in flight
+//! the tick head and at each admission frees every detached entry at its deadline. A live open with
+//! no free entry takes the detached entry with the earliest deadline. Both stop a prefill in flight
 //! before the release. A scan reads the clock once.
 //!
-//! Resume. `resumeLease` attaches the slot of a token to a new connection and rotates the token.
-//! It also takes an attached slot after the drop effect, so the newest holder wins. A resume of a
-//! busy slot waits for the idle transition, and every request on the session gets `session_busy`
-//! until then. A `resumed` reply goes out when the slot is idle, so the position it names is final.
+//! Resume. `resumeLease` attaches the entry of a token to a new connection and rotates the token.
+//! It also takes an attached entry after the drop effect, so the newest holder wins. A resume of a
+//! busy entry waits for the idle transition, and every request on the session gets `session_busy`
+//! until then. A `resumed` reply goes out when the entry is idle, so the position it names is
+//! final.
 //!
 //! Lease table. Tokens are unique. Live session ids are unique, nonzero, and below the counter. A
-//! free slot holds no lease and id 0. A detached slot holds a lease. Every lease has a positive
+//! free entry holds no lease and id 0. A detached entry holds a lease. Every lease has a positive
 //! time to live at or below the server maximum.
 //!
 //! Shares. `Config.sessions_per_connection` below `max_sessions` keeps one client from taking every
-//! session. Open, clone, and resume check it before they take a slot.
+//! session. Open, clone, and resume check it before they take an entry.
 //!
 //! Shutdown. A server that several clients share must not stop on the request of one client. With
 //! `allow_shutdown` off, a wire request gets `forbidden`. Connection 0 never comes from the wire,
@@ -119,7 +121,7 @@ const log_token = std.log.scoped(.token);
 
 // -- constants --------------------------------------------------------------
 
-/// Draws before a keep or a resume gives up on a token that a slot holds. Two equal draws of 128
+/// Draws before a keep or a resume gives up on a token that an entry holds. Two equal draws of 128
 /// bits do not occur in practice. The bound only makes the retry loop finite, and its end is an
 /// `internal` refusal.
 const token_draws_max: u32 = 4;
@@ -189,7 +191,7 @@ pub const KeepError = error{
     OtherOwner,
     /// The server maximum is 0, so the server keeps no lease.
     ResumptionOff,
-    /// A slot already holds the token. Only a caller fault can reach it.
+    /// An entry already holds the token. Only a caller fault can reach it.
     TokenInUse,
 };
 
@@ -199,13 +201,13 @@ pub const ResumeError = error{
     NoSuchLease,
     /// The new connection holds its share of the session table.
     ShareFull,
-    /// A slot already holds the new token. Only a caller fault can reach it.
+    /// An entry already holds the new token. Only a caller fault can reach it.
     TokenInUse,
 };
 
-/// The outcome of a resume. `ready` is false while the slot finishes an
+/// The outcome of a resume. `ready` is false while the entry finishes an
 /// opening or append prefill, or the stop of a cut turn. The resume then
-/// waits in the slot until it is idle, so the position it names is final.
+/// waits in the entry until it is idle, so the position it names is final.
 pub const Resumed = struct {
     session_id: u32,
     ready: bool,
@@ -234,10 +236,10 @@ pub const Think = struct {
 pub const Tick = enum { worked, idle };
 pub const HandleResult = enum { ok, shutdown };
 
-const SlotState = enum { free, idle, prefill, decode };
+const SessionPhase = enum { free, idle, prefill, decode };
 
 /// What a prefill feeds. A `turn` samples its first token at the end. An `opening` system prompt
-/// and an `append` of kept pairs sample nothing. They return the slot to idle with one reply.
+/// and an `append` of kept pairs sample nothing. They return the entry to idle with one reply.
 const PrefillKind = enum { turn, opening, append };
 
 /// The session table over `SessionPool` and `CodecT`.
@@ -248,7 +250,7 @@ pub fn Scheduler(comptime SessionPool: type, comptime CodecT: type) type {
         /// The pool can snapshot a KV prefix. Without it the prefix-cache paths compile away.
         const can_snapshot = @hasDecl(SessionPool, "can_snapshot") and SessionPool.can_snapshot;
 
-        /// The owner of a slot that is not free. A detached slot holds the
+        /// The owner of an entry that is not free. A detached entry holds the
         /// deadline of its lease, and no connection reaches it.
         const Owner = union(enum) {
             attached: u32,
@@ -260,7 +262,7 @@ pub fn Scheduler(comptime SessionPool: type, comptime CodecT: type) type {
             ttl_ms: u32,
         };
 
-        /// The last finished request of a slot. A resume reports it, so a
+        /// The last finished request of an entry. A resume reports it, so a
         /// client can tell a complete reply from a cut one.
         const Summary = struct {
             request_id: u32,
@@ -269,14 +271,14 @@ pub fn Scheduler(comptime SessionPool: type, comptime CodecT: type) type {
             reasoning_tokens: u32,
         };
 
-        /// A resume that waits for the slot to become idle.
+        /// A resume that waits for the entry to become idle.
         const ResumeWait = struct {
             conn: u32,
             request_id: u32,
         };
 
-        const Slot = struct {
-            state: SlotState = .free,
+        const SessionEntry = struct {
+            state: SessionPhase = .free,
             proto_id: u32 = 0,
             engine_id: u32 = 0,
             owner: Owner = .{ .attached = 0 },
@@ -308,7 +310,7 @@ pub fn Scheduler(comptime SessionPool: type, comptime CodecT: type) type {
             think_n: u32 = 0,
             /// Think tokens before the forced close, from the request or the server.
             think_budget: u32 = 0,
-            /// The forced ids still owed are `forced[forced_head..forced_len]`.
+            /// The forced ids still left are `forced[forced_head..forced_len]`.
             /// A turn loads the queue once, so it needs no wraparound.
             forced: [limits.think_force_ids_max]u32 = @splat(no_token),
             forced_len: u8 = 0,
@@ -321,7 +323,7 @@ pub fn Scheduler(comptime SessionPool: type, comptime CodecT: type) type {
         /// The decode rows of one composed step, in admission order.
         const DecodeRows = struct {
             ids: [limits.max_batch]u32 = undefined,
-            members: [limits.max_batch]*Slot = undefined,
+            members: [limits.max_batch]*SessionEntry = undefined,
             out: [limits.max_batch]u32 = undefined,
             n: usize = 0,
 
@@ -329,7 +331,7 @@ pub fn Scheduler(comptime SessionPool: type, comptime CodecT: type) type {
                 return self.ids[0..self.n];
             }
 
-            fn slots(self: *const DecodeRows) []const *Slot {
+            fn entries(self: *const DecodeRows) []const *SessionEntry {
                 return self.members[0..self.n];
             }
 
@@ -350,17 +352,17 @@ pub fn Scheduler(comptime SessionPool: type, comptime CodecT: type) type {
         pool: *SessionPool,
         codec: *const CodecT,
         cfg: Config,
-        slots: []Slot,
-        /// One id set per slot.
+        entries: []SessionEntry,
+        /// One id set per entry.
         presence: []u64,
         context: []u64,
         set_words: usize,
         /// Session ids only grow. A resume keeps the id, and a yield or an expiry never returns it.
         next_proto_id: u32 = 1,
         next_prefill_seq: u64 = 1,
-        /// Detached slots freed at their deadline.
+        /// Detached entries freed at their deadline.
         lease_expires: u64 = 0,
-        /// Detached slots freed for a live open.
+        /// Detached entries freed for a live open.
         lease_yields: u64 = 0,
         /// Yields before an open or a clone that the engine then refused.
         lease_yields_lost: u64 = 0,
@@ -414,9 +416,9 @@ pub fn Scheduler(comptime SessionPool: type, comptime CodecT: type) type {
 
             assertThinkConfig(cfg.think, cfg.eos_id, cfg.vocab_size);
 
-            // Allocate the slot table and its id sets.
-            const slots = try arena.alloc(Slot, cfg.max_sessions);
-            for (slots) |*s| {
+            // Allocate the session table and its id sets.
+            const entries = try arena.alloc(SessionEntry, cfg.max_sessions);
+            for (entries) |*s| {
                 s.* = .{};
             }
 
@@ -432,7 +434,7 @@ pub fn Scheduler(comptime SessionPool: type, comptime CodecT: type) type {
                 .pool = pool,
                 .codec = codec,
                 .cfg = cfg,
-                .slots = slots,
+                .entries = entries,
                 .presence = presence,
                 .context = context,
                 .set_words = words,
@@ -441,7 +443,7 @@ pub fn Scheduler(comptime SessionPool: type, comptime CodecT: type) type {
             };
         }
 
-        /// Free the prefix cache. Slots are arena-owned and turn tokens are
+        /// Free the prefix cache. Entries are arena-owned and turn tokens are
         /// freed per turn, so the cache is the only gpa state left.
         pub fn deinit(self: *Self) void {
             self.prefix.deinit();
@@ -521,8 +523,8 @@ pub fn Scheduler(comptime SessionPool: type, comptime CodecT: type) type {
 
             if (self.runComposedStep(sink)) return self.worked();
 
-            for (self.slots) |*slot| {
-                if (slot.state == .decode and slot.stop != null and slot.pending_event == null) {
+            for (self.entries) |*entry| {
+                if (entry.state == .decode and entry.stop != null and entry.pending_event == null) {
                     return self.worked();
                 }
             }
@@ -647,36 +649,36 @@ pub fn Scheduler(comptime SessionPool: type, comptime CodecT: type) type {
             self.reply(sink, req, OutEvent.fail(req.request_id, 0, code, detail));
         }
 
-        /// The slot of the session that `req` names. A refusal goes out when none matches.
-        fn sessionOf(self: *Self, req: Request, sink: anytype) ?*Slot {
-            return self.slotByProto(req.session_id, req.conn) orelse {
+        /// The entry of the session that `req` names. A refusal goes out when none matches.
+        fn sessionOf(self: *Self, req: Request, sink: anytype) ?*SessionEntry {
+            return self.entryByProto(req.session_id, req.conn) orelse {
                 self.refuse(req, sink, .unknown_session, "no such session");
                 return null;
             };
         }
 
-        /// The slot of a session between turns, with its parked event sent. A refusal or a
+        /// The entry of a session between turns, with its parked event sent. A refusal or a
         /// disconnect ends the request when the session is not ready for a new one.
-        fn idleSession(self: *Self, req: Request, sink: anytype) ?*Slot {
-            const slot = self.sessionOf(req, sink) orelse return null;
-            if (slot.resume_wait != null) {
+        fn idleSession(self: *Self, req: Request, sink: anytype) ?*SessionEntry {
+            const entry = self.sessionOf(req, sink) orelse return null;
+            if (entry.resume_wait != null) {
                 self.refuseWaiting(req, sink);
                 return null;
             }
 
-            if (!self.flushParked(slot, sink)) return null;
+            if (!self.flushParked(entry, sink)) return null;
 
-            std.debug.assert(slot.pending_event == null);
-            if (slot.state != .idle) {
+            std.debug.assert(entry.pending_event == null);
+            if (entry.state != .idle) {
                 self.refuse(req, sink, .session_busy, "turn in flight");
                 return null;
             }
 
-            return slot;
+            return entry;
         }
 
-        /// A slot for a new session, within the share of the connection, or a refusal.
-        fn admitSlot(self: *Self, req: Request, sink: anytype) ?Taken {
+        /// An entry for a new session, within the share of the connection, or a refusal.
+        fn admitEntry(self: *Self, req: Request, sink: anytype) ?Taken {
             if (self.leaseNow()) |now| {
                 self.expireDetached(now);
             }
@@ -686,7 +688,7 @@ pub fn Scheduler(comptime SessionPool: type, comptime CodecT: type) type {
                 return null;
             }
 
-            return self.freeSlot() orelse {
+            return self.freeEntry() orelse {
                 self.refuseNoSession(req, sink, .sessions_exhausted, "no free session");
                 return null;
             };
@@ -716,35 +718,35 @@ pub fn Scheduler(comptime SessionPool: type, comptime CodecT: type) type {
             system_prompt: []const u8,
             sink: anytype,
         ) void {
-            // Bind a slot to a new engine session.
-            const taken = self.admitSlot(req, sink) orelse return;
-            const slot = taken.slot;
+            // Bind an entry to a new engine session.
+            const taken = self.admitEntry(req, sink) orelse return;
+            const entry = taken.entry;
             const engine_id = self.pool.create(
                 sampling.seed,
-                self.samplerParams(slot, sampling),
+                self.samplerParams(entry, sampling),
             ) catch {
                 self.yieldLost(taken, "open");
                 self.refuseNoSession(req, sink, .sessions_exhausted, "no free session");
                 return;
             };
-            slot.* = .{
+            entry.* = .{
                 .state = .idle,
                 .proto_id = self.next_proto_id,
                 .engine_id = engine_id,
                 .owner = .{ .attached = req.conn },
                 .request_id = req.request_id,
             };
-            @memset(self.presenceOf(slot), 0);
-            @memset(self.contextOf(slot), 0);
-            self.yieldDone(taken, slot.proto_id);
+            @memset(self.presenceOf(entry), 0);
+            @memset(self.contextOf(entry), 0);
+            self.yieldDone(taken, entry.proto_id);
             log.info(
                 "admit: session {d} engine {d} conn {d}",
-                .{ slot.proto_id, engine_id, req.conn },
+                .{ entry.proto_id, engine_id, req.conn },
             );
             self.next_proto_id += 1;
 
             // An empty system prompt ends the open here.
-            if (system_prompt.len == 0) return self.emitOpened(slot, sink);
+            if (system_prompt.len == 0) return self.emitOpened(entry, sink);
 
             // Tokenize the system prompt, and refuse one past the window.
             // A system block has no think tail, so the switch changes no id.
@@ -755,22 +757,22 @@ pub fn Scheduler(comptime SessionPool: type, comptime CodecT: type) type {
                 &.{},
                 self.cfg.think.open_default,
             ) catch {
-                self.dropSlot(slot);
+                self.dropEntry(entry);
                 self.refuseNoSession(req, sink, .internal, "tokenize failed");
                 return;
             };
             const window = self.pool.capacityRemaining(engine_id);
             if (tokens.len > window) {
                 self.gpa.free(tokens);
-                self.dropSlot(slot);
+                self.dropEntry(entry);
                 var detail: [detail_max]u8 = undefined;
                 const msg = systemTooLongDetail(&detail, tokens.len, window);
                 self.refuseNoSession(req, sink, .turn_too_long, msg);
                 return;
             }
 
-            slot.has_system_prompt = true;
-            self.startPrefill(slot, req.request_id, tokens, .opening, sink);
+            entry.has_system_prompt = true;
+            self.startPrefill(entry, req.request_id, tokens, .opening, sink);
         }
 
         /// Fork an open session: shared context, new seed and sampling, new protocol id. The source
@@ -783,13 +785,13 @@ pub fn Scheduler(comptime SessionPool: type, comptime CodecT: type) type {
             const source = self.idleSession(req, sink) orelse return;
             if (self.refuseFrequency(req, sampling, sink)) return;
 
-            // Fork the engine session into a slot.
-            const taken = self.admitSlot(req, sink) orelse return;
-            const slot = taken.slot;
+            // Fork the engine session into an entry.
+            const taken = self.admitEntry(req, sink) orelse return;
+            const entry = taken.entry;
             const engine_id = self.pool.clone(
                 source.engine_id,
                 sampling.seed,
-                self.samplerParams(slot, sampling),
+                self.samplerParams(entry, sampling),
             ) catch |err| {
                 // A fork needs both sides VRAM-resident, so tiered KV can refuse. Name the
                 // reason: a client that reads "no free session" retries the wrong thing.
@@ -805,8 +807,8 @@ pub fn Scheduler(comptime SessionPool: type, comptime CodecT: type) type {
                 return;
             };
 
-            // Fill the slot from the source.
-            slot.* = .{
+            // Fill the entry from the source.
+            entry.* = .{
                 .state = .idle,
                 .proto_id = self.next_proto_id,
                 .engine_id = engine_id,
@@ -817,15 +819,15 @@ pub fn Scheduler(comptime SessionPool: type, comptime CodecT: type) type {
                 .request_id = req.request_id,
             };
             // A clone shares the context of its source, but its presence set starts empty.
-            @memset(self.presenceOf(slot), 0);
-            @memcpy(self.contextOf(slot), self.contextOf(source));
-            self.yieldDone(taken, slot.proto_id);
+            @memset(self.presenceOf(entry), 0);
+            @memcpy(self.contextOf(entry), self.contextOf(source));
+            self.yieldDone(taken, entry.proto_id);
             log.info(
                 "clone: session {d} from {d} engine {d}",
-                .{ slot.proto_id, source.proto_id, engine_id },
+                .{ entry.proto_id, source.proto_id, engine_id },
             );
             self.next_proto_id += 1;
-            self.emitOpened(slot, sink);
+            self.emitOpened(entry, sink);
         }
 
         fn handleGenerate(
@@ -834,13 +836,13 @@ pub fn Scheduler(comptime SessionPool: type, comptime CodecT: type) type {
             m: @FieldType(Request.Body, "generate"),
             sink: anytype,
         ) void {
-            const slot = self.idleSession(req, sink) orelse return;
+            const entry = self.idleSession(req, sink) orelse return;
 
             if (m.sampling) |sampling| {
                 if (self.refuseFrequency(req, sampling, sink)) return;
             }
 
-            // The switch resolves once. The render and the slot read this one
+            // The switch resolves once. The render and the entry read this one
             // value, so the tail of the wrap and the think state agree.
             const open = m.think_open orelse self.cfg.think.open_default;
 
@@ -860,69 +862,69 @@ pub fn Scheduler(comptime SessionPool: type, comptime CodecT: type) type {
             if (m.reseed) std.debug.assert(m.sampling != null);
 
             // Encode the turn, with any carried token first.
-            const tokens = self.encodeTurn(req, slot, m.text, m.plain, open, sink) orelse return;
+            const tokens = self.encodeTurn(req, entry, m.text, m.plain, open, sink) orelse return;
 
             // Every refusal is behind, so a refused turn leaves the sampler
             // of the session unchanged.
             if (m.sampling) |sampling| {
-                self.pool.setParams(slot.engine_id, self.samplerParams(slot, sampling));
+                self.pool.setParams(entry.engine_id, self.samplerParams(entry, sampling));
                 // Only an explicit reseed restarts the stream, so a client
                 // that resends its sampling keeps one stream per session.
                 if (m.reseed) {
-                    self.pool.reseed(slot.engine_id, sampling.seed);
+                    self.pool.reseed(entry.engine_id, sampling.seed);
                 }
             }
 
             // Reset the turn state.
-            slot.max_tokens_turn = m.max_tokens;
-            slot.generated = 0;
-            slot.think_open = open;
-            slot.think_budget = budget;
-            slot.think_n = 0;
-            slot.forced_len = 0;
-            slot.forced_head = 0;
-            slot.t_turn_start = Io.Clock.Timestamp.now(self.io, .awake);
-            @memset(self.presenceOf(slot), 0);
+            entry.max_tokens_turn = m.max_tokens;
+            entry.generated = 0;
+            entry.think_open = open;
+            entry.think_budget = budget;
+            entry.think_n = 0;
+            entry.forced_len = 0;
+            entry.forced_head = 0;
+            entry.t_turn_start = Io.Clock.Timestamp.now(self.io, .awake);
+            @memset(self.presenceOf(entry), 0);
 
             // The echo goes out before the prefill.
             if (open) {
-                self.emitEcho(slot, req.request_id, sink);
+                self.emitEcho(entry, req.request_id, sink);
             }
 
-            std.debug.assert(slot.think_open == open);
-            if (slot.think_budget > 0) std.debug.assert(self.cfg.think.hasTags());
+            std.debug.assert(entry.think_open == open);
+            if (entry.think_budget > 0) std.debug.assert(self.cfg.think.hasTags());
 
-            self.startPrefill(slot, req.request_id, tokens, .turn, sink);
+            self.startPrefill(entry, req.request_id, tokens, .turn, sink);
         }
 
         /// The tokens of a turn, with any carried token first, or a refusal. A turn that does not
-        /// fit keeps the carry, because the carried token stays owed to the next turn.
+        /// fit keeps the carry, because the carried token stays pending for the next turn.
         fn encodeTurn(
             self: *Self,
             req: Request,
-            slot: *Slot,
+            entry: *SessionEntry,
             text: []const u8,
             plain: []const chat.PlainRange,
             open: bool,
             sink: anytype,
         ) ?[]u32 {
-            const turn = turnKind(slot.has_system_prompt, slot.turns_done);
+            const turn = turnKind(entry.has_system_prompt, entry.turns_done);
             const encoded = self.codec.turnTokens(self.gpa, turn, text, plain, open) catch {
                 self.refuse(req, sink, .internal, "tokenize failed");
                 return null;
             };
-            const carry_before = slot.carry;
-            const tokens = self.withCarry(slot, encoded) catch {
+            const carry_before = entry.carry;
+            const tokens = self.withCarry(entry, encoded) catch {
                 self.gpa.free(encoded);
                 self.refuse(req, sink, .internal, "oom");
                 return null;
             };
 
-            const room = self.pool.capacityRemaining(slot.engine_id);
+            const room = self.pool.capacityRemaining(entry.engine_id);
             if (tokens.len <= room) return tokens;
 
             self.gpa.free(tokens);
-            slot.carry = carry_before;
+            entry.carry = carry_before;
             var detail: [detail_max]u8 = undefined;
             const msg = turnTooLongDetail(&detail, tokens.len, room);
             self.refuse(req, sink, .turn_too_long, msg);
@@ -940,14 +942,14 @@ pub fn Scheduler(comptime SessionPool: type, comptime CodecT: type) type {
             std.debug.assert(pairs.n >= 1);
             std.debug.assert(pairs.n <= limits.max_append_pairs);
 
-            const slot = self.idleSession(req, sink) orelse return;
+            const entry = self.idleSession(req, sink) orelse return;
 
             // Render every pair before any row moves.
             var ends: [limits.max_append_pairs]u32 = undefined;
-            var ids = self.renderPairs(req, slot, pairs, &ends, sink) orelse return;
+            var ids = self.renderPairs(req, entry, pairs, &ends, sink) orelse return;
 
             // Refuse a set past the room.
-            const room = self.pool.capacityRemaining(slot.engine_id);
+            const room = self.pool.capacityRemaining(entry.engine_id);
             if (ids.items.len > room) {
                 var detail: [detail_max]u8 = undefined;
                 const msg = turnTooLongDetail(&detail, ids.items.len, room);
@@ -955,15 +957,15 @@ pub fn Scheduler(comptime SessionPool: type, comptime CodecT: type) type {
             }
 
             // Record the position after each pair.
-            const pos0 = self.pool.posOf(slot.engine_id);
-            for (ends[0..pairs.n], slot.append_pos[0..pairs.n]) |end, *pos| {
+            const pos0 = self.pool.posOf(entry.engine_id);
+            for (ends[0..pairs.n], entry.append_pos[0..pairs.n]) |end, *pos| {
                 pos.* = pos0 + end;
             }
 
-            slot.append_n = pairs.n;
+            entry.append_n = pairs.n;
             log.info(
                 "append: session {d}, {d} pairs, {d} tokens, pos {d} -> {d}",
-                .{ slot.proto_id, pairs.n, ids.items.len, pos0, slot.append_pos[pairs.n - 1] },
+                .{ entry.proto_id, pairs.n, ids.items.len, pos0, entry.append_pos[pairs.n - 1] },
             );
 
             // Start the prefill.
@@ -973,14 +975,14 @@ pub fn Scheduler(comptime SessionPool: type, comptime CodecT: type) type {
             if (tokens.len == 0) {
                 // Empty pairs of a template-free family render to no token.
                 self.gpa.free(tokens);
-                slot.request_id = req.request_id;
-                slot.kind = .append;
-                self.emitAppended(slot, sink);
-                self.endPrefill(slot, .idle, sink);
+                entry.request_id = req.request_id;
+                entry.kind = .append;
+                self.emitAppended(entry, sink);
+                self.endPrefill(entry, .idle, sink);
                 return;
             }
 
-            self.startPrefill(slot, req.request_id, tokens, .append, sink);
+            self.startPrefill(entry, req.request_id, tokens, .append, sink);
         }
 
         /// The ids of `pairs` after any carried token, or a refusal. `ends` gets the id count after
@@ -988,13 +990,13 @@ pub fn Scheduler(comptime SessionPool: type, comptime CodecT: type) type {
         fn renderPairs(
             self: *Self,
             req: Request,
-            slot: *const Slot,
+            entry: *const SessionEntry,
             pairs: protocol.AppendPairs,
             ends: *[limits.max_append_pairs]u32,
             sink: anytype,
         ) ?std.ArrayList(u32) {
             var ids: std.ArrayList(u32) = .empty;
-            if (slot.carry) |c| {
+            if (entry.carry) |c| {
                 ids.append(self.gpa, c) catch {
                     self.appendFailed(req, &ids, sink, .internal, "oom");
                     return null;
@@ -1005,7 +1007,7 @@ pub fn Scheduler(comptime SessionPool: type, comptime CodecT: type) type {
             var i: u16 = 0;
             // One pass per pair. The decoder bounds the count.
             while (it.next()) |pair| : (i += 1) {
-                const order = turnOrder(slot.has_system_prompt, slot.turns_done + i);
+                const order = turnOrder(entry.has_system_prompt, entry.turns_done + i);
                 const toks = self.codec.pairTokens(
                     self.gpa,
                     order,
@@ -1047,153 +1049,153 @@ pub fn Scheduler(comptime SessionPool: type, comptime CodecT: type) type {
         }
 
         /// The reply of a finished open or clone. It names the position of the session.
-        fn emitOpened(self: *Self, slot: *Slot, sink: anytype) void {
-            self.emitOrPark(slot, sink, .{
-                .request_id = slot.request_id,
-                .session_id = slot.proto_id,
-                .body = .{ .session_opened = .{ .kv_pos = self.pool.posOf(slot.engine_id) } },
+        fn emitOpened(self: *Self, entry: *SessionEntry, sink: anytype) void {
+            self.emitOrPark(entry, sink, .{
+                .request_id = entry.request_id,
+                .session_id = entry.proto_id,
+                .body = .{ .session_opened = .{ .kv_pos = self.pool.posOf(entry.engine_id) } },
             });
         }
 
-        fn emitAppended(self: *Self, slot: *Slot, sink: anytype) void {
-            std.debug.assert(slot.kind == .append);
+        fn emitAppended(self: *Self, entry: *SessionEntry, sink: anytype) void {
+            std.debug.assert(entry.kind == .append);
 
-            var body: protocol.Appended = .{ .n = slot.append_n };
-            @memcpy(body.kv_pos[0..slot.append_n], slot.append_pos[0..slot.append_n]);
-            std.debug.assert(body.kv_pos[slot.append_n - 1] == self.pool.posOf(slot.engine_id));
-            self.emitOrPark(slot, sink, .{
-                .request_id = slot.request_id,
-                .session_id = slot.proto_id,
+            var body: protocol.Appended = .{ .n = entry.append_n };
+            @memcpy(body.kv_pos[0..entry.append_n], entry.append_pos[0..entry.append_n]);
+            std.debug.assert(body.kv_pos[entry.append_n - 1] == self.pool.posOf(entry.engine_id));
+            self.emitOrPark(entry, sink, .{
+                .request_id = entry.request_id,
+                .session_id = entry.proto_id,
                 .body = .{ .appended = body },
             });
         }
 
-        /// The sampling params of `slot`, which read the two id sets of the slot.
-        fn samplerParams(self: *Self, slot: *Slot, s: protocol.Sampling) sampler.Params {
+        /// The sampling params of `entry`, which read the two id sets of the entry.
+        fn samplerParams(self: *Self, entry: *SessionEntry, s: protocol.Sampling) sampler.Params {
             return .{
                 .temperature = s.temperature,
                 .top_k = s.top_k,
                 .top_p = s.top_p,
                 .min_p = s.min_p,
                 .presence_penalty = s.presence_penalty,
-                .presence = self.presenceOf(slot),
+                .presence = self.presenceOf(entry),
                 .repetition_penalty = s.repetition_penalty,
-                .context = self.contextOf(slot),
+                .context = self.contextOf(entry),
             };
         }
 
-        fn presenceOf(self: *Self, slot: *const Slot) []u64 {
-            return self.setOf(self.presence, slot);
+        fn presenceOf(self: *Self, entry: *const SessionEntry) []u64 {
+            return self.setOf(self.presence, entry);
         }
 
-        fn contextOf(self: *Self, slot: *const Slot) []u64 {
-            return self.setOf(self.context, slot);
+        fn contextOf(self: *Self, entry: *const SessionEntry) []u64 {
+            return self.setOf(self.context, entry);
         }
 
-        fn setOf(self: *Self, sets: []u64, slot: *const Slot) []u64 {
-            const at = (@intFromPtr(slot) - @intFromPtr(self.slots.ptr)) / @sizeOf(Slot);
-            std.debug.assert(at < self.slots.len);
-            std.debug.assert(sets.len == self.slots.len * self.set_words);
+        fn setOf(self: *Self, sets: []u64, entry: *const SessionEntry) []u64 {
+            const at = (@intFromPtr(entry) - @intFromPtr(self.entries.ptr)) / @sizeOf(SessionEntry);
+            std.debug.assert(at < self.entries.len);
+            std.debug.assert(sets.len == self.entries.len * self.set_words);
             return sets[at * self.set_words ..][0..self.set_words];
         }
 
-        /// Mark ids that enter the KV of `slot` in its context set.
-        fn markFed(self: *Self, slot: *const Slot, ids: []const u32) void {
-            sampler.markIds(self.contextOf(slot), self.cfg.vocab_size, ids);
+        /// Mark ids that enter the KV of `entry` in its context set.
+        fn markFed(self: *Self, entry: *const SessionEntry, ids: []const u32) void {
+            sampler.markIds(self.contextOf(entry), self.cfg.vocab_size, ids);
         }
 
         /// The first event of an open turn: the `<think>` id alone, before the prefill. The
         /// admission check left the cell empty, so this one event can park but never collide.
-        fn emitEcho(self: *Self, slot: *Slot, request_id: u32, sink: anytype) void {
-            std.debug.assert(slot.state == .idle);
-            std.debug.assert(slot.pending_event == null);
-            std.debug.assert(slot.think_open);
+        fn emitEcho(self: *Self, entry: *SessionEntry, request_id: u32, sink: anytype) void {
+            std.debug.assert(entry.state == .idle);
+            std.debug.assert(entry.pending_event == null);
+            std.debug.assert(entry.think_open);
 
             const id = self.cfg.think.open_id;
-            log.debug("echo: session {d} opens in the think block", .{slot.proto_id});
+            log.debug("echo: session {d} opens in the think block", .{entry.proto_id});
             self.emitOrPark(
-                slot,
+                entry,
                 sink,
-                OutEvent.token(request_id, slot.proto_id, id, .open_tag, self.codec.piece(id)),
+                OutEvent.token(request_id, entry.proto_id, id, .open_tag, self.codec.piece(id)),
             );
         }
 
         fn handleCancel(self: *Self, req: Request, sink: anytype) void {
-            const slot = self.sessionOf(req, sink) orelse return;
-            if (slot.resume_wait != null) return self.refuseWaiting(req, sink);
-            switch (slot.state) {
-                .prefill => if (slot.kind == .append) self.cancelAppend(
-                    slot,
+            const entry = self.sessionOf(req, sink) orelse return;
+            if (entry.resume_wait != null) return self.refuseWaiting(req, sink);
+            switch (entry.state) {
+                .prefill => if (entry.kind == .append) self.cancelAppend(
+                    entry,
                     sink,
-                ) else self.cancelTurn(slot),
-                .decode => self.cancelTurn(slot),
+                ) else self.cancelTurn(entry),
+                .decode => self.cancelTurn(entry),
                 else => {}, // an idle cancel has nothing in flight, so it is a no-op
             }
         }
 
         /// The cancel rule of a turn. A cancel and a drop share it.
-        fn cancelTurn(self: *Self, slot: *Slot) void {
-            std.debug.assert(slot.state == .prefill or slot.state == .decode);
+        fn cancelTurn(self: *Self, entry: *SessionEntry) void {
+            std.debug.assert(entry.state == .prefill or entry.state == .decode);
 
-            if (slot.state == .prefill) {
+            if (entry.state == .prefill) {
                 // The partial turn stays in context. A client that cares closes the session.
-                std.debug.assert(slot.kind != .append);
+                std.debug.assert(entry.kind != .append);
 
-                log.info("stop: session {d} cancelled (prefill state)", .{slot.proto_id});
-                self.gpa.free(slot.turn_tokens);
-                slot.turn_tokens = &.{};
-                slot.t_prefill_end = Io.Clock.Timestamp.now(self.io, .awake);
-                std.debug.assert(slot.stop == null);
-                slot.stop = .cancelled;
-                slot.state = .decode; // finalizeStops emits the done
+                log.info("stop: session {d} cancelled (prefill state)", .{entry.proto_id});
+                self.gpa.free(entry.turn_tokens);
+                entry.turn_tokens = &.{};
+                entry.t_prefill_end = Io.Clock.Timestamp.now(self.io, .awake);
+                std.debug.assert(entry.stop == null);
+                entry.stop = .cancelled;
+                entry.state = .decode; // finalizeStops emits the done
                 return;
             }
 
             // A natural stop keeps its reason.
-            if (slot.stop == null) {
-                log.info("stop: session {d} cancelled (decode state)", .{slot.proto_id});
-                slot.stop = .cancelled;
+            if (entry.stop == null) {
+                log.info("stop: session {d} cancelled (decode state)", .{entry.proto_id});
+                entry.stop = .cancelled;
             }
         }
 
-        /// A cancelled append frees the unfed tokens and returns the slot to idle. The fed rows
+        /// A cancelled append frees the unfed tokens and returns the entry to idle. The fed rows
         /// stay, but `turns_done` does not move. The next wrap is then wrong, so the `err` tells
         /// the client to close.
-        fn cancelAppend(self: *Self, slot: *Slot, sink: anytype) void {
-            std.debug.assert(slot.state == .prefill);
-            std.debug.assert(slot.kind == .append);
+        fn cancelAppend(self: *Self, entry: *SessionEntry, sink: anytype) void {
+            std.debug.assert(entry.state == .prefill);
+            std.debug.assert(entry.kind == .append);
 
             log.info(
                 "stop: session {d} append cancelled after {d} of {d} tokens",
-                .{ slot.proto_id, slot.fed, slot.turn_tokens.len },
+                .{ entry.proto_id, entry.fed, entry.turn_tokens.len },
             );
-            self.gpa.free(slot.turn_tokens);
-            slot.turn_tokens = &.{};
-            slot.state = .idle;
-            slot.kind = .turn;
+            self.gpa.free(entry.turn_tokens);
+            entry.turn_tokens = &.{};
+            entry.state = .idle;
+            entry.kind = .turn;
             self.emitOrPark(
-                slot,
+                entry,
                 sink,
-                OutEvent.fail(slot.request_id, slot.proto_id, .cancelled, "append cancelled"),
+                OutEvent.fail(entry.request_id, entry.proto_id, .cancelled, "append cancelled"),
             );
-            self.deliverResume(slot, sink);
+            self.deliverResume(entry, sink);
         }
 
         fn handleClose(self: *Self, req: Request, sink: anytype) void {
-            const slot = self.sessionOf(req, sink) orelse return;
+            const entry = self.sessionOf(req, sink) orelse return;
             // The client has no `resumed` reply yet, so it cannot know the
             // session it closes. It closes it after the reply.
-            if (slot.resume_wait != null) return self.refuseWaiting(req, sink);
+            if (entry.resume_wait != null) return self.refuseWaiting(req, sink);
             // A failed flush disconnects, and the sweep of that connection
-            // releases the slot.
-            if (!self.flushParked(slot, sink)) return;
+            // releases the entry.
+            if (!self.flushParked(entry, sink)) return;
 
             self.reply(sink, req, .{
                 .request_id = req.request_id,
-                .session_id = slot.proto_id,
+                .session_id = entry.proto_id,
                 .body = .session_closed,
             });
-            self.releaseSlot(slot);
+            self.releaseEntry(entry);
         }
 
         fn sweepConn(self: *Self, conn: u32) void {
@@ -1205,13 +1207,13 @@ pub fn Scheduler(comptime SessionPool: type, comptime CodecT: type) type {
         /// because the client has no `resumed` reply yet. The handler draws
         /// a new token for a collision, and it never sends that refusal.
         fn handleKeep(self: *Self, req: Request, ttl_ms: u32, sink: anytype) void {
-            const slot = self.sessionOf(req, sink) orelse return;
-            if (slot.resume_wait != null) return self.refuseWaiting(req, sink);
+            const entry = self.sessionOf(req, sink) orelse return;
+            if (entry.resume_wait != null) return self.refuseWaiting(req, sink);
             // A failed flush disconnects, and the sweep of that connection
-            // handles the slot.
-            if (!self.flushParked(slot, sink)) return;
+            // handles the entry.
+            if (!self.flushParked(entry, sink)) return;
 
-            // Keep with a new token, and retry a draw that a slot already holds.
+            // Keep with a new token, and retry a draw that an entry already holds.
             var draws: u32 = 0;
             while (draws < token_draws_max) : (draws += 1) {
                 // A keep that drops the lease or that resumption refuses
@@ -1223,7 +1225,8 @@ pub fn Scheduler(comptime SessionPool: type, comptime CodecT: type) type {
                         return self.refuse(req, sink, .internal, "no secure random source");
                     };
 
-                const granted = self.keepLease(slot.proto_id, req.conn, ttl_ms, token) catch |err| {
+                const id = entry.proto_id;
+                const granted = self.keepLease(id, req.conn, ttl_ms, token) catch |err| {
                     const code: protocol.ErrorCode, const detail: []const u8 = switch (err) {
                         error.TokenInUse => continue,
                         error.ResumptionOff => .{ .forbidden, "resumption is off" },
@@ -1235,12 +1238,12 @@ pub fn Scheduler(comptime SessionPool: type, comptime CodecT: type) type {
                     return self.refuse(req, sink, code, detail);
                 };
                 const sent: Token = if (granted > 0) token else @splat(0);
-                if (granted > 0) std.debug.assert(std.mem.eql(u8, &slot.lease.?.token, &token));
+                if (granted > 0) std.debug.assert(std.mem.eql(u8, &entry.lease.?.token, &token));
 
                 self.reply(
                     sink,
                     req,
-                    .{ .request_id = req.request_id, .session_id = slot.proto_id, .body = .{
+                    .{ .request_id = req.request_id, .session_id = entry.proto_id, .body = .{
                         .kept = .{ .granted_ms = granted, .token = sent },
                     } },
                 );
@@ -1254,7 +1257,7 @@ pub fn Scheduler(comptime SessionPool: type, comptime CodecT: type) type {
         /// token. The guards run in the order of `resumeLease`. Only a match draws a token, so a
         /// probe costs the source nothing.
         fn handleResume(self: *Self, req: Request, token: Token, sink: anytype) void {
-            // With resumption off no slot holds a lease, so no draw is due.
+            // With resumption off no entry holds a lease, so no draw is due.
             if (self.cfg.resume_ttl_max_ms == 0) {
                 return self.refuse(req, sink, .unknown_session, "no such lease");
             }
@@ -1264,11 +1267,11 @@ pub fn Scheduler(comptime SessionPool: type, comptime CodecT: type) type {
                 return self.refuse(req, sink, .sessions_exhausted, detail_share_full);
             }
 
-            if (self.slotByToken(token) == null) {
+            if (self.entryByToken(token) == null) {
                 return self.refuse(req, sink, .unknown_session, "no such lease");
             }
 
-            // Rotate the token, and retry a draw that a slot already holds.
+            // Rotate the token, and retry a draw that an entry already holds.
             var draws: u32 = 0;
             while (draws < token_draws_max) : (draws += 1) {
                 const new_token = drawToken(self.io) catch {
@@ -1290,13 +1293,13 @@ pub fn Scheduler(comptime SessionPool: type, comptime CodecT: type) type {
                 };
 
                 // Answer at once, or at the idle transition.
-                const slot = self.slotByProto(r.session_id, req.conn).?;
+                const entry = self.entryByProto(r.session_id, req.conn).?;
                 if (r.ready) {
-                    std.debug.assert(slot.state == .idle);
+                    std.debug.assert(entry.state == .idle);
 
-                    self.emitOrPark(slot, sink, self.resumedEvent(slot, req.request_id));
+                    self.emitOrPark(entry, sink, self.resumedEvent(entry, req.request_id));
                 } else {
-                    std.debug.assert(slot.resume_wait != null);
+                    std.debug.assert(entry.resume_wait != null);
                 }
 
                 return;
@@ -1305,14 +1308,14 @@ pub fn Scheduler(comptime SessionPool: type, comptime CodecT: type) type {
             self.refuse(req, sink, .internal, "token draws collided");
         }
 
-        /// The `resumed` reply of an idle slot. It names the token, the final
+        /// The `resumed` reply of an idle entry. It names the token, the final
         /// position, and the last finished request.
-        fn resumedEvent(self: *Self, slot: *const Slot, request_id: u32) OutEvent {
-            std.debug.assert(slot.state == .idle);
-            std.debug.assert(slot.resume_wait == null);
+        fn resumedEvent(self: *Self, entry: *const SessionEntry, request_id: u32) OutEvent {
+            std.debug.assert(entry.state == .idle);
+            std.debug.assert(entry.resume_wait == null);
 
-            const lease = slot.lease.?;
-            const last: ?protocol.LastDone = if (slot.last_done) |d| .{
+            const lease = entry.lease.?;
+            const last: ?protocol.LastDone = if (entry.last_done) |d| .{
                 .request_id = d.request_id,
                 .finish = d.finish,
                 .gen_tokens = d.gen_tokens,
@@ -1321,11 +1324,11 @@ pub fn Scheduler(comptime SessionPool: type, comptime CodecT: type) type {
 
             return .{
                 .request_id = request_id,
-                .session_id = slot.proto_id,
+                .session_id = entry.proto_id,
                 .body = .{ .resumed = .{
                     .token = lease.token,
-                    .kv_pos = self.pool.posOf(slot.engine_id),
-                    .turns_done = slot.turns_done,
+                    .kv_pos = self.pool.posOf(entry.engine_id),
+                    .turns_done = entry.turns_done,
                     .last = last,
                 } },
             };
@@ -1345,14 +1348,14 @@ pub fn Scheduler(comptime SessionPool: type, comptime CodecT: type) type {
         ) KeepError!u32 {
             defer self.checkLeases();
 
-            const slot = self.slotById(proto_id) orelse return error.NoSuchSession;
-            switch (slot.owner) {
+            const entry = self.entryById(proto_id) orelse return error.NoSuchSession;
+            switch (entry.owner) {
                 .attached => |c| if (c != conn) return error.OtherOwner,
                 .detached => return error.OtherOwner,
             }
 
             if (ttl_ms == 0) {
-                slot.lease = null;
+                entry.lease = null;
                 log.info("keep: session {d}, lease dropped", .{proto_id});
                 return 0;
             }
@@ -1360,18 +1363,18 @@ pub fn Scheduler(comptime SessionPool: type, comptime CodecT: type) type {
             if (self.cfg.resume_ttl_max_ms == 0) return error.ResumptionOff;
             // The check stays in every build mode, because a duplicate token gives one client
             // the session of another.
-            if (self.slotByToken(token) != null) return error.TokenInUse;
+            if (self.entryByToken(token) != null) return error.TokenInUse;
 
             // A zero token is the wire form of no lease.
             std.debug.assert(!std.mem.allEqual(u8, &token, 0));
             const granted = @min(ttl_ms, self.cfg.resume_ttl_max_ms);
-            slot.lease = .{ .token = token, .ttl_ms = granted };
+            entry.lease = .{ .token = token, .ttl_ms = granted };
             log.info("keep: session {d}, lease {d} ms", .{ proto_id, granted });
             std.debug.assert(granted >= 1);
             return granted;
         }
 
-        /// Connection `conn` presents `token` at `now`, and the slot then holds `new_token`. See
+        /// Connection `conn` presents `token` at `now`, and the entry then holds `new_token`. See
         /// "Resume" in the header. The wire handler draws `new_token` with `drawToken` and no other
         /// source.
         pub fn resumeLease(
@@ -1387,148 +1390,148 @@ pub fn Scheduler(comptime SessionPool: type, comptime CodecT: type) type {
             std.debug.assert(!std.mem.allEqual(u8, &new_token, 0));
 
             // A resume is an admission, so it runs the expiry scan first. A
-            // slot at its deadline is then free, and its token is gone.
+            // entry at its deadline is then free, and its token is gone.
             self.expireDetached(now);
-            if (self.slotByToken(new_token) != null) return error.TokenInUse;
+            if (self.entryByToken(new_token) != null) return error.TokenInUse;
             if (self.shareFull(conn)) return error.ShareFull;
 
-            // Move the slot to the new connection.
-            const slot = self.slotByToken(token) orelse return error.NoSuchLease;
-            switch (slot.owner) {
+            // Move the entry to the new connection.
+            const entry = self.entryByToken(token) orelse return error.NoSuchLease;
+            switch (entry.owner) {
                 .attached => |c| {
-                    log.info("takeover: session {d} conn {d} -> {d}", .{ slot.proto_id, c, conn });
-                    self.dropEffect(slot);
+                    log.info("takeover: session {d} conn {d} -> {d}", .{ entry.proto_id, c, conn });
+                    self.dropEffect(entry);
                 },
-                // The scan above freed every slot at its deadline.
+                // The scan above freed every entry at its deadline.
                 .detached => |d| std.debug.assert(now.raw.nanoseconds < d.raw.nanoseconds),
             }
 
-            slot.owner = .{ .attached = conn };
-            slot.lease.?.token = new_token;
+            entry.owner = .{ .attached = conn };
+            entry.lease.?.token = new_token;
 
-            // Answer at once, or wait in the slot until it is idle.
-            const ready = slot.state == .idle;
-            std.debug.assert(slot.resume_wait == null);
-            std.debug.assert(slot.pending_event == null);
+            // Answer at once, or wait in the entry until it is idle.
+            const ready = entry.state == .idle;
+            std.debug.assert(entry.resume_wait == null);
+            std.debug.assert(entry.pending_event == null);
             if (ready) {
-                log.info("resume: session {d} conn {d}", .{ slot.proto_id, conn });
+                log.info("resume: session {d} conn {d}", .{ entry.proto_id, conn });
             } else {
-                slot.resume_wait = .{ .conn = conn, .request_id = request_id };
-                log.info("resume: session {d} conn {d} waits for idle", .{ slot.proto_id, conn });
+                entry.resume_wait = .{ .conn = conn, .request_id = request_id };
+                log.info("resume: session {d} conn {d} waits for idle", .{ entry.proto_id, conn });
             }
 
-            return .{ .session_id = slot.proto_id, .ready = ready };
+            return .{ .session_id = entry.proto_id, .ready = ready };
         }
 
-        /// The end of connection `conn` at `now`. A slot with no lease frees. A leased slot
+        /// The end of connection `conn` at `now`. An entry with no lease frees. A leased entry
         /// detaches until `now` plus its time to live, after the drop effect.
         pub fn detachConn(self: *Self, conn: u32, now: Io.Clock.Timestamp) void {
             defer self.checkLeases();
 
-            for (self.slots) |*slot| {
-                if (slot.state == .free or !attachedTo(slot, conn)) continue;
+            for (self.entries) |*entry| {
+                if (entry.state == .free or !attachedTo(entry, conn)) continue;
 
-                const lease = slot.lease orelse {
-                    self.releaseSlot(slot);
+                const lease = entry.lease orelse {
+                    self.releaseEntry(entry);
                     continue;
                 };
-                self.dropEffect(slot);
+                self.dropEffect(entry);
                 const deadline = now.addDuration(msDuration(lease.ttl_ms));
                 const bound = now.addDuration(msDuration(self.cfg.resume_ttl_max_ms));
                 std.debug.assert(deadline.raw.nanoseconds <= bound.raw.nanoseconds);
-                slot.owner = .{ .detached = deadline };
-                log.info("detach: session {d}, lease {d} ms", .{ slot.proto_id, lease.ttl_ms });
+                entry.owner = .{ .detached = deadline };
+                log.info("detach: session {d}, lease {d} ms", .{ entry.proto_id, lease.ttl_ms });
             }
 
             // Postcondition: no session is attached to the connection. The loop above frees or
             // detaches each one, and an emit names only an attached session or a request sender.
-            for (self.slots) |*slot| {
-                std.debug.assert(slot.state == .free or !attachedTo(slot, conn));
+            for (self.entries) |*entry| {
+                std.debug.assert(entry.state == .free or !attachedTo(entry, conn));
             }
         }
 
-        /// The lazy expiry scan at `now`. It frees every detached slot at or
+        /// The lazy expiry scan at `now`. It frees every detached entry at or
         /// past its deadline, after it cancels the prefill in flight.
         pub fn expireDetached(self: *Self, now: Io.Clock.Timestamp) void {
-            for (self.slots) |*slot| {
-                if (!expired(slot, now)) continue;
+            for (self.entries) |*entry| {
+                if (!expired(entry, now)) continue;
 
                 self.lease_expires += 1;
                 log.info(
                     "expire: session {d}, {d} expired",
-                    .{ slot.proto_id, self.lease_expires },
+                    .{ entry.proto_id, self.lease_expires },
                 );
-                self.releaseDetached(slot);
+                self.releaseDetached(entry);
             }
         }
 
-        /// The drop effect on one slot. A turn takes the cancel rule. An opening or append prefill
+        /// The drop effect on one entry. A turn takes the cancel rule. An opening or append prefill
         /// runs on, because it rebuilds context that the client asked for. A parked event and a
         /// waiting resume belong to the old connection, so they go.
-        fn dropEffect(self: *Self, slot: *Slot) void {
-            std.debug.assert(slot.state != .free);
-            std.debug.assert(slot.owner == .attached);
+        fn dropEffect(self: *Self, entry: *SessionEntry) void {
+            std.debug.assert(entry.state != .free);
+            std.debug.assert(entry.owner == .attached);
 
-            switch (slot.state) {
-                .decode => self.cancelTurn(slot),
-                .prefill => if (slot.kind == .turn) self.cancelTurn(slot),
+            switch (entry.state) {
+                .decode => self.cancelTurn(entry),
+                .prefill => if (entry.kind == .turn) self.cancelTurn(entry),
                 .idle, .free => {},
             }
 
-            slot.pending_event = null;
-            slot.resume_wait = null;
+            entry.pending_event = null;
+            entry.resume_wait = null;
         }
 
-        /// Release a detached slot. A prefill in flight stops first, so no
+        /// Release a detached entry. A prefill in flight stops first, so no
         /// row of the released session reaches the engine.
-        fn releaseDetached(self: *Self, slot: *Slot) void {
-            std.debug.assert(slot.owner == .detached);
-            std.debug.assert(slot.pending_event == null);
+        fn releaseDetached(self: *Self, entry: *SessionEntry) void {
+            std.debug.assert(entry.owner == .detached);
+            std.debug.assert(entry.pending_event == null);
 
-            if (slot.state == .prefill) {
+            if (entry.state == .prefill) {
                 // The drop cancelled any turn, so only these two remain.
-                std.debug.assert(slot.kind == .opening or slot.kind == .append);
+                std.debug.assert(entry.kind == .opening or entry.kind == .append);
 
                 self.lease_prefills_cut += 1;
                 log.info(
                     "stop: session {d} {t} prefill cancelled after {d} of {d} tokens",
-                    .{ slot.proto_id, slot.kind, slot.fed, slot.turn_tokens.len },
+                    .{ entry.proto_id, entry.kind, entry.fed, entry.turn_tokens.len },
                 );
-                self.gpa.free(slot.turn_tokens);
-                slot.turn_tokens = &.{};
-                slot.state = .idle;
-                slot.kind = .turn;
+                self.gpa.free(entry.turn_tokens);
+                entry.turn_tokens = &.{};
+                entry.state = .idle;
+                entry.kind = .turn;
             }
 
-            std.debug.assert(slot.state != .prefill);
-            self.releaseSlot(slot);
+            std.debug.assert(entry.state != .prefill);
+            self.releaseEntry(entry);
         }
 
-        /// Send a waiting resume at the moment its slot becomes idle. Every idle transition calls
-        /// it, so no request can reach the slot between the two. The events before it went, so the
+        /// Send a waiting resume at the moment its entry becomes idle. Every idle transition calls
+        /// it, so no request can reach the entry between the two. The events before it went, so the
         /// cell is empty.
-        fn deliverResume(self: *Self, slot: *Slot, sink: anytype) void {
-            std.debug.assert(slot.state == .idle);
+        fn deliverResume(self: *Self, entry: *SessionEntry, sink: anytype) void {
+            std.debug.assert(entry.state == .idle);
 
-            const wait = slot.resume_wait orelse return;
-            std.debug.assert(attachedTo(slot, wait.conn));
-            std.debug.assert(slot.pending_event == null);
+            const wait = entry.resume_wait orelse return;
+            std.debug.assert(attachedTo(entry, wait.conn));
+            std.debug.assert(entry.pending_event == null);
             log.info(
                 "resume ready: session {d} conn {d} at pos {d}",
-                .{ slot.proto_id, wait.conn, self.pool.posOf(slot.engine_id) },
+                .{ entry.proto_id, wait.conn, self.pool.posOf(entry.engine_id) },
             );
-            slot.resume_wait = null;
-            self.emitOrPark(slot, sink, self.resumedEvent(slot, wait.request_id));
+            entry.resume_wait = null;
+            self.emitOrPark(entry, sink, self.resumedEvent(entry, wait.request_id));
         }
 
-        /// The refusal of a request on a slot whose resume still waits. The
+        /// The refusal of a request on an entry whose resume still waits. The
         /// client has no `resumed` answer yet, so the session is busy.
         fn refuseWaiting(self: *Self, req: Request, sink: anytype) void {
             self.refuse(req, sink, .session_busy, "resume in flight");
         }
 
         /// The lease clock for a scan, or null when resumption is off. No
-        /// slot then holds a lease, so a scan has nothing to do.
+        /// entry then holds a lease, so a scan has nothing to do.
         fn leaseNow(self: *const Self) ?Io.Clock.Timestamp {
             if (self.cfg.resume_ttl_max_ms == 0) return null;
             return self.readClock();
@@ -1549,29 +1552,29 @@ pub fn Scheduler(comptime SessionPool: type, comptime CodecT: type) type {
             return .{ .raw = .fromNanoseconds(ns), .clock = .awake };
         }
 
-        /// A detached slot at or past its deadline.
-        fn expired(slot: *const Slot, now: Io.Clock.Timestamp) bool {
-            if (slot.state == .free) return false;
-            return switch (slot.owner) {
+        /// A detached entry at or past its deadline.
+        fn expired(entry: *const SessionEntry, now: Io.Clock.Timestamp) bool {
+            if (entry.state == .free) return false;
+            return switch (entry.owner) {
                 .attached => false,
                 .detached => |d| d.raw.nanoseconds <= now.raw.nanoseconds,
             };
         }
 
-        /// The slot that yields to a live open: the detached slot with the
+        /// The entry that yields to a live open: the detached entry with the
         /// earliest deadline, then the lowest index.
-        fn pickYield(slots: []const Slot) ?usize {
+        fn pickYield(entries: []const SessionEntry) ?usize {
             var best: ?usize = null;
-            for (slots, 0..) |*slot, i| {
-                if (slot.state == .free) continue;
+            for (entries, 0..) |*entry, i| {
+                if (entry.state == .free) continue;
 
-                const d = switch (slot.owner) {
+                const d = switch (entry.owner) {
                     .attached => continue,
                     .detached => |d| d,
                 };
 
                 if (best) |b| {
-                    if (d.raw.nanoseconds >= slots[b].owner.detached.raw.nanoseconds) continue;
+                    if (d.raw.nanoseconds >= entries[b].owner.detached.raw.nanoseconds) continue;
                 }
 
                 best = i;
@@ -1584,8 +1587,8 @@ pub fn Scheduler(comptime SessionPool: type, comptime CodecT: type) type {
         /// that attaches a session or takes one away.
         pub fn sessionsOf(self: *const Self, conn: u32) u32 {
             var n: u32 = 0;
-            for (self.slots) |*slot| {
-                if (slot.state != .free and attachedTo(slot, conn)) {
+            for (self.entries) |*entry| {
+                if (entry.state != .free and attachedTo(entry, conn)) {
                     n += 1;
                 }
             }
@@ -1593,61 +1596,61 @@ pub fn Scheduler(comptime SessionPool: type, comptime CodecT: type) type {
             return n;
         }
 
-        fn attachedTo(slot: *const Slot, conn: u32) bool {
-            return switch (slot.owner) {
+        fn attachedTo(entry: *const SessionEntry, conn: u32) bool {
+            return switch (entry.owner) {
                 .attached => |c| c == conn,
                 .detached => false,
             };
         }
 
-        /// The connection of an attached slot. Only an attached slot emits.
-        fn connOf(slot: *const Slot) u32 {
-            return slot.owner.attached;
+        /// The connection of an attached entry. Only an attached entry emits.
+        fn connOf(entry: *const SessionEntry) u32 {
+            return entry.owner.attached;
         }
 
         /// Check the rules of "Lease table" in the header after each event.
         fn checkLeases(self: *const Self) void {
             if (!std.debug.runtime_safety) return;
             std.debug.assert(self.next_proto_id >= 1);
-            for (self.slots, 0..) |*slot, i| {
-                // A free slot holds nothing.
-                if (slot.state == .free) {
-                    std.debug.assert(slot.lease == null);
-                    std.debug.assert(slot.proto_id == 0);
-                    std.debug.assert(slot.resume_wait == null);
+            for (self.entries, 0..) |*entry, i| {
+                // A free entry holds nothing.
+                if (entry.state == .free) {
+                    std.debug.assert(entry.lease == null);
+                    std.debug.assert(entry.proto_id == 0);
+                    std.debug.assert(entry.resume_wait == null);
 
                     continue;
                 }
 
-                // A live slot holds a counted id, and a detached slot holds a lease.
-                std.debug.assert(slot.proto_id >= 1);
-                std.debug.assert(slot.proto_id < self.next_proto_id);
-                if (slot.owner == .detached) {
-                    std.debug.assert(slot.lease != null);
-                    std.debug.assert(slot.pending_event == null);
-                    std.debug.assert(slot.resume_wait == null);
+                // A live entry holds a counted id, and a detached entry holds a lease.
+                std.debug.assert(entry.proto_id >= 1);
+                std.debug.assert(entry.proto_id < self.next_proto_id);
+                if (entry.owner == .detached) {
+                    std.debug.assert(entry.lease != null);
+                    std.debug.assert(entry.pending_event == null);
+                    std.debug.assert(entry.resume_wait == null);
                 }
 
-                if (slot.resume_wait) |wait| {
+                if (entry.resume_wait) |wait| {
                     // A waiting resume ends at the idle transition, and its
-                    // slot emits nothing before it.
-                    std.debug.assert(slot.state != .idle);
-                    std.debug.assert(attachedTo(slot, wait.conn));
-                    std.debug.assert(slot.pending_event == null);
+                    // entry emits nothing before it.
+                    std.debug.assert(entry.state != .idle);
+                    std.debug.assert(attachedTo(entry, wait.conn));
+                    std.debug.assert(entry.pending_event == null);
                 }
 
-                if (slot.lease) |lease| {
+                if (entry.lease) |lease| {
                     std.debug.assert(lease.ttl_ms >= 1);
                     std.debug.assert(lease.ttl_ms <= self.cfg.resume_ttl_max_ms);
                 }
 
-                // No two live slots share a session id or a token.
-                for (self.slots[i + 1 ..]) |*other| {
+                // No two live entries share a session id or a token.
+                for (self.entries[i + 1 ..]) |*other| {
                     if (other.state == .free) continue;
-                    std.debug.assert(other.proto_id != slot.proto_id);
-                    if (slot.lease != null and other.lease != null) {
+                    std.debug.assert(other.proto_id != entry.proto_id);
+                    if (entry.lease != null and other.lease != null) {
                         std.debug.assert(
-                            !std.mem.eql(u8, &slot.lease.?.token, &other.lease.?.token),
+                            !std.mem.eql(u8, &entry.lease.?.token, &other.lease.?.token),
                         );
                     }
                 }
@@ -1656,27 +1659,27 @@ pub fn Scheduler(comptime SessionPool: type, comptime CodecT: type) type {
 
         fn cancelAll(self: *Self, sink: anytype) void {
             log.debug("cancel-all", .{});
-            for (self.slots) |*slot| {
-                if (slot.state != .prefill and slot.state != .decode) continue;
+            for (self.entries) |*entry| {
+                if (entry.state != .prefill and entry.state != .decode) continue;
 
-                if (slot.state == .prefill and slot.kind == .append) {
-                    self.cancelAppend(slot, sink);
+                if (entry.state == .prefill and entry.kind == .append) {
+                    self.cancelAppend(entry, sink);
                     continue;
                 }
 
-                if (slot.state == .prefill) {
-                    self.gpa.free(slot.turn_tokens);
-                    slot.turn_tokens = &.{};
-                    slot.t_prefill_end = Io.Clock.Timestamp.now(self.io, .awake);
-                    std.debug.assert(slot.stop == null);
+                if (entry.state == .prefill) {
+                    self.gpa.free(entry.turn_tokens);
+                    entry.turn_tokens = &.{};
+                    entry.t_prefill_end = Io.Clock.Timestamp.now(self.io, .awake);
+                    std.debug.assert(entry.stop == null);
                 }
 
                 // A natural stop keeps its reason.
-                if (slot.stop == null) {
-                    slot.stop = .cancelled;
+                if (entry.stop == null) {
+                    entry.stop = .cancelled;
                 }
 
-                slot.state = .decode;
+                entry.state = .decode;
             }
 
             self.finalizeStops(sink);
@@ -1685,11 +1688,11 @@ pub fn Scheduler(comptime SessionPool: type, comptime CodecT: type) type {
         // -- the tick, in order ---------------------------------------------
 
         fn retryParked(self: *Self, sink: anytype) void {
-            for (self.slots) |*slot| {
-                if (slot.pending_event) |ev| {
-                    if (sink.emit(connOf(slot), ev)) {
-                        log.debug("unpark: session {d}", .{slot.proto_id});
-                        slot.pending_event = null;
+            for (self.entries) |*entry| {
+                if (entry.pending_event) |ev| {
+                    if (sink.emit(connOf(entry), ev)) {
+                        log.debug("unpark: session {d}", .{entry.proto_id});
+                        entry.pending_event = null;
                     }
                 }
             }
@@ -1697,55 +1700,55 @@ pub fn Scheduler(comptime SessionPool: type, comptime CodecT: type) type {
 
         fn finalizeStops(self: *Self, sink: anytype) void {
             const now = Io.Clock.Timestamp.now(self.io, .awake);
-            for (self.slots) |*slot| {
-                if (slot.state != .decode or slot.stop == null or slot.pending_event != null) {
+            for (self.entries) |*entry| {
+                if (entry.state != .decode or entry.stop == null or entry.pending_event != null) {
                     continue;
                 }
 
                 // A cut turn carries its last token.
-                const reason = slot.stop.?;
-                slot.carry = switch (reason) {
-                    .max_tokens, .cancelled => if (slot.generated > 0) slot.last_token else null,
+                const reason = entry.stop.?;
+                entry.carry = switch (reason) {
+                    .max_tokens, .cancelled => if (entry.generated > 0) entry.last_token else null,
                     .eos, .context_full => null,
                 };
 
                 // Report the turn to the client and to a later resume.
-                self.emitOrPark(slot, sink, .{
-                    .request_id = slot.request_id,
-                    .session_id = slot.proto_id,
+                self.emitOrPark(entry, sink, .{
+                    .request_id = entry.request_id,
+                    .session_id = entry.proto_id,
                     .body = .{ .done = .{
                         .finish_reason = reason,
-                        .turn_prompt_tokens = slot.turn_prompt_len,
-                        .gen_tokens = slot.generated,
-                        .kv_pos = self.pool.posOf(slot.engine_id),
-                        .prefill_ms = time.msBetweenF32(slot.t_turn_start, slot.t_prefill_end),
-                        .decode_ms = time.msBetweenF32(slot.t_prefill_end, now),
-                        .reasoning_tokens = slot.think_n,
+                        .turn_prompt_tokens = entry.turn_prompt_len,
+                        .gen_tokens = entry.generated,
+                        .kv_pos = self.pool.posOf(entry.engine_id),
+                        .prefill_ms = time.msBetweenF32(entry.t_turn_start, entry.t_prefill_end),
+                        .decode_ms = time.msBetweenF32(entry.t_prefill_end, now),
+                        .reasoning_tokens = entry.think_n,
                     } },
                 });
-                slot.last_done = .{
-                    .request_id = slot.request_id,
+                entry.last_done = .{
+                    .request_id = entry.request_id,
                     .finish = reason,
-                    .gen_tokens = slot.generated,
-                    .reasoning_tokens = slot.think_n,
+                    .gen_tokens = entry.generated,
+                    .reasoning_tokens = entry.think_n,
                 };
                 log.info(
                     "complete: session {d} {s}, {d}+{d} tokens, prefill {d:.0}ms decode {d:.0}ms",
                     .{
-                        slot.proto_id,
+                        entry.proto_id,
                         @tagName(reason),
-                        slot.turn_prompt_len,
-                        slot.generated,
-                        time.msBetweenF32(slot.t_turn_start, slot.t_prefill_end),
-                        time.msBetweenF32(slot.t_prefill_end, now),
+                        entry.turn_prompt_len,
+                        entry.generated,
+                        time.msBetweenF32(entry.t_turn_start, entry.t_prefill_end),
+                        time.msBetweenF32(entry.t_prefill_end, now),
                     },
                 );
 
                 // End the turn. The idle transition delivers a waiting resume.
-                slot.stop = null;
-                slot.state = .idle;
-                slot.turns_done += 1;
-                self.deliverResume(slot, sink);
+                entry.stop = null;
+                entry.state = .idle;
+                entry.turns_done += 1;
+                self.deliverResume(entry, sink);
             }
         }
 
@@ -1760,7 +1763,7 @@ pub fn Scheduler(comptime SessionPool: type, comptime CodecT: type) type {
             if (feeding == null and rows.n == 0) return false;
 
             const feed_chunk: ?session_mod.FeedChunk =
-                if (feeding) |slot| self.nextChunk(slot, rows.n) else null;
+                if (feeding) |entry| self.nextChunk(entry, rows.n) else null;
             const chunk: usize = if (feed_chunk) |fc| fc.tokens.len else 0;
             logBatch(&rows, feeding, chunk);
 
@@ -1777,16 +1780,16 @@ pub fn Scheduler(comptime SessionPool: type, comptime CodecT: type) type {
                 }
 
                 // Any other error fails every row of the call.
-                if (feeding) |slot| {
-                    self.failTurn(slot, sink, detail_advance_failed);
+                if (feeding) |entry| {
+                    self.failTurn(entry, sink, detail_advance_failed);
                 }
 
                 self.failDecodeRows(&rows, sink);
                 return true;
             };
 
-            if (feeding) |slot| {
-                self.finishChunk(slot, chunk, first, sink);
+            if (feeding) |entry| {
+                self.finishChunk(entry, chunk, first, sink);
             }
 
             self.acceptDecodeRows(&rows, sink);
@@ -1798,56 +1801,56 @@ pub fn Scheduler(comptime SessionPool: type, comptime CodecT: type) type {
         fn admitDecodeRows(self: *Self, rows: *DecodeRows) void {
             std.debug.assert(rows.n == 0);
 
-            for (0..self.slots.len) |k| {
+            for (0..self.entries.len) |k| {
                 if (rows.n == self.cfg.max_batch) break;
 
-                const slot = &self.slots[(self.rr_cursor + k) % self.slots.len];
-                // The drop cancelled the turn of a detached slot, so it takes no decode row.
-                if (slot.state == .decode and slot.owner == .detached) {
-                    std.debug.assert(slot.stop != null);
+                const entry = &self.entries[(self.rr_cursor + k) % self.entries.len];
+                // The drop cancelled the turn of a detached entry, so it takes no decode row.
+                if (entry.state == .decode and entry.owner == .detached) {
+                    std.debug.assert(entry.stop != null);
                 }
-                if (slot.state != .decode or slot.stop != null or slot.pending_event != null) {
+                if (entry.state != .decode or entry.stop != null or entry.pending_event != null) {
                     continue;
                 }
 
-                std.debug.assert(slot.owner == .attached);
-                if (self.pool.capacityRemaining(slot.engine_id) == 0) {
-                    slot.stop = .context_full;
+                std.debug.assert(entry.owner == .attached);
+                if (self.pool.capacityRemaining(entry.engine_id) == 0) {
+                    entry.stop = .context_full;
                     log.info(
                         "stop: session {d} context_full at pos {d}",
-                        .{ slot.proto_id, self.pool.posOf(slot.engine_id) },
+                        .{ entry.proto_id, self.pool.posOf(entry.engine_id) },
                     );
                     continue;
                 }
 
-                rows.ids[rows.n] = slot.engine_id;
-                rows.members[rows.n] = slot;
+                rows.ids[rows.n] = entry.engine_id;
+                rows.members[rows.n] = entry;
                 rows.n += 1;
             }
 
-            self.rr_cursor = (self.rr_cursor + 1) % self.slots.len;
+            self.rr_cursor = (self.rr_cursor + 1) % self.entries.len;
         }
 
         /// The longest-waiting feeding turn. A parked event holds its turn back.
-        fn pickFeeding(self: *Self) ?*Slot {
-            var feeding: ?*Slot = null;
-            for (self.slots) |*slot| {
-                if (slot.state != .prefill or slot.pending_event != null) continue;
-                if (slot.owner == .detached) std.debug.assert(slot.kind != .turn);
-                if (feeding == null or slot.prefill_seq < feeding.?.prefill_seq) {
-                    feeding = slot;
+        fn pickFeeding(self: *Self) ?*SessionEntry {
+            var feeding: ?*SessionEntry = null;
+            for (self.entries) |*entry| {
+                if (entry.state != .prefill or entry.pending_event != null) continue;
+                if (entry.owner == .detached) std.debug.assert(entry.kind != .turn);
+                if (feeding == null or entry.prefill_seq < feeding.?.prefill_seq) {
+                    feeding = entry;
                 }
             }
 
             return feeding;
         }
 
-        /// The next chunk of `slot` beside `n_decode` rows, by the rule in `prefill_chunk.zig`.
+        /// The next chunk of `entry` beside `n_decode` rows, by the rule in `prefill_chunk.zig`.
         /// Null when a saturated decode batch leaves no room, so the turn waits for the next tick.
-        fn nextChunk(self: *Self, slot: *Slot, n_decode: usize) ?session_mod.FeedChunk {
+        fn nextChunk(self: *Self, entry: *SessionEntry, n_decode: usize) ?session_mod.FeedChunk {
             const chunk = prefill_chunk.chunk(
                 self.cfg.prefill,
-                slot.turn_tokens.len - slot.fed,
+                entry.turn_tokens.len - entry.fed,
                 n_decode,
                 self.cfg.max_batch,
                 self.cfg.max_step_rows,
@@ -1857,16 +1860,16 @@ pub fn Scheduler(comptime SessionPool: type, comptime CodecT: type) type {
 
             // The engine samples the first token of a turn inside the advance, so the chunk
             // enters the context set first. A second mark of a parked chunk is a no-op.
-            const tokens = slot.turn_tokens[slot.fed..][0..chunk];
-            self.markFed(slot, tokens);
+            const tokens = entry.turn_tokens[entry.fed..][0..chunk];
+            self.markFed(entry, tokens);
             return .{
-                .id = slot.engine_id,
+                .id = entry.engine_id,
                 .tokens = tokens,
-                .final = slot.kind == .turn and slot.fed + chunk == slot.turn_tokens.len,
+                .final = entry.kind == .turn and entry.fed + chunk == entry.turn_tokens.len,
             };
         }
 
-        fn logBatch(rows: *const DecodeRows, feeding: ?*const Slot, chunk: usize) void {
+        fn logBatch(rows: *const DecodeRows, feeding: ?*const SessionEntry, chunk: usize) void {
             if (feeding) |f| {
                 log.debug(
                     "batch: decode {d} engines {any}, prefill {d} rows (session {d} fed {d}/{d})",
@@ -1899,7 +1902,13 @@ pub fn Scheduler(comptime SessionPool: type, comptime CodecT: type) type {
 
         /// Park the prefill of `f`, and retry the decode rows alone. Returns whether the tick
         /// did work.
-        fn parkPrefill(self: *Self, f: *Slot, rows: *DecodeRows, err: anytype, sink: anytype) bool {
+        fn parkPrefill(
+            self: *Self,
+            f: *SessionEntry,
+            rows: *DecodeRows,
+            err: anytype,
+            sink: anytype,
+        ) bool {
             if (err == error.RamBudgetExceeded) {
                 log.debug("park: prefill session {d}, ram budget exhausted", .{f.proto_id});
             } else {
@@ -1929,56 +1938,56 @@ pub fn Scheduler(comptime SessionPool: type, comptime CodecT: type) type {
         }
 
         fn failDecodeRows(self: *Self, rows: *const DecodeRows, sink: anytype) void {
-            for (rows.slots()) |slot| {
-                self.failTurn(slot, sink, detail_advance_failed);
+            for (rows.entries()) |entry| {
+                self.failTurn(entry, sink, detail_advance_failed);
             }
         }
 
         fn acceptDecodeRows(self: *Self, rows: *const DecodeRows, sink: anytype) void {
-            logAdvanceTokens(rows.slots(), rows.tokens());
-            for (rows.slots(), rows.tokens()) |slot, token| {
-                self.acceptToken(slot, sink, token);
+            logAdvanceTokens(rows.entries(), rows.tokens());
+            for (rows.entries(), rows.tokens()) |entry, token| {
+                self.acceptToken(entry, sink, token);
             }
         }
 
-        /// Count the fed chunk of `slot`. The last chunk ends the prefill. A turn then takes
+        /// Count the fed chunk of `entry`. The last chunk ends the prefill. A turn then takes
         /// `first`, the token that the engine sampled.
         fn finishChunk(
             self: *Self,
-            slot: *Slot,
+            entry: *SessionEntry,
             chunk: usize,
             first: ?u32,
             sink: anytype,
         ) void {
-            slot.fed += chunk;
-            if (slot.fed != slot.turn_tokens.len) return;
+            entry.fed += chunk;
+            if (entry.fed != entry.turn_tokens.len) return;
 
-            self.maybeInsertPrefix(slot);
-            switch (slot.kind) {
+            self.maybeInsertPrefix(entry);
+            switch (entry.kind) {
                 .opening => {
-                    self.emitOpened(slot, sink);
-                    self.endPrefill(slot, .idle, sink);
+                    self.emitOpened(entry, sink);
+                    self.endPrefill(entry, .idle, sink);
                 },
                 .append => {
-                    self.emitAppended(slot, sink);
-                    self.endPrefill(slot, .idle, sink);
+                    self.emitAppended(entry, sink);
+                    self.endPrefill(entry, .idle, sink);
                 },
                 .turn => {
-                    slot.t_prefill_end = Io.Clock.Timestamp.now(self.io, .awake);
-                    self.endPrefill(slot, .decode, sink);
-                    self.acceptToken(slot, sink, first.?);
+                    entry.t_prefill_end = Io.Clock.Timestamp.now(self.io, .awake);
+                    self.endPrefill(entry, .decode, sink);
+                    self.acceptToken(entry, sink, first.?);
                 },
             }
         }
 
         /// One line per tick with the produced tokens, so the serve stream
         /// reports outcomes, not only the composed inputs.
-        fn logAdvanceTokens(members: []const *Slot, out: []const u32) void {
+        fn logAdvanceTokens(members: []const *SessionEntry, out: []const u32) void {
             if (members.len == 0) return;
 
             var protos: [limits.max_batch]u32 = undefined;
-            for (members, 0..) |slot, i| {
-                protos[i] = slot.proto_id;
+            for (members, 0..) |entry, i| {
+                protos[i] = entry.proto_id;
             }
 
             log.debug(
@@ -1989,37 +1998,38 @@ pub fn Scheduler(comptime SessionPool: type, comptime CodecT: type) type {
 
         // -- shared turn machinery ------------------------------------------
 
-        /// Record one accepted token. An owed forced id replaces the sampled one. The token is the
-        /// pending token of the engine, and it stays uncommitted until the next step.
-        fn acceptToken(self: *Self, slot: *Slot, sink: anytype, sampled: u32) void {
-            std.debug.assert(slot.state == .decode);
-            std.debug.assert(slot.stop == null);
-            std.debug.assert(slot.forced_head <= slot.forced_len);
+        /// Record one accepted token. A pending forced id replaces the sampled one. The token is
+        /// the pending token of the engine, and it stays uncommitted until the next step.
+        fn acceptToken(self: *Self, entry: *SessionEntry, sink: anytype, sampled: u32) void {
+            std.debug.assert(entry.state == .decode);
+            std.debug.assert(entry.stop == null);
+            std.debug.assert(entry.forced_head <= entry.forced_len);
 
             // Take the token, and mark it in both id sets.
-            const token = if (slot.forced_head < slot.forced_len) self.popForced(slot) else sampled;
-            slot.generated += 1;
-            slot.last_token = token;
+            const forced = entry.forced_head < entry.forced_len;
+            const token = if (forced) self.popForced(entry) else sampled;
+            entry.generated += 1;
+            entry.last_token = token;
             self.tokens_generated_total += 1;
             // Every sampled and forced id counts for both penalties of the
             // next draw. The id enters the KV at the next step.
-            sampler.markId(self.presenceOf(slot), self.cfg.vocab_size, token);
-            self.markFed(slot, &.{token});
+            sampler.markId(self.presenceOf(entry), self.cfg.vocab_size, token);
+            self.markFed(entry, &.{token});
             if (comptime core_log.hot) {
                 log_token.debug(
                     "token: session {d} #{d} id {d}",
-                    .{ slot.proto_id, slot.generated, token },
+                    .{ entry.proto_id, entry.generated, token },
                 );
             }
 
             // The event goes out or parks before the stop decision.
-            const channel = tokenChannel(slot.think_open, token, self.cfg.think.close_id);
+            const channel = tokenChannel(entry.think_open, token, self.cfg.think.close_id);
             self.emitOrPark(
-                slot,
+                entry,
                 sink,
                 OutEvent.token(
-                    slot.request_id,
-                    slot.proto_id,
+                    entry.request_id,
+                    entry.proto_id,
                     token,
                     channel,
                     self.codec.piece(token),
@@ -2028,35 +2038,35 @@ pub fn Scheduler(comptime SessionPool: type, comptime CodecT: type) type {
 
             // Decide the stop, then update the think block.
             if (token == self.cfg.eos_id) {
-                slot.stop = .eos;
-            } else if (slot.generated >= slot.max_tokens_turn) {
-                slot.stop = .max_tokens;
+                entry.stop = .eos;
+            } else if (entry.generated >= entry.max_tokens_turn) {
+                entry.stop = .max_tokens;
             }
 
-            self.acceptThink(slot, token);
-            if (slot.stop) |reason| {
+            self.acceptThink(entry, token);
+            if (entry.stop) |reason| {
                 log.info(
                     "stop: session {d} {t} after {d} tokens",
-                    .{ slot.proto_id, reason, slot.generated },
+                    .{ entry.proto_id, reason, entry.generated },
                 );
             }
         }
 
-        /// Take the next owed id. The engine steps its own pending token, so
+        /// Take the next forced id. The engine steps its own pending token, so
         /// the forced id must replace it there too. Otherwise the model steps
         /// the sampled id behind the forced event.
-        fn popForced(self: *Self, slot: *Slot) u32 {
-            std.debug.assert(slot.forced_head < slot.forced_len);
+        fn popForced(self: *Self, entry: *SessionEntry) u32 {
+            std.debug.assert(entry.forced_head < entry.forced_len);
 
-            const id = slot.forced[slot.forced_head];
-            slot.forced_head += 1;
+            const id = entry.forced[entry.forced_head];
+            entry.forced_head += 1;
             std.debug.assert(id != self.cfg.eos_id);
             std.debug.assert(id < self.cfg.vocab_size);
-            self.pool.overridePending(slot.engine_id, id);
+            self.pool.overridePending(entry.engine_id, id);
             if (comptime core_log.hot) {
                 log_token.debug(
-                    "forced: session {d} id {d}, {d} owed",
-                    .{ slot.proto_id, id, slot.forced_len - slot.forced_head },
+                    "forced: session {d} id {d}, {d} left",
+                    .{ entry.proto_id, id, entry.forced_len - entry.forced_head },
                 );
             }
 
@@ -2064,58 +2074,58 @@ pub fn Scheduler(comptime SessionPool: type, comptime CodecT: type) type {
         }
 
         /// The think bookkeeping. The close id closes the block and counts nothing. Every other id
-        /// counts, and a count at a nonzero budget owes the forced ids. The close leads them, so
+        /// counts, and a count at a nonzero budget queues the forced ids. The close leads them, so
         /// the count stays in the budget.
-        fn acceptThink(self: *const Self, slot: *Slot, token: u32) void {
-            if (!slot.think_open) return;
+        fn acceptThink(self: *const Self, entry: *SessionEntry, token: u32) void {
+            if (!entry.think_open) return;
 
             const t = &self.cfg.think;
             if (token == t.close_id) {
-                slot.think_open = false;
+                entry.think_open = false;
                 return;
             }
 
-            slot.think_n += 1;
-            const budget = slot.think_budget;
-            if (budget > 0 and slot.think_n == budget) {
+            entry.think_n += 1;
+            const budget = entry.think_budget;
+            if (budget > 0 and entry.think_n == budget) {
                 std.debug.assert(t.force_len >= 1);
 
-                @memcpy(slot.forced[0..t.force_len], t.force[0..t.force_len]);
-                slot.forced_len = t.force_len;
-                slot.forced_head = 0;
+                @memcpy(entry.forced[0..t.force_len], t.force[0..t.force_len]);
+                entry.forced_len = t.force_len;
+                entry.forced_head = 0;
             }
 
-            if (budget > 0) std.debug.assert(slot.think_n <= budget);
+            if (budget > 0) std.debug.assert(entry.think_n <= budget);
         }
 
         fn startPrefill(
             self: *Self,
-            slot: *Slot,
+            entry: *SessionEntry,
             request_id: u32,
             tokens: []u32,
             kind: PrefillKind,
             sink: anytype,
         ) void {
             std.debug.assert(tokens.len > 0);
-            std.debug.assert(slot.state == .idle);
+            std.debug.assert(entry.state == .idle);
 
-            // Move the slot to prefill.
+            // Move the entry to prefill.
             log.debug(
                 "prefill: session {d}, {d} prompt tokens ({t}, budget {d})",
-                .{ slot.proto_id, tokens.len, kind, slot.max_tokens_turn },
+                .{ entry.proto_id, tokens.len, kind, entry.max_tokens_turn },
             );
-            slot.state = .prefill;
-            slot.kind = kind;
-            slot.request_id = request_id;
-            slot.turn_tokens = tokens;
-            slot.turn_prompt_len = @intCast(tokens.len);
-            slot.fed = 0;
-            slot.caches_prefix = false;
-            slot.carry = null;
-            slot.prefill_seq = self.next_prefill_seq;
+            entry.state = .prefill;
+            entry.kind = kind;
+            entry.request_id = request_id;
+            entry.turn_tokens = tokens;
+            entry.turn_prompt_len = @intCast(tokens.len);
+            entry.fed = 0;
+            entry.caches_prefix = false;
+            entry.carry = null;
+            entry.prefill_seq = self.next_prefill_seq;
             self.next_prefill_seq += 1;
             if (kind != .turn) {
-                slot.t_turn_start = Io.Clock.Timestamp.now(self.io, .awake);
+                entry.t_turn_start = Io.Clock.Timestamp.now(self.io, .awake);
             }
 
             // An append takes no prefix.
@@ -2124,12 +2134,12 @@ pub fn Scheduler(comptime SessionPool: type, comptime CodecT: type) type {
             if (comptime can_snapshot) {
                 // A full hit emits the first token at once, and a parked echo
                 // holds the one event cell.
-                if (slot.pending_event == null) {
-                    self.tryRestorePrefix(slot, sink);
+                if (entry.pending_event == null) {
+                    self.tryRestorePrefix(entry, sink);
                 } else {
                     log.debug(
                         "prefix: session {d} skips the restore behind a parked echo",
-                        .{slot.proto_id},
+                        .{entry.proto_id},
                     );
                 }
             }
@@ -2137,177 +2147,177 @@ pub fn Scheduler(comptime SessionPool: type, comptime CodecT: type) type {
 
         /// Prefix-cache admission for a turn that starts at position zero: restore the prefix that
         /// the manager offers and prefill only the suffix.
-        fn tryRestorePrefix(self: *Self, slot: *Slot, sink: anytype) void {
+        fn tryRestorePrefix(self: *Self, entry: *SessionEntry, sink: anytype) void {
             if (!self.prefix.enabled()) return;
-            if (self.pool.posOf(slot.engine_id) != 0) return;
+            if (self.pool.posOf(entry.engine_id) != 0) return;
 
-            slot.caches_prefix = true;
+            entry.caches_prefix = true;
             // The slices of the plan live inside this call only: later inserts reallocate the list.
-            switch (self.prefix.planRestore(slot.turn_tokens, slot.kind == .opening)) {
+            switch (self.prefix.planRestore(entry.turn_tokens, entry.kind == .opening)) {
                 .miss => self.prefix.recordMiss(),
-                .ready => |hit| self.restoreFull(slot, hit, sink),
-                .rows => |hit| self.restoreRows(slot, hit, sink),
+                .ready => |hit| self.restoreFull(entry, hit, sink),
+                .rows => |hit| self.restoreRows(entry, hit, sink),
             }
         }
 
         /// A full hit: restore the rows, and take the first token from the stored logits.
-        fn restoreFull(self: *Self, slot: *Slot, hit: PrefixHit, sink: anytype) void {
+        fn restoreFull(self: *Self, entry: *SessionEntry, hit: PrefixHit, sink: anytype) void {
             // The engine samples the first token inside the restore, so the prefix enters
             // the context set first. The cold path of a failed restore feeds the same ids.
-            self.markFed(slot, slot.turn_tokens[0..hit.n]);
+            self.markFed(entry, entry.turn_tokens[0..hit.n]);
             const first = self.pool.restoreReady(
-                slot.engine_id,
+                entry.engine_id,
                 hit.n,
                 hit.blob,
                 hit.logits,
             ) catch |err| {
                 log.debug(
                     "prefix full restore failed: session {d}: {t}",
-                    .{ slot.proto_id, err },
+                    .{ entry.proto_id, err },
                 );
                 self.prefix.recordMiss();
                 return;
             };
             self.prefix.recordHit();
             // The exact entry already serves this prefix, so nothing inserts.
-            slot.caches_prefix = false;
+            entry.caches_prefix = false;
             log.info(
                 "prefix full hit: session {d} restored {d} prompt tokens, zero forward rows",
-                .{ slot.proto_id, hit.n },
+                .{ entry.proto_id, hit.n },
             );
-            slot.t_prefill_end = Io.Clock.Timestamp.now(self.io, .awake);
-            self.endPrefill(slot, .decode, sink);
-            self.acceptToken(slot, sink, first);
+            entry.t_prefill_end = Io.Clock.Timestamp.now(self.io, .awake);
+            self.endPrefill(entry, .decode, sink);
+            self.acceptToken(entry, sink, first);
         }
 
         /// A partial hit: restore the rows, and leave the suffix to the prefill.
-        fn restoreRows(self: *Self, slot: *Slot, hit: PrefixHit, sink: anytype) void {
-            self.pool.restorePrefix(slot.engine_id, hit.n, hit.blob) catch |err| {
-                log.debug("prefix restore failed: session {d}: {t}", .{ slot.proto_id, err });
+        fn restoreRows(self: *Self, entry: *SessionEntry, hit: PrefixHit, sink: anytype) void {
+            self.pool.restorePrefix(entry.engine_id, hit.n, hit.blob) catch |err| {
+                log.debug("prefix restore failed: session {d}: {t}", .{ entry.proto_id, err });
                 self.prefix.recordMiss();
                 return;
             };
-            self.markFed(slot, slot.turn_tokens[0..hit.n]);
+            self.markFed(entry, entry.turn_tokens[0..hit.n]);
             self.prefix.recordHit();
-            slot.fed = hit.n;
+            entry.fed = hit.n;
             log.info(
                 "prefix hit: session {d} restored {d} of {d} prompt tokens",
-                .{ slot.proto_id, hit.n, slot.turn_tokens.len },
+                .{ entry.proto_id, hit.n, entry.turn_tokens.len },
             );
-            if (slot.fed != slot.turn_tokens.len) return;
+            if (entry.fed != entry.turn_tokens.len) return;
 
             // Only an opening restores its whole prompt here. A generate full hit is
             // `restoreFull`. Nothing inserts.
-            std.debug.assert(slot.kind == .opening);
+            std.debug.assert(entry.kind == .opening);
 
-            slot.caches_prefix = false;
-            self.emitOpened(slot, sink);
-            self.endPrefill(slot, .idle, sink);
+            entry.caches_prefix = false;
+            self.emitOpened(entry, sink);
+            self.endPrefill(entry, .idle, sink);
         }
 
         /// Offer a completed position-zero prefix to the cache. The manager
         /// owns the snapshot and the admission gate. This function owns the
         /// eligibility rule: a position-zero completion, offered once.
-        fn maybeInsertPrefix(self: *Self, slot: *Slot) void {
+        fn maybeInsertPrefix(self: *Self, entry: *SessionEntry) void {
             if (comptime !can_snapshot) return;
-            if (!slot.caches_prefix) return;
+            if (!entry.caches_prefix) return;
 
-            slot.caches_prefix = false;
+            entry.caches_prefix = false;
             self.prefix.insert(self.pool, .{
-                .engine_id = slot.engine_id,
-                .proto_id = slot.proto_id,
-                .tokens = slot.turn_tokens,
-                .opening = slot.kind == .opening,
+                .engine_id = entry.engine_id,
+                .proto_id = entry.proto_id,
+                .tokens = entry.turn_tokens,
+                .opening = entry.kind == .opening,
                 .vocab_size = self.cfg.vocab_size,
-                .t_turn_start = slot.t_turn_start,
+                .t_turn_start = entry.t_turn_start,
             });
         }
 
-        fn endPrefill(self: *Self, slot: *Slot, state: SlotState, sink: anytype) void {
-            log.debug("prefill done: session {d} -> {t}", .{ slot.proto_id, state });
-            self.gpa.free(slot.turn_tokens);
-            slot.turn_tokens = &.{};
-            slot.state = state;
+        fn endPrefill(self: *Self, entry: *SessionEntry, state: SessionPhase, sink: anytype) void {
+            log.debug("prefill done: session {d} -> {t}", .{ entry.proto_id, state });
+            self.gpa.free(entry.turn_tokens);
+            entry.turn_tokens = &.{};
+            entry.state = state;
             // A turn reaches idle through its `done`, and an opening adds no
             // turn. An append adds one turn per pair.
-            if (state == .idle and slot.kind == .append) {
-                slot.turns_done += slot.append_n;
+            if (state == .idle and entry.kind == .append) {
+                entry.turns_done += entry.append_n;
             }
 
-            if (state == .decode) std.debug.assert(slot.kind == .turn);
+            if (state == .decode) std.debug.assert(entry.kind == .turn);
 
-            slot.kind = .turn;
+            entry.kind = .turn;
             if (state == .idle) {
-                self.deliverResume(slot, sink);
+                self.deliverResume(entry, sink);
             }
         }
 
-        fn failTurn(self: *Self, slot: *Slot, sink: anytype, detail: []const u8) void {
-            log.debug("turn failed: session {d}: {s}", .{ slot.proto_id, detail });
-            if (slot.turn_tokens.len > 0) {
-                self.gpa.free(slot.turn_tokens);
+        fn failTurn(self: *Self, entry: *SessionEntry, sink: anytype, detail: []const u8) void {
+            log.debug("turn failed: session {d}: {s}", .{ entry.proto_id, detail });
+            if (entry.turn_tokens.len > 0) {
+                self.gpa.free(entry.turn_tokens);
             }
 
-            slot.turn_tokens = &.{};
+            entry.turn_tokens = &.{};
             self.emitOrPark(
-                slot,
+                entry,
                 sink,
-                OutEvent.fail(slot.request_id, slot.proto_id, .internal, detail),
+                OutEvent.fail(entry.request_id, entry.proto_id, .internal, detail),
             );
-            slot.stop = null;
-            slot.state = .idle;
-            slot.kind = .turn;
-            self.deliverResume(slot, sink);
+            entry.stop = null;
+            entry.state = .idle;
+            entry.kind = .turn;
+            self.deliverResume(entry, sink);
         }
 
-        fn withCarry(self: *Self, slot: *Slot, encoded: []u32) Allocator.Error![]u32 {
-            const carry = slot.carry orelse return encoded;
+        fn withCarry(self: *Self, entry: *SessionEntry, encoded: []u32) Allocator.Error![]u32 {
+            const carry = entry.carry orelse return encoded;
             defer self.gpa.free(encoded);
 
             const tokens = try self.gpa.alloc(u32, encoded.len + 1);
             tokens[0] = carry;
             @memcpy(tokens[1..], encoded);
-            slot.carry = null;
+            entry.carry = null;
             return tokens;
         }
 
-        /// Session-scoped event. The slot's single pending cell is the
+        /// Session-scoped event. The entry's single pending cell is the
         /// backpressure bound. A parked event excludes the session from
         /// scheduling until the writer drains.
-        fn emitOrPark(self: *Self, slot: *Slot, sink: anytype, ev: OutEvent) void {
+        fn emitOrPark(self: *Self, entry: *SessionEntry, sink: anytype, ev: OutEvent) void {
             _ = self;
-            std.debug.assert(slot.pending_event == null);
-            // No client reads the events of a detached slot, or the events
+            std.debug.assert(entry.pending_event == null);
+            // No client reads the events of a detached entry, or the events
             // before a waiting resume, so they go.
-            if (slot.owner == .detached or slot.resume_wait != null) {
-                log.debug("drop: session {d} event, no attached reader", .{slot.proto_id});
+            if (entry.owner == .detached or entry.resume_wait != null) {
+                log.debug("drop: session {d} event, no attached reader", .{entry.proto_id});
                 return;
             }
 
-            if (!sink.emit(connOf(slot), ev)) {
-                log.debug("park: session {d}, writer queue full", .{slot.proto_id});
-                slot.pending_event = ev;
+            if (!sink.emit(connOf(entry), ev)) {
+                log.debug("park: session {d}, writer queue full", .{entry.proto_id});
+                entry.pending_event = ev;
             }
         }
 
-        /// Send a parked event of `slot` before a reply that names the session, so no reply
+        /// Send a parked event of `entry` before a reply that names the session, so no reply
         /// overtakes it. Returns false after a disconnect: a failed flush takes the rule of
         /// `reply`.
-        fn flushParked(self: *Self, slot: *Slot, sink: anytype) bool {
+        fn flushParked(self: *Self, entry: *SessionEntry, sink: anytype) bool {
             _ = self;
-            const ev = slot.pending_event orelse return true;
-            const conn = connOf(slot);
+            const ev = entry.pending_event orelse return true;
+            const conn = connOf(entry);
             if (!sink.emit(conn, ev)) {
                 log.debug(
                     "flush: session {d} parked event refused, disconnect conn {d}",
-                    .{ slot.proto_id, conn },
+                    .{ entry.proto_id, conn },
                 );
                 sink.disconnect(conn);
                 return false;
             }
 
-            log.debug("flush: session {d} parked event sent ahead of a reply", .{slot.proto_id});
-            slot.pending_event = null;
+            log.debug("flush: session {d} parked event sent ahead of a reply", .{entry.proto_id});
+            entry.pending_event = null;
             return true;
         }
 
@@ -2354,12 +2364,12 @@ pub fn Scheduler(comptime SessionPool: type, comptime CodecT: type) type {
         fn statsAck(self: *const Self, req: Request) OutEvent {
             var open: u16 = 0;
             var decoding: u16 = 0;
-            for (self.slots) |*slot| {
-                if (slot.state != .free) {
+            for (self.entries) |*entry| {
+                if (entry.state != .free) {
                     open += 1;
                 }
 
-                if (slot.state == .decode) {
+                if (entry.state == .decode) {
                     decoding += 1;
                 }
             }
@@ -2373,33 +2383,33 @@ pub fn Scheduler(comptime SessionPool: type, comptime CodecT: type) type {
             } } };
         }
 
-        // -- slot table -----------------------------------------------------
+        // -- session table --------------------------------------------------
 
-        /// A slot for a live open or clone. `yielded` names the detached
-        /// session that gave its slot up, or is 0 for a free slot.
-        const Taken = struct { slot: *Slot, yielded: u32 };
+        /// An entry for a live open or clone. `yielded` names the detached
+        /// session that gave its entry up, or is 0 for a free entry.
+        const Taken = struct { entry: *SessionEntry, yielded: u32 };
 
-        /// The first free slot, else the detached slot that yields. A lease
+        /// The first free entry, else the detached entry that yields. A lease
         /// never blocks a live client. The caller reports the yield with its
         /// outcome, through `yieldDone` or `yieldLost`, as one event.
-        fn freeSlot(self: *Self) ?Taken {
-            for (self.slots) |*slot| {
-                if (slot.state == .free) return .{ .slot = slot, .yielded = 0 };
+        fn freeEntry(self: *Self) ?Taken {
+            for (self.entries) |*entry| {
+                if (entry.state == .free) return .{ .entry = entry, .yielded = 0 };
             }
 
-            const i = pickYield(self.slots) orelse return null;
-            const slot = &self.slots[i];
-            const yielded = slot.proto_id;
+            const i = pickYield(self.entries) orelse return null;
+            const entry = &self.entries[i];
+            const yielded = entry.proto_id;
             std.debug.assert(yielded != 0);
-            self.releaseDetached(slot);
-            std.debug.assert(slot.state == .free);
-            return .{ .slot = slot, .yielded = yielded };
+            self.releaseDetached(entry);
+            std.debug.assert(entry.state == .free);
+            return .{ .entry = entry, .yielded = yielded };
         }
 
         fn yieldDone(self: *Self, taken: Taken, proto_id: u32) void {
             if (taken.yielded == 0) return;
 
-            std.debug.assert(taken.slot.proto_id == proto_id);
+            std.debug.assert(taken.entry.proto_id == proto_id);
             self.lease_yields += 1;
             log.info(
                 "yield: session {d} for session {d}, {d} yielded",
@@ -2409,11 +2419,11 @@ pub fn Scheduler(comptime SessionPool: type, comptime CodecT: type) type {
 
         /// A yield before an engine refusal loses the detached session. The release must come
         /// first, because the engine has no free session before it. An open cannot fail then,
-        /// because the engine holds one session per slot. A clone on tiered KV can.
+        /// because the engine holds one session per KV slot. A clone on tiered KV can.
         fn yieldLost(self: *Self, taken: Taken, what: []const u8) void {
             if (taken.yielded == 0) return;
 
-            std.debug.assert(taken.slot.state == .free);
+            std.debug.assert(taken.entry.state == .free);
             self.lease_yields += 1;
             self.lease_yields_lost += 1;
             log.info(
@@ -2423,15 +2433,15 @@ pub fn Scheduler(comptime SessionPool: type, comptime CodecT: type) type {
         }
 
         /// Whether `conn` already holds its share of the session table. Open
-        /// and clone check it before they take a slot, so no connection ever
+        /// and clone check it before they take an entry, so no connection ever
         /// holds more than its share.
         fn shareFull(self: *const Self, conn: u32) bool {
             const share = self.cfg.sessions_per_connection;
             std.debug.assert(share >= 1);
             std.debug.assert(share <= self.cfg.max_sessions);
             var held: u32 = 0;
-            for (self.slots) |*slot| {
-                if (slot.state != .free and attachedTo(slot, conn)) {
+            for (self.entries) |*entry| {
+                if (entry.state != .free and attachedTo(entry, conn)) {
                     held += 1;
                 }
             }
@@ -2440,63 +2450,64 @@ pub fn Scheduler(comptime SessionPool: type, comptime CodecT: type) type {
             return held == share;
         }
 
-        /// The slot of session `proto_id` for a request on `conn`. Live ids
-        /// are unique, so the first match is the only match. A detached slot
+        /// The entry of session `proto_id` for a request on `conn`. Live ids
+        /// are unique, so the first match is the only match. A detached entry
         /// never matches, so a guessed id grants nothing.
-        fn slotByProto(self: *Self, proto_id: u32, conn: u32) ?*Slot {
+        fn entryByProto(self: *Self, proto_id: u32, conn: u32) ?*SessionEntry {
             if (proto_id == 0) return null;
-            for (self.slots) |*slot| {
-                if (slot.state != .free and slot.proto_id == proto_id and attachedTo(slot, conn)) {
-                    std.debug.assert(slot.owner == .attached);
+            for (self.entries) |*entry| {
+                const live = entry.state != .free and entry.proto_id == proto_id;
+                if (live and attachedTo(entry, conn)) {
+                    std.debug.assert(entry.owner == .attached);
 
-                    return slot;
+                    return entry;
                 }
             }
 
             return null;
         }
 
-        /// The live slot of session `proto_id`, whatever its owner.
-        fn slotById(self: *Self, proto_id: u32) ?*Slot {
+        /// The live entry of session `proto_id`, whatever its owner.
+        fn entryById(self: *Self, proto_id: u32) ?*SessionEntry {
             if (proto_id == 0) return null;
-            for (self.slots) |*slot| {
-                if (slot.state != .free and slot.proto_id == proto_id) return slot;
+            for (self.entries) |*entry| {
+                if (entry.state != .free and entry.proto_id == proto_id) return entry;
             }
 
             return null;
         }
 
-        /// The slot that holds `token`. Every compare runs in constant
+        /// The entry that holds `token`. Every compare runs in constant
         /// time, so the scan time does not depend on the token bytes.
-        fn slotByToken(self: *Self, token: Token) ?*Slot {
-            var found: ?*Slot = null;
-            for (self.slots) |*slot| {
-                const lease = slot.lease orelse continue;
+        fn entryByToken(self: *Self, token: Token) ?*SessionEntry {
+            var found: ?*SessionEntry = null;
+            for (self.entries) |*entry| {
+                const lease = entry.lease orelse continue;
                 if (std.crypto.timing_safe.eql(Token, lease.token, token)) {
                     std.debug.assert(found == null);
 
-                    found = slot;
+                    found = entry;
                 }
             }
 
-            if (found) |slot| std.debug.assert(slot.state != .free);
+            if (found) |entry| std.debug.assert(entry.state != .free);
 
             return found;
         }
 
-        fn releaseSlot(self: *Self, slot: *Slot) void {
-            log.info("release: session {d} engine {d}", .{ slot.proto_id, slot.engine_id });
-            if (slot.turn_tokens.len > 0) {
-                self.gpa.free(slot.turn_tokens);
+        fn releaseEntry(self: *Self, entry: *SessionEntry) void {
+            log.info("release: session {d} engine {d}", .{ entry.proto_id, entry.engine_id });
+            if (entry.turn_tokens.len > 0) {
+                self.gpa.free(entry.turn_tokens);
             }
 
-            self.pool.destroy(slot.engine_id);
-            slot.* = .{};
+            self.pool.destroy(entry.engine_id);
+            entry.* = .{};
         }
 
-        fn dropSlot(self: *Self, slot: *Slot) void {
-            self.pool.destroy(slot.engine_id);
-            slot.* = .{};
+        fn dropEntry(self: *Self, entry: *SessionEntry) void {
+            self.pool.destroy(entry.engine_id);
+            entry.* = .{};
         }
     };
 }
@@ -2511,9 +2522,9 @@ pub fn drawToken(io: Io) error{EntropyUnavailable}!Token {
     return t;
 }
 
-/// The host bytes of the two id sets of one slot over `vocab_size` ids. The
-/// boot RAM line prices them.
-pub fn slotSetBytes(vocab_size: u32) u64 {
+/// The host bytes of the two id sets of one entry over `vocab_size` ids. The
+/// boot RAM line sizes them.
+pub fn sessionSetBytes(vocab_size: u32) u64 {
     return 2 * @as(u64, sampler.setWords(vocab_size)) * @sizeOf(u64);
 }
 
@@ -2812,8 +2823,8 @@ const FakeCodec = struct {
 };
 
 const FakeSink = struct {
-    const Entry = struct { conn: u32, ev: OutEvent };
-    events: [256]Entry = undefined,
+    const Seen = struct { conn: u32, ev: OutEvent };
+    events: [256]Seen = undefined,
     n: usize = 0,
     fail_conn: ?u32 = null,
     /// Refuse this many emits of any connection, then accept again.
@@ -2838,11 +2849,11 @@ const FakeSink = struct {
         self.disconnected = conn;
     }
 
-    fn seen(self: *const FakeSink) []const Entry {
+    fn seen(self: *const FakeSink) []const Seen {
         return self.events[0..self.n];
     }
 
-    fn last(self: *const FakeSink) Entry {
+    fn last(self: *const FakeSink) Seen {
         std.debug.assert(self.n > 0);
 
         return self.events[self.n - 1];
@@ -2854,6 +2865,9 @@ const TestScheduler = Scheduler(TestPool, FakeCodec);
 const ResPool = Residency(Sessions(TestRunner));
 const ResScheduler = Scheduler(ResPool, FakeCodec);
 const NoSnapScheduler = Scheduler(Sessions(NoSnapRunner), FakeCodec);
+
+/// The answer of a lookup that finds no session entry.
+const no_entry: ?*TestScheduler.SessionEntry = null;
 
 const Fixture = struct {
     arena_state: std.heap.ArenaAllocator,
@@ -3013,10 +3027,10 @@ const Fixture = struct {
     }
 };
 
-fn tokenIds(entries: []const FakeSink.Entry, sid: u32) [16]u32 {
+fn tokenIds(events: []const FakeSink.Seen, sid: u32) [16]u32 {
     var out: [16]u32 = .{0xFFFF_FFFF} ** 16;
     var n: usize = 0;
-    for (entries) |e| {
+    for (events) |e| {
         if (e.ev.session_id != sid) continue;
         if (e.ev.body != .token) continue;
 
@@ -3027,9 +3041,9 @@ fn tokenIds(entries: []const FakeSink.Entry, sid: u32) [16]u32 {
     return out;
 }
 
-fn countTokens(entries: []const FakeSink.Entry, sid: u32) usize {
+fn countTokens(events: []const FakeSink.Seen, sid: u32) usize {
     var n: usize = 0;
-    for (entries) |e| {
+    for (events) |e| {
         if (e.ev.session_id == sid and e.ev.body == .token) {
             n += 1;
         }
@@ -3081,7 +3095,7 @@ test "decode at max_batch cannot starve a waiting turn: floor of one chunk row" 
     _ = fx.sched.tick(fx.sink); // a decoding: fills the whole max_batch
     try fx.generate(2, sb, "xxx", 6);
 
-    // The tick still funds one chunk row for b beside a's decode row.
+    // The tick still holds one chunk row for b beside a's decode row.
     const rows_before = fx.runner.rows_log_len;
     _ = fx.sched.tick(fx.sink);
     const rows = fx.runner.rowsSeen()[rows_before..];
@@ -3389,12 +3403,12 @@ test "a cancel after a natural stop keeps the natural finish reason" {
 
     const sid = try fx.openSession(1, "a");
     try fx.generate(1, sid, "x", 1);
-    // One tick feeds the turn in one final chunk and samples token 1, which spends the budget.
+    // One tick feeds the turn in one final chunk and samples token 1, which fills the budget.
     // The tick sets the stop, and the done waits for the finalize of the next tick.
     _ = fx.sched.tick(fx.sink);
-    const slot = &fx.sched.slots[0];
-    try std.testing.expectEqual(SlotState.decode, slot.state);
-    try std.testing.expectEqual(@as(?protocol.FinishReason, .max_tokens), slot.stop);
+    const entry = &fx.sched.entries[0];
+    try std.testing.expectEqual(SessionPhase.decode, entry.state);
+    try std.testing.expectEqual(@as(?protocol.FinishReason, .max_tokens), entry.stop);
     for (fx.sink.seen()) |e| {
         try std.testing.expect(e.ev.body != .done);
     }
@@ -3441,7 +3455,7 @@ test "a connection past its session share gets sessions_exhausted" {
     const sa = try fx.openSession(1, "a");
 
     // Conn 1 holds its share, so the server refuses its second open while a
-    // slot stays free.
+    // entry stays free.
     const dup = try std.testing.allocator.dupe(u8, "b");
     _ = fx.sched.handle(.{ .conn = 1, .request_id = 2, .session_id = 0, .body = .{
         .session_open = .{ .sampling = protocol.Sampling.greedy, .system_prompt = dup },
@@ -3464,7 +3478,7 @@ test "a connection past its session share gets sessions_exhausted" {
         clone_refused.detail[0..clone_refused.detail_len],
     );
 
-    // Conn 2 still opens into the free slot. Past that, the pool itself is full.
+    // Conn 2 still opens into the free entry. Past that, the pool itself is full.
     _ = try fx.openSession(2, "b");
     const dup3 = try std.testing.allocator.dupe(u8, "c");
     _ = fx.sched.handle(.{ .conn = 3, .request_id = 4, .session_id = 0, .body = .{
@@ -3528,7 +3542,7 @@ test "session_clone forks between turns: shared context, fresh id, guards hold" 
     );
 }
 
-test "close releases the slot for reuse, and a conn sweep closes everything it owned" {
+test "close releases the session entry for reuse, and a conn sweep closes everything it owned" {
     var fx = try Fixture.setUp(std.testing.allocator, 1, 64, null);
     defer fx.tearDown();
 
@@ -3542,7 +3556,7 @@ test "close releases the slot for reuse, and a conn sweep closes everything it o
         std.meta.activeTag(fx.sink.last().ev.body),
     );
 
-    const sid2 = try fx.openSession(1, "a"); // slot reused, fresh id
+    const sid2 = try fx.openSession(1, "a"); // entry reused, fresh id
     try std.testing.expect(sid2 != sid);
     _ = fx.sched.handle(
         .{ .conn = 1, .request_id = 0, .session_id = 0, .body = .conn_closed },
@@ -3741,10 +3755,10 @@ test "over-subscription: a ram budget of one blob parks a prefill, and the loop 
     };
     @memset(runner.logits, 0);
     var sessions = try Sessions(TestRunner).init(arena, &runner);
-    // The fake charges one u32 per evicted slot, so this budget funds exactly
-    // one blob. A rotation transiently needs two: `ensureResident` charges the
+    // The fake adds one u32 per evicted slot, so this budget holds exactly
+    // one blob. A rotation transiently needs two: `ensureResident` adds the
     // victim's new blob before the restored session's blob is dropped. So this
-    // budget funds no swap at all, and a parked turn waits for a free slot.
+    // budget holds no swap at all, and a parked turn waits for a free slot.
     var pool = try ResPool.init(arena, gpa, &sessions, 3, @sizeOf(u32));
     defer pool.deinit();
 
@@ -3775,7 +3789,7 @@ test "over-subscription: a ram budget of one blob parks a prefill, and the loop 
         sids[k] = sink.last().ev.session_id;
     }
 
-    // The third session spent the whole budget on the first session's blob.
+    // The third session filled the whole budget on the first session's blob.
     try std.testing.expectEqual(@as(u32, 1), runner.evicts);
 
     // The evicted session asks last. No tick can admit its prefill. The swap holds the blob of the
@@ -4013,12 +4027,12 @@ test "prefix cache: preload warms the cache at boot" {
     defer fx.tearDown();
 
     // The boot warm-up: one open + close through the normal request path.
-    // The prefill lands in the cache and the session leaves no slot behind.
+    // The prefill lands in the cache and the session leaves no entry behind.
     fx.sched.cfg.cache.preload = &.{"abcdefab"};
     fx.sched.preloadPrefixes();
     try std.testing.expectEqual(@as(u64, 1), fx.sched.prefix.inserts);
-    for (fx.sched.slots) |*s| {
-        try std.testing.expectEqual(SlotState.free, s.state);
+    for (fx.sched.entries) |*s| {
+        try std.testing.expectEqual(SessionPhase.free, s.state);
     }
 
     // The first open of a client with the same text restores with zero engine rows.
@@ -4092,7 +4106,7 @@ test "scheduler: an engine that cannot snapshot serves without a cache" {
 }
 
 // The think tests run the fake chain with the tags of a fake vocab. `<think>` is 2, `</think>` is
-// 3, and a spent budget forces 3 then 0. A reader derives each stream by hand. The prompt "4" feeds
+// 3, and a full budget forces 3 then 0. A reader derives each stream by hand. The prompt "4" feeds
 // the one token 4, so the first token is 5. It lands inside the block when the turn opens.
 
 const Client = @import("client.zig").Client;
@@ -4210,7 +4224,7 @@ test "think budget: the budget forces the close, and the model steps the forced 
 
     const sid = try fx.openSession(1, "");
 
-    // 5 and 6 spend the budget of two, so 3 and 0 replace the sampled 7 and 4.
+    // 5 and 6 use the budget of two, so 3 and 0 replace the sampled 7 and 4.
     // The forced close is a close tag. The later sampled 3 is content, because the block is closed.
     try expectThinkTurn(&fx, sid, .{
         .open = true,
@@ -4234,8 +4248,8 @@ test "think budget: the budget forces the close, and the model steps the forced 
         },
         .reasoning = 2,
     });
-    try std.testing.expect(!fx.sched.slots[0].think_open);
-    try std.testing.expectEqual(@as(u32, 2), fx.sched.slots[0].think_n);
+    try std.testing.expect(!fx.sched.entries[0].think_open);
+    try std.testing.expectEqual(@as(u32, 2), fx.sched.entries[0].think_n);
 }
 
 test "think budget: a close before the budget leaves the unbounded stream" {
@@ -4266,7 +4280,7 @@ test "think budget: a close before the budget leaves the unbounded stream" {
             },
             .reasoning = 1,
         });
-        try std.testing.expectEqual(@as(u32, 1), fx.sched.slots[0].think_n);
+        try std.testing.expectEqual(@as(u32, 1), fx.sched.entries[0].think_n);
     }
 }
 
@@ -4286,16 +4300,16 @@ test "think off: the turn has no echo and no forced id" {
         .reason = .eos,
         .chans = &.{ .content, .content, .content },
     });
-    try std.testing.expectEqual(@as(u32, 0), fx.sched.slots[0].think_n);
+    try std.testing.expectEqual(@as(u32, 0), fx.sched.entries[0].think_n);
 }
 
-test "think budget: the cap lands inside the forced ids, and the next turn owes nothing" {
+test "think budget: the cap lands inside the forced ids, and the next turn has none left" {
     var fx = try Fixture.setUpThink(std.testing.allocator, 65, 0, think_tags);
     defer fx.tearDown();
 
     const sid = try fx.openSession(1, "");
 
-    // The forced 3 is the third token, so the cap of three leaves the forced 0 owed.
+    // The forced 3 is the third token, so the cap of three leaves the forced 0 pending.
     try expectThinkTurn(&fx, sid, .{
         .open = true,
         .prompt = "4",
@@ -4306,10 +4320,10 @@ test "think budget: the cap lands inside the forced ids, and the next turn owes 
         .chans = &.{ .open_tag, .reasoning, .reasoning, .close_tag },
         .reasoning = 2,
     });
-    const slot = &fx.sched.slots[0];
-    try std.testing.expectEqual(@as(u8, 1), slot.forced_len - slot.forced_head);
+    const entry = &fx.sched.entries[0];
+    try std.testing.expectEqual(@as(u8, 1), entry.forced_len - entry.forced_head);
 
-    // The next turn leads with the carried 3 and drops the owed 0. Its first
+    // The next turn leads with the carried 3 and drops the pending 0. Its first
     // token is therefore the sampled 5, and its stream repeats the budget case.
     try expectThinkTurn(&fx, sid, .{
         .open = true,
@@ -4321,13 +4335,13 @@ test "think budget: the cap lands inside the forced ids, and the next turn owes 
     });
 }
 
-test "think budget: a full window stops the turn with forced ids owed" {
+test "think budget: a full window stops the turn with forced ids left" {
     var fx = try Fixture.setUpThink(std.testing.allocator, 2, 0, think_tags);
     defer fx.tearDown();
 
     const sid = try fx.openSession(1, "");
 
-    // 6 spends the budget, and the window holds no row for the forced 3.
+    // 6 uses the budget, and the window holds no row for the forced 3.
     try expectThinkTurn(&fx, sid, .{
         .open = true,
         .prompt = "4",
@@ -4337,8 +4351,8 @@ test "think budget: a full window stops the turn with forced ids owed" {
         .reasoning = 2,
     });
     try std.testing.expectEqual(@as(u32, 2), fx.sink.last().ev.body.done.kv_pos);
-    const slot = &fx.sched.slots[0];
-    try std.testing.expectEqual(@as(u8, 2), slot.forced_len - slot.forced_head);
+    const entry = &fx.sched.entries[0];
+    try std.testing.expectEqual(@as(u8, 2), entry.forced_len - entry.forced_head);
 
     // A full window leaves no room for a next turn. The refusal names the
     // numbers, and it leaves the carry and the session as they were.
@@ -4349,8 +4363,8 @@ test "think budget: a full window stops the turn with forced ids owed" {
         "turn of 1 tokens, 0 positions left",
         e.detail[0..e.detail_len],
     );
-    try std.testing.expectEqual(SlotState.idle, slot.state);
-    try std.testing.expectEqual(@as(?u32, null), slot.carry);
+    try std.testing.expectEqual(SessionPhase.idle, entry.state);
+    try std.testing.expectEqual(@as(?u32, null), entry.carry);
 }
 
 test "think budget: end-of-sequence inside the block ends the turn open" {
@@ -4368,8 +4382,8 @@ test "think budget: end-of-sequence inside the block ends the turn open" {
         .reason = .eos,
         .reasoning = 4,
     });
-    try std.testing.expect(fx.sched.slots[0].think_open);
-    try std.testing.expectEqual(@as(u32, 4), fx.sched.slots[0].think_n);
+    try std.testing.expect(fx.sched.entries[0].think_open);
+    try std.testing.expectEqual(@as(u32, 4), fx.sched.entries[0].think_n);
 }
 
 test "think echo: a parked echo holds the prefill and skips the prefix restore" {
@@ -4393,9 +4407,9 @@ test "think echo: a parked echo holds the prefill and skips the prefix restore" 
     const rows_before = fx.runner.rows_log_len;
     try fx.generate(2, sb, "44444", 8);
     fx.drain();
-    const slot_b = &fx.sched.slots[1];
-    try std.testing.expectEqual(SlotState.prefill, slot_b.state);
-    try std.testing.expect(slot_b.pending_event != null);
+    const entry_b = &fx.sched.entries[1];
+    try std.testing.expectEqual(SessionPhase.prefill, entry_b.state);
+    try std.testing.expect(entry_b.pending_event != null);
     try std.testing.expectEqual(seen_before, fx.sink.n);
     try std.testing.expectEqual(rows_before, fx.runner.rows_log_len);
     try std.testing.expectEqual(@as(u64, 0), fx.sched.prefix.hits);
@@ -4437,7 +4451,7 @@ test "think config: an open turn on a model without think tags fails the request
     try std.testing.expectEqualStrings("this model has no think tags", e.detail[0..e.detail_len]);
 
     // The refusal changed nothing, so the session answers a closed turn.
-    try std.testing.expectEqual(SlotState.idle, fx.sched.slots[0].state);
+    try std.testing.expectEqual(SessionPhase.idle, fx.sched.entries[0].state);
     const t = try runTurn(&fx, 1, sid, "4", 4);
     try std.testing.expectEqualSlices(u32, &.{ 5, 6, 7 }, t.tokens());
 }
@@ -4522,7 +4536,7 @@ test "append: kept pairs give the rows of the live turns, and the next turn matc
         .{ .user = "\x02", .assistant = "3456" },
     });
     try expectAppended(body, &.{ t1.done.kv_pos, t2.done.kv_pos });
-    try std.testing.expectEqual(@as(u32, 2), fx.sched.slots[1].turns_done);
+    try std.testing.expectEqual(@as(u32, 2), fx.sched.entries[1].turns_done);
 
     // The next turn on each session streams the same ids.
     const n1 = try runTurn(&fx, 1, live, "x", 4);
@@ -4533,8 +4547,8 @@ test "append: kept pairs give the rows of the live turns, and the next turn matc
     // Both sessions stepped the same rows at the same positions.
     var a_buf: [64][2]u32 = undefined;
     var b_buf: [64][2]u32 = undefined;
-    const a_rows = slotRows(&fx, fx.sched.slots[0].engine_id, &a_buf);
-    const b_rows = slotRows(&fx, fx.sched.slots[1].engine_id, &b_buf);
+    const a_rows = slotRows(&fx, fx.sched.entries[0].engine_id, &a_buf);
+    const b_rows = slotRows(&fx, fx.sched.entries[1].engine_id, &b_buf);
     try std.testing.expectEqual(a_rows.len, b_rows.len);
     for (a_rows, b_rows) |a, b| {
         try std.testing.expectEqual(a, b);
@@ -4548,24 +4562,24 @@ test "append: a set past the room refuses whole, feeds no row, and keeps the car
     const sid = try fx.openSession(1, "a");
     // A cap of two leaves the sampled 2 pending, so it carries.
     _ = try runTurn(&fx, 1, sid, "x", 2);
-    const slot = &fx.sched.slots[0];
-    try std.testing.expectEqual(@as(?u32, 2), slot.carry);
-    const pos = fx.pool.posOf(slot.engine_id);
+    const entry = &fx.sched.entries[0];
+    try std.testing.expectEqual(@as(?u32, 2), entry.carry);
+    const pos = fx.pool.posOf(entry.engine_id);
     const rows_before = fx.runner.rows_log_len;
 
     // The carry joins the first pair. 1 + 4 + 8 = 13 ids fit the 13
     // positions left, and one byte more does not.
-    try std.testing.expectEqual(@as(u32, 13), fx.pool.capacityRemaining(slot.engine_id));
+    try std.testing.expectEqual(@as(u32, 13), fx.pool.capacityRemaining(entry.engine_id));
     const refused = try fx.appendDrain(1, sid, &.{
         .{ .user = "abcd", .assistant = "" },
         .{ .user = "efgh", .assistant = "ijklm" },
     });
     try expectRefused(refused, .turn_too_long, "turn of 14 tokens, 13 positions left");
     try std.testing.expectEqual(rows_before, fx.runner.rows_log_len);
-    try std.testing.expectEqual(pos, fx.pool.posOf(slot.engine_id));
-    try std.testing.expectEqual(@as(u32, 1), slot.turns_done);
-    try std.testing.expectEqual(@as(?u32, 2), slot.carry);
-    try std.testing.expectEqual(SlotState.idle, slot.state);
+    try std.testing.expectEqual(pos, fx.pool.posOf(entry.engine_id));
+    try std.testing.expectEqual(@as(u32, 1), entry.turns_done);
+    try std.testing.expectEqual(@as(?u32, 2), entry.carry);
+    try std.testing.expectEqual(SessionPhase.idle, entry.state);
 
     // The exact fit is admitted, and the carry leads its rows.
     const fits = try fx.appendDrain(1, sid, &.{
@@ -4574,8 +4588,8 @@ test "append: a set past the room refuses whole, feeds no row, and keeps the car
     });
     try expectAppended(fits, &.{ pos + 5, pos + 13 });
     try std.testing.expectEqual(@as(u32, 2), fx.runner.rowsSeen()[rows_before].token);
-    try std.testing.expectEqual(@as(?u32, null), slot.carry);
-    try std.testing.expectEqual(@as(u32, 3), slot.turns_done);
+    try std.testing.expectEqual(@as(?u32, null), entry.carry);
+    try std.testing.expectEqual(@as(u32, 3), entry.turns_done);
 }
 
 test "append: the pairs take the live wraps, and the next turn continues" {
@@ -4645,10 +4659,10 @@ test "append: two frames end in the state of one frame, the multi-frame rule" {
             try std.testing.expectEqual(OutEvent.Body.appended, std.meta.activeTag(last));
             const got = last.appended.positions();
             try std.testing.expectEqual(pos, got[got.len - 1]);
-            try std.testing.expectEqual(pos, fx.pool.posOf(fx.sched.slots[0].engine_id));
+            try std.testing.expectEqual(pos, fx.pool.posOf(fx.sched.entries[0].engine_id));
         } else {
             try std.testing.expectEqual(protocol.ErrorCode.turn_too_long, last.err.code);
-            try std.testing.expectEqual(@as(u32, 1), fx.pool.posOf(fx.sched.slots[0].engine_id));
+            try std.testing.expectEqual(@as(u32, 1), fx.pool.posOf(fx.sched.entries[0].engine_id));
         }
 
         // Cases 3 and 4 hold one frame and two frames of the same pairs. The
@@ -4664,7 +4678,7 @@ test "append: two frames end in the state of one frame, the multi-frame rule" {
     }
 }
 
-test "append: a cancel during the prefill returns the slot idle with an err" {
+test "append: a cancel during the prefill returns the session idle with an err" {
     // One slot gives one prefill row per tick, so the append spans ticks.
     var fx = try Fixture.setUp(std.testing.allocator, 1, 64, null);
     defer fx.tearDown();
@@ -4672,9 +4686,9 @@ test "append: a cancel during the prefill returns the slot idle with an err" {
     const sid = try fx.openSession(1, "a");
     try fx.append(1, sid, &.{.{ .user = "bcde", .assistant = "" }});
     _ = fx.sched.tick(fx.sink);
-    const slot = &fx.sched.slots[0];
-    try std.testing.expectEqual(SlotState.prefill, slot.state);
-    const fed = fx.pool.posOf(slot.engine_id);
+    const entry = &fx.sched.entries[0];
+    try std.testing.expectEqual(SessionPhase.prefill, entry.state);
+    const fed = fx.pool.posOf(entry.engine_id);
     try std.testing.expect(fed > 1 and fed < 5);
 
     _ = fx.sched.handle(
@@ -4684,10 +4698,10 @@ test "append: a cancel during the prefill returns the slot idle with an err" {
     fx.drain();
     try expectRefused(fx.sink.last().ev.body, .cancelled, "append cancelled");
     try std.testing.expectEqual(@as(u32, 11), fx.sink.last().ev.request_id);
-    try std.testing.expectEqual(SlotState.idle, slot.state);
-    try std.testing.expectEqual(@as(u32, 0), slot.turns_done);
+    try std.testing.expectEqual(SessionPhase.idle, entry.state);
+    try std.testing.expectEqual(@as(u32, 0), entry.turns_done);
     // The fed rows stay.
-    try std.testing.expectEqual(fed, fx.pool.posOf(slot.engine_id));
+    try std.testing.expectEqual(fed, fx.pool.posOf(entry.engine_id));
     for (fx.sink.seen()) |e| {
         try std.testing.expect(e.ev.body != .appended);
     }
@@ -4734,7 +4748,7 @@ test "parked frames: a close and a busy refusal flush the parked event first" {
     // The first token of the turn parks behind a full queue.
     fx.sink.fail_next = 1;
     _ = fx.sched.tick(fx.sink);
-    try std.testing.expect(fx.sched.slots[0].pending_event != null);
+    try std.testing.expect(fx.sched.entries[0].pending_event != null);
 
     // A busy refusal goes out behind the parked token.
     try fx.generate(1, sid, "y", 8);
@@ -4747,12 +4761,12 @@ test "parked frames: a close and a busy refusal flush the parked event first" {
         protocol.ErrorCode.session_busy,
         fx.sink.events[n - 1].ev.body.err.code,
     );
-    try std.testing.expect(fx.sched.slots[0].pending_event == null);
+    try std.testing.expect(fx.sched.entries[0].pending_event == null);
 
     // The next token parks, and the close sends it before session_closed.
     fx.sink.fail_next = 1;
     _ = fx.sched.tick(fx.sink);
-    try std.testing.expect(fx.sched.slots[0].pending_event != null);
+    try std.testing.expect(fx.sched.entries[0].pending_event != null);
     _ = fx.sched.handle(
         .{ .conn = 1, .request_id = 30, .session_id = sid, .body = .session_close },
         fx.sink,
@@ -4777,7 +4791,7 @@ test "parked frames: a flush the writer still refuses disconnects, and no reply 
     try fx.generate(1, sid, "x", 8);
     fx.sink.fail_conn = 1;
     _ = fx.sched.tick(fx.sink);
-    try std.testing.expect(fx.sched.slots[0].pending_event != null);
+    try std.testing.expect(fx.sched.entries[0].pending_event != null);
     const n = fx.sink.n;
     _ = fx.sched.handle(
         .{ .conn = 1, .request_id = 30, .session_id = sid, .body = .session_close },
@@ -4785,12 +4799,12 @@ test "parked frames: a flush the writer still refuses disconnects, and no reply 
     );
     try std.testing.expectEqual(@as(?u32, 1), fx.sink.disconnected);
     try std.testing.expectEqual(n, fx.sink.n);
-    // The sweep of the dropped connection releases the slot.
+    // The sweep of the dropped connection releases the entry.
     _ = fx.sched.handle(
         .{ .conn = 1, .request_id = 0, .session_id = 0, .body = .conn_closed },
         fx.sink,
     );
-    try std.testing.expectEqual(SlotState.free, fx.sched.slots[0].state);
+    try std.testing.expectEqual(SessionPhase.free, fx.sched.entries[0].state);
 }
 
 test "hello: the think mode, the budget, and the card sampling of the model" {
@@ -4873,10 +4887,10 @@ test "presence penalty: a budget-forced close counts as a drawn id, the echo doe
     defer fx.tearDown();
 
     const sid = try fx.openSession(1, "");
-    // 5 and 6 spend the budget, and the forced 3 and 0 follow.
+    // 5 and 6 use the budget, and the forced 3 and 0 follow.
     const t = try runTurn(&fx, 1, sid, "4", 4);
     try std.testing.expectEqualSlices(u32, &.{ 2, 5, 6, 3, 0 }, t.tokens());
-    const set = fx.sched.presenceOf(&fx.sched.slots[0]);
+    const set = fx.sched.presenceOf(&fx.sched.entries[0]);
     for (0..test_vocab) |id| {
         const want = id == 0 or id == 3 or id == 5 or id == 6;
         const got = set[id / 64] & (@as(u64, 1) << @intCast(id % 64)) != 0;
@@ -4892,7 +4906,7 @@ test "parked frames: a clone and an append flush the parked event before their r
     try fx.generate(1, sid, "x", 8);
     fx.sink.fail_next = 1;
     _ = fx.sched.tick(fx.sink);
-    try std.testing.expect(fx.sched.slots[0].pending_event != null);
+    try std.testing.expect(fx.sched.entries[0].pending_event != null);
     _ = fx.sched.handle(.{ .conn = 1, .request_id = 40, .session_id = sid, .body = .{
         .session_clone = .{ .sampling = protocol.Sampling.greedy },
     } }, fx.sink);
@@ -4908,7 +4922,7 @@ test "parked frames: a clone and an append flush the parked event before their r
 
     fx.sink.fail_next = 1;
     _ = fx.sched.tick(fx.sink);
-    try std.testing.expect(fx.sched.slots[0].pending_event != null);
+    try std.testing.expect(fx.sched.entries[0].pending_event != null);
     try fx.append(1, sid, &.{.{ .user = "b", .assistant = "" }});
     n = fx.sink.n;
     try std.testing.expectEqual(
@@ -4946,7 +4960,7 @@ test "context set: every feed path marks it, a clone copies it, an open clears i
 
     // The opening system prompt is id 3.
     const sa = try fx.openSession(1, "\x03");
-    const a = fx.sched.slotByProto(sa, 1).?;
+    const a = fx.sched.entryByProto(sa, 1).?;
     try std.testing.expectEqual(idMask(&.{3}), setWord(fx.sched.contextOf(a)));
     // A turn feeds 5, and the model draws 6. The cap carries 6.
     var t = try runTurn(&fx, 1, sa, "\x05", 1);
@@ -4961,7 +4975,7 @@ test "context set: every feed path marks it, a clone copies it, an open clears i
         .session_clone = .{ .sampling = protocol.Sampling.greedy },
     } }, fx.sink);
     const sb = fx.sink.last().ev.session_id;
-    const b = fx.sched.slotByProto(sb, 1).?;
+    const b = fx.sched.entryByProto(sb, 1).?;
     try std.testing.expectEqual(setWord(fx.sched.contextOf(a)), setWord(fx.sched.contextOf(b)));
     // A turn of the clone marks the clone alone.
     t = try runTurn(&fx, 1, sb, "\x01", 1);
@@ -4969,7 +4983,7 @@ test "context set: every feed path marks it, a clone copies it, an open clears i
     try std.testing.expectEqual(idMask(&.{ 0, 1, 2, 3, 5, 6 }), setWord(fx.sched.contextOf(b)));
     try std.testing.expectEqual(idMask(&.{ 0, 3, 5, 6 }), setWord(fx.sched.contextOf(a)));
 
-    // A new session in a reused slot starts empty.
+    // A new session in a reused entry starts empty.
     _ = fx.sched.handle(
         .{ .conn = 1, .request_id = 6, .session_id = sa, .body = .session_close },
         fx.sink,
@@ -4977,7 +4991,7 @@ test "context set: every feed path marks it, a clone copies it, an open clears i
     const sc = try fx.openSession(1, "");
     try std.testing.expectEqual(
         @as(u64, 0),
-        setWord(fx.sched.contextOf(fx.sched.slotByProto(sc, 1).?)),
+        setWord(fx.sched.contextOf(fx.sched.entryByProto(sc, 1).?)),
     );
 }
 
@@ -4993,7 +5007,7 @@ test "context set: a restored prefix marks it with no forward row" {
     try std.testing.expectEqual(@as(u64, 1), fx.sched.prefix.hits);
     try std.testing.expectEqual(
         idMask(&.{ 1, 2, 3, 4, 5, 6 }),
-        setWord(fx.sched.contextOf(fx.sched.slotByProto(sb, 2).?)),
+        setWord(fx.sched.contextOf(fx.sched.entryByProto(sb, 2).?)),
     );
     _ = fx.sched.handle(
         .{ .conn = 2, .request_id = 7, .session_id = sb, .body = .session_close },
@@ -5017,7 +5031,7 @@ test "context set: a restored prefix marks it with no forward row" {
     try std.testing.expectEqualSlices(u32, &.{1}, t.tokens());
     try std.testing.expectEqual(
         idMask(&.{ 0, 1 }),
-        setWord(fx.sched.contextOf(fx.sched.slotByProto(sd, 4).?)),
+        setWord(fx.sched.contextOf(fx.sched.entryByProto(sd, 4).?)),
     );
 }
 
@@ -5032,7 +5046,7 @@ test "context set: a budget-forced id counts, the echo does not" {
     try std.testing.expectEqualSlices(u32, &.{ 2, 5, 6, 3, 0 }, t.tokens());
     try std.testing.expectEqual(
         idMask(&.{ 0, 3, 4, 5, 6 }),
-        setWord(fx.sched.contextOf(&fx.sched.slots[0])),
+        setWord(fx.sched.contextOf(&fx.sched.entries[0])),
     );
 }
 
@@ -5052,12 +5066,12 @@ fn checkContextRecount(_: void, seed: u64) anyerror!void {
     }
 
     const sid = try fx.openSession(1, sys);
-    const slot = fx.sched.slotByProto(sid, 1).?;
+    const entry = fx.sched.entryByProto(sid, 1).?;
     for (sys) |c| {
         want |= @as(u64, 1) << @intCast(c);
     }
 
-    try std.testing.expectEqual(want, setWord(fx.sched.contextOf(slot)));
+    try std.testing.expectEqual(want, setWord(fx.sched.contextOf(entry)));
 
     // Run random turns and recount the context after each.
     for (0..5) |_| {
@@ -5084,7 +5098,7 @@ fn checkContextRecount(_: void, seed: u64) anyerror!void {
             }
         }
 
-        try std.testing.expectEqual(want, setWord(fx.sched.contextOf(slot)));
+        try std.testing.expectEqual(want, setWord(fx.sched.contextOf(entry)));
     }
 }
 
@@ -5101,9 +5115,9 @@ test "context recount: the set equals the ids fed and drawn over random feed seq
 // -- lease tests ------------------------------------------------------------
 //
 // The anchors of the lease model replay through the scheduler with the fake
-// sink and a pinned clock. The anchor table has two slots, a share of 2, and
+// sink and a pinned clock. The anchor table has two entries, a share of 2, and
 // a maximum of 100 ms. Time counts in milliseconds from zero, and a token
-// names its first byte. `viewOf` reads a slot in the shape of the model: the
+// names its first byte. `viewOf` reads an entry in the shape of the model: the
 // owner, the session id, the token, and the time to live.
 
 /// The lease clock at `ms` milliseconds.
@@ -5117,27 +5131,27 @@ fn tok(n: u8) Token {
     return t;
 }
 
-const SlotView = struct {
+const EntryView = struct {
     owner: union(enum) { free, attached: u32, detached: i64 },
     pid: u32,
     token: ?u8,
     ttl: u32,
 };
 
-fn viewOf(slot: *const TestScheduler.Slot) SlotView {
-    const lease = slot.lease;
+fn viewOf(entry: *const TestScheduler.SessionEntry) EntryView {
+    const lease = entry.lease;
     return .{
-        .owner = if (slot.state == .free) .free else switch (slot.owner) {
+        .owner = if (entry.state == .free) .free else switch (entry.owner) {
             .attached => |c| .{ .attached = c },
             .detached => |d| .{ .detached = d.raw.toMilliseconds() },
         },
-        .pid = slot.proto_id,
+        .pid = entry.proto_id,
         .token = if (lease) |l| l.token[0] else null,
         .ttl = if (lease) |l| l.ttl_ms else 0,
     };
 }
 
-const free_view: SlotView = .{ .owner = .free, .pid = 0, .token = null, .ttl = 0 };
+const free_view: EntryView = .{ .owner = .free, .pid = 0, .token = null, .ttl = 0 };
 
 /// A table of `n_slots` with resumption on at a maximum of 100 ms, and the
 /// clock pinned at zero.
@@ -5161,8 +5175,8 @@ const LeaseStep = union(enum) {
     no_such_lease: struct { conn: u32, request: u32, token: u8, at: i64, fresh: u8 },
     /// A close from `conn`. A refused close answers `unknown_session`.
     close: struct { conn: u32, sid: u32, refused: bool },
-    route: struct { sid: u32, conn: u32, slot: ?usize },
-    view: struct { slot: usize, want: SlotView },
+    route: struct { sid: u32, conn: u32, entry: ?usize },
+    view: struct { entry: usize, want: EntryView },
     counts: struct { expires: u64, yields: u64 },
 };
 
@@ -5235,10 +5249,11 @@ fn checkLease(c: LeaseCase) !void {
 
             // Check the routes, the views, and the counters.
             .route => |s| {
-                const want: ?*TestScheduler.Slot = if (s.slot) |i| &fx.sched.slots[i] else null;
-                try std.testing.expectEqual(want, fx.sched.slotByProto(s.sid, s.conn));
+                const Entry = TestScheduler.SessionEntry;
+                const want: ?*Entry = if (s.entry) |i| &fx.sched.entries[i] else null;
+                try std.testing.expectEqual(want, fx.sched.entryByProto(s.sid, s.conn));
             },
-            .view => |s| try std.testing.expectEqual(s.want, viewOf(&fx.sched.slots[s.slot])),
+            .view => |s| try std.testing.expectEqual(s.want, viewOf(&fx.sched.entries[s.entry])),
             .counts => |s| {
                 try std.testing.expectEqual(s.expires, fx.sched.lease_expires);
                 try std.testing.expectEqual(s.yields, fx.sched.lease_yields);
@@ -5247,51 +5262,51 @@ fn checkLease(c: LeaseCase) !void {
     }
 }
 
-const view_detached_60: SlotView = .{
+const view_detached_60: EntryView = .{
     .owner = .{ .detached = 60 },
     .pid = 1,
     .token = 7,
     .ttl = 50,
 };
-const view_attached_2_resumed: SlotView = .{
+const view_attached_2_resumed: EntryView = .{
     .owner = .{ .attached = 2 },
     .pid = 1,
     .token = 8,
     .ttl = 50,
 };
-const view_attached_1_plain: SlotView = .{
+const view_attached_1_plain: EntryView = .{
     .owner = .{ .attached = 1 },
     .pid = 1,
     .token = null,
     .ttl = 0,
 };
 
-/// Slot 1 after a live open took it from a detached session.
-const view_yield_taken: SlotView = .{
+/// Entry 1 after a live open took it from a detached session.
+const view_yield_taken: EntryView = .{
     .owner = .{ .attached = 2 },
     .pid = 5,
     .token = null,
     .ttl = 0,
 };
-const view_detached_30: SlotView = .{
+const view_detached_30: EntryView = .{
     .owner = .{ .detached = 30 },
     .pid = 1,
     .token = 5,
     .ttl = 30,
 };
-const view_attached_9: SlotView = .{
+const view_attached_9: EntryView = .{
     .owner = .{ .attached = 9 },
     .pid = 3,
     .token = null,
     .ttl = 0,
 };
-const view_detached_20: SlotView = .{
+const view_detached_20: EntryView = .{
     .owner = .{ .detached = 20 },
     .pid = 4,
     .token = 7,
     .ttl = 20,
 };
-const view_clamped: SlotView = .{
+const view_clamped: EntryView = .{
     .owner = .{ .attached = 1 },
     .pid = 1,
     .token = 7,
@@ -5331,29 +5346,29 @@ const detached_anchor = [_]LeaseStep{
     .{ .open = .{ .conn = 1, .sid = 1 } },
     .{ .keep = .{ .sid = 1, .conn = 1, .ttl = 50, .token = 7, .granted = 50 } },
     .{ .detach = .{ .conn = 1, .at = 10 } },
-    .{ .view = .{ .slot = 0, .want = view_detached_60 } },
+    .{ .view = .{ .entry = 0, .want = view_detached_60 } },
 };
 
 test "lease anchors: the deadline, the token, the takeover order, the share, and the owner rules" {
     const cases = [_]LeaseCase{
         .{
-            .name = "a resume before the deadline attaches the slot",
+            .name = "a resume before the deadline attaches the session",
             .n_slots = 2,
             .share = 2,
             .steps = &(detached_anchor ++ [_]LeaseStep{
                 resume_before_deadline,
-                .{ .view = .{ .slot = 0, .want = view_attached_2_resumed } },
+                .{ .view = .{ .entry = 0, .want = view_attached_2_resumed } },
             }),
         },
         .{
-            .name = "a resume at the deadline fails, and the resume scan frees the slot",
+            .name = "a resume at the deadline fails, and the resume scan frees the session",
             .n_slots = 2,
             .share = 2,
             .steps = &(detached_anchor ++ [_]LeaseStep{
                 .{ .expire = 59 },
-                .{ .view = .{ .slot = 0, .want = view_detached_60 } },
+                .{ .view = .{ .entry = 0, .want = view_detached_60 } },
                 resume_at_deadline,
-                .{ .view = .{ .slot = 0, .want = free_view } },
+                .{ .view = .{ .entry = 0, .want = free_view } },
                 .{ .counts = .{ .expires = 1, .yields = 0 } },
             }),
         },
@@ -5364,10 +5379,10 @@ test "lease anchors: the deadline, the token, the takeover order, the share, and
             .steps = &(detached_anchor ++ [_]LeaseStep{
                 resume_before_deadline,
                 resume_replayed,
-                .{ .view = .{ .slot = 0, .want = view_attached_2_resumed } },
+                .{ .view = .{ .entry = 0, .want = view_attached_2_resumed } },
             }),
         },
-        // Slot 2 stays attached to connection 9. The others detach at 0 with
+        // Entry 2 stays attached to connection 9. The others detach at 0 with
         // the deadlines 30, 20, and 20.
         .{
             .name = "a live open takes the earliest deadline, and the lowest index on a tie",
@@ -5384,15 +5399,15 @@ test "lease anchors: the deadline, the token, the takeover order, the share, and
                 .{ .detach = .{ .conn = 1, .at = 0 } },
                 .{ .pin = 5 },
                 .{ .open = .{ .conn = 2, .sid = 5 } },
-                .{ .view = .{ .slot = 1, .want = view_yield_taken } },
-                .{ .view = .{ .slot = 0, .want = view_detached_30 } },
-                .{ .view = .{ .slot = 2, .want = view_attached_9 } },
-                .{ .view = .{ .slot = 3, .want = view_detached_20 } },
+                .{ .view = .{ .entry = 1, .want = view_yield_taken } },
+                .{ .view = .{ .entry = 0, .want = view_detached_30 } },
+                .{ .view = .{ .entry = 2, .want = view_attached_9 } },
+                .{ .view = .{ .entry = 3, .want = view_detached_20 } },
                 .{ .counts = .{ .expires = 0, .yields = 1 } },
             },
         },
         .{
-            .name = "a table with every slot attached refuses the open",
+            .name = "a table with every session attached refuses the open",
             .n_slots = 2,
             .share = 2,
             .steps = &.{
@@ -5402,13 +5417,13 @@ test "lease anchors: the deadline, the token, the takeover order, the share, and
             },
         },
         .{
-            .name = "a connection at its share is refused while a slot is free",
+            .name = "a connection at its share is refused while a session entry is free",
             .n_slots = 2,
             .share = 1,
             .steps = &.{
                 .{ .open = .{ .conn = 1, .sid = 1 } },
                 .{ .open_refused = .{ .conn = 1 } },
-                .{ .view = .{ .slot = 1, .want = free_view } },
+                .{ .view = .{ .entry = 1, .want = free_view } },
             },
         },
         .{
@@ -5417,12 +5432,12 @@ test "lease anchors: the deadline, the token, the takeover order, the share, and
             .share = 2,
             .steps = &.{
                 .{ .open = .{ .conn = 1, .sid = 1 } },
-                .{ .route = .{ .sid = 1, .conn = 1, .slot = 0 } },
-                .{ .route = .{ .sid = 1, .conn = 2, .slot = null } },
+                .{ .route = .{ .sid = 1, .conn = 1, .entry = 0 } },
+                .{ .route = .{ .sid = 1, .conn = 2, .entry = null } },
                 .{ .close = .{ .conn = 2, .sid = 1, .refused = true } },
-                .{ .view = .{ .slot = 0, .want = view_attached_1_plain } },
+                .{ .view = .{ .entry = 0, .want = view_attached_1_plain } },
                 .{ .close = .{ .conn = 1, .sid = 1, .refused = false } },
-                .{ .view = .{ .slot = 0, .want = free_view } },
+                .{ .view = .{ .entry = 0, .want = free_view } },
             },
         },
         .{
@@ -5433,13 +5448,13 @@ test "lease anchors: the deadline, the token, the takeover order, the share, and
                 .{ .open = .{ .conn = 1, .sid = 1 } },
                 .{ .keep = .{ .sid = 1, .conn = 1, .ttl = 50, .token = 7, .granted = 50 } },
                 .{ .keep = .{ .sid = 1, .conn = 1, .ttl = 0, .token = 9, .granted = 0 } },
-                .{ .view = .{ .slot = 0, .want = view_attached_1_plain } },
+                .{ .view = .{ .entry = 0, .want = view_attached_1_plain } },
                 .{ .keep = .{ .sid = 1, .conn = 1, .ttl = 500, .token = 7, .granted = 100 } },
-                .{ .view = .{ .slot = 0, .want = view_clamped } },
+                .{ .view = .{ .entry = 0, .want = view_clamped } },
                 // A dropped lease returns the session to the sweep rule.
                 .{ .keep = .{ .sid = 1, .conn = 1, .ttl = 0, .token = 9, .granted = 0 } },
                 .{ .detach = .{ .conn = 1, .at = 10 } },
-                .{ .view = .{ .slot = 0, .want = free_view } },
+                .{ .view = .{ .entry = 0, .want = free_view } },
             },
         },
     };
@@ -5459,14 +5474,14 @@ test "lease anchor: a takeover with no drop moves the route to the new connectio
     const r = try fx.sched.resumeLease(2, 5, tok(7), atMs(5), tok(8));
     try std.testing.expectEqual(Resumed{ .session_id = sid, .ready = true }, r);
     try std.testing.expectEqual(
-        SlotView{ .owner = .{ .attached = 2 }, .pid = 1, .token = 8, .ttl = 50 },
-        viewOf(&fx.sched.slots[0]),
+        EntryView{ .owner = .{ .attached = 2 }, .pid = 1, .token = 8, .ttl = 50 },
+        viewOf(&fx.sched.entries[0]),
     );
     try std.testing.expectEqual(
-        @as(?*TestScheduler.Slot, &fx.sched.slots[0]),
-        fx.sched.slotByProto(sid, 2),
+        @as(?*TestScheduler.SessionEntry, &fx.sched.entries[0]),
+        fx.sched.entryByProto(sid, 2),
     );
-    try std.testing.expectEqual(@as(?*TestScheduler.Slot, null), fx.sched.slotByProto(sid, 1));
+    try std.testing.expectEqual(no_entry, fx.sched.entryByProto(sid, 1));
     // The old connection gets `unknown_session`, and the new one streams.
     try fx.generate(1, sid, "x", 1);
     try std.testing.expectEqual(
@@ -5505,8 +5520,8 @@ test "lease: the three keep refusals each take their own path" {
     fx.sched.detachConn(1, atMs(10));
     try std.testing.expectError(error.OtherOwner, fx.sched.keepLease(sid, 1, 50, tok(9)));
     try std.testing.expectEqual(
-        SlotView{ .owner = .{ .detached = 60 }, .pid = 1, .token = 7, .ttl = 50 },
-        viewOf(&fx.sched.slots[0]),
+        EntryView{ .owner = .{ .detached = 60 }, .pid = 1, .token = 7, .ttl = 50 },
+        viewOf(&fx.sched.entries[0]),
     );
 
     // Resumption off: the keep is refused, the lease does not change, and the drop frees the
@@ -5517,13 +5532,13 @@ test "lease: the three keep refusals each take their own path" {
     try std.testing.expectEqual(@as(u32, 0), off.sched.cfg.resume_ttl_max_ms);
     const s = try off.openSession(1, "");
     try std.testing.expectError(error.ResumptionOff, off.sched.keepLease(s, 1, 50, tok(7)));
-    try std.testing.expectEqual(@as(?TestScheduler.Lease, null), off.sched.slots[0].lease);
+    try std.testing.expectEqual(@as(?TestScheduler.Lease, null), off.sched.entries[0].lease);
     try std.testing.expectEqual(@as(u32, 0), try off.sched.keepLease(s, 1, 0, tok(7)));
     _ = off.sched.handle(
         .{ .conn = 1, .request_id = 0, .session_id = 0, .body = .conn_closed },
         off.sink,
     );
-    try std.testing.expectEqual(free_view, viewOf(&off.sched.slots[0]));
+    try std.testing.expectEqual(free_view, viewOf(&off.sched.entries[0]));
 }
 
 test "lease: a drop mid-decode cuts the turn, keeps the carry, and the resumed turn feeds it" {
@@ -5545,12 +5560,12 @@ test "lease: a drop mid-decode cuts the turn, keeps the carry, and the resumed t
     fx.drain();
     // The cut turn finalizes, but no event reaches any connection.
     try std.testing.expectEqual(seen_before, fx.sink.n);
-    const slot = &fx.sched.slots[0];
-    try std.testing.expectEqual(SlotState.idle, slot.state);
-    try std.testing.expectEqual(@as(?u32, 3), slot.carry);
-    try std.testing.expectEqual(protocol.FinishReason.cancelled, slot.last_done.?.finish);
-    try std.testing.expectEqual(@as(u32, 3), slot.last_done.?.gen_tokens);
-    try std.testing.expectEqual(@as(u32, 9), slot.last_done.?.request_id);
+    const entry = &fx.sched.entries[0];
+    try std.testing.expectEqual(SessionPhase.idle, entry.state);
+    try std.testing.expectEqual(@as(?u32, 3), entry.carry);
+    try std.testing.expectEqual(protocol.FinishReason.cancelled, entry.last_done.?.finish);
+    try std.testing.expectEqual(@as(u32, 3), entry.last_done.?.gen_tokens);
+    try std.testing.expectEqual(@as(u32, 9), entry.last_done.?.request_id);
 
     _ = try fx.sched.resumeLease(2, 5, tok(7), atMs(20), tok(8));
     const rows_before = fx.runner.rows_log_len;
@@ -5573,7 +5588,7 @@ test "lease: an append finishes while detached, and the resume names the final p
     // Six tokens at two rows a pass: three passes.
     try fx.append(1, sid, &.{.{ .user = "abcd", .assistant = "ef" }});
     _ = fx.sched.tick(fx.sink);
-    try std.testing.expectEqual(SlotState.prefill, fx.sched.slots[0].state);
+    try std.testing.expectEqual(SessionPhase.prefill, fx.sched.entries[0].state);
 
     const seen_before = fx.sink.n;
     const rows_before = fx.runner.rows_log_len;
@@ -5581,10 +5596,10 @@ test "lease: an append finishes while detached, and the resume names the final p
     fx.drain();
     try std.testing.expectEqual(@as(usize, 4), fx.runner.rows_log_len - rows_before);
     try std.testing.expectEqual(seen_before, fx.sink.n);
-    const slot = &fx.sched.slots[0];
-    try std.testing.expectEqual(SlotState.idle, slot.state);
-    try std.testing.expectEqual(@as(u32, 1), slot.turns_done);
-    try std.testing.expectEqual(@as(u32, 7), fx.pool.posOf(slot.engine_id));
+    const entry = &fx.sched.entries[0];
+    try std.testing.expectEqual(SessionPhase.idle, entry.state);
+    try std.testing.expectEqual(@as(u32, 1), entry.turns_done);
+    try std.testing.expectEqual(@as(u32, 7), fx.pool.posOf(entry.engine_id));
 
     const r = try fx.sched.resumeLease(2, 5, tok(7), atMs(20), tok(8));
     try std.testing.expectEqual(Resumed{ .session_id = sid, .ready = true }, r);
@@ -5605,7 +5620,7 @@ test "lease: a resume during an append waits for idle and drops the events befor
     const seen_before = fx.sink.n;
     const r = try fx.sched.resumeLease(2, 5, tok(7), atMs(5), tok(8));
     try std.testing.expectEqual(Resumed{ .session_id = sid, .ready = false }, r);
-    try std.testing.expect(fx.sched.slots[0].resume_wait != null);
+    try std.testing.expect(fx.sched.entries[0].resume_wait != null);
     fx.drain();
     // The append reply belonged to connection 1, so it goes. The one event
     // is the resume, and it names the final position.
@@ -5613,15 +5628,15 @@ test "lease: a resume during an append waits for idle and drops the events befor
     try expectResumed(fx.sink.last(), 2, 5, sid, 7, 8);
     try std.testing.expectEqual(
         @as(?TestScheduler.ResumeWait, null),
-        fx.sched.slots[0].resume_wait,
+        fx.sched.entries[0].resume_wait,
     );
-    try std.testing.expectEqual(@as(u32, 7), fx.pool.posOf(fx.sched.slots[0].engine_id));
+    try std.testing.expectEqual(@as(u32, 7), fx.pool.posOf(fx.sched.entries[0].engine_id));
 }
 
 /// A `resumed` reply to `conn` under `request_id` for session `sid` at
 /// `kv_pos`, with the token that `token_byte` names.
 fn expectResumed(
-    e: FakeSink.Entry,
+    e: FakeSink.Seen,
     conn: u32,
     request_id: u32,
     sid: u32,
@@ -5650,8 +5665,8 @@ test "lease: the share of the new connection bounds a resume" {
         fx.sched.resumeLease(2, 5, tok(7), atMs(20), tok(8)),
     );
     try std.testing.expectEqual(
-        SlotView{ .owner = .{ .detached = 60 }, .pid = 1, .token = 7, .ttl = 50 },
-        viewOf(&fx.sched.slots[0]),
+        EntryView{ .owner = .{ .detached = 60 }, .pid = 1, .token = 7, .ttl = 50 },
+        viewOf(&fx.sched.entries[0]),
     );
 
     _ = fx.sched.handle(
@@ -5660,8 +5675,8 @@ test "lease: the share of the new connection bounds a resume" {
     );
     _ = try fx.sched.resumeLease(2, 5, tok(7), atMs(20), tok(8));
     try std.testing.expectEqual(
-        SlotView{ .owner = .{ .attached = 2 }, .pid = 1, .token = 8, .ttl = 50 },
-        viewOf(&fx.sched.slots[0]),
+        EntryView{ .owner = .{ .attached = 2 }, .pid = 1, .token = 8, .ttl = 50 },
+        viewOf(&fx.sched.entries[0]),
     );
 
     // A connection at its share cannot take over its own session.
@@ -5669,10 +5684,10 @@ test "lease: the share of the new connection bounds a resume" {
         error.ShareFull,
         fx.sched.resumeLease(2, 7, tok(8), atMs(30), tok(9)),
     );
-    try std.testing.expectEqual(@as(?u8, 8), viewOf(&fx.sched.slots[0]).token);
+    try std.testing.expectEqual(@as(?u8, 8), viewOf(&fx.sched.entries[0]).token);
 }
 
-test "lease: a detached slot takes no decode row in any step" {
+test "lease: a detached session takes no decode row in any step" {
     var fx = try leaseFixture(2, 2);
     defer fx.tearDown();
 
@@ -5685,8 +5700,8 @@ test "lease: a detached slot takes no decode row in any step" {
         _ = fx.sched.tick(fx.sink);
     }
 
-    const engine_a = fx.sched.slots[0].engine_id;
-    try std.testing.expectEqual(SlotState.decode, fx.sched.slots[0].state);
+    const engine_a = fx.sched.entries[0].engine_id;
+    try std.testing.expectEqual(SessionPhase.decode, fx.sched.entries[0].state);
 
     fx.sched.detachConn(1, atMs(10));
     const rows_before = fx.runner.rows_log_len;
@@ -5706,7 +5721,7 @@ test "lease: a detached slot takes no decode row in any step" {
     );
 }
 
-test "lease: a yield cancels an opening prefill in flight before it releases the slot" {
+test "lease: a yield cancels an opening prefill in flight before it releases the session" {
     var fx = try leaseFixture(1, 1);
     defer fx.tearDown();
 
@@ -5717,10 +5732,10 @@ test "lease: a yield cancels an opening prefill in flight before it releases the
     // One row a pass: two of the six prompt rows feed.
     _ = fx.sched.tick(fx.sink);
     _ = fx.sched.tick(fx.sink);
-    const slot = &fx.sched.slots[0];
-    try std.testing.expectEqual(SlotState.prefill, slot.state);
-    try std.testing.expectEqual(@as(usize, 2), slot.fed);
-    _ = try fx.sched.keepLease(slot.proto_id, 1, 50, tok(7));
+    const entry = &fx.sched.entries[0];
+    try std.testing.expectEqual(SessionPhase.prefill, entry.state);
+    try std.testing.expectEqual(@as(usize, 2), entry.fed);
+    _ = try fx.sched.keepLease(entry.proto_id, 1, 50, tok(7));
     fx.sched.detachConn(1, atMs(10));
 
     const rows_before = fx.runner.rows_log_len;
@@ -5731,10 +5746,10 @@ test "lease: a yield cancels an opening prefill in flight before it releases the
     try std.testing.expectEqual(@as(u64, 1), fx.sched.lease_yields);
     try std.testing.expectEqual(@as(u64, 1), fx.sched.lease_prefills_cut);
     try std.testing.expectEqual(
-        SlotView{ .owner = .{ .attached = 2 }, .pid = 2, .token = null, .ttl = 0 },
-        viewOf(slot),
+        EntryView{ .owner = .{ .attached = 2 }, .pid = 2, .token = null, .ttl = 0 },
+        viewOf(entry),
     );
-    try std.testing.expectEqual(@as(u32, 0), fx.pool.posOf(slot.engine_id));
+    try std.testing.expectEqual(@as(u32, 0), fx.pool.posOf(entry.engine_id));
 }
 
 test "lease: an expiry at the tick head cancels an append prefill before the release" {
@@ -5746,20 +5761,20 @@ test "lease: an expiry at the tick head cancels an append prefill before the rel
     try fx.append(1, sid, &.{.{ .user = "abcd", .assistant = "ef" }});
     _ = fx.sched.tick(fx.sink);
     _ = fx.sched.tick(fx.sink);
-    try std.testing.expectEqual(@as(usize, 2), fx.sched.slots[0].fed);
+    try std.testing.expectEqual(@as(usize, 2), fx.sched.entries[0].fed);
     fx.sched.detachConn(1, atMs(10));
 
     // One pass before the deadline feeds one more row of the append.
     fx.sched.pinClock(atMs(59));
     try std.testing.expectEqual(Tick.worked, fx.sched.tick(fx.sink));
-    try std.testing.expectEqual(@as(usize, 3), fx.sched.slots[0].fed);
+    try std.testing.expectEqual(@as(usize, 3), fx.sched.entries[0].fed);
 
     const rows_before = fx.runner.rows_log_len;
     fx.sched.pinClock(atMs(60));
     try std.testing.expectEqual(Tick.idle, fx.sched.tick(fx.sink));
     fx.drain();
     try std.testing.expectEqual(rows_before, fx.runner.rows_log_len);
-    try std.testing.expectEqual(free_view, viewOf(&fx.sched.slots[0]));
+    try std.testing.expectEqual(free_view, viewOf(&fx.sched.entries[0]));
     try std.testing.expectEqual(@as(u64, 1), fx.sched.lease_expires);
     try std.testing.expectEqual(@as(u64, 1), fx.sched.lease_prefills_cut);
 }
@@ -5783,8 +5798,8 @@ fn refusalOf(fx: *Fixture, conn: u32, sid: u32, body: Request.Body) protocol.Err
     return e.ev.body.err.code;
 }
 
-/// The refusal of a request on a slot whose resume waits.
-fn expectWaitRefusal(e: FakeSink.Entry) !void {
+/// The refusal of a request on an entry whose resume waits.
+fn expectWaitRefusal(e: FakeSink.Seen) !void {
     try std.testing.expectEqual(protocol.ErrorCode.session_busy, e.ev.body.err.code);
     try std.testing.expectEqualStrings(
         "resume in flight",
@@ -5799,7 +5814,7 @@ fn appendInFlight(fx: *Fixture) !u32 {
     _ = try fx.sched.keepLease(sid, 1, 50, tok(7));
     try fx.append(1, sid, &.{.{ .user = "abcd", .assistant = "ef" }});
     _ = fx.sched.tick(fx.sink);
-    std.debug.assert(fx.sched.slots[0].state == .prefill);
+    std.debug.assert(fx.sched.entries[0].state == .prefill);
     return sid;
 }
 
@@ -5823,16 +5838,16 @@ test "lease: a waiting resume refuses each request, ends at idle, and the next o
         refusalOf(&fx, 2, sid, .{ .session_clone = .{ .sampling = protocol.Sampling.greedy } }),
     );
     try expectWaitRefusal(fx.sink.last());
-    try std.testing.expectEqual(SlotState.prefill, fx.sched.slots[0].state);
+    try std.testing.expectEqual(SessionPhase.prefill, fx.sched.entries[0].state);
 
     // The second pass ends the append inside the tick, and the resume ends
     // with it. A generate before the next tick then streams to connection 2.
     _ = fx.sched.tick(fx.sink);
     _ = fx.sched.tick(fx.sink);
-    try std.testing.expectEqual(SlotState.idle, fx.sched.slots[0].state);
+    try std.testing.expectEqual(SessionPhase.idle, fx.sched.entries[0].state);
     try std.testing.expectEqual(
         @as(?TestScheduler.ResumeWait, null),
-        fx.sched.slots[0].resume_wait,
+        fx.sched.entries[0].resume_wait,
     );
     const from = fx.sink.n;
     try fx.generate(2, sid, "x", 2);
@@ -5862,7 +5877,7 @@ test "lease: the client waits for the resume, then generates on the new connecti
     fx.drain();
     try std.testing.expectEqual(seen_before + 1, fx.sink.n);
     try expectResumed(fx.sink.last(), 2, 5, sid, 7, 8);
-    try std.testing.expectEqual(@as(u32, 7), fx.pool.posOf(fx.sched.slots[0].engine_id));
+    try std.testing.expectEqual(@as(u32, 7), fx.pool.posOf(fx.sched.entries[0].engine_id));
     try fx.generate(2, sid, "x", 3);
     fx.drain();
     try std.testing.expectEqualSlices(
@@ -5899,16 +5914,16 @@ test "lease: a takeover mid-turn cuts the turn, keeps the carry, and the old tok
     // The done of the cut turn belonged to connection 1, so it goes. The
     // resume names the cut turn as the last request.
     try std.testing.expectEqual(seen_before + 1, fx.sink.n);
-    try expectResumed(fx.sink.last(), 2, 5, sid, fx.pool.posOf(fx.sched.slots[0].engine_id), 8);
+    try expectResumed(fx.sink.last(), 2, 5, sid, fx.pool.posOf(fx.sched.entries[0].engine_id), 8);
     try std.testing.expectEqual(
         protocol.FinishReason.cancelled,
         fx.sink.last().ev.body.resumed.last.?.finish,
     );
     try std.testing.expectEqual(@as(u32, 9), fx.sink.last().ev.body.resumed.last.?.request_id);
-    const slot = &fx.sched.slots[0];
-    try std.testing.expectEqual(@as(?TestScheduler.ResumeWait, null), slot.resume_wait);
-    try std.testing.expectEqual(@as(?u32, 3), slot.carry);
-    try std.testing.expectEqual(protocol.FinishReason.cancelled, slot.last_done.?.finish);
+    const entry = &fx.sched.entries[0];
+    try std.testing.expectEqual(@as(?TestScheduler.ResumeWait, null), entry.resume_wait);
+    try std.testing.expectEqual(@as(?u32, 3), entry.carry);
+    try std.testing.expectEqual(protocol.FinishReason.cancelled, entry.last_done.?.finish);
     try std.testing.expectError(
         error.NoSuchLease,
         fx.sched.resumeLease(3, 6, tok(7), atMs(6), tok(9)),
@@ -5929,24 +5944,24 @@ test "lease: a second resume takes over a waiting resume" {
     _ = try fx.sched.resumeLease(2, 5, tok(7), atMs(5), tok(8));
     const r = try fx.sched.resumeLease(3, 6, tok(8), atMs(6), tok(9));
     try std.testing.expectEqual(Resumed{ .session_id = sid, .ready = false }, r);
-    try std.testing.expectEqual(@as(u32, 3), fx.sched.slots[0].resume_wait.?.conn);
-    try std.testing.expectEqual(@as(?*TestScheduler.Slot, null), fx.sched.slotByProto(sid, 2));
+    try std.testing.expectEqual(@as(u32, 3), fx.sched.entries[0].resume_wait.?.conn);
+    try std.testing.expectEqual(no_entry, fx.sched.entryByProto(sid, 2));
     try std.testing.expectError(
         error.NoSuchLease,
         fx.sched.resumeLease(2, 7, tok(8), atMs(7), tok(10)),
     );
     fx.drain();
     try std.testing.expectEqual(
-        SlotView{ .owner = .{ .attached = 3 }, .pid = sid, .token = 9, .ttl = 50 },
-        viewOf(&fx.sched.slots[0]),
+        EntryView{ .owner = .{ .attached = 3 }, .pid = sid, .token = 9, .ttl = 50 },
+        viewOf(&fx.sched.entries[0]),
     );
     try std.testing.expectEqual(
         @as(?TestScheduler.ResumeWait, null),
-        fx.sched.slots[0].resume_wait,
+        fx.sched.entries[0].resume_wait,
     );
 }
 
-test "lease: the new connection drops while its resume waits, and the slot detaches again" {
+test "lease: the new connection drops while its resume waits, and the session detaches again" {
     var fx = try leaseFixture(2, 2);
     defer fx.tearDown();
 
@@ -5954,21 +5969,21 @@ test "lease: the new connection drops while its resume waits, and the slot detac
     _ = try fx.sched.resumeLease(2, 5, tok(7), atMs(5), tok(8));
     fx.sched.detachConn(2, atMs(20));
     try std.testing.expectEqual(
-        SlotView{ .owner = .{ .detached = 70 }, .pid = sid, .token = 8, .ttl = 50 },
-        viewOf(&fx.sched.slots[0]),
+        EntryView{ .owner = .{ .detached = 70 }, .pid = sid, .token = 8, .ttl = 50 },
+        viewOf(&fx.sched.entries[0]),
     );
     try std.testing.expectEqual(
         @as(?TestScheduler.ResumeWait, null),
-        fx.sched.slots[0].resume_wait,
+        fx.sched.entries[0].resume_wait,
     );
     fx.drain();
-    try std.testing.expectEqual(SlotState.idle, fx.sched.slots[0].state);
-    try std.testing.expectEqual(@as(u32, 1), fx.sched.slots[0].turns_done);
+    try std.testing.expectEqual(SessionPhase.idle, fx.sched.entries[0].state);
+    try std.testing.expectEqual(@as(u32, 1), fx.sched.entries[0].turns_done);
     const r = try fx.sched.resumeLease(3, 6, tok(8), atMs(30), tok(9));
     try std.testing.expectEqual(Resumed{ .session_id = sid, .ready = true }, r);
 }
 
-test "lease: a shutdown cancels the work of a detached slot and keeps its lease" {
+test "lease: a shutdown cancels the work of a detached session and keeps its lease" {
     var fx = try leaseFixture(2, 2);
     defer fx.tearDown();
 
@@ -5985,15 +6000,15 @@ test "lease: a shutdown cancels the work of a detached slot and keeps its lease"
     );
     try std.testing.expectEqual(HandleResult.shutdown, res);
     // Connection 2 gets its done, connection 0 its ack, and the detached
-    // slot sends nothing.
+    // entry sends nothing.
     for (fx.sink.seen()[seen_before..]) |e| {
         try std.testing.expect(e.conn == 2 or e.conn == 0);
     }
 
-    try std.testing.expectEqual(SlotState.idle, fx.sched.slots[0].state);
+    try std.testing.expectEqual(SessionPhase.idle, fx.sched.entries[0].state);
     try std.testing.expectEqual(
-        SlotView{ .owner = .{ .detached = 60 }, .pid = 1, .token = 7, .ttl = 50 },
-        viewOf(&fx.sched.slots[0]),
+        EntryView{ .owner = .{ .detached = 60 }, .pid = 1, .token = 7, .ttl = 50 },
+        viewOf(&fx.sched.entries[0]),
     );
 }
 
@@ -6005,14 +6020,14 @@ test "lease: a session of the process owner keeps a lease like any other" {
     _ = try fx.sched.keepLease(sid, 0, 50, tok(7));
     fx.sched.detachConn(0, atMs(10));
     try std.testing.expectEqual(
-        SlotView{ .owner = .{ .detached = 60 }, .pid = sid, .token = 7, .ttl = 50 },
-        viewOf(&fx.sched.slots[0]),
+        EntryView{ .owner = .{ .detached = 60 }, .pid = sid, .token = 7, .ttl = 50 },
+        viewOf(&fx.sched.entries[0]),
     );
-    try std.testing.expectEqual(@as(?*TestScheduler.Slot, null), fx.sched.slotByProto(sid, 0));
+    try std.testing.expectEqual(no_entry, fx.sched.entryByProto(sid, 0));
     _ = try fx.sched.resumeLease(5, 5, tok(7), atMs(20), tok(8));
     try std.testing.expectEqual(
-        @as(?*TestScheduler.Slot, &fx.sched.slots[0]),
-        fx.sched.slotByProto(sid, 5),
+        @as(?*TestScheduler.SessionEntry, &fx.sched.entries[0]),
+        fx.sched.entryByProto(sid, 5),
     );
     // The owner keeps the right to stop the server.
     try std.testing.expectEqual(
@@ -6024,7 +6039,7 @@ test "lease: a session of the process owner keeps a lease like any other" {
     );
 }
 
-test "lease: a token that a slot already holds is refused in every build mode" {
+test "lease: a token that a session already holds is refused in every build mode" {
     var fx = try leaseFixture(2, 2);
     defer fx.tearDown();
 
@@ -6033,7 +6048,7 @@ test "lease: a token that a slot already holds is refused in every build mode" {
     _ = try fx.sched.keepLease(s1, 1, 50, tok(7));
     try std.testing.expectError(error.TokenInUse, fx.sched.keepLease(s2, 1, 50, tok(7)));
     try std.testing.expectError(error.TokenInUse, fx.sched.keepLease(s1, 1, 50, tok(7)));
-    try std.testing.expectEqual(@as(?TestScheduler.Lease, null), fx.sched.slots[1].lease);
+    try std.testing.expectEqual(@as(?TestScheduler.Lease, null), fx.sched.entries[1].lease);
     _ = try fx.sched.keepLease(s2, 1, 50, tok(8));
     try std.testing.expectError(
         error.TokenInUse,
@@ -6044,8 +6059,8 @@ test "lease: a token that a slot already holds is refused in every build mode" {
         fx.sched.resumeLease(2, 5, tok(7), atMs(5), tok(7)),
     );
     try std.testing.expectEqual(
-        SlotView{ .owner = .{ .attached = 1 }, .pid = s1, .token = 7, .ttl = 50 },
-        viewOf(&fx.sched.slots[0]),
+        EntryView{ .owner = .{ .attached = 1 }, .pid = s1, .token = 7, .ttl = 50 },
+        viewOf(&fx.sched.entries[0]),
     );
 }
 
@@ -6227,7 +6242,7 @@ test "park: decode rows alone that the engine parks report no work and change no
     try std.testing.expectEqual(events_before, fx.sink.n);
     try std.testing.expectEqual(pos_before, fx.pool.posOf(0));
 
-    // A later credit lets the same turn finish with the whole stream.
+    // A later blob removal lets the same turn finish with the whole stream.
     fx.pool.fail_decode_only = null;
     var iters: u32 = 0;
     while (fx.sched.tick(fx.sink) != .idle) {
@@ -6324,7 +6339,7 @@ test "lease: an open that the engine refuses after a yield reports the lost sess
         protocol.ErrorCode.sessions_exhausted,
         fx.sink.last().ev.body.err.code,
     );
-    try std.testing.expectEqual(SlotState.free, fx.sched.slots[0].state);
+    try std.testing.expectEqual(SessionPhase.free, fx.sched.entries[0].state);
     try std.testing.expectEqual(@as(u64, 1), fx.sched.lease_yields);
     try std.testing.expectEqual(@as(u64, 1), fx.sched.lease_yields_lost);
     try std.testing.expectError(
@@ -6357,9 +6372,9 @@ test "lease: a clone that the engine refuses after a yield reports the lost sess
         "kv ram budget refused the clone",
         refused.detail[0..refused.detail_len],
     );
-    try std.testing.expectEqual(SlotState.free, fx.sched.slots[1].state);
+    try std.testing.expectEqual(SessionPhase.free, fx.sched.entries[1].state);
     try std.testing.expectEqual(@as(u64, 1), fx.sched.lease_yields_lost);
-    try std.testing.expectEqual(SlotState.idle, fx.sched.slots[0].state);
+    try std.testing.expectEqual(SessionPhase.idle, fx.sched.entries[0].state);
 }
 
 // -- wire handler tests -----------------------------------------------------
@@ -6369,7 +6384,7 @@ test "lease: a clone that the engine refuses after a yield reports the lost sess
 // reads each one back from the reply that carries it.
 
 /// Send one request on `conn` and return the last event of the sink.
-fn request(fx: *Fixture, conn: u32, request_id: u32, sid: u32, body: Request.Body) FakeSink.Entry {
+fn request(fx: *Fixture, conn: u32, request_id: u32, sid: u32, body: Request.Body) FakeSink.Seen {
     _ = fx.sched.handle(
         .{ .conn = conn, .request_id = request_id, .session_id = sid, .body = body },
         fx.sink,
@@ -6377,7 +6392,7 @@ fn request(fx: *Fixture, conn: u32, request_id: u32, sid: u32, body: Request.Bod
     return fx.sink.last();
 }
 
-fn expectErr(e: FakeSink.Entry, code: protocol.ErrorCode, detail: []const u8) !void {
+fn expectErr(e: FakeSink.Seen, code: protocol.ErrorCode, detail: []const u8) !void {
     try std.testing.expectEqual(OutEvent.Body.err, std.meta.activeTag(e.ev.body));
     try std.testing.expectEqual(code, e.ev.body.err.code);
     try std.testing.expectEqualStrings(detail, e.ev.body.err.detail[0..e.ev.body.err.detail_len]);
@@ -6446,8 +6461,8 @@ test "wire lease: keep, drop, resume, a replayed token, and an expired token" {
         fx.sink,
     );
     try std.testing.expectEqual(
-        SlotView{ .owner = .{ .detached = 60 }, .pid = sid, .token = kept[0], .ttl = 50 },
-        viewOf(&fx.sched.slots[0]),
+        EntryView{ .owner = .{ .detached = 60 }, .pid = sid, .token = kept[0], .ttl = 50 },
+        viewOf(&fx.sched.entries[0]),
     );
     try expectErr(
         request(&fx, 3, 24, 0, .{ .session_resume = .{ .token = first } }),
@@ -6463,7 +6478,7 @@ test "wire lease: keep, drop, resume, a replayed token, and an expired token" {
     try std.testing.expectEqual(sid, e.ev.session_id);
     const r = e.ev.body.resumed;
     try std.testing.expect(!std.mem.eql(u8, &kept, &r.token));
-    try std.testing.expectEqual(fx.pool.posOf(fx.sched.slots[0].engine_id), r.kv_pos);
+    try std.testing.expectEqual(fx.pool.posOf(fx.sched.entries[0].engine_id), r.kv_pos);
     try std.testing.expectEqual(@as(u32, 1), r.turns_done);
     try std.testing.expectEqual(
         protocol.LastDone{
@@ -6494,7 +6509,7 @@ test "wire lease: keep, drop, resume, a replayed token, and an expired token" {
         .unknown_session,
         "no such lease",
     );
-    try std.testing.expectEqual(SlotState.free, fx.sched.slots[0].state);
+    try std.testing.expectEqual(SessionPhase.free, fx.sched.entries[0].state);
     try std.testing.expectEqual(@as(u64, 1), fx.sched.lease_expires);
 }
 
@@ -6524,7 +6539,7 @@ test "wire lease: resumption off, a zero time to live, a waiting resume, and a f
     const sid = try appendInFlight(&fx);
     // The resume waits for the append, and a keep on it is busy.
     e = request(&fx, 2, 30, 0, .{ .session_resume = .{ .token = tok(7) } });
-    try std.testing.expect(fx.sched.slots[0].resume_wait != null);
+    try std.testing.expect(fx.sched.entries[0].resume_wait != null);
     try expectWaitRefusal(request(&fx, 2, 31, sid, .{ .session_keep = .{ .ttl_ms = 50 } }));
     fx.drain();
     try std.testing.expectEqual(OutEvent.Body.resumed, std.meta.activeTag(fx.sink.last().ev.body));
@@ -6573,7 +6588,7 @@ test "per-turn budget: a request budget forces the close at its count, not at th
         const from = fx.sink.n;
         try generateWith(&fx, 1, sid, "3", 64, null, null, c.budget);
         fx.drain();
-        try std.testing.expectEqual(c.budget, fx.sched.slots[0].think_budget);
+        try std.testing.expectEqual(c.budget, fx.sched.entries[0].think_budget);
         var ids: [16]u32 = undefined;
         var n: usize = 0;
         for (fx.sink.seen()[from..]) |e| {
@@ -6584,16 +6599,16 @@ test "per-turn budget: a request budget forces the close at its count, not at th
 
         try std.testing.expectEqualSlices(u32, c.want, ids[0..n]);
         try std.testing.expectEqual(c.reasoning, fx.sink.last().ev.body.done.reasoning_tokens);
-        try std.testing.expectEqual(c.open_after, fx.sched.slots[0].think_open);
+        try std.testing.expectEqual(c.open_after, fx.sched.entries[0].think_open);
     }
 
     // A turn with no budget takes the server value again.
     try generateWith(&fx, 1, sid, "3", 64, null, null, null);
     fx.drain();
-    try std.testing.expectEqual(@as(u32, 2), fx.sched.slots[0].think_budget);
+    try std.testing.expectEqual(@as(u32, 2), fx.sched.entries[0].think_budget);
 }
 
-test "per-turn switch: the render and the slot read the one resolved value" {
+test "per-turn switch: the render and the session read the one resolved value" {
     var tags = think_tags;
     tags.budget = 0;
     var fx = try Fixture.setUpThink(std.testing.allocator, 65, 0, tags);
@@ -6615,7 +6630,7 @@ test "per-turn switch: the render and the slot read the one resolved value" {
         const from = fx.sink.n;
         try generateWith(&fx, 1, sid, "4", 2, null, c.open, null);
         try std.testing.expectEqual(c.resolved, opens.seen[i]);
-        try std.testing.expectEqual(c.resolved, fx.sched.slots[0].think_open);
+        try std.testing.expectEqual(c.resolved, fx.sched.entries[0].think_open);
         fx.drain();
         try std.testing.expectEqual(c.first, fx.sink.seen()[from].ev.body.token.token_id);
     }
@@ -6635,7 +6650,7 @@ test "per-turn guards: a budget or an open switch needs tags, a closed switch pa
 
     try generateWith(&fx, 1, sid, "4", 4, null, true, null);
     try expectErr(fx.sink.last(), .forbidden, "this model has no think tags");
-    try std.testing.expectEqual(SlotState.idle, fx.sched.slots[0].state);
+    try std.testing.expectEqual(SessionPhase.idle, fx.sched.entries[0].state);
     const from = fx.sink.n;
     try generateWith(&fx, 1, sid, "4", 4, null, false, null);
     fx.drain();
@@ -6669,7 +6684,7 @@ test "per-turn sampling: only reseed restarts the stream, min_p and repetition l
     defer fx.tearDown();
 
     const sid = try fx.openSession(1, "");
-    const eid = fx.sched.slots[0].engine_id;
+    const eid = fx.sched.entries[0].engine_id;
     // A sampled turn moves the stream of the open seed 0.
     var hot = protocol.Sampling.greedy;
     hot.temperature = 1;
@@ -6707,7 +6722,7 @@ test "per-turn sampling: a refused turn leaves the params and the stream of the 
     defer fx.tearDown();
 
     const sid = try fx.openSession(1, "");
-    const eid = fx.sched.slots[0].engine_id;
+    const eid = fx.sched.entries[0].engine_id;
     const params = fx.pool.table[eid].params;
     const rng = fx.pool.table[eid].rng.s;
     var s = protocol.Sampling.greedy;
@@ -6740,14 +6755,14 @@ test "frequency penalty: a nonzero value fails the request, and the session live
         .forbidden,
         "frequency_penalty is not supported",
     );
-    try std.testing.expectEqual(SlotState.free, fx.sched.slots[0].state);
+    try std.testing.expectEqual(SessionPhase.free, fx.sched.entries[0].state);
     const sid = try fx.openSession(1, "");
     try expectErr(
         request(&fx, 1, 21, sid, .{ .session_clone = .{ .sampling = s } }),
         .forbidden,
         "frequency_penalty is not supported",
     );
-    try std.testing.expectEqual(SlotState.free, fx.sched.slots[1].state);
+    try std.testing.expectEqual(SessionPhase.free, fx.sched.entries[1].state);
     try std.testing.expectEqual(@as(?u32, null), fx.sink.disconnected);
     // The session still streams on the same connection.
     const t = try runTurn(&fx, 1, sid, "x", 2);
@@ -6760,14 +6775,14 @@ test "wire lease: a close on a waiting resume is busy, and the close after the r
 
     const sid = try appendInFlight(&fx);
     _ = request(&fx, 2, 30, 0, .{ .session_resume = .{ .token = tok(7) } });
-    try std.testing.expect(fx.sched.slots[0].resume_wait != null);
+    try std.testing.expect(fx.sched.entries[0].resume_wait != null);
     try expectWaitRefusal(request(&fx, 2, 31, sid, .session_close));
-    try std.testing.expect(fx.sched.slots[0].state != .free);
+    try std.testing.expect(fx.sched.entries[0].state != .free);
     fx.drain();
     try std.testing.expectEqual(OutEvent.Body.resumed, std.meta.activeTag(fx.sink.last().ev.body));
     const e = request(&fx, 2, 32, sid, .session_close);
     try std.testing.expectEqual(OutEvent.Body.session_closed, std.meta.activeTag(e.ev.body));
-    try std.testing.expectEqual(SlotState.free, fx.sched.slots[0].state);
+    try std.testing.expectEqual(SessionPhase.free, fx.sched.entries[0].state);
 }
 
 test "wire lease: a drop before the resume reply strands the lease until its time to live" {
@@ -6780,8 +6795,8 @@ test "wire lease: a drop before the resume reply strands the lease until its tim
     // drops at 20, before the `resumed` reply goes out.
     fx.sched.pinClock(atMs(10));
     _ = request(&fx, 2, 30, 0, .{ .session_resume = .{ .token = tok(7) } });
-    try std.testing.expect(fx.sched.slots[0].resume_wait != null);
-    const rotated = fx.sched.slots[0].lease.?.token;
+    try std.testing.expect(fx.sched.entries[0].resume_wait != null);
+    const rotated = fx.sched.entries[0].lease.?.token;
     try std.testing.expect(!std.mem.eql(u8, &rotated, &tok(7)));
     fx.sched.pinClock(atMs(20));
     _ = fx.sched.handle(
@@ -6790,7 +6805,7 @@ test "wire lease: a drop before the resume reply strands the lease until its tim
     );
     const seen = fx.sink.n;
     fx.drain();
-    // No client holds a valid token: the old one is spent, and the new one
+    // No client holds a valid token: the old one is no longer valid, and the new one
     // never left the server.
     try std.testing.expectEqual(seen, fx.sink.n);
     try expectErr(
@@ -6799,15 +6814,15 @@ test "wire lease: a drop before the resume reply strands the lease until its tim
         "no such lease",
     );
     try std.testing.expectEqual(
-        SlotView{ .owner = .{ .detached = 70 }, .pid = sid, .token = rotated[0], .ttl = 50 },
-        viewOf(&fx.sched.slots[0]),
+        EntryView{ .owner = .{ .detached = 70 }, .pid = sid, .token = rotated[0], .ttl = 50 },
+        viewOf(&fx.sched.entries[0]),
     );
-    // The slot holds until its time to live ends, then frees.
+    // The entry holds until its time to live ends, then frees.
     fx.sched.expireDetached(atMs(69));
-    try std.testing.expect(fx.sched.slots[0].state != .free);
+    try std.testing.expect(fx.sched.entries[0].state != .free);
     fx.sched.pinClock(atMs(70));
     _ = fx.sched.tick(fx.sink);
-    try std.testing.expectEqual(free_view, viewOf(&fx.sched.slots[0]));
+    try std.testing.expectEqual(free_view, viewOf(&fx.sched.entries[0]));
     try std.testing.expectEqual(@as(u64, 1), fx.sched.lease_expires);
 }
 
@@ -6825,7 +6840,7 @@ const trace_ttl_max_ms = 100;
 
 /// What the trace knows of one session from the wire alone: the token the
 /// client holds, the lease it asked for, and the deadline that its own clock
-/// implies. It reads no slot of the scheduler under test.
+/// implies. It reads no entry of the scheduler under test.
 const SessionModel = struct {
     /// The connection that owns the session, or null when it is detached.
     conn: ?u32 = null,
@@ -6837,7 +6852,7 @@ const SessionModel = struct {
     gone: bool = false,
     /// The `session_opened` reply came. A guessed id can name a session in its opening prefill.
     opened: bool = false,
-    /// Open requests at the detach. A later open can take the slot, so the model cannot tell.
+    /// Open requests at the detach. A later open can take the entry, so the model cannot tell.
     opens_at_detach: u32 = 0,
     /// The `kv_pos` of the last `resumed` reply.
     last_pos: u64 = 0,
@@ -6857,7 +6872,7 @@ const LeaseTrace = struct {
     n_sids: usize = 0,
     /// The connection of each request, to name the owner of an opened session.
     req_conn: [trace_steps]u32 = @splat(0),
-    /// An open holds a slot until its `session_opened`, so it counts against the share.
+    /// An open holds an entry until its `session_opened`, so it counts against the share.
     open_pending: [trace_steps]bool = @splat(false),
     n_opens: u32 = 0,
     /// The session that a resume with a live token must reach.
@@ -7076,12 +7091,12 @@ const LeaseTrace = struct {
         t.fx.sched.pinClock(atMs(ms));
     }
 
-    /// The earliest deadline of a detached slot.
+    /// The earliest deadline of a detached entry.
     fn earliestDeadline(t: *const LeaseTrace) ?i64 {
         var best: ?i64 = null;
-        for (t.fx.sched.slots) |*slot| {
-            if (slot.state == .free or slot.owner != .detached) continue;
-            const d = slot.owner.detached.raw.toMilliseconds();
+        for (t.fx.sched.entries) |*entry| {
+            if (entry.state == .free or entry.owner != .detached) continue;
+            const d = entry.owner.detached.raw.toMilliseconds();
             if (best == null or d < best.?) {
                 best = @intCast(d);
             }
@@ -7090,13 +7105,13 @@ const LeaseTrace = struct {
         return best;
     }
 
-    /// The live sessions fit the slots, and no connection holds more than
-    /// its share. No token and no session id sits on two slots. A free slot
-    /// holds nothing, and a detached slot holds a lease.
+    /// The live sessions fit the entries, and no connection holds more than
+    /// its share. No token and no session id sits on two entries. A free entry
+    /// holds nothing, and a detached entry holds a lease.
     fn expectTable(t: *const LeaseTrace) !void {
-        const slots = t.fx.sched.slots;
+        const entries = t.fx.sched.entries;
         var live: usize = 0;
-        for (slots, 0..) |*a, i| {
+        for (entries, 0..) |*a, i| {
             if (a.state == .free) {
                 try std.testing.expect(a.lease == null);
                 try std.testing.expectEqual(@as(u32, 0), a.proto_id);
@@ -7110,7 +7125,7 @@ const LeaseTrace = struct {
 
             if (a.owner == .attached) {
                 var share: usize = 0;
-                for (slots) |*b| {
+                for (entries) |*b| {
                     share += @intFromBool(
                         b.state != .free and b.owner == .attached and b.owner.attached ==
                             a.owner.attached,
@@ -7120,7 +7135,7 @@ const LeaseTrace = struct {
                 try std.testing.expect(share <= t.fx.sched.cfg.sessions_per_connection);
             }
 
-            for (slots[i + 1 ..]) |*b| {
+            for (entries[i + 1 ..]) |*b| {
                 if (b.state == .free) continue;
                 try std.testing.expect(a.proto_id != b.proto_id);
                 if (a.lease != null and b.lease != null) {
@@ -7132,7 +7147,7 @@ const LeaseTrace = struct {
         try std.testing.expect(live <= t.fx.sched.cfg.max_sessions);
     }
 
-    /// One tick, then no detached slot sits at or past its deadline.
+    /// One tick, then no detached entry sits at or past its deadline.
     fn tickOnce(t: *LeaseTrace) !void {
         _ = t.fx.sched.tick(t.fx.sink);
         if (t.earliestDeadline()) |d| {
@@ -7143,16 +7158,16 @@ const LeaseTrace = struct {
     /// A drop detaches each kept session of `conn`, with a deadline of its time to live after the
     /// clock. It frees each other session of `conn`.
     fn drop(t: *LeaseTrace, k: usize) !void {
-        // Record what each slot of the connection holds.
+        // Record what each entry of the connection holds.
         const conn = t.conns[k];
-        const slots = t.fx.sched.slots;
+        const entries = t.fx.sched.entries;
         var kept: [limits.max_vram_slots]?u32 = @splat(null);
-        for (slots, 0..) |*slot, i| {
-            if (slot.state == .free or slot.owner != .attached or slot.owner.attached != conn) {
+        for (entries, 0..) |*entry, i| {
+            if (entry.state == .free or entry.owner != .attached or entry.owner.attached != conn) {
                 continue;
             }
 
-            kept[i] = if (slot.lease) |l| l.ttl_ms else 0;
+            kept[i] = if (entry.lease) |l| l.ttl_ms else 0;
         }
 
         // Drop the connection. A session without a lease frees, even in its opening prefill.
@@ -7180,16 +7195,16 @@ const LeaseTrace = struct {
             }
         }
 
-        // Each kept slot detached at its deadline, and every other slot is free.
-        for (slots, 0..) |*slot, i| {
+        // Each kept entry detached at its deadline, and every other entry is free.
+        for (entries, 0..) |*entry, i| {
             const ttl = kept[i] orelse continue;
             if (ttl == 0) {
-                try std.testing.expectEqual(SlotState.free, slot.state);
+                try std.testing.expectEqual(SessionPhase.free, entry.state);
             } else {
-                try std.testing.expect(slot.owner == .detached);
+                try std.testing.expect(entry.owner == .detached);
                 try std.testing.expectEqual(
                     t.now + @as(i64, ttl),
-                    slot.owner.detached.raw.toMilliseconds(),
+                    entry.owner.detached.raw.toMilliseconds(),
                 );
             }
         }
@@ -7200,9 +7215,9 @@ const LeaseTrace = struct {
     }
 };
 
-/// A random wire trace keeps the lease table and the streams sound. Live sessions fit the slots and
-/// the shares. No token sits on two slots, and no token event follows a finish. Every lease ends
-/// within its time to live plus one tick.
+/// A random wire trace keeps the lease table and the streams sound. Live sessions fit the entries
+/// and the shares. No token sits on two entries, and no token event follows a finish. Every lease
+/// ends within its time to live plus one tick.
 fn checkLeaseTrace(_: void, seed: u64) anyerror!void {
     var prng = std.Random.DefaultPrng.init(seed);
     const r = prng.random();

@@ -18,7 +18,7 @@
 //!   ropeInplace                       CPU. One dispatch per head, 32 per layer,
 //!                                     costs more than the CPU microseconds.
 //!   linearF32                         CPU. Only the small f32 norm weights.
-//!   rmsnorm, swiglu, residualAdd,     GPU. The heavy ops that repay a dispatch.
+//!   rmsnorm, swiglu, residualAdd,     GPU. The heavy ops that justify a dispatch.
 //!   attentionSingle, linearF32Q80
 //!
 //! Globals. These globals are deliberate, because the engine otherwise keeps none. They hold the

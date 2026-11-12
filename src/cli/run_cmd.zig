@@ -6,7 +6,7 @@
 //! Comptime. `inline else` turns the architecture into a family row once, so the rest is generic.
 //!
 //! Placement. No `--gpu-layers` flag runs the whole-model fused path. A zero pin runs the CPU
-//! runner with no device context. A pin of one layer or more, or auto, prices a split. A split with
+//! runner with no device context. A pin of one layer or more, or auto, sizes a split. A split with
 //! no GPU layer comes back to the CPU runner.
 //!
 //! Prompt cache. `--prompt-cache` applies to the whole-model qwen35 fused path only. A scripted
@@ -313,7 +313,7 @@ fn runHost(
 
     std.debug.assert(plan.window == window.base);
 
-    // Start the per-op backend, and quote the RAM.
+    // Start the per-op backend, and plan the RAM.
     if (comptime per_op_build) {
         try vulkan_ops_wrap.initBackend(ctx.arena, ctx.vk_options);
     }
@@ -326,7 +326,7 @@ fn runHost(
         boot_lines.logSessionWindow(window);
     }
 
-    try boot_resources.hostQuote(ctx.io, &b.device, b.kvDtype(), window, placement);
+    try boot_resources.hostRamPlan(ctx.io, &b.device, b.kvDtype(), window, placement);
 
     // Build the runner. One prompt chunk of slot 0 is the most rows a step holds.
     const t_init = Io.Clock.Timestamp.now(ctx.io, .awake);
@@ -421,7 +421,7 @@ fn attemptDevice(comptime Family: type, t: *const Turn, pin: ?u32) !boot_resourc
     };
 
     if (placement == .fused) {
-        // The split funds the whole model. The clamp logged, so it does not repeat.
+        // The split holds the whole model. The clamp logged, so it does not repeat.
         const t_init = logFusedInit(ctx.io);
         try runFusedOn(Family, t, ctxp, placement.fused, t_init);
         return .done;
@@ -448,7 +448,7 @@ fn attemptDevice(comptime Family: type, t: *const Turn, pin: ?u32) !boot_resourc
     }
 }
 
-/// The hybrid runner at a resolved split. The placement already prices the KV at the window.
+/// The hybrid runner at a resolved split. The placement already sizes the KV at the window.
 fn runHybrid(
     comptime Family: type,
     t: *const Turn,
@@ -458,8 +458,8 @@ fn runHybrid(
     const b = t.boot;
     const ctx = b.ctx;
 
-    switch (h.quote) {
-        .ok => |q| boot_lines.logRamQuote(q, false),
+    switch (h.ram_plan) {
+        .ok => |q| boot_lines.logRamPlan(q, false),
         .refused => |r| return boot_lines.refuse(ctx.io, b.model.pub_name, r),
     }
 

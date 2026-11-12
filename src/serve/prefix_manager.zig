@@ -3,8 +3,8 @@
 //! position-zero prefix is offered back as a new entry. Every path is best-effort: a refusal or a
 //! failure degrades to a cold prefill.
 //!
-//! Boundary with the scheduler. The scheduler keeps every engine call whose result a slot's state
-//! machine consumes (`restorePrefix` and `restoreReady` drive `slot.fed`, `endPrefill`, and
+//! Boundary with the scheduler. The scheduler keeps every engine call whose result the phase of a
+//! session entry consumes (`restorePrefix` and `restoreReady` drive `entry.fed`, `endPrefill`, and
 //! `acceptToken`). This module keeps every engine call whose result only the cache consumes
 //! (`snapshotBytesFor`, `snapshotPrefix`, and `copyFinalLogits` travel with the insert body).
 //!
@@ -26,7 +26,7 @@
 //! the engine still holds them. An exact-duplicate prompt then needs zero forward rows. An
 //! opening turn stores none. A failed logits allocation downgrades the entry to restore-only.
 //!
-//! Lifetime. A `Hit` points into the cache entry. The caller must spend it before the next insert
+//! Lifetime. A `Hit` points into the cache entry. The caller must use it before the next insert
 //! reallocates the RAM list. The strings of `CacheConfig.dir` and `preload` must outlive the
 //! manager.
 //!
@@ -81,7 +81,8 @@ const Hit = struct {
 /// `rows` restores a prefix, and the suffix still needs the engine.
 pub const Restore = union(enum) { miss, ready: Hit, rows: Hit };
 
-/// The slot values an insert reads, stated as a value because the scheduler owns the slot.
+/// The values of a session entry that an insert reads. The scheduler owns the entry, so they
+/// cross as a value.
 const Candidate = struct {
     engine_id: u32,
     proto_id: u32,
@@ -227,7 +228,7 @@ pub const PrefixManager = struct {
         const buf = self.gpa.alloc(u8, bytes) catch return;
         defer self.gpa.free(buf);
 
-        // Time the copy alone, because a hit never pays this transient allocation.
+        // Time the copy alone, because a hit never makes this transient allocation.
         const t_copy = Io.Clock.Timestamp.now(self.io, .awake);
         pool.snapshotPrefix(c.engine_id, n, buf) catch |err| {
             log.debug("prefix snapshot failed: session {d}: {t}", .{ c.proto_id, err });

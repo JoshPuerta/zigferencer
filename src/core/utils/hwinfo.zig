@@ -18,7 +18,7 @@
 //!     cpuid runs.
 //!   - `/proc/cpuinfo` (Linux, best effort) for the CPU model name.
 //!   - `/proc/meminfo` (Linux) for total RAM, and for the available RAM that
-//!     the RAM quote reads.
+//!     the RAM plan reads.
 //!   - `std.Thread.getCpuCount` for online cores.
 
 const std = @import("std");

@@ -405,7 +405,7 @@ pub fn expectSameStream(expected: Stream, actual: Stream) !void {
 /// The vocab of the canned-logits runner, built from GGUF values. The prompt "d" is id 3, so a
 /// greedy reply samples the plain "e", a control token, a user-defined tag, and the control end.
 pub fn controlVocab(arena: Allocator) !vocab_mod.Vocab {
-    const kvs = [_]parser.Kv{
+    const metadata = [_]parser.MetadataPair{
         .{ .key = "tokenizer.ggml.tokens", .value = .{ .array = .{ .strings = &control_tokens } } },
         .{ .key = "tokenizer.ggml.merges", .value = .{ .array = .{ .strings = &.{} } } },
         .{ .key = "tokenizer.ggml.token_type", .value = .{ .array = .{ .i32s = &control_types } } },
@@ -413,7 +413,7 @@ pub fn controlVocab(arena: Allocator) !vocab_mod.Vocab {
     };
     const parsed: parser.Parsed = .{
         .header = undefined,
-        .kvs = &kvs,
+        .metadata = &metadata,
         .tensors = &.{},
         .data_offset = 0,
         .alignment = 1,

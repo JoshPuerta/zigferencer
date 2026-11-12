@@ -38,7 +38,7 @@
 //!
 //! Namespaces. `model_fp` names the namespace of every file a cache writes, and `disk_budget`
 //! bounds that namespace alone. Many models and processes can share one directory. A scan skips a
-//! foreign file silently, spends none of the bound on it, and never counts or deletes it. A file
+//! foreign file silently, uses none of the bound on it, and never counts or deletes it. A file
 //! that fails to open, to read, or to stat skips both roles, so one transient IO error never
 //! makes a namespace look small enough to keep growing.
 //!
@@ -115,7 +115,7 @@ const Entry = struct {
     n: u32, // prefix length (== tokens.len), the restore position
     blob: []u8, // owned snapshot bytes (opaque to the cache)
     last_logits: []f32, // owned, logits of token n-1 (sample first output, 0 forwards)
-    last_used: u64, // LRU tick
+    last_used: u64, // LRU clock
     hits: u64 = 0, // longest-prefix queries served
 };
 
@@ -129,7 +129,8 @@ pub const PromptCache = struct {
     gpa: Allocator,
     budget_bytes: usize, // RAM tier byte budget
     used_bytes: usize,
-    tick: u64,
+    /// The LRU clock. Each lookup hit and each insert takes the next value.
+    lru_clock: u64,
     entries: std.ArrayList(Entry),
     // Disk tier. A null `dir` means RAM-only.
     io: ?Io = null,
@@ -150,7 +151,7 @@ pub const PromptCache = struct {
             .gpa = gpa,
             .budget_bytes = budget_bytes,
             .used_bytes = 0,
-            .tick = 0,
+            .lru_clock = 0,
             .entries = .empty,
         };
     }
@@ -196,15 +197,15 @@ pub const PromptCache = struct {
 
     // -- lookup -------------------------------------------------------------
 
-    /// Find the entry for `key` whose stored tokens equal `tokens`, and bump its LRU tick.
+    /// Find the entry for `key` whose stored tokens equal `tokens`, and bump its LRU clock.
     /// A RAM miss tries the disk tier and promotes a hit. `last_hit_from_disk` records the tier.
     /// Null means a miss.
     pub fn lookup(self: *PromptCache, key: u64, tokens: []const u32) ?*const Entry {
         self.last_hit_from_disk = false;
         for (self.entries.items) |*e| {
             if (e.key == key and std.mem.eql(u32, e.tokens, tokens)) {
-                self.tick += 1;
-                e.last_used = self.tick;
+                self.lru_clock += 1;
+                e.last_used = self.lru_clock;
                 log.debug("ram hit: key {x:0>16}, {d} tokens restored", .{ key, e.n });
                 return e;
             }
@@ -246,7 +247,7 @@ pub const PromptCache = struct {
     }
 
     /// Return the entry with the largest `n` whose tokens equal `tokens[0..n]`, and bump its
-    /// LRU tick. The scan covers the RAM tier and the disk index, and promotes a longer disk
+    /// LRU clock. The scan covers the RAM tier and the disk index, and promotes a longer disk
     /// prefix. Null means no candidate.
     pub fn lookupBestPrefix(self: *PromptCache, tokens: []const u32) ?*const Entry {
         self.last_hit_from_disk = false;
@@ -283,8 +284,8 @@ pub const PromptCache = struct {
             log.debug("miss: best prefix of {d} tokens", .{tokens.len});
             return null;
         };
-        self.tick += 1;
-        hit.last_used = self.tick;
+        self.lru_clock += 1;
+        hit.last_used = self.lru_clock;
         hit.hits += 1;
         log.debug("ram hit: key {x:0>16}, {d} tokens restored", .{ hit.key, hit.n });
         return hit;
@@ -339,7 +340,7 @@ pub const PromptCache = struct {
         while (it.next(io) catch null) |entry| {
             if (entry.kind != .file or !std.mem.endsWith(u8, entry.name, ".zkv")) continue;
 
-            // Check the fingerprint before the cap, so a foreign file spends no capacity.
+            // Check the fingerprint before the cap, so a foreign file uses no capacity.
             const tokens = (self.readOwnTokens(io, entry.name) catch continue) orelse continue;
             if (self.disk_index.items.len >= limits.serve_prefix_disk_index_max) {
                 self.gpa.free(tokens);
@@ -504,8 +505,8 @@ pub const PromptCache = struct {
             if (!self.evictLru()) break;
         }
 
-        self.tick += 1;
-        e.last_used = self.tick;
+        self.lru_clock += 1;
+        e.last_used = self.lru_clock;
         self.entries.append(self.gpa, e) catch |err| {
             self.freeEntry(&e);
             return err;
@@ -724,7 +725,7 @@ const CacheModel = struct {
     entries: [model_cap]ModelEntry = undefined,
     len: usize = 0,
     used: usize = 0,
-    tick: u64 = 0,
+    lru_clock: u64 = 0,
     budget: usize,
 
     fn find(m: *const CacheModel, tokens: []const u32) ?usize {
@@ -750,12 +751,12 @@ const CacheModel = struct {
         }
 
         std.debug.assert(m.len < model_cap);
-        m.tick += 1;
+        m.lru_clock += 1;
         var e: ModelEntry = .{
             .tokens = undefined,
             .n = @intCast(tokens.len),
             .bytes = bytes,
-            .last_used = m.tick,
+            .last_used = m.lru_clock,
         };
         @memcpy(e.tokens[0..tokens.len], tokens);
         m.entries[m.len] = e;
@@ -776,8 +777,8 @@ const CacheModel = struct {
         }
 
         if (best) |i| {
-            m.tick += 1;
-            m.entries[i].last_used = m.tick;
+            m.lru_clock += 1;
+            m.entries[i].last_used = m.lru_clock;
         }
 
         return best;
@@ -825,7 +826,7 @@ pub fn parseImage(bytes: []const u8, model_fp: u64) ImageError!Image {
 
 /// Refuse a snapshot of no rows, or of more rows than a runner of `max_rows` positions holds. A
 /// cache file can hold either, so the caller treats the refusal as a miss. Call it before the
-/// caller prices the blob of `n_rows` rows.
+/// caller sizes the blob of `n_rows` rows.
 pub fn checkRows(n_rows: u32, max_rows: u32) error{SnapshotMismatch}!void {
     if (n_rows >= 1 and n_rows <= max_rows) return;
 
@@ -1491,8 +1492,8 @@ fn checkPromptCache(_: void, seed: u64) anyerror!void {
                 const got = cache.lookup(prefixKey(fp, tokens), tokens);
                 try std.testing.expectEqual(want == null, got == null);
                 if (want) |i| {
-                    model.tick += 1;
-                    model.entries[i].last_used = model.tick;
+                    model.lru_clock += 1;
+                    model.entries[i].last_used = model.lru_clock;
                 }
             },
         }

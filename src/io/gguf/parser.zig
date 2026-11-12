@@ -41,7 +41,8 @@ pub const Error = error{
     NameTooLong,
     BadAlignment,
     BadTensorDims,
-    /// A header count (kv, tensor, or array length) is larger than the remaining bytes can hold.
+    /// A header count (metadata, tensor, or array length) is larger than the remaining bytes can
+    /// hold.
     CountExceedsFile,
     /// Tensor offsets do not rise monotonically. The loader needs that order.
     TensorOffsetsUnordered,
@@ -97,7 +98,8 @@ pub const Array = union(enum) {
     f64s: []const f64,
 };
 
-pub const Kv = struct {
+/// One `gguf_metadata_kv_t` of the spec: a key and its typed value.
+pub const MetadataPair = struct {
     key: []const u8,
     value: Value,
 };
@@ -115,12 +117,12 @@ pub const TensorInfo = struct {
 const Header = struct {
     version: u32,
     tensor_count: u64,
-    kv_count: u64,
+    metadata_kv_count: u64,
 };
 
 pub const Parsed = struct {
     header: Header,
-    kvs: []const Kv,
+    metadata: []const MetadataPair,
     tensors: []const TensorInfo,
     /// Absolute byte offset where the tensor data blob starts. It is a
     /// multiple of `alignment`.
@@ -206,15 +208,18 @@ pub fn parse(arena: Allocator, bytes: []const u8) Error!Parsed {
     if (version != supported_version) return error.UnsupportedVersion;
 
     const tensor_count = try r.read(u64);
-    const kv_count = try r.read(u64);
-    log.debug("header: v{d}, {d} tensors, {d} kv", .{ version, tensor_count, kv_count });
+    const pair_count = try r.read(u64);
+    log.debug(
+        "header: v{d}, {d} tensors, {d} metadata pairs",
+        .{ version, tensor_count, pair_count },
+    );
 
-    // Read the metadata pairs.
-    try r.boundCount(kv_count, 13); // floor per Kv: 8 (key len) + 4 (value type) + 1 (value)
-    const kvs = try arena.alloc(Kv, @intCast(kv_count));
-    for (kvs) |*kv| {
-        kv.key = try r.readString();
-        kv.value = try readValue(&r, arena);
+    // Read the metadata pairs. The floor per pair: 8 (key length) + 4 (value type) + 1 (value).
+    try r.boundCount(pair_count, 13);
+    const metadata = try arena.alloc(MetadataPair, @intCast(pair_count));
+    for (metadata) |*pair| {
+        pair.key = try r.readString();
+        pair.value = try readValue(&r, arena);
     }
 
     // Read the tensor table.
@@ -247,9 +252,9 @@ pub fn parse(arena: Allocator, bytes: []const u8) Error!Parsed {
 
     // Find the alignment and check each tensor offset against it.
     var alignment: u64 = default_alignment;
-    for (kvs) |kv| {
-        if (std.mem.eql(u8, kv.key, "general.alignment")) {
-            alignment = switch (kv.value) {
+    for (metadata) |pair| {
+        if (std.mem.eql(u8, pair.key, "general.alignment")) {
+            alignment = switch (pair.value) {
                 .u32_val => |u| u,
                 .u64_val => |u| u,
                 else => return error.BadAlignment,
@@ -275,12 +280,19 @@ pub fn parse(arena: Allocator, bytes: []const u8) Error!Parsed {
     // Skip the padding to the start of the tensor data.
     const pad = (alignment - (r.pos % alignment)) % alignment;
     try r.skip(std.math.cast(usize, pad) orelse return error.Truncated);
-    log.debug("parsed: kv done, tensor table done, data at {d} (align {d})", .{ r.pos, alignment });
+    log.debug(
+        "parsed: metadata done, tensor table done, data at {d} (align {d})",
+        .{ r.pos, alignment },
+    );
     std.debug.assert(r.pos % alignment == 0);
 
     return .{
-        .header = .{ .version = version, .tensor_count = tensor_count, .kv_count = kv_count },
-        .kvs = kvs,
+        .header = .{
+            .version = version,
+            .tensor_count = tensor_count,
+            .metadata_kv_count = pair_count,
+        },
+        .metadata = metadata,
         .tensors = tensors,
         .data_offset = r.pos,
         .alignment = alignment,
@@ -446,8 +458,8 @@ test "magic bytes" {
 }
 
 test "hardening: a header count larger than the file is rejected before allocating" {
-    // tensor_count=0, kv_count=2^40, no body: the count cannot fit in 0 trailing
-    // bytes, so `parse` rejects it early instead of trying to alloc ~2^40 Kvs.
+    // tensor_count=0, metadata_kv_count=2^40, no body: the count cannot fit in 0 trailing
+    // bytes, so `parse` rejects it early instead of trying to alloc ~2^40 pairs.
     var buf: [24]u8 = undefined;
     @memcpy(buf[0..4], "GGUF");
     std.mem.writeInt(u32, buf[4..8], supported_version, .little);
@@ -467,7 +479,7 @@ test "hardening: unordered tensor offsets are a typed error, not a panic" {
     try list.appendSlice(al, "GGUF");
     try tInt(al, &list, u32, supported_version);
     try tInt(al, &list, u64, 2); // tensor_count
-    try tInt(al, &list, u64, 0); // kv_count
+    try tInt(al, &list, u64, 0); // metadata_kv_count
     inline for (.{ .{ "a", 100 }, .{ "b", 50 } }) |t| { // second offset < first
         try tInt(al, &list, u64, @as(u64, t[0].len));
         try list.appendSlice(al, t[0]);
@@ -480,9 +492,9 @@ test "hardening: unordered tensor offsets are a typed error, not a panic" {
     try std.testing.expectError(error.TensorOffsetsUnordered, parse(arena.allocator(), list.items));
 }
 
-/// A small valid GGUF: three kvs (the alignment, a string, a string array),
+/// A small valid GGUF: three metadata pairs (the alignment, a string, a string array),
 /// two tensors, and a data blob. The `table_end` bytes before the padding are
-/// the header, the kv section, and the tensor table.
+/// the header, the metadata section, and the tensor table.
 pub const Sample = struct {
     /// The loader views f32 tensor data in place, so the buffer keeps the
     /// file alignment that a page-aligned map gives.
@@ -501,19 +513,19 @@ pub fn sampleGguf() !Sample {
     list.appendSliceAssumeCapacity("GGUF");
     try tInt(al, &list, u32, supported_version);
     try tInt(al, &list, u64, 2); // tensor_count
-    try tInt(al, &list, u64, 3); // kv_count
-    const kv_strings = [_][]const u8{ "general.alignment", "general.name", "tok.list" };
-    try tInt(al, &list, u64, kv_strings[0].len);
-    list.appendSliceAssumeCapacity(kv_strings[0]);
+    try tInt(al, &list, u64, 3); // metadata_kv_count
+    const key_strings = [_][]const u8{ "general.alignment", "general.name", "tok.list" };
+    try tInt(al, &list, u64, key_strings[0].len);
+    list.appendSliceAssumeCapacity(key_strings[0]);
     try tInt(al, &list, u32, @intFromEnum(ValueType.u32));
     try tInt(al, &list, u32, 16);
-    try tInt(al, &list, u64, kv_strings[1].len);
-    list.appendSliceAssumeCapacity(kv_strings[1]);
+    try tInt(al, &list, u64, key_strings[1].len);
+    list.appendSliceAssumeCapacity(key_strings[1]);
     try tInt(al, &list, u32, @intFromEnum(ValueType.string));
     try tInt(al, &list, u64, 3);
     list.appendSliceAssumeCapacity("abc");
-    try tInt(al, &list, u64, kv_strings[2].len);
-    list.appendSliceAssumeCapacity(kv_strings[2]);
+    try tInt(al, &list, u64, key_strings[2].len);
+    list.appendSliceAssumeCapacity(key_strings[2]);
     try tInt(al, &list, u32, @intFromEnum(ValueType.array));
     try tInt(al, &list, u32, @intFromEnum(ValueType.string));
     try tInt(al, &list, u64, 2);
@@ -564,9 +576,9 @@ fn expectParseInside(bytes: []const u8) !void {
     try std.testing.expect(p.data_offset <= bytes.len);
     try std.testing.expect(std.math.isPowerOfTwo(p.alignment));
     try std.testing.expectEqual(@as(u64, 0), p.data_offset % p.alignment);
-    for (p.kvs) |kv| {
-        try std.testing.expect(inside(bytes, kv.key));
-        switch (kv.value) {
+    for (p.metadata) |pair| {
+        try std.testing.expect(inside(bytes, pair.key));
+        switch (pair.value) {
             .string => |s| try std.testing.expect(inside(bytes, s)),
             .array => |a| if (a == .strings) for (a.strings) |s| try std.testing.expect(
                 inside(bytes, s),
@@ -657,7 +669,7 @@ test "hardening: a key length of maxInt(u64) is a typed error, not an overflow" 
     @memcpy(bytes[0..4], "GGUF");
     std.mem.writeInt(u32, bytes[4..8], supported_version, .little);
     std.mem.writeInt(u64, bytes[24..32], std.math.maxInt(u64), .little);
-    std.mem.writeInt(u64, bytes[16..24], 1, .little); // kv_count
+    std.mem.writeInt(u64, bytes[16..24], 1, .little); // metadata_kv_count
     try std.testing.expectError(error.Truncated, parse(arena.allocator(), &bytes));
 }
 

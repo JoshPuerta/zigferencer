@@ -42,8 +42,8 @@ the major values:
 | --- | --- | --- | --- | --- |
 | `Tensor` | `tensor.zig` | A `GgmlType`, a shape, and a borrowed byte view | `io/gguf/loader` | `ops/`, `ops_vulkan/`, `runtime/` |
 | `Model` | `registry.zig` | The paths, a `chat.Kind`, and the default `KvDtype` | The static table | `cli/`, `io/` |
-| `KvPlan` | `kv_budget.zig` | The slots, the window, and the VRAM and RAM spend | `kvPlan` | `resolve/`, `runtime/`, `cli/` |
-| `LayerSplit` | `kv_budget.zig` | A layer split and its spend | `planLayerSplit` | `resolve/`, the hybrid runners |
+| `KvPlan` | `kv_budget.zig` | The slots, the window, and the VRAM and RAM bytes | `kvPlan` | `resolve/`, `runtime/`, `cli/` |
+| `LayerSplit` | `kv_budget.zig` | A layer split and the bytes of each side | `planLayerSplit` | `resolve/`, the hybrid runners |
 | `Layout` | `kv_index.zig` | The shape of the KV regions | The GPU runners | `runtime/`, `ops_vulkan/` |
 | `AttnPlan` | `attn_split.zig` | The split rows of one step | `attn_split` | `runtime/attn_record` |
 | `OpRequires` | `op_requires.zig` | A target and a `Tolerance` | Each backend | `cli/info` |
@@ -95,7 +95,7 @@ Inside the directory, `Tensor` reads `dtype` and `limits`, `Model` reads `chat` 
   therefore serves the plan and the preflight, and a test can replay it.
 - `kvPlan` refuses a budget that cannot host one decode row with
   `error.KvVramBudgetTooSmall`. Where the slot ceiling cuts the count the budget
-  bought, `KvPlan.slots_clamped` carries the witness, so the caller names the
+  holds, `KvPlan.slots_clamped` carries the witness, so the caller names the
   clamp instead of hiding it.
 - `OpRequires.tolerance` is the numeric agreement against `naive`. `.bit_exact`
   means the output bytes match. `.relative = eps` means the largest per-element

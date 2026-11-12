@@ -49,7 +49,7 @@
 //! KV commit. The f32 scratch pipeline never learns the KV dtype. One conversion boundary narrows
 //! the finished K and V rows at commit. The compiler vectorizes the narrowing into
 //! hardware round-to-nearest-even with F16C. The recurrent slabs stay f32 under every KV
-//! dtype, so the planner prices them as one constant per slot.
+//! dtype, so the planner sizes them as one constant per slot.
 //!
 //! Blobs. A prefix snapshot moves the state of a slot to and from a host blob by memcpy. The blob
 //! walks the layers in model order: the K rows, then the V rows of a KV layer, and the recurrent
@@ -785,7 +785,7 @@ fn expectProfilePartition(comptime Family: type) !void {
         .kv_dtype = .f32,
     });
 
-    // One unprofiled step faults in the weight pages, so the measured step pays no first touch.
+    // One unprofiled step faults in the weight pages, so the measured step sees no first touch.
     _ = try r.step(1, 0);
 
     // Time one profiled step against the wall clock.
@@ -800,7 +800,7 @@ fn expectProfilePartition(comptime Family: type) !void {
     const wall = time.elapsedNs(t0, t1);
 
     try std.testing.expectEqual(@as(u64, 1), prof.steps);
-    // Cover: one decode step charges every op of the family, and no other op key.
+    // Cover: one decode step times every op of the family, and no other op key.
     for (std.enums.values(LayerOp)) |op| {
         if (cpu_profile.usedBy(op, family)) {
             try std.testing.expect(prof.nsOf(op) > 0);
@@ -809,15 +809,15 @@ fn expectProfilePartition(comptime Family: type) !void {
         }
     }
 
-    // Sum: the charges of all keys add to the total.
-    var charged: u64 = 0;
+    // Sum: the times of all keys add to the total.
+    var attributed: u64 = 0;
     for (prof.sums.ns) |ns| {
-        charged += ns;
+        attributed += ns;
     }
 
-    try std.testing.expectEqual(prof.total(), charged);
+    try std.testing.expectEqual(prof.total(), attributed);
 
-    // Disjoint: two overlapping brackets charge one nanosecond twice, past the wall time.
+    // Disjoint: two overlapping brackets attribute one nanosecond twice, past the wall time.
     try std.testing.expect(prof.total() <= wall);
     // Whole: the uncounted remainder is row validation and loop bookkeeping.
     try std.testing.expect(prof.total() * 2 >= wall);

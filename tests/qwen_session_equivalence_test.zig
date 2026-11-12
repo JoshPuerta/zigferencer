@@ -413,15 +413,15 @@ test "qwen kv f16: the kv slab halves and the blob round-trips" {
     var wide = try cpuRunner(arena, &cpu_pool, &loaded, 1, .f32, default_policy);
     var narrow = try cpuRunner(arena, &cpu_pool, &loaded, 1, .f16, default_policy);
 
-    // The slab prices whole rows, so f16 halves the storage exactly.
+    // The slab sizes whole rows, so f16 halves the storage exactly.
     try std.testing.expectEqual(wide.kv_slots[0].sizeBytes(), 2 * narrow.kv_slots[0].sizeBytes());
 
     // The blob narrows its KV half only. The GDN state stays f32, so both blobs share it.
     const n_rows: u32 = @intCast(ids.len);
-    const per_step: u32 = wide.card.n_kv_heads * wide.card.head_dim;
+    const kv_row_elems: u32 = wide.card.n_kv_heads * wide.card.head_dim;
     const n_full: u32 = wide.kv_slots[0].n_layers;
-    const kv_wide: u64 = @as(u64, 2) * n_full * n_rows * KvDtype.f32.rowBytes(per_step);
-    const kv_narrow: u64 = @as(u64, 2) * n_full * n_rows * KvDtype.f16.rowBytes(per_step);
+    const kv_wide: u64 = @as(u64, 2) * n_full * n_rows * KvDtype.f32.rowBytes(kv_row_elems);
+    const kv_narrow: u64 = @as(u64, 2) * n_full * n_rows * KvDtype.f16.rowBytes(kv_row_elems);
     const bytes_wide = wide.evictSlotBytesFor(n_rows);
     const bytes_narrow = narrow.evictSlotBytesFor(n_rows);
     try std.testing.expectEqual(kv_wide - kv_narrow, bytes_wide - bytes_narrow);

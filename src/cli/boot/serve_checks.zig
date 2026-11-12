@@ -2,11 +2,11 @@
 //!
 //! Slots. `--max-sessions` is the logical conversation count. Only the fused-GPU build can evict
 //! idle sessions to RAM, so only it can over-subscribe the physical slots. With no flag, every
-//! session is resident, unless a `--kv-vram` budget lets the planner buy the count.
+//! session is resident, unless a `--kv-vram` budget lets the planner derive the count.
 //!
 //! Exclusions. `--kv-vram` states a budget, and `--vram-slots` states the count that the budget
-//! buys. The pair can disagree, so it is a mistake. The same holds for `--gpu-layers` with
-//! `--kv-vram`, because the layer split planner already prices a pinned suffix and its KV.
+//! derives. The pair can disagree, so it is a mistake. The same holds for `--gpu-layers` with
+//! `--kv-vram`, because the layer split planner already sizes a pinned suffix and its KV.
 
 const std = @import("std");
 const Io = std.Io;
@@ -151,7 +151,7 @@ fn checkBudgets(io: Io, serve: *const flags_mod.ServeFlags) !ByteBudgets {
     if (serve.kv_vram != null and serve.vram_slots != null) {
         return args.fail(
             io,
-            "--kv-vram and --vram-slots are mutually exclusive (the budget buys the slots)",
+            "--kv-vram and --vram-slots are mutually exclusive (the budget sets the slot count)",
             .{},
         );
     }
@@ -165,7 +165,7 @@ fn checkBudgets(io: Io, serve: *const flags_mod.ServeFlags) !ByteBudgets {
         if (!fused_build) {
             return args.fail(
                 io,
-                "--kv-vram applies only to the fused-GPU build (it spends a device KV budget)",
+                "--kv-vram applies only to the fused-GPU build (it sets a device KV budget)",
                 .{},
             );
         }
@@ -178,7 +178,7 @@ fn checkBudgets(io: Io, serve: *const flags_mod.ServeFlags) !ByteBudgets {
         return args.fail(
             io,
             "--gpu-layers and --kv-vram are mutually exclusive " ++
-                "(a pinned placement prices its own KV, it does not buy slots)",
+                "(a pinned placement sizes its own KV and takes no slot budget)",
             .{},
         );
     }
@@ -242,7 +242,7 @@ fn checkSlots(
             return args.fail(io, "--vram-slots must be in 1..{d}", .{limits.max_vram_slots});
         }
 
-        // A slot no session can occupy is VRAM bought and left dead.
+        // A slot no session can occupy is VRAM reserved and left dead.
         break :blk @min(value, serve.max_sessions);
     };
 
@@ -297,7 +297,7 @@ fn checkBatch(io: Io, serve: *const flags_mod.ServeFlags, structural_slots: u16)
     return batch;
 }
 
-/// The CPU placement holds every session resident and funds no blob. Fewer slots than sessions park
+/// The CPU placement holds every session resident and keeps no blob. Fewer slots than sessions park
 /// a turn with no eviction to free a slot.
 fn refuseCpuSlots(io: Io, n_slots: u16, max_sessions: u16) error{UsageError}!void {
     if (n_slots >= max_sessions) return;

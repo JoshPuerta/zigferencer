@@ -4,17 +4,17 @@
 //! because an instruct template can hit EOS early.
 //!
 //! Sizing. The bench plans what `serve` plans: the KV type, the window, and the placement come
-//! from `resolve`. The last row is the most sessions of the model: the largest count that holds
+//! from `resolve`. The last point is the most sessions of the model: the largest count that holds
 //! every session in a slot. Past `limits.max_batch` the sessions share the decode rows of a tick.
 //!
-//! Rates. A row counts the generated tokens over its whole wall time, so prefill lowers the rate.
-//! The prefix cache stays off, so every session pays for its own prompt.
+//! Rates. A point counts the generated tokens over its whole wall time, so prefill lowers the rate.
+//! The prefix cache stays off, so every session prefills its own prompt.
 //!
 //! Comptime. Generic over the model family and the server type. The fused build option picks
 //! the GPU curve.
 //!
 //! Decoding is greedy and the prompts are identical, so every session generates the
-//! same stream at every B, and the rows differ only in concurrency.
+//! same stream at every B, and the points differ only in concurrency.
 
 const std = @import("std");
 const zigferencer = @import("zigferencer");
@@ -61,12 +61,12 @@ const session_cap: u16 = if (fused_build)
 else
     @intCast(limits.max_batch);
 
-/// The rows of a curve: the powers of two below the most sessions, then the most sessions.
-const rows_max: usize = std.math.log2_int_ceil(u32, limits.max_connections) + 2;
+/// The points of a curve: the powers of two below the most sessions, then the most sessions.
+const curve_points_max: usize = std.math.log2_int_ceil(u32, limits.max_connections) + 2;
 
 // -- types ------------------------------------------------------------------
 
-const Row = struct {
+const CurvePoint = struct {
     tokens: u64,
     wall_s: f64,
     agg_tok_s: f64,
@@ -75,7 +75,7 @@ const Row = struct {
     p50_ms: f64,
     p99_ms: f64,
     /// Token arrivals past a session's store of `store` entries, summed over
-    /// the row. The ITL tails omit them, and the row says so.
+    /// the point. The ITL tails omit them, and the point says so.
     unstored: u64,
     store: u32,
     /// Sessions that ended before `store` tokens, because the model reached EOS.
@@ -112,7 +112,7 @@ const Flags = struct {
     pub const help: args.Help = .{
         .usage = "zigferencer-dev bench-serve <pub_name> [flags]",
         .about = "Drive 1, 2, 4, ... concurrent sessions up to the most the model holds, " ++
-            "fresh server per row. Report tok/s + ITL tails.\n",
+            "fresh server per point. Report tok/s + ITL tails.\n",
         .footer =
         \\examples:
         \\  zigferencer-dev bench-serve SmolLM2-135M-Instruct-Q8_0 --max-tokens 64
@@ -131,10 +131,10 @@ const Flags = struct {
         },
         .max_tokens = args.Doc{ .text = "the most tokens one turn generates, 1..max-seq" },
         .max_sessions = args.Doc{
-            .text = "the session count of the last row, a cap on what the model holds",
+            .text = "the largest session count of the curve, a cap on what the model holds",
             .default = "the most the model holds",
         },
-        .max_only = args.Doc{ .text = "run only the last row of the curve" },
+        .max_only = args.Doc{ .text = "run only the largest session count" },
         .vram_budget = args.Doc{
             .text = "MiB of VRAM the plan reads, at most the live budget. Fused build only.\n" ++
                 "A fixed figure keeps the session count the same from run to run",
@@ -151,7 +151,7 @@ const Flags = struct {
     };
 };
 
-/// What every row of one curve reads.
+/// What every point of one curve reads.
 const Curve = struct {
     ctx: context.Context,
     w: *Io.Writer,
@@ -193,7 +193,7 @@ pub fn run(ctx: context.Context) !void {
 
     const entry = boot_resources.entryOf(model);
     const input: resolve_mod.Input = .{ .engine = flags.engine };
-    const first = resolve_mod.spendVram(input, 1);
+    const first = resolve_mod.withAllVram(input, 1);
     const boot = try boot_resources.resolveLoaded(ctx, .serve, first, entry, &loaded);
     const max_seq = boot.values.window.base;
 
@@ -318,17 +318,17 @@ fn textOfTokens(arena: Allocator, v: *const vocab_mod.Vocab, seed: []const u8, n
     return text;
 }
 
-/// The rows of a curve into `out`: the powers of two below `most`, then `most`. `max_only` keeps
-/// the last row alone.
-fn sessionRows(most: u16, max_only: bool, out: *[rows_max]u16) []const u16 {
+/// The session counts of a curve into `out`: the powers of two below `most`, then `most`.
+/// `max_only` keeps the last count alone.
+fn sessionCounts(most: u16, max_only: bool, out: *[curve_points_max]u16) []const u16 {
     std.debug.assert(most >= 1);
     std.debug.assert(most <= limits.max_connections);
 
     var n: usize = 0;
     if (!max_only) {
-        var row: u16 = 1;
-        while (row < most) : (row *= 2) {
-            out[n] = row;
+        var count: u16 = 1;
+        while (count < most) : (count *= 2) {
+            out[n] = count;
             n += 1;
         }
     }
@@ -369,7 +369,7 @@ fn benchFamily(comptime Family: type, c: *const Curve) !void {
     return cpuCurve(Family, c);
 }
 
-/// A fresh runner and session pool per row give clean KV pools.
+/// A fresh runner and session pool per point give clean KV pools.
 fn cpuCurve(comptime Family: type, c: *const Curve) !void {
     const Runner = Family.Cpu;
     const ctx = c.ctx;
@@ -388,8 +388,8 @@ fn cpuCurve(comptime Family: type, c: *const Curve) !void {
     try c.w.print("sessions: {d} at most, kv {t}, limit {d}\n", .{ most, c.kv_dtype, cap });
     try printTableHead(c.w, c.max_seq);
 
-    var rows_buffer: [rows_max]u16 = undefined;
-    for (sessionRows(most, c.flags.max_only, &rows_buffer)) |b| {
+    var counts_buffer: [curve_points_max]u16 = undefined;
+    for (sessionCounts(most, c.flags.max_only, &counts_buffer)) |b| {
         var round_arena_state = std.heap.ArenaAllocator.init(ctx.gpa);
         defer round_arena_state.deinit();
 
@@ -405,13 +405,13 @@ fn cpuCurve(comptime Family: type, c: *const Curve) !void {
         const SessionPool = Sessions(Runner);
         var pool = try SessionPool.init(arena, &runner);
         const rule = prefill_chunk.cpu_rule;
-        const row = try benchOne(SessionPool, c, &pool, rule, c.max_seq, b, b);
-        try printRow(c.w, b, row);
+        const point = try benchOne(SessionPool, c, &pool, rule, c.max_seq, b, b);
+        try printPoint(c.w, b, point);
     }
 }
 
 /// One session pool holds the whole curve, so the weights upload once, and the plan takes
-/// the widest row. The rows reuse slots: a session closes at the end of a row, and
+/// the widest point. The points reuse slots: a session closes at the end of a point, and
 /// `create` re-zeros any recurrent state.
 fn fusedCurve(comptime Family: type, c: *const Curve) !void {
     const ctx = c.ctx;
@@ -443,7 +443,7 @@ fn fusedCurve(comptime Family: type, c: *const Curve) !void {
         });
     };
 
-    const shaped = resolve_mod.spendVram(input, most);
+    const shaped = resolve_mod.withAllVram(input, most);
     const boot = switch (resolve_mod.resolve(.serve, shaped, entry, card, resources)) {
         .ok => |r| r,
         .refused => |r| return boot_lines.refuse(ctx.io, entry.pub_name, r),
@@ -461,12 +461,12 @@ fn fusedCurve(comptime Family: type, c: *const Curve) !void {
     var pool = try SessionPool.init(ctx.arena, fused);
 
     try printTableHead(c.w, fused.max_seq);
-    var rows_buffer: [rows_max]u16 = undefined;
-    for (sessionRows(most, c.flags.max_only, &rows_buffer)) |b| {
+    var counts_buffer: [curve_points_max]u16 = undefined;
+    for (sessionCounts(most, c.flags.max_only, &counts_buffer)) |b| {
         const rule: prefill_chunk.Rule = .{ .derived = pool.runner.maxStepRows() };
         const width: u16 = @intCast(@min(b, plan.n_streams));
-        const row = try benchOne(SessionPool, c, &pool, rule, fused.max_seq, b, width);
-        try printRow(c.w, b, row);
+        const point = try benchOne(SessionPool, c, &pool, rule, fused.max_seq, b, width);
+        try printPoint(c.w, b, point);
     }
 }
 
@@ -510,26 +510,26 @@ fn printTableHead(w: *Io.Writer, max_seq: u32) !void {
     try w.flush();
 }
 
-fn printRow(w: *Io.Writer, b: u16, row: Row) !void {
+fn printPoint(w: *Io.Writer, b: u16, point: CurvePoint) !void {
     try w.print("  {d:>8}   {d:>6}   {d:>6.1}   {d:>9.2}   {d:>11.2}   " ++
         "{d:>7.0}   {d:>10.1}   {d:>10.1}\n", .{
-        b,            row.tokens,  row.wall_s, row.agg_tok_s,
-        row.per_sess, row.ttft_ms, row.p50_ms, row.p99_ms,
+        b,              point.tokens,  point.wall_s, point.agg_tok_s,
+        point.per_sess, point.ttft_ms, point.p50_ms, point.p99_ms,
     });
-    if (row.unstored > 0) {
+    if (point.unstored > 0) {
         try w.print("      cut: {d} token arrivals passed the store of {d} per session. " ++
-            "The ITL tails omit them\n", .{ row.unstored, row.store });
+            "The ITL tails omit them\n", .{ point.unstored, point.store });
     }
-    if (row.short > 0) {
+    if (point.short > 0) {
         try w.print("          short: {d} sessions reached EOS before {d} tokens\n", .{
-            row.short, row.store,
+            point.short, point.store,
         });
     }
 
     try w.flush();
 }
 
-/// One row: a fresh server, `b` concurrent clients, and the server stop. A fresh
+/// One point: a fresh server, `b` concurrent clients, and the server stop. A fresh
 /// server gives clean queues and a clean port, and it lives in a round arena.
 fn benchOne(
     comptime SessionPool: type,
@@ -539,7 +539,7 @@ fn benchOne(
     max_seq: u32,
     b: u16,
     width: u16,
-) !Row {
+) !CurvePoint {
     const ServerT = server_mod.Server(SessionPool, event.Codec);
     const ctx = c.ctx;
     std.debug.assert(b <= limits.max_connections);
@@ -614,8 +614,8 @@ fn driveClients(
     }
 }
 
-/// The figures of one row. `itl` is a scratch of `results.len * max_tokens` gaps.
-fn summarize(results: []const ClientResult, itl: []f64, wall_s: f64, max_tokens: u32) !Row {
+/// The figures of one point. `itl` is a scratch of `results.len * max_tokens` gaps.
+fn summarize(results: []const ClientResult, itl: []f64, wall_s: f64, max_tokens: u32) !CurvePoint {
     var total: u64 = 0;
     var unstored: u64 = 0;
     var short: u32 = 0;
@@ -654,7 +654,7 @@ fn summarize(results: []const ClientResult, itl: []f64, wall_s: f64, max_tokens:
 }
 
 /// One session, one turn, and the per-token arrival timestamps. A failure
-/// surfaces as `ok = false`. The row then fails, because a silent partial row
+/// surfaces as `ok = false`. The point then fails, because a silent partial point
 /// reports a number that is not the measurement.
 fn clientTask(
     gpa: Allocator,
@@ -743,18 +743,18 @@ test "textOfTokens: the server encoding of the text holds the asked count" {
     }
 }
 
-test "sessionRows: the powers of two below the most, then the most" {
-    var out: [rows_max]u16 = undefined;
+test "sessionCounts: the powers of two below the most, then the most" {
+    var out: [curve_points_max]u16 = undefined;
 
-    try std.testing.expectEqualSlices(u16, &.{1}, sessionRows(1, false, &out));
-    try std.testing.expectEqualSlices(u16, &.{ 1, 2, 4, 5 }, sessionRows(5, false, &out));
-    try std.testing.expectEqualSlices(u16, &.{ 1, 2, 4, 8 }, sessionRows(8, false, &out));
-    try std.testing.expectEqualSlices(u16, &.{12}, sessionRows(12, true, &out));
+    try std.testing.expectEqualSlices(u16, &.{1}, sessionCounts(1, false, &out));
+    try std.testing.expectEqualSlices(u16, &.{ 1, 2, 4, 5 }, sessionCounts(5, false, &out));
+    try std.testing.expectEqualSlices(u16, &.{ 1, 2, 4, 8 }, sessionCounts(8, false, &out));
+    try std.testing.expectEqualSlices(u16, &.{12}, sessionCounts(12, true, &out));
 
     const cap: u16 = @intCast(limits.max_connections);
-    const curve = sessionRows(cap, false, &out);
+    const curve = sessionCounts(cap, false, &out);
     try std.testing.expectEqual(cap, curve[curve.len - 1]);
-    try std.testing.expect(curve.len <= rows_max);
+    try std.testing.expect(curve.len <= curve_points_max);
 }
 
 test "storedGaps: reads stop at the store when more tokens arrived" {

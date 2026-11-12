@@ -59,7 +59,7 @@ const layer_kernels = @import("layer_kernels.zig");
 const layer_op = @import("../core/layer_op.zig");
 const core_log = @import("../core/utils/log.zig");
 const StepRow = @import("step_row.zig").StepRow;
-const KvTensor = @import("../core/kv_index.zig").Tensor;
+const KvKind = @import("../core/kv_index.zig").KvKind;
 
 const Activation = layer_kernels.Activation;
 const LayerBinding = layer_kernels.LayerBinding;
@@ -580,7 +580,7 @@ pub fn FusedLayerKernels(comptime kind: StepKind) type {
 
         /// Copy row `i` of `src` to the row of step row `i` in the KV region `(index, t)`, with one
         /// copy command that holds one region per step row.
-        fn scatterRows(self: *Self, src: vk.Buffer, index: u32, t: KvTensor) void {
+        fn scatterRows(self: *Self, src: vk.Buffer, index: u32, t: KvKind) void {
             const layout = self.kv.layout;
             const row_bytes: vk.DeviceSize = layout.rowBytes();
             const dst = self.kv.region(index, t).buffer;
@@ -718,7 +718,7 @@ pub const OpResources = struct {
     }
 
     /// The device bytes of the scratch that `init` allocates at `rows` step rows. The runner adds
-    /// them to the scratch price of the planner.
+    /// them to the scratch size of the planner.
     pub fn scratchBytes(
         comptime DecoderLayer: type,
         card: *const loader.ModelCard,

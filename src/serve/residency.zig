@@ -32,8 +32,8 @@
 //! gate runs before any allocation or device copy, so a refusal leaves the pool as it was. A
 //! failed restore keeps its blob, because the blob is the only copy until the restore lands. A
 //! successful restore also releases it, so VRAM is authoritative. `destroy` is the one legal way a
-//! live blob disappears, and it holds the only credit. The swap counters cover device copies only,
-//! so the millisecond totals divide by the counts.
+//! live blob disappears, and the only call that removes its bytes. The swap counters cover device
+//! copies only, so the millisecond totals divide by the counts.
 //!
 //! Prefix seeding. `restorePrefix` and `restoreReady` seed a FRESH logical session with a cached
 //! prefix. They make the session resident first, because the bytes land in a physical slot. The
@@ -109,7 +109,8 @@ pub fn Residency(comptime SessionsT: type) type {
         ram_used: u64,
         /// Ceiling on `ram_used`. Null accounts the tier without enforcing it.
         blob_budget: ?u64,
-        tick: u64,
+        /// The LRU clock. Each use of a session takes the next value.
+        lru_clock: u64,
         /// Swap counters. They cover device copies only.
         evicts: u64 = 0,
         restores: u64 = 0,
@@ -148,7 +149,7 @@ pub fn Residency(comptime SessionsT: type) type {
                 .phys_owner = phys_owner,
                 .ram_used = 0,
                 .blob_budget = blob_budget,
-                .tick = 0,
+                .lru_clock = 0,
                 .evicts = 0,
                 .restores = 0,
                 .evict_ms = 0,
@@ -157,7 +158,7 @@ pub fn Residency(comptime SessionsT: type) type {
         }
 
         /// Free every RAM blob. The ledger must drain to zero: a residue means
-        /// a blob was charged without a matching credit.
+        /// a blob was added without a matching removal.
         pub fn deinit(self: *Self) void {
             for (self.entries) |*e| {
                 self.dropBlob(e);
@@ -169,25 +170,25 @@ pub fn Residency(comptime SessionsT: type) type {
         // -- the RAM byte ledger --------------------------------------------
 
         /// Book `bytes` into the ledger. The caller checks the budget first, so
-        /// an over-budget charge here is a missed check, not backpressure.
-        fn charge(self: *Self, bytes: u64) void {
+        /// an over-budget add here is a missed check, not backpressure.
+        fn addRamUsed(self: *Self, bytes: u64) void {
             if (self.blob_budget) |budget| std.debug.assert(self.ram_used + bytes <= budget);
             self.ram_used += bytes;
         }
 
         /// Book `bytes` out of the ledger. Crediting more than the ledger holds
-        /// means the same blob was credited twice.
-        fn credit(self: *Self, bytes: u64) void {
+        /// means the same blob was removed twice.
+        fn removeRamUsed(self: *Self, bytes: u64) void {
             std.debug.assert(bytes <= self.ram_used);
 
             self.ram_used -= bytes;
         }
 
-        /// Release `e`'s blob and credit its bytes back.
+        /// Release the blob of `e`, and remove its bytes from `ram_used`.
         fn dropBlob(self: *Self, e: *Entry) void {
             if (e.blob.bytes.len == 0) return;
 
-            self.credit(e.blob.bytes.len);
+            self.removeRamUsed(e.blob.bytes.len);
             self.gpa.free(e.blob.bytes);
             e.blob = .{};
             e.ever_resident = false;
@@ -209,8 +210,8 @@ pub fn Residency(comptime SessionsT: type) type {
         }
 
         fn bump(self: *Self) u64 {
-            self.tick += 1;
-            return self.tick;
+            self.lru_clock += 1;
+            return self.lru_clock;
         }
 
         fn freeLogical(self: *Self) ?u32 {
@@ -302,9 +303,9 @@ pub fn Residency(comptime SessionsT: type) type {
                     // Resize the blob and book the change.
                     if (need != held) {
                         const resized = try self.gpa.realloc(e.blob.bytes, need);
-                        self.credit(held);
+                        self.removeRamUsed(held);
                         e.blob.bytes = resized;
-                        self.charge(need);
+                        self.addRamUsed(need);
                     }
 
                     // Copy the slot out. A failed copy leaves stale bytes, so drop the blob.
@@ -423,7 +424,7 @@ pub fn Residency(comptime SessionsT: type) type {
             const id = self.freeLogical() orelse return error.NoFreeSession;
             self.entries[id] = .{ .used = true, .saved = self.sessions.table[src_phys] };
             // A residency refusal must not keep the claim. Otherwise a client
-            // that retries a refused clone spends a logical session per try.
+            // that retries a refused clone uses a logical session per try.
             errdefer self.entries[id] = .{};
 
             try self.ensureResident(id, &.{src_phys});
@@ -506,7 +507,7 @@ pub fn Residency(comptime SessionsT: type) type {
             try self.sessions.snapshotPrefix(e.phys.?, n_rows, out);
         }
 
-        /// Release a logical session. Its credit has no later charge.
+        /// Release a logical session. Its blob removal has no later add.
         pub fn destroy(self: *Self, id: u32) void {
             std.debug.assert(id < self.entries.len);
 
@@ -926,12 +927,12 @@ test "residency ledger: the incremental count equals the blob sum across a trace
     try expectLedger(res, 1 * fake_row_bytes);
     try std.testing.expectEqual(@as(?u32, null), res.entries[a].phys);
 
-    // Every swap charges the victim's rows and credits the restored session's rows.
+    // Every swap adds the rows of the victim and removes the rows of the restored session.
     var out: [1]u32 = undefined;
     try res.decodeBatch(&.{a}, &out);
-    try expectLedger(res, 1 * fake_row_bytes); // b's row, a's credited back
+    try expectLedger(res, 1 * fake_row_bytes); // b's row, a's removed
     try res.decodeBatch(&.{b}, &out);
-    try expectLedger(res, 1 * fake_row_bytes); // c's row, b's credited back
+    try expectLedger(res, 1 * fake_row_bytes); // c's row, b's removed
 
     res.destroy(c); // the one session still out of VRAM
     try expectLedger(res, 0);
@@ -954,7 +955,7 @@ test "residency ledger: an over-budget eviction refuses and changes nothing" {
     const b = try res.create(2, .{});
     _ = try res.feed(b, &.{0}, true);
     const c = try res.create(3, .{});
-    _ = try res.feed(c, &.{0}, true); // evicts a, and the budget is spent
+    _ = try res.feed(c, &.{0}, true); // evicts a, and the budget is full
     try expectLedger(res, 1 * fake_row_bytes);
 
     const b_phys = res.entries[b].phys;
@@ -1030,8 +1031,8 @@ test "residency ledger: eviction moves the committed rows only" {
     try std.testing.expectEqual(@as(u32, 3), res.entries[a].blob.n_rows);
     try expectLedger(res, 3 * fake_row_bytes);
 
-    // The restore states the same row count the eviction wrote, and it credits
-    // those three rows back. Only b, the victim of this swap, is still charged.
+    // The restore states the same row count the eviction wrote, and it removes
+    // those three rows. Only b, the victim of this swap, is still counted.
     var out: [1]u32 = undefined;
     try res.decodeBatch(&.{a}, &out);
     try std.testing.expectEqual(@as(u32, 3), fx.fake.last_restore_rows);
@@ -1097,7 +1098,7 @@ test "residency ledger: a restore releases the blob, and the next eviction re-cr
     res.destroy(d);
 }
 
-test "residency prefix: a restore makes the session resident and charges nothing" {
+test "residency prefix: a restore makes the session resident and adds no RAM" {
     const gpa = std.testing.allocator;
     var fx: Fixture = undefined;
     try fx.setUp(gpa, 2, 3, null);
@@ -1147,7 +1148,7 @@ test "residency prefix: a restored session evicts and returns before its first f
     try std.testing.expectEqual(@as(u32, 4), first); // argmax(3+1)
     try std.testing.expectEqual(@as(u32, 3), res.posOf(a));
     try std.testing.expectEqual(@as(u32, 2), fx.fake.restores); // the prefix, then the swap-in
-    try expectLedger(res, 1 * fake_row_bytes); // b's row, a's credited back
+    try expectLedger(res, 1 * fake_row_bytes); // b's row, a's removed
 
     var out: [1]u32 = undefined;
     try res.decodeBatch(&.{a}, &out);
@@ -1159,7 +1160,7 @@ test "residency prefix: a restored session evicts and returns before its first f
     res.destroy(c);
 }
 
-test "residency prefix: restoreReady makes the session resident and charges nothing" {
+test "residency prefix: restoreReady makes the session resident and adds no RAM" {
     const gpa = std.testing.allocator;
     var fx: Fixture = undefined;
     try fx.setUp(gpa, 2, 3, null);
@@ -1216,7 +1217,7 @@ test "residency prefix: a snapshot reads a resident slot and moves nothing" {
 
 test "residency prefix: an unfundable blob refuses and leaves a cold session" {
     const gpa = std.testing.allocator;
-    // A budget of exactly one one-row blob, spent by the third session.
+    // A budget of exactly one one-row blob, filled by the third session.
     var fx: Fixture = undefined;
     try fx.setUp(gpa, 2, 4, 1 * fake_row_bytes);
     defer fx.tearDown(gpa);
@@ -1228,7 +1229,7 @@ test "residency prefix: an unfundable blob refuses and leaves a cold session" {
     const b = try res.create(2, .{});
     _ = try res.feed(b, &.{0}, true);
     const c = try res.create(3, .{});
-    _ = try res.feed(c, &.{0}, true); // evicts a, and the budget is spent
+    _ = try res.feed(c, &.{0}, true); // evicts a, and the budget is full
     try expectLedger(res, 1 * fake_row_bytes);
 
     const b_phys = res.entries[b].phys;

@@ -11,7 +11,7 @@
 //!   rule                        run               serve                     bench
 //!   default window budget       run budget        serve budget              run budget
 //!   slots of the CPU placement  1                 the structural slots      1
-//!   residency priced in RAM     no                yes                       no
+//!   residency sized in RAM      no                yes                       no
 //!   prefix default (no Y)       none              the serve default         none
 //!   whole-model split           falls through     the placement it selects  refuses
 //!                               to the placement
@@ -67,7 +67,7 @@ pub const Entry = struct {
 /// slot and leave the defaults.
 pub const ServeShape = struct {
     max_sessions: u16 = 1,
-    /// The slots every session holds when no device buys a count.
+    /// The slots every session holds when no device budget sets a count.
     structural_slots: u16 = 1,
     /// `--kv-ram` in bytes. Null names no RAM budget.
     kv_ram_bytes: ?u64 = null,
@@ -77,15 +77,15 @@ pub const ServeShape = struct {
     slots_req: ?u16 = null,
     /// `--kv-vram` in bytes. Null names no device budget.
     kv_vram_bytes: ?u64 = null,
-    /// Buy slots with all the VRAM that the other reservations leave. `kv_vram_bytes` wins.
+    /// Size the slots with all the VRAM that the other reservations leave. `kv_vram_bytes` wins.
     kv_vram_rest: bool = false,
 };
 
 pub const Input = struct {
     engine: EngineFlags = .{},
     serve: ServeShape = .{},
-    /// `run --prompt-cache`. The qwen fused placement prices the cache in its RAM
-    /// quote.
+    /// `run --prompt-cache`. The qwen fused placement sizes the cache in its RAM
+    /// RAM plan.
     prompt_cache: bool = false,
 };
 
@@ -122,13 +122,13 @@ pub const Early = struct {
     kv_dtype: dtype.KvDtype,
 };
 
-/// The all-host placement: the plan, and the RAM quote of the split that keeps
+/// The all-host placement: the plan, and the RAM plan of the split that keeps
 /// every layer on the host.
 pub const HostPlacement = struct {
     plan: kv_budget.KvPlan,
     /// True when no `--kv-ram` named a Y, so the prefix took the serve default.
     prefix_default: bool,
-    quote: kv_budget.RamQuote,
+    ram_plan: kv_budget.RamPlan,
 };
 
 /// The host placement of a `run` of a llama model: the plan and the placement line.
@@ -160,7 +160,7 @@ pub const Refusal = union(enum) {
     gpu_layers_past_model: struct { n: u32, n_layers: u32 },
     /// The structural slot count a pinned `--vram-slots` asks of a split.
     hybrid_slots: u32,
-    layer_split_vram: struct { kind: Kind, n_gpu: u32, spend: u64, usable: u64 },
+    layer_split_vram: struct { kind: Kind, n_gpu: u32, vram_bytes: u64, usable: u64 },
     /// The pinned GPU layer count of a split whose GPU layers hold no KV layer.
     layer_split_no_kv: u32,
     /// The pin of a bench split that keeps the whole model on one tier. Null
@@ -183,7 +183,7 @@ pub fn Result(comptime T: type) type {
 // -- api --------------------------------------------------------------------
 
 /// True when the boot opens a device context. The bench of a fused build always opens one,
-/// because it prices a zero count to refuse it as a whole model.
+/// because it sizes a zero count to refuse it as a whole model.
 pub fn needsDevice(kind: Kind, flags: EngineFlags, card: loader.ModelCard) bool {
     if (comptime build_options.use_vulkan_fused_ops) {
         if (kind == .bench) return true;
@@ -273,9 +273,9 @@ pub fn resolve(
     return .{ .ok = out };
 }
 
-/// The input of a `serve` boot of `sessions` sessions that buys slots with all the VRAM the other
-/// reservations leave, as `--max-sessions` with a `--kv-vram` of that size does.
-pub fn spendVram(input: Input, sessions: u16) Input {
+/// The input of a `serve` boot of `sessions` sessions that sizes its slots with all the VRAM the
+/// other reservations leave, as `--max-sessions` with a `--kv-vram` of that size does.
+pub fn withAllVram(input: Input, sessions: u16) Input {
     std.debug.assert(sessions >= 1);
 
     const width: u16 = @intCast(@min(@as(u32, sessions), limits.max_batch));
@@ -289,8 +289,8 @@ pub fn spendVram(input: Input, sessions: u16) Input {
     return out;
 }
 
-/// The most sessions, at most `cap`, that `spendVram` gives a slot each. Null when no count fits.
-/// The walk starts at `cap`, because a plan refuses a decode width it cannot fund, so a refused
+/// The most sessions, at most `cap`, that `withAllVram` gives a slot each. Null when no count fits.
+/// The walk starts at `cap`, because a plan refuses a decode width it cannot hold, so a refused
 /// count states nothing about the count that fits.
 pub fn mostSessions(
     input: Input,
@@ -304,15 +304,15 @@ pub fn mostSessions(
 
     var sessions = cap;
     while (sessions >= 1) : (sessions -= 1) {
-        const shaped = spendVram(input, sessions);
+        const shaped = withAllVram(input, sessions);
         if (eachSessionHasSlot(shaped, entry, card, resources)) return sessions;
     }
 
     return null;
 }
 
-/// The all-host placement at `w`: the plan and its RAM quote. Serve holds every session resident
-/// and prices the residency stages. Run and bench hold one slot and price no stage.
+/// The all-host placement at `w`: the plan and its RAM plan. Serve holds every session resident
+/// and sizes the residency stages. Run and bench hold one slot and size no stage.
 pub fn hostPlacement(
     kind: Kind,
     input: Input,
@@ -353,7 +353,7 @@ pub fn hostPlacement(
         plan = kv_budget.pinned(1, window);
     }
 
-    // Quote the RAM, or refuse.
+    // Plan the RAM, or refuse.
     const kv: kv_budget.KvStructure = .{
         .n_slots = plan.n_slots,
         .window = plan.window,
@@ -361,7 +361,7 @@ pub fn hostPlacement(
     };
     const host: kv_budget.HostRequest = .{ .ram_split = plan.ram, .residency = residency };
     const named = kind == .serve and shape.kv_ram_bytes != null;
-    const quote = kv_budget.quoteRam(
+    const ram_plan = kv_budget.planRam(
         kv,
         card.n_layers,
         host,
@@ -387,11 +387,11 @@ pub fn hostPlacement(
         },
     };
     std.debug.assert(plan.window == window);
-    return .{ .ok = .{ .plan = plan, .prefix_default = prefix_default, .quote = quote } };
+    return .{ .ok = .{ .plan = plan, .prefix_default = prefix_default, .ram_plan = ram_plan } };
 }
 
 /// The host placement of a llama `run`. A fused build plans against the fused runner reservations
-/// at no VRAM, so the placement line prices what the device placement prices.
+/// at no VRAM, so the placement line sizes what the device placement sizes.
 pub fn runHost(
     card: loader.ModelCard,
     model: ?ModelNeeds,
@@ -470,7 +470,7 @@ fn eachSessionHasSlot(
         .hybrid, .cpu => return false,
     };
 
-    if (f.quote == .refused) return false;
+    if (f.ram_plan == .refused) return false;
     if (f.plan.n_slots < input.serve.max_sessions) return false;
 
     // A plan wider than the device limits leaves the refusal to the runner, so check here.
@@ -753,8 +753,8 @@ test "resolve: the CPU oracle rows resolve to their logged window, slots, and RA
                 const placement = r.cpu.?.ok;
                 try std.testing.expectEqual(w.window, placement.plan.window);
                 try std.testing.expectEqual(w.slots, placement.plan.n_slots);
-                try std.testing.expectEqual(w.host_kv_mib, placement.quote.ram.host_kv / mib);
-                try std.testing.expectEqual(w.prefix_mib, placement.quote.ram.prefix / mib);
+                try std.testing.expectEqual(w.host_kv_mib, placement.ram_plan.ram.host_kv / mib);
+                try std.testing.expectEqual(w.prefix_mib, placement.ram_plan.ram.prefix / mib);
             },
         }
     }
@@ -890,9 +890,9 @@ fn checkCase(_: void, c: Case) anyerror!void {
         },
     };
 
-    // A plan never spends more host RAM than the resources it was given.
+    // A plan never uses more host RAM than the resources it was given.
     if (c.ram_free) |free| {
-        try std.testing.expect(placement.quote.ram.spend() <= free);
+        try std.testing.expect(placement.ram_plan.ram.hostBytes() <= free);
     }
 
     try std.testing.expect(placement.plan.n_slots >= 1);
@@ -944,7 +944,7 @@ fn qwenModel() ModelNeeds {
 
 /// The device of the capture: the storage range it reports, which no row of
 /// the default storage range passes. The rows log no VRAM cut, so any figure
-/// that funds every row stands for the live budget.
+/// that holds every row stands for the live budget.
 const capture_device: DeviceCapacity = .{
     .vram = 12 << 30,
     .driver = .other,
@@ -1184,7 +1184,7 @@ const device_rows =
         .{ "glauto", auto_in, refused(.whole_model_split), .{ .host_layers = 0, .clamped = true } },
     });
 
-/// The refusal of a device placement: the placement itself, or the RAM quote of the placement it
+/// The refusal of a device placement: the placement itself, or the RAM plan of the placement it
 /// took.
 fn deviceRefusal(placement: Result(device_placement.Placement)) ?Refusal {
     const taken = switch (placement) {
@@ -1193,13 +1193,13 @@ fn deviceRefusal(placement: Result(device_placement.Placement)) ?Refusal {
     };
 
     return switch (taken) {
-        .fused => |f| if (f.quote == .refused) f.quote.refused else null,
-        .hybrid => |h| if (h.quote == .refused) h.quote.refused else null,
+        .fused => |f| if (f.ram_plan == .refused) f.ram_plan.refused else null,
+        .hybrid => |h| if (h.ram_plan == .refused) h.ram_plan.refused else null,
         .cpu => |c| if (c == .refused) c.refused else null,
     };
 }
 
-/// The window, slots, VRAM KV, and RAM quote of the placement a device row takes.
+/// The window, slots, VRAM KV, and RAM plan of the placement a device row takes.
 fn deviceShape(placement: device_placement.Placement) struct {
     slots: u32,
     window: u32,
@@ -1211,19 +1211,19 @@ fn deviceShape(placement: device_placement.Placement) struct {
             .slots = f.plan.n_slots,
             .window = f.plan.window,
             .vram_kv = f.plan.vram.kv,
-            .ram = f.quote.ok.ram,
+            .ram = f.ram_plan.ok.ram,
         },
         .hybrid => |h| .{
             .slots = h.plan.?.n_slots,
             .window = h.plan.?.window,
             .vram_kv = 0,
-            .ram = h.quote.ok.ram,
+            .ram = h.ram_plan.ok.ram,
         },
         .cpu => |c| .{
             .slots = c.ok.plan.n_slots,
             .window = c.ok.plan.window,
             .vram_kv = 0,
-            .ram = c.ok.quote.ram,
+            .ram = c.ok.ram_plan.ram,
         },
     };
 }
@@ -1275,7 +1275,7 @@ test "mostSessions: every count it returns plans a slot per session, and more VR
             try std.testing.expect(most >= last);
             last = most;
 
-            const shaped = spendVram(.{}, most);
+            const shaped = withAllVram(.{}, most);
             const boot = resolve(.serve, shaped, m.entry, m.card, .{ .ram_free = 64 << 30 }).ok;
             const placed = device_placement.choosePlacement(
                 .serve,

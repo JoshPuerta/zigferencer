@@ -41,7 +41,7 @@ pub fn fromFlag(flag: ?u32, width: u32) Rule {
     return .{ .fixed = n };
 }
 
-/// The prompt rows one pass takes, given the rows that the feeding turn still owes (`remaining`).
+/// The prompt rows one pass takes, given the rows that the feeding turn has left (`remaining`).
 /// `step_cap` is the most rows the runner takes in one pass. The result is zero only when decode
 /// rows fill the pass. The caller then composes the pass without a chunk.
 pub fn chunk(

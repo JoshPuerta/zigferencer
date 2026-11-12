@@ -54,7 +54,7 @@ pub const EngineDocs = struct {
         },
         .kv_dtype = Doc{
             .group = "kv",
-            .text = "KV element type. f16 halves every KV price",
+            .text = "KV element type. f16 halves every KV size",
             .default = "the model's registered one",
         },
         .max_seq = Doc{
@@ -67,7 +67,7 @@ pub const EngineDocs = struct {
             .group = "gpu (fused-GPU build only)",
             .text = "pin N GPU layers, counted from the top (llama, qwen35).\n0 = CPU " ++
                 "runner. A mid split runs the hybrid runner.\nauto puts the most layers on " ++
-                "the GPU that the free VRAM funds",
+                "the GPU that the free VRAM holds",
         },
         .thinking = Doc{
             .group = "thinking (qwen35)",
@@ -109,7 +109,7 @@ pub const ServeFlags = struct {
             .group = "gpu (fused-GPU build only)",
             .text = "pin N GPU layers, counted from the top (llama, qwen35).\n0 = CPU " ++
                 "runner. A mid split serves the hybrid runner,\nwhich holds at most 8 VRAM " ++
-                "KV slots.\nauto puts the most layers on the GPU that the free VRAM funds",
+                "KV slots.\nauto puts the most layers on the GPU that the free VRAM holds",
         },
         .max_sessions = Doc{
             .group = "sessions",
@@ -164,7 +164,7 @@ pub const ServeFlags = struct {
         .kv_vram = Doc{
             .group = "kv",
             .value = "MiB",
-            .text = "VRAM the KV economy can spend. It buys the slots, so it\n" ++
+            .text = "VRAM for the KV slots. It sets the slot count, so it\n" ++
                 "excludes --vram-slots. fused-GPU build only",
         },
         .kv_ram = Doc{

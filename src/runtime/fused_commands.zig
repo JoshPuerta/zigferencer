@@ -235,7 +235,7 @@ pub const KvCommit = struct {
     narrowed: KvPair,
 };
 
-/// The device bytes that one fused runner allocates, for `preflightVram`. Every figure prices
+/// The device bytes that one fused runner allocates, for `preflightVram`. Every figure sizes
 /// the layer range of the runner.
 pub const VramPreflight = struct {
     weights: u64,
@@ -456,7 +456,7 @@ pub fn preflightVram(
 
 // -- tests ------------------------------------------------------------------
 
-/// A plan of one family with no recurrent state, and the preflight value that prices it.
+/// A plan of one family with no recurrent state, and the preflight value that sizes it.
 fn testPreflight() struct { plan: kv_budget.KvPlan, vram: VramPreflight } {
     const vram: VramPreflight = .{
         .weights = 1000,

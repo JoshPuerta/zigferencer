@@ -122,7 +122,7 @@ pub fn refuse(io: Io, name: []const u8, r: resolve_mod.Refusal) anyerror {
     }
 }
 
-/// The boot lines of a whole-model fused placement, in boot order, and its RAM quote. `session` is
+/// The boot lines of a whole-model fused placement, in boot order, and its RAM plan. `session` is
 /// true for `run` and `bench-model`, which log the window line when no cut replaces it.
 pub fn logFused(
     io: Io,
@@ -131,7 +131,7 @@ pub fn logFused(
     session: bool,
     kv_ram_named: bool,
     kv_dtype: dtype.KvDtype,
-) !kv_budget.RamQuote {
+) !kv_budget.RamPlan {
     // Log the window cuts.
     if (f.clamp) |c| {
         logClamp(c);
@@ -156,14 +156,14 @@ pub fn logFused(
 
     // Log the budget findings.
     if (f.stranded) |st| {
-        log.warn("kv budget: the ceiling of {d} slots cut the count this budget bought. " ++
-            "{d} MiB of the {d} MiB stays unspendable. Raise --max-seq to give each slot " ++
+        log.warn("kv budget: the ceiling of {d} slots cut the count this budget holds. " ++
+            "{d} MiB of the {d} MiB stays unused. Raise --max-seq to give each slot " ++
             "a wider window", .{ st.max_slots, st.stranded / mib, st.x_bytes / mib });
     }
 
     if (f.device_slots) |ds| {
         log.info("kv budget: the {s} of {d} {t} holds one KV region of {d} slots at {d} " ++
-            "positions, so the budget buys at most {d} slots", .{
+            "positions, so the budget holds at most {d} slots", .{
             ds.limit.name, ds.limit.value, ds.limit.unit, ds.slots, ds.window, ds.slots,
         });
     }
@@ -172,12 +172,12 @@ pub fn logFused(
         logPrefixDefault();
     }
 
-    // Log the plan, then the RAM quote.
+    // Log the plan, then the RAM plan.
     logPlan(f.plan, kv_dtype);
 
-    return switch (f.quote) {
+    return switch (f.ram_plan) {
         .ok => |q| blk: {
-            logRamQuote(q, kv_ram_named);
+            logRamPlan(q, kv_ram_named);
             break :blk q;
         },
         .refused => |r| refuse(io, name, r),
@@ -207,7 +207,7 @@ pub fn logAutoSplit(split: u32, n_layers: u32) void {
     log.info("--gpu-layers auto: gpu {d}/{d} layers", .{ n_layers - split, n_layers });
 }
 
-/// The startup witness of the KV economy. `kv_dtype` is the dtype of the prices.
+/// The startup witness of the KV plan. `kv_dtype` is the dtype of the sizes.
 pub fn logPlan(plan: kv_budget.KvPlan, kv_dtype: dtype.KvDtype) void {
     log.info("kv plan: {d} slots x {d} window{s} = {d} MiB vram kv, {d} MiB ram, {d} MiB prefix", .{
         plan.n_slots,
@@ -242,13 +242,14 @@ pub fn logSessionWindow(w: SessionWindow) void {
     }
 }
 
-/// The boot lines of one RAM quote: the spend, then the blob tier. An absent tier prints no line.
-pub fn logRamQuote(q: kv_budget.RamQuote, kv_ram_named: bool) void {
+/// The boot lines of one RAM plan: the host bytes, then the blob tier. An absent tier prints
+/// no line.
+pub fn logRamPlan(q: kv_budget.RamPlan, kv_ram_named: bool) void {
     const r = q.ram;
     const parts_fmt = "{d} MiB host kv + {d} MiB blobs + {d} MiB prefix + {d} MiB stages";
     if (q.usable) |usable| {
         log.info("ram: {d} of {d} MiB usable = " ++ parts_fmt, .{
-            r.spend() / mib,
+            r.hostBytes() / mib,
             usable / mib,
             r.host_kv / mib,
             r.blobs / mib,
@@ -257,7 +258,11 @@ pub fn logRamQuote(q: kv_budget.RamQuote, kv_ram_named: bool) void {
         });
     } else {
         log.info("ram: {d} MiB, not checked = " ++ parts_fmt, .{
-            r.spend() / mib, r.host_kv / mib, r.blobs / mib, r.prefix / mib, r.swap_stages / mib,
+            r.hostBytes() / mib,
+            r.host_kv / mib,
+            r.blobs / mib,
+            r.prefix / mib,
+            r.swap_stages / mib,
         });
     }
 
@@ -275,7 +280,7 @@ pub fn logRamQuote(q: kv_budget.RamQuote, kv_ram_named: bool) void {
             });
             // A named budget below the need is a choice of backpressure. Say what it costs.
             if (kv_ram_named and bytes < q.need) {
-                log.warn("kv ram tier: --kv-ram funds {d} MiB of blobs, " ++
+                log.warn("kv ram tier: --kv-ram holds {d} MiB of blobs, " ++
                     "but the need is {d} MiB. A turn can wait until another session closes", .{
                     bytes / mib, q.need / mib,
                 });
@@ -330,7 +335,7 @@ fn refuseLayerSplitVram(io: Io, p: @FieldType(resolve_mod.Refusal, "layer_split_
     return args.fail(
         io,
         "--gpu-layers {d} needs ~{d} MiB of device budget, usable ~{d} MiB. {s}",
-        .{ p.n_gpu, p.spend / mib, p.usable / mib, advice },
+        .{ p.n_gpu, p.vram_bytes / mib, p.usable / mib, advice },
     );
 }
 
@@ -348,7 +353,7 @@ fn logKvVramSmall(k: @FieldType(resolve_mod.Refusal, "kv_vram_small")) void {
         logClamp(c);
     }
 
-    log.err("kv budget: {d} MiB of KV cannot fund {d} slot(s). " ++
+    log.err("kv budget: {d} MiB of KV cannot hold {d} slot(s). " ++
         "One slot costs {d:.1} MiB at window {d}, so raise --kv-vram to {d} MiB or more, " ++
         "or lower --max-seq / --vram-slots", .{
         k.x_bytes / mib,
@@ -359,13 +364,13 @@ fn logKvVramSmall(k: @FieldType(resolve_mod.Refusal, "kv_vram_small")) void {
     });
 }
 
-/// The line of a placement that funds the whole model on the device. A null `pin` is auto.
+/// The line of a placement that holds the whole model on the device. A null `pin` is auto.
 fn logFusedPlacement(pin: ?u32) void {
-    const funded = "the budget funds the whole model, so the fused runner serves it";
+    const whole_model_text = "the budget holds the whole model, so the fused runner serves it";
     if (pin) |n| {
-        log.info("--gpu-layers {d}: " ++ funded, .{n});
+        log.info("--gpu-layers {d}: " ++ whole_model_text, .{n});
     } else {
-        log.info("--gpu-layers auto: " ++ funded, .{});
+        log.info("--gpu-layers auto: " ++ whole_model_text, .{});
     }
 }
 

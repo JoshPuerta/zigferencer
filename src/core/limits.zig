@@ -21,12 +21,12 @@
 //! KV windows. Each model gets its own ceiling under `max_model_ctx` from `contextCeiling`. With no
 //! window flag, `run` and `bench-model` take the larger KV budget. Each serve session takes the
 //! smaller one. The costliest KV in the registry, an 8B at f32, keeps windows of 8192 and 512 under
-//! these two figures. A cheaper KV family gets a deeper window. The model picker shows both windows
+//! these two figures. A smaller KV family gets a deeper window. The model picker shows both windows
 //! of each model before a run.
 //!
 //! Slots. The CPU and hybrid runners cannot evict, so `max_batch` also bounds their physical KV
 //! slots. The fused-GPU runners take their slot ceiling from `max_vram_slots`, because VRAM fits
-//! far more slots than one tick decodes. A KV budget buys up to that many slots, of which at most
+//! far more slots than one tick decodes. A KV budget holds up to that many slots, of which at most
 //! `max_batch` decode per tick.
 //!
 //! OpenAI connector. HTTP and JSON are untrusted input, so each `openai_*` bound is a hard guard at
@@ -161,7 +161,7 @@ pub const window_granule: u32 = 256;
 pub const max_batch: u32 = 8;
 
 /// Ceiling on physical VRAM KV slots, the conversations a device holds resident at once. 128 is the
-/// largest slot count a 16 GB card funds at f16 KV for the 9B model. A raise lands in two places:
+/// largest slot count a 16 GB card holds at f16 KV for the 9B model. A raise lands in two places:
 /// this constant and the clamp anchors in `core/kv_budget.zig`.
 pub const max_vram_slots: u32 = 128;
 
@@ -194,7 +194,7 @@ pub const spans_per_thread: u32 = 1024 * 1024;
 pub const trace_gpu_records: u32 = 64 * 1024;
 
 /// The largest ring capacity that `trace_spans_env` sets. A thread allocates its ring at its first
-/// span, so this maximum prices 96 MiB per recording thread.
+/// span, so this maximum takes 96 MiB per recording thread.
 pub const spans_per_thread_max: u32 = 4 * 1024 * 1024;
 
 /// The environment variable that sets the capacity of every span ring. The GPU ring keeps

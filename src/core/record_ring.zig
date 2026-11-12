@@ -162,7 +162,7 @@ pub fn RecordRing(comptime Key: type) type {
             return c.other();
         }
 
-        /// The GPU finished buffer `c`. A one-time-submit buffer is spent, so
+        /// The GPU finished buffer `c`. A one-time-submit buffer cannot run again, so
         /// it becomes free.
         pub fn complete(self: *Self, c: Buf) void {
             std.debug.assert(self.isPending(c));

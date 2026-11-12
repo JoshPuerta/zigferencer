@@ -1,6 +1,6 @@
 # Profiling
 
-This page tells you how to find where a zigferencer command spends its time, and
+This page tells you how to find where the time of a zigferencer command goes, and
 which function calls which.
 
 ## What you need

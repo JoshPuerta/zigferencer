@@ -14,7 +14,7 @@
 //! sink, the terminal EOS included. A hash therefore counts EOS, and a streamer can choose not to
 //! print it. A sink can also declare `onStep(pos: u32, ns: u64) void`. The loop then hands it the
 //! position each step wrote and the wall time since the previous mark. The first mark is the first
-//! token. A sink without `onStep` pays no clock read per step.
+//! token. A sink without `onStep` makes no clock read per step.
 //!
 //! Stop conditions. The three stops are asymmetric on purpose. EOS and a full cache stop before
 //! the loop steps the last token. The token budget stops after the step and commits the KV of that

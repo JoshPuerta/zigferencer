@@ -57,7 +57,7 @@ pub fn bench(comptime Family: type, b: *const Bench) !void {
     // Log the placement and encode the prompt.
     const max_seq = b.resolved.window.base;
     boot_lines.logSessionWindow(b.resolved.window);
-    try boot_resources.hostQuote(ctx.io, b.boot, b.kvDtype(), b.resolved.window, b.resolved.cpu);
+    try boot_resources.hostRamPlan(ctx.io, b.boot, b.kvDtype(), b.resolved.window, b.resolved.cpu);
 
     const v = try vocab_mod.buildFromParsed(ctx.arena, b.loaded.parsed);
     const prompt_ids = try exec.promptIds(b, &v, max_seq);

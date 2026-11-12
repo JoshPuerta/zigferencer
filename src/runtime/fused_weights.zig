@@ -3,7 +3,7 @@
 //! Arenas. Two arenas hold the weights in a few large segments, because one allocation per tensor
 //! runs a translation-layer driver out of memory on an 8B model. The upload order of the runner
 //! fixes the offset of each weight in an arena. `plan` sizes each segment in a dry run of that
-//! order, so the arenas hold the priced bytes plus their alignment padding.
+//! order, so the arenas hold the planned bytes plus their alignment padding.
 //!
 //! Upload stage. One host buffer pair carries every weight to the device, because one pair per
 //! tensor creates and frees a host heap for each tensor. `plan` also finds the largest view of each
@@ -166,16 +166,16 @@ pub const WeightMemory = struct {
         return self.small.packing.paddingBound() + self.quants.packing.paddingBound();
     }
 
-    /// Check both arenas after the upload against `priced`, the weight bytes of the planner.
-    pub fn assertFull(self: *const WeightMemory, priced: u64) void {
+    /// Check both arenas after the upload against `planned`, the weight bytes of the planner.
+    pub fn assertFull(self: *const WeightMemory, planned: u64) void {
         self.small.packing.assertFull();
         self.quants.packing.assertFull();
 
         // Each tensor view pads at most the offset alignment (256 bytes by the Vulkan limits), so
         // the padding stays under 1 MiB at `limits.max_layers`, inside the preflight reserve of
         // every row of `limits.vram_shares`.
-        assert(self.viewBytes() <= priced);
-        assert(self.heldBytes() <= priced + self.paddingBound());
+        assert(self.viewBytes() <= planned);
+        assert(self.heldBytes() <= planned + self.paddingBound());
     }
 
     /// Upload one matmul weight in the form of `quant`. A weight of another dtype is refused.

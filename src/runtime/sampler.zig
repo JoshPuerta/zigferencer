@@ -738,7 +738,7 @@ fn tieCut(weight: f32, n: u32, above: f64, target: f64) Cut {
 }
 
 /// Zero every weight that `cut` drops and rewrite the block sums. Returns the sum of the block
-/// sums, in block order. A second pass zeroes the surplus ties in id order.
+/// sums, in block order. A second pass zeroes the excess ties in id order.
 fn applyCut(weights: []f32, sums: []f32, cut: Cut) f32 {
     assert(sums.len == blockCount(weights.len));
     assert(cut.weight > 0);
@@ -777,7 +777,7 @@ fn applyCut(weights: []f32, sums: []f32, cut: Cut) f32 {
         sum.* = s;
     }
 
-    // Zero the surplus ties in id order and sum the blocks again.
+    // Zero the excess ties in id order and sum the blocks again.
     if (tied > cut.ties) {
         var kept_ties: u32 = 0;
         for (weights) |*w| {

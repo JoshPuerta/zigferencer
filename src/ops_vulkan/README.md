@@ -80,7 +80,7 @@ pool, and `core/ring_fsm.zig` holds its slot table. No runner drives it.
   `src/main.zig` takes the address of every method so the build analyzes the bodies, and
   `tests/vulkan_stream_ring_test.zig` gates it against a live device.
 - **A shader header owns its kernel.** The header of each shader holds the math, the schedule, the
-  memory table, and the bindings. A wrapper states what the host owes: a precondition or a
+  memory table, and the bindings. A wrapper states what the host must supply: a precondition or a
   tolerance.
 - **Build guard.** `kernels.zig`, `dispatch_list.zig`, `stream_ring.zig`, and `wrap.zig` raise
   `@compileError` when `build_options.use_vulkan` is false. The files of `kernels/` load only

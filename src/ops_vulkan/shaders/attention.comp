@@ -57,7 +57,7 @@
 //
 // Hardware
 //   Waves: 64 lanes are two wave32 waves. Two resident waves hide global memory latency behind
-//   compute, and that pays for the K and V fetches. One head per workgroup keeps the working set
+//   compute, and that covers the K and V fetches. One head per workgroup keeps the working set
 //   hot. Every lane reads the same q[h] and walks the rows of one KV head, and those rows stay in
 //   cache for the whole reduction of the head.
 //   Registers: head_dim has no bound here. The kernel reads q and k per element from global memory

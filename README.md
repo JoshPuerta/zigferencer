@@ -1,29 +1,24 @@
 # Zigferencer
 
-zigferencer is a small inference engine for LLMs (to be extended to other models), written
+zigferencer is a small inference engine for LLMs (to be extended), written
 in Zig 0.16. It reads a model file in the GGUF format and runs the model, with some extra conveniences.
-
-One definition of each model family drives three runners: a CPU runner, a GPU runner that computes
-a whole model step in one Vulkan submission, and a split runner that keeps some layers on the CPU.
-For the same prompt, the three runners generate the same tokens, and the token-hash gates of
-`make gate` check it.
 
 ```console
 $ zigferencer run Qwen3.5-2B-Q8_0 --chat --prompt "Write a haiku about a GPU." --max-tokens 48
-+    0.306ms info(parallel): threads 8 (auto), floor 250000 FLOPs (auto), spin 50000 ns (auto)
-+    0.703ms info(gguf): loading Qwen3.5-2B-Q8_0.gguf...
-+  102.045ms info(gguf): loaded qwen35: 320 tensors, ctx 262144, 1919 MiB in 101 ms
-+  102.159ms info(run): backend: simd_pf
-+  155.438ms info(serve): precision: weights q8_0, activations f32, accum f32, kv f16, logits f32
-+  155.457ms info(serve): kv window: 174592 positions, the 2048 MiB session budget (model ceiling 262144)
-+  155.460ms info(serve): ram: 2065 of 13170 MiB usable = 2065 MiB host kv + 0 MiB blobs + 0 MiB prefix + 0 MiB stages
-+ 1061.303ms info(run): qwen cpu runner ready in 906 ms
-+ 1061.320ms info(run): generating up to 48 tokens (prompt 20 tokens)
++    0.276ms info(parallel): threads 8 (auto), floor 250000 FLOPs (auto), spin 50000 ns (auto)
++    0.664ms info(gguf): loading Qwen3.5-2B-Q8_0.gguf...
++  109.418ms info(gguf): loaded qwen35: 320 tensors, ctx 262144, 1919 MiB in 109 ms
++  109.535ms info(run): backend: simd_pf
++  171.469ms info(serve): precision: weights q8_0, activations f32, accum f32, kv f16, logits f32
++  171.488ms info(serve): kv window: 174592 positions, the 2048 MiB session budget (model ceiling 262144)
++  171.490ms info(serve): ram: 2065 of 14899 MiB usable = 2065 MiB host kv + 0 MiB blobs + 0 MiB prefix + 0 MiB stages
++ 1090.939ms info(run): qwen cpu runner ready in 919 ms
++ 1090.958ms info(run): generating up to 48 tokens (prompt 20 tokens)
 Write a haiku about a GPU.
 Silent chips,
 Huge heat,
 Powerful dreams.
-+ 2614.032ms info(run): 15 tokens | TTFT 859.1 ms | ITL 49.5 ms = 20.2 tok/s
++ 2124.741ms info(run): 15 tokens | TTFT 309.2 ms | ITL 51.8 ms = 19.3 tok/s
 ```
 
 The same engine serves many conversations at once, through ZMQ or through the OpenAI HTTP API:
@@ -37,6 +32,7 @@ $ curl -s localhost:8080/v1/chat/completions -H 'Content-Type: application/json'
 
 One of the main goals of this project is to provide a sandbox to tinker with small models and kernels implemented on
 non-typical hardware, using Zig. Don't expect a production-grade inference engine (not because of Zig, but due to the scope).
+Another side-quest was to minimize dependencies (that's one of the reason for the size of the repo).
 
 - **Models:** the Llama 3 family and the Qwen3.5 hybrid family (not all quantizations, check registered models with `list`)
 - **Hardware:** x86_64 CPUs, with scalar and AVX2 paths, and GPUs through Vulkan.
@@ -120,16 +116,14 @@ make help    # every target and variable
 zig-out/bin/zigferencer fetch SmolLM2-135M-Instruct-Q8_0  # download the small test model
 zig-out/bin/zigferencer run SmolLM2-135M-Instruct-Q8_0 --prompt "Tell me a joke" --max-tokens 64
 zig-out/bin/zigferencer serve SmolLM2-135M-Instruct-Q8_0 --port 8000 --max-sessions 4
-zig-out/bin/zigferencer client --connect 127.0.0.1:8000   # or any ZMQ DEALER socket
+zig-out/bin/zigferencer client --connect 127.0.0.1:8000
 zig-out/bin/zigferencer info  # host CPU, RAM, SIMD, and the backends this build can run
 ```
 
 `make build BACKEND=vulkan_fused` builds the GPU binary, and `make debug` builds for lldb or gdb.
-The Makefile is a convenience only: it prints each `zig build` command before it runs it. A bare
-`zig build` makes a Debug binary, so do not measure it.
 
 `zig build --help` lists every build option. `zigferencer --help` lists the commands. The
-benchmarks, the kernel checks, and the demo are in a second executable, `zigferencer-dev`.
+benchmarks, the kernel checks are in a second executable, `zigferencer-dev`.
 `make build` installs both.
 
 ## Performance
@@ -137,13 +131,7 @@ benchmarks, the kernel checks, and the demo are in a second executable, `zigfere
 One desktop made these numbers, the host of the worked example in
 [`docs/architecture.md`](docs/architecture.md), section 9.
 
-| Model | Weights | Backend | Prompt + generated tokens | TTFT (mean) | ITL (mean) | Tokens/s, 1 prompt | Tokens/s, 4 sessions |
-| --- | --- | --- | --- | --- | --- | --- | --- |
-| SmolLM2-135M-Instruct | Q8_0 | `simd_pf`, 8 threads | 512 + 128 | 0.97 s | 5.1 ms | 197 | 380 |
-| Qwen3.5-2B | Q8_0 | `simd_pf`, 8 threads | 512 + 128 | 8.0 s | 53 ms | 19 | 46 |
-| Qwen3.5-2B | Q8_0 | `vulkan_fused` | 512 + 128 | 0.52 s | 8.3 ms | 121 | 66 |
-| Llama-3.1-8B-Instruct | Q8_0 | `vulkan_fused` | 512 + 128 | 2.1 s | 24 ms | 41 | 22 |
-| Llama-3.1-8B-Instruct | Q4_0 | `vulkan_fused` | 512 + 128 | 2.4 s | 18 ms | 54 | 33 |
+Table TBD
 
  To measure your own host, run:
 
@@ -155,11 +143,10 @@ zigferencer-dev bench-serve MODEL --max-tokens 128
 ## Documentation
 
 - [`docs/architecture.md`](docs/architecture.md): how the engine works. The build,
-  the forward pass, CPU threads, memory, serving, and correctness. Start here.
+  the forward pass, CPU threads, memory, serving, and correctness.
 - [`docs/gpu-rdna2.md`](docs/gpu-rdna2.md): the target GPU. The RDNA2 hardware details
   and how the Vulkan kernels use them.
-- [`docs/profiling.md`](docs/profiling.md): how to find where the time is spent. Linux
-  perf on the host, the span trace of the engine (a `-Dtrace=true` build), and GPU timestamps.
+- [`docs/profiling.md`](docs/profiling.md): how to find where the time is spent.
 - [`docs/debugging.md`](docs/debugging.md): step through a command, a test, or `build.zig` in lldb
   or gdb.
 - Each top-level source directory (`src/*`, `tests/`, `tools/`) has a `README.md`

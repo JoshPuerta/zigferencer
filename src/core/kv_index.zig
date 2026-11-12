@@ -2,10 +2,10 @@
 //!
 //! Comptime. An assert pins the widest layout the bounds admit inside a `u64`.
 //!
-//! Regions. The cache holds one region per layer and tensor. Region `t * n_layers + layer` holds
+//! Regions. The cache holds one region per layer and K or V. Region `t * n_layers + layer` holds
 //! the rows of every slot in row-major order: slot, then position, then element.
 //!
-//! Offsets. An element offset is a mixed-radix numeral with the radices `window` and `per_step`
+//! Offsets. An element offset is a mixed-radix numeral with the radices `window` and `kv_row_elems`
 //! (Knuth, TAOCP vol 1, section 2.2.6). So each coordinate of the index box gets its own element,
 //! and every element stays below the region size.
 //!
@@ -41,24 +41,30 @@ comptime {
 
 // -- types ------------------------------------------------------------------
 
-/// The two tensors of one layer. The value orders the regions: every K region
-/// comes before every V region.
-pub const Tensor = enum(u1) { k = 0, v = 1 };
+/// The kind of a KV entry: a key (K) or a value (V). The value orders the regions:
+/// every K region comes before every V region.
+pub const KvKind = enum(u1) { k = 0, v = 1 };
 
 /// The shape of the device KV cache: `n_slots` slots of `window` positions,
-/// with rows of `per_step` elements, in `n_layers` layers that hold KV.
+/// with rows of `kv_row_elems` elements, in `n_layers` layers that hold KV.
 pub const Layout = struct {
     n_slots: u32,
     window: u32,
-    per_step: u32,
+    kv_row_elems: u32,
     n_layers: u32,
     kv_dtype: KvDtype,
 
-    pub fn init(n_slots: u32, window: u32, per_step: u32, n_layers: u32, kv_dtype: KvDtype) Layout {
+    pub fn init(
+        n_slots: u32,
+        window: u32,
+        kv_row_elems: u32,
+        n_layers: u32,
+        kv_dtype: KvDtype,
+    ) Layout {
         const layout: Layout = .{
             .n_slots = n_slots,
             .window = window,
-            .per_step = per_step,
+            .kv_row_elems = kv_row_elems,
             .n_layers = n_layers,
             .kv_dtype = kv_dtype,
         };
@@ -76,8 +82,8 @@ pub const Layout = struct {
         return count;
     }
 
-    /// The index of the region that holds tensor `t` of `layer`.
-    pub fn regionIndex(self: Layout, layer: u32, t: Tensor) u32 {
+    /// The index of the region that holds kind `t` of `layer`.
+    pub fn regionIndex(self: Layout, layer: u32, t: KvKind) u32 {
         assert(layer < self.n_layers);
 
         const region = @as(u32, @intFromEnum(t)) * self.n_layers + layer;
@@ -85,19 +91,19 @@ pub const Layout = struct {
         return region;
     }
 
-    /// Bytes one row of `per_step` elements occupies.
+    /// Bytes one row of `kv_row_elems` elements occupies.
     pub fn rowBytes(self: Layout) u64 {
         self.assertValid();
-        const bytes = self.kv_dtype.rowBytes(self.per_step);
+        const bytes = self.kv_dtype.rowBytes(self.kv_row_elems);
         assert(bytes >= 1);
-        assert(bytes == @as(u64, self.per_step) * elemBytes(self.kv_dtype));
+        assert(bytes == @as(u64, self.kv_row_elems) * elemBytes(self.kv_dtype));
         return bytes;
     }
 
     /// Elements one region holds: every row of every slot.
     pub fn regionElems(self: Layout) u64 {
         self.assertValid();
-        const elems = @as(u64, self.n_slots) * self.window * self.per_step;
+        const elems = @as(u64, self.n_slots) * self.window * self.kv_row_elems;
         assert(elems >= 1);
         return elems;
     }
@@ -117,7 +123,7 @@ pub const Layout = struct {
     }
 
     /// Bytes one position of one slot holds across every region: the KV
-    /// price of one token.
+    /// size of one token.
     pub fn tokenBytes(self: Layout) u64 {
         const bytes = @as(u64, self.regionCount()) * self.rowBytes();
         assert(bytes >= 2);
@@ -128,9 +134,9 @@ pub const Layout = struct {
     pub fn offset(self: Layout, slot: u32, pos: u32, elem: u32) u64 {
         assert(slot < self.n_slots);
         assert(pos < self.window);
-        assert(elem < self.per_step);
+        assert(elem < self.kv_row_elems);
 
-        const index = (@as(u64, slot) * self.window + pos) * self.per_step + elem;
+        const index = (@as(u64, slot) * self.window + pos) * self.kv_row_elems + elem;
         assert(index < self.regionElems());
         return index;
     }
@@ -162,7 +168,7 @@ pub const Layout = struct {
         // The shader multiplies this stride by a slot index in 32 bits.
         assert(self.regionElems() <= limits.max_kv_index_elems);
 
-        const stride = @as(u64, self.window) * self.per_step;
+        const stride = @as(u64, self.window) * self.kv_row_elems;
         assert(stride * self.n_slots == self.regionElems());
         return std.math.cast(u32, stride) orelse unreachable;
     }
@@ -200,11 +206,11 @@ pub const Layout = struct {
         assert(self.n_slots <= limits.max_vram_slots);
         assert(self.window >= 1);
         assert(self.window <= limits.max_model_ctx);
-        assert(self.per_step >= 1);
-        assert(self.per_step <= limits.max_kv_row_elems);
+        assert(self.kv_row_elems >= 1);
+        assert(self.kv_row_elems <= limits.max_kv_row_elems);
 
         // The f16 shaders read a row in 32-bit word pairs.
-        if (self.kv_dtype == .f16) assert(self.per_step % 2 == 0);
+        if (self.kv_dtype == .f16) assert(self.kv_row_elems % 2 == 0);
 
         assert(self.n_layers >= 1);
         assert(self.n_layers <= limits.max_layers);
@@ -282,16 +288,16 @@ pub fn fits(layout: Layout, lim: limits.BufferLimits) limits.BufferVerdict {
 /// whole alignment units keeps every window aligned. Zero means that no window fits.
 pub fn maxWindowForLimits(
     n_slots: u32,
-    per_step: u32,
+    kv_row_elems: u32,
     kv_dtype: KvDtype,
     lim: limits.BufferLimits,
 ) u32 {
     assert(n_slots >= 1);
     assert(n_slots <= limits.max_vram_slots);
-    assert(per_step >= 1);
-    assert(per_step <= limits.max_kv_row_elems);
+    assert(kv_row_elems >= 1);
+    assert(kv_row_elems <= limits.max_kv_row_elems);
 
-    const per_position: u64 = @as(u64, n_slots) * per_step;
+    const per_position: u64 = @as(u64, n_slots) * kv_row_elems;
     const cap = regionElemCap(kv_dtype, lim);
     const window = std.math.cast(u32, cap / per_position) orelse unreachable;
     assert(@as(u64, window) * per_position <= cap);
@@ -304,16 +310,16 @@ pub fn maxWindowForLimits(
 /// `maxWindowForLimits`. No slot ceiling caps it. Zero means that one slot already breaks a limit.
 pub fn maxSlotsForLimits(
     window: u32,
-    per_step: u32,
+    kv_row_elems: u32,
     kv_dtype: KvDtype,
     lim: limits.BufferLimits,
 ) u32 {
     assert(window >= 1);
     assert(window <= limits.max_model_ctx);
-    assert(per_step >= 1);
-    assert(per_step <= limits.max_kv_row_elems);
+    assert(kv_row_elems >= 1);
+    assert(kv_row_elems <= limits.max_kv_row_elems);
 
-    const per_slot: u64 = @as(u64, window) * per_step;
+    const per_slot: u64 = @as(u64, window) * kv_row_elems;
     const cap = regionElemCap(kv_dtype, lim);
     const slots = std.math.cast(u32, cap / per_slot) orelse unreachable;
     assert(@as(u64, slots) * per_slot <= cap);
@@ -326,11 +332,11 @@ pub fn maxSlotsForLimits(
 /// `n_slots` slots passes the device limits. Zero means that no granule fits.
 pub fn maxGranuleWindow(
     n_slots: u32,
-    per_step: u32,
+    kv_row_elems: u32,
     kv_dtype: KvDtype,
     lim: limits.BufferLimits,
 ) u32 {
-    const deepest = maxWindowForLimits(n_slots, per_step, kv_dtype, lim);
+    const deepest = maxWindowForLimits(n_slots, kv_row_elems, kv_dtype, lim);
     const window: u32 = @intCast(limits.floorToGranule(deepest));
     assert(window <= deepest);
     assert(window % limits.window_granule == 0);
@@ -473,16 +479,16 @@ test "offset: every coordinate of a small box gets its own element below the reg
         while (n_slots <= 3) : (n_slots += 1) {
             var window: u32 = 1;
             while (window <= 5) : (window += 1) {
-                var per_step: u32 = 1;
-                while (per_step <= 4) : (per_step += 1) {
-                    if (kv_dtype == .f16 and per_step % 2 != 0) continue;
+                var kv_row_elems: u32 = 1;
+                while (kv_row_elems <= 4) : (kv_row_elems += 1) {
+                    if (kv_dtype == .f16 and kv_row_elems % 2 != 0) continue;
 
-                    const layout = Layout.init(n_slots, window, per_step, 1, kv_dtype);
+                    const layout = Layout.init(n_slots, window, kv_row_elems, 1, kv_dtype);
                     var seen = [_]bool{false} ** 64;
                     var count: u64 = 0;
                     for (0..n_slots) |s| {
                         for (0..window) |p| {
-                            for (0..per_step) |e| {
+                            for (0..kv_row_elems) |e| {
                                 const at = layout.offset(@intCast(s), @intCast(p), @intCast(e));
                                 try testing.expect(at < layout.regionElems());
                                 try testing.expect(!seen[@intCast(at)]);
@@ -608,11 +614,11 @@ fn checkPackRegions(_: void, seed: u64) anyerror!void {
     const r = prng.random();
     const kv_dtype: KvDtype = if (r.boolean()) .f16 else .f32;
     // A multiple of 8 elements keeps a row a whole number of 16-byte units.
-    const per_step = 8 * r.intRangeAtMost(u32, 1, 128);
+    const kv_row_elems = 8 * r.intRangeAtMost(u32, 1, 128);
     const layout = Layout.init(
         r.intRangeAtMost(u32, 1, 8),
         r.intRangeAtMost(u32, 1, 4096),
-        per_step,
+        kv_row_elems,
         r.intRangeAtMost(u32, 1, limits.max_layers),
         kv_dtype,
     );
@@ -665,12 +671,12 @@ test "pack: every region lands once, aligned, inside an allocation" {
 }
 
 test "Layout: at one slot the regions reproduce the offsets of the CPU KvCache slab" {
-    // The CPU `KvCache` slab holds layer `l` of tensor `t` at `(t * L + l) * W`
+    // The CPU `KvCache` slab holds layer `l` of kind `t` at `(t * L + l) * W`
     // rows, and position `p` one row further on. The slab holds `2 * L * W`
     // rows.
     const Case = struct {
         window: u32,
-        per_step: u32,
+        kv_row_elems: u32,
         n_layers: u32,
         kv_dtype: KvDtype,
         allocation_size: u64,
@@ -679,7 +685,7 @@ test "Layout: at one slot the regions reproduce the offsets of the CPU KvCache s
         // SmolLM2-135M at f32 in one allocation.
         .{
             .window = 2048,
-            .per_step = 192,
+            .kv_row_elems = 192,
             .n_layers = 30,
             .kv_dtype = .f32,
             .allocation_size = 1 << 40,
@@ -687,15 +693,15 @@ test "Layout: at one slot the regions reproduce the offsets of the CPU KvCache s
         // Llama-3.1-8B at f16, split over allocations of five regions.
         .{
             .window = 512,
-            .per_step = 1024,
+            .kv_row_elems = 1024,
             .n_layers = 32,
             .kv_dtype = .f16,
             .allocation_size = 5 * 512 * 2048,
         },
     };
     for (cases) |c| {
-        const layout = Layout.init(1, c.window, c.per_step, c.n_layers, c.kv_dtype);
-        const row_bytes = c.kv_dtype.rowBytes(c.per_step);
+        const layout = Layout.init(1, c.window, c.kv_row_elems, c.n_layers, c.kv_dtype);
+        const row_bytes = c.kv_dtype.rowBytes(c.kv_row_elems);
         try testing.expectEqual(
             2 * @as(u64, c.n_layers) * c.window * row_bytes,
             layout.slotBytes(),
@@ -714,7 +720,7 @@ test "Layout: at one slot the regions reproduce the offsets of the CPU KvCache s
             const layer: u32 = @intCast(l);
             try testing.expectEqual(layer, layout.regionIndex(layer, .k));
             try testing.expectEqual(c.n_layers + layer, layout.regionIndex(layer, .v));
-            for ([_]Tensor{ .k, .v }) |t| {
+            for ([_]KvKind{ .k, .v }) |t| {
                 const region = layout.regionIndex(layer, t);
                 const base = segment_base[packing.segmentOf(region)] + packing.offsetOf(region);
                 for ([_]u32{ 0, 1, c.window / 2, c.window - 1 }) |pos| {
@@ -849,7 +855,7 @@ test "blobBytes: the walk over layers, K then V, sums to the blob" {
             // ascending, K before V.
             var walked: u64 = 0;
             for (0..layout.n_layers) |_| {
-                for ([_]Tensor{ .k, .v }) |_| {
+                for ([_]KvKind{ .k, .v }) |_| {
                     walked += @as(u64, n_rows) * layout.rowBytes();
                 }
             }
@@ -867,16 +873,16 @@ fn checkWindowForLimits(layout_checks: *u32, seed: u64) anyerror!void {
     const kv_dtype: KvDtype = if (r.boolean()) .f16 else .f32;
     const n_slots = r.intRangeAtMost(u32, 1, limits.max_vram_slots);
     // Whole 16-byte rows, so the alignment never decides a verdict.
-    const per_step = 8 * r.intRangeAtMost(u32, 1, 512);
+    const kv_row_elems = 8 * r.intRangeAtMost(u32, 1, 512);
     const lim: limits.BufferLimits = .{
         .storage_range = r.intRangeAtMost(u64, 16, limits.storage_range_max),
         .allocation_size = r.intRangeAtMost(u64, 16, 1 << 36),
         .offset_alignment = 16,
     };
-    const window = maxWindowForLimits(n_slots, per_step, kv_dtype, lim);
-    const row_bytes = kv_dtype.rowBytes(per_step);
+    const window = maxWindowForLimits(n_slots, kv_row_elems, kv_dtype, lim);
+    const row_bytes = kv_dtype.rowBytes(kv_row_elems);
     // The arithmetic form holds at every window, with no model ceiling.
-    const per_position = @as(u64, n_slots) * per_step;
+    const per_position = @as(u64, n_slots) * kv_row_elems;
     const here = limits.bufferFits(window * per_position, window * n_slots * row_bytes, lim);
     try testing.expectEqual(limits.BufferVerdict.fits, here);
     const next = @as(u64, window) + 1;
@@ -888,9 +894,9 @@ fn checkWindowForLimits(layout_checks: *u32, seed: u64) anyerror!void {
     if (window >= 1 and window < limits.max_model_ctx) {
         try testing.expectEqual(
             limits.BufferVerdict.fits,
-            fits(Layout.init(n_slots, window, per_step, 1, kv_dtype), lim),
+            fits(Layout.init(n_slots, window, kv_row_elems, 1, kv_dtype), lim),
         );
-        const verdict = fits(Layout.init(n_slots, window + 1, per_step, 1, kv_dtype), lim);
+        const verdict = fits(Layout.init(n_slots, window + 1, kv_row_elems, 1, kv_dtype), lim);
         try testing.expect(
             verdict == .index_past_31_bits or verdict == .past_allocation_size or verdict ==
                 .past_storage_range,
@@ -945,7 +951,7 @@ fn checkSlotsMatchWindow(_: void, seed: u64) anyerror!void {
     var prng = std.Random.DefaultPrng.init(seed);
     const r = prng.random();
     const kv_dtype: KvDtype = if (r.boolean()) .f16 else .f32;
-    const per_step = 8 * r.intRangeAtMost(u32, 1, 512);
+    const kv_row_elems = 8 * r.intRangeAtMost(u32, 1, 512);
     const lim: limits.BufferLimits = .{
         .storage_range = r.intRangeAtMost(u64, 16, limits.storage_range_max),
         .allocation_size = r.intRangeAtMost(u64, 16, 1 << 36),
@@ -953,15 +959,15 @@ fn checkSlotsMatchWindow(_: void, seed: u64) anyerror!void {
     };
     const n_slots = r.intRangeAtMost(u32, 1, limits.max_vram_slots);
     const window = r.intRangeAtMost(u32, 1, limits.max_model_ctx);
-    // Both bounds solve `slots * window * per_step` against the same
+    // Both bounds solve `slots * window * kv_row_elems` against the same
     // limits, so each one admits the pair exactly when the other does.
-    const by_slots = n_slots <= maxSlotsForLimits(window, per_step, kv_dtype, lim);
-    const by_window = window <= maxWindowForLimits(n_slots, per_step, kv_dtype, lim);
+    const by_slots = n_slots <= maxSlotsForLimits(window, kv_row_elems, kv_dtype, lim);
+    const by_window = window <= maxWindowForLimits(n_slots, kv_row_elems, kv_dtype, lim);
     try testing.expectEqual(by_window, by_slots);
     if (by_slots) {
         try testing.expectEqual(
             limits.BufferVerdict.fits,
-            fits(Layout.init(n_slots, window, per_step, 1, kv_dtype), lim),
+            fits(Layout.init(n_slots, window, kv_row_elems, 1, kv_dtype), lim),
         );
     }
 }

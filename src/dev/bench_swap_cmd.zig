@@ -66,7 +66,7 @@ const Opt = struct {
     pos: u32 = 256,
     reps: u32 = 50,
     budget: bool = false,
-    /// `--kv-dtype`: the element type every KV row frames at. It prices the blob
+    /// `--kv-dtype`: the element type every KV row frames at. It sizes the blob
     /// this bench moves. Absent takes the model's default.
     kv_dtype: ?dtype.KvDtype = null,
     /// `--chunk-mib`: the chunk one staged copy moves, in MiB. The sweep that
@@ -101,7 +101,7 @@ const Opt = struct {
             ),
         },
         .kv_dtype = args.Doc{
-            .text = "KV element type. It prices the blob a swap moves",
+            .text = "KV element type. It sets the size of the blob that a swap moves",
             .default = "the model's registered one",
         },
         .chunk_mib = args.Doc{
@@ -180,7 +180,7 @@ fn runFused(ctx: context.Context, opt_in: Opt) !void {
     var loaded = try loader.load(ctx.io, ctx.arena, path);
     defer loaded.close();
 
-    // The KV dtype resolves ahead of every price, plan, and device call, so a
+    // The KV dtype resolves ahead of every size, plan, and device call, so a
     // refusal costs a GGUF map and nothing more.
     var opt = opt_in;
     opt.resolved_kv_dtype = boot_resources.kvDtypeFor(opt.kv_dtype, model);
@@ -204,7 +204,7 @@ fn runFused(ctx: context.Context, opt_in: Opt) !void {
 }
 
 /// The window is the point of the bench. `--budget` derives the budget from the
-/// live free VRAM, and the slot count's share of it buys the window. Without the
+/// live free VRAM, and the slot count's share of it sets the window. Without the
 /// flag the planner takes the serve default of the model.
 fn planFor(comptime Family: type, b: *const Bench) !kv_budget.KvPlan {
     const opt = b.opt;
@@ -302,7 +302,7 @@ fn benchOne(comptime Family: type, b: *const Bench) !void {
     return printReport(Runner, b, decode, swaps, copies, blob_bytes);
 }
 
-/// The sizes of one swap, and how many slots the live budget affords.
+/// The sizes of one swap, and how many slots the live budget holds.
 fn printSizes(b: *const Bench, slot_bytes: usize, blob_bytes: usize) !void {
     const w = b.w;
 

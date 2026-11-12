@@ -1,5 +1,5 @@
 //! Host and device transfer cost, in two sections. `benchCrossingLatency` measures the fixed
-//! price of one crossing at residual-row payloads. `benchStagedCopy` measures staged-copy
+//! cost of one crossing at residual-row payloads. `benchStagedCopy` measures staged-copy
 //! bandwidth: each row times one `runStagingCopies` submission per repetition, in both
 //! directions, across the transfer sizes that the weight uploads and the KV swaps move. The file
 //! runs copies alone, with no model, no kernels, and no dispatch. Both sections need a device,
@@ -11,13 +11,13 @@
 //! its 512 MiB pair does not fit.
 //!
 //! Crossing floor. Every staged-copy row carries 8 MiB or more, where the transfer time hides
-//! the fixed submit-and-wait price. The crossing rows carry one hidden row, so the floor is what
+//! the fixed submit-and-wait cost. The crossing rows carry one hidden row, so the floor is what
 //! is left.
 //!
 //! Missing variant. A persistent-command-buffer variant of `submit_empty` (reset, record, and
 //! submit per repetition) is absent. Recording a copy outside the engine needs the `vk` types,
 //! and the bench module imports the engine alone. So every submission row holds the transient
-//! allocate-and-free cost that `runStagingCopies` pays, and each one ends on `queueWaitIdle`
+//! allocate-and-free cost that `runStagingCopies` has, and each one ends on `queueWaitIdle`
 //! rather than on a fence.
 
 const std = @import("std");
@@ -161,7 +161,7 @@ pub fn benchStagedCopy(io: std.Io, runner: *zigferencer.vulkan_runner.Runner) !v
     }
 }
 
-/// The crossing price at residual-row payloads: what one copy between host and device costs
+/// The crossing cost at residual-row payloads: what one copy between host and device costs
 /// before any bandwidth term appears. Each row reports the median, the minimum, and the maximum.
 pub fn benchCrossingLatency(io: std.Io, runner: *zigferencer.vulkan_runner.Runner) !void {
     // Allocate the three buffers, or skip the section.

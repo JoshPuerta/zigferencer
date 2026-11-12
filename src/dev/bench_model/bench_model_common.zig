@@ -114,7 +114,7 @@ pub const Options = struct {
         },
         .ignore_eos = args.Doc{
             .group = "prompt shape",
-            .text = "spend the full decode budget per run (clean ITL)",
+            .text = "use the full decode budget per run (clean ITL)",
         },
         .profile_cpu_decode = args.Doc{
             .group = "profiling (cpu, trace build only: -Dtrace=true)",
@@ -131,7 +131,7 @@ pub const Options = struct {
         .gpu_layers = args.Doc{
             .group = "gpu (fused-GPU build only)",
             .text = "pin N GPU layers, bench the hybrid split runner.\n" ++
-                "auto puts the most layers on the GPU that the free VRAM funds",
+                "auto puts the most layers on the GPU that the free VRAM holds",
         },
     };
 };

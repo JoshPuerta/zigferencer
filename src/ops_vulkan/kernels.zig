@@ -9,7 +9,7 @@
 //! one tolerance class.
 //!
 //! Shader headers. The header of each file in `shaders/` owns the math, the schedule, the memory
-//! table, and the bindings of its kernel. A wrapper here states what the host owes: a precondition
+//! table, and the bindings of its kernel. A wrapper here states what the host must supply: a
 //! or a tolerance. See `docs/gpu-rdna2.md` section 5 for the wave32 pin of every pipeline.
 //!
 //! Two paths. The per-op wrappers use host-visible coherent memory, one descriptor set per kernel,

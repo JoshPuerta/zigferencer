@@ -383,7 +383,7 @@ test "kvIndex: the closed form counts the full layers of the range before the la
     }
 }
 
-test "recurrentElems: one GDN slot holds the fixed bytes that the cost vector prices" {
+test "recurrentElems: one GDN slot holds the fixed bytes that the cost vector sizes" {
     const card = test_fakes.testCard(.qwen35);
     const elems = recurrentElems(&card);
     const vector = kv_cost.qwenCostVector(card, .f32);

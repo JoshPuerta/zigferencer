@@ -30,8 +30,8 @@
 //!     | p0 p1 .. pmax  | p0 p1 .. pmax  |     | p0 p1 .. pmax  |
 //!     +----------------+----------------+     +----------------+
 //!
-//!   per_step_elems  = n_kv_heads * head_dim          (one K or V row)
-//!   per_layer_elems = max_seq * per_step_elems
+//!   kv_row_elems    = n_kv_heads * head_dim        (one K or V row)
+//!   per_layer_elems = max_seq * kv_row_elems
 //!   kBase(L)        = L * per_layer_elems
 //!   vBase(L)        = n_layers * per_layer_elems + L * per_layer_elems
 
@@ -54,8 +54,8 @@ pub const KvCache = struct {
     /// The element type the rows are framed at. The header describes the tag.
     kv_dtype: dtype.KvDtype,
     /// Elements per (layer, seq_pos): n_kv_heads * head_dim.
-    per_step_elems: u32,
-    /// Elements per layer: max_seq * per_step_elems.
+    kv_row_elems: u32,
+    /// Elements per layer: max_seq * kv_row_elems.
     per_layer_elems: u32,
 
     // -- init ---------------------------------------------------------------
@@ -75,14 +75,14 @@ pub const KvCache = struct {
         std.debug.assert(max_seq <= limits.max_model_ctx);
         std.debug.assert(n_layers <= limits.max_layers);
 
-        const per_step_elems = n_kv_heads * head_dim;
-        const per_layer_wide: u64 = @as(u64, max_seq) * per_step_elems;
+        const kv_row_elems = n_kv_heads * head_dim;
+        const per_layer_wide: u64 = @as(u64, max_seq) * kv_row_elems;
         std.debug.assert(per_layer_wide <= std.math.maxInt(u32));
         const per_layer_elems: u32 = @intCast(per_layer_wide);
 
-        // Price whole rows: a K row and a V row for every (layer, position).
+        // Size whole rows: a K row and a V row for every (layer, position).
         const n_rows: u64 = 2 * @as(u64, n_layers) * max_seq;
-        const total_bytes: usize = @intCast(n_rows * kv_dtype.rowBytes(per_step_elems));
+        const total_bytes: usize = @intCast(n_rows * kv_dtype.rowBytes(kv_row_elems));
         const storage = try arena.alignedAlloc(u8, .@"4", total_bytes);
         @memset(storage, 0);
 
@@ -93,7 +93,7 @@ pub const KvCache = struct {
             .max_seq = max_seq,
             .storage = storage,
             .kv_dtype = kv_dtype,
-            .per_step_elems = per_step_elems,
+            .kv_row_elems = kv_row_elems,
             .per_layer_elems = per_layer_elems,
         };
     }
@@ -104,12 +104,12 @@ pub const KvCache = struct {
 
     // -- typed views --------------------------------------------------------
 
-    /// K rows of `layer` at `0..=pos`, viewed at `E`. Length is `(pos + 1) * per_step_elems`.
+    /// K rows of `layer` at `0..=pos`, viewed at `E`. Length is `(pos + 1) * kv_row_elems`.
     pub fn kSliceAs(self: *const KvCache, comptime E: type, layer: u32, pos: u32) []const E {
         std.debug.assert(layer < self.n_layers);
         std.debug.assert(pos < self.max_seq);
 
-        return self.viewConst(E, self.kBase(layer), (@as(usize, pos) + 1) * self.per_step_elems);
+        return self.viewConst(E, self.kBase(layer), (@as(usize, pos) + 1) * self.kv_row_elems);
     }
 
     /// Slice of V-cache rows for `layer` covering positions `0..=pos`, viewed at `E`.
@@ -117,16 +117,16 @@ pub const KvCache = struct {
         std.debug.assert(layer < self.n_layers);
         std.debug.assert(pos < self.max_seq);
 
-        return self.viewConst(E, self.vBase(layer), (@as(usize, pos) + 1) * self.per_step_elems);
+        return self.viewConst(E, self.vBase(layer), (@as(usize, pos) + 1) * self.kv_row_elems);
     }
 
-    /// Mutable K destination row for (layer, pos), viewed at `E`. Length is `per_step_elems`.
+    /// Mutable K destination row for (layer, pos), viewed at `E`. Length is `kv_row_elems`.
     pub fn kDstAs(self: *KvCache, comptime E: type, layer: u32, pos: u32) []E {
         std.debug.assert(layer < self.n_layers);
         std.debug.assert(pos < self.max_seq);
 
-        const off = self.kBase(layer) + @as(usize, pos) * self.per_step_elems;
-        return self.viewMut(E, off, self.per_step_elems);
+        const off = self.kBase(layer) + @as(usize, pos) * self.kv_row_elems;
+        return self.viewMut(E, off, self.kv_row_elems);
     }
 
     /// Mutable V destination row for (layer, pos), viewed at `E`.
@@ -134,8 +134,8 @@ pub const KvCache = struct {
         std.debug.assert(layer < self.n_layers);
         std.debug.assert(pos < self.max_seq);
 
-        const off = self.vBase(layer) + @as(usize, pos) * self.per_step_elems;
-        return self.viewMut(E, off, self.per_step_elems);
+        const off = self.vBase(layer) + @as(usize, pos) * self.kv_row_elems;
+        return self.viewMut(E, off, self.kv_row_elems);
     }
 
     /// Slice of K-cache rows for `layer` covering positions `0..=pos`.
@@ -148,12 +148,12 @@ pub const KvCache = struct {
         return self.vSliceAs(f32, layer, pos);
     }
 
-    /// Mutable destination row to write K for (layer, pos). Length = per_step_elems.
+    /// Mutable destination row to write K for (layer, pos). Length = kv_row_elems.
     pub fn kDst(self: *KvCache, layer: u32, pos: u32) []f32 {
         return self.kDstAs(f32, layer, pos);
     }
 
-    /// Mutable destination row to write V for (layer, pos). Length = per_step_elems.
+    /// Mutable destination row to write V for (layer, pos). Length = kv_row_elems.
     pub fn vDst(self: *KvCache, layer: u32, pos: u32) []f32 {
         return self.vDstAs(f32, layer, pos);
     }
@@ -194,7 +194,7 @@ pub const KvCache = struct {
     /// Rows past `n_pos` keep their old bytes. Both slabs must have the same shape and dtype.
     pub fn copyFrom(self: *KvCache, source: *const KvCache, n_pos: u32) void {
         std.debug.assert(self.storage.len == source.storage.len);
-        std.debug.assert(self.per_step_elems == source.per_step_elems);
+        std.debug.assert(self.kv_row_elems == source.kv_row_elems);
         std.debug.assert(self.n_layers == source.n_layers);
         std.debug.assert(self.kv_dtype == source.kv_dtype);
         std.debug.assert(n_pos <= self.max_seq);
@@ -240,7 +240,7 @@ pub const KvCache = struct {
         std.debug.assert(n_rows <= self.max_seq);
 
         return self.storage[self.byteOff(base)..][0..self.byteOff(
-            @as(usize, n_rows) * self.per_step_elems,
+            @as(usize, n_rows) * self.kv_row_elems,
         )];
     }
 
@@ -249,7 +249,7 @@ pub const KvCache = struct {
         std.debug.assert(n_rows <= self.max_seq);
 
         return self.storage[self.byteOff(base)..][0..self.byteOff(
-            @as(usize, n_rows) * self.per_step_elems,
+            @as(usize, n_rows) * self.kv_row_elems,
         )];
     }
 
@@ -295,7 +295,7 @@ test "KvCache shapes and slice math" {
     const arena = arena_state.allocator();
 
     var c = try KvCache.init(arena, 2, 3, 4, 8, .f32);
-    try std.testing.expectEqual(@as(u32, 12), c.per_step_elems);
+    try std.testing.expectEqual(@as(u32, 12), c.kv_row_elems);
     try std.testing.expectEqual(@as(u32, 96), c.per_layer_elems);
     try std.testing.expectEqual(@as(usize, 384 * 4), c.storage.len);
 
@@ -318,7 +318,7 @@ test "KvCache at f16 halves the slab and round-trips a row" {
     const arena = arena_state.allocator();
 
     var c = try KvCache.init(arena, 2, 3, 4, 8, .f16);
-    try std.testing.expectEqual(@as(u32, 12), c.per_step_elems);
+    try std.testing.expectEqual(@as(u32, 12), c.kv_row_elems);
     try std.testing.expectEqual(@as(u32, 96), c.per_layer_elems);
     try std.testing.expectEqual(@as(usize, 384 * 2), c.storage.len);
 
@@ -336,7 +336,7 @@ test "KvCache at f16 halves the slab and round-trips a row" {
     try std.testing.expectEqual(@as(f16, 0), k_view[0]);
 }
 
-test "KvCache byte ranges price the rows at the storage dtype" {
+test "KvCache byte ranges size the rows at the storage dtype" {
     const gpa = std.testing.allocator;
     var arena_state = std.heap.ArenaAllocator.init(gpa);
     defer arena_state.deinit();

@@ -101,7 +101,7 @@ pub const GdnDecode = struct {
     }
 
     /// Record the GDN recurrence of a whole prefill chunk as one dispatch. The result is
-    /// bit-identical to `n_tokens` per-token dispatches, and it pays the host dispatch and
+    /// bit-identical to `n_tokens` per-token dispatches, and it runs the host dispatch and
     /// pipeline-barrier cost once. That is the prefill win.
     pub fn recordChunk(
         self: *const GdnDecode,

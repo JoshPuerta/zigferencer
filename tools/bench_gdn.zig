@@ -8,7 +8,7 @@
 //!
 //! Not covered. The Qwen full-attention helpers that exist only as `recordInto` (QkNorm and the
 //! batched rmsnorm, rope, and attention) go into the fused command buffer, so no section here
-//! runs them standalone. `bench-model <qwen> --profile-prefill` and `--profile-decode` price
+//! runs them standalone. `bench-model <qwen> --profile-prefill` and `--profile-decode` time
 //! them instead.
 //!
 //! Inputs. A deterministic pattern fills the inputs, so the reference hash stays stable. One CPU

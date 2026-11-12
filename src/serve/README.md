@@ -79,7 +79,7 @@ The prefix cache sits beside the pool.
 
 `Residency` presents the same method surface as `Sessions`, so the scheduler only swaps its pool
 type. The split with the cache is the pool boundary. The scheduler makes the calls whose result a
-slot state machine consumes. The manager makes the calls whose result only the cache consumes.
+session table consumes. The manager makes the calls whose result only the cache consumes.
 
 ## Rules
 
@@ -122,29 +122,29 @@ slot state machine consumes. The manager makes the calls whose result only the c
   share option, because HTTP has no shutdown verb and holds one session per
   connection. `tests/serve_integration_test.zig` checks the cap, the share, the
   sweep, and the refused shutdown from the wire.
-- **Session leases.** A lease keeps a session through a drop. The scheduler holds it in the slot as
-  a 128-bit token from the secure random source and a time to live. `serve --resume-ttl MS` sets
-  `Config.resume_ttl_max_ms`, the cap on the time to live, and `limits.max_resume_ttl_ms` (one hour)
-  caps the flag. The default is 0, which turns resumption off, so every drop frees as before. At a
-  drop, a leased slot detaches until the drop time plus its time to live. A turn in flight takes the
-  cancel rule, and an opening or append prefill runs on. A detached slot takes no decode row, emits
-  no event, and no request reaches it. A resume with the token attaches the slot to the new
-  connection within its share, and the token rotates. The newest holder wins, so a resume also takes
-  an attached slot. A resume of a slot that is not idle waits in the slot and ends at the moment the
-  slot becomes idle. Until then, the session answers `session_busy` to a generate, an append, a
-  clone, a cancel, a keep, or a close. The client has no `resumed` reply yet. The scheduler frees a
-  detached slot at its deadline. It scans lazily at the tick head and at each admission, with one
-  clock read per scan. A live open with no free slot takes the detached slot with the earliest
-  deadline, so a lease never blocks a live client. An expiry and a yield stop a prefill in flight
-  before the release. A clone that tiered KV refuses after a yield loses the yielded session, and
-  the log line of the yield names the loss. The serve stats line counts the expiries, the yields,
-  the lost yields, and the cut prefills. The server never logs a token.
+- **Session leases.** A lease keeps a session through a drop. The scheduler holds it in the session
+  entry as a 128-bit token from the secure random source and a time to live. `serve --resume-ttl MS`
+  sets `Config.resume_ttl_max_ms`, the cap on the time to live, and `limits.max_resume_ttl_ms` (one
+  hour) caps the flag. The default is 0, which turns resumption off, so every drop frees as before.
+  At a drop, a leased entry detaches until the drop time plus its time to live. A turn in flight
+  takes the cancel rule, and an opening or append prefill runs on. A detached entry takes no decode
+  row, emits no event, and no request reaches it. A resume with the token attaches the entry to the
+  new connection within its share, and the token rotates. The newest holder wins, so a resume also
+  takes an attached entry. A resume of an entry that is not idle waits in the entry and ends at the
+  moment the entry becomes idle. Until then, the session answers `session_busy` to a generate, an
+  append, a clone, a cancel, a keep, or a close. The client has no `resumed` reply yet. The
+  scheduler frees a detached entry at its deadline. It scans lazily at the tick head and at each
+  admission, with one clock read per scan. A live open with no free entry takes the detached entry
+  with the earliest deadline, so a lease never blocks a live client. An expiry and a yield stop a
+  prefill in flight before the release. A clone that tiered KV refuses after a yield loses the
+  yielded session, and the log line of the yield names the loss. The serve stats line counts the
+  expiries, the yields, the lost yields, and the cut prefills. The server never logs a token.
 - **A lost lease reply strands the session until its time to live.** A resume rotates the token
   before the `resumed` reply goes out. A keep issues its token in the `kept` reply. If that reply is
   lost, for example because the connection drops before the delivery, no client holds a valid token.
   The session stays detached until its time to live ends, and the expiry scan then frees it. The
   client falls back to a rebuild from its own history: an open with the original system prompt and
-  an append of the kept pairs. The time to live bounds the stranded slot, and a live open can take
+  an append of the kept pairs. The time to live bounds the stranded entry, and a live open can take
   it earlier.
 - **The engine never blocks on a client.** Emission is non-blocking. A full
   out-queue parks one event in the session's single `pending_event` cell, and the
@@ -152,7 +152,7 @@ slot state machine consumes. The manager makes the calls whose result only the c
   whose queue stays full while it keeps sending is broken, and `disconnect` is
   the bounded answer.
 - **Backpressure is the only legal answer to a full RAM ledger.** An eviction that pushes the ledger
-  past its budget gets `error.RamBudgetExceeded`. The scheduler then parks that turn until a slot
+  past its budget gets `error.RamBudgetExceeded`. The scheduler then parks that turn until a KV slot
   frees. A blob is the only copy of its conversation, so dropping one is never legal.
 - **A full window is a stop, never a shift or a cut.** The server ends a turn with
   `context_full` when the window fills. A turn or a system prompt that does
@@ -330,7 +330,7 @@ leaves the sampling of the session unchanged. On a
 model with no think tags, a switch that opens the block or any budget gets
 `err` with `forbidden`. A switch that keeps the block closed passes, because it
 names the only mode of such a model. The scheduler resolves the switch once,
-and the wrap of the turn and the think state of the slot read that one value.
+and the wrap of the turn and the think state of the entry read that one value.
 A budget above 0 on a model with no forced close also gets `err` with `forbidden`.
 
 `next` and `send` touch disjoint fields, so one task can read while another task
@@ -386,7 +386,7 @@ the new one.
 
 One answer covers an unknown, a rotated, and an expired token, so a probe
 learns nothing from the difference. The server compares tokens in constant
-time. A token that a slot already holds makes the server draw again, at most 4
+time. A token that an entry already holds makes the server draw again, at most 4
 times and then answers `internal` "token draws collided". Two equal draws of
 128 bits do not occur in practice. The token is a bearer secret,
 and ZMTP NULL security sends it in clear text. Bind to 127.0.0.1 or to an `ipc`
@@ -598,6 +598,6 @@ then, and not before.
 | Prefix RAM eviction | `runtime/prompt_cache.zig` `evictLru` | the budget can overshoot by at most one entry |
 | Prefix disk eviction | `runtime/prompt_cache.zig` `diskEvictToFit` | own namespace only. The budget bounds this process, and the victim is its oldest file by mtime |
 | Cache-insert eligibility | `prefix_manager.zig` `insert`, offered by `scheduler.zig` `maybeInsertPrefix` | position-zero completions only |
-| The RAM split, blobs against prefix | `core/kv_budget.zig` `splitRam`, with the corners in `resolve/device_placement.zig` | blobs get their provable need, the prefix gets the surplus |
-| The blob tier of an unset `--kv-ram` | `core/kv_budget.zig` `quoteRam`, called through `resolve/resolve.zig` and `resolve/device_placement.zig` | the full need of `(E + 1)` blobs, or a boot refusal with both fits |
+| The RAM split, blobs against prefix | `core/kv_budget.zig` `splitRam`, with the corners in `resolve/device_placement.zig` | blobs get their provable need, the prefix gets the rest |
+| The blob tier of an unset `--kv-ram` | `core/kv_budget.zig` `planRam`, called through `resolve/resolve.zig` and `resolve/device_placement.zig` | the full need of `(E + 1)` blobs, or a boot refusal with both fits |
 | Full window | `scheduler.zig` decode admission and the turn refusal, `cli/client/client_transcript.zig` `plan` | the server stops and refuses with numbers, the client keeps the longest suffix of turns that fits beside the system prompt and the reserve |

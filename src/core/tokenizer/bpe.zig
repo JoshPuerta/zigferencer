@@ -622,7 +622,7 @@ fn testVocab(arena: Allocator, pre: []const u8) !Vocab {
         try types.append(arena, t);
     }
 
-    const kvs = try arena.dupe(parser.Kv, &.{
+    const metadata = try arena.dupe(parser.MetadataPair, &.{
         .{ .key = "tokenizer.ggml.tokens", .value = .{ .array = .{ .strings = tokens.items } } },
         .{ .key = "tokenizer.ggml.merges", .value = .{ .array = .{ .strings = &test_merges } } },
         .{ .key = "tokenizer.ggml.token_type", .value = .{ .array = .{ .i32s = types.items } } },
@@ -631,7 +631,13 @@ fn testVocab(arena: Allocator, pre: []const u8) !Vocab {
     });
     return vocab_mod.buildFromParsed(
         arena,
-        .{ .header = undefined, .kvs = kvs, .tensors = &.{}, .data_offset = 0, .alignment = 1 },
+        .{
+            .header = undefined,
+            .metadata = metadata,
+            .tensors = &.{},
+            .data_offset = 0,
+            .alignment = 1,
+        },
     );
 }
 

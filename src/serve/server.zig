@@ -707,7 +707,7 @@ test "loopback: keep, hang up, resume, and the next turn equals an undropped twi
     );
     try std.testing.expect(!std.mem.eql(u8, &token, &resumed.state.token));
 
-    // The old token is spent.
+    // The old token is no longer valid.
     try std.testing.expectError(error.ServerError, second.resumeSession(token));
     try std.testing.expectEqual(protocol.ErrorCode.unknown_session, second.last_error.?.code);
     try std.testing.expectEqualStrings("no such lease", second.last_error.?.detail());

@@ -178,7 +178,7 @@ pub const ResidualAdd = struct {
 
     /// Record `n_dispatches` adds into one command buffer and submit once, so `dst_final[i] =
     /// dst_init[i] + n_dispatches * x[i]`. The benchmark reads the timing: per-dispatch time falls
-    /// as `n_dispatches` rises, which prices the submit that one buffer per token amortizes.
+    /// as `n_dispatches` rises, which measures the submit that one buffer per token amortizes.
     pub fn runRepeat(
         self: *ResidualAdd,
         n_dispatches: u32,

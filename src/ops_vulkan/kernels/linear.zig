@@ -210,7 +210,7 @@ pub const LinearQ80Reduce = struct {
 
     /// Record one Q8_0 matmul into a command buffer the caller owns. Before the submit, the caller
     /// points `desc_set` at (input, scales, quants, output), and it inserts the barriers. The fused
-    /// runners chain many such dispatches, and they pay the submit and wait-idle once.
+    /// runners chain many such dispatches, and they run the submit and wait-idle once.
     pub fn recordInto(
         self: *LinearQ80Reduce,
         cb: vk.CommandBuffer,

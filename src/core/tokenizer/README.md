@@ -30,7 +30,7 @@ The data flows from the GGUF file to the ids:
 
 ```
   io/gguf/parser   --Parsed-->  vocab.buildFromParsed  --Vocab-->  bpe.encodePromptAlloc  --> []u32
-   KV pairs                      once at load, on the              bpe.decodeAlloc        --> []u8
+   metadata pairs                once at load, on the              bpe.decodeAlloc        --> []u8
                                  caller's arena
 ```
 

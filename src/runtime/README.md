@@ -23,7 +23,7 @@ comes in, and token ids go out.
 | `session.zig` | `Sessions(RunnerT)`, the conversation slots over the KV slots of a runner. |
 | `runner_surface.zig` | `requireSurface`, the build-time check of the functions and fields of a runner. |
 | `kv_cache.zig` | `KvCache`, the static KV slab of a CPU runner. |
-| `kv_cost.zig` | `costVector`, the per-layer KV price of a model card. |
+| `kv_cost.zig` | `costVector`, the per-layer KV size of a model card. |
 | `prompt_cache.zig` | `PromptCache`, the two-tier store of state snapshots. |
 | `sampler.zig` | The greedy and the seeded sampling of one logits row. |
 | `generate.zig` | The single-sequence decode loop, its `sink` boundary, and the two prefill loops. |
