@@ -1,5 +1,5 @@
 //! The Perfetto protobuf encoder of the span trace, and the nesting walk that turns the intervals
-//! of one track into balanced slice events. Pure datapath, std only.
+//! of one track into balanced slice events. Datapath, std only.
 //!
 //! Comptime. Asserts check that the worst packet of each kind fits `packet_bytes_max`. `Nest` takes
 //! the interval type at comptime.

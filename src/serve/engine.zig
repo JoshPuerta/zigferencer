@@ -121,7 +121,7 @@ pub fn ServeEngine(comptime Engine: type, comptime CodecT: type, comptime Adapte
             out_q: Io.Queue(OutEvent) = undefined,
             out_buf: [out_queue_capacity]OutEvent = undefined,
             out_closed: std.atomic.Value(bool) = .init(false),
-            /// Single-owner guard for closing `stream` (see `fin_*`).
+            /// Single-owner guard for closing `stream`.
             fin: std.atomic.Value(u8) = .init(fin_live),
             parked_hint: std.atomic.Value(bool) = .init(false),
             /// The sessions attached to the connection, as the engine thread last counted them.

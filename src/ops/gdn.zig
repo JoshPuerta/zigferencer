@@ -1,5 +1,5 @@
 //! Gated DeltaNet (GDN) linear-attention CPU reference: the per-token recurrent step of one Qwen3.5
-//! or Qwen3-Next GDN layer. It is a pure datapath over state that the runner owns (the recurrent
+//! or Qwen3-Next GDN layer. It is a datapath over state that the runner owns (the recurrent
 //! state `S` and the conv ring buffer). A fixed d x d state per head replaces the KV cache, so the
 //! cost is O(1) in sequence length. This scalar form specifies the GPU kernel.
 //!

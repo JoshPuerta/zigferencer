@@ -1,5 +1,4 @@
-//! Shared fixture lookup for the model tests. Test code imports this file. The
-//! root module re-exports it only for the tests under `tests/`.
+//! Shared fixture lookup for the model tests.
 //!
 //! Lookup. A test names a registry model, and `path` finds its file through
 //! `registry.locate`: the repo-local `models/` first, then the store that
@@ -41,7 +40,7 @@ pub fn path(arena: Allocator, pub_name: []const u8) (Error || Allocator.Error)![
     };
 }
 
-/// The pure decision, separate so a test can enumerate it.
+/// The decision, separate so a test can enumerate it.
 pub fn decide(found: ?[]const u8, env_set: bool) Error![]const u8 {
     if (found) |p| {
         assert(p.len > 0);

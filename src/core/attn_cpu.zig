@@ -1,4 +1,4 @@
-//! The geometry of CPU attention. The module is pure: no allocation, no threads, and no I/O.
+//! The geometry of CPU attention.
 //!
 //! Comptime. Asserts keep `tileCount` inside 32 bits and the test walk past one tile.
 //!

@@ -1,5 +1,4 @@
-//! The geometry of split-depth GPU attention. The module is pure: no allocation, no device, and no
-//! I/O.
+//! The geometry of split-depth GPU attention.
 //!
 //! Comptime. An assert keeps `splitCount` inside 32 bits.
 //!

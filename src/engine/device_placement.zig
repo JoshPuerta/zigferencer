@@ -1,8 +1,7 @@
-//! Role. The device placements of a boot as pure values: the fused fit, the VRAM budgets, and the
-//! hybrid placement. The CLI measures the device once (`ModelNeeds`,
-//! `DeviceCapacity`), `resolve` calls `choosePlacement`, and the CLI logs the value and constructs
-//! the runner it names. Nothing here reads a device or logs, so a table test runs every device row
-//! with no GPU.
+//! Role. The device placements of a boot as values: the fused fit, the VRAM budgets, and the
+//! hybrid placement. The CLI measures the device once (`ModelNeeds`, `DeviceCapacity`), `resolve`
+//! calls `choosePlacement`, and the CLI logs the value and constructs the runner it names. A table
+//! test runs every device row with no GPU.
 //!
 //! Log order. The value keeps the order of the boot lines. A `LayerChoice` value holds the lines
 //! before the split and the split itself. The placement holds the lines of the runner the split

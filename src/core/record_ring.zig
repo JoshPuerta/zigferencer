@@ -4,8 +4,8 @@
 //!
 //! Role. While the GPU runs the submitted buffer, the runner records the predicted next step into
 //! the other buffer. The next step then submits that buffer with no record on its critical path.
-//! This file holds the control state alone: no Vulkan, no allocation, no I/O. The fused runners
-//! own the command buffers and call these transitions around each Vulkan action.
+//! This file holds the control state alone. The fused runners own the
+//! command buffers and call these transitions around each Vulkan action.
 //!
 //! States. A buffer is `free`, `recorded k`, or `pending k`. `recorded k` holds the
 //! commands of key `k` that the GPU has not seen. `pending k` is submitted and

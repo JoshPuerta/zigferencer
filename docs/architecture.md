@@ -2,6 +2,23 @@
 
 This document explains how zigferencer works, from the build to a served token.
 
+**Contents**
+
+- [1. Glossary](#1-glossary): the words of this document.
+- [2. Build approach](#2-build-approach): the artifacts, the build options, and the Makefile.
+- [3. From a prompt to text](#3-from-a-prompt-to-text): the pipeline, and `run` against `serve`.
+- [4. Control and datapath](#4-control-and-datapath): which modules own state, and which are pure.
+- [5. Code placement](#5-code-placement): what each directory holds, and the files to read first.
+- [6. The core data types](#6-the-core-data-types): the values that pass between the parts.
+- [7. The forward pass](#7-the-forward-pass): the runners, the rings, and the kernels of a layer.
+- [8. CPU threads](#8-cpu-threads): the thread pool, and why the thread count changes no bit.
+- [9. Memory](#9-memory): how the engine plans the window, the slots, the VRAM, and the RAM.
+- [10. Serving](#10-serving): the threads, the scheduler, the sessions, and what outlives a turn.
+- [11. Correctness](#11-correctness): the reference, the token hash, and the tests.
+- [12. What calls what](#12-what-calls-what): the call trees from `main` to the kernels.
+- [13. Operating notes](#13-operating-notes): how to measure, test, and debug.
+- [14. Summary](#14-summary): the design in eight points.
+
 ## 1. Glossary
 
 **The model**
@@ -18,12 +35,14 @@ This document explains how zigferencer works, from the build to a served token.
 | KV cache | The keys and values that attention keeps for each earlier position, so that a new token does not compute them again. |
 | position | The index of a token in the sequence of one session, counted from 0. Each attention layer keeps one K row and one V row for each position, and RoPE encodes the position into Q and K. A session keeps counting across its turns, so the second turn starts where the first turn ended. |
 | Gated-DeltaNet (GDN) | A linear-attention layer of Qwen3.5. It keeps a state of fixed size instead of a KV cache that grows with each token. |
+| convolution ring | The last inputs of the convolution of one GDN layer, `conv_kernel - 1` for each channel. It is part of the GDN state of a slot. |
 
 **The engine**
 
 | Term | Meaning |
 | --- | --- |
-| op | One operation of the model: a matrix product, a norm, attention. `LayerOp` in `core/layer_op.zig` lists them, and every CPU span and every GPU mark of a profile names ops of that list. |
+| engine | The library: every directory under `src/` but `cli/` and `dev/`. The directory `src/engine/` holds only its boot decisions. In the serve layer, `ServeEngine` is the thread that owns the scheduler, and the type parameter `Engine` is the session pool under it. |
+| op | One operation of the model: a matrix product, a norm, attention. `LayerOp` in `core/layer_op.zig` lists them. Every op span of a CPU trace and every GPU mark names an op of that list, or one pass of an op. The other spans name a stage, for example `sched_tick`. |
 | kernel | One implementation of an op: a Zig function on the CPU, a compute shader on the GPU. |
 | backend | The set of kernels that the build selects (`-Dops-backend`). |
 | layer kernel set | The ten methods that a decoder layer calls: `norm`, `project`, `qkNorm`, `rope`, `kvCommit`, `attention`, `gate`, `residual`, `swiglu`, and `gdn`. `CpuLayerKernels` computes each one, and `FusedLayerKernels` records each one into a command buffer. A decoder layer file (`llama_layer`, `qwen_layer`) calls them in the order of its `forward`. |
@@ -36,6 +55,9 @@ This document explains how zigferencer works, from the build to a served token.
 | prefill | The steps that feed the prompt into the model. Only the last prompt row needs logits. |
 | decode | The steps that make one new token for each session. |
 | host, device | The CPU side and the GPU side. |
+| decode ring | The two decode command buffers of a fused runner (`DecodeRing`). While the GPU runs one decode step, the host records the next step into the other buffer. `RecordRing` in `core/record_ring.zig` holds its state. |
+| upload ring | Two host-to-device upload segments (`StreamRing`). No runner uses it. |
+| span ring | The trace buffer of one thread in `core/span.zig`. [profiling.md](profiling.md) calls it the span log. |
 
 **Memory**
 
@@ -74,10 +96,10 @@ This document explains how zigferencer works, from the build to a served token.
 | Artifact | Root file | Where it goes | What it is |
 | --- | --- | --- | --- |
 | `zigferencer` | `src/main.zig` | `zig-out/bin/` | The release binary: `list`, `fetch`, `inspect`, `info`, `run`, `serve`, `serve-openai`, and `client`. |
-| `zigferencer-dev` | `src/dev/dev_main.zig` | `zig-out/bin/` | The release commands, plus the developer commands: `bench-model`, `bench-serve`, `bench-swap`, `bench-decode-host`, `gpu-selftest`, `tokens`, and `serve-demo`. |
+| `zigferencer-dev` | `src/dev/dev_main.zig` | `zig-out/bin/` | The release commands, plus the developer commands: `bench-model`, `bench-serve`, `bench-swap`, `bench-decode-host`, `gpu-selftest`, `tokens`, `serve-demo`, and `dispatch-list`. |
 | `zigferencer-bench` | `tools/bench.zig` | not installed | The op micro-benchmarks. `zig build bench` builds and runs it. |
 | `zigferencer-simd-probe` | `tools/simd_probe.zig` | `zig-out/` | The assembly of each op, for `make simd-report`. `zig build simd-probe` installs only the `.s` file. |
-| test binaries | `src/main.zig`, `tests/*_test.zig` | `zig-out/test/` | The unit tests, and one binary for each integration test. Only `test-install` installs one. |
+| test binaries | `src/main.zig`, `src/dev/dev_main.zig`, `tools/shader_lint.zig`, `tests/*_test.zig` | `zig-out/test/` | The unit tests of each module, the shader lint tests, and one binary for each integration test. Only `test-install` installs one. |
 | SPIR-V blobs | `src/ops_vulkan/shaders/*.comp` | inside the binary | The GPU kernels. Only a GPU build compiles them. |
 
 A plain `zig build` installs only the release binary. `zig build install dev`
@@ -134,7 +156,7 @@ The main build steps:
 | `zig build dev` | Builds and installs the dev binary. |
 | `zig build check` | Type-checks both executables. It installs nothing. |
 | `zig build test` | Runs the unit tests of both modules (`unit` and `dev_unit`), every integration test of this build, the format check, and the shader style rules. |
-| `zig build test-unit` | Runs the unit tests of both modules only. |
+| `zig build test-unit` | Runs the unit tests of both modules and the tests of `tools/shader_lint.zig`. It runs no integration test. |
 | `zig build test-build` | Compiles every test and runs none. |
 | `zig build test-install -Dtest-bin=NAME` | Installs one test binary, so that a debugger can run it. |
 | `zig build bench` | Builds and runs the op micro-benchmarks. |
@@ -183,9 +205,13 @@ and FMA stops the build with a message.
 
 All SIMD work lives inside the op modules. A runner calls `ops.rmsnorm` and the
 other op names, and it does not know which module answers. A new CPU backend is
-therefore a new module with three parts. It holds the op functions and a `pub
-const requires: OpRequires` that declares its target requirements, and
-`resolveOpsBackend` gets a case for it. No runner changes.
+therefore a new module. It holds the op functions and a
+`pub const requires: OpRequires` that declares its target requirements. In
+`build.zig`, `OpsBackendOption`, `OpsBackendResolved`, `resolveOpsBackend`, and
+`cpuOpsBackend` get a case for it, and `addBuildOptions` gets a flag. The `ops`
+alias in `cpu_runner.zig`, `cpu_layer_kernels.zig`, and `linear_dispatch.zig`
+gets one branch each. `op_requires.ops_backend_names` and the backend tables of
+`cli/info/` get a row, so that `info` lists it. No layer file changes.
 
 ### The other build options
 
@@ -199,10 +225,11 @@ const requires: OpRequires` that declares its target requirements, and
 | `-Dtest-filter`, `-Dtest-threads`, `-Dtest-bin` | Run only the tests whose name holds a string, the thread count of the runner tests, and the binary that `test-install` installs. |
 
 A GPU build compiles each shader with `glslc` and embeds the SPIR-V in the binary
-with `@embedFile`. The attention shaders compile twice, once for f32 KV and once for
-f16 KV (`-DKV_F16`), so the two variants share one source. The tile sizes come from
+with `@embedFile`. The attention shaders that read KV compile twice, once for f32
+KV and once for f16 KV (`-DKV_F16`), so the two variants share one source.
+`attention_merge` reads no KV and compiles once. The tile sizes come from
 `core/limits.zig` as `-D` defines, so a shader and the host code that sizes its
-buffers read the same` value.
+buffers read the same value.
 
 ### The Makefile
 
@@ -217,12 +244,13 @@ The `Makefile` is a small layer over `zig build`, and `make help` lists the targ
 - `make build` and `make run` install both executables in one `zig build install dev` call.
   `make run` runs `zigferencer-dev`, which holds every command.
 - `make ci` runs the CPU part of CI. `make ci-gpu` compiles every GPU path and runs none.
-- `make gate`, `make profile`, `make simd-report`, and `make debug-build` call the scripts of
-  `tools/`, and `ARGS=` carries their arguments.
+- `make gate`, `make profile`, and `make simd-report` call the scripts of `tools/`, and
+  `ARGS=` carries their arguments. `make debug-build` calls `tools/debug-build.sh` with no
+  arguments.
 
 ## 3. From a prompt to text
 
-Every command drives the same pipeline:
+The three commands that generate text drive one pipeline:
 
 ```
      model file (GGUF)                          prompt text
@@ -245,7 +273,7 @@ Every command drives the same pipeline:
                            detokenize --> text
 ```
 
-Three commands drive this pipeline. They differ in what sits around the runner.
+The three commands differ in what sits around the runner.
 
 - **`run`** generates text for one prompt, then exits. It prefills the prompt and
   decodes with greedy sampling, so the same prompt always gives the same tokens.
@@ -271,7 +299,7 @@ parts that only matter when many conversations share one model:
 | Decode | One row for each step | One row for each active session in one step |
 | KV cache after a turn | Freed at exit | Kept for the session. The prefix cache and the RAM tier extend it |
 | Sampling | Greedy | Set for each session: temperature, top-k, top-p, min-p, penalties, seed |
-| Output | stdout | Frames of the binary protocol, or HTTP with server-sent events |
+| Output | stdout | Frames of the binary protocol, or HTTP: one JSON body, or server-sent events when the request sets `stream` |
 
 ### The options
 
@@ -290,7 +318,7 @@ parts that only matter when many conversations share one model:
 | `--thinking`, `--thinking-budget`, and the sampling fields | flag, and a field of each turn | 10 |
 | `$ZIGFERENCER_VK_STORAGE_RANGE` | environment variable | 9 |
 | `$ZIGFERENCER_VK_SOFTWARE` | environment variable | [debugging.md](debugging.md) |
-| `$ZIGFERENCER_LOG`, `$ZIGFERENCER_MODELS_DIR`, `$ZIGFERENCER_CACHE_DIR` | environment variable | 12 |
+| `$ZIGFERENCER_LOG`, `$ZIGFERENCER_MODELS_DIR`, `$ZIGFERENCER_CACHE_DIR` | environment variable | 13 |
 | `$ZIGFERENCER_TRACE_OUT` and the other trace variables | environment variable | [profiling.md](profiling.md) |
 
 ## 4. Control and datapath
@@ -332,8 +360,10 @@ the lessons from digital design in VHDL I had many years ago.
 ### The surface between the CLI and the engine
 
 The CLI is one client of the engine. It owns what belongs to a process: the command line, the
-environment, stdout, the terminal, and the exit code. No engine file reads any of them, and no
-engine file imports `src/cli/`.
+environment, stdout, the terminal, and the exit code. No engine file reads the command line or
+the environment, sets the exit code, or imports `src/cli/`. Three engine files write to stdout
+or stderr. `core/log.zig` writes the log, and `io/download.zig` writes the download progress,
+both on stderr. `runtime/gpu_profile.zig` writes the GPU profile table on stdout.
 
 | Step | CLI -> Engine | Engine -> CLI |
 | --- | --- | --- |
@@ -355,7 +385,7 @@ engine file imports `src/cli/`.
 | `EngineFlags` | `engine/flags.zig` | The flags that several commands share: the KV dtype, the window, the GPU layers, the threads, and the thinking mode. | The flag parser fills it. `resolve` reads it. |
 | `Resources` | `engine/resolve.zig` | What the host measured once: free RAM and, on a GPU build, the free VRAM and the device buffer limits. | The CLI measures it. `resolve` reads it. |
 | `Resolved`, `Refusal` | `engine/resolve.zig` | The result of the boot decision: the window, the KV dtype, the placement, the plan, or the reason the boot stops. | `resolve` makes it as a pure function. The CLI builds the runner from it or prints the refusal. |
-| `KvPlan` | `core/kv_budget.zig` | The slot count, the window, and the bytes that each part reserves in VRAM and RAM. | The planner makes it. Every runner constructor reads it. |
+| `KvPlan` | `core/kv_budget.zig` | The slot count, the window, and the bytes that each part reserves in VRAM and RAM. | The planner makes it. The CPU and fused runner constructors read it. The hybrid constructor reads a `LayerSplit`. |
 | `LayerSplit` | `core/kv_budget.zig` | The layer split of a hybrid and the cost of each side. | The device decision makes it. A hybrid runner reads it, and `run` and `serve` print it. |
 | `Policy` | `runtime/parallel.zig` | The thread count, the fan-out floor, and the spin budget of the CPU pool. | Set from the host and the thread flags. The pool and every parallel op read it. |
 | `StepRow` | `runtime/step_row.zig` | One row of a step: the slot, the token, the position, and whether the row needs logits. | Sessions and the decode loop make it. Every runner step reads it. |
@@ -375,11 +405,18 @@ families.
   stream. The same code runs SmolLM2-135M and Llama-3.1-8B.
 - **Qwen3.5 hybrid family** (`runtime/qwen_layer.zig`). Most layers replace
   attention with Gated-DeltaNet (`ops/gdn.zig`). A GDN layer keeps a recurrent state
-  of fixed size for each head instead of a KV cache which does not grow with the sequence. 
-  Every Nth layer is full attention with a norm on Q and K and an output gate. 
-  The file sets N (`full_attention_interval`).
+  of fixed size for each head. A KV cache grows with the sequence, and this state
+  does not. Every Nth layer is full attention with a norm on Q and K and an output
+  gate. The model file sets N in the GGUF key `qwen35.full_attention_interval`.
+  Qwen3.5-2B sets 4.
 
 ### Runners and placements
+
+With `-Dops-backend=vulkan`, the CPU runner drives the model, and each heavy op is
+one GPU submit with its own wait and read-back. This per-op backend is a
+correctness reference, and `serve` refuses it. With `-Dops-backend=vulkan_fused`,
+the fused runner records the whole step as one command buffer and submits it once.
+Its weights, KV, and activations stay in VRAM.
 
 A runner runs the forward pass of one family on one placement. Two families on
 three placements give six runners:
@@ -427,35 +464,77 @@ A row in a batch gets the same inputs as the same row alone. A batched step
 therefore gives each session the result it gets alone. The serve layer depends on
 this rule (section 10).
 
+### The fused step and the rings
+
+A fused step is one command buffer that holds every dispatch of the step. The
+buffer copies the input rows from the host, runs every layer, the final norm, and
+the lm_head, and copies the logits rows back. The host submits it once and waits
+once.
+
+The host writes every dispatch and barrier of the step into the buffer, and the
+GPU idles while a record runs before its submit. A decode record reads no token,
+because the token is data in the input stage and the descriptor sets are fixed at
+start. So while the GPU runs the step at position `p`, the decode ring records
+the step at `p + 1` into its other buffer. The key of a record is its position
+and its GPU timestamp level.
+
+A step whose key equals the key of a recorded buffer is a hit, and it submits that
+buffer with no record. Any other step is a miss, and it records first. A wasted
+record is a recording that no step submitted. A new record, or a submit that is
+not a decode step, discards it. Only `step`, the one-row decode of `run` and
+`bench-model`, uses the ring. `serve` calls `stepBatch`, which records its buffer
+on every step.
+
+| Ring | File | What it holds | Slots | When it is full |
+| --- | --- | --- | --- | --- |
+| decode ring | `runtime/decode_ring.zig`, the state in `core/record_ring.zig` | The decode command buffers of a fused runner. | 2, one for each value of `record_ring.Buf` | It never blocks. A new record replaces a recording, which counts as wasted. |
+| upload ring | `ops_vulkan/stream_ring.zig`, the slot table in `core/ring_fsm.zig` | Host-to-device upload segments (`StreamRing`). | `ring_fsm.depth` | `acquire` returns null, and the caller decides. |
+| span ring | `core/span.zig` | The trace spans of one thread. One more ring holds the GPU submit records. | `limits.spans_per_thread` by default, `limits.trace_gpu_records` | It drops the new entry and counts it. |
+| convolution ring | `ops/gdn.zig` | The last inputs of the convolution of one GDN layer and slot. | `conv_kernel - 1` for each channel | It never fills. Each token drops the oldest input. |
+
+In this document, "the ring" is the decode ring. The `host_ring` line of
+`bench-model` counts its hits, misses, speculative records, and wasted records.
+`StreamRing` keeps one upload in flight while the host fills the next segment. No
+runner uses it, and only `tests/vulkan_stream_ring_test.zig` drives it.
+
 ### The op API
 
-A runner computes a layer as a fixed sequence of op calls, for example
-`ops.rmsnorm`, `ops.linearF32Q80`, `ops.ropeInplace`, `ops.swiglu`, and
-`ops.residualAdd`. The name `ops` is a compile-time alias for one module, and every
-op module exports the same names with the same signatures:
+A family writes the forward pass of a decoder layer once, as calls of the layer
+kernel set that each runner supplies. `CpuLayerKernels`, the set of the CPU runner,
+turns each call into op calls (**The calls of one layer**, below). The name `ops`
+is a compile-time alias for the op module of the build, and the CPU modules export
+the same names and signatures:
 
 ```
-                    a layer of llama_layer.zig
-   rmsnorm -> linear Q,K,V -> rope -> attention -> linear out -> add
-   rmsnorm -> linear gate,up -> swiglu -> linear down -> add
+                llama_layer.forward, qwen_layer.forward
                                  |
-                                 |  calls  ops.<name>
+                                 |  calls the kernel set of the runner
                                  v
+      CpuLayerKernels                         FusedLayerKernels
+      the CPU runner, and the CPU layers      the fused runner, and the GPU layers
+      of a hybrid                             of a hybrid. It records each call
+                                              into one command buffer.
+              |
+              |  calls  ops.<name>
+              v
       +----------------+------------------+---------------------+
       | ops/naive.zig  | ops/simd_pf.zig  | ops_vulkan/wrap.zig |
       | scalar Zig     | AVX2, prefetch   | one GPU submit      |
       | the reference  | the CPU default  | for each op         |
       +----------------+------------------+---------------------+
-            the build keeps exactly one of these modules
+             the ops alias names exactly one op module.
+         simd_pf.zig and wrap.zig re-export some naive kernels.
 ```
 
 Attention is the one op whose names differ. A CPU module exports a part kernel and a
 merge, and `runtime/parallel.zig` runs them on the pool (section 8). The per-op GPU
 module exports one attention call.
 
-The fused runners do not use this API. They record every kernel of a step into one
-command buffer and submit it once. Their weights, KV, and scratch stay in VRAM, and
-their descriptor sets are bound once at start. The three paths compare like this:
+The fused runners do not call the `ops` module. They record every kernel of a step into one
+command buffer and submit it once. Their layer weights, the lm_head, the KV, and the
+scratch stay in VRAM, and their descriptor sets are bound once at start. The
+embedding lookup reads the memory map on the host. The three paths compare like
+this:
 
 | Path | Build | How a step runs | Use |
 | --- | --- | --- | --- |
@@ -473,6 +552,51 @@ workgroup for each query head. A longer row splits its positions across workgrou
 and a merge pass adds the splits in a fixed order. A row length therefore gives the
 same bits in any batch. Each runner plans the attention rows of a step once
 (`AttnPlan` in `core/attn_split.zig`).
+
+**The calls of one layer.** A decoder layer calls the layer kernel set in the order
+of its `forward`. The first table numbers the calls of each kind of layer. The
+second table names the CPU function and the fused shader behind each call. `ops`
+is the op module of the build, and a shader name is its file in
+`ops_vulkan/shaders/` without `.comp`.
+
+| Op | Call | Llama | Qwen3.5 attention | Qwen3.5 GDN |
+| --- | --- | --- | --- | --- |
+| `attn_norm` | `norm` | 1 | 1 | 1 |
+| `attn_proj` | `project` | 2: Q, K, V | 2: Q with its gate, K, V | |
+| `qk_norm` | `qkNorm` | | 3 | |
+| `rope` | `rope` | 3: adjacent pairs | 4: half-split pairs | |
+| `kv_commit` | `kvCommit` | 4 | 5 | |
+| `attention` | `attention` | 5 | 6 | |
+| `attn_gate` | `gate` | | 7 | |
+| `o_proj` | `project` | 6 | 8 | |
+| `gdn_proj` | `project` | | | 2: qkv, z, alpha, beta |
+| `gdn` | `gdn` | | | 3 |
+| `gdn_out` | `project` | | | 4 |
+| `mixer_residual` | `residual` | 7 | 9 | 5 |
+| `ffn_norm` | `norm` | 8 | 10 | 6 |
+| `gate_up_proj` | `project` | 9 | 11 | 7 |
+| `swiglu` | `swiglu` | 10 | 12 | 8 |
+| `down_proj` | `project` | 11 | 13 | 9 |
+| `ffn_residual` | `residual` | 12 | 14 | 10 |
+
+| Call | CPU function (`CpuLayerKernels`) | Fused shader (`FusedLayerKernels`) |
+| --- | --- | --- |
+| `norm` | `ops.rmsnorm` | `rmsnorm` for `step`, `rmsnorm_batch` for the other steps |
+| `project` | `ops.linearF32Q80Batch`, or the batch op of the weight type, on the pool | `linear_q8_0_reduce` for one row, `linear_q8_0_batch` for more. Qwen3.5 records `linear_q8_0_gemm` from `gemm_min_batch` rows. A Llama Q4_0 model records the `linear_q4_0_` forms. |
+| `qkNorm` | `ops.rmsnorm` on each head | `qwen_qk_norm` |
+| `rope` | `ops.ropeInplace` on each head | `rope_multi` for `step`, `rope_multi_batch` for the other steps |
+| `kvCommit` | a copy into the slot, narrowed to the KV type | a buffer copy, after `kv_commit_f16` at f16 KV |
+| `attention` | `ops.attentionPartTyped` for each part on the pool, then `ops.attentionMerge` | `attention` for `step`, `attention_multi_stream` for `stepBatch`, `attention_batch` for a prompt chunk. A row past `limits.attn_split_len` adds `attention_split` and `attention_merge`. |
+| `gate` | a sigmoid product inside `CpuLayerKernels.gate` | `sigmoid_gate` |
+| `residual` | `ops.residualAdd` | `residual_add` |
+| `swiglu` | `ops.swiglu` | `swiglu` |
+| `gdn` | `gdn.stepPrologue`, then `gdn.stepHeads` on the pool (`ops/gdn.zig`) | `gdn_decode` for `step` and `stepBatch`. A prompt chunk records `gdn_chunk_conv`, `gdn_chunk_scan`, and `gdn_chunk_norm`. |
+
+All three layers share the norms, the projections, the residual adds, and the
+feed-forward, on the same CPU functions. The Qwen3.5 attention layer adds
+`qkNorm` and `gate`, and it rotates half-split pairs where Llama rotates adjacent
+pairs. A GDN layer keeps a fixed-size recurrent state and no KV, so `gdn` replaces
+RoPE, the KV commit, and attention.
 
 ### Support by path
 
@@ -769,8 +893,10 @@ case where whole-slot moves measure as not enough.
   prefix files <-----> prefix cache (RAM tier)
 ```
 
-The runtime sizes every buffer once, from a plan, before the first step. No buffer
-grows during a step.
+The runtime sizes the weights, the KV slots, and the scratch once, from a plan,
+before the first step. The swap stages grow on the first swap, up to one chunk. The
+blobs and the prefix entries allocate when the server stores one. The plan prices
+these too. No buffer grows during a step.
 
 ### The window
 
@@ -784,6 +910,14 @@ window than a Llama model of the same size.
 
 A `--max-seq` past the model ceiling is a usage error. The loader refuses a file
 that declares a RoPE scaling that the engine does not apply.
+
+A window that you name with `--max-seq` is a request that the engine meets or
+refuses with a message. A silent smaller window breaks a client that sized its
+prompts for the named window. A default window is the choice of the engine, so
+the GPU checks below shrink it to fit. A refusal of a default punishes a user who
+asked for nothing. With `--vram-slots`, the slot count is the request, and the
+VRAM budget buys the window. A named window then caps that window, and the boot
+log warns when the budget buys less.
 
 ### The GPU checks
 
@@ -932,8 +1066,8 @@ no work and no request came in.
 A failed `accept` does not end the server. A failure that comes from a client, such as an
 aborted connection, retries at once. A failure from a lack of resources, such as file
 descriptors or memory, retries after a wait (`accept_backoff_ms`). Each retry logs one line.
-Only a cancel at shutdown or a closed listener stops the acceptor task (`acceptAction`
-in `serve/engine.zig`).
+Only a cancel at shutdown, a closed listener, or `error.WouldBlock` stops the acceptor task
+(`acceptAction` in `serve/engine.zig`).
 
 The engine thread never waits for a client. When the event queue of a connection is
 full, the scheduler puts the event in the pending cell of that session. That session
@@ -943,7 +1077,7 @@ gets no row until the event goes out, and every other session keeps its rows.
 
 | | Binary frontend (`serve`) | OpenAI frontend (`serve-openai`) |
 | --- | --- | --- |
-| Wire | Framed binary messages over ZMTP. `serve/protocol.zig` defines the frames and refuses every other protocol version. | HTTP: `POST /v1/chat/completions` with server-sent events, `GET /v1/models`, `GET /healthz`. |
+| Wire | Framed binary messages over ZMTP. `serve/protocol.zig` defines the frames and refuses every other protocol version. | HTTP: `POST /v1/chat/completions`, with one JSON reply or with server-sent events when the request sets `stream`, `GET /v1/models`, `GET /healthz`. |
 | Client | Any ZMQ DEALER socket. `serve/client.zig` is the reference client. | Any OpenAI client or SDK. |
 | Tasks | Two for each connection: a reader and a writer. | One for each connection. |
 | Sessions | A client opens, uses, and closes sessions, many on one connection. | Each request opens a session, runs one turn, and closes it. |
@@ -966,7 +1100,8 @@ When the server is ready, it prints one line to stdout: `READY tcp <address>` or
         |                          +-------- stop, send done --------- decode
         |                                    (end token, max tokens,   (one token
         |                                     window full, cancel)      each tick)
-        +---- close, a drop with no lease, or a lease that expires (from any state)
+        +---- close, a drop with no lease, a lease that expires, or a lease that
+              yields to a new open (from any state)
 ```
 
 - **open** gives a session a free slot. **clone** copies an idle session into a new
@@ -1030,12 +1165,13 @@ penalty field, and the server refuses a value other than zero. `run` and
 `bench-model` always sample greedily.
 
 A model with a think block (Qwen3.5) can think before it answers. `--thinking
-auto|on|off` sets the default for each turn, and `auto` takes the default of the
-model file. `--thinking-budget N` limits the think tokens of a turn, and `0` means no
-limit. When a turn reaches the budget, the scheduler forces the close tag, and the
-model continues with the answer. A turn can set both values for itself. The OpenAI
-frontend takes them as `chat_template_kwargs.enable_thinking` and
-`thinking_token_budget`.
+auto|on|off` sets the default for each turn, and `auto` takes the thinking mode of
+the registry entry of the model. `--thinking-budget N` limits the think tokens of a
+turn, and `0` means no limit. When a turn reaches the budget, the scheduler forces
+the close tag, and the model continues with the answer. A turn can set both values
+for itself. The OpenAI frontend takes them as `chat_template_kwargs.enable_thinking`
+and `thinking_token_budget`. There, the vLLM rule applies: a budget of 0 turns
+thinking off, and -1 or no field keeps the value of the server.
 
 ### State that outlives a turn
 
@@ -1047,13 +1183,13 @@ frontend takes them as `chat_template_kwargs.enable_thinking` and
   the time of a restore. The RAM tier is an LRU list sized by the boot plan.
   `--prefix-disk` adds a disk tier, and `--preload FILE` fills the cache at boot. A
   restore gives the same tokens as a full prefill.
-- **The KV tiers** (`serve/residency.zig`). With `--vram-slots` below
-  `--max-sessions`, the server keeps more sessions than it has VRAM slots. When a
-  session needs a slot, the least recently used resident session moves its written
-  KV rows to a RAM blob. When the RAM budget cannot hold one more blob, the move is
-  refused and the turn waits until a slot or RAM frees. A blob is the only copy of
-  its session, so the server never drops one. Without `--vram-slots`, every session
-  has its own slot and nothing moves.
+- **The KV tiers** (`serve/residency.zig`). With `--vram-slots` or `--kv-vram`, the
+  server can keep more sessions than it has VRAM slots. When a session needs a slot,
+  the least recently used resident session moves its written KV rows to a RAM blob.
+  When the RAM budget cannot hold one more blob, the move is refused and the turn
+  waits until a slot or RAM frees. A blob is the only copy of its session, so the
+  server never drops one. With neither flag, every session has its own slot and
+  nothing moves.
 - **Leases.** A client can ask the server to keep a session after its connection
   drops (`session_keep`), for at most `--resume-ttl` milliseconds. A new connection
   takes the session back with `session_resume`. The default is `0`, no leases.
@@ -1100,8 +1236,9 @@ backends the greedy tokens are equal. Section 11 names the tests that check it.
 - **The token hash.** `bench-model` prints an FNV-1a hash of the generated token
   ids. Equal hashes across thread counts check determinism. Equal hashes across
   backends and placements check that the paths agree. `tools/gate.sh` holds the gates as
-  tables. `backends` covers the CPU backends, `threads` the thread counts, `hybrid` the CPU
-  runner, the fused runner, and three hybrid splits, and `deep` a deep prompt.
+  tables. `backends` covers the CPU backends and the per-op Vulkan backend. `threads`
+  covers the thread counts, `hybrid` the CPU runner, the fused runner, and three hybrid
+  splits, and `deep` a deep prompt.
 - **The snapshot test** (`tests/snapshot_smollm2_test.zig`) pins the first greedy
   tokens of a fixed prompt on a real model file. A fault anywhere in the stack fails
   it.
@@ -1185,17 +1322,17 @@ run_cmd.run(ctx)
   runFused                                                 cli/run_cmd.zig
     openDevice -> vulkan_ctx.Context.init                  runtime/vulkan_ctx.zig: instance, device, queue, limits
     fusedOn(ctx) -> resolve.resolve with device capacity   cli/boot/boot_resources.zig, engine/device_placement.zig: region check, VRAM fit, plan
-  runFusedOn(ctx, fused, ...)                              cli/run_cmd.zig
-    FusedRunner(qwen_layer).init(ctx, loaded, plan)        runtime/fused_runner.zig
-      the VRAM preflight, guardKvLayout
-      the pipelines, the scratch buffers, the KvStore, the weight upload
-      the descriptor sets (bound once), DecodeRing.init
-    runner.prefillBatch(chunk, pos)                        record the step, submit, wait, copy the logits
-    generate.decode -> runner.step(id, pos)
-      DecodeRing.step(key, next)                           runtime/decode_ring.zig
-        the recorded buffer of this key, or record it now
-        queueSubmit, record the predicted next step, wait on the fence
-      copy the logits to the host, then sampler.greedy as on the CPU
+    runFusedOn(ctx, fused, ...)                            cli/run_cmd.zig
+      FusedRunner(qwen_layer).init(ctx, loaded, plan)      runtime/fused_runner.zig
+        guardKvLayout, the step buffer guards, the VRAM preflight
+        the pipelines, the scratch buffers, the KvStore, the weight upload
+        the descriptor sets (bound once), DecodeRing.init
+      runner.prefillBatch(chunk, pos)                      record the step, submit, wait, copy the logits
+      generate.decode -> runner.step(id, pos)
+        DecodeRing.step(key, next)                         runtime/decode_ring.zig
+          the recorded buffer of this key, or record it now
+          queueSubmit, record the predicted next step, wait on the fence
+        copy the logits to the host, then sampler.greedy as on the CPU
 ```
 
 ### `run` on the hybrid placement
@@ -1282,17 +1419,18 @@ acceptorTask -> HttpAdapter.onAccept                       serve/openai/http_ser
 ## 13. Operating notes
 
 - **Measure ReleaseFast binaries only.** A plain `zig build` makes a Debug binary,
-  which runs the host code much slower. Every `make` target that runs a
-  model builds `ReleaseFast`. Check the optimize mode before you look for the cause
-  of a slowdown.
+  which runs the host code much slower. With the default variables, every `make`
+  target that measures a model builds `ReleaseFast`. `make test` builds `ReleaseSafe`,
+  and `FLAVOR=structure` of `make profile` builds Debug. Check the optimize mode before
+  you look for the cause of a slowdown.
 - **Run GPU tests one at a time.** `-Dtest-filter="<text>"` runs only the tests
   whose name holds the text. A test that the filter skips touches no device.
   Read the `Build Summary` line of `zig build test -Druntime=vulkan --summary all`.
   On some drivers a test process exits abnormally after its tests report, and the
   summary line still carries the result.
 - **Use the compile-only steps on a host with no GPU.** `zig build check`,
-  `test-build`, and `bench-build`, each with `-Druntime=vulkan`, compile the GPU code
-  and run no kernel.
+  `test-build`, and `bench-build`, each with `-Druntime=vulkan -Dops-backend=vulkan_fused`,
+  compile the fused GPU code and run no kernel. `make ci-gpu` compiles every GPU backend.
 - **Stay under the preflight.** The preflight refuses a plan that cannot fit. A plan
   under the line can still fail on a driver whose budget does not show its
   host-visible staging or its residency. After a device loss,
@@ -1311,9 +1449,9 @@ acceptorTask -> HttpAdapter.onAccept                       serve/openai/http_ser
 
 ## 14. Summary
 
-1. **One pipeline.** Every command loads a model, tokenizes, prefills, and decodes
-   through the same runners. `run` is the shortest path, and `serve` adds sessions, a
-   scheduler, and the KV tiers.
+1. **One pipeline.** Every command that generates text loads a model, tokenizes,
+   prefills, and decodes through the same runners. `run` is the shortest path, and
+   `serve` adds sessions, a scheduler, and the KV tiers.
 2. **The build selects the kernels.** `-Druntime` sets what the binary links, and
    `-Dops-backend` sets which kernels compute the ops. The binary holds no backend
    branch at run time.
@@ -1328,5 +1466,8 @@ acceptorTask -> HttpAdapter.onAccept                       serve/openai/http_ser
    with prompt rows, and it never waits for a client.
 7. **Checked determinism.** Token hashes compare thread counts, backends, and
    placements against one value. `naive` is the reference for every kernel.
-8. **Bounds in one place.** `core/limits.zig` holds the caps of every queue, ring,
-   table, and window, and the boot refuses a value past a cap.
+8. **Named bounds.** `core/limits.zig` holds the caps of the tables, the
+   windows, the span ring, and most queues. The boot refuses a value past a cap. The
+   two queue capacities of the serve engine stand in `serve/engine.zig`. The decode
+   ring takes its size from `record_ring.Buf`, and the upload ring from
+   `ring_fsm.depth`.

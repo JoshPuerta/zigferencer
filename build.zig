@@ -358,8 +358,8 @@ fn simdBackendSupportedBy(cpu: std.Target.Cpu) bool {
     return true;
 }
 
-/// The CPU variant of a binary. A GPU binary still owns engines that the GPU does not cover, such
-/// as the qwen session engine on a fused build. They must run on the strongest CPU variant.
+/// The CPU variant of a binary. A GPU binary still owns runners that the GPU does not cover, such
+/// as the qwen session runner on a fused build. They must run on the strongest CPU variant.
 fn cpuOpsBackend(config: Config) OpsBackendResolved {
     const simd_ok = simdBackendSupportedBy(config.target.result.cpu);
     return switch (config.ops_backend) {

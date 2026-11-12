@@ -381,7 +381,7 @@ pub fn linearF32Q41(input: []const f32, weight: Tensor, out: []f32) void {
     }
 }
 
-/// Batched Q4_1 linear via the per-row fallback (see `linearF32Q40Batch`).
+/// Batched Q4_1 linear via the per-row fallback.
 pub fn linearF32Q41Batch(
     inputs: []const f32,
     weight: Tensor,
@@ -430,7 +430,7 @@ pub fn linearF32Q6K(input: []const f32, weight: Tensor, out: []f32) void {
     }
 }
 
-/// Batched Q6_K linear via the per-row fallback (see `linearF32Q40Batch`).
+/// Batched Q6_K linear via the per-row fallback.
 pub fn linearF32Q6KBatch(
     inputs: []const f32,
     weight: Tensor,

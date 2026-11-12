@@ -15,11 +15,10 @@
 //!     12   session_id   u32   0 = server scope, otherwise a live session id
 //!     16   payload_len  u32   <= max_frame_payload_bytes
 //!
-//! Trust boundary. This module is pure: it imports no I/O and allocates nothing. Decoded
-//! messages BORROW their text slices from the payload buffer, and the caller copies what it
-//! keeps. Every decode checks every length and consumes the payload exactly, so trailing bytes
-//! are malformed. A decode never panics on input. It returns a typed error that the connection
-//! layer maps to an `error` frame.
+//! Trust boundary. Decoded messages BORROW their text slices from the payload buffer, and the
+//! caller copies what it keeps. Every decode checks every length and consumes the payload
+//! exactly, so trailing bytes are malformed. A decode never panics on input. It returns a typed
+//! error that the connection layer maps to an `error` frame.
 //!
 //! Token text. One rule every client must implement: `token.text` is RAW BYTES. One token can be
 //! a partial UTF-8 sequence. The concatenation of a turn's token texts is well-formed. Buffer the
@@ -70,7 +69,7 @@
 //!     30   gen_tokens        u32      0 when has_last is 0
 //!     34   reasoning_tokens  u32      0 when has_last is 0
 //!
-//! Kept reply. 40 bytes: the granted time to live, then the token. See `serve/README.md` for the
+//! Kept reply. 40 bytes: the granted time to live, then the token. `serve/README.md` holds the
 //! grant rules, the client method, and the terminal message of every verb.
 
 const std = @import("std");

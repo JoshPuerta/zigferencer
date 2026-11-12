@@ -2007,7 +2007,7 @@ test "openai routes: HEAD on a GET route answers as GET with no body" {
 }
 
 // The std chunk decoder panics on this size in a safe build, so this test runs last: a
-// failure before the fix stops the binary only after the other tests ran.
+// failure stops the binary only after the other tests ran.
 test "openai framing: a chunk size past 64 bits gets 400, and the server stays up" {
     var fx: Fixture = undefined;
     try fx.setUp();

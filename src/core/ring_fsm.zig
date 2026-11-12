@@ -3,8 +3,8 @@
 //!
 //! Comptime. Tests run at comptime, so drift in the transition table fails the build.
 //!
-//! Role. This file holds the control table alone: no Vulkan, no allocation, no I/O. The GPU type
-//! mirrors this table, and the anchor trace below replays step for step in it.
+//! Role. This file holds the control table alone. The GPU type mirrors
+//! this table, and the anchor trace below replays step for step in it.
 //!
 //! Legality. Every state change in the ring routes through `next`. A transition the
 //! table does not name is a bug in the caller, not a runtime condition, so

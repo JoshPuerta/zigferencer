@@ -8,7 +8,7 @@
 //! Layout. GGUF stores 2D weight shapes REVERSED vs PyTorch: a linear weight that is
 //! PyTorch [out_features, in_features] arrives here as shape = [in, out].
 //! Memory is row-major by OUTPUT row, so the linear kernels read w[j*in + k]
-//! for output j, input k (see `ops/naive.zig`):
+//! for output j, input k:
 //!
 //!   shape = [in, out]                 memory (row-major, one row per output)
 //!                                       +------------------------------+

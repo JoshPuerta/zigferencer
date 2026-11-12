@@ -905,7 +905,7 @@ pub fn worthwhile(prefill_ns: u64, restore_ns: u64) bool {
 
 // -- helpers ----------------------------------------------------------------
 
-// -- tests (pure logic, no GPU) ---------------------------------------------
+// -- tests ------------------------------------------------------------------
 /// Test helper: the on-disk path of one cached prefix.
 fn testDiskPath(buf: []u8, dir: []const u8, key: u64) ![]u8 {
     return std.fmt.bufPrint(buf, "{s}/{x:0>16}.zkv", .{ dir, key });

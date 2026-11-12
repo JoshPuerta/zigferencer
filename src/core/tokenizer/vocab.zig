@@ -1,13 +1,12 @@
 //! `Vocab`, a boundary value derived from the GGUF tokenizer KVs. It is built once at load time and
-//! consumed by `bpe.encodeAlloc` and `bpe.decodeAlloc`, which stay pure over Vocab with storage on
-//! the caller's arena.
+//! consumed by `bpe.encodeAlloc` and `bpe.decodeAlloc`, with storage on the caller's arena.
 //!
 //! Comptime. The GPT-2 byte table (`gpt2_byte_table`) is built at comptime.
 //!
 //! Byte level. GPT-2 byte-level BPE maps every byte 0..255 to a printable Unicode codepoint, and
-//! the model only ever sees those. The byte-to-codepoint table is fixed and lives in `comptime`
-//! (see `gpt2_byte_table`). The table must produce exactly 68 escape codepoints, which is what the
-//! GPT-2 byte-to-unicode algorithm produces.
+//! the model only ever sees those. The byte-to-codepoint table is fixed and lives in `comptime`.
+//! The table must produce exactly 68 escape codepoints, which is what the GPT-2 byte-to-unicode
+//! algorithm produces.
 //!
 //! Encode speed. It lives in the data, not the code: `byte_to_id` is a flat [256]u32 lookup, the
 //! merge maps are u64-keyed, and `specials_sorted` is length-descending so the encoder
@@ -107,10 +106,9 @@ pub const Vocab = struct {
 
     bos_id: u32,
     eos_id: u32,
-    /// Whether `bpe.encodeAlloc` prepends `bos_id`. It comes from the model metadata (see
-    /// `addBos`).
+    /// Whether `bpe.encodeAlloc` prepends `bos_id`. It comes from the model metadata.
     add_bos: bool,
-    /// Pre-tokenization regime (see `PreType`). Selects the encode path in `bpe`.
+    /// Pre-tokenization regime. Selects the encode path in `bpe`.
     pre: PreType,
     /// llama3: emit a whole pre-token directly when it is a vocab token. Mirrors `ignore_merges`.
     ignore_merges: bool,
@@ -119,7 +117,7 @@ pub const Vocab = struct {
 };
 
 /// One byte's GPT-2 byte-level entry: its codepoint and the UTF-8 bytes that
-/// encode it. Computed entirely at comptime (see `gpt2_byte_table`).
+/// encode it. Computed entirely at comptime.
 const ByteEntry = struct {
     cp: u21,
     bytes: [4]u8,

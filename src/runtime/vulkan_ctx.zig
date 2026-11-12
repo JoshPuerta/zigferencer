@@ -134,7 +134,7 @@ pub const HeapBudget = struct {
 pub const PickedDevice = struct {
     device: vk.PhysicalDevice,
     props: vk.PhysicalDeviceProperties,
-    /// See `scoreDeviceType`. A negative score rejects the device.
+    /// A negative score rejects the device.
     score: i32,
 };
 

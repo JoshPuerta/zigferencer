@@ -1,6 +1,6 @@
-//! The pure datapath of the OpenAI frontend. It parses and validates an untrusted request body
-//! into a value, and it maps a rejection to an HTTP error. These functions do no I/O. The HTTP
-//! shell (`http_server.zig`) calls them and owns the transport.
+//! The datapath of the OpenAI frontend. It parses and validates an untrusted request body
+//! into a value, and it maps a rejection to an HTTP error. The HTTP shell (`http_server.zig`) calls
+//! them and owns the transport.
 //!
 //! Comptime. The refusal messages and the type probe walk the fields of `ChatRequest`, so a
 //! new field needs no table edit.

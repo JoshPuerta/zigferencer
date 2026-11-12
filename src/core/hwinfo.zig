@@ -79,7 +79,7 @@ pub fn detect(io: Io, arena: Allocator) HwCard {
     };
 }
 
-/// Read the build target's SIMD feature flags. It is pure (only `builtin.cpu`),
+/// Read the build target's SIMD feature flags. It reads only `builtin.cpu`,
 /// so it evaluates at comptime and the simd-probe bakes the result into a
 /// static string.
 pub fn detectSimd() SimdFeatures {

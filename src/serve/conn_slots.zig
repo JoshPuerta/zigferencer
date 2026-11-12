@@ -5,9 +5,8 @@
 //! Comptime. The schedule test takes the slot rules as a type, so one schedule drives the old
 //! rules and the current rules.
 //!
-//! Role. This file holds the control rules alone: no I/O, no queue, no socket. So a test can call
-//! the steps of all three threads from one thread, in any order that the rules of each thread
-//! allow.
+//! Role. This file holds the control rules alone, so a test can call the steps of all three
+//! threads from one thread, in any order that the rules of each thread allow.
 //!
 //! States. A slot is `free`, `live`, `closing`, `swept`, or `reclaimable`. Two events end a
 //! connection: the last task exits, and the engine handles `conn_closed`. They can come in either

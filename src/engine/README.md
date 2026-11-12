@@ -1,7 +1,8 @@
 # Engine
 
-This directory holds the boot decisions as pure values. A command measures the host once, passes
-the resources here, and gets back a plan or a refusal. Nothing here reads a clock, a file, or a
+This directory holds the boot decisions of the engine as values. It does not hold the forward pass
+(`runtime/`) or the serve loop (`serve/`). A command measures the host once, passes the resources
+here, and gets back a plan or a refusal. Nothing here reads a clock, a file, or a
 device, and nothing logs, so a table test runs every boot shape with no GPU.
 
 ## Files

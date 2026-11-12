@@ -1,6 +1,6 @@
 //! The prefill chunk rule of the serve scheduler: how many prompt rows one forward pass takes from
-//! the turn that feeds. The function is pure. The scheduler owns the state (`fed`, the decode set)
-//! and passes the numbers in.
+//! the turn that feeds. The scheduler owns the state (`fed`, the decode set) and passes the
+//! numbers in.
 //!
 //! Rules. `derived` is the default. A pass with no decode row takes a full row width of prompt, so
 //! one session prefills in ceil(N / width) passes. A pass with decode rows takes the spare decode

@@ -1,6 +1,6 @@
-//! The transcript of a client chat and the pure decisions that compact it. The client cannot
+//! The transcript of a client chat and the decisions that compact it. The client cannot
 //! tokenize, so it weighs each turn in positions and keeps the newest turns that fit beside the
-//! system rows and a reserve. The module is pure: no I/O and no allocation.
+//! system rows and a reserve.
 //!
 //! Comptime. Asserts order the transcript byte limits, and `splitFormat` splits a format string
 //! at comptime.

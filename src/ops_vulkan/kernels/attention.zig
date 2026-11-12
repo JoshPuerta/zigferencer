@@ -214,7 +214,7 @@ pub const Attention = struct {
         self.ctx.vkd.cmdDispatch(cb, n_heads, 1, 1);
     }
 
-    /// Run one row against f32 caches. See `runTyped`.
+    /// Run one row against f32 caches.
     pub fn run(
         self: *Attention,
         q: []const f32,
@@ -911,7 +911,7 @@ pub const AttentionBatch = struct {
     };
     pub const InitError = VecAdd.InitError;
 
-    /// KV-dtype variant selector. See `Attention.initKv`.
+    /// KV-dtype variant selector.
     pub fn initKv(ctx: *const vulkan_ctx.Context, kv: dtype.KvDtype) InitError!AttentionBatch {
         const spv: []align(@alignOf(u32)) const u8 = switch (kv) {
             .f32 => &spirv.attention_batch_spv,
@@ -1006,7 +1006,7 @@ pub const AttentionMultiStream = struct {
     };
     pub const InitError = VecAdd.InitError;
 
-    /// KV-dtype variant selector. See `Attention.initKv`.
+    /// KV-dtype variant selector.
     pub fn initKv(
         ctx: *const vulkan_ctx.Context,
         kv: dtype.KvDtype,

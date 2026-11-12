@@ -180,13 +180,13 @@ pub const SamplingCard = struct {
 pub const Model = struct {
     /// Stable name the user types on the CLI. It matches the `gguf` filename stem where possible.
     pub_name: []const u8,
-    /// Per-model subdirectory under the models root, as `<org>_<repo>`. See `modelDir`.
+    /// Per-model subdirectory under the models root, as `<org>_<repo>`.
     local_path: []const u8,
     /// Bare filename of the GGUF on disk.
     file_name: []const u8,
     /// Raw download URL. For Hugging Face, it must use the `/resolve/<rev>/<file>` form.
     download_url: []const u8,
-    /// Which prompt wrap `--chat` applies. `.none` passes the prompt through. See `core/chat.zig`.
+    /// Which prompt wrap `--chat` applies. `.none` passes the prompt through.
     chat_template_kind: chat.Kind = .none,
     /// The KV dtype this model is verified at when no flag names one. A change re-anchors that
     /// model's no-flag token hashes.
@@ -201,7 +201,7 @@ pub const Model = struct {
 // -- api --------------------------------------------------------------------
 
 /// Map a raw env value to the models root: null or empty gives `models`. The caller reads the env
-/// once at startup, so the path helpers stay pure string joins.
+/// once at startup.
 pub fn resolveRoot(env_value: ?[]const u8) []const u8 {
     const v = env_value orelse return default_models_root;
     return if (v.len == 0) default_models_root else v;

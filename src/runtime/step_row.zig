@@ -1,5 +1,5 @@
-//! The batch row every runner steps, and the row rule they all hold. The file carries no weights
-//! and no state, so a runner of either family can depend on it without depending on another runner.
+//! The batch row every runner steps, and the row rule they all hold. A runner of either
+//! family can depend on this file without depending on another runner.
 //!
 //! Comptime. `chunkedPrefill` reads a runner declaration at comptime, so no runner needs a flag.
 //!

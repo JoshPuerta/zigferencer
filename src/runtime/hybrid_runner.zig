@@ -36,8 +36,8 @@
 //! when it is smaller. A plan with residency prices two stages. A plan without residency prices
 //! zero, and the runner never swaps.
 //!
-//! Tests. The tests below need no device: the blob arithmetic of both families. The tag tests live
-//! in `engine/family.zig`. The equivalence tests in `tests/` and the hybrid gate run on a device.
+//! Tests. The tests below need no device: the blob arithmetic of both families. The equivalence
+//! tests in `tests/` and the hybrid gate run on a device.
 
 const std = @import("std");
 const build_options = @import("build_options");

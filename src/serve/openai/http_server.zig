@@ -1,7 +1,7 @@
 //! The OpenAI HTTP frontend as a serve-engine adapter. `serve/engine.zig` owns the batched engine.
 //! This file is the transport: one task per connection over `std.http.Server`, mapping OpenAI JSON
-//! to and from the engine's `Request` and `OutEvent` values. The format layer is pure (`types.zig`,
-//! `map.zig`). This file is the imperative shell.
+//! to and from the engine's `Request` and `OutEvent` values. The format layer is `types.zig` and
+//! `map.zig`. This file is the imperative shell.
 //!
 //! Comptime. Generic over the engine, so the adapter builds against any engine type.
 //!

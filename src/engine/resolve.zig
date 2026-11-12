@@ -1,7 +1,7 @@
-//! Role. The boot decisions of `run`, `serve`, and `bench-model` as one pure step. The CLI
+//! Role. The boot decisions of `run`, `serve`, and `bench-model` as one step. The CLI
 //! measures the host once (`Resources`), calls `early` before the model loads and `resolve` after,
-//! logs the `Resolved` value, and formats a `Refusal`. Nothing here reads a clock, a file, or a
-//! device, and nothing logs, so a table test runs every boot shape with no GPU.
+//! logs the `Resolved` value, and formats a `Refusal`. A table test runs every boot shape with no
+//! GPU.
 //!
 //! Comptime. Build options pick the Vulkan placements, so a CPU build drops them. `Result` is
 //! generic over its value type.
@@ -21,9 +21,8 @@
 //! Refusal order. Every refusal that needs no model file is in `early`, so it lands before the
 //! load.
 //!
-//! Device placements. The fused and hybrid placements live in `device_placement.zig`. They read one
-//! VRAM figure, the live budget, which the CLI measures from one device context and passes in
-//! `Resources.device`.
+//! Device placements. The fused and hybrid placements read one VRAM figure, the live
+//! budget, which the CLI measures from one device context and passes in `Resources.device`.
 //!
 //! RAM refusals. A RAM refusal of the host placement sits in `Resolved.cpu`, so the CLI reports it
 //! where the placement starts, after the boot lines that come before it. A device placement that

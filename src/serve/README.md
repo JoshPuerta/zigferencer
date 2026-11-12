@@ -1,6 +1,6 @@
 # Serving
 
-This directory holds the serving layer. It turns the single-sequence engine into a server that
+This directory holds the serving layer. It turns the single-sequence runner into a server that
 clients reach over a socket. Each conversation is a session with a KV slot, and its position
 persists across turns. One forward pass per tick advances a batch of sessions. `engine.zig` and
 `scheduler.zig` know no wire format. Each frontend is a thin adapter between bytes and values.

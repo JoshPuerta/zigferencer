@@ -1,5 +1,5 @@
 //! Output formatting for the bench-model command: the result values of `bench_model_common` as the
-//! human table and the single-line JSON. The module is pure and keeps no state.
+//! human table and the single-line JSON.
 //!
 //! Comptime. `statsOfField` takes the result field at compile time, so one body covers every
 //! statistic.

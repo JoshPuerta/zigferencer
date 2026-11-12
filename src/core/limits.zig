@@ -5,7 +5,7 @@
 //!
 //! Load bounds. The loader rejects a model that exceeds a structural bound with a typed error at
 //! load. It caps a declared context at `max_model_ctx` and logs both numbers. It never truncates in
-//! silence (see `io/gguf/loader.zig`).
+//! silence.
 //!
 //! Shader defines. The build feeds each tile constant to glslc, and the kernel wrapper derives its
 //! grid from the same constant. So the tile the shader walks and the grid the host dispatches read
@@ -201,9 +201,9 @@ pub const spans_per_thread_max: u32 = 4 * 1024 * 1024;
 /// `trace_gpu_records`.
 pub const trace_spans_env = "ZIGFERENCER_TRACE_SPANS";
 
-/// Ceiling on logical serve sessions. A session is resident in a VRAM slot or evicted to a RAM blob
-/// (`serve/residency.zig`). The residency table is heap, so this bounds memory, not stack. Only the
-/// fused-GPU build can evict, so CPU builds keep logical equal to physical. The VRAM budget in
+/// Ceiling on logical serve sessions. A session is resident in a VRAM slot or evicted to a RAM
+/// blob. The residency table is heap, so this bounds memory, not stack. Only the fused-GPU build
+/// can evict, so CPU builds keep logical equal to physical. The VRAM budget in
 /// `engine/device_placement.zig` caps its slots at the logical count and `max_vram_slots`.
 pub const max_logical_sessions: u32 = 128;
 

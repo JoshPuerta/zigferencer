@@ -577,7 +577,7 @@ const DescriptorBufferInfo = @typeInfo(
     @typeInfo(@TypeOf(zigferencer.ops_vulkan.updateStorageBindings)).@"fn".params[2].type.?,
 ).pointer.child;
 
-/// A stateless generator: value `i` of sequence `seed`, uniform in [-1, 1).
+/// A generator: value `i` of sequence `seed`, uniform in [-1, 1).
 /// A value depends on its index alone, so a stream fills the same at any
 /// window.
 fn unit(seed: u64, i: u64) f32 {

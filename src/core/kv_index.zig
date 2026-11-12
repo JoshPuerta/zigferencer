@@ -1,5 +1,4 @@
-//! The index algebra of the device KV cache. The module is pure: no allocation, no device, and no
-//! I/O.
+//! The index algebra of the device KV cache.
 //!
 //! Comptime. An assert pins the widest layout the bounds admit inside a `u64`.
 //!

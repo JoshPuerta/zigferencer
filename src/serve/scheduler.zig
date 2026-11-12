@@ -1,6 +1,5 @@
 //! The control unit of the serve layer: a fixed table of protocol sessions over the session pool
 //! of the engine, advanced by one engine call per `tick`. All state lives here and in the engine.
-//! Frame encode and decode and the batched forward pass are the pure datapaths on either side.
 //!
 //! Comptime. Generic over the engine and the codec, so the prongs for snapshots and stats compile
 //! away on an engine that lacks them.
@@ -56,8 +55,8 @@
 //!
 //! Prefix cache. The cache is best-effort. Any failure counts a miss and the cold path proceeds.
 //! A `ready` plan finishes the prefill with zero forward rows, and the engine samples the first
-//! token from the stored logits. `prefix_manager.planRestore` states the plan of each turn shape.
-//! An append neither restores nor inserts a prefix, because its rows follow a live session.
+//! token from the stored logits. An append neither restores nor inserts a prefix, because its rows
+//! follow a live session.
 //!
 //! Leases. A lease lets a session outlive its connection. The owner of a slot is free, attached
 //! to a connection, or detached with a deadline. `keepLease` gives an attached session a token and
@@ -69,7 +68,7 @@
 //! Lease expiry. Every transition is a guarded write that keeps `checkLeases`. The expiry scan at
 //! the tick head and at each admission frees every detached slot at its deadline. A live open with
 //! no free slot takes the detached slot with the earliest deadline. Both stop a prefill in flight
-//! before the release. `expired` and `pickYield` are pure. A scan reads the clock once.
+//! before the release. A scan reads the clock once.
 //!
 //! Resume. `resumeLease` attaches the slot of a token to a new connection and rotates the token.
 //! It also takes an attached slot after the drop effect, so the newest holder wins. A resume of a
@@ -95,9 +94,6 @@
 //! or a test fake). The scheduler calls only its composed `advance`. `CodecT` is the text-to-token
 //! boundary. `sink` is any value with `emit(conn: u32, ev: OutEvent) bool` and
 //! `disconnect(conn: u32) void`.
-//!
-//! Tests. The tests stay in this file. They read private declarations of the state machine. A
-//! separate test file needs each of those declarations public.
 
 const std = @import("std");
 const Io = std.Io;

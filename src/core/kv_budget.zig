@@ -1,6 +1,5 @@
-//! The KV budget planner: byte budgets in, `n_slots x window` out. It is pure: no allocation, no
-//! device query, no I/O. One arithmetic serves both the plan and the preflight, and any caller can
-//! replay it in a test.
+//! The KV budget planner: byte budgets in, `n_slots x window` out. One arithmetic serves both the
+//! plan and the preflight, and any caller can replay it in a test.
 //!
 //! Comptime. `clipCopies` is generic over the copy record type.
 //!
@@ -37,9 +36,6 @@
 //! one chunk, and the stage at the refused window bounds the stage at any narrower one. So the
 //! widest w with P * w + F within the usable RAM is floor((usable - F) / P), and no search is
 //! needed.
-//!
-//! Tests. The tests stay in this file. They read private declarations of the planner. A separate
-//! test file needs each of those declarations public.
 
 const std = @import("std");
 const dtype = @import("dtype.zig");
@@ -1175,8 +1171,7 @@ pub fn blobRefusal(
 }
 
 /// Write the refusal of an unset `--kv-ram` whose blob need the usable RAM
-/// cannot fund. This function writes into the caller's buffer, so the planner
-/// stays free of allocation and of I/O.
+/// cannot fund.
 pub fn formatBlobRefusal(buf: []u8, r: BlobRefusal) []const u8 {
     std.debug.assert(buf.len >= blob_refusal_text_max);
     std.debug.assert(r.n_logical > r.n_slots);
@@ -1214,9 +1209,7 @@ pub fn formatBlobRefusal(buf: []u8, r: BlobRefusal) []const u8 {
     return text;
 }
 
-/// Write the refusal of a placement that the usable RAM cannot hold. This
-/// function writes into the caller's buffer, so the planner stays free of
-/// allocation and of I/O.
+/// Write the refusal of a placement that the usable RAM cannot hold.
 pub fn formatRamRefusal(buf: []u8, r: RamRefusal) []const u8 {
     std.debug.assert(buf.len >= ram_refusal_text_max);
     std.debug.assert(r.n_slots >= 1);
@@ -1480,7 +1473,7 @@ fn quoteRamAt(
     };
 }
 
-/// `blobRefusal` at an explicit stage chunk, the twin of `quoteRamAt`.
+/// `blobRefusal` at an explicit stage chunk.
 fn blobRefusalAt(
     kv: KvStructure,
     k: u32,
@@ -1865,9 +1858,7 @@ const anchor_kv: KvStructure = .{
 
 const no_ram_split: KvPlan.Ram = .{ .blobs = 0, .prefix = 0 };
 
-/// The host request the split tests ran before the RAM check existed: a
-/// serve caller that prices both stages, with the check off. Each such test
-/// keeps its meaning under it.
+/// The host request of a serve caller that prices both stages, with the RAM check off.
 const unchecked_serve: HostRequest = .{ .ram_split = no_ram_split, .residency = true };
 
 /// The layer split planner reads neither default window, so the fixture pins both
@@ -2922,7 +2913,7 @@ test "kvPlan: the RAM split conserves Y, and both shares grow with it" {
 }
 
 test "kvPlan: a half-stated split keeps the shipped reservation" {
-    // No logical count: the whole budget funds the ledger, bit for bit as before.
+    // No logical count: the whole budget funds the ledger alone.
     const no_count = try kvPlan(no_vram_caps, llama_8b_cost, .{
         .slots = 4,
         .batch = 4,
@@ -3891,7 +3882,7 @@ test "planLayerSplit: the RAM vector, and both staging buffers at high water" {
     try std.testing.expectEqual(@as(u64, 48_000), tight.ram.swap_stages);
     try std.testing.expectEqual(tight.kv_host, tight.ram.host_kv);
 
-    // The Model 2 split anchor passes through byte for byte.
+    // The anchor split passes through byte for byte.
     const carried = try planLayerSplit(anchorCaps(56_000), &anchor_weights, 0, anchor_kv, .{
         .ram_split = .{ .blobs = 384 << 20, .prefix = 128 << 20 },
         .residency = true,
@@ -4044,9 +4035,8 @@ test "KvCostVector: the column sums are the whole-model cost model" {
 }
 
 test "planLayerSplit: the uniform vector reproduces the whole-model product at every split" {
-    // The pre-vector planner charged `n_slots * window * layers * kv_per_layer`
-    // at every split. This grid replays that closed form field for field, so a
-    // span sum that drifted from it fails here.
+    // The whole-model product is `n_slots * window * layers * kv_per_layer` at every split.
+    // This grid replays that closed form field for field, so a drifted span sum fails here.
     const layer_counts = [_]u32{ 1, 8, 32, limits.max_layers };
     const windows = [_]u32{ 100, 512, 8_192 };
     const slot_counts = [_]u32{ 1, 2, 128 };

@@ -1,5 +1,5 @@
 //! The Llama decoder layer: its forward through a layer kernel set, and the rules of the family
-//! that a runner reads to hold and bind the layer. The file holds no state.
+//! that a runner reads to hold and bind the layer.
 //!
 //! Comptime. `forward` takes the kernel set type and checks it with `assertLayerKernels`.
 //! `tensorName` takes the role at comptime, because `tensor_lookup.roleName` takes a comptime

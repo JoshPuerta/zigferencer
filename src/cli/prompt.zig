@@ -1,6 +1,6 @@
 //! The stdin and stderr prompts the commands share. Prompts go to stderr, so stdout stays program
 //! output. EOF, a read error, and a non-TTY stdin all resolve to "no" or "no selection", so a piped
-//! run never blocks on a prompt. The parse of the typed line is pure, and the tests cover it.
+//! run never blocks on a prompt.
 
 const std = @import("std");
 const Io = std.Io;

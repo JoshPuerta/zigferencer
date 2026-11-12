@@ -3,10 +3,39 @@
 zigferencer is a small inference engine for LLMs (to be extended to other models), written
 in Zig 0.16. It reads a model file in the GGUF format and runs the model, with some extra conveniences.
 
+One definition of each model family drives three runners: a CPU runner, a GPU runner that computes
+a whole model step in one Vulkan submission, and a split runner that keeps some layers on the CPU.
+For the same prompt, the three runners generate the same tokens, and the token-hash gates of
+`make gate` check it.
+
+```console
+$ zigferencer run Qwen3.5-2B-Q8_0 --chat --prompt "Write a haiku about a GPU." --max-tokens 48
++    0.281ms info(parallel): threads 8 (auto), floor 250000 FLOPs (auto), spin 50000 ns (auto)
++    0.638ms info(gguf): loading Qwen3.5-2B-Q8_0.gguf...
++   76.934ms info(gguf): loaded qwen35: 320 tensors, ctx 262144, 1919 MiB in 76 ms
++   77.095ms info(run): backend: naive simd [+]simd_pf vulkan vulkan_fused  ([+] active. Rebuild: -Dops-backend=<name> [+ -Druntime=vulkan for GPU])
++  153.185ms info(serve): precision: weights q8_0, activations f32, accum f32, kv f16, logits f32
++  153.206ms info(serve): kv window: 174592 positions, the 2048 MiB session budget (model ceiling 262144)
++  153.208ms info(serve): ram: 2065 of 12725 MiB usable = 2065 MiB host kv + 0 MiB blobs + 0 MiB prefix + 0 MiB stages
++ 1342.564ms info(run): qwen cpu runner ready in 1189 ms
+Write a haiku about a GPU.+ 1673.174ms info(run): generating up to 48 tokens (prompt 20 tokens)
+Silent chips,
+Huge heat,
+Powerful dreams.
++ 2396.745ms info(run): 15 tokens | TTFT 330.7 ms | ITL 51.7 ms = 19.4 tok/s
+```
+
+The same engine serves many conversations at once, through ZMQ or through the OpenAI HTTP API:
+
+```console
+$ zigferencer serve-openai Qwen3.5-2B-Q8_0 --port 8080 &
+$ curl -s localhost:8080/v1/chat/completions -H 'Content-Type: application/json' \
+    -d '{"model":"Qwen3.5-2B-Q8_0","messages":[{"role":"user","content":"Name three prime numbers."}],"max_tokens":48}'
+{"id":"chatcmpl-1","object":"chat.completion","created":0,"model":"Qwen3.5-2B-Q8_0","choices":[{"index":0,"message":{"role":"assistant","content":"Here are three prime numbers:\n\n1.  **2** (the only even prime number)\n2.  **3**\n3.  **7**"},"finish_reason":"stop"}],"usage":{"prompt_tokens":17,"completion_tokens":35,"total_tokens":52}}
+```
+
 One of the main goals of this project is to provide a sandbox to tinker with small models and kernels implemented on
 non-typical hardware, using Zig. Don't expect a production-grade inference engine (not because of Zig, but due to the scope).
-Regarding development, AI assistance was and is heavily used. Most decisions came from experiments and iterations,
-but each relevant aspect was agreed, so in case of a complaint, blame the author and not the tool.
 
 - **Models:** the Llama 3 family and the Qwen3.5 hybrid family (not all quantizations, check registered models with `list`)
 - **Hardware:** x86_64 CPUs, with scalar and AVX2 paths, and GPUs through Vulkan.
@@ -41,42 +70,30 @@ and its API can change in any release.
 
 ## Requirements
 
-The project is tested on Linux x86_64 with Ubuntu 24.04. The CPU build also
-compiles for Windows and macOS, but these platforms are not tested yet.
+Ubuntu 24.04 on x86_64 is the tested platform. These commands install what the quick start needs:
 
-The CPU build needs only Zig 0.16.0 on `PATH`. The CPU binary uses only the Zig standard
-library, links no libc, and is static. By default the build targets the CPU that builds it, so the
-binary can use instructions that an older CPU lacks. `-Dcpu=x86_64_v3` gives a binary that runs on
-any x86_64 CPU of that level.
+```bash
+sudo apt install make curl xz-utils
+curl -fsSLO https://ziglang.org/download/0.16.0/zig-x86_64-linux-0.16.0.tar.xz
+tar -xf zig-x86_64-linux-0.16.0.tar.xz
+export PATH="$PWD/zig-x86_64-linux-0.16.0:$PATH"
 
-**`fetch`** downloads over HTTPS from huggingface, with the TLS client of the
-Zig standard library. It needs:
-
-- The `ca-certificates` package.
-- A direct connection (does not read `HTTPS_PROXY`).
-- Disk space. For convenience, `$ZIGFERENCER_MODELS_DIR` moves the model store.
-
-Every registered model is in a public repository, so `fetch` needs no account and
-no token.
-
-The GPU build needs `glslc` and the Vulkan loader with its headers.
-```
+# Only for the GPU build:
 sudo apt install glslc libvulkan-dev
 ```
 
-`libvulkan-dev` also installs the Vulkan registry,
-`/usr/share/vulkan/registry/vk.xml`, which the build reads by default. Another
-distribution passes its path with `-Dvk-registry`.
-
-A GPU run needs a Vulkan 1.2 driver with `VK_EXT_subgroup_size_control`, 16-bit
-storage, and f16 arithmetic. The kernels require a subgroup size of 32.
-
-- On Linux with an AMD card, RADV in the stock `mesa-vulkan-drivers` package
-  provides it (not fully tested yet).
-- Under WSL2, the driver is Mesa Dozen, which the stock Mesa of Ubuntu 24.04 does
-  not include. The tested setup uses Mesa 26.1 from the kisak PPA
-  (`ppa:kisak/kisak-mesa`), the LunarG Vulkan SDK 1.4.313, and the AMD driver of
-  Windows. [`docs/gpu-rdna2.md`](docs/gpu-rdna2.md) lists the limits of that setup.
+- **CPU build.** It needs only Zig 0.16.0. The binary links no libc and is static. By default the
+  build targets the CPU that builds it, and `-Dcpu=x86_64_v3` gives a binary for any x86_64 CPU of
+  that level. The CPU build also compiles for Windows and macOS, which are not tested yet.
+- **`fetch`.** It downloads over HTTPS from huggingface and needs no account and no token. It does
+  not read `HTTPS_PROXY`. `$ZIGFERENCER_MODELS_DIR` moves the model store.
+- **GPU build.** It reads the Vulkan registry that `libvulkan-dev` installs. Another distribution
+  passes its path with `-Dvk-registry`.
+- **GPU run.** It needs a Vulkan 1.2 driver with `VK_EXT_subgroup_size_control`, 16-bit storage,
+  f16 arithmetic, and a subgroup size of 32. On Linux with an AMD card, RADV in the stock
+  `mesa-vulkan-drivers` package provides it (not fully tested yet). The tested setup is WSL2 with
+  the Mesa Dozen driver, which needs more than the stock packages:
+  [`docs/gpu-rdna2.md`](docs/gpu-rdna2.md) lists its versions and its limits.
 
 **Optional tools:**
 
@@ -146,6 +163,11 @@ zigferencer-dev bench-serve MODEL --max-tokens 128
   or gdb.
 - Each top-level source directory (`src/*`, `tests/`, `tools/`) has a `README.md`
   with one row per file and a short guide to the directory.
+
+## How this was built
+
+AI assistance was and is heavily used in the development. Most decisions came from experiments and iterations,
+but each relevant aspect was agreed, so in case of a complaint, blame the author and not the tool.
 
 ## License
 

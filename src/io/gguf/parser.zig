@@ -1,5 +1,5 @@
-//! Role. GGUF v3 binary parser. The file is a pure datapath: a byte slice goes in and a
-//! structured `Parsed` value comes out, with no I/O, so a plain buffer tests it. The parser checks
+//! Role. GGUF v3 binary parser. The file is a datapath: a byte slice goes in and a
+//! structured `Parsed` value comes out, so a plain buffer tests it. The parser checks
 //! the "GGUF" identifier, the version, the alignment, and the alignment of each tensor offset. It
 //! rejects truncated or malformed input with a typed `Error`. The loader one level up joins the
 //! map, this parser, and the architecture-specific semantic checks.

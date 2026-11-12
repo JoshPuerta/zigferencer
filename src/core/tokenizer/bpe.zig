@@ -1,5 +1,5 @@
-//! Byte-level BPE encode and decode over a `Vocab`. It is a pure datapath: no Vocab mutation, no
-//! I/O, and a `gpa` taken only for the output slice. `Vocab` (vocab.zig) holds the state. The split
+//! Byte-level BPE encode and decode over a `Vocab`. It is a datapath: it never mutates the Vocab,
+//! and it takes a `gpa` only for the output slice. `Vocab` holds the state. The split
 //! keeps encode and decode small and testable on their own.
 //!
 //! Encode. It greedy-matches the longest special token at the cursor. On a match, it flushes the

@@ -218,8 +218,7 @@ pub const FusedCommands = struct {
 /// The K and V buffers of one commit side.
 pub const KvPair = struct { k: vk.Buffer, v: vk.Buffer };
 
-/// What `recordKvCommit` reads from a runner. The runner builds it for each record, so it holds
-/// no state of its own.
+/// What `recordKvCommit` reads from a runner. The runner builds it for each record.
 pub const KvCommit = struct {
     /// Narrows the f32 scratch, only at a non-f32 `kv_dtype`.
     kernel: ?*kernels.KvCommitF16,

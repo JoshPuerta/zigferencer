@@ -12,7 +12,7 @@
 //! engine type and gains a residency-aware admission step.
 //!
 //! Control unit and datapath. This file is the control unit: the residency FSM and the LRU. The
-//! datapath is the runner's `evictSlot` and `restoreSlot` (pure byte moves) and the step machinery
+//! datapath is the runner's `evictSlot` and `restoreSlot` and the step machinery
 //! of `Sessions`. A runner without `evictSlot` requires `n_logical <= n_physical`, so nothing is
 //! ever evicted. Only a test fake compiles those identity prongs.
 //!
@@ -21,7 +21,7 @@
 //! session's own slot. Eviction is byte-faithful, so any slot outside `exclude` is dormant and a
 //! mid-turn or `.feeding` session restores identically. A filter on `state == .ready` is wrong: an
 //! opening prefill leaves the session `.feeding`, so that filter pins idle sessions and deadlocks
-//! an over-subscribed pool. The scan mirrors the LRU scan in `prompt_cache`.
+//! an over-subscribed pool.
 //!
 //! Blob. An evicted session keeps a RAM blob: the trimmed slot bytes and the count of committed
 //! rows they cover. Only committed rows travel, because attention reads no position past `pos`.
@@ -481,7 +481,7 @@ pub fn Residency(comptime SessionsT: type) type {
             return self.sessions.restoreReady(self.entries[id].phys.?, n_rows, blob, logits);
         }
 
-        /// See `Sessions.copyFinalLogits`, keyed by logical id. The session completed a prefill
+        /// Keyed by logical id. The session completed a prefill
         /// this tick, so it is resident.
         pub fn copyFinalLogits(self: *Self, id: u32, out: []f32) void {
             std.debug.assert(id < self.entries.len);
@@ -554,13 +554,13 @@ pub fn Residency(comptime SessionsT: type) type {
             self.liveOrSaved(id).params = params;
         }
 
-        /// See `Sessions.reseed`. An evicted session takes the seed in its
+        /// An evicted session takes the seed in its
         /// saved copy, and the restore carries the stream back to the slot.
         pub fn reseed(self: *Self, id: u32, seed: u64) void {
             self.liveOrSaved(id).rng = .init(seed);
         }
 
-        /// See `Sessions.overridePending`. An evicted session takes the id in
+        /// An evicted session takes the id in
         /// its saved copy, and the restore carries it back to the slot.
         pub fn overridePending(self: *Self, id: u32, token: u32) void {
             const s = self.liveOrSaved(id);

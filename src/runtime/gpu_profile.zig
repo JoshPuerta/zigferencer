@@ -89,7 +89,7 @@ pub const Readout = struct {
     period_ns: f64,
     marks: u32,
     dropped: u32,
-    /// The intervals where the device counter stepped back (see `span.tickSpan`).
+    /// The intervals where the device counter stepped back.
     backsteps: u32,
     /// The interval sums by op key, at the `phases` level only.
     op_ns: ?[OpKey.count]f64,
