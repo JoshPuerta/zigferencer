@@ -79,7 +79,7 @@ command.zig --- release table ---> <command>_cmd.run(ctx)
    args.zig  flag_groups.zig  select.zig  style.zig  prompt.zig
                   |              |
                   v              v
-          engine/flags     core/registry
+          resolve/flags    core/registry
                            io/gguf/loader
 ```
 
@@ -88,14 +88,14 @@ A command takes one of three paths:
 | Path | Commands | What it reads below the CLI |
 | --- | --- | --- |
 | Look something up | `list`, `fetch`, `inspect`, `info` | `core/`, `io/` |
-| Run a model | `run`, `serve`, `serve-openai` | `boot/`, `engine/`, then `runtime/` or `serve/` |
+| Run a model | `run`, `serve`, `serve-openai` | `boot/`, `resolve/`, then `runtime/` or `serve/` |
 | Talk to a server | `client` | `serve/client`, `serve/protocol` |
 
 A command that runs a model takes four steps:
 
 1. `boot/boot_resources` measures the host and the device.
-2. `engine/resolve` picks the placement, or refuses.
-3. `engine/family` names the runner of that placement.
+2. `resolve/resolve` picks the placement, or refuses.
+3. `resolve/family` names the runner of that placement.
 4. `run_cmd` runs the turn through `runtime/generate`. `boot/serve_boot` builds the engine, and
    `serve_cmd` or `serve_openai_cmd` hands it to its transport.
 
@@ -123,7 +123,7 @@ A command that runs a model takes four steps:
   empty codes, so a piped run or a `$NO_COLOR` run prints plain text with no
   branch at any call site.
 - A command branches on the model family once, with an `inline else` switch over
-  `family.Of`. A new family adds one row in `engine/family.zig`, and the build fails
+  `family.Of`. A new family adds one row in `resolve/family.zig`, and the build fails
   until the row is complete.
 - A handler exchanges values, never handles. It takes the immutable `Context`,
   resolves a `*const registry.Model`, and passes `ModelCard`, `Vocab`,

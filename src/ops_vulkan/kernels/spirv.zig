@@ -5,7 +5,7 @@
 //! `align(@alignOf(u32))` on the embed. A bare `@embedFile` has alignment 1.
 
 const std = @import("std");
-const core_log = @import("../../core/log.zig");
+const core_log = @import("../../core/utils/log.zig");
 
 // -- constants --------------------------------------------------------------
 

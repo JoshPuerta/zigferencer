@@ -58,12 +58,12 @@ const print_token = "std.debug." ++ "print(";
 const sleep_allowed = [_][]const u8{ "cli/client/client_reconnect.zig", "core/span.zig" };
 
 /// Files whose job is to print on a test failure.
-const print_allowed = [_][]const u8{ "core/prop.zig", "core/test_fixtures.zig" };
+const print_allowed = [_][]const u8{ "core/utils/prop.zig", "core/test_fixtures.zig" };
 
 /// The directories of `src/` that a host of the library can read.
 const engine_dirs = [_][]const u8{
     "core/",
-    "engine/",
+    "resolve/",
     "io/",
     "ops/",
     "ops_vulkan/",
@@ -74,7 +74,7 @@ const engine_dirs = [_][]const u8{
 /// The engine files that write to a stream on purpose: the log, the progress bar of a download,
 /// and the table of a GPU profile.
 const stream_allowed = [_][]const u8{
-    "core/log.zig",
+    "core/utils/log.zig",
     "io/download.zig",
     "runtime/gpu_profile.zig",
 };
@@ -729,7 +729,7 @@ test "the stream rule finds an engine file that opens a stream" {
     }
 
     try std.testing.expect(isEngineFile("serve/server.zig"));
-    try std.testing.expect(!isEngineFile("core/log.zig"));
+    try std.testing.expect(!isEngineFile("core/utils/log.zig"));
     try std.testing.expect(!isEngineFile("cli/run_cmd.zig"));
 }
 

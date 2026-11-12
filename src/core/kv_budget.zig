@@ -40,7 +40,7 @@
 const std = @import("std");
 const dtype = @import("dtype.zig");
 const limits = @import("limits.zig");
-const prop = @import("prop.zig");
+const prop = @import("utils/prop.zig");
 
 // -- constants --------------------------------------------------------------
 

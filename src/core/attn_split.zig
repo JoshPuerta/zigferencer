@@ -23,7 +23,7 @@
 //! `runtime/attn_record.zig` walks it through the attention kernel set of the build.
 
 const std = @import("std");
-const prop = @import("prop.zig");
+const prop = @import("utils/prop.zig");
 const limits = @import("limits.zig");
 
 const assert = std.debug.assert;

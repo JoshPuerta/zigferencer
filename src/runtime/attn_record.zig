@@ -32,7 +32,7 @@ const std = @import("std");
 const attn_split = @import("../core/attn_split.zig");
 const limits = @import("../core/limits.zig");
 const layer_op = @import("../core/layer_op.zig");
-const prop = @import("../core/prop.zig");
+const prop = @import("../core/utils/prop.zig");
 const step_row = @import("step_row.zig");
 
 const OpPart = layer_op.OpPart;

@@ -58,7 +58,7 @@ const limits = @import("../core/limits.zig");
 const span = @import("../core/span.zig");
 const kv_index = @import("../core/kv_index.zig");
 const attn_split = @import("../core/attn_split.zig");
-const core_log = @import("../core/log.zig");
+const core_log = @import("../core/utils/log.zig");
 const dispatch_list = if (core_log.hot) @import("../ops_vulkan/dispatch_list.zig") else void;
 
 const log = std.log.scoped(.gpu);

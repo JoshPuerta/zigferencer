@@ -11,7 +11,7 @@
 
 const std = @import("std");
 const builtin = @import("builtin");
-const hwinfo = @import("hwinfo.zig");
+const hwinfo = @import("utils/hwinfo.zig");
 
 // -- constants --------------------------------------------------------------
 

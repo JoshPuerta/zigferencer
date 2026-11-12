@@ -225,11 +225,11 @@ test "weightDims: every weight of a layer has an input width" {
 }
 
 const kv_budget = @import("../core/kv_budget.zig");
-const resolve = @import("../engine/resolve.zig");
+const resolve = @import("../resolve/resolve.zig");
 const chat = @import("../core/chat.zig");
 const sampler = @import("sampler.zig");
 const parser = @import("../io/gguf/parser.zig");
-const prop = @import("../core/prop.zig");
+const prop = @import("../core/utils/prop.zig");
 const test_gguf = @import("test_gguf.zig");
 const vocab = @import("../core/tokenizer/vocab.zig");
 const CpuRunner = @import("cpu_runner.zig").CpuRunner;

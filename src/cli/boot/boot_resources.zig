@@ -1,5 +1,5 @@
 //! What a boot measures. `run`, `serve`, and the benches read the host and the device once
-//! through these functions, and hand the resources to `engine/resolve`.
+//! through these functions, and hand the resources to `resolve/resolve`.
 //!
 //! Comptime. A build option picks the fused placement, and `measureFused` is generic over the
 //! family.
@@ -13,11 +13,11 @@ const build_options = @import("build_options");
 
 const context = @import("../context.zig");
 const args = @import("../args.zig");
-const family = @import("../../engine/family.zig");
+const family = @import("../../resolve/family.zig");
 const weight_check = @import("../../runtime/weight_check.zig");
-const resolve_mod = @import("../../engine/resolve.zig");
+const resolve_mod = @import("../../resolve/resolve.zig");
 const dtype = @import("../../core/dtype.zig");
-const hwinfo = @import("../../core/hwinfo.zig");
+const hwinfo = @import("../../core/utils/hwinfo.zig");
 const kv_budget = @import("../../core/kv_budget.zig");
 const limits = @import("../../core/limits.zig");
 const registry = @import("../../core/registry.zig");

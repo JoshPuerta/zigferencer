@@ -15,6 +15,7 @@
 //! discards it.
 
 const std = @import("std");
+const nsToMs = @import("utils/time.zig").nsToMs;
 
 // -- types ------------------------------------------------------------------
 
@@ -96,21 +97,6 @@ pub const DecodeHost = struct {
     }
 };
 
-// -- api --------------------------------------------------------------------
-
-/// Nanoseconds as milliseconds.
-pub fn nsToMs(ns: u64) f64 {
-    return @as(f64, @floatFromInt(ns)) / 1e6;
-}
-
-/// Nanoseconds from `t0` to `t1` on the debug-io clock the runners read.
-/// The clock is monotonic, so the difference is never negative.
-pub fn nsBetween(t0: std.Io.Timestamp, t1: std.Io.Timestamp) u64 {
-    std.debug.assert(t1.nanoseconds >= t0.nanoseconds);
-
-    return @intCast(t1.nanoseconds - t0.nanoseconds);
-}
-
 // -- tests ------------------------------------------------------------------
 
 test "Stat: sum, max, count, and mean follow the samples" {
@@ -150,11 +136,4 @@ test "DecodeHost: merge adds counts and keeps the larger max per host step" {
         RingCounts{ .hits = 7, .misses = 1, .speculated = 5, .wasted = 1 },
         a.ring,
     );
-}
-
-test "nsBetween: difference of two timestamps" {
-    const t0: std.Io.Timestamp = .{ .nanoseconds = 10 };
-    const t1: std.Io.Timestamp = .{ .nanoseconds = 35 };
-    try std.testing.expectEqual(@as(u64, 25), nsBetween(t0, t1));
-    try std.testing.expectEqual(@as(u64, 0), nsBetween(t1, t1));
 }

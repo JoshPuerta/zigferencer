@@ -45,7 +45,7 @@ const chat = @import("../../core/chat.zig");
 const limits = @import("../../core/limits.zig");
 const types = @import("types.zig");
 const protocol = @import("../protocol.zig");
-const prop = @import("../../core/prop.zig");
+const prop = @import("../../core/utils/prop.zig");
 
 const log = std.log.scoped(.serve_openai);
 

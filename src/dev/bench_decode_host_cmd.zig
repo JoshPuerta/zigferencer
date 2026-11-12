@@ -34,6 +34,7 @@ const limits = zigferencer.limits;
 const kv_budget = zigferencer.kv_budget;
 const dtype = zigferencer.dtype;
 const step_stats = zigferencer.step_stats;
+const time = zigferencer.time;
 const family = zigferencer.family;
 const sampler = zigferencer.sampler;
 const log = std.log.scoped(.bench_decode_host);
@@ -276,7 +277,7 @@ fn recordCost(comptime RunnerT: type, runner: *RunnerT, io: Io, opt: Opt, w: *Io
     for (0..opt.reps) |_| {
         const t0 = Io.Clock.Timestamp.now(io, .awake);
         try runner.probeRecord(opt.pos);
-        stat.add(nsBetween(t0, Io.Clock.Timestamp.now(io, .awake)));
+        stat.add(time.elapsedNs(t0, Io.Clock.Timestamp.now(io, .awake)));
     }
 
     try w.print(
@@ -297,7 +298,7 @@ fn resubmit(comptime RunnerT: type, runner: *RunnerT, io: Io, opt: Opt, w: *Io.W
     for (0..opt.reps) |_| {
         const t0 = Io.Clock.Timestamp.now(io, .awake);
         try runner.probeSubmitWait();
-        stat.add(nsBetween(t0, Io.Clock.Timestamp.now(io, .awake)));
+        stat.add(time.elapsedNs(t0, Io.Clock.Timestamp.now(io, .awake)));
     }
 
     try w.print(
@@ -335,7 +336,7 @@ fn syncFloor(ctxp: *vulkan_ctx_mod.Context, io: Io, reps: u32, w: *Io.Writer) !v
         try vkd.queueSubmit(ctxp.queue, &submits, .null_handle);
         try vkd.queueWaitIdle(ctxp.queue);
         if (i >= warm_reps) {
-            idle.add(nsBetween(t0, Io.Clock.Timestamp.now(io, .awake)));
+            idle.add(time.elapsedNs(t0, Io.Clock.Timestamp.now(io, .awake)));
         }
     }
 
@@ -348,7 +349,7 @@ fn syncFloor(ctxp: *vulkan_ctx_mod.Context, io: Io, reps: u32, w: *Io.Writer) !v
         std.debug.assert(r == .success);
         try vkd.resetFences(ctxp.device, &fences);
         if (i >= warm_reps) {
-            fenced.add(nsBetween(t0, Io.Clock.Timestamp.now(io, .awake)));
+            fenced.add(time.elapsedNs(t0, Io.Clock.Timestamp.now(io, .awake)));
         }
     }
 
@@ -401,7 +402,7 @@ fn gapProbe(
 
     const wall_ms = @as(
         f64,
-        @floatFromInt(nsBetween(t_all, Io.Clock.Timestamp.now(io, .awake))),
+        @floatFromInt(time.elapsedNs(t_all, Io.Clock.Timestamp.now(io, .awake))),
     ) / 1e6;
     std.debug.assert(pos <= runner.max_seq);
 
@@ -444,10 +445,6 @@ fn printStat(w: *Io.Writer, label: []const u8, s: step_stats.Stat) !void {
         "  {s:<15} avg={d:.3}  min={d:.3}  max={d:.3} ms\n",
         .{ label, s.avgMs(), s.minMs(), s.maxMs() },
     );
-}
-
-fn nsBetween(t0: Io.Clock.Timestamp, t1: Io.Clock.Timestamp) u64 {
-    return @intCast(t0.durationTo(t1).raw.toNanoseconds());
 }
 
 // -- tests ------------------------------------------------------------------

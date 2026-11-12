@@ -39,11 +39,11 @@ scheduler. The scheduler drives the session pool of `runtime/` and emits `OutEve
 | `Codec` | `event.zig` | The chat template, the tokenizer, and the piece table | `cli/serve_cmd` | `Scheduler` |
 | `Scheduler` | `scheduler.zig` | The session table, the state machines, and the config | `ServeEngine` | The engine loop |
 | `ServeEngine` | `engine.zig` | One engine thread and its bounded queues | `server.Server`, `http_server.Server` | `cli/serve_cmd`, `cli/serve_openai_cmd` |
-| `Residency` | `residency.zig` | The logical sessions, the LRU clock, and the RAM ledger | `cli/boot/serve_boot` | `Scheduler`, as its `Engine` |
+| `Residency` | `residency.zig` | The logical sessions, the LRU clock, and the RAM ledger | `cli/boot/serve_boot` | `Scheduler`, as its `SessionPool` |
 | `PrefixManager` | `prefix_manager.zig` | The cache entries and counters over a `PromptCache` | `Scheduler` | `Scheduler` |
 | `Frame` payload | `protocol.zig` | A 20-byte header and a bounded payload | `client.zig`, `server.zig` | The same two |
 
-The scheduler takes its engine and its codec as parameters. The engine is `Residency` over
+The scheduler takes its session pool and its codec as parameters. The pool is `Residency` over
 `runtime/session.Sessions`, or `Sessions` alone. The codec is `event.Codec` for the binary wire and
 `openai.RawCodec` for HTTP. The scheduler imports no socket.
 
@@ -77,8 +77,8 @@ The prefix cache sits beside the pool.
       +--restorePrefix / snapshotPrefix--> Sessions --> runner blob
 ```
 
-`Residency` presents the same method surface as `Sessions`, so the scheduler only swaps its engine
-type. The split with the cache is the engine boundary. The scheduler makes the calls whose result a
+`Residency` presents the same method surface as `Sessions`, so the scheduler only swaps its pool
+type. The split with the cache is the pool boundary. The scheduler makes the calls whose result a
 slot state machine consumes. The manager makes the calls whose result only the cache consumes.
 
 ## Rules
@@ -598,6 +598,6 @@ then, and not before.
 | Prefix RAM eviction | `runtime/prompt_cache.zig` `evictLru` | the budget can overshoot by at most one entry |
 | Prefix disk eviction | `runtime/prompt_cache.zig` `diskEvictToFit` | own namespace only. The budget bounds this process, and the victim is its oldest file by mtime |
 | Cache-insert eligibility | `prefix_manager.zig` `insert`, offered by `scheduler.zig` `maybeInsertPrefix` | position-zero completions only |
-| The RAM split, blobs against prefix | `core/kv_budget.zig` `splitRam`, with the corners in `engine/device_placement.zig` | blobs get their provable need, the prefix gets the surplus |
-| The blob tier of an unset `--kv-ram` | `core/kv_budget.zig` `quoteRam`, called through `engine/resolve.zig` and `engine/device_placement.zig` | the full need of `(E + 1)` blobs, or a boot refusal with both fits |
+| The RAM split, blobs against prefix | `core/kv_budget.zig` `splitRam`, with the corners in `resolve/device_placement.zig` | blobs get their provable need, the prefix gets the surplus |
+| The blob tier of an unset `--kv-ram` | `core/kv_budget.zig` `quoteRam`, called through `resolve/resolve.zig` and `resolve/device_placement.zig` | the full need of `(E + 1)` blobs, or a boot refusal with both fits |
 | Full window | `scheduler.zig` decode admission and the turn refusal, `cli/client/client_transcript.zig` `plan` | the server stops and refuses with numbers, the client keeps the longest suffix of turns that fits beside the system prompt and the reserve |

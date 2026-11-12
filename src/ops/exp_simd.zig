@@ -30,7 +30,7 @@
 //! rounds that maximum up.
 
 const std = @import("std");
-const prop = @import("../core/prop.zig");
+const prop = @import("../core/utils/prop.zig");
 
 const assert = std.debug.assert;
 

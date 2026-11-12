@@ -113,8 +113,8 @@ const BinaryAdapter = struct {
 };
 
 /// The serve engine with the binary transport.
-pub fn Server(comptime Engine: type, comptime CodecT: type) type {
-    return engine_mod.ServeEngine(Engine, CodecT, BinaryAdapter);
+pub fn Server(comptime SessionPool: type, comptime CodecT: type) type {
+    return engine_mod.ServeEngine(SessionPool, CodecT, BinaryAdapter);
 }
 
 /// The per-connection task roots, concrete over the engine type.

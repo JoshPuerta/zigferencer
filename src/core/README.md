@@ -4,8 +4,8 @@ This directory holds the tensor view, the quant geometry, and the static engine 
 They also include the two memory planners, the device KV layout, the split geometry of decode attention, 
 the host hardware card, what each backend needs from the target, the model table, and the chat wraps. No
 module here owns engine state, and what crosses its edges is a plain immutable
-struct. Four files touch the outside and take an `Io` for it. `log.zig` writes
-the diagnostics to stderr, `span.zig` writes the trace file, `hwinfo.zig` reads
+struct. Four files touch the outside and take an `Io` for it. `utils/log.zig` writes
+the diagnostics to stderr, `span.zig` writes the trace file, `utils/hwinfo.zig` reads
 the host details from `/proc`, and `registry.locate` checks a path on disk.
 
 ## Files
@@ -20,22 +20,18 @@ the host details from `/proc`, and `registry.locate` checks a path on disk.
 | `attn_split.zig` | The split geometry of GPU attention. |
 | `attn_cpu.zig` | The part geometry of CPU attention. |
 | `op_requires.zig` | What a backend needs from the target, and its tolerance. |
-| `hwinfo.zig` | The host hardware card. |
 | `registry.zig` | The table of known models and the paths of the model store. |
 | `chat.zig` | The chat wrap of each model family, as a `Prompt` with its plain ranges. |
-| `log.zig` | The process log, gated at run time. |
 | `span.zig` | The trace sites, the per-thread span logs, and the flush. |
 | `trace_file.zig` | The layout of the trace: names, tracks, slices, flows, and args. |
-| `perfetto.zig` | The protobuf encoder and the nesting walk. |
 | `gpu_record.zig` | The GPU record and the host-clock mapping of its ticks. |
 | `layer_op.zig` | The one list of op names, and the keys that a span and a GPU mark time. |
-| `time.zig` | Elapsed-time arithmetic. |
 | `step_stats.zig` | The timers of a decode step. |
 | `record_ring.zig` | The state of the decode record ring. |
 | `ring_fsm.zig` | The slot state machine of the upload ring. |
-| `prop.zig` | The property test driver. |
 | `test_fixtures.zig` | The path of a test model. |
 | [`tokenizer/`](./tokenizer/README.md) | The BPE encoder and decoder. |
+| [`utils/`](./utils/README.md) | The general services: time, log, host probe, Perfetto, property tests. |
 
 ## How the pieces fit
 
@@ -46,12 +42,12 @@ the major values:
 | --- | --- | --- | --- | --- |
 | `Tensor` | `tensor.zig` | A `GgmlType`, a shape, and a borrowed byte view | `io/gguf/loader` | `ops/`, `ops_vulkan/`, `runtime/` |
 | `Model` | `registry.zig` | The paths, a `chat.Kind`, and the default `KvDtype` | The static table | `cli/`, `io/` |
-| `KvPlan` | `kv_budget.zig` | The slots, the window, and the VRAM and RAM spend | `kvPlan` | `engine/`, `runtime/`, `cli/` |
-| `LayerSplit` | `kv_budget.zig` | A layer split and its spend | `planLayerSplit` | `engine/`, the hybrid runners |
+| `KvPlan` | `kv_budget.zig` | The slots, the window, and the VRAM and RAM spend | `kvPlan` | `resolve/`, `runtime/`, `cli/` |
+| `LayerSplit` | `kv_budget.zig` | A layer split and its spend | `planLayerSplit` | `resolve/`, the hybrid runners |
 | `Layout` | `kv_index.zig` | The shape of the KV regions | The GPU runners | `runtime/`, `ops_vulkan/` |
 | `AttnPlan` | `attn_split.zig` | The split rows of one step | `attn_split` | `runtime/attn_record` |
 | `OpRequires` | `op_requires.zig` | A target and a `Tolerance` | Each backend | `cli/info` |
-| `HwCard` | `hwinfo.zig` | The CPU, RAM, SIMD, and GPU of the host | `hwinfo` | `op_requires`, `cli/info` |
+| `HwCard` | `utils/hwinfo.zig` | The CPU, RAM, SIMD, and GPU of the host | `hwinfo` | `op_requires`, `cli/info` |
 
 A model file becomes tensors:
 
@@ -64,7 +60,7 @@ A model file becomes tensors:
 A byte budget becomes the shape of the KV cache:
 
 ```
-  engine/resolve       the byte budgets
+  resolve/resolve      the byte budgets
   runtime/kv_cost      KvCostVector         --> kv_budget --> KvPlan, LayerSplit
   limits, dtype        the ceilings, KvDtype                       |
                                                                    v

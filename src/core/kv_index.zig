@@ -13,7 +13,7 @@
 //! `maxWindowForLimits` and `maxSlotsForLimits` solve the same inequality for opposite unknowns.
 
 const std = @import("std");
-const prop = @import("prop.zig");
+const prop = @import("utils/prop.zig");
 const dtype = @import("dtype.zig");
 const limits = @import("limits.zig");
 

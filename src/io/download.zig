@@ -20,7 +20,7 @@
 
 const std = @import("std");
 const registry = @import("../core/registry.zig");
-const time = @import("../core/time.zig");
+const time = @import("../core/utils/time.zig");
 const parser = @import("gguf/parser.zig");
 const Allocator = std.mem.Allocator;
 const Io = std.Io;

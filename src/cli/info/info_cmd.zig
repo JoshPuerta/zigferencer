@@ -13,8 +13,8 @@ const context = @import("../context.zig");
 const args = @import("../args.zig");
 const style = @import("../style.zig");
 const arch_matrix = @import("arch_matrix.zig");
-const log = @import("../../core/log.zig");
-const hwinfo = @import("../../core/hwinfo.zig");
+const log = @import("../../core/utils/log.zig");
+const hwinfo = @import("../../core/utils/hwinfo.zig");
 const op_requires = @import("../../core/op_requires.zig");
 const naive_ops = @import("../../ops/naive.zig");
 const simd_ops = @import("../../ops/simd.zig");
@@ -135,7 +135,7 @@ fn printBuild(w: *Io.Writer, p: style.Palette) !void {
     );
     try w.print(
         "  {s} fetch parallel cache bench_swap bench_serve + hot: " ++
-            "layer dispatch token, see core/log.zig){s}\n",
+            "layer dispatch token, see core/utils/log.zig){s}\n",
         .{ p.dim, p.reset },
     );
 

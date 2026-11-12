@@ -13,7 +13,7 @@
 
 const std = @import("std");
 const limits = @import("../core/limits.zig");
-const prop = @import("../core/prop.zig");
+const prop = @import("../core/utils/prop.zig");
 
 // -- constants --------------------------------------------------------------
 

@@ -1,7 +1,7 @@
 //! `zigferencer serve <pub_name>` is the binary frontend. It parses the flags and hands a
 //! `BinaryLauncher` to `serve_boot.buildAndServe`.
 //!
-//! Comptime. The launcher is generic over the engine type, so every backend shares one body.
+//! Comptime. The launcher is generic over the session pool type, so every backend shares one body.
 //!
 //! Shutdown. A client can stop the server with `shutdown` only under `--allow-shutdown`, because a
 //! shared server must not stop on the request of one client.
@@ -25,7 +25,7 @@ const log = std.log.scoped(.serve);
 
 // -- types ------------------------------------------------------------------
 
-/// Builds the chat-aware codec and the framed `Server` over the shared engine, announces the bind,
+/// Builds the chat-aware codec and the framed `Server` over the session pool, announces the bind,
 /// and runs until `shutdown`.
 const BinaryLauncher = struct {
     transport: server_mod.Transport,
@@ -33,9 +33,9 @@ const BinaryLauncher = struct {
 
     pub fn serve(
         self: BinaryLauncher,
-        comptime EngineT: type,
+        comptime SessionPool: type,
         ctx: context.Context,
-        engine: *EngineT,
+        pool: *SessionPool,
         parts: codec_parts.CodecParts,
         sched_cfg: scheduler_mod.Config,
     ) !void {
@@ -45,12 +45,12 @@ const BinaryLauncher = struct {
             .pieces = parts.pieces,
             .eos_id = parts.eos_id,
         };
-        const ServerT = server_mod.Server(EngineT, event.Codec);
+        const ServerT = server_mod.Server(SessionPool, event.Codec);
         var server = try ServerT.init(
             ctx.arena,
             ctx.gpa,
             ctx.io,
-            engine,
+            pool,
             &codec,
             sched_cfg,
             self.transport,

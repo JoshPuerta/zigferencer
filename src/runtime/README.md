@@ -50,21 +50,21 @@ The runtime owns the middle of that chain.
 
 | Value | File | Holds | Made by | Read by |
 | --- | --- | --- | --- | --- |
-| `Loaded` | `io/gguf/loader` | A `ModelCard`, a `TensorRef` list, and the mapped file | `loader.load` | Every runner, `engine/family` |
-| `KvPlan`, `LayerSplit` | `core/kv_budget` | The slots, the window, and the layer split | `engine/resolve` | Every runner `init` |
+| `Loaded` | `io/gguf/loader` | A `ModelCard`, a `TensorRef` list, and the mapped file | `loader.load` | Every runner, `resolve/family` |
+| `KvPlan`, `LayerSplit` | `core/kv_budget` | The slots, the window, and the layer split | `resolve/resolve` | Every runner `init` |
 | `StepRow` | `step_row.zig` | One `(slot, token, pos)` row of a batch | `Sessions`, `generate` | Every runner `stepBatch` |
 | Decoder layer | `llama_layer.zig`, `qwen_layer.zig` | `forward`, which calls the ops of one layer on a kernel set, and the weight roles of the family | The files, as the `Family` of a runner | `CpuRunner`, `FusedRunner`, and their kernel sets |
 | Layer kernel set | `cpu_layer_kernels.zig`, `fused_layer_kernels.zig` | One method for each kind of layer op, over the step rows | `CpuRunner`, once per step. `FusedRunner`, once per record call | `forward` of the decoder layer |
-| `CpuRunner(Family)` | `cpu_runner.zig` | The weights, the KV slots, the recurrent slabs, and the scratch of the CPU | The `engine/family` row | `Sessions`, `HybridRunner` |
-| `FusedRunner(Family)` | `fused_runner.zig` | The pipelines, the device buffers, the descriptor sets, and a `FusedCommands` | The `engine/family` row | `Sessions`, `HybridRunner` |
-| `HybridRunner(Family)` | `hybrid_runner.zig` | A CPU prefix runner and a fused suffix runner | The `engine/family` row | `Sessions` |
+| `CpuRunner(Family)` | `cpu_runner.zig` | The weights, the KV slots, the recurrent slabs, and the scratch of the CPU | The `resolve/family` row | `Sessions`, `HybridRunner` |
+| `FusedRunner(Family)` | `fused_runner.zig` | The pipelines, the device buffers, the descriptor sets, and a `FusedCommands` | The `resolve/family` row | `Sessions`, `HybridRunner` |
+| `HybridRunner(Family)` | `hybrid_runner.zig` | A CPU prefix runner and a fused suffix runner | The `resolve/family` row | `Sessions` |
 | `KvCache` | `kv_cache.zig` | One flat K and V slab per slot | `CpuRunner` | `CpuLayerKernels` |
 | `Sessions` | `session.zig` | The slots, the positions, the RNG, and the sampling params | `cli/boot/serve_boot`, `dev/` tools | `serve/residency`, `serve/scheduler` |
 | `PromptCache` | `prompt_cache.zig` | State snapshots keyed by token prefix | `cli/run_cmd`, `serve/prefix_manager` | The same two |
 | `Pool` | `pool.zig` | The workers of the CPU ops | `cli/run_cmd`, `cli/boot/serve_boot` | `parallel`, the CPU runners |
 | `Context` | `vulkan_ctx.zig` | The Vulkan device, queue, and command pool | `vulkan_runner.Runner`, `cli/boot/boot_resources` | Every GPU kernel |
 
-The runners form a grid of three placements for two families. `engine/family` names the six.
+The runners form a grid of three placements for two families. `resolve/family` names the six.
 
 | Placement | Llama | Qwen3.5 |
 | --- | --- | --- |
@@ -84,7 +84,7 @@ A decoder layer is written once and runs on both kernel sets. The runner supplie
   HybridRunner(Family) = CpuRunner.initPrefix (host layers) + FusedRunner.initSuffix (GPU layers)
 ```
 
-A row of `engine/family.zig` binds a family to its layer file and its three runners. A command
+A row of `resolve/family.zig` binds a family to its layer file and its three runners. A command
 selects the row with `family.Of(arch)` and stays generic below that point.
 
 A model file reaches the serving layer through this chain.
@@ -154,7 +154,7 @@ rows are one unit: the pools test for `evictSlot` alone, so the sizing hook and 
 must arrive with it.
 
 `Sessions(RunnerT)` checks the rows it reads when a pool type is built. Every build that names a
-pool, test fakes included, fails to compile on a drifted runner. Each row of `engine/family.zig`
+pool, test fakes included, fails to compile on a drifted runner. Each row of `resolve/family.zig`
 calls `runner_surface.requireSurface` for its runners, `step` included. It checks every row of the
 table against the CPU runner of each family always, and against the fused and the hybrid runner of
 each family on a `vulkan_fused` build. It checks that the fused and CPU runners read a `KvPlan` and

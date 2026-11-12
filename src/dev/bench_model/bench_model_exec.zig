@@ -113,7 +113,7 @@ pub fn runOnce(runner: anytype, turn: Turn, ctx: context.Context) !RunResult {
         &sink,
     );
     const t_end = Io.Clock.Timestamp.now(ctx.io, .awake);
-    const turn_s = common.toMs(t_start, t_end) / 1000.0;
+    const turn_s = zigferencer.time.msBetween(t_start, t_end) / 1000.0;
 
     return .{
         .ttft_ms = generated.ttft_ms,

@@ -282,12 +282,6 @@ pub fn loadAndRun(
     }
 }
 
-pub fn toMs(t0: Io.Clock.Timestamp, t1: Io.Clock.Timestamp) f64 {
-    const ns_i96 = t0.durationTo(t1).raw.toNanoseconds();
-    const ns: f64 = @floatFromInt(@as(i64, @intCast(ns_i96)));
-    return ns / 1e6;
-}
-
 /// Refuse a bench whose prompt plus decode budget passes the sequence window.
 pub fn requireSequenceFits(
     io: Io,

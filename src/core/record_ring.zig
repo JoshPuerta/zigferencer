@@ -23,7 +23,7 @@
 //! is part of the key, so a recording made at one level never replays at another.
 
 const std = @import("std");
-const prop = @import("prop.zig");
+const prop = @import("utils/prop.zig");
 const span = @import("span.zig");
 
 // -- types ------------------------------------------------------------------

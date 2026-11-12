@@ -19,7 +19,7 @@
 const std = @import("std");
 const dtype = @import("../../core/dtype.zig");
 const Allocator = std.mem.Allocator;
-const prop = @import("../../core/prop.zig");
+const prop = @import("../../core/utils/prop.zig");
 
 const log = std.log.scoped(.gguf);
 

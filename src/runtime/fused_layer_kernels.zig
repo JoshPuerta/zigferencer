@@ -57,7 +57,7 @@ const gpu_profile = @import("gpu_profile.zig");
 const fused_commands = @import("fused_commands.zig");
 const layer_kernels = @import("layer_kernels.zig");
 const layer_op = @import("../core/layer_op.zig");
-const core_log = @import("../core/log.zig");
+const core_log = @import("../core/utils/log.zig");
 const StepRow = @import("step_row.zig").StepRow;
 const KvTensor = @import("../core/kv_index.zig").Tensor;
 

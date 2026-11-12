@@ -1,6 +1,6 @@
 //! The serve boot that `serve` and `serve-openai` share. `buildAndServe` checks the flags, loads
 //! the model, builds the runner of its family on the selected placement, wraps it in the tiered-KV
-//! residency, and hands it to a launcher: a value with a `serve(EngineT, ...)` method.
+//! residency, and hands it to a launcher: a value with a `serve(SessionPool, ...)` method.
 //!
 //! Comptime. `inline else` turns the architecture into a family row once, so the rest is generic.
 //!
@@ -25,14 +25,14 @@ const context = @import("../context.zig");
 const args = @import("../args.zig");
 const flags_mod = @import("../flag_groups.zig");
 const select = @import("../select.zig");
-const family = @import("../../engine/family.zig");
-const resolve_mod = @import("../../engine/resolve.zig");
+const family = @import("../../resolve/family.zig");
+const resolve_mod = @import("../../resolve/resolve.zig");
 const chat = @import("../../core/chat.zig");
 const dtype = @import("../../core/dtype.zig");
 const kv_budget = @import("../../core/kv_budget.zig");
 const limits = @import("../../core/limits.zig");
 const registry = @import("../../core/registry.zig");
-const time = @import("../../core/time.zig");
+const time = @import("../../core/utils/time.zig");
 const vocab_mod = @import("../../core/tokenizer/vocab.zig");
 const loader = @import("../../io/gguf/loader.zig");
 const parallel = @import("../../runtime/parallel.zig");
@@ -396,7 +396,7 @@ fn serveHybrid(
     log.info("{s} hybrid engine ready in {d:.0} ms: logical={d} vram={d} batch={d} max_seq={d} " ++
         "gpu={d}/{d} layers kv={d} MiB vram + {d} MiB host", .{
         Family.name,
-        msBetween(ctx.io, open.t_init),
+        time.msSince(ctx.io, open.t_init),
         b.flags.max_sessions,
         plan.n_slots,
         b.checked.shape.batch,
@@ -447,7 +447,7 @@ fn serveFused(
 
     log.info("{s} gpu engine ready in {d:.0} ms: logical={d} vram={d} batch={d} max_seq={d}", .{
         Family.name,
-        msBetween(ctx.io, open.t_init),
+        time.msSince(ctx.io, open.t_init),
         b.flags.max_sessions,
         fused.n_slots,
         b.checked.shape.batch,
@@ -502,7 +502,7 @@ fn serveCpu(
     });
     log.info("{s} engine ready in {d:.0} ms: sessions={d} batch={d} max_seq={d} kv={d} MiB", .{
         Family.name,
-        msBetween(ctx.io, t_init),
+        time.msSince(ctx.io, t_init),
         n_sessions,
         b.checked.shape.batch,
         runner.max_seq,
@@ -662,10 +662,6 @@ fn kvMiB(runner: anytype) u64 {
     }
 
     return total >> 20;
-}
-
-fn msBetween(io: Io, t0: Io.Clock.Timestamp) f64 {
-    return time.msBetween(t0, Io.Clock.Timestamp.now(io, .awake));
 }
 
 fn printReady(w: *Io.Writer, comptime fmt: []const u8, fmt_args: anytype) !void {

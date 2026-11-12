@@ -30,8 +30,8 @@ const flags_mod = @import("flag_groups.zig");
 const select = @import("select.zig");
 const boot_resources = @import("boot/boot_resources.zig");
 const boot_lines = @import("boot/boot_lines.zig");
-const family = @import("../engine/family.zig");
-const resolve_mod = @import("../engine/resolve.zig");
+const family = @import("../resolve/family.zig");
+const resolve_mod = @import("../resolve/resolve.zig");
 const bpe = @import("../core/tokenizer/bpe.zig");
 const chat_mod = @import("../core/chat.zig");
 const dtype = @import("../core/dtype.zig");
@@ -39,7 +39,7 @@ const kv_budget = @import("../core/kv_budget.zig");
 const limits = @import("../core/limits.zig");
 const registry = @import("../core/registry.zig");
 const trace_span = @import("../core/span.zig");
-const time = @import("../core/time.zig");
+const time = @import("../core/utils/time.zig");
 const vocab_mod = @import("../core/tokenizer/vocab.zig");
 const loader = @import("../io/gguf/loader.zig");
 const generate = @import("../runtime/generate.zig");
@@ -344,7 +344,7 @@ fn runHost(
         .policy = b.policy,
         .kv_dtype = b.kvDtype(),
     });
-    log.info("{s} cpu runner ready in {d:.0} ms", .{ Family.name, msSince(ctx.io, t_init) });
+    log.info("{s} cpu runner ready in {d:.0} ms", .{ Family.name, time.msSince(ctx.io, t_init) });
 
     return prefillAndStream(&runner, t);
 }
@@ -382,7 +382,7 @@ fn runFusedOn(
     const runner = try Family.Fused.init(ctx.gpa, ctxp, b.loaded, f.plan, kv_dtype);
     defer runner.deinit();
 
-    log.info("{s} gpu runner ready in {d:.0} ms", .{ Family.name, msSince(ctx.io, t_init) });
+    log.info("{s} gpu runner ready in {d:.0} ms", .{ Family.name, time.msSince(ctx.io, t_init) });
 
     if (comptime Family.prompt_cache) return prefillCachedAndStream(runner, t);
 
@@ -495,7 +495,8 @@ fn runHybrid(
     );
     defer hybrid.deinit();
 
-    log.info("{s} hybrid runner ready in {d:.0} ms", .{ Family.name, msSince(ctx.io, t_init) });
+    const init_ms = time.msSince(ctx.io, t_init);
+    log.info("{s} hybrid runner ready in {d:.0} ms", .{ Family.name, init_ms });
 
     return prefillAndStream(hybrid, t);
 }
@@ -787,10 +788,6 @@ fn streamDecode(
     } else {
         log.info("{d} tokens | TTFT {d:.1} ms", .{ g.tokens_generated, g.ttft_ms });
     }
-}
-
-fn msSince(io: Io, t0: Io.Clock.Timestamp) f64 {
-    return time.msBetween(t0, Io.Clock.Timestamp.now(io, .awake));
 }
 
 // -- tests ------------------------------------------------------------------

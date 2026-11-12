@@ -14,7 +14,7 @@ const dtype = @import("../core/dtype.zig");
 const chat = @import("../core/chat.zig");
 const kv_budget = @import("../core/kv_budget.zig");
 const parallel = @import("../runtime/parallel.zig");
-const engine_flags = @import("../engine/flags.zig");
+const engine_flags = @import("../resolve/flags.zig");
 
 const Doc = args.Doc;
 

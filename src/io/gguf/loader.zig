@@ -24,8 +24,9 @@ const limits = @import("../../core/limits.zig");
 const span = @import("../../core/span.zig");
 const mmap = @import("../mmap.zig");
 const parser = @import("parser.zig");
-const prop = @import("../../core/prop.zig");
+const prop = @import("../../core/utils/prop.zig");
 const Tensor = @import("../../core/tensor.zig").Tensor;
+const time = @import("../../core/utils/time.zig");
 const Allocator = std.mem.Allocator;
 const Io = std.Io;
 
@@ -312,12 +313,14 @@ pub fn loadWith(
             refs.len,
             card.context_length,
             mibOf(bytes.len),
-            elapsedMs(t_start, t_done),
+            time.msBetween(t_start, t_done),
         });
     }
 
     log.debug("  timings: mmap {d:.1} ms | parse {d:.1} ms | build {d:.1} ms", .{
-        elapsedMs(t_start, t_mapped), elapsedMs(t_mapped, t_parsed), elapsedMs(t_parsed, t_done),
+        time.msBetween(t_start, t_mapped),
+        time.msBetween(t_mapped, t_parsed),
+        time.msBetween(t_parsed, t_done),
     });
 
     return .{
@@ -871,11 +874,6 @@ fn hasTensor(p: parser.Parsed, name: []const u8) bool {
 
 fn mibOf(bytes: usize) f64 {
     return @as(f64, @floatFromInt(bytes)) / (1024.0 * 1024.0);
-}
-
-fn elapsedMs(t0: Io.Clock.Timestamp, t1: Io.Clock.Timestamp) f64 {
-    const ns: u64 = @intCast(t0.durationTo(t1).raw.toNanoseconds());
-    return @as(f64, @floatFromInt(ns)) / 1e6;
 }
 
 /// Build a prefixed KV key such as `<arch>.block_count` into `buf`. The key always fits.

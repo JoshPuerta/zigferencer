@@ -9,7 +9,7 @@
 //! invariant is untouched. This layer owns the LOGICAL session state. A resident session keeps its
 //! truth in `sessions.table[phys]`. An evicted session keeps it in `Entry{saved, blob}`. The layer
 //! presents the method surface of `Sessions`, keyed by logical id, so the scheduler only swaps the
-//! engine type and gains a residency-aware admission step.
+//! pool type and gains a residency-aware admission step.
 //!
 //! Control unit and datapath. This file is the control unit: the residency FSM and the LRU. The
 //! datapath is the runner's `evictSlot` and `restoreSlot` and the step machinery
@@ -47,10 +47,11 @@ const Allocator = std.mem.Allocator;
 const session = @import("../runtime/session.zig");
 const sampler = @import("../runtime/sampler.zig");
 const limits = @import("../core/limits.zig");
-const prop = @import("../core/prop.zig");
+const prop = @import("../core/utils/prop.zig");
 const BlobTier = @import("../core/kv_budget.zig").BlobTier;
-const core_log = @import("../core/log.zig");
+const core_log = @import("../core/utils/log.zig");
 const span = @import("../core/span.zig");
+const time = @import("../core/utils/time.zig");
 const FeedChunk = session.FeedChunk;
 
 const log = std.log.scoped(.serve);
@@ -314,7 +315,7 @@ pub fn Residency(comptime SessionsT: type) type {
                     const t1 = core_log.now();
                     span.record(.kv_evict, t0, t1);
                     self.evicts += 1;
-                    self.evict_ms += msBetween(t0, t1);
+                    self.evict_ms += time.rawMsBetween(t0, t1);
                     e.blob.n_rows = n_rows;
                     e.ever_resident = true;
                 }
@@ -359,7 +360,7 @@ pub fn Residency(comptime SessionsT: type) type {
                     const t1 = core_log.now();
                     span.record(.kv_restore, t0, t1);
                     self.restores += 1;
-                    self.restore_ms += msBetween(t0, t1);
+                    self.restore_ms += time.rawMsBetween(t0, t1);
                     self.dropBlob(e);
                 } else if (comptime @hasDecl(Runner, "resetSlotState")) {
                     self.sessions.runner.resetSlotState(s);
@@ -658,10 +659,6 @@ pub fn Residency(comptime SessionsT: type) type {
 }
 
 // -- helpers ----------------------------------------------------------------
-
-fn msBetween(t0: std.Io.Timestamp, t1: std.Io.Timestamp) f64 {
-    return @as(f64, @floatFromInt(t1.nanoseconds - t0.nanoseconds)) / 1e6;
-}
 
 fn indexOf(haystack: []const u32, needle: u32) ?usize {
     for (haystack, 0..) |h, i| {

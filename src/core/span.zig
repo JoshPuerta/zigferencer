@@ -56,7 +56,7 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const limits = @import("limits.zig");
-const core_log = @import("log.zig");
+const core_log = @import("utils/log.zig");
 const gpu_record = @import("gpu_record.zig");
 const layer_op = @import("layer_op.zig");
 const trace_file = @import("trace_file.zig");
@@ -881,7 +881,7 @@ fn windowMain(io: std.Io, seconds: u32) void {
 
 // -- tests ------------------------------------------------------------------
 
-const prop = @import("prop.zig");
+const prop = @import("utils/prop.zig");
 const testing = std.testing;
 
 /// A recorder for the tests of other modules. The tests start it, run threads, join them, then
@@ -932,7 +932,7 @@ pub const TestCapture = struct {
     }
 };
 
-const perfetto = @import("perfetto.zig");
+const perfetto = @import("utils/perfetto.zig");
 
 test {
     _ = gpu_record;

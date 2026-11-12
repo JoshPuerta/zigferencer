@@ -22,7 +22,7 @@ const File = std.Io.File;
 const builtin = @import("builtin");
 const build_options = @import("build_options");
 pub const cli = @import("cli.zig");
-pub const log = @import("core/log.zig");
+pub const log = @import("core/utils/log.zig");
 pub const span = @import("core/span.zig");
 
 // -- constants --------------------------------------------------------------
@@ -48,14 +48,14 @@ pub const ring_fsm = @import("core/ring_fsm.zig");
 pub const tensor = @import("core/tensor.zig");
 pub const dtype = @import("core/dtype.zig");
 pub const step_stats = @import("core/step_stats.zig");
-pub const time = @import("core/time.zig");
+pub const time = @import("core/utils/time.zig");
 pub const ops = @import("ops/naive.zig");
 pub const gdn = @import("ops/gdn.zig");
 pub const vocab = @import("core/tokenizer/vocab.zig");
 pub const bpe = @import("core/tokenizer/bpe.zig");
 pub const chat = @import("core/chat.zig");
-pub const family = @import("engine/family.zig");
-pub const resolve = @import("engine/resolve.zig");
+pub const family = @import("resolve/family.zig");
+pub const resolve = @import("resolve/resolve.zig");
 pub const generate = @import("runtime/generate.zig");
 pub const cpu_profile = @import("runtime/cpu_profile.zig");
 pub const step_row = @import("runtime/step_row.zig");
@@ -67,7 +67,7 @@ pub const parallel = @import("runtime/parallel.zig");
 pub const pool = @import("runtime/pool.zig");
 pub const prompt_cache = @import("runtime/prompt_cache.zig");
 pub const tensor_lookup = @import("runtime/tensor_lookup.zig");
-pub const hwinfo = @import("core/hwinfo.zig");
+pub const hwinfo = @import("core/utils/hwinfo.zig");
 pub const op_requires = @import("core/op_requires.zig");
 pub const serve_protocol = @import("serve/protocol.zig");
 pub const serve_zmtp = @import("serve/zmtp.zig");
@@ -304,7 +304,7 @@ fn isUserError(err: anyerror) bool {
 
 pub const test_fakes = @import("runtime/test_fakes.zig");
 pub const test_fixtures = @import("core/test_fixtures.zig");
-pub const prop = @import("core/prop.zig");
+pub const prop = @import("core/utils/prop.zig");
 
 test {
     _ = dtype;
@@ -325,7 +325,7 @@ test {
     _ = @import("runtime/qwen_layer.zig");
     _ = @import("runtime/llama_layer.zig");
     _ = @import("core/ring_fsm.zig");
-    _ = @import("core/time.zig");
+    _ = @import("core/utils/time.zig");
     _ = @import("core/step_stats.zig");
     _ = @import("core/record_ring.zig");
     _ = span;
@@ -339,7 +339,7 @@ test {
     _ = @import("cli/info/arch_matrix.zig");
     _ = @import("cli/args.zig");
     _ = @import("cli/flag_groups.zig");
-    _ = @import("engine/resolve.zig");
+    _ = @import("resolve/resolve.zig");
     _ = @import("cli/client/client_blocking.zig");
     _ = @import("cli/client/client_chat.zig");
     _ = @import("cli/client/client_cmd.zig");

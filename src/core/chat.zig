@@ -23,7 +23,7 @@
 const std = @import("std");
 const bpe = @import("tokenizer/bpe.zig");
 const limits = @import("limits.zig");
-const prop = @import("prop.zig");
+const prop = @import("utils/prop.zig");
 const Allocator = std.mem.Allocator;
 const log = std.log.scoped(.run);
 

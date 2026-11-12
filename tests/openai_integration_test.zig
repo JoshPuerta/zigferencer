@@ -931,8 +931,8 @@ test "openai loopback: min_p and repetition_penalty reach the sampler" {
 
 // -- control tokens ---------------------------------------------------------
 
-const FakeEngine = Sessions(harness.FakeRunner);
-const FakeServer = http_server.Server(FakeEngine);
+const FakePool = Sessions(harness.FakeRunner);
+const FakeServer = http_server.Server(FakePool);
 
 fn runFakeServer(server: *FakeServer) void {
     server.run() catch {};
@@ -965,8 +965,8 @@ test "openai loopback: a control token sends no text and still counts" {
         .logits = try arena.alloc(f32, vocab.tokens.len),
     };
     @memset(runner.logits, 0);
-    var engine = try FakeEngine.init(arena, &runner);
-    var server = try FakeServer.init(arena, gpa, io, &engine, &codec, .{
+    var pool = try FakePool.init(arena, &runner);
+    var server = try FakeServer.init(arena, gpa, io, &pool, &codec, .{
         .max_sessions = 1,
         .max_batch = 1,
         .max_seq = window,

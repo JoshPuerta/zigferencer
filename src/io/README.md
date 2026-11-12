@@ -23,9 +23,9 @@ reads it. The values on the load path are these:
 | --- | --- | --- | --- | --- |
 | `Mapped` | `mmap.zig` | The bytes of the whole file | `openReadOnly`, `openReadOnlyLazy` | `loader`, `runtime/prompt_cache` |
 | `Parsed` | `gguf/parser.zig` | The header, the `Kv` pairs, the `TensorInfo` rows, the data offset | `parser.parse` | `loader`, `core/tokenizer/vocab` |
-| `ModelCard` | `gguf/loader.zig` | The dimensions, the token ids, the chat template, and the `GdnParams` of Qwen | `loader.load` | `engine/resolve`, `runtime/`, `cli/` |
+| `ModelCard` | `gguf/loader.zig` | The dimensions, the token ids, the chat template, and the `GdnParams` of Qwen | `loader.load` | `resolve/resolve`, `runtime/`, `cli/` |
 | `TensorRef` | `gguf/loader.zig` | A tensor name and a `Tensor` that borrows the map | `loader.load` | `runtime/tensor_lookup`, the runners |
-| `Loaded` | `gguf/loader.zig` | The `Mapped`, the `Parsed`, the `ModelCard`, and the `[]TensorRef` | `loader.load` | `cli/`, `dev/`, `engine/family` |
+| `Loaded` | `gguf/loader.zig` | The `Mapped`, the `Parsed`, the `ModelCard`, and the `[]TensorRef` | `loader.load` | `cli/`, `dev/`, `resolve/family` |
 
 The load path:
 
@@ -43,7 +43,7 @@ The load path:
                                      |
               +----------------------+-----------------------+
               v                      v                       v
-      engine/resolve          runtime/ runners        core/tokenizer/vocab
+      resolve/resolve         runtime/ runners        core/tokenizer/vocab
       (ModelCard)             (TensorRef)             (Parsed kvs --> Vocab)
 ```
 

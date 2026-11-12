@@ -61,7 +61,7 @@
 //! line it measured 107 us in both layouts.
 
 const std = @import("std");
-const prop = @import("../core/prop.zig");
+const prop = @import("../core/utils/prop.zig");
 const limits = @import("../core/limits.zig");
 const span = @import("../core/span.zig");
 const exp_simd = @import("../ops/exp_simd.zig");

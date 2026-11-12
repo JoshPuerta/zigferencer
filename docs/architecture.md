@@ -41,7 +41,7 @@ This document explains how zigferencer works, from the build to a served token.
 
 | Term | Meaning |
 | --- | --- |
-| engine | The library: every directory under `src/` but `cli/` and `dev/`. The directory `src/engine/` holds only its boot decisions. In the serve layer, `ServeEngine` is the thread that owns the scheduler, and the type parameter `Engine` is the session pool under it. |
+| engine | The library: every directory under `src/` but `cli/` and `dev/`. The directory `src/resolve/` holds its boot decisions: it resolves the flags and the host resources into a setup or a refusal. In the serve layer, `ServeEngine` is the thread that owns the scheduler, and the type parameter `SessionPool` is the session pool under it. |
 | op | One operation of the model: a matrix product, a norm, attention. `LayerOp` in `core/layer_op.zig` lists them. Every op span of a CPU trace and every GPU mark names an op of that list, or one pass of an op. The other spans name a stage, for example `sched_tick`. |
 | kernel | One implementation of an op: a Zig function on the CPU, a compute shader on the GPU. |
 | backend | The set of kernels that the build selects (`-Dops-backend`). |
@@ -128,10 +128,10 @@ The layers inside the tree point one way:
 ```
   src/dev/  -->  zigferencer.cli  (src/cli.zig)  -->  src/cli/
      |                                                   |
-     +----------------->  engine/, runtime/, serve/, io/, ops*/, core/  <--+
+     +---------------->  resolve/, runtime/, serve/, io/, ops*/, core/  <--+
 ```
 
-1. The engine (`engine/`, `runtime/`, `serve/`, `io/`, `ops/`, `ops_vulkan/`, `core/`)
+1. The engine (`resolve/`, `runtime/`, `serve/`, `io/`, `ops/`, `ops_vulkan/`, `core/`)
    reads no file of `src/cli/` or `src/dev/`.
 2. A building block of `src/cli/` (the flag parser, the boot steps, the styles) reads
    no command file.
@@ -328,7 +328,7 @@ The code has two kinds of modules:
 - A **datapath** module holds as-pure-as-possible functions: bytes into metadata, 
   activations into activations. It holds no state and does no I/O, so a test can call 
   it with no setup. The datapath is the kernels in `ops/` and in the shaders, the GGUF 
-  parser (`io/gguf/parser.zig`), the boot decisions in `engine/`, and most of `core/`.
+  parser (`io/gguf/parser.zig`), the boot decisions in `resolve/`, and most of `core/`.
 - A **control** module owns state and calls the datapath in order. The state is the
   KV cache, the GDN state, the scratch buffers, the decode position, the GPU command
   buffers, and the sessions. Control lives in `runtime/` and `serve/`.
@@ -347,7 +347,7 @@ the lessons from digital design in VHDL I had many years ago.
 | [`src/`](../src/README.md) | The two root files. | `main.zig` (the entry of `zigferencer`, the re-exports, and the test list), `cli.zig` (the CLI building blocks that `src/dev/` can read) |
 | [`src/cli/`](../src/cli/README.md) | The commands: the command line in, one handler for each command. | `command.zig` (the command tables), `args.zig` (the flag parser), `run_cmd.zig`, `boot/serve_boot.zig` (builds the serve engine) |
 | [`src/dev/`](../src/dev/README.md) | The developer commands of `zigferencer-dev`. | `dev_command.zig` (the developer table), `bench_model/bench_model_cmd.zig`, `gpu_selftest/gpu_selftest_cmd.zig` |
-| [`src/engine/`](../src/engine/) | The boot decisions. | `resolve.zig`, `device_placement.zig` (the GPU fit), `family.zig` (the runners of each family) |
+| [`src/resolve/`](../src/resolve/) | The boot decisions. | `resolve.zig`, `device_placement.zig` (the GPU fit), `family.zig` (the runners of each family) |
 | [`src/core/`](../src/core/README.md) | The shared values and helpers. | `tensor.zig`, `dtype.zig`, `limits.zig` (every bound), `kv_budget.zig` (the plans), `registry.zig` (the model table), `tokenizer/` |
 | [`src/io/`](../src/io/README.md) | Files and the network. | `gguf/parser.zig`, `gguf/loader.zig`, `mmap.zig`, `download.zig` |
 | [`src/ops/`](../src/ops/README.md) | The CPU kernels. | `naive.zig` (the reference), `simd_pf.zig` (the default), `gdn.zig` |
@@ -362,7 +362,7 @@ the lessons from digital design in VHDL I had many years ago.
 The CLI is one client of the engine. It owns what belongs to a process: the command line, the
 environment, stdout, the terminal, and the exit code. No engine file reads the command line or
 the environment, sets the exit code, or imports `src/cli/`. Three engine files write to stdout
-or stderr. `core/log.zig` writes the log, and `io/download.zig` writes the download progress,
+or stderr. `core/utils/log.zig` writes the log, and `io/download.zig` writes the download progress,
 both on stderr. `runtime/gpu_profile.zig` writes the GPU profile table on stdout.
 
 | Step | CLI -> Engine | Engine -> CLI |
@@ -382,9 +382,9 @@ both on stderr. `runtime/gpu_profile.zig` writes the GPU profile table on stdout
 | `ModelCard` | `io/gguf/loader.zig` | The dimensions of the model, the end token, and the chat template. | The loader makes it. The runners and the boot decisions read it. |
 | `Vocab` | `core/tokenizer/vocab.zig` | The token, merge, and byte tables of the tokenizer. | Built once at load. The BPE tokenizer reads it, and nothing changes it after the load. |
 | `OpRequires` | `core/op_requires.zig` | What a backend needs from the target (architecture, SIMD level, FMA) and its tolerance against the reference. | Each op module declares one. `info` and the benchmarks read it. |
-| `EngineFlags` | `engine/flags.zig` | The flags that several commands share: the KV dtype, the window, the GPU layers, the threads, and the thinking mode. | The flag parser fills it. `resolve` reads it. |
-| `Resources` | `engine/resolve.zig` | What the host measured once: free RAM and, on a GPU build, the free VRAM and the device buffer limits. | The CLI measures it. `resolve` reads it. |
-| `Resolved`, `Refusal` | `engine/resolve.zig` | The result of the boot decision: the window, the KV dtype, the placement, the plan, or the reason the boot stops. | `resolve` makes it as a pure function. The CLI builds the runner from it or prints the refusal. |
+| `EngineFlags` | `resolve/flags.zig` | The flags that several commands share: the KV dtype, the window, the GPU layers, the threads, and the thinking mode. | The flag parser fills it. `resolve` reads it. |
+| `Resources` | `resolve/resolve.zig` | What the host measured once: free RAM and, on a GPU build, the free VRAM and the device buffer limits. | The CLI measures it. `resolve` reads it. |
+| `Resolved`, `Refusal` | `resolve/resolve.zig` | The result of the boot decision: the window, the KV dtype, the placement, the plan, or the reason the boot stops. | `resolve` makes it as a pure function. The CLI builds the runner from it or prints the refusal. |
 | `KvPlan` | `core/kv_budget.zig` | The slot count, the window, and the bytes that each part reserves in VRAM and RAM. | The planner makes it. The CPU and fused runner constructors read it. The hybrid constructor reads a `LayerSplit`. |
 | `LayerSplit` | `core/kv_budget.zig` | The layer split of a hybrid and the cost of each side. | The device decision makes it. A hybrid runner reads it, and `run` and `serve` print it. |
 | `Policy` | `runtime/parallel.zig` | The thread count, the fan-out floor, and the spin budget of the CPU pool. | Set from the host and the thread flags. The pool and every parallel op read it. |
@@ -1277,9 +1277,9 @@ every frame ([profiling.md](profiling.md)).
 main -> entry(init, dispatchRelease) -> dispatchOver(argv)   main.zig, cli/command.zig
   run_cmd.run(ctx)                                         cli/run_cmd.zig
     args.parseInto(Flags), select.model(name)              cli/args.zig, cli/select.zig
-    resolve.early(.run, flags, entry)                      engine/resolve.zig: refusals before the load
+    resolve.early(.run, flags, entry)                      resolve/resolve.zig: refusals before the load
     loader.load(path)                                      io/gguf/loader.zig: mmap, parse, ModelCard, tensors
-    resolve.resolve(.run, flags, card, resources)          engine/resolve.zig: window, KvPlan, RAM quote
+    resolve.resolve(.run, flags, card, resources)          resolve/resolve.zig: window, KvPlan, RAM quote
     parallel.initPool(policy)                              runtime/parallel.zig: the worker threads
     vocab.buildFromParsed, bpe.encodeAlloc(prompt)         core/tokenizer/: the prompt ids
       --chat: chat.promptAlloc, bpe.encodePromptAlloc      the prompt text stays plain
@@ -1321,7 +1321,7 @@ run_cmd.run(ctx)
   resolve.resolve(.run, flags, card, resources)            no device capacity yet, so no placement yet
   runFused                                                 cli/run_cmd.zig
     openDevice -> vulkan_ctx.Context.init                  runtime/vulkan_ctx.zig: instance, device, queue, limits
-    fusedOn(ctx) -> resolve.resolve with device capacity   cli/boot/boot_resources.zig, engine/device_placement.zig: region check, VRAM fit, plan
+    fusedOn(ctx) -> resolve.resolve with device capacity   cli/boot/boot_resources.zig, resolve/device_placement.zig: region check, VRAM fit, plan
     runFusedOn(ctx, fused, ...)                            cli/run_cmd.zig
       FusedRunner(qwen_layer).init(ctx, loaded, plan)      runtime/fused_runner.zig
         guardKvLayout, the step buffer guards, the VRAM preflight
@@ -1343,7 +1343,7 @@ the fused tree:
 ```
 run_cmd.run(ctx)                                           the pool gets workers again, for the CPU layers
   attemptDevice(pin = 12)                                  cli/run_cmd.zig
-    openDevice, DeviceBoot.resolveOn -> DevicePlacement    cli/boot/boot_resources.zig, engine/device_placement.zig: kv_budget.planLayerSplit picks the split
+    openDevice, DeviceBoot.resolveOn -> DevicePlacement    cli/boot/boot_resources.zig, resolve/device_placement.zig: kv_budget.planLayerSplit picks the split
     HybridRunner(Qwen).init(ctx, loaded, plan)             runtime/hybrid_runner.zig
       FusedRunner(qwen_layer).initSuffix(host_layers)      the GPU holds layers host_layers .. n
       CpuRunner(qwen_layer).initPrefix(host_layers)        the CPU holds layers 0 .. host_layers
@@ -1440,7 +1440,7 @@ acceptorTask -> HttpAdapter.onAccept                       serve/openai/http_ser
   such as `/dev/full`, ends the command with exit 1 and one line that names the cause.
 - **Logs.** `$ZIGFERENCER_LOG` sets the log level with no rebuild: `off`, `err`,
   `warn`, `info` (the default), `debug`, or a level for each scope, such as
-  `info,runner=debug`. `src/core/log.zig` holds the grammar.
+  `info,runner=debug`. `src/core/utils/log.zig` holds the grammar.
 - **Files.** `$ZIGFERENCER_MODELS_DIR` moves the model store, and `fetch`
   downloads into it. The default is `models/`. `$ZIGFERENCER_CACHE_DIR` moves the
   disk tier of the prefix cache. The default is `.prompt_cache`.

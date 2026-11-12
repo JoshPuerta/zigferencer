@@ -563,7 +563,7 @@ fn isSymbol(cp: u21) bool {
 // -- tests ------------------------------------------------------------------
 
 const parser = @import("../../io/gguf/parser.zig");
-const prop = @import("../prop.zig");
+const prop = @import("../utils/prop.zig");
 
 /// The merges of the synthetic vocab, in rank order, as byte-level strings. They cover letters, a
 /// leading space (U+0120), digits, the two bytes of U+00E9, and a newline pair (U+010A). The last

@@ -64,7 +64,7 @@ A model command boots like this:
 ```
   args, select --> registry.Model --> loader.load --> Loaded
                                                                      |
-  boot_resources --> engine/resolve --> Resolved --> boot_lines      |
+  boot_resources --> resolve/resolve --> Resolved --> boot_lines     |
                                             |                        |
                                             v                        v
                                       family.Of(arch) --> runner --> measured rows

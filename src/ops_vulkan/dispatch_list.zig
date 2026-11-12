@@ -52,7 +52,7 @@
 const std = @import("std");
 const vk = @import("vulkan");
 const build_options = @import("build_options");
-const core_log = @import("../core/log.zig");
+const core_log = @import("../core/utils/log.zig");
 const kernels = @import("kernels.zig");
 
 const assert = std.debug.assert;

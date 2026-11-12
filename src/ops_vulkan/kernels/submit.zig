@@ -15,8 +15,9 @@
 const std = @import("std");
 const vk = @import("vulkan");
 const kv_budget = @import("../../core/kv_budget.zig");
-const core_log = @import("../../core/log.zig");
+const core_log = @import("../../core/utils/log.zig");
 const span = @import("../../core/span.zig");
+const time = @import("../../core/utils/time.zig");
 const gpu_profile = @import("../../runtime/gpu_profile.zig");
 const vulkan_ctx = @import("../../runtime/vulkan_ctx.zig");
 const log = std.log.scoped(.gpu);
@@ -230,7 +231,7 @@ pub fn submitOnce(
 
     // Close the laps and record the spans.
     const t_done = core_log.now();
-    lap[@intFromEnum(SubmitPhase.wait)] = msBetween(t, t_done);
+    lap[@intFromEnum(SubmitPhase.wait)] = time.rawMsBetween(t, t_done);
     span.record(.gpu_submit, t_submit, t_wait);
     span.record(.gpu_wait, t_wait, t_done);
     if (stamps != .null_handle) {
@@ -326,10 +327,6 @@ pub fn walkStage(
 }
 
 // -- helpers ----------------------------------------------------------------
-
-fn msBetween(t0: std.Io.Timestamp, t1: std.Io.Timestamp) f64 {
-    return @as(f64, @floatFromInt(t1.nanoseconds - t0.nanoseconds)) / 1e6;
-}
 
 /// Read the two stamps of the one-shot buffer after its wait and hand them to
 /// the span recorder. A failed read loses one trace record, never the submit.

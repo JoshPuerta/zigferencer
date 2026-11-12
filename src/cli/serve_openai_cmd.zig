@@ -3,7 +3,7 @@
 //! the scheduler of `serve` on every backend but the per-op `vulkan` one. It serves on
 //! `std.http.Server`, which adds no dependency. stdout holds only the READY line.
 //!
-//! Comptime. The launcher is generic over the engine type, so every backend shares one body.
+//! Comptime. The launcher is generic over the session pool type, so every backend shares one body.
 
 const std = @import("std");
 
@@ -22,7 +22,7 @@ const log = std.log.scoped(.serve_openai);
 
 // -- types ------------------------------------------------------------------
 
-/// Builds the `RawCodec` and the HTTP `Server` over the shared engine, announces the bind, and
+/// Builds the `RawCodec` and the HTTP `Server` over the session pool, announces the bind, and
 /// runs.
 const OpenAiLauncher = struct {
     host: []const u8,
@@ -32,9 +32,9 @@ const OpenAiLauncher = struct {
 
     pub fn serve(
         self: OpenAiLauncher,
-        comptime EngineT: type,
+        comptime SessionPool: type,
         ctx: context.Context,
-        engine: *EngineT,
+        pool: *SessionPool,
         parts: codec_parts.CodecParts,
         sched_cfg: scheduler_mod.Config,
     ) !void {
@@ -63,11 +63,11 @@ const OpenAiLauncher = struct {
         });
 
         // Bind, announce, and run.
-        var server = try http_server.Server(EngineT).init(
+        var server = try http_server.Server(SessionPool).init(
             ctx.arena,
             ctx.gpa,
             ctx.io,
-            engine,
+            pool,
             &codec,
             sched_cfg,
             .{ .tcp = .{ .host = self.host, .port = self.port } },

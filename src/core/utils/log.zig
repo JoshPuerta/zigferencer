@@ -35,6 +35,7 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const build_options = @import("build_options");
+const time = @import("time.zig");
 
 // -- constants --------------------------------------------------------------
 
@@ -90,7 +91,7 @@ pub fn now() std.Io.Timestamp {
 
 /// Milliseconds from `t0` to now, for hot-trace args.
 pub fn msSince(t0: std.Io.Timestamp) f64 {
-    return @as(f64, @floatFromInt(now().nanoseconds - t0.nanoseconds)) / 1e6;
+    return time.rawMsBetween(t0, now());
 }
 
 /// Apply `$ZIGFERENCER_LOG`. An unset value keeps the defaults. A mistake never fails a run.
@@ -215,13 +216,12 @@ fn elapsedNs() u64 {
         start = t;
         break :blk t;
     };
-    return @intCast(now().nanoseconds - t0.nanoseconds);
+    return time.rawElapsedNs(t0, now());
 }
 
 /// Render the line prefix into `buf`: `+`, right-aligned milliseconds with three decimals, `ms `.
 fn prefixText(buf: []u8, ns: u64) []const u8 {
-    const ms = @as(f64, @floatFromInt(ns)) / 1e6;
-    return std.fmt.bufPrint(buf, "+{d:>9.3}ms ", .{ms}) catch buf[0..0];
+    return std.fmt.bufPrint(buf, "+{d:>9.3}ms ", .{time.nsToMs(ns)}) catch buf[0..0];
 }
 
 /// Map a level word, with the err/error and warn/warning aliases, to a spec. An unrecognized word

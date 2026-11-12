@@ -18,6 +18,7 @@
 
 const std = @import("std");
 const zigferencer = @import("zigferencer");
+const time = zigferencer.time;
 const Io = std.Io;
 const Allocator = std.mem.Allocator;
 const build_options = @import("build_options");
@@ -368,7 +369,7 @@ fn benchFamily(comptime Family: type, c: *const Curve) !void {
     return cpuCurve(Family, c);
 }
 
-/// A fresh runner and engine per row give clean KV pools.
+/// A fresh runner and session pool per row give clean KV pools.
 fn cpuCurve(comptime Family: type, c: *const Curve) !void {
     const Runner = Family.Cpu;
     const ctx = c.ctx;
@@ -401,15 +402,15 @@ fn cpuCurve(comptime Family: type, c: *const Curve) !void {
             .policy = c.policy,
             .kv_dtype = c.kv_dtype,
         });
-        const EngineT = Sessions(Runner);
-        var engine = try EngineT.init(arena, &runner);
+        const SessionPool = Sessions(Runner);
+        var pool = try SessionPool.init(arena, &runner);
         const rule = prefill_chunk.cpu_rule;
-        const row = try benchOne(EngineT, c, &engine, rule, c.max_seq, b, b);
+        const row = try benchOne(SessionPool, c, &pool, rule, c.max_seq, b, b);
         try printRow(c.w, b, row);
     }
 }
 
-/// One engine holds the whole curve, so the weights upload once, and the plan takes
+/// One session pool holds the whole curve, so the weights upload once, and the plan takes
 /// the widest row. The rows reuse slots: a session closes at the end of a row, and
 /// `create` re-zeros any recurrent state.
 fn fusedCurve(comptime Family: type, c: *const Curve) !void {
@@ -456,15 +457,15 @@ fn fusedCurve(comptime Family: type, c: *const Curve) !void {
     const fused = try Family.Fused.init(ctx.gpa, ctxp, c.loaded, plan, c.kv_dtype);
     defer fused.deinit();
 
-    const EngineT = Sessions(Family.Fused);
-    var engine = try EngineT.init(ctx.arena, fused);
+    const SessionPool = Sessions(Family.Fused);
+    var pool = try SessionPool.init(ctx.arena, fused);
 
     try printTableHead(c.w, fused.max_seq);
     var rows_buffer: [rows_max]u16 = undefined;
     for (sessionRows(most, c.flags.max_only, &rows_buffer)) |b| {
-        const rule: prefill_chunk.Rule = .{ .derived = engine.runner.maxStepRows() };
+        const rule: prefill_chunk.Rule = .{ .derived = pool.runner.maxStepRows() };
         const width: u16 = @intCast(@min(b, plan.n_streams));
-        const row = try benchOne(EngineT, c, &engine, rule, fused.max_seq, b, width);
+        const row = try benchOne(SessionPool, c, &pool, rule, fused.max_seq, b, width);
         try printRow(c.w, b, row);
     }
 }
@@ -531,15 +532,15 @@ fn printRow(w: *Io.Writer, b: u16, row: Row) !void {
 /// One row: a fresh server, `b` concurrent clients, and the server stop. A fresh
 /// server gives clean queues and a clean port, and it lives in a round arena.
 fn benchOne(
-    comptime EngineT: type,
+    comptime SessionPool: type,
     c: *const Curve,
-    engine: *EngineT,
+    pool: *SessionPool,
     rule: prefill_chunk.Rule,
     max_seq: u32,
     b: u16,
     width: u16,
 ) !Row {
-    const ServerT = server_mod.Server(EngineT, event.Codec);
+    const ServerT = server_mod.Server(SessionPool, event.Codec);
     const ctx = c.ctx;
     std.debug.assert(b <= limits.max_connections);
     std.debug.assert(width >= 1);
@@ -560,12 +561,12 @@ fn benchOne(
     const itl = try arena.alloc(f64, @as(usize, b) * c.max_tokens);
 
     // Start the server and drive the clients.
-    var server = try ServerT.init(arena, ctx.gpa, ctx.io, engine, c.codec, .{
+    var server = try ServerT.init(arena, ctx.gpa, ctx.io, pool, c.codec, .{
         .max_sessions = b,
         .max_batch = width,
         .max_connections = b,
         .max_seq = max_seq,
-        .max_step_rows = engine.runner.maxStepRows(),
+        .max_step_rows = pool.runner.maxStepRows(),
         .prefill = rule,
         .allow_shutdown = true,
         .model_name = "bench",
@@ -586,7 +587,7 @@ fn benchOne(
     control.deinit();
     server_future.await(ctx.io);
 
-    return summarize(results[0..b], itl, ms(t0, t1) / 1000.0, c.max_tokens);
+    return summarize(results[0..b], itl, time.msBetween(t0, t1) / 1000.0, c.max_tokens);
 }
 
 /// Run one client per store to the end of its turn.
@@ -629,7 +630,7 @@ fn summarize(results: []const ClientResult, itl: []f64, wall_s: f64, max_tokens:
         }
 
         unstored += r.n_tokens - @min(r.n_tokens, r.arrivals.len);
-        ttft_sum += ms(r.t_sent, r.arrivals[0]);
+        ttft_sum += time.msBetween(r.t_sent, r.arrivals[0]);
         n_itl += storedGaps(r.arrivals, r.n_tokens, itl[n_itl..]);
     }
 
@@ -703,7 +704,7 @@ fn storedGaps(arrivals: []const Io.Clock.Timestamp, n_tokens: u32, out: []f64) u
     std.debug.assert(out.len >= n_gaps);
 
     for (arrivals[1..stored], arrivals[0..n_gaps], out[0..n_gaps]) |t_now, t_prev, *gap| {
-        gap.* = ms(t_prev, t_now);
+        gap.* = time.msBetween(t_prev, t_now);
     }
 
     return n_gaps;
@@ -714,11 +715,6 @@ fn percentile(sorted: []const f64, pct: usize) f64 {
 
     const idx = @min(sorted.len - 1, (sorted.len * pct) / 100);
     return sorted[idx];
-}
-
-fn ms(t0: Io.Clock.Timestamp, t1: Io.Clock.Timestamp) f64 {
-    const ns: i64 = @intCast(t0.durationTo(t1).raw.toNanoseconds());
-    return @as(f64, @floatFromInt(ns)) / 1e6;
 }
 
 // -- tests ------------------------------------------------------------------

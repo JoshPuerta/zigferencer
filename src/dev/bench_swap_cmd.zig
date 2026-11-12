@@ -11,6 +11,7 @@
 
 const std = @import("std");
 const zigferencer = @import("zigferencer");
+const time = zigferencer.time;
 const Io = std.Io;
 const build_options = @import("build_options");
 
@@ -367,7 +368,7 @@ fn timeSwaps(comptime Runner: type, b: *const Bench, runner: *Runner, blob: []u8
     for (0..reps) |i| {
         const e0 = Io.Clock.Timestamp.now(io, .awake);
         try runner.evictSlot(0, pos, blob);
-        times.evict[i] = ms(e0, Io.Clock.Timestamp.now(io, .awake));
+        times.evict[i] = time.msBetween(e0, Io.Clock.Timestamp.now(io, .awake));
         if (comptime has_split) {
             times.evict_dma[i] = runner.last_swap_split.dma_ms;
             times.evict_copy[i] = runner.last_swap_split.memcpy_ms;
@@ -375,7 +376,7 @@ fn timeSwaps(comptime Runner: type, b: *const Bench, runner: *Runner, blob: []u8
 
         const r0 = Io.Clock.Timestamp.now(io, .awake);
         try runner.restoreSlot(0, pos, blob);
-        times.restore[i] = ms(r0, Io.Clock.Timestamp.now(io, .awake));
+        times.restore[i] = time.msBetween(r0, Io.Clock.Timestamp.now(io, .awake));
         if (comptime has_split) {
             times.restore_dma[i] = runner.last_swap_split.dma_ms;
             times.restore_copy[i] = runner.last_swap_split.memcpy_ms;
@@ -392,7 +393,7 @@ fn timeHostCopy(b: *const Bench, blob: []const u8, copy: []u8) ![]f64 {
     for (times) |*t| {
         const c0 = Io.Clock.Timestamp.now(b.ctx.io, .awake);
         @memcpy(copy, blob);
-        t.* = ms(c0, Io.Clock.Timestamp.now(b.ctx.io, .awake));
+        t.* = time.msBetween(c0, Io.Clock.Timestamp.now(b.ctx.io, .awake));
     }
 
     if (copy[copy.len - 1] != blob[blob.len - 1]) return error.BenchCopyMismatch;
@@ -501,7 +502,7 @@ fn timeDecode(
     for (samples[0..reps]) |*sample| {
         const t0 = Io.Clock.Timestamp.now(io, .awake);
         try pool.decodeBatch(ids, out);
-        sample.* = ms(t0, Io.Clock.Timestamp.now(io, .awake));
+        sample.* = time.msBetween(t0, Io.Clock.Timestamp.now(io, .awake));
     }
 
     return median(samples[0..reps]);
@@ -586,11 +587,6 @@ fn countFds(io: Io) ?u32 {
 }
 
 // -- helpers: timing + stats ------------------------------------------------
-
-fn ms(t0: Io.Clock.Timestamp, t1: Io.Clock.Timestamp) f64 {
-    const ns: i64 = @intCast(t0.durationTo(t1).raw.toNanoseconds());
-    return @as(f64, @floatFromInt(ns)) / 1e6;
-}
 
 fn median(xs: []f64) f64 {
     std.mem.sort(f64, xs, {}, std.sort.asc(f64));

@@ -22,7 +22,7 @@ const std = @import("std");
 const limits = @import("limits.zig");
 const gpu_record = @import("gpu_record.zig");
 const layer_op = @import("layer_op.zig");
-const perfetto = @import("perfetto.zig");
+const perfetto = @import("utils/perfetto.zig");
 
 const OpKey = layer_op.OpKey;
 const OpSet = layer_op.OpSet;
@@ -536,7 +536,7 @@ fn gpuSlotLess(_: void, a: GpuSlot, b: GpuSlot) bool {
 
 // -- tests ------------------------------------------------------------------
 
-const prop = @import("prop.zig");
+const prop = @import("utils/prop.zig");
 const testing = std.testing;
 
 test "name: partFits accepts a pool run of 2 or more parts and a worker share only" {

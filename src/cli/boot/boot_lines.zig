@@ -11,7 +11,7 @@ const std = @import("std");
 const Io = std.Io;
 
 const args = @import("../args.zig");
-const resolve_mod = @import("../../engine/resolve.zig");
+const resolve_mod = @import("../../resolve/resolve.zig");
 const dtype = @import("../../core/dtype.zig");
 const kv_budget = @import("../../core/kv_budget.zig");
 const limits = @import("../../core/limits.zig");

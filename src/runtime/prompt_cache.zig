@@ -59,7 +59,8 @@ const Allocator = std.mem.Allocator;
 const Io = std.Io;
 const mmap = @import("../io/mmap.zig");
 const limits = @import("../core/limits.zig");
-const prop = @import("../core/prop.zig");
+const prop = @import("../core/utils/prop.zig");
+const time = @import("../core/utils/time.zig");
 
 const log = std.log.scoped(.cache);
 
@@ -636,12 +637,7 @@ pub const PromptCache = struct {
         try fw.interface.flush();
         file.close(io);
         log.debug("disk persist: {x:0>16}.zkv, {d} bytes written", .{ key, total });
-        const dt_ns: f64 = @floatFromInt(
-            @as(
-                i64,
-                @intCast(t0.durationTo(Io.Clock.Timestamp.now(io, .awake)).raw.toNanoseconds()),
-            ),
-        );
+        const dt_ns: f64 = @floatFromInt(time.elapsedNs(t0, Io.Clock.Timestamp.now(io, .awake)));
         if (dt_ns > 0) {
             self.disk_bw_bps = @as(f64, @floatFromInt(total)) / (dt_ns / 1e9);
         }

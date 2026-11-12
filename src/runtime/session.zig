@@ -56,7 +56,7 @@
 //! Runner surface. `Sessions` reaches a runner through a duck-typed surface. A renamed member
 //! breaks only the call sites that instantiate it, and a GPU-only runner can break where no CPU
 //! test looks. So `Sessions(RunnerT)` checks the rows it reads when the pool type is built, and
-//! each family row checks the whole surface of its runners in `engine/family.zig`. A runner
+//! each family row checks the whole surface of its runners in `resolve/family.zig`. A runner
 //! that holds recurrent state must declare `has_recurrent_state` and both slot hooks, because
 //! `@hasDecl` alone lets a runner omit `resetSlotState` and inherit the state of the last
 //! conversation.
@@ -67,7 +67,7 @@ const sampler = @import("sampler.zig");
 const prompt_cache = @import("prompt_cache.zig");
 const StepRow = @import("step_row.zig").StepRow;
 const runner_surface = @import("runner_surface.zig");
-const core_log = @import("../core/log.zig");
+const core_log = @import("../core/utils/log.zig");
 
 const log = std.log.scoped(.serve);
 const log_token = std.log.scoped(.token);

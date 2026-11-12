@@ -390,7 +390,7 @@ fn hexValue(c: u8) ?u32 {
 // -- tests ------------------------------------------------------------------
 
 const testing = std.testing;
-const prop = @import("../../core/prop.zig");
+const prop = @import("../../core/utils/prop.zig");
 
 fn decode(arena: Allocator, bytes: []const u8) ChunkError![]u8 {
     var in: Io.Reader = .fixed(bytes);

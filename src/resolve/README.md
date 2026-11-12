@@ -1,6 +1,7 @@
-# Engine
+# Resolve
 
-This directory holds the boot decisions of the engine as values. It does not hold the forward pass
+This directory resolves the flags and the measured host resources into a setup or a refusal. It
+holds the boot decisions as values and the family table. It does not hold the forward pass
 (`runtime/`) or the serve loop (`serve/`). A command measures the host once, passes the resources
 here, and gets back a plan or a refusal. Nothing here reads a clock, a file, or a
 device, and nothing logs, so a table test runs every boot shape with no GPU.

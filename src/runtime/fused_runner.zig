@@ -68,10 +68,10 @@ const limits = @import("../core/limits.zig");
 const kv_budget = @import("../core/kv_budget.zig");
 const kv_index = @import("../core/kv_index.zig");
 const attn_split = @import("../core/attn_split.zig");
-const core_log = @import("../core/log.zig");
+const core_log = @import("../core/utils/log.zig");
 const span = @import("../core/span.zig");
 const step_stats = @import("../core/step_stats.zig");
-const time = @import("../core/time.zig");
+const time = @import("../core/utils/time.zig");
 const loader = @import("../io/gguf/loader.zig");
 const attn_record = @import("attn_record.zig");
 const fused_commands = @import("fused_commands.zig");
@@ -658,7 +658,7 @@ pub fn FusedRunner(comptime Family: type) type {
             const t0 = core_log.now();
             const vocab = self.card.vocab_size;
             @memcpy(self.logits[0..vocab], self.commands.stage_out.sliceTyped(f32, vocab));
-            self.commands.host.copy.add(step_stats.nsBetween(t0, core_log.now()));
+            self.commands.host.copy.add(time.rawElapsedNs(t0, core_log.now()));
             return self.logits[0..vocab];
         }
 

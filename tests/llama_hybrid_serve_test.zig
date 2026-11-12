@@ -1,4 +1,4 @@
-//! Serve gate for the llama hybrid runner under the real serve stack. The engine type is
+//! Serve gate for the llama hybrid runner under the real serve stack. The session pool is
 //! `Residency(Sessions(LlamaHybrid))`, the same type `serve_boot` builds for `--gpu-layers
 //! N`. The driver is the reference client over an in-process server on an ephemeral TCP port.
 //!
@@ -43,8 +43,8 @@ const LlamaHybrid = zigferencer.family.Of(.llama).Hybrid;
 const Residency = zigferencer.serve_residency.Residency;
 const Sessions = zigferencer.session.Sessions;
 
-const Engine = Residency(Sessions(LlamaHybrid));
-const HybridServer = server_mod.Server(Engine, event.Codec);
+const SessionPool = Residency(Sessions(LlamaHybrid));
+const HybridServer = server_mod.Server(SessionPool, event.Codec);
 
 // -- fixtures ---------------------------------------------------------------
 
@@ -274,10 +274,10 @@ fn overSubscribedRoundTrip(kv_dtype: dtype.KvDtype) !void {
     // The blob budget funds the evicted session plus the transient blob of a rotation.
     var sessions = try Sessions(LlamaHybrid).init(arena, hybrid);
     const blob_budget: u64 = 2 * hybrid.evictSlotBytesFor(hybrid.max_seq);
-    var engine = try Engine.init(arena, gpa, &sessions, prompts.len, blob_budget);
-    defer engine.deinit();
+    var pool = try SessionPool.init(arena, gpa, &sessions, prompts.len, blob_budget);
+    defer pool.deinit();
 
-    var server = HybridServer.init(arena, gpa, io, &engine, &codec, .{
+    var server = HybridServer.init(arena, gpa, io, &pool, &codec, .{
         .max_sessions = prompts.len,
         .max_batch = @intCast(n_slots),
         .max_seq = hybrid.max_seq,
@@ -308,7 +308,7 @@ fn overSubscribedRoundTrip(kv_dtype: dtype.KvDtype) !void {
     var reference: [prompts.len]Stream = undefined;
     var reference2: [prompts.len]Stream = undefined;
     try soloReference(&client, &reference, &reference2);
-    const quiet = engine.stats();
+    const quiet = pool.stats();
 
     var got: [prompts.len]Stream = undefined;
     var sids: [prompts.len]u32 = undefined;
@@ -325,7 +325,7 @@ fn overSubscribedRoundTrip(kv_dtype: dtype.KvDtype) !void {
     try expectSameStreams(&reference2, &got2);
 
     // Without a swap the comparisons above say nothing, so read the counters.
-    const busy = engine.stats();
+    const busy = pool.stats();
     try std.testing.expect(busy.evicts > quiet.evicts);
     try std.testing.expect(busy.restores > quiet.restores);
 }
@@ -364,10 +364,10 @@ test "llama hybrid serve: an interleaved turn matches its solo stream" {
 
     // Full residency: no swap can run, so the batched pass alone answers for the streams.
     var sessions = try Sessions(LlamaHybrid).init(arena, hybrid);
-    var engine = try Engine.init(arena, gpa, &sessions, 2, null);
-    defer engine.deinit();
+    var pool = try SessionPool.init(arena, gpa, &sessions, 2, null);
+    defer pool.deinit();
 
-    var server = HybridServer.init(arena, gpa, io, &engine, &codec, .{
+    var server = HybridServer.init(arena, gpa, io, &pool, &codec, .{
         .max_sessions = 2,
         .max_batch = @intCast(n_slots),
         .max_seq = hybrid.max_seq,

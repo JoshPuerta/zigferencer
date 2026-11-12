@@ -66,7 +66,8 @@ const dtype = @import("../core/dtype.zig");
 const limits = @import("../core/limits.zig");
 const attn_cpu = @import("../core/attn_cpu.zig");
 const kv_budget = @import("../core/kv_budget.zig");
-const core_log = @import("../core/log.zig");
+const core_log = @import("../core/utils/log.zig");
+const time = @import("../core/utils/time.zig");
 const loader = @import("../io/gguf/loader.zig");
 const KvCache = @import("kv_cache.zig").KvCache;
 const parallel = @import("parallel.zig");
@@ -796,7 +797,7 @@ fn expectProfilePartition(comptime Family: type) !void {
     const t1 = std.Io.Clock.Timestamp.now(io, .awake);
     span.installSums(null);
     prof.steps = 1;
-    const wall: u64 = @intCast(t0.durationTo(t1).raw.toNanoseconds());
+    const wall = time.elapsedNs(t0, t1);
 
     try std.testing.expectEqual(@as(u64, 1), prof.steps);
     // Cover: one decode step charges every op of the family, and no other op key.

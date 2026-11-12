@@ -106,12 +106,12 @@ pub const AcceptAction = enum {
     back_off,
 };
 
-/// `Engine` and `CodecT` are the scheduler boundaries (see scheduler.zig). `Adapter` is the
+/// `SessionPool` and `CodecT` are the scheduler boundaries (see scheduler.zig). `Adapter` is the
 /// transport. A value must not move once `run` has started, because tasks hold `*Self`.
-pub fn ServeEngine(comptime Engine: type, comptime CodecT: type, comptime Adapter: type) type {
+pub fn ServeEngine(comptime SessionPool: type, comptime CodecT: type, comptime Adapter: type) type {
     return struct {
         const Self = @This();
-        const SchedulerT = scheduler_mod.Scheduler(Engine, CodecT);
+        const SchedulerT = scheduler_mod.Scheduler(SessionPool, CodecT);
 
         /// A connection slot: the fields the engine and sink touch, plus the adapter state (`ext`).
         /// `slots` holds its state and its connection id.
@@ -153,7 +153,7 @@ pub fn ServeEngine(comptime Engine: type, comptime CodecT: type, comptime Adapte
             arena: Allocator,
             gpa: Allocator,
             io: Io,
-            engine: *Engine,
+            pool: *SessionPool,
             codec: *const CodecT,
             sched_cfg: scheduler_mod.Config,
             endpoint: Endpoint,
@@ -195,7 +195,7 @@ pub fn ServeEngine(comptime Engine: type, comptime CodecT: type, comptime Adapte
             var self: Self = .{
                 .gpa = gpa,
                 .io = io,
-                .sched = try SchedulerT.init(arena, gpa, io, engine, codec, sched_cfg),
+                .sched = try SchedulerT.init(arena, gpa, io, pool, codec, sched_cfg),
                 .codec = codec,
                 .listener = listener,
                 .conns = conns,

@@ -1178,8 +1178,8 @@ test "kept pairs give the ids of the live turns on the qwen CPU runner, thinking
 
 // -- control tokens ---------------------------------------------------------
 
-const FakeEngine = zigferencer.session.Sessions(harness.FakeRunner);
-const FakeServer = zigferencer.serve_server.Server(FakeEngine, event.Codec);
+const FakePool = zigferencer.session.Sessions(harness.FakeRunner);
+const FakeServer = zigferencer.serve_server.Server(FakePool, event.Codec);
 
 /// The token frames of one turn, each with its id and its text.
 const FrameLog = struct {
@@ -1225,8 +1225,8 @@ test "a control token frame carries its id and no text, and the kept reply holds
         .logits = try arena.alloc(f32, vocab.tokens.len),
     };
     @memset(runner.logits, 0);
-    var engine = try FakeEngine.init(arena, &runner);
-    var server = try FakeServer.init(arena, gpa, io, &engine, &codec, .{
+    var pool = try FakePool.init(arena, &runner);
+    var server = try FakeServer.init(arena, gpa, io, &pool, &codec, .{
         .max_sessions = 1,
         .max_batch = 1,
         .max_seq = window,

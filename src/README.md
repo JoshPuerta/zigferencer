@@ -16,7 +16,7 @@ read.
 | [`cli/`](./cli/README.md) | argv to one handler per command. |
 | [`dev/`](./dev/README.md) | The developer commands and `dev_main.zig`, the root of `zigferencer-dev`. This directory is a module of its own, and it imports the engine as the `zigferencer` module. |
 | [`core/`](./core/README.md) | The boundary values and the pure helpers: `Tensor`, quant geometry, the static bounds, the two planners, the device KV layout, the model table, the tokenizer, and the chat wraps. |
-| [`engine/`](./engine/README.md) | The boot decisions. `resolve.zig` takes the flags, the registry entry, the model card, and the host resources. It returns the thinking mode, the KV dtype, the window, and the all-host plan with its RAM quote, or a `Refusal`. `device_placement.zig` adds the device placements from the resources one device context states: the fused fit, the VRAM budgets, and the hybrid split. `flags.zig` holds `EngineFlags`, the options it reads. `family.zig` holds one row for each model family: the runner of each placement. |
+| [`resolve/`](./resolve/README.md) | The boot decisions. `resolve.zig` takes the flags, the registry entry, the model card, and the host resources. It returns the thinking mode, the KV dtype, the window, and the all-host plan with its RAM quote, or a `Refusal`. `device_placement.zig` adds the device placements from the resources one device context states: the fused fit, the VRAM budgets, and the hybrid split. `flags.zig` holds `EngineFlags`, the options it reads. `family.zig` holds one row for each model family: the runner of each placement. |
 | [`io/`](./io/README.md) | The I/O shell: an HTTPS download, a read-only whole-file map, and the GGUF parser and loader. |
 | [`ops/`](./ops/README.md) | The CPU op variants. |
 | [`ops_vulkan/`](./ops_vulkan/README.md) | The GPU op backend: one pipeline struct per shader, the upload ring, and the GLSL sources. GPU builds only. |
@@ -68,7 +68,7 @@ read.
 - `entry` maps a failed write to stdout to an exit. A reader that closes the pipe, as `head`
   does, ends the command with exit 1 and no message. Another cause, such as `/dev/full`, ends it
   with exit 1 and one line that names the cause.
-- `std_options` routes `std.log` through `core/log.zig`. The comptime ceiling is
+- `std_options` routes `std.log` through `core/utils/log.zig`. The comptime ceiling is
   `debug` in every build, and `$ZIGFERENCER_LOG` is the runtime check with a
   default of `info`. No log line reaches stdout, because stdout carries the
   generated text.

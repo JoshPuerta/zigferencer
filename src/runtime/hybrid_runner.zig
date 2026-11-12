@@ -3,7 +3,7 @@
 //! `[host_layers..n_layers)`, the final norm, and the lm_head. The planner picks `host_layers` so
 //! the GPU layers fit the VRAM budget.
 //!
-//! Comptime. `Family` is a row of `engine/family.zig`, and the runner names only its `Cpu` and
+//! Comptime. `Family` is a row of `resolve/family.zig`, and the runner names only its `Cpu` and
 //! `Fused` runners. A build check stops the compiler when a build without fused ops includes it.
 //!
 //! Composition. `Family.Cpu.initPrefix` builds the host layers, and the hidden-row entries of

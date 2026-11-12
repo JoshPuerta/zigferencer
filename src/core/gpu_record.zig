@@ -209,7 +209,7 @@ fn writeKeyFrames(w: *std.Io.Writer, key: OpKey) std.Io.Writer.Error!void {
 
 // -- tests ------------------------------------------------------------------
 
-const prop = @import("prop.zig");
+const prop = @import("utils/prop.zig");
 const testing = std.testing;
 
 /// GPU records whose device clock drifts against the host clock: a counter that pauses (the offset

@@ -486,7 +486,7 @@ fn eachSessionHasSlot(
 
 // -- tests ------------------------------------------------------------------
 
-const prop = @import("../core/prop.zig");
+const prop = @import("../core/utils/prop.zig");
 
 const mib: u64 = 1024 * 1024;
 

@@ -15,7 +15,7 @@ const build_options = @import("build_options");
 const context = @import("../context.zig");
 const args = @import("../args.zig");
 const flags_mod = @import("../flag_groups.zig");
-const resolve_mod = @import("../../engine/resolve.zig");
+const resolve_mod = @import("../../resolve/resolve.zig");
 const limits = @import("../../core/limits.zig");
 const prefill_chunk = @import("../../serve/prefill_chunk.zig");
 

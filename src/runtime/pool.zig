@@ -39,7 +39,7 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const limits = @import("../core/limits.zig");
-const prop = @import("../core/prop.zig");
+const prop = @import("../core/utils/prop.zig");
 const span = @import("../core/span.zig");
 
 const assert = std.debug.assert;

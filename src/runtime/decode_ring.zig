@@ -31,8 +31,9 @@ const kernels = @import("../ops_vulkan/kernels.zig");
 const gpu_profile = @import("gpu_profile.zig");
 const record_ring = @import("../core/record_ring.zig");
 const step_stats = @import("../core/step_stats.zig");
-const core_log = @import("../core/log.zig");
+const core_log = @import("../core/utils/log.zig");
 const span = @import("../core/span.zig");
+const time = @import("../core/utils/time.zig");
 
 const log_dispatch = std.log.scoped(.dispatch);
 
@@ -179,10 +180,10 @@ pub const DecodeRing = struct {
         self.last = try self.profs[@intFromEnum(p.buf)].collectInto(self.runner, .decode, t1, t4);
 
         // Report the four host steps.
-        host.record.add(step_stats.nsBetween(t0, t1));
-        host.submit.add(step_stats.nsBetween(t1, t2));
-        host.speculate.add(step_stats.nsBetween(t2, t3));
-        host.wait.add(step_stats.nsBetween(t3, t4));
+        host.record.add(time.rawElapsedNs(t0, t1));
+        host.submit.add(time.rawElapsedNs(t1, t2));
+        host.speculate.add(time.rawElapsedNs(t2, t3));
+        host.wait.add(time.rawElapsedNs(t3, t4));
         span.record(.gpu_record, t0, t1);
         span.record(.gpu_submit, t1, t2);
         span.record(.gpu_speculate, t2, t3);
@@ -191,8 +192,8 @@ pub const DecodeRing = struct {
             log_dispatch.debug("step pos {d} ({s}): record {d:.1} ms, submit+wait {d:.1} ms", .{
                 key.pos,
                 if (p.hit) "hit" else "miss",
-                step_stats.nsToMs(step_stats.nsBetween(t0, t1)),
-                step_stats.nsToMs(step_stats.nsBetween(t1, t4)),
+                time.nsToMs(time.rawElapsedNs(t0, t1)),
+                time.nsToMs(time.rawElapsedNs(t1, t4)),
             });
         }
 

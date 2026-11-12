@@ -24,6 +24,7 @@ const std = @import("std");
 const Io = std.Io;
 const sampler = @import("sampler.zig");
 const step_stats = @import("../core/step_stats.zig");
+const time = @import("../core/utils/time.zig");
 const span = @import("../core/span.zig");
 const log = std.log.scoped(.run);
 
@@ -89,7 +90,7 @@ pub fn decode(
     var pos = pos_in;
     if (max_tokens == 0) {
         return .{
-            .ttft_ms = ms(t_start, Io.Clock.Timestamp.now(io, .awake)),
+            .ttft_ms = time.msBetween(t_start, Io.Clock.Timestamp.now(io, .awake)),
             .itl_ms = 0,
             .tokens_generated = 0,
             .steps = 0,
@@ -122,7 +123,7 @@ pub fn decode(
         steps += 1;
         if (comptime has_on_step) {
             const t_now = Io.Clock.Timestamp.now(io, .awake);
-            sink.onStep(pos, nsBetween(t_mark, t_now));
+            sink.onStep(pos, time.elapsedNs(t_mark, t_now));
             t_mark = t_now;
         }
 
@@ -149,8 +150,11 @@ pub fn decode(
     var host: step_stats.DecodeHost = if (host_out) |h| h.* else .{};
     host.argmax = argmax;
     return .{
-        .ttft_ms = ms(t_start, t_first),
-        .itl_ms = if (steps > 0) ms(t_first, t_end) / @as(f64, @floatFromInt(steps)) else 0,
+        .ttft_ms = time.msBetween(t_start, t_first),
+        .itl_ms = if (steps > 0)
+            time.msBetween(t_first, t_end) / @as(f64, @floatFromInt(steps))
+        else
+            0,
         .tokens_generated = n,
         .steps = steps,
         .pos_end = pos,
@@ -159,16 +163,6 @@ pub fn decode(
 }
 
 // -- helpers ----------------------------------------------------------------
-
-fn ms(t0: Io.Clock.Timestamp, t1: Io.Clock.Timestamp) f64 {
-    const ns: i64 = @intCast(t0.durationTo(t1).raw.toNanoseconds());
-    return @as(f64, @floatFromInt(ns)) / 1e6;
-}
-
-/// The awake clock is monotonic, so the difference is never negative.
-fn nsBetween(t0: Io.Clock.Timestamp, t1: Io.Clock.Timestamp) u64 {
-    return @intCast(t0.durationTo(t1).raw.toNanoseconds());
-}
 
 /// Greedy argmax with its wall time folded into `stat`. A row with a NaN, a +inf, or no finite
 /// logit ends the turn with an error, because argmax over it names no real token.
@@ -182,7 +176,7 @@ fn timedGreedy(logits: []const f32, io: Io, stat: *step_stats.Stat) sampler.Erro
     const t0 = Io.Clock.Timestamp.now(io, .awake);
     const id = sampler.greedy(logits);
     const t1 = Io.Clock.Timestamp.now(io, .awake);
-    stat.add(nsBetween(t0, t1));
+    stat.add(time.elapsedNs(t0, t1));
     span.record(.sample, t0.raw, t1.raw);
     return id;
 }

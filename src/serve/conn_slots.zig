@@ -295,7 +295,7 @@ fn transition(slot: *Slot, from: State, to: State) void {
 
 // -- tests ------------------------------------------------------------------
 
-const prop = @import("../core/prop.zig");
+const prop = @import("../core/utils/prop.zig");
 const testing = std.testing;
 
 /// The rules of one model table. The real rules hold every default. Each broken-rule variant

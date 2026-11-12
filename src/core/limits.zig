@@ -204,7 +204,7 @@ pub const trace_spans_env = "ZIGFERENCER_TRACE_SPANS";
 /// Ceiling on logical serve sessions. A session is resident in a VRAM slot or evicted to a RAM
 /// blob. The residency table is heap, so this bounds memory, not stack. Only the fused-GPU build
 /// can evict, so CPU builds keep logical equal to physical. The VRAM budget in
-/// `engine/device_placement.zig` caps its slots at the logical count and `max_vram_slots`.
+/// `resolve/device_placement.zig` caps its slots at the logical count and `max_vram_slots`.
 pub const max_logical_sessions: u32 = 128;
 
 /// Ceiling on live serve connections, the clients one server holds at once. A binary connection

@@ -267,8 +267,8 @@ const SseSink = struct {
 };
 
 /// The serve engine with the OpenAI HTTP transport. The `RawCodec` carries the model metadata.
-pub fn Server(comptime Engine: type) type {
-    return engine_mod.ServeEngine(Engine, RawCodec, HttpAdapter);
+pub fn Server(comptime SessionPool: type) type {
+    return engine_mod.ServeEngine(SessionPool, RawCodec, HttpAdapter);
 }
 
 fn HttpTasks(comptime Eng: type) type {

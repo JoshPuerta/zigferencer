@@ -1,8 +1,8 @@
 //! The control unit of the serve layer: a fixed table of protocol sessions over the session pool
-//! of the engine, advanced by one engine call per `tick`. All state lives here and in the engine.
+//! of the engine, advanced by one pool call per `tick`. All state lives here and in the pool.
 //!
-//! Comptime. Generic over the engine and the codec, so the prongs for snapshots and stats compile
-//! away on an engine that lacks them.
+//! Comptime. Generic over the session pool and the codec, so the prongs for snapshots and stats
+//! compile away on a pool that lacks them.
 //!
 //! Tick order. One tick runs four steps in order. It expires leases and retries parked emits. It
 //! finalizes stopped turns, which emits `done`. It then makes ONE composed engine call. That call
@@ -90,16 +90,16 @@
 //! outside the think block. A client picks the row of the mode of each turn. The launcher reads the
 //! model registry, so the engine holds no per-model table. The default is greedy.
 //!
-//! Engine boundary. `Engine` is the session pool of the runtime (`Sessions(RunnerT)`, `Residency`,
-//! or a test fake). The scheduler calls only its composed `advance`. `CodecT` is the text-to-token
-//! boundary. `sink` is any value with `emit(conn: u32, ev: OutEvent) bool` and
+//! Pool boundary. `SessionPool` is the session pool of the runtime (`Sessions(RunnerT)`,
+//! `Residency`, or a test fake). The scheduler calls only its composed `advance`. `CodecT` is the
+//! text-to-token boundary. `sink` is any value with `emit(conn: u32, ev: OutEvent) bool` and
 //! `disconnect(conn: u32) void`.
 
 const std = @import("std");
 const Io = std.Io;
 const Allocator = std.mem.Allocator;
 const limits = @import("../core/limits.zig");
-const prop = @import("../core/prop.zig");
+const prop = @import("../core/utils/prop.zig");
 const span = @import("../core/span.zig");
 const protocol = @import("protocol.zig");
 const event = @import("event.zig");
@@ -111,7 +111,8 @@ const sampler = @import("../runtime/sampler.zig");
 const Request = event.Request;
 const OutEvent = event.OutEvent;
 
-const core_log = @import("../core/log.zig");
+const core_log = @import("../core/utils/log.zig");
+const time = @import("../core/utils/time.zig");
 
 const log = std.log.scoped(.serve);
 const log_token = std.log.scoped(.token);
@@ -239,13 +240,13 @@ const SlotState = enum { free, idle, prefill, decode };
 /// and an `append` of kept pairs sample nothing. They return the slot to idle with one reply.
 const PrefillKind = enum { turn, opening, append };
 
-/// The session table over `Engine` and `CodecT`.
-pub fn Scheduler(comptime Engine: type, comptime CodecT: type) type {
+/// The session table over `SessionPool` and `CodecT`.
+pub fn Scheduler(comptime SessionPool: type, comptime CodecT: type) type {
     return struct {
         const Self = @This();
 
-        /// The engine can snapshot a KV prefix. Without it the prefix-cache paths compile away.
-        const can_snapshot = @hasDecl(Engine, "can_snapshot") and Engine.can_snapshot;
+        /// The pool can snapshot a KV prefix. Without it the prefix-cache paths compile away.
+        const can_snapshot = @hasDecl(SessionPool, "can_snapshot") and SessionPool.can_snapshot;
 
         /// The owner of a slot that is not free. A detached slot holds the
         /// deadline of its lease, and no connection reaches it.
@@ -346,7 +347,7 @@ pub fn Scheduler(comptime Engine: type, comptime CodecT: type) type {
 
         gpa: Allocator,
         io: Io,
-        engine: *Engine,
+        pool: *SessionPool,
         codec: *const CodecT,
         cfg: Config,
         slots: []Slot,
@@ -382,7 +383,7 @@ pub fn Scheduler(comptime Engine: type, comptime CodecT: type) type {
             arena: Allocator,
             gpa: Allocator,
             io: Io,
-            engine: *Engine,
+            pool: *SessionPool,
             codec: *const CodecT,
             cfg_in: Config,
         ) Allocator.Error!Self {
@@ -428,7 +429,7 @@ pub fn Scheduler(comptime Engine: type, comptime CodecT: type) type {
             return .{
                 .gpa = gpa,
                 .io = io,
-                .engine = engine,
+                .pool = pool,
                 .codec = codec,
                 .cfg = cfg,
                 .slots = slots,
@@ -542,8 +543,8 @@ pub fn Scheduler(comptime Engine: type, comptime CodecT: type) type {
         /// One line of KV-residency pressure. Only the tiered engine keeps
         /// these counters, so a plain session pool logs nothing here.
         fn logStats(self: *const Self) void {
-            if (comptime @hasDecl(Engine, "stats")) {
-                const s = self.engine.stats();
+            if (comptime @hasDecl(SessionPool, "stats")) {
+                const s = self.pool.stats();
                 const mib = 1024 * 1024;
 
                 // Only a bounded tier has a ceiling to print. A zero budget
@@ -598,8 +599,8 @@ pub fn Scheduler(comptime Engine: type, comptime CodecT: type) type {
                     },
                 );
                 self.prefix.logEntryHits();
-                if (comptime @hasDecl(Engine, "logBlobs")) {
-                    self.engine.logBlobs();
+                if (comptime @hasDecl(SessionPool, "logBlobs")) {
+                    self.pool.logBlobs();
                 }
             }
         }
@@ -718,7 +719,7 @@ pub fn Scheduler(comptime Engine: type, comptime CodecT: type) type {
             // Bind a slot to a new engine session.
             const taken = self.admitSlot(req, sink) orelse return;
             const slot = taken.slot;
-            const engine_id = self.engine.create(
+            const engine_id = self.pool.create(
                 sampling.seed,
                 self.samplerParams(slot, sampling),
             ) catch {
@@ -758,7 +759,7 @@ pub fn Scheduler(comptime Engine: type, comptime CodecT: type) type {
                 self.refuseNoSession(req, sink, .internal, "tokenize failed");
                 return;
             };
-            const window = self.engine.capacityRemaining(engine_id);
+            const window = self.pool.capacityRemaining(engine_id);
             if (tokens.len > window) {
                 self.gpa.free(tokens);
                 self.dropSlot(slot);
@@ -775,7 +776,7 @@ pub fn Scheduler(comptime Engine: type, comptime CodecT: type) type {
         /// Fork an open session: shared context, new seed and sampling, new protocol id. The source
         /// must be between turns, because a client cannot reason about a half-written fork.
         fn handleClone(self: *Self, req: Request, sampling: protocol.Sampling, sink: anytype) void {
-            if (comptime !Engine.can_clone) {
+            if (comptime !SessionPool.can_clone) {
                 return self.refuse(req, sink, .internal, "clone unsupported on this backend");
             }
 
@@ -785,7 +786,7 @@ pub fn Scheduler(comptime Engine: type, comptime CodecT: type) type {
             // Fork the engine session into a slot.
             const taken = self.admitSlot(req, sink) orelse return;
             const slot = taken.slot;
-            const engine_id = self.engine.clone(
+            const engine_id = self.pool.clone(
                 source.engine_id,
                 sampling.seed,
                 self.samplerParams(slot, sampling),
@@ -864,11 +865,11 @@ pub fn Scheduler(comptime Engine: type, comptime CodecT: type) type {
             // Every refusal is behind, so a refused turn leaves the sampler
             // of the session unchanged.
             if (m.sampling) |sampling| {
-                self.engine.setParams(slot.engine_id, self.samplerParams(slot, sampling));
+                self.pool.setParams(slot.engine_id, self.samplerParams(slot, sampling));
                 // Only an explicit reseed restarts the stream, so a client
                 // that resends its sampling keeps one stream per session.
                 if (m.reseed) {
-                    self.engine.reseed(slot.engine_id, sampling.seed);
+                    self.pool.reseed(slot.engine_id, sampling.seed);
                 }
             }
 
@@ -917,7 +918,7 @@ pub fn Scheduler(comptime Engine: type, comptime CodecT: type) type {
                 return null;
             };
 
-            const room = self.engine.capacityRemaining(slot.engine_id);
+            const room = self.pool.capacityRemaining(slot.engine_id);
             if (tokens.len <= room) return tokens;
 
             self.gpa.free(tokens);
@@ -946,7 +947,7 @@ pub fn Scheduler(comptime Engine: type, comptime CodecT: type) type {
             var ids = self.renderPairs(req, slot, pairs, &ends, sink) orelse return;
 
             // Refuse a set past the room.
-            const room = self.engine.capacityRemaining(slot.engine_id);
+            const room = self.pool.capacityRemaining(slot.engine_id);
             if (ids.items.len > room) {
                 var detail: [detail_max]u8 = undefined;
                 const msg = turnTooLongDetail(&detail, ids.items.len, room);
@@ -954,7 +955,7 @@ pub fn Scheduler(comptime Engine: type, comptime CodecT: type) type {
             }
 
             // Record the position after each pair.
-            const pos0 = self.engine.posOf(slot.engine_id);
+            const pos0 = self.pool.posOf(slot.engine_id);
             for (ends[0..pairs.n], slot.append_pos[0..pairs.n]) |end, *pos| {
                 pos.* = pos0 + end;
             }
@@ -1050,7 +1051,7 @@ pub fn Scheduler(comptime Engine: type, comptime CodecT: type) type {
             self.emitOrPark(slot, sink, .{
                 .request_id = slot.request_id,
                 .session_id = slot.proto_id,
-                .body = .{ .session_opened = .{ .kv_pos = self.engine.posOf(slot.engine_id) } },
+                .body = .{ .session_opened = .{ .kv_pos = self.pool.posOf(slot.engine_id) } },
             });
         }
 
@@ -1059,7 +1060,7 @@ pub fn Scheduler(comptime Engine: type, comptime CodecT: type) type {
 
             var body: protocol.Appended = .{ .n = slot.append_n };
             @memcpy(body.kv_pos[0..slot.append_n], slot.append_pos[0..slot.append_n]);
-            std.debug.assert(body.kv_pos[slot.append_n - 1] == self.engine.posOf(slot.engine_id));
+            std.debug.assert(body.kv_pos[slot.append_n - 1] == self.pool.posOf(slot.engine_id));
             self.emitOrPark(slot, sink, .{
                 .request_id = slot.request_id,
                 .session_id = slot.proto_id,
@@ -1323,7 +1324,7 @@ pub fn Scheduler(comptime Engine: type, comptime CodecT: type) type {
                 .session_id = slot.proto_id,
                 .body = .{ .resumed = .{
                     .token = lease.token,
-                    .kv_pos = self.engine.posOf(slot.engine_id),
+                    .kv_pos = self.pool.posOf(slot.engine_id),
                     .turns_done = slot.turns_done,
                     .last = last,
                 } },
@@ -1514,7 +1515,7 @@ pub fn Scheduler(comptime Engine: type, comptime CodecT: type) type {
             std.debug.assert(slot.pending_event == null);
             log.info(
                 "resume ready: session {d} conn {d} at pos {d}",
-                .{ slot.proto_id, wait.conn, self.engine.posOf(slot.engine_id) },
+                .{ slot.proto_id, wait.conn, self.pool.posOf(slot.engine_id) },
             );
             slot.resume_wait = null;
             self.emitOrPark(slot, sink, self.resumedEvent(slot, wait.request_id));
@@ -1716,9 +1717,9 @@ pub fn Scheduler(comptime Engine: type, comptime CodecT: type) type {
                         .finish_reason = reason,
                         .turn_prompt_tokens = slot.turn_prompt_len,
                         .gen_tokens = slot.generated,
-                        .kv_pos = self.engine.posOf(slot.engine_id),
-                        .prefill_ms = msBetween(slot.t_turn_start, slot.t_prefill_end),
-                        .decode_ms = msBetween(slot.t_prefill_end, now),
+                        .kv_pos = self.pool.posOf(slot.engine_id),
+                        .prefill_ms = time.msBetweenF32(slot.t_turn_start, slot.t_prefill_end),
+                        .decode_ms = time.msBetweenF32(slot.t_prefill_end, now),
                         .reasoning_tokens = slot.think_n,
                     } },
                 });
@@ -1735,8 +1736,8 @@ pub fn Scheduler(comptime Engine: type, comptime CodecT: type) type {
                         @tagName(reason),
                         slot.turn_prompt_len,
                         slot.generated,
-                        msBetween(slot.t_turn_start, slot.t_prefill_end),
-                        msBetween(slot.t_prefill_end, now),
+                        time.msBetweenF32(slot.t_turn_start, slot.t_prefill_end),
+                        time.msBetweenF32(slot.t_prefill_end, now),
                     },
                 );
 
@@ -1763,7 +1764,7 @@ pub fn Scheduler(comptime Engine: type, comptime CodecT: type) type {
             const chunk: usize = if (feed_chunk) |fc| fc.tokens.len else 0;
             logBatch(&rows, feeding, chunk);
 
-            const first = self.engine.advance(
+            const first = self.pool.advance(
                 feed_chunk,
                 rows.engineIds(),
                 rows.tokensOut(),
@@ -1810,11 +1811,11 @@ pub fn Scheduler(comptime Engine: type, comptime CodecT: type) type {
                 }
 
                 std.debug.assert(slot.owner == .attached);
-                if (self.engine.capacityRemaining(slot.engine_id) == 0) {
+                if (self.pool.capacityRemaining(slot.engine_id) == 0) {
                     slot.stop = .context_full;
                     log.info(
                         "stop: session {d} context_full at pos {d}",
-                        .{ slot.proto_id, self.engine.posOf(slot.engine_id) },
+                        .{ slot.proto_id, self.pool.posOf(slot.engine_id) },
                     );
                     continue;
                 }
@@ -1911,7 +1912,7 @@ pub fn Scheduler(comptime Engine: type, comptime CodecT: type) type {
             self.parks += 1;
             if (rows.n == 0) return false;
 
-            const decoded = self.engine.advance(
+            const decoded = self.pool.advance(
                 null,
                 rows.engineIds(),
                 rows.tokensOut(),
@@ -2051,7 +2052,7 @@ pub fn Scheduler(comptime Engine: type, comptime CodecT: type) type {
             slot.forced_head += 1;
             std.debug.assert(id != self.cfg.eos_id);
             std.debug.assert(id < self.cfg.vocab_size);
-            self.engine.overridePending(slot.engine_id, id);
+            self.pool.overridePending(slot.engine_id, id);
             if (comptime core_log.hot) {
                 log_token.debug(
                     "forced: session {d} id {d}, {d} owed",
@@ -2138,7 +2139,7 @@ pub fn Scheduler(comptime Engine: type, comptime CodecT: type) type {
         /// the manager offers and prefill only the suffix.
         fn tryRestorePrefix(self: *Self, slot: *Slot, sink: anytype) void {
             if (!self.prefix.enabled()) return;
-            if (self.engine.posOf(slot.engine_id) != 0) return;
+            if (self.pool.posOf(slot.engine_id) != 0) return;
 
             slot.caches_prefix = true;
             // The slices of the plan live inside this call only: later inserts reallocate the list.
@@ -2154,7 +2155,7 @@ pub fn Scheduler(comptime Engine: type, comptime CodecT: type) type {
             // The engine samples the first token inside the restore, so the prefix enters
             // the context set first. The cold path of a failed restore feeds the same ids.
             self.markFed(slot, slot.turn_tokens[0..hit.n]);
-            const first = self.engine.restoreReady(
+            const first = self.pool.restoreReady(
                 slot.engine_id,
                 hit.n,
                 hit.blob,
@@ -2181,7 +2182,7 @@ pub fn Scheduler(comptime Engine: type, comptime CodecT: type) type {
 
         /// A partial hit: restore the rows, and leave the suffix to the prefill.
         fn restoreRows(self: *Self, slot: *Slot, hit: PrefixHit, sink: anytype) void {
-            self.engine.restorePrefix(slot.engine_id, hit.n, hit.blob) catch |err| {
+            self.pool.restorePrefix(slot.engine_id, hit.n, hit.blob) catch |err| {
                 log.debug("prefix restore failed: session {d}: {t}", .{ slot.proto_id, err });
                 self.prefix.recordMiss();
                 return;
@@ -2212,7 +2213,7 @@ pub fn Scheduler(comptime Engine: type, comptime CodecT: type) type {
             if (!slot.caches_prefix) return;
 
             slot.caches_prefix = false;
-            self.prefix.insert(self.engine, .{
+            self.prefix.insert(self.pool, .{
                 .engine_id = slot.engine_id,
                 .proto_id = slot.proto_id,
                 .tokens = slot.turn_tokens,
@@ -2368,7 +2369,7 @@ pub fn Scheduler(comptime Engine: type, comptime CodecT: type) type {
                 .sessions_open = open,
                 .sessions_decoding = decoding,
                 .tokens_generated_total = self.tokens_generated_total,
-                .uptime_ms = @intFromFloat(@max(0, msBetween(self.t_init, now))),
+                .uptime_ms = @intFromFloat(@max(0, time.msBetweenF32(self.t_init, now))),
             } } };
         }
 
@@ -2489,12 +2490,12 @@ pub fn Scheduler(comptime Engine: type, comptime CodecT: type) type {
                 self.gpa.free(slot.turn_tokens);
             }
 
-            self.engine.destroy(slot.engine_id);
+            self.pool.destroy(slot.engine_id);
             slot.* = .{};
         }
 
         fn dropSlot(self: *Self, slot: *Slot) void {
-            self.engine.destroy(slot.engine_id);
+            self.pool.destroy(slot.engine_id);
             slot.* = .{};
         }
     };
@@ -2556,11 +2557,6 @@ fn avgMs(total_ms: f64, n: u64) f64 {
 /// A span of `ms` milliseconds on the clock that the lease reads.
 fn msDuration(ms: u32) Io.Clock.Duration {
     return .{ .raw = .fromMilliseconds(ms), .clock = .awake };
-}
-
-fn msBetween(t0: Io.Clock.Timestamp, t1: Io.Clock.Timestamp) f32 {
-    const ns: i64 = @intCast(t0.durationTo(t1).raw.toNanoseconds());
-    return @as(f32, @floatFromInt(ns)) / 1e6;
 }
 
 /// The well-formed think config the launcher builds. A nonzero budget forces
@@ -2853,16 +2849,16 @@ const FakeSink = struct {
     }
 };
 
-const TestEngine = Sessions(TestRunner);
-const TestScheduler = Scheduler(TestEngine, FakeCodec);
-const ResEngine = Residency(Sessions(TestRunner));
-const ResScheduler = Scheduler(ResEngine, FakeCodec);
+const TestPool = Sessions(TestRunner);
+const TestScheduler = Scheduler(TestPool, FakeCodec);
+const ResPool = Residency(Sessions(TestRunner));
+const ResScheduler = Scheduler(ResPool, FakeCodec);
 const NoSnapScheduler = Scheduler(Sessions(NoSnapRunner), FakeCodec);
 
 const Fixture = struct {
     arena_state: std.heap.ArenaAllocator,
     runner: *TestRunner,
-    engine: *TestEngine,
+    pool: *TestPool,
     codec: *FakeCodec,
     sched: *TestScheduler,
     sink: *FakeSink,
@@ -2923,7 +2919,7 @@ const Fixture = struct {
 
         const arena = arena_state.allocator();
 
-        // Build the runner, the engine, and the codec in the arena.
+        // Build the runner, the pool, and the codec in the arena.
         const runner = try arena.create(TestRunner);
         runner.* = .{
             .n_slots = n_slots,
@@ -2931,14 +2927,14 @@ const Fixture = struct {
             .logits = try arena.alloc(f32, n_slots * test_vocab),
         };
         @memset(runner.logits, 0);
-        const engine = try arena.create(TestEngine);
-        engine.* = try TestEngine.init(arena, runner);
+        const pool = try arena.create(TestPool);
+        pool.* = try TestPool.init(arena, runner);
         const codec = try arena.create(FakeCodec);
         codec.* = FakeCodec.initFake();
 
         // Build the scheduler and the sink.
         const sched = try arena.create(TestScheduler);
-        sched.* = try TestScheduler.init(arena, gpa, std.testing.io, engine, codec, .{
+        sched.* = try TestScheduler.init(arena, gpa, std.testing.io, pool, codec, .{
             .max_sessions = @intCast(n_slots),
             .max_batch = max_batch orelse @intCast(n_slots),
             .max_seq = max_seq,
@@ -2957,7 +2953,7 @@ const Fixture = struct {
         return .{
             .arena_state = arena_state,
             .runner = runner,
-            .engine = engine,
+            .pool = pool,
             .codec = codec,
             .sched = sched,
             .sink = sink,
@@ -3142,7 +3138,7 @@ test "lifecycle: open with system prompt, generate to max_tokens, carry feeds th
     defer fx.tearDown();
 
     const sid = try fx.openSession(1, "abc"); // system prompt: 3 tokens via chunk size 2
-    try std.testing.expectEqual(@as(u32, 3), fx.engine.posOf(0));
+    try std.testing.expectEqual(@as(u32, 3), fx.pool.posOf(0));
 
     try fx.generate(1, sid, "x", 3); // 'x'%8=0 -> sampled chain 1,2,3
     fx.drain();
@@ -3574,11 +3570,11 @@ test "over-subscription: three logical sessions over two VRAM slots stream corre
     };
     @memset(runner.logits, 0);
     var sessions = try Sessions(TestRunner).init(arena, &runner);
-    var engine = try ResEngine.init(arena, gpa, &sessions, 3, null); // three logical sessions
-    defer engine.deinit();
+    var pool = try ResPool.init(arena, gpa, &sessions, 3, null); // three logical sessions
+    defer pool.deinit();
 
     var codec = FakeCodec.initFake();
-    var sched = try ResScheduler.init(arena, gpa, std.testing.io, &engine, &codec, .{
+    var sched = try ResScheduler.init(arena, gpa, std.testing.io, &pool, &codec, .{
         .max_sessions = 3,
         .max_batch = 2, // <= physical slots
         .max_seq = 64,
@@ -3663,11 +3659,11 @@ test "over-subscription: slots decoupled from the decode width, 12 logical / 6 s
     };
     @memset(runner.logits, 0);
     var sessions = try Sessions(TestRunner).init(arena, &runner);
-    var engine = try ResEngine.init(arena, gpa, &sessions, 12, null);
-    defer engine.deinit();
+    var pool = try ResPool.init(arena, gpa, &sessions, 12, null);
+    defer pool.deinit();
 
     var codec = FakeCodec.initFake();
-    var sched = try ResScheduler.init(arena, gpa, std.testing.io, &engine, &codec, .{
+    var sched = try ResScheduler.init(arena, gpa, std.testing.io, &pool, &codec, .{
         .max_sessions = 12,
         .max_batch = 2, // << physical slots: width is stepped, breadth is held
         .max_seq = 64,
@@ -3749,11 +3745,11 @@ test "over-subscription: a ram budget of one blob parks a prefill, and the loop 
     // one blob. A rotation transiently needs two: `ensureResident` charges the
     // victim's new blob before the restored session's blob is dropped. So this
     // budget funds no swap at all, and a parked turn waits for a free slot.
-    var engine = try ResEngine.init(arena, gpa, &sessions, 3, @sizeOf(u32));
-    defer engine.deinit();
+    var pool = try ResPool.init(arena, gpa, &sessions, 3, @sizeOf(u32));
+    defer pool.deinit();
 
     var codec = FakeCodec.initFake();
-    var sched = try ResScheduler.init(arena, gpa, std.testing.io, &engine, &codec, .{
+    var sched = try ResScheduler.init(arena, gpa, std.testing.io, &pool, &codec, .{
         .max_sessions = 3,
         .max_batch = 2,
         .max_seq = 64,
@@ -3861,7 +3857,7 @@ test "prefix cache: a repeated system prompt restores with zero engine rows" {
     try std.testing.expectEqual(@as(u64, 0), fx.sched.prefix.disk_hits); // the RAM tier served it
     try std.testing.expectEqual(@as(u64, 1), fx.sched.prefix.cache.?.entries.items[0].hits);
     try std.testing.expectEqual(@as(u32, 1), fx.runner.restores);
-    try std.testing.expectEqual(@as(u32, 8), fx.engine.posOf(1)); // second engine session
+    try std.testing.expectEqual(@as(u32, 8), fx.pool.posOf(1)); // second engine session
     try std.testing.expectEqual(fx.runner.markers[0], fx.runner.markers[1]); // restored KV marker
 
     // Both sessions decode identically from the shared prefix.
@@ -4554,19 +4550,19 @@ test "append: a set past the room refuses whole, feeds no row, and keeps the car
     _ = try runTurn(&fx, 1, sid, "x", 2);
     const slot = &fx.sched.slots[0];
     try std.testing.expectEqual(@as(?u32, 2), slot.carry);
-    const pos = fx.engine.posOf(slot.engine_id);
+    const pos = fx.pool.posOf(slot.engine_id);
     const rows_before = fx.runner.rows_log_len;
 
     // The carry joins the first pair. 1 + 4 + 8 = 13 ids fit the 13
     // positions left, and one byte more does not.
-    try std.testing.expectEqual(@as(u32, 13), fx.engine.capacityRemaining(slot.engine_id));
+    try std.testing.expectEqual(@as(u32, 13), fx.pool.capacityRemaining(slot.engine_id));
     const refused = try fx.appendDrain(1, sid, &.{
         .{ .user = "abcd", .assistant = "" },
         .{ .user = "efgh", .assistant = "ijklm" },
     });
     try expectRefused(refused, .turn_too_long, "turn of 14 tokens, 13 positions left");
     try std.testing.expectEqual(rows_before, fx.runner.rows_log_len);
-    try std.testing.expectEqual(pos, fx.engine.posOf(slot.engine_id));
+    try std.testing.expectEqual(pos, fx.pool.posOf(slot.engine_id));
     try std.testing.expectEqual(@as(u32, 1), slot.turns_done);
     try std.testing.expectEqual(@as(?u32, 2), slot.carry);
     try std.testing.expectEqual(SlotState.idle, slot.state);
@@ -4649,10 +4645,10 @@ test "append: two frames end in the state of one frame, the multi-frame rule" {
             try std.testing.expectEqual(OutEvent.Body.appended, std.meta.activeTag(last));
             const got = last.appended.positions();
             try std.testing.expectEqual(pos, got[got.len - 1]);
-            try std.testing.expectEqual(pos, fx.engine.posOf(fx.sched.slots[0].engine_id));
+            try std.testing.expectEqual(pos, fx.pool.posOf(fx.sched.slots[0].engine_id));
         } else {
             try std.testing.expectEqual(protocol.ErrorCode.turn_too_long, last.err.code);
-            try std.testing.expectEqual(@as(u32, 1), fx.engine.posOf(fx.sched.slots[0].engine_id));
+            try std.testing.expectEqual(@as(u32, 1), fx.pool.posOf(fx.sched.slots[0].engine_id));
         }
 
         // Cases 3 and 4 hold one frame and two frames of the same pairs. The
@@ -4678,7 +4674,7 @@ test "append: a cancel during the prefill returns the slot idle with an err" {
     _ = fx.sched.tick(fx.sink);
     const slot = &fx.sched.slots[0];
     try std.testing.expectEqual(SlotState.prefill, slot.state);
-    const fed = fx.engine.posOf(slot.engine_id);
+    const fed = fx.pool.posOf(slot.engine_id);
     try std.testing.expect(fed > 1 and fed < 5);
 
     _ = fx.sched.handle(
@@ -4691,7 +4687,7 @@ test "append: a cancel during the prefill returns the slot idle with an err" {
     try std.testing.expectEqual(SlotState.idle, slot.state);
     try std.testing.expectEqual(@as(u32, 0), slot.turns_done);
     // The fed rows stay.
-    try std.testing.expectEqual(fed, fx.engine.posOf(slot.engine_id));
+    try std.testing.expectEqual(fed, fx.pool.posOf(slot.engine_id));
     for (fx.sink.seen()) |e| {
         try std.testing.expect(e.ev.body != .appended);
     }
@@ -4724,7 +4720,7 @@ test "append: the guards of a turn hold, and an append emits no token" {
     const before = fx.sink.n;
     try expectAppended(
         try fx.appendDrain(1, sid, &.{.{ .user = "b", .assistant = "c" }}),
-        &.{fx.engine.posOf(0)},
+        &.{fx.pool.posOf(0)},
     );
     try std.testing.expectEqual(before + 1, fx.sink.n);
 }
@@ -5588,7 +5584,7 @@ test "lease: an append finishes while detached, and the resume names the final p
     const slot = &fx.sched.slots[0];
     try std.testing.expectEqual(SlotState.idle, slot.state);
     try std.testing.expectEqual(@as(u32, 1), slot.turns_done);
-    try std.testing.expectEqual(@as(u32, 7), fx.engine.posOf(slot.engine_id));
+    try std.testing.expectEqual(@as(u32, 7), fx.pool.posOf(slot.engine_id));
 
     const r = try fx.sched.resumeLease(2, 5, tok(7), atMs(20), tok(8));
     try std.testing.expectEqual(Resumed{ .session_id = sid, .ready = true }, r);
@@ -5619,7 +5615,7 @@ test "lease: a resume during an append waits for idle and drops the events befor
         @as(?TestScheduler.ResumeWait, null),
         fx.sched.slots[0].resume_wait,
     );
-    try std.testing.expectEqual(@as(u32, 7), fx.engine.posOf(fx.sched.slots[0].engine_id));
+    try std.testing.expectEqual(@as(u32, 7), fx.pool.posOf(fx.sched.slots[0].engine_id));
 }
 
 /// A `resumed` reply to `conn` under `request_id` for session `sid` at
@@ -5738,7 +5734,7 @@ test "lease: a yield cancels an opening prefill in flight before it releases the
         SlotView{ .owner = .{ .attached = 2 }, .pid = 2, .token = null, .ttl = 0 },
         viewOf(slot),
     );
-    try std.testing.expectEqual(@as(u32, 0), fx.engine.posOf(slot.engine_id));
+    try std.testing.expectEqual(@as(u32, 0), fx.pool.posOf(slot.engine_id));
 }
 
 test "lease: an expiry at the tick head cancels an append prefill before the release" {
@@ -5866,7 +5862,7 @@ test "lease: the client waits for the resume, then generates on the new connecti
     fx.drain();
     try std.testing.expectEqual(seen_before + 1, fx.sink.n);
     try expectResumed(fx.sink.last(), 2, 5, sid, 7, 8);
-    try std.testing.expectEqual(@as(u32, 7), fx.engine.posOf(fx.sched.slots[0].engine_id));
+    try std.testing.expectEqual(@as(u32, 7), fx.pool.posOf(fx.sched.slots[0].engine_id));
     try fx.generate(2, sid, "x", 3);
     fx.drain();
     try std.testing.expectEqualSlices(
@@ -5903,7 +5899,7 @@ test "lease: a takeover mid-turn cuts the turn, keeps the carry, and the old tok
     // The done of the cut turn belonged to connection 1, so it goes. The
     // resume names the cut turn as the last request.
     try std.testing.expectEqual(seen_before + 1, fx.sink.n);
-    try expectResumed(fx.sink.last(), 2, 5, sid, fx.engine.posOf(fx.sched.slots[0].engine_id), 8);
+    try expectResumed(fx.sink.last(), 2, 5, sid, fx.pool.posOf(fx.sched.slots[0].engine_id), 8);
     try std.testing.expectEqual(
         protocol.FinishReason.cancelled,
         fx.sink.last().ev.body.resumed.last.?.finish,
@@ -6053,11 +6049,11 @@ test "lease: a token that a slot already holds is refused in every build mode" {
     );
 }
 
-/// `TestEngine` with a switch that refuses each create and clone, as a full pool or tiered KV can.
+/// `TestPool` with a switch that refuses each create and clone, as a full pool or tiered KV can.
 /// Two more switches fail `advance`: one for a call that carries a prefill chunk, one for a call
 /// of decode rows alone.
-const RefusingEngine = struct {
-    inner: TestEngine,
+const RefusingPool = struct {
+    inner: TestPool,
     refuse: bool = false,
     fail_with_feed: ?AdvanceFail = null,
     fail_decode_only: ?AdvanceFail = null,
@@ -6067,7 +6063,7 @@ const RefusingEngine = struct {
     pub const can_clone = true;
 
     pub fn create(
-        self: *RefusingEngine,
+        self: *RefusingPool,
         seed: u64,
         params: sampler.Params,
     ) error{NoFreeSession}!u32 {
@@ -6076,7 +6072,7 @@ const RefusingEngine = struct {
     }
 
     pub fn clone(
-        self: *RefusingEngine,
+        self: *RefusingPool,
         source: u32,
         seed: u64,
         params: sampler.Params,
@@ -6085,32 +6081,32 @@ const RefusingEngine = struct {
         return self.inner.clone(source, seed, params);
     }
 
-    pub fn destroy(self: *RefusingEngine, id: u32) void {
+    pub fn destroy(self: *RefusingPool, id: u32) void {
         self.inner.destroy(id);
     }
 
-    pub fn setParams(self: *RefusingEngine, id: u32, params: sampler.Params) void {
+    pub fn setParams(self: *RefusingPool, id: u32, params: sampler.Params) void {
         self.inner.setParams(id, params);
     }
 
-    pub fn reseed(self: *RefusingEngine, id: u32, seed: u64) void {
+    pub fn reseed(self: *RefusingPool, id: u32, seed: u64) void {
         self.inner.reseed(id, seed);
     }
 
-    pub fn overridePending(self: *RefusingEngine, id: u32, token: u32) void {
+    pub fn overridePending(self: *RefusingPool, id: u32, token: u32) void {
         self.inner.overridePending(id, token);
     }
 
-    pub fn posOf(self: *RefusingEngine, id: u32) u32 {
+    pub fn posOf(self: *RefusingPool, id: u32) u32 {
         return self.inner.posOf(id);
     }
 
-    pub fn capacityRemaining(self: *RefusingEngine, id: u32) u32 {
+    pub fn capacityRemaining(self: *RefusingPool, id: u32) u32 {
         return self.inner.capacityRemaining(id);
     }
 
     pub fn advance(
-        self: *RefusingEngine,
+        self: *RefusingPool,
         feed_chunk: ?session_mod.FeedChunk,
         ids: []const u32,
         out: []u32,
@@ -6127,12 +6123,12 @@ const RefusingEngine = struct {
     }
 };
 
-const RefusingScheduler = Scheduler(RefusingEngine, FakeCodec);
+const RefusingScheduler = Scheduler(RefusingPool, FakeCodec);
 
-/// A table of `n_slots` over the refusing engine, with resumption on and the clock at zero.
+/// A table of `n_slots` over the refusing pool, with resumption on and the clock at zero.
 const RefusingFixture = struct {
     arena_state: std.heap.ArenaAllocator,
-    engine: *RefusingEngine,
+    pool: *RefusingPool,
     sched: *RefusingScheduler,
     sink: *FakeSink,
 
@@ -6148,8 +6144,8 @@ const RefusingFixture = struct {
             .logits = try arena.alloc(f32, n_slots * test_vocab),
         };
         @memset(runner.logits, 0);
-        const engine = try arena.create(RefusingEngine);
-        engine.* = .{ .inner = try TestEngine.init(arena, runner) };
+        const pool = try arena.create(RefusingPool);
+        pool.* = .{ .inner = try TestPool.init(arena, runner) };
         const codec = try arena.create(FakeCodec);
         codec.* = FakeCodec.initFake();
         const sched = try arena.create(RefusingScheduler);
@@ -6157,7 +6153,7 @@ const RefusingFixture = struct {
             arena,
             std.testing.allocator,
             std.testing.io,
-            engine,
+            pool,
             codec,
             .{
                 .max_sessions = @intCast(n_slots),
@@ -6173,7 +6169,7 @@ const RefusingFixture = struct {
         sched.pinClock(atMs(0));
         const sink = try arena.create(FakeSink);
         sink.* = .{};
-        return .{ .arena_state = arena_state, .engine = engine, .sched = sched, .sink = sink };
+        return .{ .arena_state = arena_state, .pool = pool, .sched = sched, .sink = sink };
     }
 
     fn tearDown(self: *RefusingFixture) void {
@@ -6216,12 +6212,12 @@ test "park: decode rows alone that the engine parks report no work and change no
 
     const tokens_before = countTokens(fx.sink.seen(), sid);
     const events_before = fx.sink.n;
-    const pos_before = fx.engine.posOf(0);
+    const pos_before = fx.pool.posOf(0);
     try std.testing.expect(tokens_before >= 1 and tokens_before < 4);
 
     // The tiers refuse the decode call. Each tick parks and reports no work, so the engine loop
     // sleeps and does not spin.
-    fx.engine.fail_decode_only = .park;
+    fx.pool.fail_decode_only = .park;
     const parks_before = fx.sched.parks;
     for (0..3) |_| {
         try std.testing.expectEqual(Tick.idle, fx.sched.tick(fx.sink));
@@ -6229,10 +6225,10 @@ test "park: decode rows alone that the engine parks report no work and change no
 
     try std.testing.expectEqual(parks_before + 3, fx.sched.parks);
     try std.testing.expectEqual(events_before, fx.sink.n);
-    try std.testing.expectEqual(pos_before, fx.engine.posOf(0));
+    try std.testing.expectEqual(pos_before, fx.pool.posOf(0));
 
     // A later credit lets the same turn finish with the whole stream.
-    fx.engine.fail_decode_only = null;
+    fx.pool.fail_decode_only = null;
     var iters: u32 = 0;
     while (fx.sched.tick(fx.sink) != .idle) {
         iters += 1;
@@ -6255,16 +6251,16 @@ test "park: a parked prefill whose decode retry parks too reports no work" {
 
     const events_before = fx.sink.n;
     const parks_before = fx.sched.parks;
-    fx.engine.fail_with_feed = .park;
-    fx.engine.fail_decode_only = .park;
+    fx.pool.fail_with_feed = .park;
+    fx.pool.fail_decode_only = .park;
     try std.testing.expectEqual(Tick.idle, fx.sched.tick(fx.sink));
 
     // Both calls were refused and both are counted. Nothing reached a stream.
     try std.testing.expectEqual(parks_before + 2, fx.sched.parks);
     try std.testing.expectEqual(events_before, fx.sink.n);
 
-    fx.engine.fail_with_feed = null;
-    fx.engine.fail_decode_only = null;
+    fx.pool.fail_with_feed = null;
+    fx.pool.fail_decode_only = null;
     var iters: u32 = 0;
     while (fx.sched.tick(fx.sink) != .idle) {
         iters += 1;
@@ -6287,8 +6283,8 @@ test "park: a parked prefill whose decode retry fails otherwise fails only the d
     try std.testing.expectEqual(Tick.worked, fx.sched.tick(fx.sink)); // a decodes
     try parkGenerate(&fx, 2, sb, "xxxx", 6);
 
-    fx.engine.fail_with_feed = .park;
-    fx.engine.fail_decode_only = .other;
+    fx.pool.fail_with_feed = .park;
+    fx.pool.fail_decode_only = .other;
     try std.testing.expectEqual(Tick.worked, fx.sched.tick(fx.sink));
 
     // The decode row of a fails with an error event. The prefill of b stays parked.
@@ -6296,8 +6292,8 @@ test "park: a parked prefill whose decode retry fails otherwise fails only the d
     try std.testing.expectEqual(sa, last.ev.session_id);
     try std.testing.expectEqual(protocol.ErrorCode.internal, last.ev.body.err.code);
 
-    fx.engine.fail_with_feed = null;
-    fx.engine.fail_decode_only = null;
+    fx.pool.fail_with_feed = null;
+    fx.pool.fail_decode_only = null;
     var iters: u32 = 0;
     while (fx.sched.tick(fx.sink) != .idle) {
         iters += 1;
@@ -6322,7 +6318,7 @@ test "lease: an open that the engine refuses after a yield reports the lost sess
     _ = try fx.sched.keepLease(1, 1, 50, tok(7));
     fx.sched.detachConn(1, atMs(10));
 
-    fx.engine.refuse = true;
+    fx.pool.refuse = true;
     try fx.open(2);
     try std.testing.expectEqual(
         protocol.ErrorCode.sessions_exhausted,
@@ -6337,7 +6333,7 @@ test "lease: an open that the engine refuses after a yield reports the lost sess
     );
 
     // The refused open took no session id.
-    fx.engine.refuse = false;
+    fx.pool.refuse = false;
     try fx.open(2);
     try std.testing.expectEqual(@as(u32, 2), fx.sink.last().ev.session_id);
 }
@@ -6351,7 +6347,7 @@ test "lease: a clone that the engine refuses after a yield reports the lost sess
     _ = try fx.sched.keepLease(2, 1, 50, tok(7));
     fx.sched.detachConn(1, atMs(10));
 
-    fx.engine.refuse = true;
+    fx.pool.refuse = true;
     _ = fx.sched.handle(.{ .conn = 2, .request_id = 3, .session_id = 1, .body = .{
         .session_clone = .{ .sampling = protocol.Sampling.greedy },
     } }, fx.sink);
@@ -6467,7 +6463,7 @@ test "wire lease: keep, drop, resume, a replayed token, and an expired token" {
     try std.testing.expectEqual(sid, e.ev.session_id);
     const r = e.ev.body.resumed;
     try std.testing.expect(!std.mem.eql(u8, &kept, &r.token));
-    try std.testing.expectEqual(fx.engine.posOf(fx.sched.slots[0].engine_id), r.kv_pos);
+    try std.testing.expectEqual(fx.pool.posOf(fx.sched.slots[0].engine_id), r.kv_pos);
     try std.testing.expectEqual(@as(u32, 1), r.turns_done);
     try std.testing.expectEqual(
         protocol.LastDone{
@@ -6679,7 +6675,7 @@ test "per-turn sampling: only reseed restarts the stream, min_p and repetition l
     hot.temperature = 1;
     try generateSampled(&fx, sid, "x", 3, hot, false);
     fx.drain();
-    const moved = fx.engine.table[eid].rng.s;
+    const moved = fx.pool.table[eid].rng.s;
     try std.testing.expect(!std.meta.eql(std.Random.DefaultPrng.init(0).s, moved));
 
     // A greedy turn with seed 41 and no reseed bit draws nothing and keeps
@@ -6690,20 +6686,20 @@ test "per-turn sampling: only reseed restarts the stream, min_p and repetition l
     s.repetition_penalty = 1.5;
     try generateSampled(&fx, sid, "x", 2, s, false);
     fx.drain();
-    try std.testing.expectEqual(moved, fx.engine.table[eid].rng.s);
-    try std.testing.expectEqual(@as(f32, 0.25), fx.engine.table[eid].params.min_p);
-    try std.testing.expectEqual(@as(f32, 1.5), fx.engine.table[eid].params.repetition_penalty);
+    try std.testing.expectEqual(moved, fx.pool.table[eid].rng.s);
+    try std.testing.expectEqual(@as(f32, 0.25), fx.pool.table[eid].params.min_p);
+    try std.testing.expectEqual(@as(f32, 1.5), fx.pool.table[eid].params.repetition_penalty);
 
     // The same turn with the reseed bit restarts the stream at 41.
     try generateSampled(&fx, sid, "x", 2, s, true);
     fx.drain();
-    try std.testing.expectEqual(std.Random.DefaultPrng.init(41).s, fx.engine.table[eid].rng.s);
+    try std.testing.expectEqual(std.Random.DefaultPrng.init(41).s, fx.pool.table[eid].rng.s);
 
     // A turn with no sampling keeps the stream and the params.
     try generateWith(&fx, 1, sid, "x", 2, null, null, null);
     fx.drain();
-    try std.testing.expectEqual(std.Random.DefaultPrng.init(41).s, fx.engine.table[eid].rng.s);
-    try std.testing.expectEqual(@as(f32, 0.25), fx.engine.table[eid].params.min_p);
+    try std.testing.expectEqual(std.Random.DefaultPrng.init(41).s, fx.pool.table[eid].rng.s);
+    try std.testing.expectEqual(@as(f32, 0.25), fx.pool.table[eid].params.min_p);
 }
 
 test "per-turn sampling: a refused turn leaves the params and the stream of the session unchanged" {
@@ -6712,8 +6708,8 @@ test "per-turn sampling: a refused turn leaves the params and the stream of the 
 
     const sid = try fx.openSession(1, "");
     const eid = fx.sched.slots[0].engine_id;
-    const params = fx.engine.table[eid].params;
-    const rng = fx.engine.table[eid].rng.s;
+    const params = fx.pool.table[eid].params;
+    const rng = fx.pool.table[eid].rng.s;
     var s = protocol.Sampling.greedy;
     s.temperature = 0.5;
     s.seed = 99;
@@ -6721,15 +6717,15 @@ test "per-turn sampling: a refused turn leaves the params and the stream of the 
     // Nine tokens do not fit the window of eight.
     try generateSampled(&fx, sid, "xxxxxxxxx", 2, s, true);
     try std.testing.expectEqual(protocol.ErrorCode.turn_too_long, fx.sink.last().ev.body.err.code);
-    try std.testing.expectEqual(rng, fx.engine.table[eid].rng.s);
-    try std.testing.expectEqual(params.temperature, fx.engine.table[eid].params.temperature);
-    try std.testing.expectEqual(params.min_p, fx.engine.table[eid].params.min_p);
+    try std.testing.expectEqual(rng, fx.pool.table[eid].rng.s);
+    try std.testing.expectEqual(params.temperature, fx.pool.table[eid].params.temperature);
+    try std.testing.expectEqual(params.min_p, fx.pool.table[eid].params.min_p);
     // A frequency penalty refuses the turn before any change too.
     s.frequency_penalty = 0.5;
     try generateSampled(&fx, sid, "x", 2, s, true);
     try expectErr(fx.sink.last(), .forbidden, "frequency_penalty is not supported");
-    try std.testing.expectEqual(rng, fx.engine.table[eid].rng.s);
-    try std.testing.expectEqual(params.min_p, fx.engine.table[eid].params.min_p);
+    try std.testing.expectEqual(rng, fx.pool.table[eid].rng.s);
+    try std.testing.expectEqual(params.min_p, fx.pool.table[eid].params.min_p);
 }
 
 test "frequency penalty: a nonzero value fails the request, and the session lives" {

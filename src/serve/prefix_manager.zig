@@ -8,10 +8,10 @@
 //! `acceptToken`). This module keeps every engine call whose result only the cache consumes
 //! (`snapshotBytesFor`, `snapshotPrefix`, and `copyFinalLogits` travel with the insert body).
 //!
-//! Comptime. `PrefixManager` is a plain struct and not a generic over the engine. So the
-//! scheduler's `can_snapshot` keeps its single definition on the type that owns the Engine
-//! boundary. `insert` takes `engine: anytype`, and only a `comptime can_snapshot`-guarded call
-//! site instantiates it. So this module also compiles for an engine that cannot snapshot.
+//! Comptime. `PrefixManager` is a plain struct and not a generic over the session pool. So the
+//! scheduler's `can_snapshot` keeps its single definition on the type that owns the pool
+//! boundary. `insert` takes `pool: anytype`, and only a `comptime can_snapshot`-guarded call
+//! site instantiates it. So this module also compiles for a pool that cannot snapshot.
 //!
 //! Restore. An opening turn can restore its whole prompt, because it wants no logits. A generate
 //! turn whose whole prompt matches an entry with stored logits gets `ready`. A full-length entry
@@ -41,6 +41,7 @@ const std = @import("std");
 const Io = std.Io;
 const Allocator = std.mem.Allocator;
 const limits = @import("../core/limits.zig");
+const time = @import("../core/utils/time.zig");
 const protocol = @import("protocol.zig");
 const event = @import("event.zig");
 const prompt_cache_mod = @import("../runtime/prompt_cache.zig");
@@ -210,7 +211,7 @@ pub const PrefixManager = struct {
 
     /// Offer a completed position-zero prefix to the cache. It runs before the turn frees its
     /// tokens. An allocation or snapshot failure skips the insert.
-    pub fn insert(self: *PrefixManager, engine: anytype, c: Candidate) void {
+    pub fn insert(self: *PrefixManager, pool: anytype, c: Candidate) void {
         const cache = if (self.cache) |*p| p else return;
         const tokens = c.tokens;
         const n: u32 = @intCast(tokens.len);
@@ -220,18 +221,19 @@ pub const PrefixManager = struct {
         if (cache.lookup(key, tokens) != null) return;
 
         // Snapshot the slot.
-        const prefill_ns = nsBetween(c.t_turn_start, Io.Clock.Timestamp.now(self.io, .awake));
-        const bytes: usize = @intCast(engine.snapshotBytesFor(n));
+        const t_now = Io.Clock.Timestamp.now(self.io, .awake);
+        const prefill_ns = time.elapsedNsClamped(c.t_turn_start, t_now);
+        const bytes: usize = @intCast(pool.snapshotBytesFor(n));
         const buf = self.gpa.alloc(u8, bytes) catch return;
         defer self.gpa.free(buf);
 
         // Time the copy alone, because a hit never pays this transient allocation.
         const t_copy = Io.Clock.Timestamp.now(self.io, .awake);
-        engine.snapshotPrefix(c.engine_id, n, buf) catch |err| {
+        pool.snapshotPrefix(c.engine_id, n, buf) catch |err| {
             log.debug("prefix snapshot failed: session {d}: {t}", .{ c.proto_id, err });
             return;
         };
-        const restore_ns = nsBetween(t_copy, Io.Clock.Timestamp.now(self.io, .awake));
+        const restore_ns = time.elapsedNsClamped(t_copy, Io.Clock.Timestamp.now(self.io, .awake));
 
         // Copy the final logits of a generate turn.
         var logits: []const f32 = &[_]f32{};
@@ -243,7 +245,7 @@ pub const PrefixManager = struct {
         defer if (logits_buf.len > 0) self.gpa.free(logits_buf);
 
         if (logits_buf.len > 0) {
-            engine.copyFinalLogits(c.engine_id, logits_buf);
+            pool.copyFinalLogits(c.engine_id, logits_buf);
             logits = logits_buf;
         }
 
@@ -316,12 +318,3 @@ pub const PrefixManager = struct {
         }
     }
 };
-
-// -- helpers ----------------------------------------------------------------
-
-/// Whole nanoseconds for the prefix-cache admission gate, clamped at zero so
-/// a clock step never wraps the unsigned cost.
-fn nsBetween(t0: Io.Clock.Timestamp, t1: Io.Clock.Timestamp) u64 {
-    const ns: i64 = @intCast(t0.durationTo(t1).raw.toNanoseconds());
-    return if (ns > 0) @intCast(ns) else 0;
-}
