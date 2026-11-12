@@ -559,7 +559,7 @@ checks the thread counts.
 | region | One K or one V buffer of one layer, holding the KV rows of every slot. The device buffer limits apply to one region. |
 | KV row | The K or the V of one layer at one position, for every KV head. It is a different thing from a row of a step. |
 | budget | The bytes that a plan can spend: a VRAM budget, a RAM budget, or the default budget of one session. |
-| preflight | The check, before the first device allocation, that a plan fits the free VRAM. |
+| preflight | The check, before the first device allocation, that a plan fits the usable share of the free VRAM (`limits.vram_shares`). |
 | quote | The price of a placement in host RAM, checked before the runner allocates. |
 | blob | The RAM copy of the KV of a session that left its VRAM slot. It is the only copy of that session. |
 | ledger | The running total of blob bytes against the blob budget. |
@@ -787,11 +787,12 @@ that declares a RoPE scaling that the engine does not apply.
 
 ### The GPU checks
 
-A GPU build runs two checks on its plan before the first device allocation. Each
-check can shrink a default window. A named window that fails a check stops the
-runner, and the message names the largest window that fits. With `--vram-slots`, a
-named window is a cap instead: the plan takes the smaller of `--max-seq` and the
-window that the VRAM budget can hold.
+A GPU build checks its plan before the first device allocation. Two checks can
+shrink a default window. A GDN slab or an activation buffer past a device buffer
+limit stops the runner with `error.StepBufferPastDeviceLimit`. A named window
+that fails a check stops the runner, and the message names the largest window
+that fits. With `--vram-slots`, a named window is a cap instead: the plan takes
+the smaller of `--max-seq` and the window that the VRAM budget can hold.
 
 1. **The region check.** `vulkan_ctx.Context` reads three device limits at start:
    the storage-buffer range, the largest allocation, and the binding offset
@@ -802,11 +803,13 @@ window that the VRAM budget can hold.
 2. **The VRAM preflight.** A fused or hybrid runner adds up its plan: the weights,
    the KV, the recurrent state, the logits, and the scratch. The plan must fit the
    usable share of the free VRAM. `limits.vram_shares` holds one row for each
-   driver: 3/4 on a translation-layer Vulkan driver, a heuristic of the reference setup, and
-   7/8 on every other driver. On the whole-model fused path, a default window first
-   shrinks to the widest window that fits. A plan that still does not fit stops with
-   `error.VramBudgetExceeded`. The message names the needed, free, and usable bytes,
-   the largest window that fits, and the flags that lower the plan.
+   driver: 3/4 on the translation-layer driver of the reference setup, the one
+   driver id that `vulkan_ctx.driverRow` names, and 7/8 on every other driver. The
+   3/4 row is a heuristic of that setup. On the whole-model fused path, a default
+   window first shrinks to the widest window that fits. A plan that still does not
+   fit stops with `error.VramBudgetExceeded`. The message names the needed, free,
+   and usable bytes, the largest window that fits, and the flags that lower the
+   plan.
 
 The free VRAM comes from `VK_EXT_memory_budget`, because a desktop shares the card
 with other programs. Without that extension it is the heap size. The reserve holds
@@ -819,7 +822,7 @@ Some drivers report the minimum storage-buffer range of the Vulkan specification
 128 MiB, and still read past it correctly. `$ZIGFERENCER_VK_STORAGE_RANGE` then
 states the range that you checked, and `info` prints both values.
 
-**The reference setup.** A little bit of history history on this topic. 
+**The reference setup.** A little history on this topic.
 The GPU path grew on one desktop card, through WSL2 (experimental reasons). 
 Its Vulkan driver translates every call to the graphics API of Windows. 
 That driver reports the 128 MiB range, which shrinks the
@@ -1109,8 +1112,14 @@ backends the greedy tokens are equal. Section 11 names the tests that check it.
 - **Assertions.** The core asserts its preconditions. `ReleaseSafe` keeps every
   assertion, and `make test` builds `ReleaseSafe`. `ReleaseFast` removes them, so a
   measured binary runs without them. Input from outside the process (a model file,
-  a wire frame, a flag) never depends on an assertion. It returns a typed error in
-  every build mode.
+  a wire frame, a flag) returns a typed error in every build mode, with one stated
+  limit: weight values. For a model file, `checkWeights`
+  (`runtime/weight_check.zig`) checks the shape of every weight that a runner reads
+  and the f32 dtype of each vector, and `linear_dispatch.requireWeights` refuses a
+  matrix dtype that no kernel reads. Both run before a runner reads a weight. No
+  check scans weight values. A NaN or an infinite weight that a CPU kernel reads
+  stops a `ReleaseSafe` build at an assertion. In every other case the value
+  reaches the logits, and the sampler returns the error `NonFiniteLogits`.
 - **The external reference** is the f32 path of llama.cpp on the same model file and
   prompt. Bit parity with other engines is not a goal, but helps.
 

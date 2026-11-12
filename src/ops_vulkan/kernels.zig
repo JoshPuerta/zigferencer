@@ -1,5 +1,5 @@
 //! Compute-kernel wrappers for the Vulkan op backend, one struct per shader. This file is the
-//! table of contents: it re-exports the public names of the files in `kernels/`.
+//! table of contents: it re-exports the names of `kernels/` that callers outside it use.
 //!
 //! Comptime. A build gate refuses non-Vulkan builds.
 //!

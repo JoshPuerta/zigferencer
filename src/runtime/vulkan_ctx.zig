@@ -714,7 +714,7 @@ pub fn pickHostType(mem_props: vk.PhysicalDeviceMemoryProperties, type_bits: u32
 
 // -- helpers ----------------------------------------------------------------
 
-/// True when a device reports Vulkan 1.3 or later, where `maxBufferSize` is core.
+/// True when a device reports Vulkan 1.2 or later, where `VK_KHR_driver_properties` is core.
 fn apiAtLeast12(api_version: u32) bool {
     const v: vk.Version = @bitCast(api_version);
     return v.major > 1 or (v.major == 1 and v.minor >= 2);
@@ -751,6 +751,7 @@ fn driverRow(id: vk.DriverId) limits.Driver {
     };
 }
 
+/// True when a device reports Vulkan 1.3 or later, where `maxBufferSize` is core.
 fn apiAtLeast13(api_version: u32) bool {
     const v: vk.Version = @bitCast(api_version);
     return v.major > 1 or (v.major == 1 and v.minor >= 3);

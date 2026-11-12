@@ -2,9 +2,10 @@
 //! check, each index that a runner computes from the card lies inside the tensor it addresses, so
 //! the index asserts of the kernels hold for every loaded model.
 //!
-//! Values. The check reads no weight value. A NaN or a +inf weight passes it, and the value asserts
-//! of the kernels are checks of a safety build only. A release build carries the value to the
-//! logits, and the sampler refuses the row with `error.NonFiniteLogits`.
+//! Values. The check reads no weight value. A NaN or a +inf weight passes it. The value asserts
+//! of the CPU kernels are checks of a safety build only. A release build, and a GPU runner in any
+//! build, carry the value to the logits, and the sampler refuses the row with
+//! `error.NonFiniteLogits`.
 //!
 //! Rules. The layer file of the family names each layer weight (`tensorName`) and the dims the card
 //! requires of it (`weightDims`). A weight with a second dim of 0 is a vector. Every layer weight
@@ -16,9 +17,9 @@
 //! Comptime. `checkWeights` takes the family at comptime, so each weight name format is a comptime
 //! string, as `tensor_lookup.roleName` needs.
 //!
-//! Refusals. A refusal logs the tensor name, the found shape, and the required shape once, and
-//! returns a typed `Error`. A test of a refusal logs at `debug`, because the test runner fails a
-//! test that logs an error.
+//! Refusals. A refusal logs one line: the two architectures, or the tensor name with its found
+//! and required shape or its dtype. It returns a typed `Error`. A test of a refusal logs at
+//! `debug`, because the test runner fails a test that logs an error.
 
 const std = @import("std");
 const builtin = @import("builtin");

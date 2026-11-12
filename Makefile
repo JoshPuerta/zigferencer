@@ -1,8 +1,8 @@
 # zigferencer: short names for the common flows, and the one entry for CI.
 #
-# `zig build` is the build system of record. A target is if:
-# it joins commands, it fixes a default that a bare `zig build` gets wrong (Debug in a measurement),
-# or it is the documented entry of a flow. make echoes each command before it runs, so you can copy
+# `zig build` is the build system of record. A target exists for one of three reasons: it joins
+# commands, it fixes a default that a bare `zig build` gets wrong (Debug in a measurement), or it is
+# the documented entry of a flow. make echoes each command before it runs, so you can copy
 # the exact `zig build` or `zigferencer` line. `make help` lists the targets and the variables.
 #
 # ARGS is the one way to pass arguments. It holds the words after the binary or the script name.

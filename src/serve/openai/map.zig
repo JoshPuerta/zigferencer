@@ -10,11 +10,12 @@
 //!
 //! Parse. `parseChatRequest` rejects the input the server cannot answer correctly, such as
 //! `n > 1`, a sampling field out of its range, or a frequency penalty. It ignores the other
-//! fields it does not support (tools, logprobs), so a generic OpenAI client works, and it logs each
-//! ignored name once per process. The `model` string passes through for the shell to check. A
-//! known field with a value of the wrong type is `error.BadField`, and `diag` names it. Each
-//! sampling guard reads as the range it accepts, so a NaN fails it. The ranges are the binary
-//! wire guards, so the scheduler accepts every value that passes.
+//! fields it does not support (tools, logprobs), so a generic OpenAI client works. It logs each of
+//! the first `UnknownFields.table_cap` ignored names once per process. The `model` string passes
+//! through for the shell to check. A known field with a value of the wrong type is
+//! `error.BadField`, and `diag` names it. Each sampling guard reads as the range it accepts, so a
+//! NaN fails it. The ranges are the binary wire guards, so the scheduler accepts every value that
+//! passes.
 //!
 //! Thinking. A budget of 0 turns thinking off, the vLLM rule, so it wins over `enable_thinking`.
 //! A model with no think tags accepts only the closed modes, the rule of the binary wire. A
@@ -432,8 +433,8 @@ pub fn errorObject(e: HttpError) types.ErrorObject {
     } };
 }
 
-/// Map a rejection to its OpenAI HTTP error. Every rejection here is a client
-/// error (4xx). The shell raises the `internal` 5xx on an engine fault.
+/// Map a rejection to its OpenAI HTTP error. A malformed request is a client error (4xx), and an
+/// allocation failure is a 500. The shell raises the `internal` 5xx on an engine fault.
 /// `diag` is the detail that `parseChatRequest` gives with the error.
 pub fn reqErrorToHttp(e: ReqError, diag: Diag) HttpError {
     // Check that the diagnostic matches the error.

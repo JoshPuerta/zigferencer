@@ -37,6 +37,9 @@
 //! one chunk, and the stage at the refused window bounds the stage at any narrower one. So the
 //! widest w with P * w + F within the usable RAM is floor((usable - F) / P), and no search is
 //! needed.
+//!
+//! Tests. The tests stay in this file. They read private declarations of the planner. A separate
+//! test file needs each of those declarations public.
 
 const std = @import("std");
 const dtype = @import("dtype.zig");

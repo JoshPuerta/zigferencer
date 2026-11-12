@@ -22,9 +22,9 @@
 //! Threads.
 //!   - The acceptor calls `claim`, `nextId`, `open`, and `abandon`.
 //!   - A connection task calls `exitTask`, and `idOf` for its own slot.
-//!   - The engine thread calls `find` and `release` while it runs. At teardown, after the acceptor
-//!     has stopped, it calls `stateOf` and `idOf` for the slots that still have a task, and
-//!     `reset` after those tasks exit.
+//!   - The engine thread calls `find`, `release`, `stateOf`, and `idOf` while it runs. At
+//!     teardown, after the acceptor has stopped, it calls `stateOf` and `idOf` for the slots that
+//!     still have a task, and `reset` after those tasks exit.
 //!
 //! Rules. These rules keep the engine away from a slot that the acceptor writes.
 //!   1. The acceptor writes a slot (its id, its queue) only in `free` or `reclaimable`, and in
@@ -181,8 +181,9 @@ pub const ConnSlots = struct {
         return true;
     }
 
-    /// The connection id of a slot. A task calls it for its own slot (`connId`, `taskExit`), and
-    /// the engine thread calls it in `beginClose` at teardown for a slot that still has a task.
+    /// The connection id of a slot. A task calls it for its own slot (`connId`, `taskExit`). The
+    /// engine thread calls it for each `live` slot when it counts sessions, and in `beginClose` at
+    /// teardown for a slot that still has a task.
     pub fn idOf(self: *const ConnSlots, index: u32) u32 {
         const id = self.slots[index].id.load(.monotonic);
         assert(id != 0);

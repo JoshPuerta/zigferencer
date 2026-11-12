@@ -1,10 +1,11 @@
 //! Role. The dispatch gate of the fused kernels. A fused kernel dispatches one workgroup per head
-//! on one grid axis, so a head count of the card is a workgroup count. A count past the device
-//! limit fails the dispatch, so the fused runner refuses it before the first allocation.
+//! on one grid axis, so a head count of the card is a workgroup count. A count past
+//! `limits.max_workgroups` can fail the dispatch, so the fused runner refuses it before the first
+//! allocation.
 //!
-//! Limit. The runner holds no queried `maxComputeWorkGroupCount`, so the gate reads
-//! `limits.max_workgroups`, the count that Vulkan guarantees on every axis. The attention kernels
-//! assert against the same constant.
+//! Limit. `vulkan_ctx.Context.init` refuses a device that states less than `limits.max_workgroups`
+//! on an axis, so the gate reads the constant and needs no device. The constant is the count that
+//! Vulkan guarantees on every axis. The attention kernels assert against the same constant.
 //!
 //! This file touches no device, so a CPU test proves each refusal with an in-memory card.
 
@@ -39,7 +40,8 @@ pub fn requireHeads(card: *const loader.ModelCard) Error!void {
         if (h.count <= limits.max_workgroups) continue;
 
         const format = "The model has {d} {s}. A fused kernel dispatches one workgroup per " ++
-            "head, and the device takes {d} on one axis. Run this model on a CPU build";
+            "head, and the engine takes at most {d}, the Vulkan minimum, on one axis. " ++
+            "Run this model on a CPU build";
         const args = .{ h.count, h.name, limits.max_workgroups };
         switch (refusal_level) {
             .err => log.err(format, args),

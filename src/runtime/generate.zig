@@ -174,8 +174,8 @@ fn nsBetween(t0: Io.Clock.Timestamp, t1: Io.Clock.Timestamp) u64 {
 /// logit ends the turn with an error, because argmax over it names no real token.
 fn timedGreedy(logits: []const f32, io: Io, stat: *step_stats.Stat) sampler.Error!u32 {
     sampler.checkLogits(logits) catch |err| {
-        log.err("the logits of a step hold a NaN, a +inf, or no finite value, " ++
-            "so a model weight holds a non-finite value", .{});
+        log.err("the logits of a step hold a NaN, a +inf, or no finite value. " ++
+            "A model weight can hold a non-finite value", .{});
         return err;
     };
 

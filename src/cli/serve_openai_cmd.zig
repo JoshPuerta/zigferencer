@@ -1,7 +1,7 @@
 //! `zigferencer serve-openai <pub_name>` is the OpenAI-compatible HTTP frontend. It parses the
 //! flags and hands an `OpenAiLauncher` to `serve_boot.buildAndServe`, so it batches requests over
-//! the scheduler of `serve` on every backend. It serves on `std.http.Server`, which adds no
-//! dependency. stdout holds only the READY line.
+//! the scheduler of `serve` on every backend but the per-op `vulkan` one. It serves on
+//! `std.http.Server`, which adds no dependency. stdout holds only the READY line.
 //!
 //! Comptime. The launcher is generic over the engine type, so every backend shares one body.
 
@@ -98,7 +98,8 @@ const Flags = struct {
         \\  zigferencer serve-openai SmolLM2-135M-Instruct-Q8_0 --port 8080
         \\  curl localhost:8080/v1/models
         \\
-        \\Batched over the same scheduler as `serve`. Runs on every backend.
+        \\Batched over the same scheduler as `serve`. Runs on every backend but
+        \\the per-op `vulkan` one.
         \\
         ,
     };

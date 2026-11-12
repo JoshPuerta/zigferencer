@@ -25,10 +25,10 @@
 //! engine handles the requests in order, so the reply that a request gets while the engine
 //! handles it is in the out-queue before `conn_closed`. Then the engine closes the out-queue,
 //! sweeps the sessions of the connection, and releases the slot. The sweep ends each turn in
-//! flight, so a client that closes its send side ends its turns. A writer task drains the queue,
-//! flushes, and exits. A writer that stops early closes the queue, so a reader that waits on a
-//! full queue wakes. The slot returns to the acceptor after the release and the last task exit,
-//! in either order.
+//! flight. So a binary client that closes its send side ends its turns. A writer task drains the
+//! queue, flushes, and exits. A writer that stops early closes the queue, so a reader that waits
+//! on a full queue wakes. The slot returns to the acceptor after the release and the last task
+//! exit, in either order.
 //!
 //! Idle. A binary reader closes a connection that holds no session and no request in the engine
 //! after one `--io-timeout` with no frame. `sessions` and `requests_open` of a `Conn` tell it: the
@@ -384,8 +384,9 @@ pub fn ServeEngine(comptime Engine: type, comptime CodecT: type, comptime Adapte
             return self.slots.idOf(conn.index);
         }
 
-        /// Idempotent: exactly one close reaches the queue. The draining task then drains what is
-        /// buffered, flushes, shuts the socket down, and exits.
+        /// Idempotent: exactly one close reaches the queue. A binary writer then drains what is
+        /// buffered, flushes, shuts the socket down, and exits. The HTTP task ends its turn with
+        /// `error.ConnClosed`.
         pub fn closeOutput(self: *Self, conn: *Conn) void {
             if (conn.out_closed.swap(true, .acq_rel)) return;
             conn.out_q.close(self.io);

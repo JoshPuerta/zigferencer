@@ -790,7 +790,6 @@ const CacheModel = struct {
 
 // -- api --------------------------------------------------------------------
 
-/// Apply the default to a raw env value. The CLI reads the variable once at startup.
 /// Parse the bytes of one `.zkv` file of the namespace `model_fp`. The file is input, so every size
 /// sum is checked and every view lies inside `bytes`.
 pub fn parseImage(bytes: []const u8, model_fp: u64) ImageError!Image {
@@ -864,6 +863,7 @@ pub fn checkSizes(
     return error.SnapshotMismatch;
 }
 
+/// Apply the default to a raw env value. The CLI reads the variable once at startup.
 pub fn resolveCacheDir(env_value: ?[]const u8) []const u8 {
     const v = env_value orelse return default_cache_dir;
     return if (v.len == 0) default_cache_dir else v;

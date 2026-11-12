@@ -9,7 +9,7 @@ plain slice goes in, a caller-owned `[]f32` comes out, and no device handle esca
 
 | File | Holds |
 | --- | --- |
-| `kernels.zig` | The table of contents of `kernels/`: it re-exports each public name. |
+| `kernels.zig` | The table of contents of `kernels/`: it re-exports the names that callers outside `kernels/` use. |
 | `kernels/spirv.zig` | The SPIR-V blob of each shader, and `spv_names`. |
 | `kernels/pipeline.zig` | `Pipeline`, and the descriptor and command-buffer helpers. |
 | `kernels/memory.zig` | `HostBuffer`, `DeviceBuffer`, `KvStore`, and `VramArena`. |

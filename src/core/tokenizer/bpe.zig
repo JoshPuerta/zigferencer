@@ -19,7 +19,8 @@
 //! Pre-split path. A non-default tokenizer (llama3, qwen, smollm) splits the text on a GPT-2-family
 //! regex before BPE, as llama.cpp does, so merges never cross a pre-token boundary. For example,
 //! llama3 splits "2147" into "214" and "7" (digit runs of 1-3). The default path BPE-merges the
-//! whole inter-special span, and it stays byte-identical because `encodeAlloc` branches first.
+//! whole inter-special span, and it stays byte-identical because `encodePromptAlloc` branches
+//! first.
 //! `preTokenLen` dispatches the per-family regex: `preSplitLlama` for llama3 and qwen,
 //! `preSplitGpt2` for smollm. `ignore_merges` (llama3 only) emits a whole pre-token directly when
 //! it is a vocab token. A special token is extracted before the regex runs, and `capAtSpecial`

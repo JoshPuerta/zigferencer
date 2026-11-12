@@ -481,8 +481,8 @@ pub fn Sessions(comptime RunnerT: type) type {
             // step. The scheduler then fails the turns of the call.
             for (0..base + ids.len) |row| {
                 sampler.checkLogits(self.runner.logits[row * vocab ..][0..vocab]) catch |err| {
-                    log.err("the logits of a step hold a NaN, a +inf, or no finite value, " ++
-                        "so a model weight holds a non-finite value", .{});
+                    log.err("the logits of a step hold a NaN, a +inf, or no finite value. " ++
+                        "A model weight can hold a non-finite value", .{});
                     return err;
                 };
             }

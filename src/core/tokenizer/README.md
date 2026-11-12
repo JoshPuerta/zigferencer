@@ -67,8 +67,9 @@ Decode walks each token codepoint by codepoint through `codepoint_to_byte`.
 - A byte whose GPT-2 byte-level character is absent from the vocabulary raises
   `error.UntokenizableByte`. The `no_token` sentinel marks that absence, so the encoder never
   returns a wrong id in silence.
-- `vocab` pair-validates across the parser boundary. It asserts that the token table and the
-  token-type table have equal length. A comptime check confirms that the GPT-2 table produces
+- `vocab` checks the tokenizer values across the parser boundary. It refuses token and token-type
+  tables of different lengths, an empty token table, and a BOS or EOS id past the table, with
+  `error.BadTokenizerValue`. A comptime check confirms that the GPT-2 table produces
   exactly 68 escape codepoints.
 - `decodeAlloc(vocab, encodeAlloc(vocab, s, ...))` reproduces `s` for simple inputs. That round trip
   is the invariant every pre-split path must preserve.

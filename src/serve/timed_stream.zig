@@ -15,8 +15,11 @@
 //! Platforms. Linux has the deadline, the probe, and the keepalive. The read waits in `poll`, and
 //! the write uses a send that does not block, because a blocking send on a full buffer waits with
 //! no bound. Std `Io.Threaded` reports `EAGAIN` from its own socket read as a bug, so a socket
-//! receive timeout is no option. On the other platforms the reader and the writer call the std
-//! socket path with no deadline, the probe reports no hang-up, and the keepalive does nothing.
+//! receive timeout is no option. The drain of input (`endOutput`, `dropArrived`, `lingerOutput`)
+//! and the `sendOnce` that does not wait also exist on Linux only. On the other platforms the
+//! reader and the writer call the std socket path with no deadline, the probe reports no hang-up,
+//! and the keepalive does nothing. These platforms drop no input in the drain functions, and
+//! `sendOnce` is the blocking std write.
 //!
 //! Threads. A reader or a writer belongs to one connection task. The value must not move after
 //! `init`, because the interface finds its parent by address.

@@ -6,7 +6,7 @@ in Zig 0.16. It reads a model file in the GGUF format and runs the model, with s
 One of the main goals of this project is to provide a sandbox to tinker with small models and kernels implemented on
 non-typical hardware, using Zig. Don't expect a production-grade inference engine (not because of Zig, but due to the scope).
 Regarding development, AI assistance was and is heavily used. Most decisions came from experiments and iterations,
-but each relevant aspect was agreed, so in case of complain, blame the author and not the tool.
+but each relevant aspect was agreed, so in case of a complaint, blame the author and not the tool.
 
 - **Models:** the Llama 3 family and the Qwen3.5 hybrid family (not all quantizations, check registered models with `list`)
 - **Hardware:** x86_64 CPUs, with scalar and AVX2 paths, and GPUs through Vulkan.
@@ -33,7 +33,7 @@ backend:
 | --- | --- | --- |
 | `naive` | CPU | Scalar code. It is the slowest backend, and the reference that every other backend must match. |
 | `simd`, `simd_pf` | CPU | AVX2 vector code. `simd_pf` adds software prefetch. It is the default on a CPU with AVX2 and FMA. |
-| `vulkan` | GPU | One GPU dispatch per operation. It is a correctness reference, not focusing in performance (dispatch per op is costly). |
+| `vulkan` | GPU | One GPU dispatch per operation. It is a correctness reference and does not target performance: one dispatch per operation is costly. |
 | `vulkan_fused` | GPU | The whole model step in one GPU submission. It is the fast GPU path. `--gpu-layers` can also split the layers between the CPU and the GPU. |
 
 The engine is also a Zig module. A dependent package reads it with `dep.module("zigferencer")`,
@@ -44,9 +44,10 @@ and its API can change in any release.
 The project is tested on Linux x86_64 with Ubuntu 24.04. The CPU build also
 compiles for Windows and macOS, but these platforms are not tested yet.
 
-The CPU build needs only Zig 0.16.0 on `PATH`. It uses only
-the Zig standard library and links no libc, so the binary is static and runs on any
-x86_64 Linux. By default the build targets every feature of the CPU that builds it.
+The CPU build needs only Zig 0.16.0 on `PATH`. The CPU binary uses only the Zig standard
+library, links no libc, and is static. By default the build targets the CPU that builds it, so the
+binary can use instructions that an older CPU lacks. `-Dcpu=x86_64_v3` gives a binary that runs on
+any x86_64 CPU of that level.
 
 **`fetch`** downloads over HTTPS from huggingface, with the TLS client of the
 Zig standard library. It needs:

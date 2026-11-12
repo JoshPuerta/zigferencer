@@ -172,7 +172,8 @@ pub const WeightMemory = struct {
         self.quants.packing.assertFull();
 
         // Each tensor view pads at most the offset alignment (256 bytes by the Vulkan limits), so
-        // the padding stays under 1 MiB at `limits.max_layers`, inside the 1/8 preflight reserve.
+        // the padding stays under 1 MiB at `limits.max_layers`, inside the preflight reserve of
+        // every row of `limits.vram_shares`.
         assert(self.viewBytes() <= priced);
         assert(self.heldBytes() <= priced + self.paddingBound());
     }

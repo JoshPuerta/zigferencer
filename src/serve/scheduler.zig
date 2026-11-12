@@ -95,6 +95,9 @@
 //! or a test fake). The scheduler calls only its composed `advance`. `CodecT` is the text-to-token
 //! boundary. `sink` is any value with `emit(conn: u32, ev: OutEvent) bool` and
 //! `disconnect(conn: u32) void`.
+//!
+//! Tests. The tests stay in this file. They read private declarations of the state machine. A
+//! separate test file needs each of those declarations public.
 
 const std = @import("std");
 const Io = std.Io;

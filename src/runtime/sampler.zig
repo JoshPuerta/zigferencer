@@ -50,11 +50,11 @@
 //! mass. The mass above `skip` therefore passes the target with room, so the cut lies above
 //! `skip`, and a skipped weight never survives.
 //!
-//! Non-finite logits. A NaN or a +inf weight in a model file reaches the logits, and the loader
-//! cannot refuse it without a scan of every weight. `sample` therefore refuses a row with a NaN, a
-//! +inf, or no finite logit, with `error.NonFiniteLogits`, before any other read. A -inf logit is a
-//! masked id and stays valid. After the check, the row maximum is finite, so the asserts on the
-//! weight sums hold.
+//! Non-finite logits. A NaN or a +inf weight in a model file can reach the logits: in a release
+//! build, or through a GPU kernel. The loader cannot refuse it without a scan of every weight.
+//! `sample` therefore refuses a row with a NaN, a +inf, or no finite logit, with
+//! `error.NonFiniteLogits`, before any other read. A -inf logit is a masked id and stays valid.
+//! After the check, the row maximum is finite, so the asserts on the weight sums hold.
 //!
 //! Pool selection. `samplePool` stays `noinline`. Its selection loop is branchy, and inlined into a
 //! caller it measured 107 us or 155 us per Qwen row with the caller layout alone changed. Out of
@@ -95,10 +95,11 @@ comptime {
 
 // -- types ------------------------------------------------------------------
 
-/// Per-session sampling settings. The zero value is greedy decoding, so the
-/// default keeps every determinism gate.
+/// The refusal of a logits row that holds a NaN, a +inf, or no finite logit.
 pub const Error = error{NonFiniteLogits};
 
+/// Per-session sampling settings. The zero value is greedy decoding, so the
+/// default keeps every determinism gate.
 pub const Params = struct {
     /// 0 = greedy (argmax, no RNG draw). Higher flattens.
     temperature: f32 = 0,

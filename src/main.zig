@@ -233,6 +233,8 @@ fn isUserError(err: anyerror) bool {
         loader.LoadError.NotEnoughBytes,
         loader.LoadError.UnsupportedRopeScaling,
         // Parse failures: the loader or `inspect` logged the file and the fault.
+        parser.Error.BadMagic,
+        parser.Error.UnsupportedVersion,
         parser.Error.Truncated,
         parser.Error.BadValueType,
         parser.Error.NestedArray,

@@ -9,9 +9,9 @@
 //! completeness: every architecture key resolves, the dtype and shape make sense, and the engine
 //! bounds in `limits.zig` hold. Neither side trusts the other.
 //!
-//! Refusals. A refusal of a file value logs once with the file name and the tensor name, and
-//! returns a typed `Error`. A test of a refusal logs at `debug`, because the test runner fails a
-//! test that logs an error.
+//! Refusals. A refusal of a file value logs one line with the file name and the key, the card
+//! value, or the tensor that it refuses, and returns a typed `Error`. A test of a refusal logs at
+//! `debug`, because the test runner fails a test that logs an error.
 //!
 //! Alignment. The kernels view tensor data in place. A scalar dtype needs its element width as the
 //! address alignment, and a quant block type needs none. The parser proves only the offset a
@@ -164,7 +164,8 @@ pub const LoadOptions = struct {
 /// One dimension of the model card, named by its key after the arch prefix.
 const Dim = struct { key: []const u8, value: u32 };
 
-/// The KV reads of one card. Each refusal logs the file name and the key once.
+/// The KV reads of one card. Each refusal logs one line with the file name, and the key or the
+/// value that it refuses.
 const Keys = struct {
     parsed: parser.Parsed,
     file: []const u8,

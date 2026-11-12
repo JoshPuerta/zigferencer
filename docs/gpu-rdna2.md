@@ -199,7 +199,8 @@ How the kernels use this:
   output row. Lane `L` reads the quant blocks `L`, `L + 32`, `L + 64`, and so on, so
   the lanes of the wave read adjacent blocks. Lane 0 then adds the 32 partial sums
   in LDS. Vulkan guarantees only 65535 workgroups on each grid axis, and an lm_head
-  has up to 248320 outputs. So the outputs past `limits.reduce_grid_x` (32768) fold
+  of a registered model has up to 248320 outputs. The loader takes up to
+  `limits.max_vocab` (262144). So the outputs past `limits.reduce_grid_x` (32768) fold
   onto the y axis of the grid.
 - Split attention loads K in 16-byte vectors, eight loads for each 128-byte line.
 - One counter-example stays on purpose. The resident decode attention gives each

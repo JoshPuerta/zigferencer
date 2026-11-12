@@ -208,8 +208,8 @@ pub const trace_spans_env = "ZIGFERENCER_TRACE_SPANS";
 pub const max_logical_sessions: u32 = 128;
 
 /// Ceiling on live serve connections, the clients one server holds at once. A binary connection
-/// costs two worker threads. The slot table holds two slots per allowed connection, and each slot
-/// holds one queue of 256 events and, on the binary wire, one payload buffer of 64 KiB.
+/// costs two worker threads. The slot table holds two slots per allowed connection. Each slot holds
+/// one queue of 256 events and, on the binary wire, one payload buffer of 20 bytes plus 64 KiB.
 /// `cli/boot/serve_checks.zig` refuses a count past it.
 pub const max_connections: u32 = 64;
 
@@ -273,7 +273,8 @@ pub const close_drain_bytes: usize = openai_max_header_bytes + openai_max_reques
     openai_max_chunk_overhead_bytes;
 /// The longest wait for the input of a refused HTTP request to end. The value follows the nginx
 /// default `lingering_timeout` of 5 seconds, its wait for more input in a lingering close. Here
-/// it bounds the whole drain, so a refused client holds its slot at most this long.
+/// it bounds the whole drain. The error reply before the drain has its own `--io-timeout`
+/// deadline per write.
 pub const close_linger_ms: u32 = 5_000;
 /// The most messages in one rendered conversation. A render holds one plain range per message.
 pub const max_chat_messages: usize = 64;
@@ -351,9 +352,10 @@ pub const prompt_cache_disk_default: u64 = 16 << 30;
 /// plan omits: the upload stage, the alignment padding of the weight arenas, and driver overhead.
 pub const vram_share_default: VramShare = .{ .num = 7, .den = 8 };
 
-/// Usable share on a translation-layer Vulkan driver. This row is a heuristic from one measured
-/// setup: a plan under the default line lost the device there during the weight upload, and a
-/// smaller plan ran. Every other driver keeps the default row.
+/// Usable share on the driver that `vulkan_ctx.driverRow` maps to this row, the translation-layer
+/// driver of the reference setup. This row is a heuristic from one measured setup: a plan under
+/// the default line lost the device there during the weight upload, and a smaller plan ran. Every
+/// other driver keeps the default row.
 pub const vram_share_vulkan_on_d3d12: VramShare = .{ .num = 3, .den = 4 };
 
 /// The usable share of each driver. The preflight refuses a plan that cannot fit under this line.

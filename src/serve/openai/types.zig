@@ -4,9 +4,9 @@
 //!
 //! Parse. Every optional field has a default, so a minimal request parses. The parse drops
 //! unknown fields (`ParseOptions.ignore_unknown_fields`), so a full OpenAI client with tools still
-//! round-trips. The map layer logs each unknown field name once per process. A field that takes
-//! more than one JSON form (`content`, `stop`) parses as a `std.json.Value`, and the map layer
-//! checks the form.
+//! round-trips. The map layer logs each of the first `UnknownFields.table_cap` unknown field names
+//! once per process. A field that takes more than one JSON form (`content`, `stop`) parses as a
+//! `std.json.Value`, and the map layer checks the form.
 //!
 //! Sampling. Every sampling field is a named field here, so no sampling value drops in silence.
 //!

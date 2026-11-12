@@ -293,8 +293,9 @@ fn HttpTasks(comptime Eng: type) type {
 
             var server = http.Server.init(&sr.interface, &sw.interface);
             // After a refusal the client can still be sending, so the task drops its input for a
-            // short wait before the close. After any other end, only a pipelined request can be
-            // unread. That end sends no shutdown, so the end of stream comes with the close in
+            // short wait before the close. After any other end, input can stay unread: a
+            // pipelined request, or the rest of a head or a body after a failed read or a failed
+            // allocation. That end sends no shutdown, so the end of stream comes with the close in
             // `taskExit`, after the slot leaves `live`, and a client can connect again at once.
             switch (serveRequests(engine, c, &server)) {
                 .refused => {

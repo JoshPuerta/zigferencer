@@ -94,8 +94,9 @@ slot state machine consumes. The manager makes the calls whose result only the c
   inside the message against `max_frame_payload_bytes` (64 KiB), `limits.max_token_text_bytes`
   (256), and `limits.max_model_name_bytes` (64). `openai/body.zig` checks the body framing, and
   `openai/map.zig` checks the JSON the same way. A reader must consume a payload exactly, and
-  trailing bytes are malformed. A decode never panics. It returns a typed error the adapter maps to
-  an error frame or a 4xx.
+  trailing bytes are malformed. A decode never panics. It returns a typed error that the adapter
+  maps to an error frame or an HTTP status: 4xx for a malformed request, and 501 for an unknown
+  method or transfer coding.
 - **Bounded everything.** `--max-connections` sets the live connections, 8 by
   default and 64 at most (`core/limits.zig`). A binary connection costs two
   worker threads. The table holds two slots per allowed connection, and a
@@ -196,21 +197,23 @@ slot state machine consumes. The manager makes the calls whose result only the c
   an idle server uses no CPU.
 - **A connection slot changes hands in a fixed order.** A slot is `free`, `live`, `closing`,
   `swept`, or `reclaimable` (`conn_slots.zig`). The acceptor writes a slot only in `free` or
-  `reclaimable`. The engine thread reads a slot only in `live` or `closing`. The reader task
-  submits `conn_closed` after its last request. The reply that a request gets while the engine
-  handles it, such as a `pong` or `session_closed`, is then in the out-queue. The engine closes
-  the queue, sweeps the sessions of the connection, and releases the slot. The writer task drains
-  the queue and exits. A writer that stops early closes the queue, so its reader cannot wait on a
-  full queue for good. The slot is `reclaimable` after the release and the last task exit, in
-  either order. So an event never reaches the queue of a later connection. An event for a
-  connection that holds no slot is dropped, because the engine closed its queue. At shutdown the
-  request queue closes, so a `conn_closed` can be lost. Teardown then awaits the tasks and frees
-  the slot.
-- **A half-close is a hang-up.** A client that closes its send side ends its turns on both
-  frontends. The sweep cancels a turn in flight, drops a parked event, and ends a waiting resume.
-  A reply that the engine made before the sweep still arrives. A buffered HTTP reply that is
-  complete when the probe runs still goes out. A binary frame error queues its error frame, and
-  the replies to the earlier requests of the connection follow it before the close.
+  `reclaimable`, and in `live` when it abandons a slot whose task did not start. The engine thread
+  reads a slot only in `live` or `closing`. The reader task submits `conn_closed` after its last
+  request. The reply that a request gets while the engine handles it, such as a `pong` or
+  `session_closed`, is then in the out-queue. The engine closes the queue, sweeps the sessions of
+  the connection, and releases the slot. The writer task drains the queue and exits. A writer that
+  stops early closes the queue, so its reader cannot wait on a full queue for good. The slot is
+  `reclaimable` after the release and the last task exit, in either order. So an event never reaches
+  the queue of a later connection. An event for a connection that holds no slot is dropped, because
+  the engine closed its queue. At shutdown the request queue closes, so a `conn_closed` can be lost.
+  Teardown then awaits the tasks and frees the slot.
+- **A half-close is a hang-up.** A client that closes its send side ends its turns on the binary
+  frontend. On Linux it also ends a buffered HTTP turn at the next token. A streamed HTTP turn runs
+  to its end, because a write to a half-closed client succeeds. The sweep cancels a turn in flight,
+  drops a parked event, and ends a waiting resume. A reply that the engine made before the sweep
+  still arrives. A buffered HTTP reply that is complete when the probe runs still goes out. A binary
+  frame error queues its error frame, and the replies to the earlier requests of the connection
+  follow it before the close.
 - **A slot that waits for the engine does not refuse a client.** `--max-connections` counts the
   `live` slots, where a task runs and the engine has not handled `conn_closed`. The table holds
   two slots per allowed connection, so a client can connect while the slot of an ended
@@ -224,21 +227,25 @@ slot state machine consumes. The manager makes the calls whose result only the c
   reset where the client has sent little.
 - **A socket wait has a deadline.** `--io-timeout` sets the longest wait of one socket read or
   write, 600 seconds by default (the default of the llama.cpp server `--timeout`). 0 sets no
-  deadline. Each read of an HTTP request head and body waits at most the deadline, which covers
-  the idle wait between two requests on one connection. A client that sends one byte per
-  deadline can still hold its connection. The deadline also bounds each read of the binary
-  handshake and of a binary frame after its first byte, and each write that the client does not
-  read. At the deadline the task exits, so the slot and the sessions of the connection free as
-  after a hang-up. Only Linux has the deadline. On other platforms a socket wait has no bound.
+  deadline. Each read of an HTTP request head and body waits at most the deadline, which covers the
+  idle wait between two requests on one connection. A client that sends one byte per deadline can
+  still hold its connection. The deadline also bounds each read of the binary handshake and of a
+  binary frame after its first byte, and each write that the client does not read. At the deadline
+  the task exits, so the slot and the sessions of the connection free as after a hang-up. Only Linux
+  has the deadline. On other platforms a socket wait has no bound. The input drain before a close
+  and the refusal send that does not wait are Linux only too. On other platforms the server drops no
+  input before a close, and the refusal send is the blocking std write.
 - **An idle binary connection closes when it holds nothing.** A binary reader waits for the first
   byte of a frame with no bound while its connection holds a session or a request in the engine,
   because an idle session is normal. A connection with neither closes after one deadline with no
   frame. So only a client that keeps a session open holds a slot with no traffic. On Linux the TCP
   keepalive of an accepted socket finds a peer that vanished with no close after 120 seconds
-  (`limits.zig`). That time holds for a connection with no unacknowledged output, because the
-  kernel sends no probe while output waits for an acknowledgment. With output in flight, the
-  write deadline of `--io-timeout` is the bound. With `--io-timeout 0` the server sets no bound
-  on that wait, and only the retransmission limit of the kernel ends it.
+  (`limits.zig`). That time holds for a connection with no unacknowledged output, because the kernel
+  sends no probe while output waits for an acknowledgment. With output in flight, a write that
+  waits for room in the send buffer ends at the `--io-timeout` deadline. Output that fits in the
+  send buffer starts no wait. A binary connection that holds a session then ends only at the
+  retransmission limit of the kernel. With `--io-timeout 0` the server sets no bound on a write
+  wait, and only the retransmission limit of the kernel ends it.
 - **A buffered reply sees a hang-up at the next token.** A buffered HTTP reply writes nothing
   before the turn ends. So at each token event of the turn the task probes the socket for a
   hang-up, and a hang-up ends the turn and closes the session. The probe skips the `done`, so a
@@ -248,20 +255,25 @@ slot state machine consumes. The manager makes the calls whose result only the c
 - **An HTTP reply that says close ends the connection.** An error reply, a request with
   `Connection: close`, and every HTTP/1.0 request end the connection after the reply. A request
   that the client sent after it is not answered.
-- **An HTTP connection ends in a fixed order.** A close over unread input sends a reset, and a
-  reset can drop the last reply. After a refusal, the task shuts its send side. It then drops
-  input until the end of the stream, 528 KiB (`limits.close_drain_bytes`), or 5 seconds
-  (`limits.close_linger_ms`, and at most `--io-timeout`), whichever comes first, and the socket
-  closes. After any other end, the task drops at most 528 KiB of the input that has already
-  arrived, with no wait, and the close sends the end of stream. The drain lowers the chance of a
-  reset, and it does not remove it. On the binary frontend only the refusal at the cap drains: it
-  shuts the send side and drops the input that has arrived, with no wait. Any other binary
-  connection closes with no drain.
+- **An HTTP connection ends in a fixed order.** A close over unread input sends a reset, and a reset
+  can drop the last reply. After a refusal, the task shuts its send side. It then drops input until
+  the end of the stream, 528 KiB (`limits.close_drain_bytes`), or 5 seconds
+  (`limits.close_linger_ms`), whichever comes first, and the socket closes. A nonzero `--io-timeout`
+  below 5 seconds shortens the wait. With `--io-timeout 0` the wait is 5 seconds. After any other
+  end, the task drops at most 528 KiB of the input that has already arrived, with no wait, and the
+  close sends the end of stream. The drain lowers the chance of a reset, and it does not remove it.
+  Every error reply ends the connection this way, also one that follows a complete body (a bad JSON
+  body, a model mismatch, a prompt past the window). The connection counts toward
+  `--max-connections` until the client closes or the wait ends. On the binary frontend only the
+  refusal at the cap drains: it shuts the send side and drops the input that has arrived, with no
+  wait. Any other binary connection closes with no drain.
 - **The two transports serve two kinds of traffic.** The binary wire serves embedded interactive
-  traffic. That means many short, low-latency sessions that often share a prefilled prefix. The
-  HTTP frontend serves general interop. A client that sends the request shapes of the field table
-  in "The OpenAI HTTP front" works with no change. The server ignores the other fields and logs
-  each name once.
+  traffic. That means many short, low-latency sessions that often share a prefilled prefix. The HTTP
+  frontend serves general interop. A program that sends the request shapes of the field table in
+  "The OpenAI HTTP front" works with no change. A browser page on another origin cannot call the
+  server, because its CORS preflight gets 405 and no reply carries CORS headers. The server ignores
+  the other fields. It logs each of the first 32 unknown names (`UnknownFields.table_cap`) once, and
+  then one line that says the table is full.
 
 ## The client surface
 
@@ -486,10 +498,12 @@ curl -N http://127.0.0.1:8080/v1/chat/completions -H 'Content-Type: application/
 | `seed` | honored. Without it, the server draws a seed from the secure random source per request |
 | `thinking_token_budget` | -1 or absent takes `--thinking-budget`. 0 turns thinking off. N from 1 to 262144 closes the block after N think tokens |
 | `chat_template_kwargs.enable_thinking` | true is on, false is off, absent is the server mode |
-| any other field | ignored, and the server logs each name once. Examples: `tools`, `tool_choice`, `logprobs`, `response_format`, `stream_options`, `logit_bias`, and `user` |
+| any other field | ignored. The server logs each of the first 32 unknown names (`UnknownFields.table_cap`) once. Examples: `tools`, `tool_choice`, `logprobs`, `response_format`, `stream_options`, `logit_bias`, and `user` |
 
-Every refusal is a 400 of type `invalid_request_error`, and its message names
-the field and the accepted range. A model with no think tags accepts only the
+A field refusal is a 400 of type `invalid_request_error`, and its message names
+the field. A range refusal also names the range. A `model` mismatch gets 404 of
+type `model_not_found`, and a prompt past the window gets 400 of type
+`exceed_context_size_error`. A model with no think tags accepts only the
 closed modes. `enable_thinking: true` or a budget above 0 gets a 400. A
 budget of 0 or -1 passes. A model with think tags and no forced close also
 refuses a budget above 0. A budget of 0 wins over `enable_thinking: true`.
@@ -504,17 +518,17 @@ body holds at most 256 KiB. Each refusal below closes the connection.
 
 | Request | Answer |
 | --- | --- |
-| a control byte in the request line | 400 |
+| a control byte in the target or the version | 400. A control byte in the method gets 501, because std resolves the method first |
 | a field line that is not a name of token characters, a colon right after it, and a value with no control byte but tab, for example `Content-Length : 5`, a bare LF or NUL inside a line, a line with no colon, or a folded line | 400, so a proxy and this server never read two sets of fields |
 | a method that std does not know | 501 |
 | a known method that the route does not take | 405 with `allow` |
 | `Content-Length` and `Transfer-Encoding` together | 400 |
-| a transfer coding other than `chunked`, for example `gzip` or `gzip, chunked` | 501, the status that RFC 9112 names for a transfer coding the server does not know |
+| a transfer coding that std reads as a content coding, for example `gzip`, `gzip, chunked`, or `none` | 501, the status that RFC 9112 names for a transfer coding the server does not know. Another coding name, for example `br` or `Chunked`, gets 400 from the std parser |
 | `Transfer-Encoding` on an HTTP/1.0 request | 400 |
 | a `Content-Length` that is not ASCII digits, for example `+10` or `1_0` | 400 |
-| two `Content-Length` headers, or any head that the std parser refuses | 400 |
+| two `Content-Length` headers, or another head that the std parser refuses | 400. An unknown method gets 501 |
 | a head past 16 KiB | 431 |
-| a `Content-Length` past 256 KiB | 413, before the server reads the body |
+| a `Content-Length` past 256 KiB | 413, before the server reads the body. A length past the `u64` range gets 400 from the std parser |
 | a body on a method that takes none, for example GET or HEAD | 400, so the body never reads as the next request |
 | an `Expect` other than `100-continue` | 417 |
 | a chunked body that passes 256 KiB | 413 at the size line that passes the cap, before its data |
