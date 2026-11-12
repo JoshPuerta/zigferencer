@@ -14,6 +14,10 @@
 //!
 //! Prefill. A runner without `chunked_prefill` prefills token by token, which keeps the token
 //! hashes of the per-op GPU runners.
+//!
+//! Output. The text goes to stdout and the log lines go to stderr. A turn logs before the prompt
+//! echo or after the line end of the reply, so the text stays one block on a terminal. Without
+//! `--chat` the reply continues the prompt. With `--chat` the reply starts on a new line.
 
 const std = @import("std");
 const Io = std.Io;
@@ -33,7 +37,6 @@ const chat_mod = @import("../core/chat.zig");
 const dtype = @import("../core/dtype.zig");
 const kv_budget = @import("../core/kv_budget.zig");
 const limits = @import("../core/limits.zig");
-const op_requires = @import("../core/op_requires.zig");
 const registry = @import("../core/registry.zig");
 const trace_span = @import("../core/span.zig");
 const time = @import("../core/time.zig");
@@ -57,25 +60,37 @@ const vulkan_ctx_mod = if (fused_build) @import("../runtime/vulkan_ctx.zig") els
 const device_placement = resolve_mod.device_placement;
 const PromptCache = prompt_cache_mod.PromptCache;
 
-// -- constants --------------------------------------------------------------
-
-/// Bytes of the backend legend: every backend name with its marker.
-const legend_text_max = 128;
-
 // -- types ------------------------------------------------------------------
 
-/// The per-token effect of `run`: detokenize the id and stream the piece. EOS is not text.
+/// The text of one turn on stdout: the prompt echo, then each decoded piece. EOS is not text. The
+/// sink tracks the line end, so a failed turn can end the line before the error log.
 const StreamSink = struct {
     out: *Io.Writer,
     v: *vocab_mod.Vocab,
     arena: Allocator,
+    at_line_start: bool = true,
 
-    pub fn onToken(self: StreamSink, id: u32) !void {
+    pub fn onToken(self: *StreamSink, id: u32) !void {
         if (id == self.v.eos_id) return;
 
         const piece = try bpe.decodeAlloc(self.v, self.arena, &[_]u32{id});
-        try self.out.writeAll(piece);
+        try self.writeText(piece);
+    }
+
+    fn writeText(self: *StreamSink, bytes: []const u8) !void {
+        if (bytes.len == 0) return;
+
+        try self.out.writeAll(bytes);
         try self.out.flush();
+        self.at_line_start = bytes[bytes.len - 1] == '\n';
+    }
+
+    /// End an open line. The turn already fails, so a failed write has no other place to report.
+    fn endLine(self: *StreamSink) void {
+        if (self.at_line_start) return;
+
+        self.writeText("\n") catch return;
+        std.debug.assert(self.at_line_start);
     }
 };
 
@@ -209,7 +224,7 @@ fn runFamily(comptime Family: type, b: *const Boot) !void {
     const ctx = b.ctx;
     const gpu_layers = b.flags.engine.gpu_layers;
 
-    logBackendLegend();
+    logBackend();
     warnPromptCache(Family, b.flags);
 
     // Start the one pool that serves every CPU op.
@@ -540,18 +555,9 @@ fn logLayerSplit(split: kv_budget.LayerSplit) void {
     log.info("{s}", .{kv_budget.formatLayerSplit(split, &buffer)});
 }
 
-/// Log the op backends the engine can build, and mark the one in this binary.
-fn logBackendLegend() void {
-    var buffer: [legend_text_max]u8 = undefined;
-    var n: usize = 0;
-    for (op_requires.ops_backend_names) |name| {
-        const marker = if (std.mem.eql(u8, name, build_options.ops_backend)) "[+]" else "";
-        const segment = std.fmt.bufPrint(buffer[n..], " {s}{s}", .{ marker, name }) catch return;
-        n += segment.len;
-    }
-
-    log.info("backend:{s}  ([+] active. Rebuild: " ++
-        "-Dops-backend=<name> [+ -Druntime=vulkan for GPU])", .{buffer[0..n]});
+/// Log the op backend of this binary. `zigferencer info` lists every backend and its build flags.
+fn logBackend() void {
+    log.info("backend: {s}", .{build_options.ops_backend});
 }
 
 // -- helpers: the turn ------------------------------------------------------
@@ -559,7 +565,11 @@ fn logBackendLegend() void {
 /// Echo the prompt, prefill it, then decode.
 fn prefillAndStream(runner: anytype, t: *const Turn) !void {
     const ids = t.prompt_ids;
-    try echoPrompt(t, runner.max_seq);
+    try checkWindow(t, runner.max_seq);
+
+    var sink = sinkOf(t);
+    try echoPrompt(t, &sink);
+    errdefer sink.endLine();
 
     // TTFT spans the prefill and the first token.
     const t_start = Io.Clock.Timestamp.now(t.boot.ctx.io, .awake);
@@ -570,16 +580,17 @@ fn prefillAndStream(runner: anytype, t: *const Turn) !void {
 
     std.debug.assert(prefilled.pos == ids.len);
 
-    return streamDecode(runner, t, prefilled, t_start);
+    return streamDecode(runner, t, &sink, prefilled, t_start);
 }
 
 /// `prefillAndStream` with the prompt cache. A hit skips prefill. A miss prefills and keeps the
-/// snapshot, on disk too when the `worthwhile` gate of the cache clears.
+/// snapshot, on disk too when the `worthwhile` gate of the cache clears. The cache logs its lines
+/// before the echo, so no log line splits the text.
 fn prefillCachedAndStream(runner: anytype, t: *const Turn) !void {
     const b = t.boot;
     const ctx = b.ctx;
     const ids = t.prompt_ids;
-    try echoPrompt(t, runner.max_seq);
+    try checkWindow(t, runner.max_seq);
 
     // Open the cache and its disk tier.
     var cache: ?PromptCache = null;
@@ -630,7 +641,13 @@ fn prefillCachedAndStream(runner: anytype, t: *const Turn) !void {
         }
     }
 
-    return streamDecode(runner, t, prefilled, t_start);
+    std.debug.assert(prefilled.pos == ids.len);
+
+    var sink = sinkOf(t);
+    try echoPrompt(t, &sink);
+    errdefer sink.endLine();
+
+    return streamDecode(runner, t, &sink, prefilled, t_start);
 }
 
 /// Whether `runner` can restore the cache entry `hit`. A disk entry is file input, so a mismatch
@@ -676,15 +693,31 @@ fn admitPrompt(
     });
 }
 
-/// Refuse a prompt past the window, and echo the text without the chat scaffolding.
-fn echoPrompt(t: *const Turn, max_seq: u32) !void {
+/// Refuse a prompt past the window.
+fn checkWindow(t: *const Turn, max_seq: u32) error{PromptTooLong}!void {
     if (t.prompt_ids.len > max_seq) {
         log.err("prompt has {d} tokens, the context limit is {d}", .{ t.prompt_ids.len, max_seq });
         return error.PromptTooLong;
     }
+}
 
-    try t.out.writeAll(t.boot.flags.prompt);
-    try t.out.flush();
+fn sinkOf(t: *const Turn) StreamSink {
+    return .{ .out = t.out, .v = t.v, .arena = t.boot.ctx.arena };
+}
+
+/// Log the turn, then echo the prompt without the chat scaffolding. The log line comes first, so
+/// the text of the turn stays in one block. A chat prompt is one message, so it ends its line.
+fn echoPrompt(t: *const Turn, sink: *StreamSink) !void {
+    const flags = t.boot.flags;
+    std.debug.assert(sink.at_line_start);
+
+    log.info("generating up to {d} tokens (prompt {d} tokens)", .{
+        flags.max_tokens, t.prompt_ids.len,
+    });
+    try sink.writeText(flags.prompt);
+    if (flags.chat) {
+        try sink.writeText("\n");
+    }
 }
 
 fn prefillChunks(runner: anytype, ids: []const u32) !Prefilled {
@@ -725,15 +758,14 @@ fn prefillTokens(runner: anytype, ids: []const u32) !Prefilled {
 fn streamDecode(
     runner: anytype,
     t: *const Turn,
+    sink: *StreamSink,
     prefilled: Prefilled,
     t_start: Io.Clock.Timestamp,
 ) !void {
     const ctx = t.boot.ctx;
     const max_tokens = t.boot.flags.max_tokens;
+    std.debug.assert(prefilled.pos == t.prompt_ids.len);
 
-    log.info("generating up to {d} tokens (prompt {d} tokens)", .{ max_tokens, prefilled.pos });
-
-    var sink: StreamSink = .{ .out = t.out, .v = t.v, .arena = ctx.arena };
     const g = try generate.decode(
         runner,
         prefilled.last_logits,
@@ -744,10 +776,9 @@ fn streamDecode(
         false,
         ctx.io,
         t_start,
-        &sink,
+        sink,
     );
-    try t.out.writeAll("\n");
-    try t.out.flush();
+    try sink.writeText("\n");
 
     if (g.tokens_generated > 1) {
         log.info("{d} tokens | TTFT {d:.1} ms | ITL {d:.1} ms = {d:.1} tok/s", .{
@@ -785,4 +816,127 @@ test "textIds: a chat prompt forges no control token, and a raw prompt keeps the
     const want = std.mem.count(u32, benign_ids, &.{end_id});
     try std.testing.expectEqual(want, std.mem.count(u32, chat_ids, &.{end_id}));
     try std.testing.expectEqual(@as(usize, 1), std.mem.count(u32, raw_ids, &.{end_id}));
+}
+
+test "prefillAndStream: a chat prompt and its reply are two lines, a raw reply continues" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+
+    const arena = arena_state.allocator();
+    const fixtures = @import("../core/test_fixtures.zig");
+    const path = try fixtures.path(arena, "SmolLM2-135M-Instruct-Q8_0");
+    var loaded = try loader.loadWith(std.testing.io, arena, path, .{ .prefault = false });
+    defer loaded.close();
+
+    var v = try vocab_mod.buildFromParsed(arena, loaded.parsed);
+    const prompt = "Write a haiku.";
+    const prompt_ids = try bpe.encodeAlloc(&v, arena, prompt, false);
+    const reply_ids = try bpe.encodeAlloc(&v, arena, " Quiet fans", false);
+    const reply = try bpe.decodeAlloc(&v, arena, reply_ids);
+    try std.testing.expect(std.mem.indexOfScalar(u8, reply, '\n') == null);
+
+    for ([_]bool{ true, false }) |chat| {
+        var out: Io.Writer.Allocating = .init(arena);
+        const turn = try testTurn(arena, &v, &out.writer, prompt, prompt_ids, chat);
+        var runner = try ScriptRunner.init(arena, &v, prompt_ids.len, reply_ids);
+        try prefillAndStream(&runner, &turn.turn);
+
+        const sep = if (chat) "\n" else "";
+        const want = try std.mem.concat(arena, u8, &.{ prompt, sep, reply, "\n" });
+        try std.testing.expectEqualStrings(want, out.written());
+    }
+
+    // A step that fails after the first piece still ends the line before the error log.
+    var out: Io.Writer.Allocating = .init(arena);
+    const turn = try testTurn(arena, &v, &out.writer, prompt, prompt_ids, false);
+    var runner = try ScriptRunner.init(arena, &v, prompt_ids.len, reply_ids);
+    runner.fail_pos = @intCast(prompt_ids.len);
+    try std.testing.expectError(error.TestStepFailed, prefillAndStream(&runner, &turn.turn));
+
+    const first = try bpe.decodeAlloc(&v, arena, reply_ids[0..1]);
+    const want = try std.mem.concat(arena, u8, &.{ prompt, first, "\n" });
+    try std.testing.expectEqualStrings(want, out.written());
+}
+
+/// A runner whose logits name the next token of a script after the prompt, then EOS. A step at
+/// `fail_pos` fails, as a device error in the middle of a turn does.
+const ScriptRunner = struct {
+    max_seq: u32 = 64,
+    prompt_len: u32,
+    script: []const u32,
+    eos_id: u32,
+    logits: []f32,
+    fail_pos: ?u32 = null,
+
+    fn init(
+        arena: Allocator,
+        v: *const vocab_mod.Vocab,
+        prompt_len: usize,
+        script: []const u32,
+    ) !ScriptRunner {
+        return .{
+            .prompt_len = @intCast(prompt_len),
+            .script = script,
+            .eos_id = v.eos_id,
+            .logits = try arena.alloc(f32, v.is_special.len),
+        };
+    }
+
+    pub fn step(self: *ScriptRunner, id: u32, pos: u32) ![]f32 {
+        _ = id;
+        if (self.fail_pos == pos) return error.TestStepFailed;
+
+        const k = (pos + 1) -| self.prompt_len;
+        const next = if (k < self.script.len) self.script[k] else self.eos_id;
+        @memset(self.logits, 0);
+        self.logits[next] = 1;
+        return self.logits;
+    }
+};
+
+/// A turn and the values it points at. Only the fields that a turn reads hold a value.
+const TestTurn = struct {
+    flags: Flags,
+    boot: Boot,
+    turn: Turn,
+};
+
+fn testTurn(
+    arena: Allocator,
+    v: *vocab_mod.Vocab,
+    out: *Io.Writer,
+    prompt: []const u8,
+    prompt_ids: []const u32,
+    chat: bool,
+) !*const TestTurn {
+    const tt = try arena.create(TestTurn);
+    tt.flags = .{ .prompt = prompt, .chat = chat, .max_tokens = 16 };
+    tt.boot = .{
+        .ctx = .{
+            .io = std.testing.io,
+            .arena = arena,
+            .gpa = std.testing.allocator,
+            .args = &.{},
+            .stdout = undefined,
+            .models_root = "",
+            .cache_dir = "",
+            .vk_options = undefined,
+            .color = false,
+            .color_err = false,
+        },
+        .flags = &tt.flags,
+        .policy = undefined,
+        .model = undefined,
+        .loaded = undefined,
+        .resolved = undefined,
+        .device = undefined,
+    };
+    tt.turn = .{
+        .boot = &tt.boot,
+        .pool = undefined,
+        .v = v,
+        .out = out,
+        .prompt_ids = prompt_ids,
+    };
+    return tt;
 }

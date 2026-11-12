@@ -10,19 +10,20 @@ For the same prompt, the three runners generate the same tokens, and the token-h
 
 ```console
 $ zigferencer run Qwen3.5-2B-Q8_0 --chat --prompt "Write a haiku about a GPU." --max-tokens 48
-+    0.281ms info(parallel): threads 8 (auto), floor 250000 FLOPs (auto), spin 50000 ns (auto)
-+    0.638ms info(gguf): loading Qwen3.5-2B-Q8_0.gguf...
-+   76.934ms info(gguf): loaded qwen35: 320 tensors, ctx 262144, 1919 MiB in 76 ms
-+   77.095ms info(run): backend: naive simd [+]simd_pf vulkan vulkan_fused  ([+] active. Rebuild: -Dops-backend=<name> [+ -Druntime=vulkan for GPU])
-+  153.185ms info(serve): precision: weights q8_0, activations f32, accum f32, kv f16, logits f32
-+  153.206ms info(serve): kv window: 174592 positions, the 2048 MiB session budget (model ceiling 262144)
-+  153.208ms info(serve): ram: 2065 of 12725 MiB usable = 2065 MiB host kv + 0 MiB blobs + 0 MiB prefix + 0 MiB stages
-+ 1342.564ms info(run): qwen cpu runner ready in 1189 ms
-Write a haiku about a GPU.+ 1673.174ms info(run): generating up to 48 tokens (prompt 20 tokens)
++    0.306ms info(parallel): threads 8 (auto), floor 250000 FLOPs (auto), spin 50000 ns (auto)
++    0.703ms info(gguf): loading Qwen3.5-2B-Q8_0.gguf...
++  102.045ms info(gguf): loaded qwen35: 320 tensors, ctx 262144, 1919 MiB in 101 ms
++  102.159ms info(run): backend: simd_pf
++  155.438ms info(serve): precision: weights q8_0, activations f32, accum f32, kv f16, logits f32
++  155.457ms info(serve): kv window: 174592 positions, the 2048 MiB session budget (model ceiling 262144)
++  155.460ms info(serve): ram: 2065 of 13170 MiB usable = 2065 MiB host kv + 0 MiB blobs + 0 MiB prefix + 0 MiB stages
++ 1061.303ms info(run): qwen cpu runner ready in 906 ms
++ 1061.320ms info(run): generating up to 48 tokens (prompt 20 tokens)
+Write a haiku about a GPU.
 Silent chips,
 Huge heat,
 Powerful dreams.
-+ 2396.745ms info(run): 15 tokens | TTFT 330.7 ms | ITL 51.7 ms = 19.4 tok/s
++ 2614.032ms info(run): 15 tokens | TTFT 859.1 ms | ITL 49.5 ms = 20.2 tok/s
 ```
 
 The same engine serves many conversations at once, through ZMQ or through the OpenAI HTTP API:

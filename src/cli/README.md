@@ -109,6 +109,10 @@ A command that runs a model takes four steps:
   there. Pickers, confirms, progress bars, and flag errors go to stderr. The two
   serve commands print exactly one machine-readable `READY` line to stdout, and
   route everything else through the scoped stderr logger.
+- A terminal shows stdout and stderr together. `run` writes each log line of a
+  turn before the first byte of the text or after the last byte. Thus the
+  prompt echo and the reply stay one block. Under `--chat` the reply starts on
+  a new line.
 - The command space is closed. `command.release` and the table of
   `src/dev/dev_command.zig` are compile-time tables, so a reader can enumerate every
   command. Each command accepts the fixed flags of its flag struct, and an unmatched `-`
