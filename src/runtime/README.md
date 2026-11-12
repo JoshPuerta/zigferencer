@@ -26,7 +26,7 @@ comes in, and token ids go out.
 | `kv_cost.zig` | `costVector`, the per-layer KV price of a model card. |
 | `prompt_cache.zig` | `PromptCache`, the two-tier store of state snapshots. |
 | `sampler.zig` | The greedy and the seeded sampling of one logits row. |
-| `generate.zig` | The single-sequence decode loop and its `sink` boundary. |
+| `generate.zig` | The single-sequence decode loop, its `sink` boundary, and the two prefill loops. |
 | `parallel.zig` | The threading `Policy`, the row-parallel matmul, and CPU attention dispatch. |
 | `pool.zig` | `Pool`, the fork-join pool of the CPU ops, and the spans of its work. |
 | `linear_dispatch.zig` | `linearBatchDispatch`, the batched linear by weight dtype. |
@@ -132,9 +132,9 @@ serve residency, and the CLI decode loop with no further work.
 | Declaration | Shape | The consumer that reads it | Carried by |
 | --- | --- | --- | --- |
 | `stepBatch` | `fn (*Self, []const StepRow) !void` | `session.advance`, the one row-assembly path under `feed` and `decodeBatch` | every runner |
-| `step` | `fn (*Self, u32, u32) ![]f32` | `generate.decode`, and the `run` prefill loop of a runner without `chunked_prefill` | every runner |
+| `step` | `fn (*Self, u32, u32) ![]f32` | `generate.decode`, and `generate.prefillTokens` for a runner without `chunked_prefill` | every runner |
 | `chunked_prefill` | `bool` | `step_row.chunkedPrefill`, which picks the chunked prefill loop in `run_cmd.prefillAndStream` and `bench_model_exec.prefill` | `FusedRunner`, `HybridRunner`, and `CpuRunner` in a build without GPU ops. False, the prefill loop calls `step` per token. The Qwen row of `run` takes the prompt cache loop |
-| `prefillBatch` | `fn (*Self, []const u32, u32) ![]f32` | `run_cmd.prefillAndStream`, `run_cmd.prefillCachedAndStream`, and `bench_model_exec.prefillChunks`, which pass chunks of slot 0 at consecutive positions | every runner |
+| `prefillBatch` | `fn (*Self, []const u32, u32) ![]f32` | `generate.prefillChunks` for `run` and `bench-model`. It passes chunks of slot 0 at consecutive positions | every runner |
 | `prefill_batch_max` | `u32` | the same two loops, which cut the prompt into chunks of at most this many rows | every runner |
 | `maxStepRows` | `fn (*const Self) u32` | `Sessions.init` sizes the row scratch with it. `cli/boot/serve_boot` clamps the prefill chunk to it | every runner |
 | `logits` | `[]f32` | `Sessions.init` derives the vocab stride from its length. `advance` and `copyFinalLogits` read the compact rows | every runner |

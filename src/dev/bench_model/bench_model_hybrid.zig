@@ -8,10 +8,10 @@ const std = @import("std");
 const zigferencer = @import("zigferencer");
 const build_options = @import("build_options");
 
-const args = zigferencer.cli.args;
 const common = @import("bench_model_common.zig");
 const exec = @import("bench_model_exec.zig");
 const boot_lines = zigferencer.cli.boot_lines;
+const boot_resources = zigferencer.cli.boot_resources;
 const resolve_mod = zigferencer.resolve;
 const kv_budget = zigferencer.kv_budget;
 const vocab_mod = zigferencer.vocab;
@@ -44,15 +44,15 @@ pub fn bench(comptime Family: type, b: *const Bench) !void {
     const kv_dtype = b.kvDtype();
 
     // Refuse a bad pin, then start the pool and the device.
-    try refuseOverLayerCount(b);
+    const pin = opt.engine.gpu_layers.?.pin();
+    try boot_resources.refusePastModel(ctx.io, pin, b.loaded.card.n_layers);
 
     var pool: Pool = undefined;
     try parallel.initPool(&pool, ctx.io, b.policy);
     defer pool.deinit();
 
     // The context defer runs last, after the runner releases its borrow.
-    const ctxp = try ctx.arena.create(vulkan_ctx_mod.Context);
-    ctxp.* = try vulkan_ctx_mod.Context.init(ctx.arena, ctx.vk_options);
+    const ctxp = try boot_resources.openDevice(ctx);
     defer ctxp.deinit();
 
     // Resolve the split and build the hybrid runner.
@@ -91,17 +91,6 @@ pub fn bench(comptime Family: type, b: *const Bench) !void {
         .kv_dtype = kv_dtype,
     };
     return exec.runSeries(runner, b, turn, plan_info, true);
-}
-
-/// A pin past the layer count costs no device, so it refuses before the context.
-pub fn refuseOverLayerCount(b: *const Bench) error{UsageError}!void {
-    const gpu_layers = b.opt.engine.gpu_layers.?.pin() orelse return;
-    const n_layers = b.loaded.card.n_layers;
-
-    if (gpu_layers > n_layers) {
-        const fmt = "--gpu-layers {d} exceeds the model's {d} layers";
-        return args.fail(b.ctx.io, fmt, .{ gpu_layers, n_layers });
-    }
 }
 
 /// Resolve the split on the context, and log the placement and its price.

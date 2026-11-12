@@ -38,7 +38,6 @@ const dtype = @import("../core/dtype.zig");
 const kv_budget = @import("../core/kv_budget.zig");
 const limits = @import("../core/limits.zig");
 const registry = @import("../core/registry.zig");
-const trace_span = @import("../core/span.zig");
 const time = @import("../core/utils/time.zig");
 const vocab_mod = @import("../core/tokenizer/vocab.zig");
 const loader = @import("../io/gguf/loader.zig");
@@ -157,12 +156,6 @@ const Turn = struct {
     v: *vocab_mod.Vocab,
     out: *Io.Writer,
     prompt_ids: []const u32,
-};
-
-/// The end of a prefill: the next position and the logits of the last row.
-const Prefilled = struct {
-    pos: u32,
-    last_logits: []f32,
 };
 
 // -- api --------------------------------------------------------------------
@@ -333,7 +326,7 @@ fn runHost(
         boot_lines.logSessionWindow(window);
     }
 
-    try hostQuote(b, placement);
+    try boot_resources.hostQuote(ctx.io, &b.device, b.kvDtype(), window, placement);
 
     // Build the runner. One prompt chunk of slot 0 is the most rows a step holds.
     const t_init = Io.Clock.Timestamp.now(ctx.io, .awake);
@@ -397,8 +390,10 @@ fn attemptDevice(comptime Family: type, t: *const Turn, pin: ?u32) !boot_resourc
     const name = b.model.pub_name;
     const n_layers = b.loaded.card.n_layers;
 
-    // Open the device and resolve the split.
-    try refusePastModel(ctx, pin, n_layers);
+    // Open the device and resolve the split. The zero pin took the CPU placement, so a pin here
+    // names a real GPU suffix.
+    if (pin) |n_gpu| std.debug.assert(n_gpu >= 1);
+    try boot_resources.refusePastModel(ctx.io, pin, n_layers);
 
     const ctxp = try boot_resources.openDevice(ctx);
     defer ctxp.deinit();
@@ -510,40 +505,6 @@ fn logHostPlan(b: *const Boot) kv_budget.KvPlan {
     return host.plan;
 }
 
-/// Log the RAM quote of the all-host placement, or refuse. A per-op vulkan boot resolves the
-/// placement here.
-fn hostQuote(b: *const Boot, placement: ?resolve_mod.Result(resolve_mod.HostPlacement)) !void {
-    const io = b.ctx.io;
-    const boot = &b.device;
-    const resources: resolve_mod.Resources = .{ .ram_free = boot.ramFree(io), .model = boot.model };
-
-    const result = placement orelse
-        resolve_mod.hostPlacement(
-            .run,
-            boot.input,
-            boot.card,
-            b.kvDtype(),
-            b.resolved.window,
-            resources,
-        );
-    switch (result) {
-        .ok => |host| boot_lines.logRamQuote(host.quote, false),
-        .refused => |r| return boot_lines.refuse(io, boot.entry.pub_name, r),
-    }
-}
-
-/// Refuse a pin past the layer count before the device opens.
-fn refusePastModel(ctx: context.Context, pin: ?u32, n_layers: u32) error{UsageError}!void {
-    const n_gpu = pin orelse return;
-
-    // The zero pin took the CPU placement, so a pin here names a real GPU suffix.
-    std.debug.assert(n_gpu >= 1);
-    if (n_gpu > n_layers) {
-        const fmt = "--gpu-layers {d} exceeds the model's {d} layers";
-        return args.fail(ctx.io, fmt, .{ n_gpu, n_layers });
-    }
-}
-
 /// Log the first line of a fused boot, and return the start of its timing.
 fn logFusedInit(io: Io) Io.Clock.Timestamp {
     log.info("initializing GPU: context + weight upload to VRAM...", .{});
@@ -575,9 +536,9 @@ fn prefillAndStream(runner: anytype, t: *const Turn) !void {
     // TTFT spans the prefill and the first token.
     const t_start = Io.Clock.Timestamp.now(t.boot.ctx.io, .awake);
     const prefilled = if (comptime step_row.chunkedPrefill(@TypeOf(runner)))
-        try prefillChunks(runner, ids)
+        try generate.prefillChunks(runner, ids)
     else
-        try prefillTokens(runner, ids);
+        try generate.prefillTokens(runner, ids);
 
     std.debug.assert(prefilled.pos == ids.len);
 
@@ -617,7 +578,7 @@ fn prefillCachedAndStream(runner: anytype, t: *const Turn) !void {
 
     // Restore the snapshot on a hit.
     const t_start = Io.Clock.Timestamp.now(ctx.io, .awake);
-    var prefilled: Prefilled = .{ .pos = 0, .last_logits = undefined };
+    var prefilled: generate.Prefilled = .{ .pos = 0, .last_logits = undefined };
     if (cache) |*c| {
         if (c.lookup(cache_key, ids)) |hit| {
             if (snapshotFits(runner, hit)) {
@@ -633,7 +594,7 @@ fn prefillCachedAndStream(runner: anytype, t: *const Turn) !void {
     // Prefill on a miss, and keep the snapshot.
     if (prefilled.pos == 0) {
         const t0 = Io.Clock.Timestamp.now(ctx.io, .awake);
-        prefilled = try prefillChunks(runner, ids);
+        prefilled = try generate.prefillChunks(runner, ids);
         if (cache) |*c| {
             // The turn holds the prefill, so a failed snapshot costs only the next hit.
             admitPrompt(runner, t, c, cache_key, prefilled.last_logits, t0) catch |err| {
@@ -721,46 +682,13 @@ fn echoPrompt(t: *const Turn, sink: *StreamSink) !void {
     }
 }
 
-fn prefillChunks(runner: anytype, ids: []const u32) !Prefilled {
-    var pos: u32 = 0;
-    var last_logits: []f32 = undefined;
-
-    // Each pass feeds at least one token, so the loop ends in `ids.len` passes.
-    while (pos < ids.len) {
-        const chunk: u32 = @intCast(@min(ids.len - pos, runner.prefill_batch_max));
-
-        const sp = trace_span.beginArg(.prefill_chunk, chunk);
-        last_logits = try runner.prefillBatch(ids[pos..][0..chunk], pos);
-        sp.end();
-
-        pos += chunk;
-    }
-
-    return .{ .pos = pos, .last_logits = last_logits };
-}
-
-fn prefillTokens(runner: anytype, ids: []const u32) !Prefilled {
-    var pos: u32 = 0;
-    var last_logits: []f32 = undefined;
-
-    for (ids) |id| {
-        const sp = trace_span.beginArg(.prefill_chunk, 1);
-        last_logits = try runner.step(id, pos);
-        sp.end();
-
-        pos += 1;
-    }
-
-    return .{ .pos = pos, .last_logits = last_logits };
-}
-
 /// Decode greedily from the prefill, stream each piece, and log TTFT and ITL. The caller takes
 /// `t_start` before prefill.
 fn streamDecode(
     runner: anytype,
     t: *const Turn,
     sink: *StreamSink,
-    prefilled: Prefilled,
+    prefilled: generate.Prefilled,
     t_start: Io.Clock.Timestamp,
 ) !void {
     const ctx = t.boot.ctx;

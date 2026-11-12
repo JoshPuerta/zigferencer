@@ -36,8 +36,7 @@ pub fn bench(comptime Family: type, b: *const Bench) !void {
     const opt = b.opt;
     const kv_dtype = b.kvDtype();
 
-    const ctxp = try ctx.arena.create(vulkan_ctx_mod.Context);
-    ctxp.* = try vulkan_ctx_mod.Context.init(ctx.arena, ctx.vk_options);
+    const ctxp = try boot_resources.openDevice(ctx);
     defer ctxp.deinit();
 
     const f = try place(b, ctxp);

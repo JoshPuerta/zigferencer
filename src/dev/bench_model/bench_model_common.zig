@@ -249,31 +249,16 @@ pub fn loadAndRun(
     var loaded = try loader.load(ctx.io, ctx.arena, path);
     defer loaded.close();
 
-    try boot_resources.checkLoaded(&loaded);
-    const model_needs = boot_resources.modelNeeds(&loaded);
-    const ram_free = boot_resources.hostRamFree(ctx.io);
-    const resources: resolve_mod.Resources = .{ .ram_free = ram_free, .model = model_needs };
-    const resolved = switch (resolve_mod.resolve(kind, input, entry, loaded.card, resources)) {
-        .ok => |r| r,
-        .refused => |r| return boot_lines.refuse(ctx.io, model.pub_name, r),
-    };
+    const resolved = try boot_resources.resolveLoaded(ctx, kind, input, entry, &loaded);
 
     // Hand the bench to the family.
-    const boot: boot_resources.DeviceBoot = .{
-        .kind = kind,
-        .input = input,
-        .entry = entry,
-        .card = loaded.card,
-        .model = model_needs,
-        .ram = .{ .read = ram_free },
-    };
     const bench: Bench = .{
         .ctx = ctx,
         .opt = opt,
         .model = model,
         .loaded = &loaded,
-        .boot = &boot,
-        .resolved = &resolved,
+        .boot = &resolved.device,
+        .resolved = &resolved.values,
         .policy = policy,
     };
 

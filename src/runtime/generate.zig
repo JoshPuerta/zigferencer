@@ -6,9 +6,9 @@
 //!
 //! Ownership. The loop owns the sequencing (sample, step, stop) and the timing. The caller owns
 //! the per-token effect and passes it in as a `sink` value, because boundaries are values. A sink
-//! streams the detokenized piece, or folds the id into a hash. Prefill stays the job of the caller
-//! because it varies: per-token CPU, batched GPU, or cache restore. `decode` picks up from the
-//! `last_logits` and `pos` that prefill left.
+//! streams the detokenized piece, or folds the id into a hash. The caller picks the prefill because
+//! it varies: per-token CPU, batched GPU, or cache restore. The two prefill loops live here too.
+//! `decode` picks up from the `last_logits` and `pos` that prefill left.
 //!
 //! Sink. A sink is any value with `onToken(id: u32) !void`. The loop hands every sampled id to the
 //! sink, the terminal EOS included. A hash therefore counts EOS, and a streamer can choose not to
@@ -42,6 +42,12 @@ pub const Generated = struct {
     /// Host time of the decode host steps. A fused runner fills the first four, and every runner
     /// gets the argmax step. A zero count means the step did not run.
     host: step_stats.DecodeHost = .{},
+};
+
+/// The end of a prefill: the next position and the logits of the last row.
+pub const Prefilled = struct {
+    pos: u32,
+    last_logits: []f32,
 };
 
 /// A sink or a runner arrives by pointer or by value. `@hasDecl` and `@hasField` need the struct.
@@ -160,6 +166,51 @@ pub fn decode(
         .pos_end = pos,
         .host = host,
     };
+}
+
+/// Prefill `prompt_ids` from position zero in chunks of at most `prefill_batch_max` rows. Each
+/// chunk writes its KV rows before its rows attend, so the chunks compose. The callers refuse a
+/// prompt past `max_seq` first, so the bound at `max_seq` cuts nothing.
+pub fn prefillChunks(runner: anytype, prompt_ids: []const u32) !Prefilled {
+    const window: u32 = runner.max_seq;
+    var pos: u32 = 0;
+    var last_logits: []f32 = undefined;
+
+    // Each pass feeds at least one token or stops, so the loop ends in
+    // `prompt_ids.len` passes.
+    while (pos < prompt_ids.len and pos < window) {
+        const room = @min(runner.prefill_batch_max, window - pos);
+        const remaining = prompt_ids.len - pos;
+        const chunk: u32 = @intCast(@min(remaining, @as(usize, room)));
+
+        const sp = span.beginArg(.prefill_chunk, chunk);
+        last_logits = try runner.prefillBatch(prompt_ids[pos..][0..chunk], pos);
+        sp.end();
+
+        pos += chunk;
+    }
+
+    return .{ .pos = pos, .last_logits = last_logits };
+}
+
+/// Prefill `prompt_ids` one `step` per token, for a runner without `chunked_prefill`. The callers
+/// refuse a prompt past `max_seq` first, so the bound at `max_seq` cuts nothing.
+pub fn prefillTokens(runner: anytype, prompt_ids: []const u32) !Prefilled {
+    const window: u32 = runner.max_seq;
+    var pos: u32 = 0;
+    var last_logits: []f32 = undefined;
+
+    for (prompt_ids) |id| {
+        if (pos >= window) break;
+
+        const sp = span.beginArg(.prefill_chunk, 1);
+        last_logits = try runner.step(id, pos);
+        sp.end();
+
+        pos += 1;
+    }
+
+    return .{ .pos = pos, .last_logits = last_logits };
 }
 
 // -- helpers ----------------------------------------------------------------

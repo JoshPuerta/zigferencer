@@ -34,6 +34,7 @@ const build_options = @import("build_options");
 
 const context = zigferencer.cli.context;
 const args = zigferencer.cli.args;
+const boot_resources = zigferencer.cli.boot_resources;
 const core_log = zigferencer.log;
 const span = zigferencer.span;
 const limits = zigferencer.limits;
@@ -309,7 +310,8 @@ fn listFused(comptime Family: type, b: *const common.Bench, out: Out) !void {
 }
 
 fn listHybrid(comptime Family: type, b: *const common.Bench, out: Out) !void {
-    try hybrid_path.refuseOverLayerCount(b);
+    const pin = b.opt.engine.gpu_layers.?.pin();
+    try boot_resources.refusePastModel(b.ctx.io, pin, b.loaded.card.n_layers);
 
     var pool: Pool = undefined;
     try parallel.initPool(&pool, b.ctx.io, b.policy);

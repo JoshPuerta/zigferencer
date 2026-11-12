@@ -15,7 +15,6 @@ const common = @import("bench_model_common.zig");
 const report = @import("bench_model_report.zig");
 const bpe = zigferencer.bpe;
 const chat_mod = zigferencer.chat;
-const span = zigferencer.span;
 const vocab_mod = zigferencer.vocab;
 const generate = zigferencer.generate;
 const step_row = zigferencer.step_row;
@@ -31,12 +30,6 @@ pub const Turn = struct {
     prompt_ids: []const u32,
     decode_len: u32,
     ignore_eos: bool,
-};
-
-/// The end of a prefill: the next position and the logits of the last row.
-const Prefilled = struct {
-    pos: u32,
-    last_logits: []f32,
 };
 
 const HashSink = struct {
@@ -170,54 +163,13 @@ pub fn printReport(b: *const Bench, prompt_len: usize, results: []const RunResul
 
 // -- helpers ----------------------------------------------------------------
 
-fn prefill(runner: anytype, prompt_ids: []const u32) !Prefilled {
+fn prefill(runner: anytype, prompt_ids: []const u32) !generate.Prefilled {
     const chunked = comptime build_options.use_vulkan_fused_ops or
         step_row.chunkedPrefill(@TypeOf(runner));
 
     if (chunked) {
-        return prefillChunks(runner, prompt_ids);
+        return generate.prefillChunks(runner, prompt_ids);
     }
 
-    return prefillTokens(runner, prompt_ids);
-}
-
-/// Each chunk writes its KV rows before its rows attend, so the chunks compose.
-fn prefillChunks(runner: anytype, prompt_ids: []const u32) !Prefilled {
-    const window: u32 = runner.max_seq;
-    var pos: u32 = 0;
-    var last_logits: []f32 = undefined;
-
-    // Each pass feeds at least one token or stops, so the loop ends in
-    // `prompt_ids.len` passes.
-    while (pos < prompt_ids.len and pos < window) {
-        const room = @min(runner.prefill_batch_max, window - pos);
-        const remaining = prompt_ids.len - pos;
-        const chunk: u32 = @intCast(@min(remaining, @as(usize, room)));
-
-        const sp = span.beginArg(.prefill_chunk, chunk);
-        last_logits = try runner.prefillBatch(prompt_ids[pos..][0..chunk], pos);
-        sp.end();
-
-        pos += chunk;
-    }
-
-    return .{ .pos = pos, .last_logits = last_logits };
-}
-
-fn prefillTokens(runner: anytype, prompt_ids: []const u32) !Prefilled {
-    const window: u32 = runner.max_seq;
-    var pos: u32 = 0;
-    var last_logits: []f32 = undefined;
-
-    for (prompt_ids) |id| {
-        if (pos >= window) break;
-
-        const sp = span.beginArg(.prefill_chunk, 1);
-        last_logits = try runner.step(id, pos);
-        sp.end();
-
-        pos += 1;
-    }
-
-    return .{ .pos = pos, .last_logits = last_logits };
+    return generate.prefillTokens(runner, prompt_ids);
 }

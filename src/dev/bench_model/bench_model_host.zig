@@ -11,7 +11,7 @@ const common = @import("bench_model_common.zig");
 const exec = @import("bench_model_exec.zig");
 const profile = @import("bench_model_profile.zig");
 const boot_lines = zigferencer.cli.boot_lines;
-const resolve_mod = zigferencer.resolve;
+const boot_resources = zigferencer.cli.boot_resources;
 const core_log = zigferencer.log;
 const kv_budget = zigferencer.kv_budget;
 const limits = zigferencer.limits;
@@ -57,7 +57,7 @@ pub fn bench(comptime Family: type, b: *const Bench) !void {
     // Log the placement and encode the prompt.
     const max_seq = b.resolved.window.base;
     boot_lines.logSessionWindow(b.resolved.window);
-    try logHostRam(b);
+    try boot_resources.hostQuote(ctx.io, b.boot, b.kvDtype(), b.resolved.window, b.resolved.cpu);
 
     const v = try vocab_mod.buildFromParsed(ctx.arena, b.loaded.parsed);
     const prompt_ids = try exec.promptIds(b, &v, max_seq);
@@ -89,29 +89,4 @@ pub fn bench(comptime Family: type, b: *const Bench) !void {
     }
 
     return exec.printReport(b, prompt_ids.len, results);
-}
-
-// -- helpers ----------------------------------------------------------------
-
-/// A host runner holds the KV on the host, so its quote is the CPU end of the
-/// vector. The per-op Vulkan build resolved a device placement, so it resolves
-/// the host placement here.
-fn logHostRam(b: *const Bench) !void {
-    const io = b.ctx.io;
-    const resolved = b.resolved;
-    const resources: resolve_mod.Resources = .{ .ram_free = b.boot.ramFree(io) };
-
-    const host = resolved.cpu orelse
-        resolve_mod.hostPlacement(
-            .bench,
-            b.boot.input,
-            b.loaded.card,
-            b.kvDtype(),
-            resolved.window,
-            resources,
-        );
-    switch (host) {
-        .ok => |layer_choice| boot_lines.logRamQuote(layer_choice.quote, false),
-        .refused => |r| return boot_lines.refuse(io, b.model.pub_name, r),
-    }
 }

@@ -166,6 +166,36 @@ pub fn fusedOn(io: Io, boot: *const DeviceBoot, ctxp: anytype) !device_placement
     };
 }
 
+/// Log the RAM quote of the all-host placement, or refuse. A per-op vulkan boot resolved a device
+/// placement, so it resolves the host placement here.
+pub fn hostQuote(
+    io: Io,
+    boot: *const DeviceBoot,
+    kv_dtype: dtype.KvDtype,
+    window: resolve_mod.Window,
+    placement: ?resolve_mod.Result(resolve_mod.HostPlacement),
+) !void {
+    const resources: resolve_mod.Resources = .{ .ram_free = boot.ramFree(io), .model = boot.model };
+
+    const result = placement orelse
+        resolve_mod.hostPlacement(boot.kind, boot.input, boot.card, kv_dtype, window, resources);
+    switch (result) {
+        .ok => |host| boot_lines.logRamQuote(host.quote, false),
+        .refused => |r| return boot_lines.refuse(io, boot.entry.pub_name, r),
+    }
+}
+
+/// Refuse a `--gpu-layers` pin past the layer count. It costs no device, so it runs before the
+/// device opens.
+pub fn refusePastModel(io: Io, pin: ?u32, n_layers: u32) error{UsageError}!void {
+    const n_gpu = pin orelse return;
+
+    if (n_gpu > n_layers) {
+        const fmt = "--gpu-layers {d} exceeds the model's {d} layers";
+        return args.fail(io, fmt, .{ n_gpu, n_layers });
+    }
+}
+
 /// The weight census of one model and the reservations of its fused runner. A build without the
 /// fused ops measures the census only.
 pub fn modelNeeds(loaded: *const loader.Loaded) resolve_mod.ModelNeeds {
