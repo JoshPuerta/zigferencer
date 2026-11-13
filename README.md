@@ -1,4 +1,10 @@
-# Zigferencer
+<h1 align="center">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="docs/assets/logo-dark.svg">
+    <source media="(prefers-color-scheme: light)" srcset="docs/assets/logo-light.svg">
+    <img src="docs/assets/logo-light.svg" alt="Zigferencer" width="480">
+  </picture>
+</h1>
 
 zigferencer is a small inference engine for LLMs (to be extended), written
 in Zig 0.16. It reads a model file in the GGUF format and runs the model, with some extra conveniences.
