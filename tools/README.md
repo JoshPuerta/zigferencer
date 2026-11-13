@@ -1,8 +1,8 @@
 # Tools
 
-This directory holds the development edge: the benchmarks, a symbol-export probe, a shader linter,
-the token-hash gates, and the profiler driver. It is the relaxed side of the strict-core split.
-The `Makefile` names a script only when a target needs more than 3 lines.
+This directory holds the development tools: the benchmarks, a symbol-export probe, a shader linter,
+the token-hash gates, and the profiler driver. The `Makefile` names a script only when a target
+needs more than 3 lines.
 
 ## Files
 
@@ -28,8 +28,7 @@ The `Makefile` names a script only when a target needs more than 3 lines.
 ## How the pieces fit
 
 The files form three groups. The bench files measure ops, the probe and linter check the build
-output, and the scripts drive the two binaries. The bench and probe files read the engine through
-the `zigferencer` module and mutate no engine state.
+output, and the scripts drive the two binaries.
 
 | Value | File | Holds | Made by | Read by |
 | --- | --- | --- | --- | --- |

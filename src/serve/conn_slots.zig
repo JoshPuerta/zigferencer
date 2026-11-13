@@ -2,8 +2,8 @@
 //! it. `engine.zig` holds the queue and the socket of slot i in `conns[i]`, and this table decides
 //! who can touch them.
 //!
-//! Comptime. The schedule test takes the slot rules as a type, so one schedule drives the old
-//! rules and the current rules.
+//! Comptime. The schedule test takes the slot rules as a type, so one schedule drives the real
+//! rules and each broken-rule variant.
 //!
 //! Role. This file holds the control rules alone, so a test can call the steps of all three
 //! threads from one thread, in any order that the rules of each thread allow.

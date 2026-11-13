@@ -1,12 +1,12 @@
 //! GGUF `ggml_type` enum plus per-type block geometry: how many bytes a tensor of N elements
 //! occupies on disk and in memory.
 //!
-//! Kernel coverage. The kernels read F32 and Q8_0 directly and dequantize Q4_0 and Q6_K at load.
-//! The enum lists the other types so the parser can recognize a mixed GGUF. `blockSize` and
-//! `bytesPerBlock` panic on a type no kernel handles, because a loud failure beats a silently wrong
-//! one. The k-quant sizes exist so the loader can map a mixed GGUF. Only q6_k has kernels: a CPU
-//! dequant-and-dot linear for the Q6_K logit head of a Q4_0 file, and a load-time requantize to
-//! q4_0 for the GPU path.
+//! Kernel coverage. The CPU kernels read F32, Q8_0, Q4_0, Q4_1, and Q6_K directly. The GPU kernels
+//! read Q8_0 and Q4_0. The enum lists the other types so the parser can recognize a mixed GGUF.
+//! `blockSize` and `bytesPerBlock` panic on a type no kernel handles, because a loud failure beats
+//! a silently wrong one. The k-quant sizes exist so the loader can map a mixed GGUF. Of the
+//! k-quants, only q6_k has kernels: a CPU dequant-and-dot linear for the Q6_K logit head of a Q4_0
+//! file, and a load-time requantize to q4_0 for the GPU path.
 //!
 //! Block geometry. It is the unit every kernel iterates over. A row of N weights is N/32
 //! contiguous blocks. An f16 scale `d` leads each block:

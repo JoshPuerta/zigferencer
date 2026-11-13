@@ -19,8 +19,7 @@ binary runs, if the build has `-Dtrace=true`.
 A command writes the trace of the engine to a Perfetto protobuf file when
 `$ZIGFERENCER_TRACE_OUT` names one. The binary must come from a `-Dtrace=true` build.
 
-> Note: The `offcpu` step needs root (`sudo`). Work to replace it is in progress, so you
-> can skip it for now.
+> Note: The `offcpu` step needs root (`sudo`).
 
 ## Two kinds of evidence
 
@@ -182,13 +181,11 @@ and `gpu_backsteps` counts it.
 
 **The cost of timestamps.** A timestamp changes the commands of a command buffer.
 A time taken at `submit` or `phases` is therefore close to the time without
-timestamps, not equal to it. The tokens stay equal at every level. The main cost was
-the readback. Before, the engine read the stamps with the wait flag, and the driver made
-one blocking call for each stamp. The engine now reads them without the flag, after the
-wait that it already does. Take a Qwen3.5-2B decode on an RDNA2 card.
-One run each took 8.83 ms for each token at `off`, 8.96 ms at `submit`, and 9.05 ms
-at `phases`. Before the fix, `phases` took 29.41 ms. `phases` is
-now fit for the timeline and for the proportions between ops.
+timestamps, not equal to it. The tokens stay equal at every level. The engine reads
+the stamps without the wait flag, after the wait that it already does, so the readback adds
+no blocking call. Take a Qwen3.5-2B decode on an RDNA2 card. One run each took 8.83 ms for
+each token at `off`, 8.96 ms at `submit`, and 9.05 ms at `phases`. So `phases` is fit for
+the timeline and for the proportions between ops.
 
 **Counts.** The trace holds one instant, `trace_meta`, on the process track. It carries
 every count: `dropped`, `threads_dropped`, `orphan_spans`, `misnested`, `gpu_records`,

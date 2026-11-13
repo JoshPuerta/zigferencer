@@ -72,7 +72,8 @@ the GGUF structure. `core/registry.zig` computes the path that both paths use. `
   `Error` and a metadata fault is a loader `Error`.
 - A file that declares a context past `limits.max_model_ctx` loads at that bound, and the log names
   both numbers. A RoPE scaling the engine does not apply fails with `error.UnsupportedRopeScaling`.
-- The download is host-pinned and fail-safe. The host is fixed to huggingface.co. The organization
+- The download is fail-safe. The first request goes to huggingface.co, and the standard library
+  follows at most 3 redirects, which reach the CDN. The organization
   and repository names hold no slash. The file name is reduced to its basename and must end in
   `.gguf`, so the on-disk path cannot escape `<root>`. A non-identity content encoding fails the
   fetch. The redirect chain is bounded. The body lands in a `<file>.partial` temporary that only a

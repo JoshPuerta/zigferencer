@@ -40,16 +40,32 @@ const Windows = struct {
     serve: u32,
 };
 
+/// The outcome of a named selection. `model` prints each refusal, so a test reads the outcome
+/// without output.
+const Named = union(enum) {
+    found: *const registry.Model,
+    unknown,
+    absent: registry.Candidates,
+};
+
 // -- api --------------------------------------------------------------------
 
-/// Resolve a load command's model. A name goes through the registry lookup. With no name, a TTY
-/// gets the picker and a non-TTY gets an error. The pointer is into the static registry table.
+/// Resolve a load command's model. A name goes through the registry lookup and must name a file
+/// on disk. With no name, a TTY gets the picker and a non-TTY gets an error. The pointer is into
+/// the static registry table.
 pub fn model(ctx: context.Context, maybe_name: ?[]const u8) !*const registry.Model {
     if (maybe_name) |name| {
-        return registry.lookup(name) orelse {
-            unknownModel(ctx.io, name);
-            return error.UnknownModel;
-        };
+        switch (try named(ctx, name)) {
+            .found => |m| return m,
+            .unknown => {
+                unknownModel(ctx.io, name);
+                return error.UnknownModel;
+            },
+            .absent => |c| {
+                notOnDisk(ctx.io, name, c);
+                return error.ModelNotOnDisk;
+            },
+        }
     }
 
     if (!prompt.stdinIsTty(ctx.io)) {
@@ -245,4 +261,108 @@ fn unknownModel(io: Io, name: []const u8) void {
     w.print("error: model '{s}' is not in the registry\n", .{name}) catch return;
     w.writeAll("       (run 'zigferencer list' for available names)\n") catch return;
     w.flush() catch {};
+}
+
+fn named(ctx: context.Context, name: []const u8) std.mem.Allocator.Error!Named {
+    const m = registry.lookup(name) orelse return .unknown;
+    if ((try registry.locate(ctx.arena, ctx.io, ctx.models_root, m.*)) == null) {
+        return .{ .absent = try registry.candidates(ctx.arena, ctx.models_root, m.*) };
+    }
+
+    return .{ .found = m };
+}
+
+/// The absent-model error: both paths `locate` tried and the fetch command. The write is
+/// best-effort.
+fn notOnDisk(io: Io, name: []const u8, c: registry.Candidates) void {
+    var stderr_buffer: [error_buffer_bytes]u8 = undefined;
+    var stderr_writer: Io.File.Writer = .initStreaming(.stderr(), io, &stderr_buffer);
+    const w = &stderr_writer.interface;
+
+    writeNotOnDisk(w, name, c) catch return;
+    w.flush() catch {};
+}
+
+fn writeNotOnDisk(w: *Io.Writer, name: []const u8, c: registry.Candidates) Io.Writer.Error!void {
+    try w.print("error: model {s} is not on disk\n", .{name});
+    try w.print("       looked in {s}\n", .{c.local});
+    if (!c.sameFile()) {
+        try w.print("       and in {s}\n", .{c.store});
+    }
+
+    try w.print("       run 'zigferencer fetch {s}' to download it\n", .{name});
+}
+
+// -- tests ------------------------------------------------------------------
+
+test "a named model passes selection exactly when its file is on disk" {
+    var arena_state: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const io = std.testing.io;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try std.fmt.allocPrint(arena, ".zig-cache/tmp/{s}", .{&tmp.sub_path});
+    const ctx: context.Context = .{
+        .io = io,
+        .arena = arena,
+        .gpa = std.testing.allocator,
+        .args = &.{},
+        .stdout = undefined,
+        .models_root = root,
+        .cache_dir = "",
+        .vk_options = .{},
+        .color = false,
+        .color_err = false,
+    };
+
+    // The repo-local models dir of the test can hold every entry, and then no absent case exists.
+    const absent = for (registry.all()) |*m| {
+        if ((try registry.locate(arena, io, root, m.*)) == null) break m;
+    } else return error.SkipZigTest;
+
+    const refused = try named(ctx, absent.pub_name);
+    try std.testing.expectEqualStrings(
+        try registry.modelFilePath(arena, root, absent.*),
+        refused.absent.store,
+    );
+
+    // Put the file in the store, and the same name now resolves to the same entry.
+    try tmp.dir.createDirPath(io, absent.local_path);
+    const sub = try std.Io.Dir.path.join(arena, &.{ absent.local_path, absent.file_name });
+    const file = try tmp.dir.createFile(io, sub, .{});
+    file.close(io);
+    try std.testing.expectEqual(absent, (try named(ctx, absent.pub_name)).found);
+    try std.testing.expectEqual(absent, try model(ctx, absent.pub_name));
+    try std.testing.expect(try named(ctx, "no-such-model") == .unknown);
+}
+
+test "the absent-model error names the store path only when it differs" {
+    var buf: [error_buffer_bytes]u8 = undefined;
+
+    var two: Io.Writer = .fixed(&buf);
+    try writeNotOnDisk(&two, "Qwen3.5-2B-Q8_0", .{
+        .local = "models/org_repo/q.gguf",
+        .store = "/data/store/org_repo/q.gguf",
+    });
+    try std.testing.expectEqualStrings(
+        \\error: model Qwen3.5-2B-Q8_0 is not on disk
+        \\       looked in models/org_repo/q.gguf
+        \\       and in /data/store/org_repo/q.gguf
+        \\       run 'zigferencer fetch Qwen3.5-2B-Q8_0' to download it
+        \\
+    , two.buffered());
+
+    var one: Io.Writer = .fixed(&buf);
+    try writeNotOnDisk(&one, "Qwen3.5-2B-Q8_0", .{
+        .local = "models/org_repo/q.gguf",
+        .store = "models/org_repo/q.gguf",
+    });
+    try std.testing.expectEqualStrings(
+        \\error: model Qwen3.5-2B-Q8_0 is not on disk
+        \\       looked in models/org_repo/q.gguf
+        \\       run 'zigferencer fetch Qwen3.5-2B-Q8_0' to download it
+        \\
+    , one.buffered());
 }

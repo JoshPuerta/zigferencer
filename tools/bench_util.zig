@@ -1,5 +1,5 @@
 //! Shared bench helpers: timing, error measurement, and the colored table reporter. No section
-//! logic lives here. It is the common datapath that the per-op files build their rows on.
+//! logic lives here. The per-op files build their rows on these helpers.
 //!
 //! Reporter. The reporter buffers a group of rows, the variants benched for one case, and prints
 //! them together. The fastest row tints green and the slowest red. The buffer is display state

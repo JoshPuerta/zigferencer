@@ -2344,11 +2344,10 @@ fn stagedCopy(
 }
 
 /// The refusal of a device failure during a fused init, or null for another error. The plan
-/// passed the preflight, so the text names the retry and not a smaller plan.
+/// passed the preflight, so the text names free device memory and the retry, not a smaller plan.
 fn deviceFailureText(err: anyerror) ?[]const u8 {
     const retry = " during the init of the fused runner, after the plan passed the VRAM " ++
-        "preflight. Run the command again. When the log shows a device removal, " ++
-        "first restart the virtual machine of the driver, for example with `wsl --shutdown`";
+        "preflight. Make sure that the device has enough free memory, then run the command again";
     return switch (err) {
         error.DeviceLost => "device: the driver removed the device" ++ retry,
         error.OutOfDeviceMemory => "device: the driver refused a device allocation" ++ retry,
@@ -2596,8 +2595,8 @@ fn hasError(comptime E: type, comptime name: []const u8) bool {
 test "a device failure at init names the retry, and another error names nothing" {
     for ([_]anyerror{ error.DeviceLost, error.OutOfDeviceMemory }) |err| {
         const text = deviceFailureText(err) orelse return error.TestExpectedText;
-        try testing.expect(std.mem.indexOf(u8, text, "Run the command again") != null);
-        try testing.expect(std.mem.indexOf(u8, text, "wsl --shutdown") != null);
+        try testing.expect(std.mem.indexOf(u8, text, "enough free memory") != null);
+        try testing.expect(std.mem.indexOf(u8, text, "run the command again") != null);
     }
 
     try testing.expectEqual(@as(?[]const u8, null), deviceFailureText(error.OutOfMemory));

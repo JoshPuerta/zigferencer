@@ -210,6 +210,7 @@ fn isUserError(err: anyerror) bool {
     return switch (err) {
         error.UsageError,
         error.UnknownModel,
+        error.ModelNotOnDisk,
         error.UnknownSubcommand,
         error.NoModelsPresent,
         error.BadHfPath,
@@ -333,7 +334,7 @@ test {
     _ = test_fixtures;
     _ = vocab;
     _ = chat;
-    // A test binary has no `main`, so name `dispatchRelease` here..
+    // A test binary has no `main`, so name `dispatchRelease` here.
     _ = &cli.command.dispatchRelease;
     // CLI sub-modules whose tests belong under `zig build test`.
     _ = @import("cli/info/arch_matrix.zig");
@@ -353,6 +354,7 @@ test {
     _ = @import("cli/fetch_cmd.zig");
     _ = @import("cli/inspect_cmd.zig");
     _ = @import("cli/prompt.zig");
+    _ = @import("cli/select.zig");
     _ = @import("cli/boot/boot_resources.zig");
     _ = @import("cli/boot/boot_lines.zig");
     _ = @import("cli/boot/codec_parts.zig");

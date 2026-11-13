@@ -1,9 +1,7 @@
 # Tests
 
-This directory holds the cross-module integration tests. Each file drives the engine end to end
-through the `zigferencer` module, against real collaborators and a real GGUF on disk. A file here
-owns a fixture and a device probe, where the `test {}` blocks beside each `src/` module own a unit.
-A host without the model or without a GPU skips the test, and the suite stays green.
+This directory holds the cross-module integration tests. A host without the model or without a
+GPU skips the test, and the suite stays green.
 
 ## Files
 
@@ -14,6 +12,7 @@ A host without the model or without a GPU skips the test, and the suite stays gr
 | `tokenizer_qwen_test.zig` | The `qwen35` ids and the added tokens against `llama-tokenize`. |
 | `gguf_smollm2_test.zig` | The `ModelCard` that `mmap`, the parser, and the loader build from SmolLM2. |
 | `tokenizer_smollm2_test.zig` | The encode and decode round trip on the SmolLM2 vocab. |
+| `chat_prompt_test.zig` | Request text that holds control strings, on the vocab of each chat family. |
 | `llama_prefix_runner_test.zig` | A Llama runner over a layer span against the whole-model runner. |
 | `qwen_prefix_runner_test.zig` | The same for the Qwen runner, plus the blob of a prefix. |
 | `llama_hybrid_residency_test.zig` | The swap blob of the Llama hybrid across two tiers. |
@@ -72,11 +71,6 @@ gates skip the model and build synthetic inputs.
       GPU runners:            device probe --> fused or hybrid runner against the CPU runner
       kernel gates:           device probe --> one kernel against its CPU op, with no GGUF
 ```
-
-The equivalence files share one shape. They build a one-slot reference path and a multi-slot
-batched path, then compare the two. The reference is always the single-sequence run, so each file
-stores no external golden. The snapshot and tokenizer files are the exception: their expected
-values come from the llama.cpp reference and live in the file.
 
 ## Rules
 

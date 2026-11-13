@@ -15,10 +15,8 @@
 //! `fetch` downloads into the store.
 //!
 //! KV defaults. An f16 default means outputs are byte identical to f32 and the reference hashes do
-//! not move. Llama-3.1-8B Q8_0: latency at parity or ahead, double the serve residency, and 1.78x
-//! swap. Qwen 2B: byte identical across backends and dtypes at depth, fused prefill 7 % ahead,
-//! every other path at parity, and blobs shrink to 0.64x because the GDN state stays f32. Qwen 9B:
-//! the 2B shape at four times the scale, with about 110 slots in free VRAM where f32 fits about 88.
+//! not move. An f16 KV is half the size, so the same memory holds more sessions and a swap moves
+//! fewer bytes. The GDN state of a Qwen model stays f32.
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
@@ -175,6 +173,17 @@ pub const SamplingCard = struct {
     non_thinking: Recommended,
 };
 
+/// The repo-local path and the store path of one model file. They are equal when the store root
+/// is the repo-local root.
+pub const Candidates = struct {
+    local: []const u8,
+    store: []const u8,
+
+    pub fn sameFile(c: Candidates) bool {
+        return std.mem.eql(u8, c.local, c.store);
+    }
+};
+
 /// Static descriptor for a model the engine knows how to fetch and run.
 /// All fields are string slices into the binary's read-only data.
 pub const Model = struct {
@@ -217,6 +226,19 @@ pub fn modelFilePath(arena: Allocator, root: []const u8, model: Model) Allocator
     return std.Io.Dir.path.join(arena, &.{ root, model.local_path, model.file_name });
 }
 
+/// The two paths `locate` tries, in its order. A refusal names both, so the user sees where the
+/// file must go.
+pub fn candidates(
+    arena: Allocator,
+    root: []const u8,
+    model: Model,
+) Allocator.Error!Candidates {
+    return .{
+        .local = try modelFilePath(arena, default_models_root, model),
+        .store = try modelFilePath(arena, root, model),
+    };
+}
+
 /// The path `model`'s GGUF is on disk at, or null when it is absent. The repo-local `models/`
 /// wins over the store at `root`. A non-null result names a file that exists.
 pub fn locate(
@@ -226,27 +248,23 @@ pub fn locate(
     model: Model,
 ) Allocator.Error!?[]const u8 {
     var cwd = Io.Dir.cwd();
-    const local = try std.Io.Dir.path.join(
-        arena,
-        &.{ default_models_root, model.local_path, model.file_name },
-    );
-    if (fileExists(io, &cwd, local)) {
-        log.debug("model resolve: {s} -> local {s}", .{ model.pub_name, local });
-        return local;
+    const c = try candidates(arena, root, model);
+    if (fileExists(io, &cwd, c.local)) {
+        log.debug("model resolve: {s} -> local {s}", .{ model.pub_name, c.local });
+        return c.local;
     }
 
-    const configured = try modelFilePath(arena, root, model);
-    if (!std.mem.eql(u8, configured, local) and fileExists(io, &cwd, configured)) {
-        log.debug("model resolve: {s} -> store {s}", .{ model.pub_name, configured });
-        return configured;
+    if (!c.sameFile() and fileExists(io, &cwd, c.store)) {
+        log.debug("model resolve: {s} -> store {s}", .{ model.pub_name, c.store });
+        return c.store;
     }
 
     log.debug("model resolve: {s} -> absent", .{model.pub_name});
     return null;
 }
 
-/// Path to load `model` from: where it is, or the target of a fresh download when it is absent,
-/// so a load failure names that location.
+/// Path to load `model` from: where it is, or the store path when it is absent. Every CLI caller
+/// passes `select.model` first, and that refuses an absent file before this call.
 pub fn resolveLoadPath(
     arena: Allocator,
     io: Io,

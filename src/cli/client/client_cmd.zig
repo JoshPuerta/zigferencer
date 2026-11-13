@@ -13,7 +13,7 @@
 //! with the original system prompt, and appends the newest turns that fit.
 //! `client_transcript.zig` holds every compaction decision.
 //!
-//! Reconnect. With `--resume-ttl`, a drop enters `reconnecting`. The control unit dials at most
+//! Reconnect. With `--resume-ttl`, a drop enters `reconnecting`. The client dials at most
 //! `reconnect_attempts_max` times, then resumes with the stored token and lets `reconcile` judge
 //! the turn in flight. A failed resume rebuilds the session from the transcript.
 

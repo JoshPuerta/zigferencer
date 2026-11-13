@@ -277,8 +277,8 @@ The three commands differ in what sits around the runner.
   row for each active session, plus prompt rows of a waiting turn. The weights then
   are read from memory once for all sessions, not once for each session. A session
   keeps its KV cache between turns, so a follow-up turn prefills only its new
-  tokens. Clients speak a small binary protocol over ZMQ (the goal for this small 
-  protocol is to make it easily embedable in other systems).
+  tokens. Clients speak a small binary protocol over ZMQ (the goal for this small
+  protocol is to make it easily embeddable in other systems).
 - **`serve-openai`** runs the same engine and scheduler behind the OpenAI HTTP API.
 
 `run` and `serve` are separate commands because they need different parts. `run`
@@ -637,9 +637,9 @@ A dispatch takes no lock and allocates nothing.
 - **`--threads N`** sets the participants. `0` or no flag takes the physical cores
   from the sysfs topology, at most 8. Without sysfs it takes half the logical CPUs. 
   On a desktop with two memory channels, decode fills the bandwidth between 4 and 8 threads, 
-  and prefill gains up to 8. A named value can go up to `limits.max_threads`. 
+  and prefill gains up to 8. A named value can go up to `limits.max_threads`.
   A placement that runs no CPU op, such as the fused GPU placement, gets one thread.
-- **`--min-parallel-flops F`** is the fan-out floor. An op below `F` flops
+- **`--min-parallel-flops F`** is the fan-out floor. An op below `F`
   operations runs on the caller and does not touch the pool. A dispatch has a fixed
   cost, and a small op ends before the workers wake. For example, a 576 x 576
   matrix-vector product is 2 x 576 x 576 = 663,552 operations, above the default

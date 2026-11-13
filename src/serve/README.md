@@ -472,8 +472,8 @@ cut.
 
 ### Validated clients
 
-Compatibility is a claim about named clients, and tests keep it true. The table
-names each client and the way the claim holds for it.
+Compatibility is a claim about named clients. The table names each client and the way
+the claim holds for it: a test keeps the first row true, and the second row is a manual check.
 
 | Client | Version | Transports | How |
 | --- | --- | --- | --- |

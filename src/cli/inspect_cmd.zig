@@ -50,8 +50,8 @@ const Flags = struct {
     pub const docs = .{
         .raw = args.Doc{
             .value = "PATH",
-            .text = "dump every raw KV + tensor straight from the parser, bypassing\n" ++
-                "the loader, for an architecture the loader does not accept",
+            .text = "dump every raw metadata pair and tensor straight from the parser,\n" ++
+                "bypassing the loader, for an architecture the loader does not accept",
         },
     };
 };
@@ -196,7 +196,7 @@ fn dumpRaw(ctx: context.Context, path: []const u8) !void {
     try w.flush();
 }
 
-/// One-line preview of a parsed KV value. A big array prints its length and a few elements.
+/// One-line preview of a parsed metadata value. A big array prints its length and a few elements.
 fn printValue(w: *std.Io.Writer, v: parser.Value) !void {
     switch (v) {
         .u8_val => |x| try w.print("{d} (u8)", .{x}),

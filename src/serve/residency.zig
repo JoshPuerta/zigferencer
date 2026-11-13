@@ -176,7 +176,7 @@ pub fn Residency(comptime SessionsT: type) type {
             self.ram_used += bytes;
         }
 
-        /// Book `bytes` out of the ledger. Crediting more than the ledger holds
+        /// Book `bytes` out of the ledger. Removing more than the ledger holds
         /// means the same blob was removed twice.
         fn removeRamUsed(self: *Self, bytes: u64) void {
             std.debug.assert(bytes <= self.ram_used);

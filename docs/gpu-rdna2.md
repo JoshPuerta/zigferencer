@@ -6,7 +6,7 @@ of that GPU that decide how fast a kernel runs. The header of each shader in `sr
 of each file in `src/ops_vulkan/kernels/` holds the details. Another RDNA2 or RDNA3 card
 changes the numbers, but ideally not the method.
 
-Take this as a condensed material from investigations while writting the kernels.
+Take this as condensed material from investigations while writing the kernels.
 
 ## 1. Words: CUDA, Vulkan, and AMD
 
@@ -58,9 +58,9 @@ Two failures set the line and the messages of this driver.
   11676 MiB, between the two plans. So the Vulkan-on-D3D12 row of `limits.vram_shares` is
   3/4. This row is a heuristic from this one setup. Another setup, for example a native
   Linux driver, uses the default row of 7/8 and can plan more of the card.
-- A Llama-8B Q8_0 fused run at a plan of 9737 MiB lost the device once during the
-  weight upload. The same run passed when it ran again, and the cause is not proven.
-  This plan is under both lines, so the 3/4 row does not explain it.
+- A Llama-8B Q8_0 fused run at a plan of 9737 MiB loses the device during the weight
+  upload in some runs. The same command passes in other runs of the same build, and the
+  cause is not proven. This plan is under both lines, so the 3/4 row does not explain it.
 
 What changed after these failures:
 
@@ -69,8 +69,10 @@ What changed after these failures:
 - `ZIGFERENCER_LOG=runner` prints the budget and the usage of each memory heap before
   and after the weight upload.
 - A device loss or a refused allocation during the init of a fused runner stops with a
-  message that names the retry, and a restart of the virtual machine first
-  (`wsl --shutdown` under WSL2) when the log shows a device removal.
+  message that asks for enough free device memory and a retry. Under WSL2, restart the
+  virtual machine first (`wsl --shutdown`) when the log shows a device removal.
+
+The second failure occurred again after these changes, so they do not remove it.
 
 A native Linux driver such as RADV removes most of these limits. It reports 64 KiB
 of shared memory and the real storage range, and the vendor profilers work with it.

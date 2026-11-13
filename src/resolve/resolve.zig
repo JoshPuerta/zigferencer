@@ -84,8 +84,7 @@ pub const ServeShape = struct {
 pub const Input = struct {
     engine: EngineFlags = .{},
     serve: ServeShape = .{},
-    /// `run --prompt-cache`. The qwen fused placement sizes the cache in its RAM
-    /// RAM plan.
+    /// `run --prompt-cache`. The qwen fused placement sizes the cache in its RAM plan.
     prompt_cache: bool = false,
 };
 

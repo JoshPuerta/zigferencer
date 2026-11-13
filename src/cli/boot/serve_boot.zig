@@ -519,7 +519,7 @@ fn serveCpu(
 }
 
 /// Log the boot lines of the all-host serve placement: the prefix default, the plan, and the RAM
-/// RAM plan. A refusal stops the boot and logs no line.
+/// plan. A refusal stops the boot and logs no line.
 fn logHostPlacement(
     io: Io,
     name: []const u8,

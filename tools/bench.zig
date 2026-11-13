@@ -6,10 +6,9 @@
 //!
 //! Comptime. `build_options.use_vulkan` gates the GPU code, so a CPU build never reads it.
 //!
-//! Layout. `main` is the control unit. It owns the lifetime of the GPU runner and drives the
-//! section files. `bench_util` holds the shared timing and printing helpers. The per-family
-//! sections live in `bench_matmul`, `bench_layer`, `bench_gdn`, `bench_parallel`, and
-//! `bench_transfer`.
+//! Layout. `main` owns the lifetime of the GPU runner and drives the section files. `bench_util`
+//! holds the shared timing and printing helpers. The per-family sections live in `bench_matmul`,
+//! `bench_layer`, `bench_gdn`, `bench_parallel`, and `bench_transfer`.
 //!
 //! GPU runner. One runner gives every GPU variant the same Context and the same persistent
 //! buffers inside each kernel. A Vulkan init failure prints a banner and leaves every CPU row to

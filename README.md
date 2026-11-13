@@ -32,7 +32,7 @@ $ curl -s localhost:8080/v1/chat/completions -H 'Content-Type: application/json'
 
 One of the main goals of this project is to provide a sandbox to tinker with small models and kernels implemented on
 non-typical hardware, using Zig. Don't expect a production-grade inference engine (not because of Zig, but due to the scope).
-Another side-quest was to minimize dependencies (that's one of the reason for the size of the repo).
+Another side-quest was to minimize dependencies (that's one of the reasons for the size of the repo).
 
 - **Models:** the Llama 3 family and the Qwen3.5 hybrid family (not all quantizations, check registered models with `list`)
 - **Hardware:** x86_64 CPUs, with scalar and AVX2 paths, and GPUs through Vulkan.
@@ -62,6 +62,9 @@ backend:
 | `vulkan` | GPU | One GPU dispatch per operation. It is a correctness reference and does not target performance: one dispatch per operation is costly. |
 | `vulkan_fused` | GPU | The whole model step in one GPU submission. It is the fast GPU path. `--gpu-layers` can also split the layers between the CPU and the GPU. |
 
+The servers have no TLS and no authentication, and they bind to 127.0.0.1 by default. To reach
+one from another network, put a reverse proxy or a tunnel that adds both in front of it.
+
 The engine is also a Zig module. A dependent package reads it with `dep.module("zigferencer")`,
 and its API can change in any release.
 
@@ -81,9 +84,11 @@ sudo apt install glslc libvulkan-dev
 
 - **CPU build.** It needs only Zig 0.16.0. The binary links no libc and is static. By default the
   build targets the CPU that builds it, and `-Dcpu=x86_64_v3` gives a binary for any x86_64 CPU of
-  that level. The CPU build also compiles for Windows and macOS, which are not tested yet.
+  that level. The CPU build also passes the compile check for Windows and macOS, which are not tested yet.
 - **`fetch`.** It downloads over HTTPS from huggingface and needs no account and no token. It does
-  not read `HTTPS_PROXY`. `$ZIGFERENCER_MODELS_DIR` moves the model store.
+  not read `HTTPS_PROXY`. It writes to `models/` under the current directory, or to
+  `$ZIGFERENCER_MODELS_DIR` when that is set. A command looks in `models/` first, then in that
+  store, and `list` prints where each model is.
 - **GPU build.** It reads the Vulkan registry that `libvulkan-dev` installs. Another distribution
   passes its path with `-Dvk-registry`.
 - **GPU run.** It needs a Vulkan 1.2 driver with `VK_EXT_subgroup_size_control`, 16-bit storage,
@@ -116,24 +121,21 @@ make help    # every target and variable
 zig-out/bin/zigferencer fetch SmolLM2-135M-Instruct-Q8_0  # download the small test model
 zig-out/bin/zigferencer run SmolLM2-135M-Instruct-Q8_0 --prompt "Tell me a joke" --max-tokens 64
 zig-out/bin/zigferencer serve SmolLM2-135M-Instruct-Q8_0 --port 8000 --max-sessions 4
-zig-out/bin/zigferencer client --connect 127.0.0.1:8000
+zig-out/bin/zigferencer client --connect 127.0.0.1:8000  # in a second terminal
 zig-out/bin/zigferencer info  # host CPU, RAM, SIMD, and the backends this build can run
+
+zig-out/bin/zigferencer fetch Qwen3.5-2B-Q8_0  # the model of the examples above, about 2 GB
 ```
 
 `make build BACKEND=vulkan_fused` builds the GPU binary, and `make debug` builds for lldb or gdb.
 
 `zig build --help` lists every build option. `zigferencer --help` lists the commands. The
-benchmarks, the kernel checks are in a second executable, `zigferencer-dev`.
+benchmarks and the kernel checks are in a second executable, `zigferencer-dev`.
 `make build` installs both.
 
 ## Performance
 
-One desktop made these numbers, the host of the worked example in
-[`docs/architecture.md`](docs/architecture.md), section 9.
-
-Table TBD
-
- To measure your own host, run:
+To measure your own host, run:
 
 ```bash
 zigferencer-dev bench-model MODEL --prompt-tokens 512 --max-tokens 128 --ignore-eos --runs 3
@@ -151,6 +153,18 @@ zigferencer-dev bench-serve MODEL --max-tokens 128
   or gdb.
 - Each top-level source directory (`src/*`, `tests/`, `tools/`) has a `README.md`
   with one row per file and a short guide to the directory.
+
+## Roadmap
+
+Planned after this release, in no fixed order:
+
+- A Windows port, with performance numbers on the native AMD driver.
+- MacOS and metal.
+- Better kernels.
+- Numbers from a native Linux run on RADV.
+- More model families, and models with other KV cache designs (a sliding window, sparse attention).
+- An evented serve layer.
+- More of the OpenAI API: `tools`, `logprobs`, and `stream_options`.
 
 ## How this was built
 

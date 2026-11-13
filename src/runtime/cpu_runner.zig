@@ -1,8 +1,7 @@
 //! `CpuRunner(Family)` runs the forward pass of one family on the CPU over a bounded set of KV
-//! slots. `Family` is the decoder layer file of the family: `llama_layer` or `qwen_layer`. This
-//! file is the control unit. It holds the weights of each layer, the KV slots, the recurrent slabs,
-//! the scratch, and the bookkeeping of each step. Every numerical op writes into a
-//! slice that the runner owns.
+//! slots. `Family` is the decoder layer file of the family: `llama_layer` or `qwen_layer`. The
+//! runner holds the weights of each layer, the KV slots, the recurrent slabs, the scratch, and the
+//! bookkeeping of each step. Every numerical op writes into a slice that the runner owns.
 //!
 //! Comptime. `assertFamily` checks `Family`, `findRole` names each weight role, and
 //! `core_log.hot` removes the trace code.

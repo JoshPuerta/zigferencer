@@ -19,7 +19,7 @@ const device_placement = zigferencer.resolve.device_placement;
 
 comptime {
     if (!build_options.use_vulkan_fused_ops) {
-        @compileError("cli/bench_model_fused.zig was included in a non-fused build.");
+        @compileError("dev/bench_model/bench_model_fused.zig was included in a non-fused build.");
     }
 }
 

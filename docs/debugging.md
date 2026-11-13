@@ -222,5 +222,4 @@ background task. Set `isBackground` to true, and add a `background` block to the
 
 The flag `--color off` removes the progress escape codes from the output. The flag
 `--summary all` prints two lines for a clean cycle, so the Problems panel clears a fixed finding at
-once. A watch holds the build lock while it runs, so call plain `zig` and not a wrapper that shares
-the lock with other builds.
+once.

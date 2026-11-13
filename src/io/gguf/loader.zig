@@ -5,7 +5,7 @@
 //! Comptime. The refusal level is a comptime parameter, and an assert pins the load errors to
 //! `LoadError`.
 //!
-//! Validation in pairs. The parser asserts the byte-level form. This layer asserts semantic
+//! Validation in pairs. The parser checks the byte-level form. This layer checks semantic
 //! completeness: every architecture key resolves, the dtype and shape make sense, and the engine
 //! bounds in `limits.zig` hold. Neither side trusts the other.
 //!
