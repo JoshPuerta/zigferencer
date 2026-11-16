@@ -41,8 +41,10 @@ add the target: `zig build simd-probe -Dtarget=aarch64-linux-gnu -Dcpu=cortex_a7
 The width column answers one question: did this kernel vectorize, and how wide? A backend that
 must reach 256-bit or NEON and reports `scalar` did not vectorize. A kernel below the target
 ceiling is headroom, not a bug. The `naive` kernels are the scalar reference by design. The f32
-kernels emit a separate multiply and add instead of a fused fma or fmla, which keeps them
-bit-identical with that reference. The cross-backend token-hash gate rests on that equality. The
+kernels emit a separate multiply and add instead of a fused fma or fmla. That keeps them free of
+fused rounding, so a kernel that keeps the order of another gives its bits. The simd and simd_pf
+Q8_0 linears share one source and give the same bits. The naive kernels sum in a different
+order, so the SIMD kernels differ from them inside the declared tolerance. The
 attention part kernels of simd and simd_pf fuse, and a test holds them to a measured tolerance.
 An op under `naive` alone is one that every backend shares.
 

@@ -66,6 +66,10 @@ const Tensor = @import("../core/tensor.zig").Tensor;
 const max_head_dim: usize = limits.attn_max_head_dim;
 const max_group: usize = limits.attn_max_group;
 
+/// The pairs per block of `ropeHeads`. A wider rope runs in several blocks, and the cosine and
+/// sine tables take this size on the stack.
+const rope_block_pairs: usize = limits.attn_max_head_dim / 2;
+
 /// The naive variant runs anywhere.
 pub const requires: op_requires.OpRequires = .{ .arch = .any };
 
@@ -78,6 +82,14 @@ pub const RopeStyle = enum {
     norm,
     /// Half-split pairs (x[i], x[i + rope_dim/2]).
     neox,
+};
+
+/// The rope values of one model. `thetas` holds the base angle of each rotated pair, so the
+/// rotated width is `2 * thetas.len`. `factors` is the frequency divisor of each pair, or null
+/// for the plain frequencies.
+pub const RopeTable = struct {
+    thetas: []const f32,
+    factors: ?[]const f32,
 };
 
 // -- api --------------------------------------------------------------------
@@ -761,6 +773,88 @@ pub fn ropeInplace(
     }
 }
 
+/// Fill the base angle of each rotated pair, `freq_base^(-2i/D)` with `D = 2 * thetas.len`. Each
+/// entry holds the value that `ropeInplace` computes for the same pair.
+pub fn fillRopeThetas(thetas: []f32, freq_base: f32) void {
+    std.debug.assert(thetas.len >= 1);
+
+    const inv_dim_f: f32 = 1.0 / @as(f32, @floatFromInt(2 * thetas.len));
+    for (thetas, 0..) |*t, i| {
+        const exp_v = -2.0 * @as(f32, @floatFromInt(i)) * inv_dim_f;
+        t.* = std.math.pow(f32, freq_base, exp_v);
+    }
+
+    if (std.debug.runtime_safety) {
+        for (thetas) |t| {
+            std.debug.assert(std.math.isFinite(t));
+        }
+    }
+}
+
+/// The RoPE of every head of `q` and `k` for one row at `pos`. It computes the cosine and the sine
+/// of each pair once, because the angle does not depend on the head. Each element gets the
+/// operations of `ropeInplace`.
+pub fn ropeHeads(
+    q: []f32,
+    k: []f32,
+    head_dim: usize,
+    pos: u32,
+    table: RopeTable,
+    style: RopeStyle,
+) void {
+    // Check the arguments.
+    const half = table.thetas.len;
+    std.debug.assert(half >= 1);
+    std.debug.assert(2 * half <= head_dim);
+    std.debug.assert(q.len >= head_dim);
+    std.debug.assert(q.len % head_dim == 0);
+    std.debug.assert(k.len % head_dim == 0);
+
+    if (table.factors) |ff| std.debug.assert(ff.len >= half);
+
+    // A block of pairs shares its angles across heads, so the tables hold each angle once.
+    var cos_tab: [rope_block_pairs]f32 = undefined;
+    var sin_tab: [rope_block_pairs]f32 = undefined;
+    const pos_f: f32 = @floatFromInt(pos);
+    var lo: usize = 0;
+    while (lo < half) : (lo += rope_block_pairs) {
+        const n = @min(rope_block_pairs, half - lo);
+        for (0..n) |j| {
+            const ff_v: f32 = if (table.factors) |ff| ff[lo + j] else 1.0;
+            const angle = pos_f * table.thetas[lo + j] / ff_v;
+            cos_tab[j] = @cos(angle);
+            sin_tab[j] = @sin(angle);
+        }
+
+        // Rotate the block in every head of q, then of k.
+        for ([_][]f32{ q, k }) |xs| {
+            var base: usize = 0;
+            while (base < xs.len) : (base += head_dim) {
+                const x = xs[base..][0..head_dim];
+                for (cos_tab[0..n], sin_tab[0..n], lo..) |cos_v, sin_v, i| {
+                    const ia: usize = if (style == .norm) 2 * i else i;
+                    const ib: usize = if (style == .norm) 2 * i + 1 else i + half;
+                    const a = x[ia];
+                    const b = x[ib];
+                    x[ia] = a * cos_v - b * sin_v;
+                    x[ib] = a * sin_v + b * cos_v;
+                }
+            }
+        }
+    }
+
+    if (std.debug.runtime_safety) {
+        for ([_][]f32{ q, k }) |xs| {
+            var base: usize = 0;
+            while (base < xs.len) : (base += head_dim) {
+                for (xs[base..][0 .. 2 * half]) |v| {
+                    std.debug.assert(std.math.isFinite(v));
+                }
+            }
+        }
+    }
+}
+
 /// One part of a decode attention row: heads `[h_lo, h_hi)` over positions `[t_lo, t_hi)`, one
 /// record per head. It walks the heads of a KV head in blocks of `max_group`, so each K and V row
 /// widens once per block, and the bits of a head never depend on its block.
@@ -1370,6 +1464,102 @@ test "rope freq_factors divide the rotation angle" {
     ropeInplace(&x, 1, 4, 10000.0, .norm, &ff);
     try std.testing.expectApproxEqAbs(@cos(@as(f32, 0.5)), x[0], 1e-6);
     try std.testing.expectApproxEqAbs(@sin(@as(f32, 0.5)), x[1], 1e-6);
+}
+
+/// One case of `expectRopeHeadsMatch`. The check rotates seeded random heads with `ropeHeads` and
+/// with `ropeInplace` per head, then compares bits.
+const RopeCase = struct {
+    head_dim: usize,
+    n_q: usize,
+    n_k: usize,
+    pos: u32,
+    table: RopeTable,
+    freq_base: f32,
+    style: RopeStyle,
+};
+
+fn expectRopeHeadsMatch(rc: RopeCase, rng: std.Random) !void {
+    const head_dim = rc.head_dim;
+    const n_q = rc.n_q;
+    const n_k = rc.n_k;
+    const pos = rc.pos;
+    const table = rc.table;
+    const freq_base = rc.freq_base;
+    const style = rc.style;
+    var q: [9 * 256]f32 = undefined;
+    var k: [3 * 256]f32 = undefined;
+    var q_ref: [9 * 256]f32 = undefined;
+    var k_ref: [3 * 256]f32 = undefined;
+    for (q[0 .. n_q * head_dim]) |*v| {
+        v.* = rng.float(f32) * 4.0 - 2.0;
+    }
+
+    for (k[0 .. n_k * head_dim]) |*v| {
+        v.* = rng.float(f32) * 4.0 - 2.0;
+    }
+
+    @memcpy(q_ref[0 .. n_q * head_dim], q[0 .. n_q * head_dim]);
+    @memcpy(k_ref[0 .. n_k * head_dim], k[0 .. n_k * head_dim]);
+    const rope_dim = 2 * table.thetas.len;
+    for (0..n_q) |h| {
+        const x = q_ref[h * head_dim ..][0..head_dim];
+        ropeInplace(x, pos, rope_dim, freq_base, style, table.factors);
+    }
+
+    for (0..n_k) |h| {
+        const x = k_ref[h * head_dim ..][0..head_dim];
+        ropeInplace(x, pos, rope_dim, freq_base, style, table.factors);
+    }
+
+    ropeHeads(q[0 .. n_q * head_dim], k[0 .. n_k * head_dim], head_dim, pos, table, style);
+    for (q[0 .. n_q * head_dim], q_ref[0 .. n_q * head_dim]) |a, b| {
+        try std.testing.expectEqual(@as(u32, @bitCast(b)), @as(u32, @bitCast(a)));
+    }
+
+    for (k[0 .. n_k * head_dim], k_ref[0 .. n_k * head_dim]) |a, b| {
+        try std.testing.expectEqual(@as(u32, @bitCast(b)), @as(u32, @bitCast(a)));
+    }
+}
+
+test "ropeHeads is bit-identical to ropeInplace per head" {
+    const Case = struct { head_dim: usize, rope_dim: usize, n_q: usize, n_k: usize };
+    const cases = [_]Case{
+        .{ .head_dim = 64, .rope_dim = 64, .n_q = 9, .n_k = 3 },
+        .{ .head_dim = 256, .rope_dim = 64, .n_q = 8, .n_k = 2 },
+        .{ .head_dim = 640, .rope_dim = 576, .n_q = 2, .n_k = 1 },
+    };
+    const positions = [_]u32{ 0, 1, 37, 8191, 100000 };
+    const bases = [_]f32{ 10000.0, 1000000.0 };
+    var prng = std.Random.DefaultPrng.init(0x5eed);
+    const widest_rope_pairs = 288;
+    var thetas: [widest_rope_pairs]f32 = undefined;
+    var factors: [widest_rope_pairs]f32 = undefined;
+    for (&factors, 0..) |*f, i| {
+        f.* = 1.0 + @as(f32, @floatFromInt(i)) / 7.0;
+    }
+
+    for (cases) |cs| {
+        const pairs = cs.rope_dim / 2;
+        for (bases) |base| {
+            fillRopeThetas(thetas[0..pairs], base);
+            for ([_]?[]const f32{ null, factors[0..pairs] }) |ff| {
+                const table: RopeTable = .{ .thetas = thetas[0..pairs], .factors = ff };
+                for ([_]RopeStyle{ .norm, .neox }) |style| {
+                    for (positions) |pos| {
+                        try expectRopeHeadsMatch(.{
+                            .head_dim = cs.head_dim,
+                            .n_q = cs.n_q,
+                            .n_k = cs.n_k,
+                            .pos = pos,
+                            .table = table,
+                            .freq_base = base,
+                            .style = style,
+                        }, prng.random());
+                    }
+                }
+            }
+        }
+    }
 }
 
 test "linearF32Batch is bit-identical to per-row linearF32 (strided outs)" {

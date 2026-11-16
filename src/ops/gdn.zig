@@ -42,10 +42,10 @@
 //! head j uses key head j mod n_k, NOT the contiguous j / v_per_k, because llama.cpp repeats q and
 //! k with ggml_repeat, which TILES the key heads. The 2B is the n_v == n_k case.
 //!
-//! Scale. `stepPrologue` scales q by 1/sqrt(head_dim) once per key head, so the scale lands
-//! exactly once even when v_per_k > 1. It matches llama.cpp `ggml_scale(q, 1/sqrt(S_k))` and
-//! feeds only the readout. Dropping it inflates the output about 1.5x, because eps breaks the
-//! scale invariance of the gated RMSNorm when the state is small.
+//! Scale. `stepPrologue` and `stepKeyHead` scale q by 1/sqrt(head_dim) once per key head, so the
+//! scale lands exactly once even when v_per_k > 1. It matches llama.cpp
+//! `ggml_scale(q, 1/sqrt(S_k))` and feeds only the readout. Dropping it inflates the output about
+//! 1.5x, because eps breaks the scale invariance of the gated RMSNorm when the state is small.
 //!
 //! Chunked form. `chunkScan` matches `recurStep` run over the T tokens in sequence, but the form
 //! is matrix ops plus one T x T strictly-lower-triangular solve. The serial t-loop collapses into
@@ -61,6 +61,9 @@
 //! Every decay factor is a product of d_u values in (0,1], so every ratio stays at or below 1.
 //! The scan is therefore stable across a full 128-token chunk, with no 1/A blow-up. A
 //! sub-chunked GPU port is a free choice under bounded shared memory, not a numerical need.
+//!
+//! Comptime. `recurPanel` takes its panel width at comptime, so the wide and narrow panels share
+//! one body.
 
 const std = @import("std");
 const limits = @import("../core/limits.zig");
@@ -70,6 +73,10 @@ const limits = @import("../core/limits.zig");
 /// Largest per-head state dimension that the stack scratch accepts. The loader refuses a larger
 /// state size.
 const max_head_dim: usize = limits.gdn_head_dim;
+
+/// The panel vector width of `recurStep`. One panel row is one AVX2 register.
+const lanes = 8;
+const Vec = @Vector(lanes, f32);
 
 // -- types ------------------------------------------------------------------
 
@@ -113,7 +120,8 @@ pub const Dims = struct {
 /// the state and the readout of its own heads. So disjoint ranges can run at the same time, and
 /// each head gets the bits of the serial step.
 pub const Heads = struct {
-    /// [convDim] q|k|v after `stepPrologue`: conv, SiLU, and the q and k norms.
+    /// [convDim] q|k|v after the conv, the SiLU, and the q and k norms of `stepPrologue` or of
+    /// `stepKeyHead`.
     qkv: []const f32,
     /// [inner] gate projection.
     z: []const f32,
@@ -328,7 +336,7 @@ pub fn stepPrologue(
     std.debug.assert(conv_state.len == d.convStateLen());
 
     // Run the conv and SiLU over the concatenated channels.
-    convStepSilu(d, conv_w, conv_state, qkv);
+    convStepSilu(d, conv_w, conv_state, qkv, 0, d.convDim());
     const q = qkv[0..key_dim];
     const k = qkv[key_dim .. 2 * key_dim];
 
@@ -391,8 +399,61 @@ pub fn stepHeads(d: Dims, heads: Heads, h_lo: usize, h_hi: usize) void {
     }
 }
 
+/// The conv, the norms, and the recurrence of key head `kh` and its value heads.
+/// It reads and writes only the channels, the ring entries, the states, and the readouts of
+/// those heads. So disjoint key heads can run at the same time.
+pub fn stepKeyHead(
+    d: Dims,
+    qkv: []f32,
+    conv_w: []const f32,
+    conv_state: []f32,
+    heads: Heads,
+    kh: usize,
+) void {
+    const dim = d.head_dim;
+    const key_dim = d.keyDim();
+    std.debug.assert(kh < d.n_k_heads);
+    std.debug.assert(dim <= max_head_dim);
+    std.debug.assert(heads.qkv.ptr == qkv.ptr);
+    std.debug.assert(heads.qkv.len == qkv.len);
+    std.debug.assert(qkv.len == d.convDim());
+    std.debug.assert(conv_state.len == d.convStateLen());
+
+    // The q and k channels of this key head, with the norms and the q scale of the prologue.
+    const q_lo = kh * dim;
+    const k_lo = key_dim + kh * dim;
+    convStepSilu(d, conv_w, conv_state, qkv, q_lo, q_lo + dim);
+    convStepSilu(d, conv_w, conv_state, qkv, k_lo, k_lo + dim);
+    const qh = qkv[q_lo..][0..dim];
+    const kk = qkv[k_lo..][0..dim];
+    const q_scale = 1.0 / @sqrt(@as(f32, @floatFromInt(dim)));
+    l2normInplace(qh, heads.rms_eps);
+    l2normInplace(kk, heads.rms_eps);
+    for (qh) |*x| {
+        x.* *= q_scale;
+    }
+
+    if (std.debug.runtime_safety) {
+        for (qh) |x| {
+            std.debug.assert(std.math.isFinite(x));
+        }
+
+        for (kk) |x| {
+            std.debug.assert(std.math.isFinite(x));
+        }
+    }
+
+    // Value head vh reads key head vh % n_k_heads, so these value heads read only this head.
+    var vh: usize = kh;
+    while (vh < d.n_v_heads) : (vh += d.n_k_heads) {
+        const v_lo = 2 * key_dim + vh * dim;
+        convStepSilu(d, conv_w, conv_state, qkv, v_lo, v_lo + dim);
+        stepHeads(d, heads, vh, vh + 1);
+    }
+}
+
 /// Assert in safe builds that every readout of a finished step is finite. A
-/// caller that splits the value heads runs it after every range ends.
+/// caller that splits the heads into ranges runs it after every range ends.
 pub fn assertFinite(d: Dims, o_out: []const f32) void {
     std.debug.assert(o_out.len == d.valueDim());
 
@@ -432,17 +493,26 @@ fn l2normInplace(x: []f32, eps: f32) void {
     }
 }
 
-/// Causal depthwise conv1d over all `convDim` channels of `qkv`, then SiLU, in place.
-/// It advances `conv_state` by one step.
-fn convStepSilu(d: Dims, conv_w: []const f32, conv_state: []f32, qkv: []f32) void {
+/// Causal depthwise conv1d over the channels `[c_lo, c_hi)` of `qkv`, then SiLU, in place.
+/// It advances the ring entries of those channels by one step. Each channel is independent.
+fn convStepSilu(
+    d: Dims,
+    conv_w: []const f32,
+    conv_state: []f32,
+    qkv: []f32,
+    c_lo: usize,
+    c_hi: usize,
+) void {
     const k = d.conv_kernel;
     const cdim = d.convDim();
     std.debug.assert(conv_w.len == k * cdim);
     std.debug.assert(conv_state.len == (k - 1) * cdim);
     std.debug.assert(qkv.len == cdim);
+    std.debug.assert(c_lo < c_hi);
+    std.debug.assert(c_hi <= cdim);
 
-    var c: usize = 0;
-    while (c < cdim) : (c += 1) {
+    var c: usize = c_lo;
+    while (c < c_hi) : (c += 1) {
         var acc: f32 = 0;
         var t: usize = 0;
         while (t < k - 1) : (t += 1) {
@@ -465,6 +535,7 @@ fn convStepSilu(d: Dims, conv_w: []const f32, conv_state: []f32, qkv: []f32) voi
 
 /// One head's gated delta-rule step: decay, read, delta, write, readout.
 /// `s` is the head's d x d state (`s[i*D + j]`), mutated. `q` and `k` arrive L2-normed.
+/// It walks column panels, and each element keeps the multiplies and adds of the scalar form.
 fn recurStep(
     s: []f32,
     q: []const f32,
@@ -481,36 +552,99 @@ fn recurStep(
     std.debug.assert(o.len == dim);
     std.debug.assert(dim <= max_head_dim);
 
-    // Decay the state.
-    for (s) |*x| {
-        x.* *= decay;
+    const decay_v: Vec = @splat(decay);
+    const beta_v: Vec = @splat(beta);
+
+    // Every element of `o` gets one store, from a panel or from the tail, so no clear is needed.
+    var j0: usize = 0;
+
+    // Wide panels: four vectors per panel keep four independent add chains in flight.
+    const wide = 4;
+    while (j0 + wide * lanes <= dim) : (j0 += wide * lanes) {
+        recurPanel(wide, s, q, k, v, decay_v, beta_v, o, j0);
     }
 
-    // Read the memory with the key and form the delta.
-    var delta: [max_head_dim]f32 = undefined;
-    var j: usize = 0;
-    while (j < dim) : (j += 1) {
+    // Narrow panels for the columns the wide panels leave.
+    while (j0 + lanes <= dim) : (j0 += lanes) {
+        recurPanel(1, s, q, k, v, decay_v, beta_v, o, j0);
+    }
+
+    // Scalar columns for the tail of dim % lanes.
+    std.debug.assert(dim - j0 < lanes);
+    while (j0 < dim) : (j0 += 1) {
         var mem: f32 = 0;
         var i: usize = 0;
         while (i < dim) : (i += 1) {
-            mem += s[i * dim + j] * k[i];
+            mem += (s[i * dim + j0] * decay) * k[i];
         }
 
-        delta[j] = (v[j] - mem) * beta;
-    }
+        const delta = (v[j0] - mem) * beta;
+        var acc: f32 = 0;
+        i = 0;
+        while (i < dim) : (i += 1) {
+            const row = (s[i * dim + j0] * decay) + k[i] * delta;
+            s[i * dim + j0] = row;
+            acc += row * q[i];
+        }
 
-    // Write the rank-1 update and read out with the query.
-    @memset(o, 0);
+        o[j0] = acc;
+    }
+}
+
+/// One panel of `n` vectors from column `j0`. Pass 1 must not store, or pass 2 decays twice.
+/// Pass 2 recomputes `s * decay`, which gives the same bits. `recurStep` checks the slice
+/// lengths and the head dim.
+fn recurPanel(
+    comptime n: usize,
+    s: []f32,
+    q: []const f32,
+    k: []const f32,
+    v: []const f32,
+    decay_v: Vec,
+    beta_v: Vec,
+    o: []f32,
+    j0: usize,
+) void {
+    const dim = q.len;
+    std.debug.assert(s.len == dim * dim);
+    std.debug.assert(k.len == dim);
+    std.debug.assert(v.len == dim);
+    std.debug.assert(o.len == dim);
+    std.debug.assert(j0 + n * lanes <= dim);
+
+    var mem: [n]Vec = @splat(@as(Vec, @splat(0)));
     var i: usize = 0;
     while (i < dim) : (i += 1) {
-        const ki = k[i];
-        const qi = q[i];
-        const row = s[i * dim ..][0..dim];
-        j = 0;
-        while (j < dim) : (j += 1) {
-            row[j] += ki * delta[j];
-            o[j] += row[j] * qi;
+        const kv: Vec = @splat(k[i]);
+        const row = s[i * dim + j0 ..][0 .. n * lanes];
+        inline for (0..n) |c| {
+            const sd = @as(Vec, row[c * lanes ..][0..lanes].*) * decay_v;
+            mem[c] = mem[c] + sd * kv;
         }
+    }
+
+    var delta: [n]Vec = undefined;
+    inline for (0..n) |c| {
+        const vv: Vec = v[j0 + c * lanes ..][0..lanes].*;
+        delta[c] = (vv - mem[c]) * beta_v;
+    }
+
+    var ov: [n]Vec = @splat(@as(Vec, @splat(0)));
+    i = 0;
+    while (i < dim) : (i += 1) {
+        const kv: Vec = @splat(k[i]);
+        const qv: Vec = @splat(q[i]);
+        const row = s[i * dim + j0 ..][0 .. n * lanes];
+        inline for (0..n) |c| {
+            const sd = @as(Vec, row[c * lanes ..][0..lanes].*) * decay_v;
+            const nv = sd + kv * delta[c];
+            row[c * lanes ..][0..lanes].* = nv;
+            ov[c] = ov[c] + nv * qv;
+        }
+    }
+
+    inline for (0..n) |c| {
+        o[j0 + c * lanes ..][0..lanes].* = ov[c];
     }
 }
 
@@ -546,7 +680,7 @@ test "convStepSilu tap order: only-current vs only-oldest" {
     var conv_w = [_]f32{0} ** 12; // K(4)*cdim(3)
     conv_w[0 * 4 + 3] = 1; // only the current tap (tap K-1)
     var qkv = [_]f32{ 4, 0, 0 }; // current input for channel 0 is 4
-    convStepSilu(d, &conv_w, &conv_state, &qkv);
+    convStepSilu(d, &conv_w, &conv_state, &qkv, 0, d.convDim());
     try std.testing.expectApproxEqAbs(silu(4.0), qkv[0], 1e-5); // picks current
 
     // Reset. Weight only the oldest tap (tap 0).
@@ -557,7 +691,7 @@ test "convStepSilu tap order: only-current vs only-oldest" {
     conv_w = [_]f32{0} ** 12;
     conv_w[0 * 4 + 0] = 1; // only the oldest tap
     qkv = .{ 4, 0, 0 };
-    convStepSilu(d, &conv_w, &conv_state, &qkv);
+    convStepSilu(d, &conv_w, &conv_state, &qkv, 0, d.convDim());
     try std.testing.expectApproxEqAbs(silu(1.0), qkv[0], 1e-5); // picks oldest (=1)
 }
 
@@ -583,6 +717,108 @@ test "recurStep first token: o = (k·q)·beta·v when state starts at zero" {
 
     for (v, o) |vj, oj| {
         try std.testing.expectApproxEqAbs(kq * beta * vj, oj, 1e-5);
+    }
+}
+
+/// The scalar form of `recurStep`. It is the bit-exact reference of the panel form.
+fn recurStepScalar(
+    s: []f32,
+    q: []const f32,
+    k: []const f32,
+    v: []const f32,
+    decay: f32,
+    beta: f32,
+    o: []f32,
+) void {
+    const dim = q.len;
+    for (s) |*x| {
+        x.* *= decay;
+    }
+
+    var delta: [max_head_dim]f32 = undefined;
+    var j: usize = 0;
+    while (j < dim) : (j += 1) {
+        var mem: f32 = 0;
+        var i: usize = 0;
+        while (i < dim) : (i += 1) {
+            mem += s[i * dim + j] * k[i];
+        }
+
+        delta[j] = (v[j] - mem) * beta;
+    }
+
+    @memset(o, 0);
+    var i: usize = 0;
+    while (i < dim) : (i += 1) {
+        const ki = k[i];
+        const qi = q[i];
+        const row = s[i * dim ..][0..dim];
+        j = 0;
+        while (j < dim) : (j += 1) {
+            row[j] += ki * delta[j];
+            o[j] += row[j] * qi;
+        }
+    }
+}
+
+test "recurStep matches the scalar step bit for bit at every panel shape" {
+    const gpa = std.testing.allocator;
+    // The dims cover scalar only (1) and one narrow panel (8). They also cover a panel with a
+    // tail (9, 41, 47), three narrow panels (24), a wide and a narrow panel (40), and 128.
+    for ([_]usize{ 1, 8, 9, 24, 40, 41, 47, 128 }) |d| {
+        var prng = std.Random.DefaultPrng.init(0x6D17_0100 + d);
+        const r = prng.random();
+
+        const s_new = try gpa.alloc(f32, d * d);
+        defer gpa.free(s_new);
+
+        const s_ref = try gpa.alloc(f32, d * d);
+        defer gpa.free(s_ref);
+
+        for (s_new, s_ref) |*a, *b| {
+            a.* = r.float(f32) * 2 - 1;
+            b.* = a.*;
+        }
+
+        const q = try gpa.alloc(f32, d);
+        defer gpa.free(q);
+
+        const k = try gpa.alloc(f32, d);
+        defer gpa.free(k);
+
+        const v = try gpa.alloc(f32, d);
+        defer gpa.free(v);
+
+        const o_new = try gpa.alloc(f32, d);
+        defer gpa.free(o_new);
+
+        const o_ref = try gpa.alloc(f32, d);
+        defer gpa.free(o_ref);
+
+        var iter: usize = 0;
+        while (iter < 6) : (iter += 1) {
+            for (q, k, v) |*qi, *ki, *vi| {
+                qi.* = r.float(f32) * 2 - 1;
+                ki.* = r.float(f32) * 2 - 1;
+                vi.* = r.float(f32) * 2 - 1;
+            }
+
+            l2normInplace(q, 1e-6);
+            l2normInplace(k, 1e-6);
+            const decay = 1.0 - r.float(f32) * 0.99;
+            const beta = r.float(f32) * 0.98 + 0.01;
+
+            recurStep(s_new, q, k, v, decay, beta, o_new);
+            recurStepScalar(s_ref, q, k, v, decay, beta, o_ref);
+
+            for (s_new, s_ref) |a, b| {
+                try std.testing.expectEqual(@as(u32, @bitCast(b)), @as(u32, @bitCast(a)));
+            }
+
+            for (o_new, o_ref) |a, b| {
+                try std.testing.expectEqual(@as(u32, @bitCast(b)), @as(u32, @bitCast(a)));
+            }
+        }
     }
 }
 
@@ -808,6 +1044,156 @@ test "step: the prologue, then every value head alone in reverse order, gives th
                 var vh: usize = nv;
                 while (vh > 0) : (vh -= 1) {
                     stepHeads(d, heads, vh - 1, vh);
+                }
+
+                assertFinite(d, o_split);
+
+                try std.testing.expectEqualSlices(
+                    u8,
+                    std.mem.sliceAsBytes(qkv_ref),
+                    std.mem.sliceAsBytes(qkv_split),
+                );
+                try std.testing.expectEqualSlices(
+                    u8,
+                    std.mem.sliceAsBytes(o_ref),
+                    std.mem.sliceAsBytes(o_split),
+                );
+                try std.testing.expectEqualSlices(
+                    u8,
+                    std.mem.sliceAsBytes(state_ref),
+                    std.mem.sliceAsBytes(state_split),
+                );
+                try std.testing.expectEqualSlices(
+                    u8,
+                    std.mem.sliceAsBytes(conv_ref),
+                    std.mem.sliceAsBytes(conv_split),
+                );
+            }
+        }
+    }
+}
+
+test "stepKeyHead over the key heads in reverse order gives the bits of step" {
+    const gpa = std.testing.allocator;
+    // The 2B has 16 key and 16 value heads. The 9B has 16 key and 32 value heads. A small shape
+    // has three value heads for each key head.
+    const shapes = [_]Dims{
+        .{ .n_k_heads = 16, .n_v_heads = 16, .head_dim = 128, .conv_kernel = 4 },
+        .{ .n_k_heads = 16, .n_v_heads = 32, .head_dim = 128, .conv_kernel = 4 },
+        // Head dim 40 meets the wide panel, the narrow panel, and the tail of `recurStep`.
+        .{ .n_k_heads = 2, .n_v_heads = 6, .head_dim = 40, .conv_kernel = 4 },
+    };
+    const tokens = 3;
+    for (shapes) |d| {
+        for ([_]u64{ 0x6D17_0001, 0x6D17_0002, 0x6D17_0003 }) |seed| {
+            var prng = std.Random.DefaultPrng.init(seed);
+            const r = prng.random();
+            const cd = d.convDim();
+            const vd = d.valueDim();
+            const nv = d.n_v_heads;
+            const buf = try gpa.alloc(
+                f32,
+                2 * cd + vd + 2 * nv + d.conv_kernel * cd + 2 * nv + d.head_dim,
+            );
+            defer gpa.free(buf);
+
+            for (buf) |*x| {
+                x.* = r.float(f32) * 2.0 - 1.0;
+            }
+
+            var at: usize = 0;
+            const qkv_in = buf[at..][0..cd];
+            at += cd;
+            const z = buf[at..][0..vd];
+            at += vd;
+            const a = buf[at..][0..nv];
+            at += nv;
+            const b = buf[at..][0..nv];
+            at += nv;
+            const conv_w = buf[at..][0 .. d.conv_kernel * cd];
+            at += d.conv_kernel * cd;
+            const ssm_a = buf[at..][0..nv];
+            at += nv;
+            const dt_bias = buf[at..][0..nv];
+            at += nv;
+            const ssm_norm = buf[at..][0..d.head_dim];
+            // GGUF ssm_a is -exp(A_log), so it is negative.
+            for (ssm_a) |*x| {
+                x.* = -@abs(x.*) - 0.1;
+            }
+
+            const state_ref = try gpa.alloc(f32, d.stateLen());
+            defer gpa.free(state_ref);
+
+            for (state_ref) |*x| {
+                x.* = (r.float(f32) - 0.5) * 0.2;
+            }
+
+            const state_split = try gpa.dupe(f32, state_ref);
+            defer gpa.free(state_split);
+
+            const conv_ref = try gpa.alloc(f32, d.convStateLen());
+            defer gpa.free(conv_ref);
+
+            for (conv_ref) |*x| {
+                x.* = r.float(f32) - 0.5;
+            }
+
+            const conv_split = try gpa.dupe(f32, conv_ref);
+            defer gpa.free(conv_split);
+
+            const qkv_ref = try gpa.alloc(f32, cd);
+            defer gpa.free(qkv_ref);
+
+            const qkv_split = try gpa.alloc(f32, cd);
+            defer gpa.free(qkv_split);
+
+            const o_ref = try gpa.alloc(f32, vd);
+            defer gpa.free(o_ref);
+
+            const o_split = try gpa.alloc(f32, vd);
+            defer gpa.free(o_split);
+
+            // Several tokens carry the state, so a head that reads a stale key
+            // or writes a neighbor moves the later tokens.
+            for (0..tokens) |t| {
+                for (qkv_ref, qkv_in) |*x, y| {
+                    x.* = y + @as(f32, @floatFromInt(t)) * 0.25;
+                }
+
+                @memcpy(qkv_split, qkv_ref);
+                step(
+                    d,
+                    qkv_ref,
+                    z,
+                    a,
+                    b,
+                    conv_w,
+                    ssm_a,
+                    dt_bias,
+                    ssm_norm,
+                    1e-6,
+                    state_ref,
+                    conv_ref,
+                    o_ref,
+                );
+
+                @memset(o_split, std.math.nan(f32));
+                const heads: Heads = .{
+                    .qkv = qkv_split,
+                    .z = z,
+                    .a = a,
+                    .b = b,
+                    .ssm_a = ssm_a,
+                    .dt_bias = dt_bias,
+                    .ssm_norm = ssm_norm,
+                    .rms_eps = 1e-6,
+                    .state = state_split,
+                    .o_out = o_split,
+                };
+                var kh: usize = d.n_k_heads;
+                while (kh > 0) : (kh -= 1) {
+                    stepKeyHead(d, qkv_split, conv_w, conv_split, heads, kh - 1);
                 }
 
                 assertFinite(d, o_split);

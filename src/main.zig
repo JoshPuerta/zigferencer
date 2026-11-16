@@ -389,6 +389,8 @@ test {
     _ = ops_simd;
     _ = ops_simd_pf;
     _ = @import("ops/attention_simd.zig");
+    _ = @import("ops/linear_simd.zig");
+    _ = @import("ops/elementwise_simd.zig");
     if (build_options.use_vulkan) {
         // Take the address of each method, because `_ = f;` leaves the body unanalyzed.
         _ = &ops_vulkan.StreamRing.init;

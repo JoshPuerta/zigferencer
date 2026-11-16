@@ -19,6 +19,9 @@
 //!
 //! Attention grid alone. `zig build bench -- attn-grid` runs the attention kernel set grid alone,
 //! so a kernel experiment skips the full table.
+//!
+//! CPU batch alone. `zig build bench -- matmul-batch-cpu` runs the CPU batched Q8_0 matmul rows
+//! alone.
 
 const std = @import("std");
 const builtin = @import("builtin");
@@ -37,6 +40,23 @@ const transfer = @import("bench_transfer.zig");
 pub fn main(init: std.process.Init) !void {
     const gpa = init.gpa;
     const io = init.io;
+    const args = try init.minimal.args.toSlice(init.arena.allocator());
+
+    // Turn color on for a terminal alone, so a piped diff stays free of ANSI escapes.
+    bench_util.setColor(std.Io.File.stderr().isTty(io) catch false);
+
+    // Print the banner.
+    std.debug.print("zigferencer bench\n", .{});
+    std.debug.print(
+        "build target: {s} ({s})\n",
+        .{ @tagName(builtin.cpu.arch), builtin.cpu.model.name },
+    );
+
+    // Run the CPU batched matmul rows alone when asked, before the GPU runner starts.
+    if (args.len >= 2 and std.mem.eql(u8, args[1], "matmul-batch-cpu")) {
+        try matmul.benchBatchCpu(gpa, io);
+        return;
+    }
 
     // Start the GPU runner.
     const RunnerOpt = if (build_options.use_vulkan)
@@ -57,20 +77,9 @@ pub fn main(init: std.process.Init) !void {
         }
     };
 
-    // Turn color on for a terminal alone, so a piped diff stays free of ANSI escapes.
-    bench_util.setColor(std.Io.File.stderr().isTty(io) catch false);
-
-    // Print the banner.
-    std.debug.print("zigferencer bench\n", .{});
-    std.debug.print(
-        "build target: {s} ({s})\n",
-        .{ @tagName(builtin.cpu.arch), builtin.cpu.model.name },
-    );
-
     // Run the attention kernel set grid alone when asked.
     if (comptime build_options.use_vulkan) {
         if (runner) |r| {
-            const args = try init.minimal.args.toSlice(init.arena.allocator());
             if (args.len >= 2 and std.mem.eql(u8, args[1], "attn-grid")) {
                 try layer.benchAttnGrid(gpa, io, r);
                 return;

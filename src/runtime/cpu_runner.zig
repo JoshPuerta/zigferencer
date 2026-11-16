@@ -74,6 +74,7 @@ const Pool = @import("pool.zig").Pool;
 const step_row = @import("step_row.zig");
 const linear_dispatch = @import("linear_dispatch.zig");
 const weight_check = @import("weight_check.zig");
+const naive = @import("../ops/naive.zig");
 const tensor_lookup = @import("tensor_lookup.zig");
 const layer_kernels = @import("layer_kernels.zig");
 const CpuLayerKernels = @import("cpu_layer_kernels.zig").CpuLayerKernels;
@@ -126,6 +127,8 @@ pub fn CpuRunner(comptime Family: type) type {
         output: ?*const Tensor,
         /// The frequency divisor of each rotated pair in every layer. Null: the plain frequencies.
         rope_factors: ?[]const f32,
+        /// The base angle of each rotated pair, `rope_dim_count / 2` entries.
+        rope_thetas: []const f32,
 
         /// Layers this runner executes. Only a prefix runner narrows it below the card count.
         n_layers: u32,
@@ -228,6 +231,8 @@ pub fn CpuRunner(comptime Family: type) type {
             if (with_head) assert(n_layers == c.n_layers);
             try linear_dispatch.requireWeights(loaded.tensors, n_layers);
             try weight_check.checkWeights(Family, &c, loaded.tensors);
+            assert(c.rope_dim_count >= 2);
+            assert(c.rope_dim_count % 2 == 0);
 
             // The row scratch holds the widest stepBatch, and never fewer rows than the slots.
             const rows_cap: u32 = @max(n_slots, options.max_rows);
@@ -252,6 +257,8 @@ pub fn CpuRunner(comptime Family: type) type {
             // Size the scratch of each activation, and the logits rows of a runner with a head.
             const widths = activationWidths(&c);
             const logits_len: usize = if (with_head) @as(usize, n_slots) * c.vocab_size else 0;
+            const rope_thetas = try arena.alloc(f32, c.rope_dim_count / 2);
+            naive.fillRopeThetas(rope_thetas, c.rope_freq_base);
             const runner: Self = .{
                 .card = c,
                 .pool = options.pool,
@@ -260,6 +267,7 @@ pub fn CpuRunner(comptime Family: type) type {
                 .output_norm = if (output_norm) |t| fp32View(t.*) else &.{},
                 .output = if (with_head) headOf(refs, embed) else null,
                 .rope_factors = ropeFactors(refs, &c),
+                .rope_thetas = rope_thetas,
                 .n_layers = n_layers,
                 .layers = layers,
                 .kv_index = kv_index,
@@ -424,6 +432,7 @@ pub fn CpuRunner(comptime Family: type) type {
                 .rows = rows,
                 .layers = self.layers,
                 .rope_factors = self.rope_factors,
+                .rope_thetas = self.rope_thetas,
                 .kv_index = self.kv_index,
                 .widths = &self.activation_widths,
                 .scratch = self.scratch,
@@ -825,7 +834,7 @@ fn expectProfilePartition(comptime Family: type) !void {
     try std.testing.expect(prof.nsParallel() < prof.total());
 }
 
-test "pool joins: a layer forks once per weight and once per row of its stateful op" {
+test "pool joins: a layer forks per weight, per row of its stateful op, and once for swiglu" {
     // A Debug build runs the forward too slowly for the unit run. The GPU per-op backend submits
     // the matmuls, the recurrent steps, and the attention rows without the pool.
     const skip = builtin.mode == .Debug or builtin.single_threaded or build_options.use_vulkan_ops;
@@ -877,14 +886,15 @@ fn expectPoolJoins(comptime Family: type) !void {
 }
 
 /// The fork-joins of one step of `n` rows with one logits row: one per weight of each layer, one
-/// per row of the attention or the recurrence of each layer, and one for the lm_head.
+/// per row of the attention or the recurrence of each layer, one for the `swiglu` of each layer,
+/// and one for the lm_head.
 fn joinsOf(kv_index: []const ?u32, n: u32) u32 {
     var joins: u32 = 1;
     for (kv_index) |index| {
         // A KV layer of either family projects q, k, v, o, gate, up, and down. A GDN layer
         // projects qkv, z, alpha, beta, out, gate, up, and down.
         const weights: u32 = if (index != null) 7 else 8;
-        joins += weights + n;
+        joins += weights + n + 1;
     }
 
     return joins;

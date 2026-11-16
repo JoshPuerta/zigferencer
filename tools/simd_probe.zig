@@ -20,7 +20,8 @@
 //! a kernel, take its address here. The simd and simd_pf backends hand-write the matmul kernels
 //! and the attention part kernel. linearF32Q80, the hot quantized matmul, and the attention part
 //! kernel exist across all three backends, and linearF32, the dense f32 matmul, in simd alone.
-//! The list names those once per specializing backend.
+//! The list names those once per specializing backend. The Q8_0 linears of simd and simd_pf share
+//! the source of `linear_simd`, so a wrapper per backend gives each its own symbol.
 //!
 //! Shared ops. Every other op is shared naive code that each backend re-exports unchanged. Its
 //! width is whatever the compiler auto-vectorizes for the target, which is the same width
@@ -29,6 +30,7 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const zigferencer = @import("zigferencer");
+const Tensor = zigferencer.tensor.Tensor;
 
 // -- constants --------------------------------------------------------------
 
@@ -36,8 +38,10 @@ const probed_ops = .{
     // Backend-specialized: the kernels that simd and simd_pf hand-write. The report keeps the
     // variants of one kernel together.
     &zigferencer.ops.linearF32Q80, // naive: scalar reference
-    &zigferencer.ops_simd.linearF32Q80, // simd: @Vector(8)
-    &zigferencer.ops_simd_pf.linearF32Q80, // simd_pf: register-blocked + prefetch
+    &linearF32Q80Simd, // simd: @Vector(8)
+    &linearF32Q80SimdPf, // simd_pf: register-blocked + prefetch
+    &linearF32Q80BatchSimd, // simd: batch panel path
+    &linearF32Q80BatchSimdPf, // simd_pf: batch panel path
     &zigferencer.ops.linearF32, // naive: scalar reference
     &zigferencer.ops_simd.linearF32, // simd: @Vector(8)
     // The part kernel is generic over the KV element type. A wrapper per type
@@ -53,7 +57,9 @@ const probed_ops = .{
     &zigferencer.ops.rmsnorm,
     &zigferencer.ops.swiglu,
     &zigferencer.ops.residualAdd,
+    &zigferencer.ops_simd_pf.residualAdd,
     &zigferencer.ops.ropeInplace,
+    &zigferencer.ops.ropeHeads,
     &zigferencer.ops.attentionMerge,
     &zigferencer.ops.dequantQ80,
     &zigferencer.ops.dequantQ40,
@@ -149,6 +155,42 @@ fn attentionPartF16Simd(a: PartArgs(f16)) void {
 
 fn attentionPartF16SimdPf(a: PartArgs(f16)) void {
     partCall(zigferencer.ops_simd_pf, f16, a);
+}
+
+fn linearF32Q80Simd(input: []const f32, weight: Tensor, out: []f32) void {
+    @call(.always_inline, zigferencer.ops_simd.linearF32Q80, .{ input, weight, out });
+}
+
+fn linearF32Q80SimdPf(input: []const f32, weight: Tensor, out: []f32) void {
+    @call(.always_inline, zigferencer.ops_simd_pf.linearF32Q80, .{ input, weight, out });
+}
+
+fn linearF32Q80BatchSimd(
+    inputs: []const f32,
+    weight: Tensor,
+    outs: []f32,
+    batch: usize,
+    out_stride: usize,
+) void {
+    @call(
+        .always_inline,
+        zigferencer.ops_simd.linearF32Q80Batch,
+        .{ inputs, weight, outs, batch, out_stride },
+    );
+}
+
+fn linearF32Q80BatchSimdPf(
+    inputs: []const f32,
+    weight: Tensor,
+    outs: []f32,
+    batch: usize,
+    out_stride: usize,
+) void {
+    @call(
+        .always_inline,
+        zigferencer.ops_simd_pf.linearF32Q80Batch,
+        .{ inputs, weight, outs, batch, out_stride },
+    );
 }
 
 fn capsLine() []const u8 {

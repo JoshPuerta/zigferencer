@@ -15,8 +15,8 @@
 //! their microsecond cost beats the fixed overhead of a dispatch. Which side each op lands on:
 //!
 //!   embedLookup                       CPU. A pure memcpy loses to a dispatch.
-//!   ropeInplace                       CPU. One dispatch per head, 32 per layer,
-//!                                     costs more than the CPU microseconds.
+//!   ropeInplace, ropeHeads            CPU. A dispatch per row or per head costs more
+//!                                     than the CPU microseconds.
 //!   linearF32                         CPU. Only the small f32 norm weights.
 //!   rmsnorm, swiglu, residualAdd,     GPU. The heavy ops that justify a dispatch.
 //!   attentionSingle, linearF32Q80
@@ -81,6 +81,8 @@ pub const embedLookup = naive.embedLookup;
 pub const linearF32 = naive.linearF32;
 pub const linearF32Batch = naive.linearF32Batch;
 pub const ropeInplace = naive.ropeInplace;
+pub const ropeHeads = naive.ropeHeads;
+pub const RopeTable = naive.RopeTable;
 
 // -- lifecycle --------------------------------------------------------------
 pub fn initBackend(alloc: std.mem.Allocator, options: vulkan_ctx.Options) InitError!void {

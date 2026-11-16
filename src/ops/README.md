@@ -11,9 +11,11 @@ on no backend.
 | File | Holds |
 | --- | --- |
 | `naive.zig` | The scalar reference and the whole op surface. |
-| `simd.zig` | The AVX2 and FMA backend, which overrides the f32 and Q8_0 linears. |
-| `simd_pf.zig` | The register-blocked backend with prefetch, the default on AVX2 and FMA. |
+| `simd.zig` | The AVX2 and FMA backend without prefetch, the control for `simd_pf`. |
+| `simd_pf.zig` | The AVX2 and FMA backend with prefetch, the auto default. |
+| `linear_simd.zig` | The Q8_0 linear kernels that both SIMD backends share. |
 | `attention_simd.zig` | The vector attention kernels that both SIMD backends share. |
+| `elementwise_simd.zig` | The vector `residualAdd` of both SIMD backends. |
 | `exp_simd.zig` | The vector `expNeg`. |
 | `attention_ref.zig` | The f64 reference and the checks for the CPU attention tests. |
 | `gdn.zig` | The Gated DeltaNet reference of the Qwen layers. |
@@ -26,12 +28,16 @@ never a gap.
 
 | Value | File | Holds | Made by | Read by |
 | --- | --- | --- | --- | --- |
-| The op surface | `naive.zig` | The linears with `Batch` forms, the dequants, `embedLookup`, `rmsnorm`, `swiglu`, `residualAdd`, `ropeInplace`, and the attention part, merge, and row | the file itself | `simd`, `simd_pf`, `ops_vulkan/wrap`, `linear_dispatch`, the runners |
+| The op surface | `naive.zig` | The linears with `Batch` forms, the dequants, `embedLookup`, `rmsnorm`, `swiglu`, `residualAdd`, `ropeInplace`, `ropeHeads`, and the attention part, merge, and row | the file itself | `simd`, `simd_pf`, `ops_vulkan/wrap`, `linear_dispatch`, the runners |
 | `requires` | each backend | An `OpRequires`: the target and the tolerance against `naive` | each backend | `cli/info`, `tools/bench_util` |
+| The Q8_0 linears | `linear_simd.zig` | `plain` and `prefetched` sets of `linearF32Q80` and `linearF32Q80Batch` | the file itself | `simd`, `simd_pf` |
 | The attention kernels | `attention_simd.zig` | `plain` and `prefetched` sets of part, merge, and row | the file itself | `simd`, `simd_pf` |
 | `expNeg` | `exp_simd.zig` | The vector exponential for inputs at or below 0 | the file itself | `attention_simd`, `runtime/sampler` |
-| `RopeStyle` | `naive.zig` | `norm` or `neox` | `llama_layer` and `qwen_layer`, per family | `ropeInplace` |
-| `gdn.step` | `gdn.zig` | The per-token recurrence over a state the runner owns | the file itself | `runtime/parallel`, `dev/gpu_selftest` |
+| `RopeStyle` | `naive.zig` | `norm` or `neox` | `llama_layer` and `qwen_layer`, per family | `ropeInplace`, `ropeHeads` |
+| `RopeTable` | `naive.zig` | The base angle of each rotated pair and the optional frequency divisors | `runtime/cpu_runner`, with `fillRopeThetas` | `ropeHeads` |
+| `residualAdd` | `elementwise_simd.zig` | The vector add, bit-identical to the naive loop | the file itself | `simd`, `simd_pf` |
+| `gdn.step` | `gdn.zig` | The serial per-token recurrence over a state the runner owns | the file itself | `dev/gpu_selftest`, `tools/simd_probe`, the tests |
+| `gdn.stepKeyHead` | `gdn.zig` | The same recurrence for one key head, so disjoint key heads can run at once | the file itself | `runtime/parallel` |
 | `gdn.chunkScan` | `gdn.zig` | The chunked matrix form of the same recurrence | the file itself | `tools/simd_probe`, the tests |
 
 A runner picks the backend once, at compile time. The `ops` constant of `runtime/cpu_runner`,
@@ -47,18 +53,21 @@ sets them from `-Dops-backend`:
        otherwise       -->  ops/naive.zig
 ```
 
-The SIMD files share the attention kernels:
+The SIMD files share the Q8_0 linears and the attention kernels:
 
 ```
+  simd.zig     --> linear_simd.plain
+  both         --> elementwise_simd.residualAdd
+  simd_pf.zig  --> linear_simd.prefetched
   simd.zig     --> attention_simd.plain      ---+--> exp_simd.expNeg
   simd_pf.zig  --> attention_simd.prefetched ---+
   both         --> naive.attentionMerge for the merge of the parts
 ```
 
 `gdn.zig` stands outside the chain. It is not part of the swappable op set, and the runner passes it
-the recurrent state and the convolution ring buffer. `gdn.step` is the form that prefill and decode
-both run. `ops_vulkan/shaders/gdn_chunk_scan.comp` follows the `chunkScan` form, and its test pins
-`chunkScan` against the sequential recurrence.
+the recurrent state and the convolution ring buffer. `gdn.step` is the serial reference, and the
+runner runs `gdn.stepKeyHead` per key head. `ops_vulkan/shaders/gdn_chunk_scan.comp` follows the
+`chunkScan` form, and its test pins `chunkScan` against the sequential recurrence.
 
 ## Rules
 
@@ -70,10 +79,9 @@ both run. `ops_vulkan/shaders/gdn_chunk_scan.comp` follows the `chunkScan` form,
   relative error per backend and fails the row on drift.
 - `resolveOpsBackend` in `build.zig` does not read `requires`. `simdBackendSupportedBy` mirrors what
   the two SIMD backends declare, and the mirror and the declaration must agree.
-- `simd_pf.linearF32Q80Batch` accumulates each (row, output) pair in an order that does not depend
-  on the batch size. The batched output is therefore bit-identical to the single-row call. The tests
-  assert it. The single-row entry point delegates to the batch body, so exactly one kernel body
-  exists.
+- `linear_simd` gives each (row, output) pair one order of operations at every batch size, with or
+  without prefetch. So the batched output is bit-identical to per-row calls, and `simd` gives the
+  bits of `simd_pf`. The tests assert both.
 - `attention_simd` gives one head the same bits at any head block, thread count, or prefetch. A head
   width off the lane grid runs the naive kernel.
 - No op allocates and no op holds state. The one allocator parameter in the directory belongs to

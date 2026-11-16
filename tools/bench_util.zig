@@ -116,6 +116,25 @@ pub fn computeErrors(ref: []const f32, got: []const f32) Errors {
     return .{ .abs = max_abs, .rel = max_rel };
 }
 
+/// The normwise error `max |ref - got| / max |ref|` over the whole row set. One near-zero output
+/// cannot inflate it, so it judges a kernel whose outputs cancel. A NaN difference gives infinity.
+/// An all-zero `ref` gives the absolute error.
+pub fn normwiseError(ref: []const f32, got: []const f32) f32 {
+    std.debug.assert(ref.len == got.len);
+
+    var max_diff: f32 = 0;
+    var max_ref: f32 = 0;
+    for (ref, got) |r, g| {
+        const d = @abs(r - g);
+        if (std.math.isNan(d)) return std.math.inf(f32);
+
+        max_diff = @max(max_diff, d);
+        max_ref = @max(max_ref, @abs(r));
+    }
+
+    return if (max_ref == 0) max_diff else max_diff / max_ref;
+}
+
 /// Timed iterations for a case of `scale` work units. Larger cases run fewer.
 pub fn pickIters(scale: usize) usize {
     if (scale > 100_000_000) return 4; // llama8b lm_head + ffn class

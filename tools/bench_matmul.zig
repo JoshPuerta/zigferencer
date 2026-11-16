@@ -21,8 +21,13 @@
 //!
 //! Batched. `benchBatchedMatmul` runs B input rows per dispatch, so the weight streams once for
 //! B outputs. Compare its GFLOP/s against the decode `vk_q8_0_re` row to see the prefill
-//! amortization. It is GPU-only, because no batched CPU op exists. The CPU reference is the
-//! naive kernel looped over the B rows.
+//! amortization. It is GPU-only. The CPU reference is the naive kernel looped over the B rows.
+//!
+//! CPU batched. `benchBatchCpu` times `simd_pf.linearF32Q80Batch` on one thread at B = 1, 8, and
+//! 64 over four prefill shapes. The rel_err column holds the normwise error, `max |ref - got| /
+//! max |ref|` against `naive` over all rows of the call, and the row passes at the declared
+//! `requires.tolerance`. The max-relative error of `computeErrors` prints on a line below each
+//! case, because one cancelling output decides it.
 
 const std = @import("std");
 const builtin = @import("builtin");
@@ -66,6 +71,25 @@ const Variant = struct {
 };
 
 const BenchResult = struct { ms: f64, gflops: f64, hash: u64 };
+
+/// One CPU batched call: `linearF32Q80Batch` over `b` rows with a fixed output stride.
+const BatchCpuCtx = struct {
+    input: []const f32,
+    w: Tensor,
+    o: []f32,
+    b: usize,
+    out_stride: usize,
+
+    pub fn run(self: @This()) !void {
+        zigferencer.ops_simd_pf.linearF32Q80Batch(
+            self.input,
+            self.w,
+            self.o,
+            self.b,
+            self.out_stride,
+        );
+    }
+};
 
 // -- api --------------------------------------------------------------------
 
@@ -480,6 +504,92 @@ pub fn benchBatchedMatmul(
             },
         );
         flush();
+    }
+}
+
+/// CPU batched Q8_0 matmul: `simd_pf.linearF32Q80Batch` on one thread, B rows per call.
+pub fn benchBatchCpu(gpa: std.mem.Allocator, io: std.Io) !void {
+    printSectionHeader("linearF32Q80Batch simd_pf, 1 thread (B rows / call)");
+    const batches = [_]usize{ 1, 8, 64 };
+    const batch_names = [_][]const u8{ "1 row", "8 rows", "64 rows" };
+    const tol = zigferencer.ops_simd_pf.requires.tolerance;
+    const max_b = batches[batches.len - 1];
+    const cases = [_]Case{
+        .{ .label = "2048 -> 6144", .in = 2048, .out = 6144 },
+        .{ .label = "6144 -> 2048", .in = 6144, .out = 2048 },
+        .{ .label = "4096 -> 14336", .in = 4096, .out = 14336 },
+        .{ .label = "14336 -> 4096", .in = 14336, .out = 4096 },
+    };
+    for (cases) |c| {
+        std.debug.assert(c.in % 32 == 0);
+
+        const row_bytes = (c.in / 32) * 34;
+        const input = try gpa.alignedAlloc(f32, .of(f32), max_b * c.in);
+        defer gpa.free(input);
+
+        const w_bytes = try gpa.alignedAlloc(u8, .@"32", c.out * row_bytes);
+        defer gpa.free(w_bytes);
+
+        fillSyntheticInputAndWeight(input[0..c.in], w_bytes, c.in, c.out);
+        for (input, 0..) |*v, i| {
+            v.* = @sin(@as(f32, @floatFromInt(i)) * 0.001);
+        }
+
+        const w_tensor: Tensor = .{
+            .dtype = .q8_0,
+            .n_dims = 2,
+            .shape = .{ @intCast(c.in), @intCast(c.out), 0, 0 },
+            .byte_stride = .{ @intCast(row_bytes), 0, 0, 0 },
+            .data = w_bytes,
+        };
+
+        // The naive reference runs once at B = 64. The smaller batches use its first rows.
+        const ref_out = try gpa.alignedAlloc(f32, .of(f32), max_b * c.out);
+        defer gpa.free(ref_out);
+
+        for (0..max_b) |bi| {
+            zigferencer.ops.linearF32Q80(
+                input[bi * c.in ..][0..c.in],
+                w_tensor,
+                ref_out[bi * c.out ..][0..c.out],
+            );
+        }
+
+        const out = try gpa.alignedAlloc(f32, .of(f32), max_b * c.out);
+        defer gpa.free(out);
+
+        var max_rel: [batches.len]f32 = undefined;
+        for (batches, 0..) |b, bi| {
+            const ctx: BatchCpuCtx = .{
+                .input = input[0 .. b * c.in],
+                .w = w_tensor,
+                .o = out[0 .. b * c.out],
+                .b = b,
+                .out_stride = c.out,
+            };
+            try ctx.run();
+
+            const errs = computeErrors(ref_out[0 .. b * c.out], out[0 .. b * c.out]);
+            const norm = bench_util.normwiseError(ref_out[0 .. b * c.out], out[0 .. b * c.out]);
+            max_rel[bi] = errs.rel;
+            const hsh = hashOut(out[0 .. b * c.out]);
+            const work: f64 = @floatFromInt(b * c.in * c.out * f32_flops_per_mac);
+            const t = try bench_util.timed(io, b * c.in * c.out, ctx);
+            bench_util.rawRow(
+                c.label,
+                batch_names[bi],
+                t.ms,
+                bench_util.rate(t, work),
+                norm,
+                hsh,
+                bench_util.opStatus(tol, norm, false),
+            );
+        }
+        flush();
+        std.debug.print(
+            "    max-rel (floor 1e-5): 1 row {e:.2}, 8 rows {e:.2}, 64 rows {e:.2}\n",
+            .{ max_rel[0], max_rel[1], max_rel[2] },
+        );
     }
 }
 

@@ -11,7 +11,8 @@
 //! position. So the order of the ops across the rows changes no bit of a result.
 //!
 //! Pool. `project` calls the matmul dispatch once per weight, and `gdn` and `attention` call their
-//! pool function once per row. Every other op takes no pool.
+//! pool function once per row. `swiglu` calls its pool function once per step. Every other op takes
+//! no pool.
 //!
 //! Comptime. `use_vulkan_ops` selects the op backend and the GPU forms of the recurrence and the
 //! attention.
@@ -63,6 +64,8 @@ pub const CpuLayerKernels = struct {
     layers: []const std.EnumArray(Weight, ?*const Tensor),
     /// The frequency divisor of each rotated pair in every layer. Null: the plain frequencies.
     rope_factors: ?[]const f32,
+    /// `rope_dim_count / 2` entries, one base angle per rotated pair.
+    rope_thetas: []const f32,
     /// The KV region of each layer of the prefix. Null: the layer holds no KV.
     kv_index: []const ?u32,
     /// The elements of each activation in one step row. Zero: no buffer.
@@ -173,32 +176,14 @@ pub const CpuLayerKernels = struct {
         const sp = span.begin(.ofOps(.initOne(.rope)));
         defer sp.end();
 
-        for (self.rows, 0..) |r, i| {
-            const q = self.stripe(.q, i);
-            var h: u32 = 0;
-            while (h < c.n_heads) : (h += 1) {
-                ops.ropeInplace(
-                    q[h * hd ..][0..hd],
-                    r.pos,
-                    c.rope_dim_count,
-                    c.rope_freq_base,
-                    style,
-                    self.rope_factors,
-                );
-            }
+        assert(self.rope_thetas.len * 2 == c.rope_dim_count);
 
-            const k = self.stripe(.k, i);
-            h = 0;
-            while (h < c.n_kv_heads) : (h += 1) {
-                ops.ropeInplace(
-                    k[h * hd ..][0..hd],
-                    r.pos,
-                    c.rope_dim_count,
-                    c.rope_freq_base,
-                    style,
-                    self.rope_factors,
-                );
-            }
+        const table: naive.RopeTable = .{
+            .thetas = self.rope_thetas,
+            .factors = self.rope_factors,
+        };
+        for (self.rows, 0..) |r, i| {
+            ops.ropeHeads(self.stripe(.q, i), self.stripe(.k, i), hd, r.pos, table, style);
         }
     }
 
@@ -338,10 +323,20 @@ pub const CpuLayerKernels = struct {
         const sp = span.begin(.ofOps(.initOne(.swiglu)));
         defer sp.end();
 
-        for (0..self.rows.len) |i| {
-            const g = self.stripe(.ffn_gate, i);
-            ops.swiglu(g, self.stripe(.ffn_up, i), g);
+        // The GPU op is one dispatch for each row, so that backend keeps the row loop.
+        if (comptime build_options.use_vulkan_ops) {
+            for (0..self.rows.len) |i| {
+                const g = self.stripe(.ffn_gate, i);
+                ops.swiglu(g, self.stripe(.ffn_up, i), g);
+            }
+            return;
         }
+
+        // The stripes are contiguous, so one flat range covers every row.
+        const n = self.rows.len * self.width(.ffn_gate);
+        const gate_all = self.scratch.get(.ffn_gate)[0..n];
+        const up_all = self.scratch.get(.ffn_up)[0..n];
+        parallel.swiglu(ops, self.pool, self.policy, gate_all, up_all, gate_all);
     }
 
     /// Run the conv, the delta rule, and the gated norm of each row into `mix_o`, against the
@@ -377,7 +372,8 @@ pub const CpuLayerKernels = struct {
             const b_row = self.stripe(.beta, i);
             const o_row = self.stripe(.mix_o, i);
             if (comptime build_options.use_vulkan_ops) {
-                // The GdnDecode kernel, bit-checked against `gdn.step` by `gpu-selftest`.
+                // The GdnDecode kernel. `gpu-selftest` compares it with `gdn.step` within a
+                // tolerance, not by bits.
                 ops.gdnStep(
                     @intCast(d.n_k_heads),
                     @intCast(d.n_v_heads),

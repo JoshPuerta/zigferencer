@@ -1,7 +1,8 @@
 //! The `@Vector(8, f32)` variant of `ops/naive.zig`. The public signatures match naive exactly,
-//! so the runner selects this backend by swapping one import. The file overrides `linearF32` and
-//! `linearF32Q80` with vectorized kernels, takes the attention part kernel and the serial row
-//! from `attention_simd.zig`, and re-exports every other op from naive unchanged.
+//! so the runner selects this backend by swapping one import. The file overrides `linearF32` with
+//! a vectorized kernel. It takes the Q8_0 linears from `linear_simd.plain`, the attention part
+//! kernel and the serial row from `attention_simd.zig`, and `residualAdd` from
+//! `elementwise_simd.zig`. It re-exports every other op from naive unchanged.
 //!
 //! Width. Width 8 matches the 256-bit AVX2 ymm register, and Zig lowers it to a NEON 4+4 pair.
 //!
@@ -15,16 +16,16 @@
 //! Q4 and Q6_K. The q4 CPU path exists for completeness, so it reuses the naive scalar
 //! dequant-and-dot. The runner still parallelizes it across rows.
 //!
-//! Batch. The batch forms run one B=1 call per row, so they match it bit for bit. No
-//! weight-reuse win exists here, because the batched microkernel lives in `simd_pf`, which is
-//! the auto default.
+//! Batch. The Q8_0 batch form is the panel path of `linear_simd`, bit-identical to per-row calls.
+//! The f32 batch form runs one B = 1 call per row, so it matches the single-row call bit for bit.
 
 const std = @import("std");
 const attention_simd = @import("attention_simd.zig");
+const elementwise_simd = @import("elementwise_simd.zig");
+const linear_simd = @import("linear_simd.zig");
 const naive = @import("naive.zig");
 const op_requires = @import("../core/op_requires.zig");
 const Tensor = @import("../core/tensor.zig").Tensor;
-const f16BitsToF32 = naive.f16BitsToF32;
 
 // -- constants --------------------------------------------------------------
 
@@ -43,15 +44,16 @@ pub const swiglu = naive.swiglu;
 // -- types ------------------------------------------------------------------
 
 const Vec = @Vector(vec_lanes, f32);
-const VecI8 = @Vector(vec_lanes, i8);
 
 // -- api --------------------------------------------------------------------
 
 pub const dequantQ80 = naive.dequantQ80;
 pub const embedLookup = naive.embedLookup;
 
-pub const residualAdd = naive.residualAdd;
+pub const residualAdd = elementwise_simd.residualAdd;
 pub const ropeInplace = naive.ropeInplace;
+pub const ropeHeads = naive.ropeHeads;
+pub const RopeTable = naive.RopeTable;
 pub const attentionPartTyped = attention_simd.plain.attentionPartTyped;
 pub const attentionMerge = attention_simd.plain.attentionMerge;
 pub const attentionRowTyped = attention_simd.plain.attentionRowTyped;
@@ -62,6 +64,8 @@ pub const linearF32Q41 = naive.linearF32Q41;
 pub const linearF32Q41Batch = naive.linearF32Q41Batch;
 pub const linearF32Q6K = naive.linearF32Q6K;
 pub const linearF32Q6KBatch = naive.linearF32Q6KBatch;
+pub const linearF32Q80 = linear_simd.plain.linearF32Q80;
+pub const linearF32Q80Batch = linear_simd.plain.linearF32Q80Batch;
 
 pub fn linearF32(input: []const f32, weight: Tensor, out: []f32) void {
     std.debug.assert(weight.dtype == .f32);
@@ -101,53 +105,6 @@ pub fn linearF32(input: []const f32, weight: Tensor, out: []f32) void {
     }
 }
 
-pub fn linearF32Q80(input: []const f32, weight: Tensor, out: []f32) void {
-    std.debug.assert(weight.dtype == .q8_0);
-    std.debug.assert(weight.n_dims == 2);
-
-    const in_features: usize = @intCast(weight.shape[0]);
-    const out_features: usize = @intCast(weight.shape[1]);
-    std.debug.assert(input.len == in_features);
-    std.debug.assert(out.len >= out_features);
-    std.debug.assert(in_features % 32 == 0);
-
-    const row_bytes = (in_features / 32) * 34;
-    const n_blocks = in_features / 32;
-
-    // Take one dot product per output row, one Q8_0 block at a time.
-    var j: usize = 0;
-    while (j < out_features) : (j += 1) {
-        var acc: Vec = @splat(0);
-        const row_off = j * row_bytes;
-
-        var blk: usize = 0;
-        while (blk < n_blocks) : (blk += 1) {
-            const blk_off = row_off + blk * 34;
-            const scale = f16BitsToF32(std.mem.readInt(u16, weight.data[blk_off..][0..2], .little));
-            const scale_v: Vec = @splat(scale);
-            const in_base = blk * 32;
-
-            // One Q8_0 block holds 32 i8 values, which is 4 lanes of 8.
-            inline for (0..4) |q| {
-                const i8_off = blk_off + 2 + q * vec_lanes;
-                const i8_arr: [vec_lanes]i8 = @bitCast(weight.data[i8_off..][0..vec_lanes].*);
-                const i8_v: VecI8 = i8_arr;
-                const w_v: Vec = scale_v * @as(Vec, @floatFromInt(i8_v));
-                const in_v: Vec = input[in_base + q * vec_lanes ..][0..vec_lanes].*;
-                acc += w_v * in_v;
-            }
-        }
-
-        out[j] = @reduce(.Add, acc);
-    }
-
-    if (std.debug.runtime_safety) {
-        for (out[0..out_features]) |x| {
-            std.debug.assert(std.math.isFinite(x));
-        }
-    }
-}
-
 /// Batch by rows over this variant's own kernels, bit-identical to one B=1 call per row.
 pub fn linearF32Batch(
     inputs: []const f32,
@@ -157,16 +114,6 @@ pub fn linearF32Batch(
     out_stride: usize,
 ) void {
     naive.linearBatchPerRow(linearF32, inputs, weight, outs, batch, out_stride);
-}
-
-pub fn linearF32Q80Batch(
-    inputs: []const f32,
-    weight: Tensor,
-    outs: []f32,
-    batch: usize,
-    out_stride: usize,
-) void {
-    naive.linearBatchPerRow(linearF32Q80, inputs, weight, outs, batch, out_stride);
 }
 
 // -- tests ------------------------------------------------------------------
@@ -194,19 +141,7 @@ test "simd linearF32Q80Batch is bit-identical to per-row simd linearF32Q80" {
         x.* = @sin(@as(f32, @floatFromInt(i)) * 0.04);
     }
 
-    for (0..out_features) |row| {
-        const off = row * row_bytes;
-        var blk: usize = 0;
-        while (blk < in_features / 32) : (blk += 1) {
-            const blk_off = off + blk * 34;
-            std.mem.writeInt(u16, w_data[blk_off..][0..2], 0x3c00, .little);
-            var i: usize = 0;
-            while (i < 32) : (i += 1) {
-                const v: i8 = @intCast(@as(i32, @intCast((row + blk * 32 + i) % 13)) - 6);
-                w_data[blk_off + 2 + i] = @bitCast(v);
-            }
-        }
-    }
+    linear_simd.fillTestWeight(w_data, in_features, out_features, row_bytes);
 
     const w: Tensor = .{
         .dtype = .q8_0,
@@ -291,20 +226,7 @@ test "simd linearF32Q80 matches naive within tolerance" {
         x.* = @sin(@as(f32, @floatFromInt(i)) * 0.01);
     }
 
-    for (0..out_features) |row| {
-        const off = row * row_bytes;
-        var blk: usize = 0;
-        while (blk < in_features / 32) : (blk += 1) {
-            const blk_off = off + blk * 34;
-            std.mem.writeInt(u16, w_data[blk_off..][0..2], 0x3c00, .little); // scale = 1.0
-            var i: usize = 0;
-            while (i < 32) : (i += 1) {
-                const v_i32: i32 = @as(i32, @intCast((row + blk * 32 + i) % 13)) - 6;
-                const v: i8 = @intCast(v_i32);
-                w_data[blk_off + 2 + i] = @bitCast(v);
-            }
-        }
-    }
+    linear_simd.fillTestWeight(w_data, in_features, out_features, row_bytes);
 
     const w: Tensor = .{
         .dtype = .q8_0,

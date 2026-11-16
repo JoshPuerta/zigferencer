@@ -4,20 +4,19 @@ This document explains how zigferencer works, from the build to a served token.
 
 **Contents**
 
-- [1. Glossary](#1-glossary): the words of this document.
-- [2. Build approach](#2-build-approach): the artifacts, the build options, and the Makefile.
-- [3. From a prompt to text](#3-from-a-prompt-to-text): the pipeline, and `run` against `serve`.
-- [4. Control and datapath](#4-control-and-datapath): which modules own state, and which are pure.
-- [5. Code placement](#5-code-placement): what each directory holds, and the files to read first.
-- [6. The core data types](#6-the-core-data-types): the values that pass between the parts.
-- [7. The forward pass](#7-the-forward-pass): the runners, the rings, and the kernels of a layer.
-- [8. CPU threads](#8-cpu-threads): the thread pool, and why the thread count changes no bit.
-- [9. Memory](#9-memory): how the engine plans the window, the slots, the VRAM, and the RAM.
-- [10. Serving](#10-serving): the threads, the scheduler, the sessions, and what outlives a turn.
-- [11. Correctness](#11-correctness): the reference, the token hash, and the tests.
-- [12. What calls what](#12-what-calls-what): the call trees from `main` to the kernels.
-- [13. Operating notes](#13-operating-notes): how to measure, test, and debug.
-- [14. Summary](#14-summary): the design in eight points.
+- [1. Glossary](#1-glossary)
+- [2. Build approach](#2-build-approach)
+- [3. From a prompt to text](#3-from-a-prompt-to-text)
+- [4. Control and datapath](#4-control-and-datapath)
+- [5. Code placement](#5-code-placement)
+- [6. The core data types](#6-the-core-data-types)
+- [7. The forward pass](#7-the-forward-pass)
+- [8. CPU threads](#8-cpu-threads)
+- [9. Memory](#9-memory)
+- [10. Serving](#10-serving)
+- [11. Correctness](#11-correctness)
+- [12. What calls what](#12-what-calls-what)
+- [13. Operating notes](#13-operating-notes)
 
 ## 1. Glossary
 
@@ -578,13 +577,13 @@ is the op module of the build, and a shader name is its file in
 | `norm` | `ops.rmsnorm` | `rmsnorm` for `step`, `rmsnorm_batch` for the other steps |
 | `project` | `ops.linearF32Q80Batch`, or the batch op of the weight type, on the pool | `linear_q8_0_reduce` for one row, `linear_q8_0_batch` for more. Qwen3.5 records `linear_q8_0_gemm` from `gemm_min_batch` rows. A Llama Q4_0 model records the `linear_q4_0_` forms. |
 | `qkNorm` | `ops.rmsnorm` on each head | `qwen_qk_norm` |
-| `rope` | `ops.ropeInplace` on each head | `rope_multi` for `step`, `rope_multi_batch` for the other steps |
+| `rope` | `ops.ropeHeads` once per row, with the base angles that the runner fills at init | `rope_multi` for `step`, `rope_multi_batch` for the other steps |
 | `kvCommit` | a copy into the slot, narrowed to the KV type | a buffer copy, after `kv_commit_f16` at f16 KV |
 | `attention` | `ops.attentionPartTyped` for each part on the pool, then `ops.attentionMerge` | `attention` for `step`, `attention_multi_stream` for `stepBatch`, `attention_batch` for a prompt chunk. A row past `limits.attn_split_len` adds `attention_split` and `attention_merge`. |
 | `gate` | a sigmoid product inside `CpuLayerKernels.gate` | `sigmoid_gate` |
 | `residual` | `ops.residualAdd` | `residual_add` |
-| `swiglu` | `ops.swiglu` | `swiglu` |
-| `gdn` | `gdn.stepPrologue`, then `gdn.stepHeads` on the pool (`ops/gdn.zig`) | `gdn_decode` for `step` and `stepBatch`. A prompt chunk records `gdn_chunk_conv`, `gdn_chunk_scan`, and `gdn_chunk_norm`. |
+| `swiglu` | `parallel.swiglu` on the pool, which runs `ops.swiglu` over element ranges | `swiglu` |
+| `gdn` | `gdn.stepKeyHead` for each key head on the pool (`ops/gdn.zig`) | `gdn_decode` for `step` and `stepBatch`. A prompt chunk records `gdn_chunk_conv`, `gdn_chunk_scan`, and `gdn_chunk_norm`. |
 
 All three layers share the norms, the projections, the residual adds, and the
 feed-forward, on the same CPU functions. The Qwen3.5 attention layer adds
@@ -656,13 +655,14 @@ A dispatch takes no lock and allocates nothing.
 | --- | --- |
 | Matrix product | A chunk of output rows, a multiple of 4, about four chunks for each participant. |
 | Attention | One KV head group over one part of the row. |
-| Gated-DeltaNet | One value head, after a short serial part on the caller. |
+| Gated-DeltaNet | One key head with its value heads. No serial part runs on the caller. |
+| `swiglu` | A range of elements of the flat gate buffer, about four ranges for each participant. |
 
 The result of a unit does not depend on the thread that runs it. A matrix row is one
 kernel call. An attention part writes its own record, and the caller adds the parts
-in order. A value head writes only its own state. The token hash therefore holds
-across thread counts, floors, spin budgets, and claim orders. `tools/gate.sh threads`
-checks the thread counts.
+in order. A key head and its value heads write only their own channels, conv ring
+entries, and states. The token hash therefore holds across thread counts, floors,
+spin budgets, and claim orders. `tools/gate.sh threads` checks the thread counts.
 
 ## 9. Memory
 
@@ -1296,13 +1296,13 @@ CpuRunner(llama_layer).stepBatch(rows)                     runtime/cpu_runner.zi
   llama_layer.forward(CpuLayerKernels, layer), for each layer
     CpuLayerKernels.norm                                   -> ops.rmsnorm
     CpuLayerKernels.project (q, k, v)                      -> linear_dispatch.linearBatchDispatch -> pool.run -> ops.linearF32Q80Batch
-    CpuLayerKernels.rope                                   -> ops.ropeInplace
+    CpuLayerKernels.rope                                   -> ops.ropeHeads, once per row
     CpuLayerKernels.kvCommit                               writes K and V into the slot, narrowed to the KV dtype
     CpuLayerKernels.attention                              -> parallel.attentionTyped -> ops.attentionPartTyped for each KV head group and part
                                                            -> ops.attentionMerge
     CpuLayerKernels.project (out), .residual               -> linearBatchDispatch, ops.residualAdd
     CpuLayerKernels.norm, .project (gate, up)              -> ops.rmsnorm, linearBatchDispatch
-    CpuLayerKernels.swiglu, .project (down), .residual     -> ops.swiglu, linearBatchDispatch, ops.residualAdd
+    CpuLayerKernels.swiglu, .project (down), .residual     -> parallel.swiglu -> ops.swiglu, linearBatchDispatch, ops.residualAdd
   ops.rmsnorm, linearBatch(lm_head), on the rows that want logits
 ```
 
@@ -1441,28 +1441,3 @@ acceptorTask -> HttpAdapter.onAccept                       serve/openai/http_ser
   disk tier of the prefix cache. The default is `.prompt_cache`.
 - **Debugging.** `make debug` and `make debug-test` build for lldb and gdb.
   [debugging.md](debugging.md) has the steps.
-
-## 14. Summary
-
-1. **One pipeline.** Every command that generates text loads a model, tokenizes,
-   prefills, and decodes through the same runners. `run` is the shortest path, and
-   `serve` adds sessions, a scheduler, and the KV tiers.
-2. **The build selects the kernels.** `-Druntime` sets what the binary links, and
-   `-Dops-backend` sets which kernels compute the ops. The binary holds no backend
-   branch at run time.
-3. **Runners own the state, kernels are pure.** A bug in a kernel shows in a table
-   test. A bug in a runner or the scheduler shows in a sequence of events.
-4. **One step for prefill and decode.** A step is a batch of rows. A row in a
-   batch gives the same result as the row alone.
-5. **Plans before allocations.** The window, the slots, the VRAM, and the RAM are
-   sized before the first large allocation. A boot that does not fit stops with the
-   numbers and a fit.
-6. **Continuous batching.** The scheduler fills the spare rows of each decode step
-   with prompt rows, and it never waits for a client.
-7. **Checked determinism.** Token hashes compare thread counts, backends, and
-   placements against one value. `naive` is the reference for every kernel.
-8. **Named bounds.** `core/limits.zig` holds the caps of the tables, the
-   windows, the span ring, and most queues. The boot refuses a value past a cap. The
-   two queue capacities of the serve engine stand in `serve/engine.zig`. The decode
-   ring takes its size from `record_ring.Buf`, and the upload ring from
-   `ring_fsm.depth`.

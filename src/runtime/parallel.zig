@@ -5,8 +5,8 @@
 //!
 //! Comptime. `E` and `Kernels` make the fan-out generic, so f32 and f16 share one body.
 //!
-//! The module also holds the control units of CPU attention and of the GDN step. They spread the
-//! work units of one row over the same pool, with the same gate, `Policy.parts`.
+//! The module also holds the control units of CPU attention, of the GDN step, and of `swiglu`. They
+//! spread their work units over the same pool, with the same gate, `Policy.parts`.
 //!
 //! Determinism. The dispatcher is bit-deterministic across thread counts. Exactly one unit
 //! computes each output row in the reduction order of the kernel. The bench token hash therefore
@@ -18,12 +18,12 @@
 //! participants claim the units. Every fan-out decision comes through `Policy.parts`, so a new
 //! rule, such as a cap for each bound of an op or a floor for each op class, goes there.
 //!
-//! Defaults. One floor serves the matmuls, the attention, and the Gated-DeltaNet heads. A sweep of
-//! the floor measured 250 kFLOP best on a small model and on a 2 GB model. A dispatch on the pool
-//! costs about half a microsecond at 8 participants, so an op of this size gains from a split. A
-//! worker that sleeps adds a futex wake to the next dispatch, and a 50 us spin covers the gap
-//! between the matmuls of one decode step. A longer spin keeps idle workers on the cores and gives
-//! no gain, so `--spin-us` stops at one second. Decode saturates the memory bandwidth of a
+//! Defaults. One floor serves the matmuls, the attention, the Gated-DeltaNet heads, and `swiglu`. A
+//! sweep of the floor measured 250 kFLOP best on a small model and on a 2 GB model. A dispatch on
+//! the pool costs about half a microsecond at 8 participants, so an op of this size gains from a
+//! split. A worker that sleeps adds a futex wake to the next dispatch, and a 50 us spin covers the
+//! gap between the matmuls of one decode step. A longer spin keeps idle workers on the cores and
+//! gives no gain, so `--spin-us` stops at one second. Decode saturates the memory bandwidth of a
 //! dual-channel desktop between 4 and 8 threads, and prefill keeps gaining to 8. The default thread
 //! count stops at 8 to keep sustained load off the rest of the cores. `--threads N` raises it.
 //!
@@ -42,9 +42,13 @@
 //! records on the calling thread, adding the parts in ascending order. The geometry is a function
 //! of `t_len` alone, so any assignment of units to participants gives the same bits.
 //!
-//! GDN units. The caller thread runs `gdn.stepPrologue`, then the value heads run on the pool, one
-//! head per unit. A head writes only its own state and readout, so any assignment of heads to
-//! participants gives the bits of `gdn.step`. The finite check runs after every head ends.
+//! GDN units. A unit is one key head. It runs the conv, the SiLU, and the norms of its q and k
+//! channels, then the conv and the recurrence of its value heads. Each channel, each conv ring
+//! entry, and each state belongs to one unit, so any assignment of units to participants gives the
+//! bits of `gdn.step`. The finite check runs after every unit ends.
+//!
+//! Swiglu units. The op is elementwise, so a unit is a range of `elementwiseUnitLen` elements of
+//! the flat gate buffer. Any partition gives the bits of the serial op.
 //!
 //! Weight slices. `Tensor.byte_stride` carries per-axis strides, but the kernels compute the bytes
 //! of one output row as the data length divided by the output count (`shape[1]`). The slice math
@@ -74,6 +78,11 @@ const log = std.log.scoped(.parallel);
 
 /// The default fan-out floor in FLOPs.
 pub const default_min_parallel_flops: u64 = 250_000;
+
+/// The weight of one `swiglu` element in FLOPs of the `simd_pf` Q8_0 matmul, the op of the floor
+/// sweep. One scalar element takes as long as this many FLOPs of that matmul. The `linearF32Q80`
+/// and `swiglu` rows of `zig build bench` give both rates.
+pub const swiglu_flops_per_element: u64 = 176;
 
 /// The default spin budget of a pool worker.
 pub const default_spin_ns: u64 = 50_000;
@@ -191,17 +200,41 @@ const MatmulUnits = struct {
     }
 };
 
-/// The inputs of one GDN step. Unit `u` is value head `u`.
+/// The inputs of one GDN step. Unit `u` is key head `u` with its value heads.
 const GdnUnits = struct {
     d: gdn.Dims,
+    qkv: []f32,
+    conv_w: []const f32,
+    conv_state: []f32,
     heads: gdn.Heads,
 
     fn unit(self: *const GdnUnits, u: u32) void {
-        std.debug.assert(u < self.d.n_v_heads);
+        std.debug.assert(u < self.d.n_k_heads);
 
-        gdn.stepHeads(self.d, self.heads, u, @as(usize, u) + 1);
+        gdn.stepKeyHead(self.d, self.qkv, self.conv_w, self.conv_state, self.heads, u);
     }
 };
+
+/// The inputs of one `swiglu` call. Unit `u` covers the elements
+/// `[u * len, min(n, (u + 1) * len))`.
+fn SwigluUnits(comptime Kernels: type) type {
+    return struct {
+        gate: []const f32,
+        up: []const f32,
+        dst: []f32,
+        len: usize,
+        n: usize,
+
+        const Self = @This();
+
+        fn unit(self: *const Self, u: u32) void {
+            const start = @as(usize, u) * self.len;
+            std.debug.assert(start < self.n);
+            const end = @min(self.n, start + self.len);
+            Kernels.swiglu(self.gate[start..end], self.up[start..end], self.dst[start..end]);
+        }
+    };
+}
 
 /// The inputs of one attention row. The pool erases the context type, so this type binds `E` and
 /// the kernels.
@@ -523,8 +556,61 @@ pub fn attentionTyped(
     Kernels.attentionMerge(parts_buf, units.n_parts, n_heads, head_dim, out);
 }
 
+/// The elements of one `swiglu` unit: `ceil(n / (4 * threads))` rounded up to a multiple of 16.
+/// 16 f32 fill one 64-byte cache line, so two units never share a line of an aligned buffer.
+pub fn elementwiseUnitLen(n: usize, threads: u32) usize {
+    std.debug.assert(n > 0);
+    std.debug.assert(threads >= 1);
+
+    const per_unit = std.math.divCeil(usize, n, 4 * @as(usize, threads)) catch unreachable;
+    const len = std.mem.alignForward(usize, per_unit, 16);
+    std.debug.assert(len >= 16);
+    std.debug.assert(len % 16 == 0);
+    return len;
+}
+
+/// Run `dst = silu(gate) * up` over the flat buffers, on the pool when the work is large enough.
+/// `dst` can be `gate`. `Kernels` declares `swiglu`.
+pub fn swiglu(
+    comptime Kernels: type,
+    pool: *Pool,
+    policy: Policy,
+    gate: []const f32,
+    up: []const f32,
+    dst: []f32,
+) void {
+    const n = gate.len;
+    std.debug.assert(n > 0);
+    std.debug.assert(up.len == n);
+    std.debug.assert(dst.len >= n);
+    const threads = pool.threads();
+    std.debug.assert(@max(policy.n_threads, 1) == threads);
+
+    // Size the units and pick the participants.
+    const len = elementwiseUnitLen(n, threads);
+    const n_units = std.math.divCeil(usize, n, len) catch unreachable;
+    const flops: u64 = @as(u64, n) * swiglu_flops_per_element;
+    const parts = policy.parts(threads, n_units, flops);
+    if (parts == 1) {
+        log.debug(
+            "swiglu serial: flops {d}, floor {d}, n {d}",
+            .{ flops, policy.min_parallel_flops, n },
+        );
+        Kernels.swiglu(gate, up, dst);
+        return;
+    }
+
+    log.debug(
+        "swiglu fanout: {d} parts, {d} units of {d} elements over n {d}",
+        .{ parts, n_units, len, n },
+    );
+    const Ctx = SwigluUnits(Kernels);
+    const ctx: Ctx = .{ .gate = gate, .up = up, .dst = dst, .len = len, .n = n };
+    pool.run(Ctx, &ctx, Ctx.unit, @intCast(n_units), parts);
+}
+
 /// The control unit of one GDN step of one row.
-/// `heads.qkv` must be `qkv`, the buffer that the prologue writes.
+/// `heads.qkv` must be `qkv`, the buffer that `gdn.stepKeyHead` writes in place.
 pub fn gdnStep(
     pool: *Pool,
     policy: Policy,
@@ -536,6 +622,7 @@ pub fn gdnStep(
 ) void {
     std.debug.assert(heads.qkv.ptr == qkv.ptr);
     std.debug.assert(heads.qkv.len == qkv.len);
+    std.debug.assert(d.n_k_heads >= 1);
     std.debug.assert(d.n_v_heads >= 1);
 
     const threads = pool.threads();
@@ -543,19 +630,29 @@ pub fn gdnStep(
     // 7 FLOP per state element: decay 1, key read 2, rank-1 write 2, query read 2.
     const flops: u64 = 7 * @as(u64, d.n_v_heads) * d.head_dim * d.head_dim;
 
-    // Run the prologue on the caller, then the heads serially or on the pool.
-    gdn.stepPrologue(d, qkv, conv_w, conv_state, heads.rms_eps);
-    const n_units: u32 = @intCast(d.n_v_heads);
+    // Run the key heads serially or on the pool.
+    const n_units: u32 = @intCast(d.n_k_heads);
     const parts = policy.parts(threads, n_units, flops);
     if (parts == 1) {
         log.debug(
-            "gdn serial: flops {d}, floor {d}, heads {d}",
-            .{ flops, policy.min_parallel_flops, d.n_v_heads },
+            "gdn serial: flops {d}, floor {d}, key heads {d}",
+            .{ flops, policy.min_parallel_flops, d.n_k_heads },
         );
-        gdn.stepHeads(d, heads, 0, d.n_v_heads);
+        for (0..d.n_k_heads) |kh| {
+            gdn.stepKeyHead(d, qkv, conv_w, conv_state, heads, kh);
+        }
     } else {
-        log.debug("gdn fanout: {d} parts over {d} heads, flops {d}", .{ parts, n_units, flops });
-        const ctx: GdnUnits = .{ .d = d, .heads = heads };
+        log.debug(
+            "gdn fanout: {d} parts over {d} key heads, flops {d}",
+            .{ parts, n_units, flops },
+        );
+        const ctx: GdnUnits = .{
+            .d = d,
+            .qkv = qkv,
+            .conv_w = conv_w,
+            .conv_state = conv_state,
+            .heads = heads,
+        };
         pool.run(GdnUnits, &ctx, GdnUnits.unit, n_units, parts);
     }
 
@@ -872,10 +969,11 @@ test "attention: forced fan-out at 1, 2, 3, 4, and 16 threads gives the bits of 
 
 test "gdnStep: forced fan-out at 1, 2, 3, 4, and 16 threads gives the bits of gdn.step" {
     const gpa = std.testing.allocator;
-    // The 2B (16 value heads) and the 9B (32 value heads). At 3 threads the heads split unevenly.
+    // The 2B, the 9B, and a small shape of 2 key heads. At 3 threads the key heads split unevenly.
     const shapes = [_]gdn.Dims{
         .{ .n_k_heads = 16, .n_v_heads = 16, .head_dim = 128, .conv_kernel = 4 },
         .{ .n_k_heads = 16, .n_v_heads = 32, .head_dim = 128, .conv_kernel = 4 },
+        .{ .n_k_heads = 2, .n_v_heads = 6, .head_dim = 40, .conv_kernel = 4 },
     };
     const thread_counts = [_]u32{ 1, 2, 3, 4, 16 };
     const tokens = 2;
@@ -1015,6 +1113,67 @@ test "gdnStep: forced fan-out at 1, 2, 3, 4, and 16 threads gives the bits of gd
                 u8,
                 std.mem.sliceAsBytes(qkv_ref),
                 std.mem.sliceAsBytes(qkv),
+            );
+        }
+    }
+}
+
+test "elementwiseUnitLen: about four units per thread, a multiple of 16" {
+    try std.testing.expectEqual(@as(usize, 16), elementwiseUnitLen(1, 1));
+    try std.testing.expectEqual(@as(usize, 16), elementwiseUnitLen(64, 1));
+    try std.testing.expectEqual(@as(usize, 32), elementwiseUnitLen(65, 1));
+    try std.testing.expectEqual(@as(usize, 1536), elementwiseUnitLen(49152, 8));
+    try std.testing.expectEqual(@as(usize, 16), elementwiseUnitLen(1000, 16));
+}
+
+test "swiglu: forced fan-out at 1, 2, 3, 4, and 16 threads gives the bits of the serial op" {
+    const gpa = std.testing.allocator;
+    const naive = @import("../ops/naive.zig");
+    var prng = std.Random.DefaultPrng.init(0xd34d_b33f);
+    const r = prng.random();
+    for ([_]usize{ 1, 17, 6144 * 3 + 5 }) |n| {
+        const gate = try gpa.alloc(f32, n);
+        defer gpa.free(gate);
+
+        const up = try gpa.alloc(f32, n);
+        defer gpa.free(up);
+
+        for (gate, up) |*g, *u| {
+            g.* = r.float(f32) * 8.0 - 4.0;
+            u.* = r.float(f32) * 8.0 - 4.0;
+        }
+
+        const want = try gpa.alloc(f32, n);
+        defer gpa.free(want);
+
+        naive.swiglu(gate, up, want);
+
+        const got = try gpa.alloc(f32, n);
+        defer gpa.free(got);
+
+        const in_place = try gpa.alloc(f32, n);
+        defer gpa.free(in_place);
+
+        for ([_]u32{ 1, 2, 3, 4, 16 }) |n_threads| {
+            var pool: Pool = undefined;
+            try pool.init(std.testing.io, n_threads, 50_000);
+            defer pool.deinit();
+
+            const policy: Policy = .{ .n_threads = n_threads, .min_parallel_flops = 0 };
+            @memset(got, std.math.nan(f32));
+            swiglu(naive, &pool, policy, gate, up, got);
+            try std.testing.expectEqualSlices(
+                u8,
+                std.mem.sliceAsBytes(want),
+                std.mem.sliceAsBytes(got),
+            );
+
+            @memcpy(in_place, gate);
+            swiglu(naive, &pool, policy, in_place, up, in_place);
+            try std.testing.expectEqualSlices(
+                u8,
+                std.mem.sliceAsBytes(want),
+                std.mem.sliceAsBytes(in_place),
             );
         }
     }
