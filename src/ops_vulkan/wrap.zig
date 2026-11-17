@@ -18,6 +18,7 @@
 //!   ropeInplace, ropeHeads            CPU. A dispatch per row or per head costs more
 //!                                     than the CPU microseconds.
 //!   linearF32                         CPU. Only the small f32 norm weights.
+//!   sigmoidGate                       CPU. A sigmoid and a multiply per element of a short vector.
 //!   rmsnorm, swiglu, residualAdd,     GPU. The heavy ops that justify a dispatch.
 //!   attentionSingle, linearF32Q80
 //!
@@ -83,6 +84,7 @@ pub const linearF32Batch = naive.linearF32Batch;
 pub const ropeInplace = naive.ropeInplace;
 pub const ropeHeads = naive.ropeHeads;
 pub const RopeTable = naive.RopeTable;
+pub const sigmoidGate = naive.sigmoidGate;
 
 // -- lifecycle --------------------------------------------------------------
 pub fn initBackend(alloc: std.mem.Allocator, options: vulkan_ctx.Options) InitError!void {

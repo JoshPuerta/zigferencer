@@ -42,10 +42,11 @@
 //! records on the calling thread, adding the parts in ascending order. The geometry is a function
 //! of `t_len` alone, so any assignment of units to participants gives the same bits.
 //!
-//! GDN units. A unit is one key head. It runs the conv, the SiLU, and the norms of its q and k
-//! channels, then the conv and the recurrence of its value heads. Each channel, each conv ring
-//! entry, and each state belongs to one unit, so any assignment of units to participants gives the
-//! bits of `gdn.step`. The finite check runs after every unit ends.
+//! GDN units. A unit is one key head, `Kernels.gdnStepKeyHead`. It runs the conv, the SiLU, and
+//! the norms of its q and k channels, then the conv and the recurrence of its value heads. Each
+//! channel, each conv ring entry, and each state belongs to one unit, so any assignment of units
+//! to participants gives the bits of the serial step of the backend: `gdn.step` for naive, and
+//! `gdn_simd.kernels.step` for the SIMD backends. The finite check runs after every unit ends.
 //!
 //! Swiglu units. The op is elementwise, so a unit is a range of `elementwiseUnitLen` elements of
 //! the flat gate buffer. Any partition gives the bits of the serial op.
@@ -78,11 +79,6 @@ const log = std.log.scoped(.parallel);
 
 /// The default fan-out floor in FLOPs.
 pub const default_min_parallel_flops: u64 = 250_000;
-
-/// The weight of one `swiglu` element in FLOPs of the `simd_pf` Q8_0 matmul, the op of the floor
-/// sweep. One scalar element takes as long as this many FLOPs of that matmul. The `linearF32Q80`
-/// and `swiglu` rows of `zig build bench` give both rates.
-pub const swiglu_flops_per_element: u64 = 176;
 
 /// The default spin budget of a pool worker.
 pub const default_spin_ns: u64 = 50_000;
@@ -201,19 +197,23 @@ const MatmulUnits = struct {
 };
 
 /// The inputs of one GDN step. Unit `u` is key head `u` with its value heads.
-const GdnUnits = struct {
-    d: gdn.Dims,
-    qkv: []f32,
-    conv_w: []const f32,
-    conv_state: []f32,
-    heads: gdn.Heads,
+fn GdnUnits(comptime Kernels: type) type {
+    return struct {
+        d: gdn.Dims,
+        qkv: []f32,
+        conv_w: []const f32,
+        conv_state: []f32,
+        heads: gdn.Heads,
 
-    fn unit(self: *const GdnUnits, u: u32) void {
-        std.debug.assert(u < self.d.n_k_heads);
+        const Self = @This();
 
-        gdn.stepKeyHead(self.d, self.qkv, self.conv_w, self.conv_state, self.heads, u);
-    }
-};
+        fn unit(self: *const Self, u: u32) void {
+            std.debug.assert(u < self.d.n_k_heads);
+
+            Kernels.gdnStepKeyHead(self.d, self.qkv, self.conv_w, self.conv_state, self.heads, u);
+        }
+    };
+}
 
 /// The inputs of one `swiglu` call. Unit `u` covers the elements
 /// `[u * len, min(n, (u + 1) * len))`.
@@ -570,7 +570,7 @@ pub fn elementwiseUnitLen(n: usize, threads: u32) usize {
 }
 
 /// Run `dst = silu(gate) * up` over the flat buffers, on the pool when the work is large enough.
-/// `dst` can be `gate`. `Kernels` declares `swiglu`.
+/// `dst` can be `gate`. `Kernels` declares `swiglu` and `swiglu_flops_per_element`.
 pub fn swiglu(
     comptime Kernels: type,
     pool: *Pool,
@@ -589,7 +589,7 @@ pub fn swiglu(
     // Size the units and pick the participants.
     const len = elementwiseUnitLen(n, threads);
     const n_units = std.math.divCeil(usize, n, len) catch unreachable;
-    const flops: u64 = @as(u64, n) * swiglu_flops_per_element;
+    const flops: u64 = @as(u64, n) * Kernels.swiglu_flops_per_element;
     const parts = policy.parts(threads, n_units, flops);
     if (parts == 1) {
         log.debug(
@@ -609,9 +609,10 @@ pub fn swiglu(
     pool.run(Ctx, &ctx, Ctx.unit, @intCast(n_units), parts);
 }
 
-/// The control unit of one GDN step of one row.
-/// `heads.qkv` must be `qkv`, the buffer that `gdn.stepKeyHead` writes in place.
+/// The control unit of one GDN step of one row. `Kernels` declares `gdnStepKeyHead`.
+/// `heads.qkv` must be `qkv`, the buffer that `Kernels.gdnStepKeyHead` writes in place.
 pub fn gdnStep(
+    comptime Kernels: type,
     pool: *Pool,
     policy: Policy,
     d: gdn.Dims,
@@ -639,21 +640,22 @@ pub fn gdnStep(
             .{ flops, policy.min_parallel_flops, d.n_k_heads },
         );
         for (0..d.n_k_heads) |kh| {
-            gdn.stepKeyHead(d, qkv, conv_w, conv_state, heads, kh);
+            Kernels.gdnStepKeyHead(d, qkv, conv_w, conv_state, heads, kh);
         }
     } else {
         log.debug(
             "gdn fanout: {d} parts over {d} key heads, flops {d}",
             .{ parts, n_units, flops },
         );
-        const ctx: GdnUnits = .{
+        const Ctx = GdnUnits(Kernels);
+        const ctx: Ctx = .{
             .d = d,
             .qkv = qkv,
             .conv_w = conv_w,
             .conv_state = conv_state,
             .heads = heads,
         };
-        pool.run(GdnUnits, &ctx, GdnUnits.unit, n_units, parts);
+        pool.run(Ctx, &ctx, Ctx.unit, n_units, parts);
     }
 
     // Check the readout after every head ends.
@@ -967,7 +969,21 @@ test "attention: forced fan-out at 1, 2, 3, 4, and 16 threads gives the bits of 
     }
 }
 
-test "gdnStep: forced fan-out at 1, 2, 3, 4, and 16 threads gives the bits of gdn.step" {
+test "gdnStep: forced fan-out at 1, 2, 3, 4, and 16 threads gives the bits of the serial step" {
+    const naive = @import("../ops/naive.zig");
+    const simd_pf = @import("../ops/simd_pf.zig");
+    const gdn_simd = @import("../ops/gdn_simd.zig");
+    const simd = @import("../ops/simd.zig");
+    // Both SIMD backends run one GDN unit, so the simd_pf run covers simd too.
+    comptime std.debug.assert(simd.gdnStepKeyHead == simd_pf.gdnStepKeyHead);
+    // Each backend with the serial step of its own arithmetic.
+    inline for (.{ .{ naive, gdn.reference }, .{ simd_pf, gdn_simd.kernels } }) |set| {
+        try expectGdnFanOut(set[0], set[1]);
+    }
+}
+
+/// Check that `gdnStep` over `Kernels` gives the bits of `Serial.step` at several thread counts.
+fn expectGdnFanOut(comptime Kernels: type, comptime Serial: type) !void {
     const gpa = std.testing.allocator;
     // The 2B, the 9B, and a small shape of 2 key heads. At 3 threads the key heads split unevenly.
     const shapes = [_]gdn.Dims{
@@ -1024,7 +1040,7 @@ test "gdnStep: forced fan-out at 1, 2, 3, 4, and 16 threads gives the bits of gd
             x.* = r.float(f32) - 0.5;
         }
 
-        // Run the serial reference: `gdn.step` over the tokens.
+        // Run the serial step over the tokens.
         const state_ref = try gpa.dupe(f32, state0);
         defer gpa.free(state_ref);
 
@@ -1038,7 +1054,7 @@ test "gdnStep: forced fan-out at 1, 2, 3, 4, and 16 threads gives the bits of gd
         defer gpa.free(o_ref);
 
         for (0..tokens) |t| {
-            gdn.step(
+            Serial.step(
                 d,
                 qkv_ref[t * cd ..][0..cd],
                 z,
@@ -1080,7 +1096,7 @@ test "gdnStep: forced fan-out at 1, 2, 3, 4, and 16 threads gives the bits of gd
             const policy: Policy = .{ .n_threads = n_threads, .min_parallel_flops = 0 };
             for (0..tokens) |t| {
                 const qkv_row = qkv[t * cd ..][0..cd];
-                gdnStep(&pool, policy, d, qkv_row, conv_w, conv, .{
+                gdnStep(Kernels, &pool, policy, d, qkv_row, conv_w, conv, .{
                     .qkv = qkv_row,
                     .z = z,
                     .a = a,
@@ -1127,8 +1143,15 @@ test "elementwiseUnitLen: about four units per thread, a multiple of 16" {
 }
 
 test "swiglu: forced fan-out at 1, 2, 3, 4, and 16 threads gives the bits of the serial op" {
+    // A unit holds a multiple of 16 elements, so each element keeps its lane. The tail of the
+    // last unit is the tail of the serial call.
+    inline for (.{ @import("../ops/naive.zig"), @import("../ops/simd_pf.zig") }) |Kernels| {
+        try checkSwigluFanout(Kernels);
+    }
+}
+
+fn checkSwigluFanout(comptime Kernels: type) !void {
     const gpa = std.testing.allocator;
-    const naive = @import("../ops/naive.zig");
     var prng = std.Random.DefaultPrng.init(0xd34d_b33f);
     const r = prng.random();
     for ([_]usize{ 1, 17, 6144 * 3 + 5 }) |n| {
@@ -1146,7 +1169,7 @@ test "swiglu: forced fan-out at 1, 2, 3, 4, and 16 threads gives the bits of the
         const want = try gpa.alloc(f32, n);
         defer gpa.free(want);
 
-        naive.swiglu(gate, up, want);
+        Kernels.swiglu(gate, up, want);
 
         const got = try gpa.alloc(f32, n);
         defer gpa.free(got);
@@ -1161,7 +1184,7 @@ test "swiglu: forced fan-out at 1, 2, 3, 4, and 16 threads gives the bits of the
 
             const policy: Policy = .{ .n_threads = n_threads, .min_parallel_flops = 0 };
             @memset(got, std.math.nan(f32));
-            swiglu(naive, &pool, policy, gate, up, got);
+            swiglu(Kernels, &pool, policy, gate, up, got);
             try std.testing.expectEqualSlices(
                 u8,
                 std.mem.sliceAsBytes(want),
@@ -1169,7 +1192,7 @@ test "swiglu: forced fan-out at 1, 2, 3, 4, and 16 threads gives the bits of the
             );
 
             @memcpy(in_place, gate);
-            swiglu(naive, &pool, policy, in_place, up, in_place);
+            swiglu(Kernels, &pool, policy, in_place, up, in_place);
             try std.testing.expectEqualSlices(
                 u8,
                 std.mem.sliceAsBytes(want),

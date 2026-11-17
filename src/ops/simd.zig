@@ -1,14 +1,17 @@
 //! The `@Vector(8, f32)` variant of `ops/naive.zig`. The public signatures match naive exactly,
-//! so the runner selects this backend by swapping one import. The file overrides `linearF32` with
-//! a vectorized kernel. It takes the Q8_0 linears from `linear_simd.plain`, the attention part
-//! kernel and the serial row from `attention_simd.zig`, and `residualAdd` from
-//! `elementwise_simd.zig`. It re-exports every other op from naive unchanged.
+//! so the runner selects this backend by swapping one import. It takes the f32 linears from
+//! `linear_simd` and the Q8_0 linears from `linear_simd.plain`, the attention part kernel and the
+//! serial row from `attention_simd.zig`, `residualAdd`, `rmsnorm`, `swiglu`, and `sigmoidGate`
+//! from `elementwise_simd.zig`, and the GDN key-head unit from `gdn_simd.zig`. It re-exports every
+//! other op from naive unchanged.
 //!
 //! Width. Width 8 matches the 256-bit AVX2 ymm register, and Zig lowers it to a NEON 4+4 pair.
 //!
-//! Reduction order. A vector reduction sums in a different order than a scalar loop, so the
-//! output differs bit for bit from naive but stays inside the declared tolerance. naive stays
-//! the reference.
+//! Reduction order. A vector reduction sums in a different order than a scalar loop, and the
+//! elementwise ops take the vector sigmoid. The f32 and Q8_0 linears add each product with one
+//! fused multiply-add and add the lanes in the lane tree order of `lane_tree_simd`. The GDN step
+//! takes the readout form and the lane arithmetic of `gdn_simd`. So the output differs bit for bit
+//! from naive but stays inside the declared tolerance. naive stays the reference.
 //!
 //! Requirements. Every AVX2 target also carries F16C. Without F16C the f16 widening stays
 //! correct and runs scalar, so `requires` does not list it.
@@ -22,14 +25,13 @@
 const std = @import("std");
 const attention_simd = @import("attention_simd.zig");
 const elementwise_simd = @import("elementwise_simd.zig");
+const gdn_simd = @import("gdn_simd.zig");
 const linear_simd = @import("linear_simd.zig");
 const naive = @import("naive.zig");
 const op_requires = @import("../core/op_requires.zig");
 const Tensor = @import("../core/tensor.zig").Tensor;
 
 // -- constants --------------------------------------------------------------
-
-const vec_lanes = 8;
 
 /// AVX2 and FMA on x86_64. The build system rejects `-Dops-backend=simd` on a lesser target.
 pub const requires: op_requires.OpRequires = .{
@@ -38,12 +40,7 @@ pub const requires: op_requires.OpRequires = .{
     .needs_fma = true,
 };
 
-pub const rmsnorm = naive.rmsnorm;
-pub const swiglu = naive.swiglu;
-
-// -- types ------------------------------------------------------------------
-
-const Vec = @Vector(vec_lanes, f32);
+pub const swiglu_flops_per_element = elementwise_simd.swiglu_flops_per_element;
 
 // -- api --------------------------------------------------------------------
 
@@ -51,12 +48,16 @@ pub const dequantQ80 = naive.dequantQ80;
 pub const embedLookup = naive.embedLookup;
 
 pub const residualAdd = elementwise_simd.residualAdd;
+pub const rmsnorm = elementwise_simd.rmsnorm;
+pub const swiglu = elementwise_simd.swiglu;
+pub const sigmoidGate = elementwise_simd.sigmoidGate;
 pub const ropeInplace = naive.ropeInplace;
 pub const ropeHeads = naive.ropeHeads;
 pub const RopeTable = naive.RopeTable;
 pub const attentionPartTyped = attention_simd.plain.attentionPartTyped;
 pub const attentionMerge = attention_simd.plain.attentionMerge;
 pub const attentionRowTyped = attention_simd.plain.attentionRowTyped;
+pub const gdnStepKeyHead = gdn_simd.kernels.stepKeyHead;
 
 pub const linearF32Q40 = naive.linearF32Q40;
 pub const linearF32Q40Batch = naive.linearF32Q40Batch;
@@ -66,55 +67,8 @@ pub const linearF32Q6K = naive.linearF32Q6K;
 pub const linearF32Q6KBatch = naive.linearF32Q6KBatch;
 pub const linearF32Q80 = linear_simd.plain.linearF32Q80;
 pub const linearF32Q80Batch = linear_simd.plain.linearF32Q80Batch;
-
-pub fn linearF32(input: []const f32, weight: Tensor, out: []f32) void {
-    std.debug.assert(weight.dtype == .f32);
-    std.debug.assert(weight.n_dims == 2);
-
-    const in_features: usize = @intCast(weight.shape[0]);
-    const out_features: usize = @intCast(weight.shape[1]);
-    std.debug.assert(input.len == in_features);
-    std.debug.assert(out.len >= out_features);
-
-    const w: []const f32 = @alignCast(std.mem.bytesAsSlice(f32, weight.data));
-
-    // Take one dot product per output row.
-    var j: usize = 0;
-    while (j < out_features) : (j += 1) {
-        var acc: Vec = @splat(0);
-        const row = w[j * in_features ..][0..in_features];
-        var k: usize = 0;
-        while (k + vec_lanes <= in_features) : (k += vec_lanes) {
-            const a: Vec = input[k..][0..vec_lanes].*;
-            const b: Vec = row[k..][0..vec_lanes].*;
-            acc += a * b;
-        }
-
-        var sum: f32 = @reduce(.Add, acc);
-        while (k < in_features) : (k += 1) {
-            sum += input[k] * row[k];
-        }
-
-        out[j] = sum;
-    }
-
-    if (std.debug.runtime_safety) {
-        for (out[0..out_features]) |x| {
-            std.debug.assert(std.math.isFinite(x));
-        }
-    }
-}
-
-/// Batch by rows over this variant's own kernels, bit-identical to one B=1 call per row.
-pub fn linearF32Batch(
-    inputs: []const f32,
-    weight: Tensor,
-    outs: []f32,
-    batch: usize,
-    out_stride: usize,
-) void {
-    naive.linearBatchPerRow(linearF32, inputs, weight, outs, batch, out_stride);
-}
+pub const linearF32 = linear_simd.linearF32;
+pub const linearF32Batch = linear_simd.linearF32Batch;
 
 // -- tests ------------------------------------------------------------------
 

@@ -1,16 +1,19 @@
-//! The Q8_0 linear kernels of both SIMD backends, `linearF32Q80` and `linearF32Q80Batch`. The
-//! file makes two sets, `plain` and `prefetched`. `simd` exports the first and `simd_pf` the
-//! second. The matmul of f32 inputs and Q8_0 weights is memory-bound, so the layout of the loop
-//! decides the speed.
+//! The linear kernels of both SIMD backends. The Q8_0 kernels, `linearF32Q80` and
+//! `linearF32Q80Batch`, come in two sets, `plain` and `prefetched`. `simd` exports the first and
+//! `simd_pf` the second. The matmul of f32 inputs and Q8_0 weights is memory-bound, so the layout
+//! of the loop decides the speed. The f32 kernels, `linearF32` and `linearF32Batch`, are one set
+//! that both backends export.
 //!
 //! Comptime. `Kernels` fixes the prefetch option, so the plain and the prefetching kernels are two
 //! builds of one source. `linearTilesForCpu` picks the tile sizes of the build target.
 //!
 //! Bit rule. For one (row, output) pair, lane j of the accumulator adds the products of dims j,
-//! j + 8, j + 16, and so on, in ascending order. Each product is
-//! `w = scale * @floatFromInt(q)` followed by a separate multiply and add, never a fused one. One
-//! `@reduce(.Add)` ends the sum. Every path below follows this rule. So the output is
-//! bit-identical at every batch size, for every output row, with or without prefetch.
+//! j + 8, j + 16, and so on, in ascending order. Each product adds with one
+//! `@mulAdd(w, x, acc)`, where `w = scale * @floatFromInt(q)`. That `w` is exact in f32, because
+//! the f16 scale holds 11 significant bits and q at most 7. `lane_tree_simd` adds the 8 lanes
+//! into the output in the lane tree order. A lane gets the same bits in a sum of one accumulator
+//! or of four. Every path below follows this rule. So each output value has the same bits at
+//! every batch size, with or without prefetch.
 //!
 //! B = 1. `groupPass` takes `mr = 4` output rows at once, one Q8_0 block at a time. The four
 //! accumulators sit in registers and each input vector loads once for the four rows.
@@ -19,7 +22,7 @@
 //! batch row. So with more batch rows a group widens its weights once per K tile and per pass
 //! of `accumulator_rows` batch rows, and keeps them in a stack panel of `mr` rows by `k_tile`
 //! weights. The panel stays in L1, and the inner loop reuses it for every batch row of the pass,
-//! `b_tile` rows per register tile. The inner loop then holds loads, a multiply, and an add.
+//! `b_tile` rows per register tile. The inner loop then holds loads and a fused multiply-add.
 //! A batch over `accumulator_rows` widens again for each pass. Each batch row still sees the K
 //! tiles in ascending order, so a pass leaves the bits unchanged. A group reads its weight bytes
 //! from memory once per pass, not once per batch row.
@@ -29,13 +32,18 @@
 //! are warm when the outer loop arrives, and they do not pollute L1. Shapes that stream past the
 //! last-level cache gain from it. Prefetch changes no bit.
 //!
-//! Tail. The rows left when `out_features % mr != 0` take `rowPass`: one row, no prefetch, and
-//! the same vector walk.
+//! Tail. The outputs left when `out_features % mr != 0` take `rowPass`: one output, no prefetch,
+//! the same vector walk, and the same lane tree.
 //!
 //! Tiles. No tile size enters the order of a lane, so the tiles change the speed, never a bit.
 //! `linearTilesForCpu` holds one row, measured on a core with 16 vector registers of 256 bits and
 //! a 32 KiB L1 data cache. Comptime asserts tie the tiles to those two figures and to
 //! `limits.cpu_prefill_chunk`. A class of CPU gets its own row only with a measurement on it.
+//!
+//! F32. `linearF32` takes the bit rule with `w` read from the weight. The last `in_features % 8`
+//! dims add with one vector whose other lanes are zero in `w` and in `x`. The f32 kernel takes
+//! 4-output groups and tail outputs in the way of the Q8_0 kernels. It has no prefetch option,
+//! because no registry model sends a 2-D f32 weight to it, and a prefetch needs a measurement.
 //!
 //! Requirements. Every AVX2 target also carries F16C. Without F16C the f16 widening stays
 //! correct and runs scalar, so the backends do not list it in `requires`.
@@ -43,6 +51,7 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const limits = @import("../core/limits.zig");
+const lane_tree = @import("lane_tree_simd.zig");
 const naive = @import("naive.zig");
 const Tensor = @import("../core/tensor.zig").Tensor;
 const f16BitsToF32 = naive.f16BitsToF32;
@@ -225,7 +234,84 @@ fn Kernels(comptime opts: Options) type {
     };
 }
 
+// -- api --------------------------------------------------------------------
+
+/// Linear layer with f32 weights: `out = input @ W.T`, under the bit rule.
+pub fn linearF32(input: []const f32, weight: Tensor, out: []f32) void {
+    std.debug.assert(weight.dtype == .f32);
+    std.debug.assert(weight.n_dims == 2);
+
+    const in_features: usize = @intCast(weight.shape[0]);
+    const out_features: usize = @intCast(weight.shape[1]);
+    std.debug.assert(input.len == in_features);
+    std.debug.assert(out.len >= out_features);
+
+    const w: []const f32 = @alignCast(std.mem.bytesAsSlice(f32, weight.data));
+    std.debug.assert(w.len >= out_features * in_features);
+
+    // Take the full 4-output groups.
+    var j: usize = 0;
+    while (j + mr <= out_features) : (j += mr) {
+        const sums: [lanes]f32 = lane_tree.transposeAdd(mr, f32Chains(mr, input, w, j));
+        out[j..][0..mr].* = sums[0..mr].*;
+    }
+
+    // Take the tail outputs one at a time.
+    while (j < out_features) : (j += 1) {
+        out[j] = lane_tree.laneSum(f32Chains(1, input, w, j)[0]);
+    }
+    std.debug.assert(j == out_features);
+
+    if (std.debug.runtime_safety) {
+        for (out[0..out_features]) |x| {
+            std.debug.assert(std.math.isFinite(x));
+        }
+    }
+}
+
+/// Batched linear with f32 weights, bit-identical to one `linearF32` call per row.
+pub fn linearF32Batch(
+    inputs: []const f32,
+    weight: Tensor,
+    outs: []f32,
+    batch: usize,
+    out_stride: usize,
+) void {
+    naive.linearBatchPerRow(linearF32, inputs, weight, outs, batch, out_stride);
+}
+
 // -- helpers ----------------------------------------------------------------
+
+/// The accumulators of the `m` f32 outputs from `out0`. Each input vector loads once for the `m`
+/// outputs.
+inline fn f32Chains(comptime m: usize, input: []const f32, w: []const f32, out0: usize) [m]Vec {
+    const in_features = input.len;
+    std.debug.assert((out0 + m) * in_features <= w.len);
+
+    var acc = [_]Vec{@splat(0)} ** m;
+    var k: usize = 0;
+    while (k + lanes <= in_features) : (k += lanes) {
+        const x: Vec = input[k..][0..lanes].*;
+        inline for (0..m) |r| {
+            const wv: Vec = w[(out0 + r) * in_features + k ..][0..lanes].*;
+            acc[r] = @mulAdd(Vec, wv, x, acc[r]);
+        }
+    }
+
+    const tail = in_features - k;
+    std.debug.assert(tail < lanes);
+    if (tail > 0) {
+        var x_pad: [lanes]f32 = @splat(0);
+        @memcpy(x_pad[0..tail], input[k..]);
+        inline for (0..m) |r| {
+            var w_pad: [lanes]f32 = @splat(0);
+            @memcpy(w_pad[0..tail], w[(out0 + r) * in_features + k ..][0..tail]);
+            acc[r] = @mulAdd(Vec, w_pad, x_pad, acc[r]);
+        }
+    }
+
+    return acc;
+}
 
 /// The tile sizes for `cpu`, a function of the target in the way of `std.atomic.cacheLineForCpu`.
 /// A class with 32 vector registers, such as AVX-512VL or NEON, gets its own row only after a
@@ -291,15 +377,25 @@ inline fn panelGroup(
                 );
             }
 
-            if (b < rows) {
-                accumulateTile(1, &panel, inputs, shape.in_features, k0, tile, pass0, b, &accs);
+            // The rows under one tile take the widest tile that fits, so that each row of a
+            // small batch does not sweep the panel alone.
+            std.debug.assert(rows - b < b_tile);
+            comptime var nb: usize = b_tile - 1;
+            inline while (nb > 0) : (nb -= 1) {
+                if (rows - b >= nb) {
+                    const in_f = shape.in_features;
+                    accumulateTile(nb, &panel, inputs, in_f, k0, tile, pass0, b, &accs);
+                    b += nb;
+                }
             }
+            std.debug.assert(b == rows);
         }
         std.debug.assert(covered == shape.in_features);
 
         for (0..rows) |b| {
+            const sums = lane_tree.transposeAdd(mr, accs[b]);
             inline for (0..mr) |r| {
-                outs[(pass0 + b) * shape.out_stride + j + r] = @reduce(.Add, accs[b][r]);
+                outs[(pass0 + b) * shape.out_stride + j + r] = sums[r];
             }
         }
     }
@@ -335,7 +431,7 @@ noinline fn panelGroupPrefetched(
     panelGroup(true, inputs, data, outs, shape, j, row_offs, pf_offs, has_next);
 }
 
-/// Widen `n_blk` blocks of the 4 rows into `panel`, with the same `w` expression as `groupPass`.
+/// Widen `n_blk` blocks of the 4 outputs into `panel` with `scaledQuarter`, the `w` of `blockStep`.
 inline fn dequantTile(
     comptime prefetch: bool,
     panel: *Panel,
@@ -362,16 +458,10 @@ inline fn dequantTile(
                 );
             }
 
-            const scale = f16BitsToF32(
-                std.mem.readInt(u16, data[row_offs[r] + blk_off ..][0..2], .little),
-            );
-            const scale_v: Vec = @splat(scale);
+            const at = row_offs[r] + blk_off;
+            const scale_v: Vec = @splat(blockScale(data, at));
             inline for (0..4) |q| {
-                const w_arr: [lanes]i8 = @bitCast(
-                    data[row_offs[r] + blk_off + 2 + q * lanes ..][0..lanes].*,
-                );
-                const w: Vec = scale_v * @as(Vec, @floatFromInt(@as(VecI8, w_arr)));
-                panel[r][t * 32 + q * lanes ..][0..lanes].* = w;
+                panel[r][t * 32 + q * lanes ..][0..lanes].* = scaledQuarter(data, at, scale_v, q);
             }
         }
     }
@@ -410,7 +500,7 @@ inline fn accumulateTile(
         inline for (0..mr) |r| {
             const w: Vec = panel[r][k..][0..lanes].*;
             inline for (0..nb) |bi| {
-                acc[bi][r] = acc[bi][r] + w * x[bi];
+                acc[bi][r] = @mulAdd(Vec, w, x[bi], acc[bi][r]);
             }
         }
     }
@@ -435,10 +525,7 @@ inline fn groupPass(
     std.debug.assert(row_offs[mr - 1] + n_blocks * 34 <= data.len);
     if (prefetch and has_next) std.debug.assert(pf_offs[mr - 1] + n_blocks * 34 <= data.len);
 
-    var acc0: Vec = @splat(0);
-    var acc1: Vec = @splat(0);
-    var acc2: Vec = @splat(0);
-    var acc3: Vec = @splat(0);
+    var acc = [_]Vec{@splat(0)} ** mr;
 
     var blk: usize = 0;
     while (blk < n_blocks) : (blk += 1) {
@@ -454,60 +541,18 @@ inline fn groupPass(
             }
         }
 
-        // Load the four block scales.
-        const s0v: Vec = @splat(
-            f16BitsToF32(
-                std.mem.readInt(u16, data[row_offs[0] + blk_off_in_row ..][0..2], .little),
-            ),
-        );
-        const s1v: Vec = @splat(
-            f16BitsToF32(
-                std.mem.readInt(u16, data[row_offs[1] + blk_off_in_row ..][0..2], .little),
-            ),
-        );
-        const s2v: Vec = @splat(
-            f16BitsToF32(
-                std.mem.readInt(u16, data[row_offs[2] + blk_off_in_row ..][0..2], .little),
-            ),
-        );
-        const s3v: Vec = @splat(
-            f16BitsToF32(
-                std.mem.readInt(u16, data[row_offs[3] + blk_off_in_row ..][0..2], .little),
-            ),
-        );
-
-        const in_base = blk * 32;
-
-        // Accumulate the four rows, 8 lanes at a time.
+        var x: [4]Vec = undefined;
         inline for (0..4) |q| {
-            const in_v: Vec = input[in_base + q * lanes ..][0..lanes].*;
+            x[q] = input[blk * 32 + q * lanes ..][0..lanes].*;
+        }
 
-            const w0_arr: [lanes]i8 = @bitCast(
-                data[row_offs[0] + blk_off_in_row + 2 + q * lanes ..][0..lanes].*,
-            );
-            const w1_arr: [lanes]i8 = @bitCast(
-                data[row_offs[1] + blk_off_in_row + 2 + q * lanes ..][0..lanes].*,
-            );
-            const w2_arr: [lanes]i8 = @bitCast(
-                data[row_offs[2] + blk_off_in_row + 2 + q * lanes ..][0..lanes].*,
-            );
-            const w3_arr: [lanes]i8 = @bitCast(
-                data[row_offs[3] + blk_off_in_row + 2 + q * lanes ..][0..lanes].*,
-            );
-
-            const w0v: Vec = s0v * @as(Vec, @floatFromInt(@as(VecI8, w0_arr)));
-            const w1v: Vec = s1v * @as(Vec, @floatFromInt(@as(VecI8, w1_arr)));
-            const w2v: Vec = s2v * @as(Vec, @floatFromInt(@as(VecI8, w2_arr)));
-            const w3v: Vec = s3v * @as(Vec, @floatFromInt(@as(VecI8, w3_arr)));
-
-            acc0 += w0v * in_v;
-            acc1 += w1v * in_v;
-            acc2 += w2v * in_v;
-            acc3 += w3v * in_v;
+        inline for (0..mr) |r| {
+            acc[r] = blockStep(data, row_offs[r] + blk_off_in_row, x, acc[r]);
         }
     }
 
-    return .{ @reduce(.Add, acc0), @reduce(.Add, acc1), @reduce(.Add, acc2), @reduce(.Add, acc3) };
+    const sums: [lanes]f32 = lane_tree.transposeAdd(mr, acc);
+    return sums[0..mr].*;
 }
 
 /// One tail row.
@@ -518,20 +563,38 @@ inline fn rowPass(input: []const f32, data: []const u8, row_off: usize, n_blocks
     var acc: Vec = @splat(0);
     var blk: usize = 0;
     while (blk < n_blocks) : (blk += 1) {
-        const blk_off = row_off + blk * 34;
-        const scale = f16BitsToF32(std.mem.readInt(u16, data[blk_off..][0..2], .little));
-        const scale_v: Vec = @splat(scale);
-        const in_base = blk * 32;
+        var x: [4]Vec = undefined;
         inline for (0..4) |q| {
-            const i8_arr: [lanes]i8 = @bitCast(data[blk_off + 2 + q * lanes ..][0..lanes].*);
-            const i8_v: VecI8 = i8_arr;
-            const w_v: Vec = scale_v * @as(Vec, @floatFromInt(i8_v));
-            const in_v: Vec = input[in_base + q * lanes ..][0..lanes].*;
-            acc += w_v * in_v;
+            x[q] = input[blk * 32 + q * lanes ..][0..lanes].*;
         }
+        acc = blockStep(data, row_off + blk * 34, x, acc);
     }
 
-    return @reduce(.Add, acc);
+    return lane_tree.laneSum(acc);
+}
+
+/// Add one Q8_0 block of one output against the 32 inputs `x` into `acc`, with the `w` of
+/// `scaledQuarter`.
+inline fn blockStep(data: []const u8, blk_off: usize, x: [4]Vec, acc: Vec) Vec {
+    std.debug.assert(blk_off + 34 <= data.len);
+    const scale_v: Vec = @splat(blockScale(data, blk_off));
+    var a = acc;
+    inline for (0..4) |q| {
+        a = @mulAdd(Vec, scaledQuarter(data, blk_off, scale_v, q), x[q], a);
+    }
+    return a;
+}
+
+/// The f32 scale of the Q8_0 block at `blk_off`.
+inline fn blockScale(data: []const u8, blk_off: usize) f32 {
+    return f16BitsToF32(std.mem.readInt(u16, data[blk_off..][0..2], .little));
+}
+
+/// The 8 weights `w` of quarter `q` of the block at `blk_off`. The panel and the B = 1 path take
+/// this one expression.
+inline fn scaledQuarter(data: []const u8, blk_off: usize, scale_v: Vec, comptime q: usize) Vec {
+    const arr: [lanes]i8 = @bitCast(data[blk_off + 2 + q * lanes ..][0..lanes].*);
+    return scale_v * @as(Vec, @floatFromInt(@as(VecI8, arr)));
 }
 
 // -- tests ------------------------------------------------------------------
@@ -724,6 +787,284 @@ test "linear_simd rowPass equals the group path of linearF32Q80" {
         for (out, 0..) |g, row| {
             const one = rowPass(input, w_data, row * row_bytes, in_features / 32);
             try std.testing.expectEqual(@as(u32, @bitCast(one)), @as(u32, @bitCast(g)));
+        }
+    }
+}
+
+test "linear_simd stays inside the gamma bound of an f64 dot" {
+    const gpa = std.testing.allocator;
+    const out_features: usize = 37;
+    const max_in: usize = 6144;
+    const max_batch: usize = 64;
+    const u = std.math.ldexp(@as(f64, 1), -24);
+    const u_f64 = std.math.ldexp(@as(f64, 1), -53);
+
+    const inputs = try gpa.alignedAlloc(f32, .of(f32), max_batch * max_in);
+    defer gpa.free(inputs);
+
+    const w_data = try gpa.alignedAlloc(u8, .@"32", out_features * (max_in / 32) * 34);
+    defer gpa.free(w_data);
+
+    const outs = try gpa.alloc(f32, max_batch * out_features);
+    defer gpa.free(outs);
+
+    var prng = std.Random.DefaultPrng.init(0x6a33a);
+    for (inputs) |*x| {
+        x.* = prng.random().float(f32) * 2.0 - 1.0;
+    }
+
+    for ([_]usize{ 1088, 6144 }) |in_features| {
+        const output_bytes = (in_features / 32) * 34;
+        const data = w_data[0 .. out_features * output_bytes];
+        fillScaledWeight(data, in_features, out_features, output_bytes);
+        const w = q80Tensor(data, in_features, out_features);
+        // The weight is exact. The longest path takes one fused multiply-add per product of
+        // its lane and 3 adds of the lane tree, so n is in_features / 8 + 3. The f64 sum of
+        // the reference adds in_features - 1 roundings of its own at 2^-53 (Higham, Accuracy
+        // and Stability of Numerical Algorithms, ch. 4).
+        const n: f64 = @floatFromInt(in_features / lanes + 3);
+        const n64: f64 = @floatFromInt(in_features);
+        const gamma = n * u / (1 - n * u) + n64 * u_f64 / (1 - n64 * u_f64);
+        inline for (.{ plain, prefetched }) |K| {
+            for ([_]usize{ 1, max_batch }) |batch| {
+                const in = inputs[0 .. batch * in_features];
+                K.linearF32Q80Batch(in, w, outs, batch, out_features);
+                for (0..batch) |b| {
+                    for (0..out_features) |j| {
+                        const x = in[b * in_features ..][0..in_features];
+                        const ref = dotF64(data, j * output_bytes, x);
+                        const got: f64 = outs[b * out_features + j];
+                        try std.testing.expect(@abs(got - ref.sum) <= gamma * ref.abs_sum);
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// The f64 dot of one Q8_0 output against `x`, and the sum of the absolute products.
+fn dotF64(data: []const u8, output_off: usize, x: []const f32) struct { sum: f64, abs_sum: f64 } {
+    var sum: f64 = 0;
+    var abs_sum: f64 = 0;
+    for (0..x.len / 32) |blk| {
+        const scale: f64 = blockScale(data, output_off + blk * 34);
+        for (0..32) |i| {
+            const q: i8 = @bitCast(data[output_off + blk * 34 + 2 + i]);
+            const p = scale * @as(f64, @floatFromInt(q)) * @as(f64, x[blk * 32 + i]);
+            sum += p;
+            abs_sum += @abs(p);
+        }
+    }
+    return .{ .sum = sum, .abs_sum = abs_sum };
+}
+
+/// The bit rule in scalar f32 arithmetic: lane `i % 8` adds dim i with one fused multiply-add.
+/// The result adds the 8 lanes in the lane tree order.
+fn bitRuleScalar(data: []const u8, output_off: usize, x: []const f32) f32 {
+    var acc: [lanes]f32 = @splat(0);
+    for (0..x.len / 32) |blk| {
+        const at = output_off + blk * 34;
+        const scale = blockScale(data, at);
+        for (0..32) |i| {
+            const q: i8 = @bitCast(data[at + 2 + i]);
+            const w = scale * @as(f32, @floatFromInt(q));
+            acc[i % lanes] = @mulAdd(f32, w, x[blk * 32 + i], acc[i % lanes]);
+        }
+    }
+    return ((acc[0] + acc[1]) + (acc[2] + acc[3])) + ((acc[4] + acc[5]) + (acc[6] + acc[7]));
+}
+
+test "linear_simd gives the bits of the scalar order of its bit rule" {
+    const gpa = std.testing.allocator;
+    // The out size leaves a 3-output tail. Batches 3, 65 leave batch rows under one register
+    // tile.
+    const out_features: usize = 39;
+    const max_in: usize = 2112;
+    const batches = [_]usize{ 1, 2, 3, 8, 64, 65 };
+    const max_batch = batches[batches.len - 1];
+
+    const w_data = try gpa.alignedAlloc(u8, .@"32", out_features * (max_in / 32) * 34);
+    defer gpa.free(w_data);
+
+    const inputs = try gpa.alloc(f32, max_batch * max_in);
+    defer gpa.free(inputs);
+
+    const outs = try gpa.alloc(f32, max_batch * out_features);
+    defer gpa.free(outs);
+
+    var prng = std.Random.DefaultPrng.init(0xb17);
+    const r = prng.random();
+    // Magnitudes from 2^-6 to 2^6 make a regrouped sum round differently.
+    for (inputs) |*x| {
+        x.* = (r.float(f32) * 2 - 1) * std.math.ldexp(@as(f32, 1), r.intRangeAtMost(i32, -6, 6));
+    }
+
+    for ([_]usize{ 1088, max_in }) |in_features| {
+        const output_bytes = (in_features / 32) * 34;
+        const data = w_data[0 .. out_features * output_bytes];
+        // Random f16 scales and the full i8 range of q.
+        for (0..out_features) |j| {
+            for (0..in_features / 32) |blk| {
+                const at = j * output_bytes + blk * 34;
+                const scale: f16 = @floatCast(0.0005 + r.float(f32) * 0.02);
+                std.mem.writeInt(u16, data[at..][0..2], @bitCast(scale), .little);
+                r.bytes(data[at + 2 ..][0..32]);
+            }
+        }
+
+        const w = q80Tensor(data, in_features, out_features);
+        inline for (.{ plain, prefetched }) |K| {
+            for (batches) |batch| {
+                K.linearF32Q80Batch(inputs[0 .. batch * in_features], w, outs, batch, out_features);
+                for (0..batch) |b| {
+                    const x = inputs[b * in_features ..][0..in_features];
+                    for (0..out_features) |j| {
+                        const want: u32 = @bitCast(bitRuleScalar(data, j * output_bytes, x));
+                        const got: u32 = @bitCast(outs[b * out_features + j]);
+                        try std.testing.expectEqual(want, got);
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// The f32 shapes of the tests as (in_features, out_features). They hold an input under 8 lanes,
+/// inputs off the lane grid, and output counts off the 4-output grid.
+const f32_shapes = [_][2]usize{ .{ 3, 5 }, .{ 13, 9 }, .{ 64, 4 }, .{ 577, 7 }, .{ 1031, 13 } };
+const f32_max_in = 1031;
+const f32_max_out = 13;
+
+fn f32Tensor(w: []const f32, in_features: usize, out_features: usize) Tensor {
+    return .{
+        .dtype = .f32,
+        .n_dims = 2,
+        .shape = .{ @intCast(in_features), @intCast(out_features), 0, 0 },
+        .byte_stride = .{ @intCast(in_features * @sizeOf(f32)), @sizeOf(f32), 0, 0 },
+        .data = std.mem.sliceAsBytes(w),
+    };
+}
+
+/// Fill `x` with magnitudes from 2^-6 to 2^6, so that a regrouped sum rounds differently.
+fn fillSpread(r: std.Random, x: []f32) void {
+    for (x) |*xi| {
+        xi.* = (r.float(f32) * 2 - 1) * std.math.ldexp(@as(f32, 1), r.intRangeAtMost(i32, -6, 6));
+    }
+}
+
+/// The f32 bit rule in scalar arithmetic: lane `i % 8` adds dim i with one fused multiply-add.
+/// The result adds the 8 lanes in the lane tree order. A pad lane adds `0 * 0` to a lane that is
+/// never -0, so the scalar order leaves the pad out.
+fn f32BitRuleScalar(w_out: []const f32, x: []const f32) f32 {
+    var acc: [lanes]f32 = @splat(0);
+    for (w_out, x, 0..) |wi, xi, i| {
+        acc[i % lanes] = @mulAdd(f32, wi, xi, acc[i % lanes]);
+    }
+    return ((acc[0] + acc[1]) + (acc[2] + acc[3])) + ((acc[4] + acc[5]) + (acc[6] + acc[7]));
+}
+
+test "linear_simd linearF32 stays inside the gamma bound of an f64 dot" {
+    const gpa = std.testing.allocator;
+    const u = std.math.ldexp(@as(f64, 1), -24);
+    const u_f64 = std.math.ldexp(@as(f64, 1), -53);
+
+    const input = try gpa.alloc(f32, f32_max_in);
+    defer gpa.free(input);
+
+    const w_buf = try gpa.alloc(f32, f32_max_in * f32_max_out);
+    defer gpa.free(w_buf);
+
+    const out = try gpa.alloc(f32, f32_max_out);
+    defer gpa.free(out);
+
+    var prng = std.Random.DefaultPrng.init(0xf32_7013);
+    const r = prng.random();
+    for (f32_shapes) |shape| {
+        const in_features = shape[0];
+        const out_features = shape[1];
+        const x = input[0..in_features];
+        const w = w_buf[0 .. in_features * out_features];
+        fillSpread(r, x);
+        fillSpread(r, w);
+
+        linearF32(x, f32Tensor(w, in_features, out_features), out);
+
+        // A lane takes one fused multiply-add per vector, the padded vector included, then 3
+        // adds of the lane tree. An f64 product of two f32 values is exact, and the f64 sum adds
+        // in_features - 1 roundings at 2^-53 (Higham, Accuracy and Stability of Numerical
+        // Algorithms, ch. 4).
+        const n: f64 = @floatFromInt((in_features + lanes - 1) / lanes + 3);
+        const n64: f64 = @floatFromInt(in_features);
+        const gamma = n * u / (1 - n * u) + n64 * u_f64 / (1 - n64 * u_f64);
+        for (0..out_features) |j| {
+            var sum: f64 = 0;
+            var abs_sum: f64 = 0;
+            for (w[j * in_features ..][0..in_features], x) |wi, xi| {
+                const p = @as(f64, wi) * @as(f64, xi);
+                sum += p;
+                abs_sum += @abs(p);
+            }
+
+            const got: f64 = out[j];
+            try std.testing.expect(@abs(got - sum) <= gamma * abs_sum);
+        }
+    }
+}
+
+test "linear_simd linearF32 gives an output the same bits in a group, alone, and in a batch" {
+    const gpa = std.testing.allocator;
+    const batch: usize = 3;
+    const gap: usize = 5;
+    const nan_bits: u32 = @bitCast(std.math.nan(f32));
+
+    const inputs = try gpa.alloc(f32, batch * f32_max_in);
+    defer gpa.free(inputs);
+
+    const w_buf = try gpa.alloc(f32, f32_max_in * f32_max_out);
+    defer gpa.free(w_buf);
+
+    const outs = try gpa.alloc(f32, batch * (f32_max_out + gap));
+    defer gpa.free(outs);
+
+    var out_single: [f32_max_out]f32 = undefined;
+    var prng = std.Random.DefaultPrng.init(0xf32_b175);
+    const r = prng.random();
+    for (f32_shapes) |shape| {
+        const in_features = shape[0];
+        const out_features = shape[1];
+        const out_stride = out_features + gap;
+        const in = inputs[0 .. batch * in_features];
+        const w = w_buf[0 .. in_features * out_features];
+        fillSpread(r, in);
+        fillSpread(r, w);
+        const weight = f32Tensor(w, in_features, out_features);
+
+        // An output in a 4-output group gets the bits of the same output as a 1-output weight,
+        // and the bits of the scalar order of the bit rule.
+        const x = in[0..in_features];
+        linearF32(x, weight, &out_single);
+        for (0..out_features) |j| {
+            const w_out = w[j * in_features ..][0..in_features];
+            var alone: [1]f32 = undefined;
+            linearF32(x, f32Tensor(w_out, in_features, 1), &alone);
+            const got: u32 = @bitCast(out_single[j]);
+            try std.testing.expectEqual(@as(u32, @bitCast(alone[0])), got);
+            try std.testing.expectEqual(@as(u32, @bitCast(f32BitRuleScalar(w_out, x))), got);
+        }
+
+        // The batch gives the bits of per-row calls and leaves the stride gap untouched.
+        @memset(outs, std.math.nan(f32));
+        linearF32Batch(in, weight, outs, batch, out_stride);
+        for (0..batch) |b| {
+            linearF32(in[b * in_features ..][0..in_features], weight, &out_single);
+            const row_outs = outs[b * out_stride ..];
+            for (out_single[0..out_features], row_outs[0..out_features]) |s, g| {
+                try std.testing.expectEqual(@as(u32, @bitCast(s)), @as(u32, @bitCast(g)));
+            }
+
+            for (row_outs[out_features..][0..gap]) |g| {
+                try std.testing.expectEqual(nan_bits, @as(u32, @bitCast(g)));
+            }
         }
     }
 }

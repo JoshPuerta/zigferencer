@@ -12,14 +12,12 @@
 //! Five rules hold that:
 //! 1. Lane j of a score accumulator adds the products of dims j, j + 8, j + 16, and so on, one
 //!    fused multiply-add each, in ascending order.
-//! 2. One fixed tree folds the 8 lanes of a score:
-//!    `((x0 + x1) + (x2 + x3)) + ((x4 + x5) + (x6 + x7))`. `transposeAdd` folds up to 8
-//!    accumulators at once with this tree, and it pads a short set with zero vectors. A pad lane
-//!    never meets a real lane. So the head block size, the position step, and a short last tile
-//!    do not change a score.
+//! 2. `transposeAdd` of `lane_tree_simd.zig` adds the 8 lanes of a score in the lane tree
+//!    order, and a lane gets the same bits at any accumulator count. So the head block size,
+//!    the position step, and a short last tile do not change a score.
 //! 3. Lane d of a value sum adds the weighted V rows in ascending position order, one fused
 //!    multiply-add each. A store and a reload between two runs of positions are exact.
-//! 4. The exponential sum of a tile folds its 8 lane sums with the same tree.
+//! 4. The exponential sum of a tile adds its 8 lane sums in the same order.
 //! 5. `expNeg` of `exp_simd.zig` computes each lane from the input of that lane alone, with one
 //!    fixed sequence of IEEE operations. So a score gets the same exponential at any lane
 //!    position, and a short last tile changes no exponential.
@@ -55,10 +53,13 @@ const std = @import("std");
 const attn_cpu = @import("../core/attn_cpu.zig");
 const limits = @import("../core/limits.zig");
 const exp_simd = @import("exp_simd.zig");
+const lane_tree_simd = @import("lane_tree_simd.zig");
 const naive = @import("naive.zig");
 
 const assert = std.debug.assert;
 const expNeg = exp_simd.expNeg;
+const laneSum = lane_tree_simd.laneSum;
+const transposeAdd = lane_tree_simd.transposeAdd;
 
 // -- constants --------------------------------------------------------------
 
@@ -480,7 +481,7 @@ inline fn foldScores(row: *[tile]f32, tile_n: usize, first: bool, m_run: *f32, l
     }
 
     // Add the tile sum to the running sum.
-    const l = l_run.* + transposeAdd(1, .{sum_v})[0];
+    const l = l_run.* + laneSum(sum_v);
     // The term at the maximum adds exp(0) = 1, and no term is negative. A non-finite score from a
     // model weight breaks it, so only a safety build checks it.
     if (std.debug.runtime_safety) assert(l >= 1);
@@ -593,52 +594,6 @@ inline fn valueStep(
 inline fn loadRow(comptime E: type, src: []const E, off: usize) Vec {
     const raw: @Vector(lanes, E) = src[off..][0..lanes].*;
     return if (E == f32) raw else @floatCast(raw);
-}
-
-/// Fold the lanes of each of `m` accumulators: lane i of the result is the sum of the lanes
-/// of `accs[i]`. See bit rule 2 in the header. A lane gets the same bits at any `m`.
-inline fn transposeAdd(comptime m: usize, accs: [m]Vec) Vec {
-    comptime assert(m >= 1 and m <= lanes);
-    var a = [_]Vec{@splat(0)} ** lanes;
-    inline for (0..m) |i| {
-        a[i] = accs[i];
-    }
-
-    // Lane i of `low4` sums the low 4 lanes of accumulator i, and lane i + 4 sums its high 4.
-    // `high4` does the same for accumulators 4 to 7.
-    const low4 = pairAdd(pairAdd(a[0], a[1]), pairAdd(a[2], a[3]));
-    const high4 = pairAdd(pairAdd(a[4], a[5]), pairAdd(a[6], a[7]));
-    const lo = @shuffle(
-        f32,
-        low4,
-        high4,
-        [lanes]i32{ 0, 1, 2, 3, ~@as(i32, 0), ~@as(i32, 1), ~@as(i32, 2), ~@as(i32, 3) },
-    );
-    const hi = @shuffle(
-        f32,
-        low4,
-        high4,
-        [lanes]i32{ 4, 5, 6, 7, ~@as(i32, 4), ~@as(i32, 5), ~@as(i32, 6), ~@as(i32, 7) },
-    );
-    return lo + hi;
-}
-
-/// The horizontal pair sums of two vectors inside each 128-bit half:
-/// `[a0+a1, a2+a3, b0+b1, b2+b3, a4+a5, a6+a7, b4+b5, b6+b7]`.
-inline fn pairAdd(a: Vec, b: Vec) Vec {
-    const even = @shuffle(
-        f32,
-        a,
-        b,
-        [lanes]i32{ 0, 2, ~@as(i32, 0), ~@as(i32, 2), 4, 6, ~@as(i32, 4), ~@as(i32, 6) },
-    );
-    const odd = @shuffle(
-        f32,
-        a,
-        b,
-        [lanes]i32{ 1, 3, ~@as(i32, 1), ~@as(i32, 3), 5, 7, ~@as(i32, 5), ~@as(i32, 7) },
-    );
-    return even + odd;
 }
 
 // -- tests ------------------------------------------------------------------

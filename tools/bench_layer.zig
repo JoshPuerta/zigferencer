@@ -1,8 +1,12 @@
-//! Per-layer op benchmarks: the elementwise ops (residual_add, swiglu, rmsnorm, rope), fused
-//! single-head attention, the dispatch-amortization demo, and the Qwen full-attention sigmoid
-//! gate. These ops sit between the matmuls on the forward pass, so a regression here hides
-//! behind the matmul rows unless it gets its own table. Each section runs the CPU reference on
-//! every build and the GPU variant under vulkan.
+//! Per-layer op benchmarks: the elementwise ops (residual_add, swiglu, rmsnorm, the Qwen
+//! full-attention sigmoid gate, rope), fused single-head attention, and the
+//! dispatch-amortization demo. These ops sit between the matmuls on the forward pass, so a
+//! regression here hides behind the matmul lines unless it gets its own table. Each section runs
+//! the CPU reference on every build and the GPU kernel under vulkan.
+//!
+//! Elementwise vector lines. `swiglu`, `rmsnorm`, and the CPU sigmoid gate also run the `simd_pf`
+//! op. Its rel_err column holds the error against the naive line, because the vector sigmoid and
+//! the fixed-order sum change the bits.
 //!
 //! Comptime. `build_options.use_vulkan` gates the GPU rows, so a CPU build never reads them. The
 //! element type and kernel set are parameters.
@@ -285,6 +289,7 @@ pub fn benchElementwise(gpa: std.mem.Allocator, io: std.Io, runner: anytype) !vo
     try benchResidualAdd(gpa, io, runner);
     try benchSwiglu(gpa, io, runner);
     try benchRmsnorm(gpa, io, runner);
+    try benchSigmoidGateCpu(gpa, io);
     try benchRope(gpa, io, runner);
     try benchFusedAttention(gpa, io, runner);
     if (comptime build_options.use_vulkan) {
@@ -295,8 +300,8 @@ pub fn benchElementwise(gpa: std.mem.Allocator, io: std.Io, runner: anytype) !vo
     }
 }
 
-/// Qwen3.5 full-attention output gate: `dst *= sigmoid(gate)`. GPU-only kernel
-/// with an inline CPU reference (there is no standalone CPU sigmoid-gate op).
+/// Qwen3.5 full-attention output gate: `dst *= sigmoid(gate)`. The GPU kernel against the naive
+/// `sigmoidGate`.
 pub fn benchSigmoidGate(gpa: std.mem.Allocator, io: std.Io, runner: *Runner) !void {
     printSectionHeader("sigmoid_gate (qwen full-attn output gate)");
     var kern = try zigferencer.ops_vulkan.SigmoidGate.init(&runner.ctx);
@@ -330,9 +335,7 @@ pub fn benchSigmoidGate(gpa: std.mem.Allocator, io: std.Io, runner: *Runner) !vo
 
         // Compute the reference.
         @memcpy(dst_ref, dst_init);
-        for (dst_ref, gate) |*d, g| {
-            d.* *= 1.0 / (1.0 + @exp(-g));
-        }
+        zigferencer.ops.sigmoidGate(gate, dst_ref);
 
         const ref_hash = hashOut(dst_ref);
         const work: f64 = @floatFromInt(c.n);
@@ -565,6 +568,27 @@ fn benchSwiglu(gpa: std.mem.Allocator, io: std.Io, runner: anytype) !void {
             Cpu{ .gate = gate, .up = up, .dst = dst_work },
         );
 
+        // Time the vector line of `simd_pf`, with its error against the naive line.
+        const Vector = struct {
+            gate: []const f32,
+            up: []const f32,
+            out: []f32,
+
+            pub fn run(self: @This()) !void {
+                zigferencer.ops_simd_pf.swiglu(self.gate, self.up, self.out);
+            }
+        };
+        _ = try cpuCheckedRow(
+            io,
+            c.n,
+            c.label,
+            "simd_pf",
+            work,
+            dst_ref,
+            null,
+            Vector{ .gate = gate, .up = up, .out = dst_work },
+        );
+
         // Time the GPU row.
         if (comptime build_options.use_vulkan) {
             if (runner) |r| {
@@ -654,6 +678,28 @@ fn benchRmsnorm(gpa: std.mem.Allocator, io: std.Io, runner: anytype) !void {
             Cpu{ .x = x, .w = w, .eps = eps, .y = y_work },
         );
 
+        // Time the vector line of `simd_pf`, with its error against the naive line.
+        const Vector = struct {
+            x: []const f32,
+            w: []const f32,
+            eps: f32,
+            out: []f32,
+
+            pub fn run(self: @This()) !void {
+                zigferencer.ops_simd_pf.rmsnorm(self.x, self.w, self.eps, self.out);
+            }
+        };
+        _ = try cpuCheckedRow(
+            io,
+            c.d,
+            c.label,
+            "simd_pf",
+            work,
+            y_ref,
+            null,
+            Vector{ .x = x, .w = w, .eps = eps, .out = y_work },
+        );
+
         // Time the GPU row.
         if (comptime build_options.use_vulkan) {
             if (runner) |r| {
@@ -683,6 +729,87 @@ fn benchRmsnorm(gpa: std.mem.Allocator, io: std.Io, runner: anytype) !void {
             }
         }
 
+        flush();
+    }
+}
+
+/// The CPU lines of the Qwen3.5 full-attention output gate, `dst *= sigmoid(gate)`, at the shapes
+/// of the GPU section.
+fn benchSigmoidGateCpu(gpa: std.mem.Allocator, io: std.Io) !void {
+    printSectionHeader("sigmoid_gate cpu");
+    const cases = [_]struct { label: []const u8, n: usize }{
+        .{ .label = "sigmoid n=2048 (qwen attn out)", .n = 2048 },
+        .{ .label = "sigmoid n=4096", .n = 4096 },
+    };
+    for (cases) |c| {
+        // Allocate and fill the inputs.
+        const gate = try gpa.alignedAlloc(f32, .of(f32), c.n);
+        defer gpa.free(gate);
+
+        const dst_init = try gpa.alignedAlloc(f32, .of(f32), c.n);
+        defer gpa.free(dst_init);
+
+        const dst_ref = try gpa.alignedAlloc(f32, .of(f32), c.n);
+        defer gpa.free(dst_ref);
+
+        const dst_work = try gpa.alignedAlloc(f32, .of(f32), c.n);
+        defer gpa.free(dst_work);
+
+        for (gate, 0..) |*v, i| {
+            v.* = @sin(@as(f32, @floatFromInt(i)) * 0.01);
+        }
+
+        for (dst_init, 0..) |*v, i| {
+            v.* = @cos(@as(f32, @floatFromInt(i)) * 0.01);
+        }
+
+        // Compute the reference.
+        @memcpy(dst_ref, dst_init);
+        zigferencer.ops.sigmoidGate(gate, dst_ref);
+        const ref_hash = hashOut(dst_ref);
+        const work: f64 = @floatFromInt(c.n);
+
+        // Time the naive line, then the vector line of `simd_pf`. Each run restores the input.
+        const Cpu = struct {
+            gate: []const f32,
+            dst_init: []const f32,
+            out: []f32,
+
+            pub fn run(self: @This()) !void {
+                @memcpy(self.out, self.dst_init);
+                zigferencer.ops.sigmoidGate(self.gate, self.out);
+            }
+        };
+        try cpuRow(
+            io,
+            c.n,
+            c.label,
+            "naive",
+            work,
+            ref_hash,
+            Cpu{ .gate = gate, .dst_init = dst_init, .out = dst_work },
+        );
+
+        const Vector = struct {
+            gate: []const f32,
+            dst_init: []const f32,
+            out: []f32,
+
+            pub fn run(self: @This()) !void {
+                @memcpy(self.out, self.dst_init);
+                zigferencer.ops_simd_pf.sigmoidGate(self.gate, self.out);
+            }
+        };
+        _ = try cpuCheckedRow(
+            io,
+            c.n,
+            c.label,
+            "simd_pf",
+            work,
+            dst_ref,
+            null,
+            Vector{ .gate = gate, .dst_init = dst_init, .out = dst_work },
+        );
         flush();
     }
 }

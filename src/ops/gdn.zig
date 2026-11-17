@@ -62,11 +62,20 @@
 //! The scan is therefore stable across a full 128-token chunk, with no 1/A blow-up. A
 //! sub-chunked GPU port is a free choice under bounded shared memory, not a numerical need.
 //!
-//! Comptime. `recurPanel` takes its panel width at comptime, so the wide and narrow panels share
-//! one body.
+//! Arithmetic. `Kernels(Math)` holds the control flow of one step: the head mapping, the q scale,
+//! and the order of the conv, the norms, the recurrence, and the gated norm. `Math` holds the
+//! arithmetic of those four parts. `reference` takes the scalar helpers of this file, and
+//! `step`, `stepPrologue`, `stepHeads`, and `stepKeyHead` are its members. `gdn_simd.zig` gives
+//! the lane arithmetic of the SIMD backends.
+//!
+//! Comptime. `Kernels` takes its arithmetic at compile time, so each arithmetic gets its own copy
+//! of the control flow and no call goes through a pointer. `recurPanel` takes its panel width at
+//! comptime, so the wide and narrow panels share one body.
 
 const std = @import("std");
 const limits = @import("../core/limits.zig");
+
+const gdn = @This();
 
 // -- constants --------------------------------------------------------------
 
@@ -140,6 +149,202 @@ pub const Heads = struct {
     state: []f32,
     /// [inner] output before ssm_out. Head `vh` owns `[vh*d, (vh+1)*d)`.
     o_out: []f32,
+};
+
+/// The control flow of one GDN step over the arithmetic `Math`. `Math` declares
+/// `convStepSilu`, `l2normInplace`, `recurStep`, and `gatedRmsNormInplace`, with the signatures
+/// of the scalar helpers of this file.
+pub fn Kernels(comptime Math: type) type {
+    inline for (.{ "convStepSilu", "l2normInplace", "recurStep", "gatedRmsNormInplace" }) |name| {
+        if (!@hasDecl(Math, name)) {
+            @compileError("gdn.Kernels: Math must declare " ++ name);
+        }
+    }
+
+    return struct {
+        const Self = @This();
+
+        /// Full per-token GDN step: `stepPrologue`, then `stepHeads` over every value head.
+        /// It mutates `qkv`, `state`, and `conv_state`, and writes `o_out` (length `inner`).
+        /// The caller applies `ssm_out` to `o_out` afterwards.
+        pub fn step(
+            d: Dims,
+            qkv: []f32, // [convDim] projected q|k|v (mutated: conv + silu in place)
+            z: []const f32, // [inner] gate projection
+            a: []const f32, // [n_heads] decay projection (ssm_alpha * x_n)
+            b: []const f32, // [n_heads] beta projection (ssm_beta * x_n)
+            conv_w: []const f32, // [K*convDim] ssm_conv1d weights
+            ssm_a: []const f32, // [n_heads] A_log
+            dt_bias: []const f32, // [n_heads] ssm_dt.bias
+            ssm_norm: []const f32, // [head_dim] gated-rmsnorm weight
+            rms_eps: f32,
+            state: []f32, // [stateLen] recurrent state (mutated)
+            conv_state: []f32, // [convStateLen] conv ring buffer (mutated)
+            o_out: []f32, // [inner] output before ssm_out
+        ) void {
+            Self.stepPrologue(d, qkv, conv_w, conv_state, rms_eps);
+            const heads: Heads = .{
+                .qkv = qkv,
+                .z = z,
+                .a = a,
+                .b = b,
+                .ssm_a = ssm_a,
+                .dt_bias = dt_bias,
+                .ssm_norm = ssm_norm,
+                .rms_eps = rms_eps,
+                .state = state,
+                .o_out = o_out,
+            };
+            Self.stepHeads(d, heads, 0, d.n_v_heads);
+            assertFinite(d, o_out);
+        }
+
+        /// The serial prologue of one GDN step: conv and SiLU over every channel, then the L2
+        /// norm of q and k per key head and the scale of q. It must end before any value head
+        /// starts.
+        pub fn stepPrologue(
+            d: Dims,
+            qkv: []f32, // [convDim] projected q|k|v (mutated: conv + silu in place)
+            conv_w: []const f32, // [K*convDim] ssm_conv1d weights
+            conv_state: []f32, // [convStateLen] conv ring buffer (mutated)
+            rms_eps: f32,
+        ) void {
+            const dim = d.head_dim;
+            const key_dim = d.keyDim();
+            std.debug.assert(dim <= max_head_dim);
+            std.debug.assert(qkv.len == d.convDim());
+            std.debug.assert(conv_state.len == d.convStateLen());
+
+            // Run the conv and SiLU over the concatenated channels.
+            Math.convStepSilu(d, conv_w, conv_state, qkv, 0, d.convDim());
+
+            // L2-normalize q and k per KEY head, then scale q.
+            var kh: usize = 0;
+            while (kh < d.n_k_heads) : (kh += 1) {
+                normKeyHead(d, qkv, rms_eps, kh);
+            }
+
+            if (std.debug.runtime_safety) {
+                for (qkv[0 .. 2 * key_dim]) |x| {
+                    std.debug.assert(std.math.isFinite(x));
+                }
+            }
+        }
+
+        /// The recurrence and the gated norm of the value heads `[h_lo, h_hi)`, after
+        /// `stepPrologue`. It writes only the state and the readout of those heads.
+        pub fn stepHeads(d: Dims, heads: Heads, h_lo: usize, h_hi: usize) void {
+            const dim = d.head_dim;
+            const key_dim = d.keyDim();
+            const value_dim = d.valueDim();
+            std.debug.assert(h_lo < h_hi);
+            std.debug.assert(h_hi <= d.n_v_heads);
+            std.debug.assert(dim <= max_head_dim);
+            std.debug.assert(heads.qkv.len == d.convDim());
+            std.debug.assert(heads.z.len == value_dim);
+            std.debug.assert(heads.o_out.len == value_dim);
+            std.debug.assert(heads.a.len == d.n_v_heads);
+            std.debug.assert(heads.b.len == d.n_v_heads);
+            std.debug.assert(heads.ssm_a.len == d.n_v_heads);
+            std.debug.assert(heads.dt_bias.len == d.n_v_heads);
+            std.debug.assert(heads.ssm_norm.len == dim);
+            std.debug.assert(heads.state.len == d.stateLen());
+
+            const q = heads.qkv[0..key_dim];
+            const k = heads.qkv[key_dim .. 2 * key_dim];
+            const v = heads.qkv[2 * key_dim .. 2 * key_dim + value_dim];
+
+            // Run the recurrence and the gated norm per VALUE head.
+            var vh: usize = h_lo;
+            while (vh < h_hi) : (vh += 1) {
+                const ki = vh % d.n_k_heads;
+                const qh = q[ki * dim ..][0..dim];
+                const kk = k[ki * dim ..][0..dim];
+                const vv = v[vh * dim ..][0..dim];
+                const oh = heads.o_out[vh * dim ..][0..dim];
+                // The step 4 line of the header gives the decay.
+                const g = heads.ssm_a[vh] * softplus(heads.a[vh] + heads.dt_bias[vh]);
+                const beta = sigmoid(heads.b[vh]);
+                const s = heads.state[vh * dim * dim ..][0 .. dim * dim];
+                Math.recurStep(s, qh, kk, vv, @exp(g), beta, oh);
+                const gate = heads.z[vh * dim ..][0..dim];
+                Math.gatedRmsNormInplace(oh, heads.ssm_norm, gate, heads.rms_eps);
+            }
+        }
+
+        /// The conv, the norms, and the recurrence of key head `kh` and its value heads.
+        /// It reads and writes only the channels, the ring entries, the states, and the readouts
+        /// of those heads. So disjoint key heads can run at the same time.
+        pub fn stepKeyHead(
+            d: Dims,
+            qkv: []f32,
+            conv_w: []const f32,
+            conv_state: []f32,
+            heads: Heads,
+            kh: usize,
+        ) void {
+            const dim = d.head_dim;
+            const key_dim = d.keyDim();
+            std.debug.assert(kh < d.n_k_heads);
+            std.debug.assert(dim <= max_head_dim);
+            std.debug.assert(heads.qkv.ptr == qkv.ptr);
+            std.debug.assert(heads.qkv.len == qkv.len);
+            std.debug.assert(qkv.len == d.convDim());
+            std.debug.assert(conv_state.len == d.convStateLen());
+
+            // The q and k channels of this key head, with the norms and the q scale of the
+            // prologue.
+            const q_lo = kh * dim;
+            const k_lo = key_dim + kh * dim;
+            Math.convStepSilu(d, conv_w, conv_state, qkv, q_lo, q_lo + dim);
+            Math.convStepSilu(d, conv_w, conv_state, qkv, k_lo, k_lo + dim);
+            normKeyHead(d, qkv, heads.rms_eps, kh);
+
+            if (std.debug.runtime_safety) {
+                for (qkv[q_lo..][0..dim]) |x| {
+                    std.debug.assert(std.math.isFinite(x));
+                }
+
+                for (qkv[k_lo..][0..dim]) |x| {
+                    std.debug.assert(std.math.isFinite(x));
+                }
+            }
+
+            // Value head vh reads key head vh % n_k_heads, so these value heads read only this
+            // head.
+            var vh: usize = kh;
+            while (vh < d.n_v_heads) : (vh += d.n_k_heads) {
+                const v_lo = 2 * key_dim + vh * dim;
+                Math.convStepSilu(d, conv_w, conv_state, qkv, v_lo, v_lo + dim);
+                Self.stepHeads(d, heads, vh, vh + 1);
+            }
+        }
+
+        /// The L2 norms of the q and k channels of key head `kh`, then the scale of q.
+        fn normKeyHead(d: Dims, qkv: []f32, eps: f32, kh: usize) void {
+            const dim = d.head_dim;
+            const key_dim = d.keyDim();
+            std.debug.assert(kh < d.n_k_heads);
+            std.debug.assert(qkv.len == d.convDim());
+
+            const qh = qkv[kh * dim ..][0..dim];
+            const kk = qkv[key_dim + kh * dim ..][0..dim];
+            const q_scale = 1.0 / @sqrt(@as(f32, @floatFromInt(dim)));
+            Math.l2normInplace(qh, eps);
+            Math.l2normInplace(kk, eps);
+            for (qh) |*x| {
+                x.* *= q_scale;
+            }
+        }
+    };
+}
+
+/// The scalar arithmetic of this file, the bits of the reference step.
+const ReferenceMath = struct {
+    pub const convStepSilu = gdn.convStepSilu;
+    pub const l2normInplace = gdn.l2normInplace;
+    pub const recurStep = gdn.recurStep;
+    pub const gatedRmsNormInplace = gdn.gatedRmsNormInplace;
 };
 
 // -- api --------------------------------------------------------------------
@@ -285,170 +490,53 @@ pub fn chunkScan(
     }
 }
 
-/// Full per-token GDN step: `stepPrologue`, then `stepHeads` over every value head.
-/// It mutates `qkv`, `state`, and `conv_state`, and writes `o_out` (length `inner`).
-/// The caller applies `ssm_out` to `o_out` afterwards.
-pub fn step(
+/// The control flow of this file over its scalar arithmetic, the reference of every backend.
+pub const reference = Kernels(ReferenceMath);
+
+/// The members of `reference`, so a caller of the reference step names no `Kernels` type.
+pub const step = reference.step;
+pub const stepPrologue = reference.stepPrologue;
+pub const stepHeads = reference.stepHeads;
+pub const stepKeyHead = reference.stepKeyHead;
+
+/// Causal depthwise conv1d over the channels `[c_lo, c_hi)` of `qkv`, in place, without the
+/// SiLU. It writes the pre-activation and advances the ring entries of those channels by one
+/// step. Each channel is independent.
+pub fn convStep(
     d: Dims,
-    qkv: []f32, // [convDim] projected q|k|v (mutated: conv + silu in place)
-    z: []const f32, // [inner] gate projection
-    a: []const f32, // [n_heads] decay projection (ssm_alpha * x_n)
-    b: []const f32, // [n_heads] beta projection (ssm_beta * x_n)
-    conv_w: []const f32, // [K*convDim] ssm_conv1d weights
-    ssm_a: []const f32, // [n_heads] A_log
-    dt_bias: []const f32, // [n_heads] ssm_dt.bias
-    ssm_norm: []const f32, // [head_dim] gated-rmsnorm weight
-    rms_eps: f32,
-    state: []f32, // [stateLen] recurrent state (mutated)
-    conv_state: []f32, // [convStateLen] conv ring buffer (mutated)
-    o_out: []f32, // [inner] output before ssm_out
-) void {
-    stepPrologue(d, qkv, conv_w, conv_state, rms_eps);
-    const heads: Heads = .{
-        .qkv = qkv,
-        .z = z,
-        .a = a,
-        .b = b,
-        .ssm_a = ssm_a,
-        .dt_bias = dt_bias,
-        .ssm_norm = ssm_norm,
-        .rms_eps = rms_eps,
-        .state = state,
-        .o_out = o_out,
-    };
-    stepHeads(d, heads, 0, d.n_v_heads);
-    assertFinite(d, o_out);
-}
-
-/// The serial prologue of one GDN step: conv and SiLU over every channel, then the L2 norm of
-/// q and k per key head and the scale of q. It must end before any value head starts.
-pub fn stepPrologue(
-    d: Dims,
-    qkv: []f32, // [convDim] projected q|k|v (mutated: conv + silu in place)
-    conv_w: []const f32, // [K*convDim] ssm_conv1d weights
-    conv_state: []f32, // [convStateLen] conv ring buffer (mutated)
-    rms_eps: f32,
-) void {
-    const dim = d.head_dim;
-    const key_dim = d.keyDim();
-    std.debug.assert(dim <= max_head_dim);
-    std.debug.assert(qkv.len == d.convDim());
-    std.debug.assert(conv_state.len == d.convStateLen());
-
-    // Run the conv and SiLU over the concatenated channels.
-    convStepSilu(d, conv_w, conv_state, qkv, 0, d.convDim());
-    const q = qkv[0..key_dim];
-    const k = qkv[key_dim .. 2 * key_dim];
-
-    // L2-normalize q and k per KEY head, then scale q.
-    const q_scale = 1.0 / @sqrt(@as(f32, @floatFromInt(dim)));
-    var kh: usize = 0;
-    while (kh < d.n_k_heads) : (kh += 1) {
-        const qh = q[kh * dim ..][0..dim];
-        const kk = k[kh * dim ..][0..dim];
-        l2normInplace(qh, rms_eps);
-        l2normInplace(kk, rms_eps);
-        for (qh) |*x| {
-            x.* *= q_scale;
-        }
-    }
-
-    if (std.debug.runtime_safety) {
-        for (qkv[0 .. 2 * key_dim]) |x| {
-            std.debug.assert(std.math.isFinite(x));
-        }
-    }
-}
-
-/// The recurrence and the gated norm of the value heads `[h_lo, h_hi)`, after
-/// `stepPrologue`. It writes only the state and the readout of those heads.
-pub fn stepHeads(d: Dims, heads: Heads, h_lo: usize, h_hi: usize) void {
-    const dim = d.head_dim;
-    const key_dim = d.keyDim();
-    const value_dim = d.valueDim();
-    std.debug.assert(h_lo < h_hi);
-    std.debug.assert(h_hi <= d.n_v_heads);
-    std.debug.assert(dim <= max_head_dim);
-    std.debug.assert(heads.qkv.len == d.convDim());
-    std.debug.assert(heads.z.len == value_dim);
-    std.debug.assert(heads.o_out.len == value_dim);
-    std.debug.assert(heads.a.len == d.n_v_heads);
-    std.debug.assert(heads.b.len == d.n_v_heads);
-    std.debug.assert(heads.ssm_a.len == d.n_v_heads);
-    std.debug.assert(heads.dt_bias.len == d.n_v_heads);
-    std.debug.assert(heads.ssm_norm.len == dim);
-    std.debug.assert(heads.state.len == d.stateLen());
-
-    const q = heads.qkv[0..key_dim];
-    const k = heads.qkv[key_dim .. 2 * key_dim];
-    const v = heads.qkv[2 * key_dim .. 2 * key_dim + value_dim];
-
-    // Run the recurrence and the gated norm per VALUE head.
-    var vh: usize = h_lo;
-    while (vh < h_hi) : (vh += 1) {
-        const ki = vh % d.n_k_heads;
-        const qh = q[ki * dim ..][0..dim];
-        const kk = k[ki * dim ..][0..dim];
-        const vv = v[vh * dim ..][0..dim];
-        const oh = heads.o_out[vh * dim ..][0..dim];
-        // The step 4 line of the header gives the decay.
-        const g = heads.ssm_a[vh] * softplus(heads.a[vh] + heads.dt_bias[vh]);
-        const beta = sigmoid(heads.b[vh]);
-        recurStep(heads.state[vh * dim * dim ..][0 .. dim * dim], qh, kk, vv, @exp(g), beta, oh);
-        gatedRmsNormInplace(oh, heads.ssm_norm, heads.z[vh * dim ..][0..dim], heads.rms_eps);
-    }
-}
-
-/// The conv, the norms, and the recurrence of key head `kh` and its value heads.
-/// It reads and writes only the channels, the ring entries, the states, and the readouts of
-/// those heads. So disjoint key heads can run at the same time.
-pub fn stepKeyHead(
-    d: Dims,
-    qkv: []f32,
     conv_w: []const f32,
     conv_state: []f32,
-    heads: Heads,
-    kh: usize,
+    qkv: []f32,
+    c_lo: usize,
+    c_hi: usize,
 ) void {
-    const dim = d.head_dim;
-    const key_dim = d.keyDim();
-    std.debug.assert(kh < d.n_k_heads);
-    std.debug.assert(dim <= max_head_dim);
-    std.debug.assert(heads.qkv.ptr == qkv.ptr);
-    std.debug.assert(heads.qkv.len == qkv.len);
-    std.debug.assert(qkv.len == d.convDim());
-    std.debug.assert(conv_state.len == d.convStateLen());
+    const k = d.conv_kernel;
+    const cdim = d.convDim();
+    std.debug.assert(k >= 2);
+    std.debug.assert(conv_w.len == k * cdim);
+    std.debug.assert(conv_state.len == (k - 1) * cdim);
+    std.debug.assert(qkv.len == cdim);
+    std.debug.assert(c_lo < c_hi);
+    std.debug.assert(c_hi <= cdim);
 
-    // The q and k channels of this key head, with the norms and the q scale of the prologue.
-    const q_lo = kh * dim;
-    const k_lo = key_dim + kh * dim;
-    convStepSilu(d, conv_w, conv_state, qkv, q_lo, q_lo + dim);
-    convStepSilu(d, conv_w, conv_state, qkv, k_lo, k_lo + dim);
-    const qh = qkv[q_lo..][0..dim];
-    const kk = qkv[k_lo..][0..dim];
-    const q_scale = 1.0 / @sqrt(@as(f32, @floatFromInt(dim)));
-    l2normInplace(qh, heads.rms_eps);
-    l2normInplace(kk, heads.rms_eps);
-    for (qh) |*x| {
-        x.* *= q_scale;
-    }
-
-    if (std.debug.runtime_safety) {
-        for (qh) |x| {
-            std.debug.assert(std.math.isFinite(x));
+    var c: usize = c_lo;
+    while (c < c_hi) : (c += 1) {
+        var acc: f32 = 0;
+        var t: usize = 0;
+        while (t < k - 1) : (t += 1) {
+            acc += conv_w[c * k + t] * conv_state[t * cdim + c];
         }
 
-        for (kk) |x| {
-            std.debug.assert(std.math.isFinite(x));
-        }
-    }
+        acc += conv_w[c * k + (k - 1)] * qkv[c];
 
-    // Value head vh reads key head vh % n_k_heads, so these value heads read only this head.
-    var vh: usize = kh;
-    while (vh < d.n_v_heads) : (vh += d.n_k_heads) {
-        const v_lo = 2 * key_dim + vh * dim;
-        convStepSilu(d, conv_w, conv_state, qkv, v_lo, v_lo + dim);
-        stepHeads(d, heads, vh, vh + 1);
+        // Advance the ring: drop the oldest entry, append the current input.
+        t = 0;
+        while (t < k - 2) : (t += 1) {
+            conv_state[t * cdim + c] = conv_state[(t + 1) * cdim + c];
+        }
+
+        conv_state[(k - 2) * cdim + c] = qkv[c];
+        qkv[c] = acc;
     }
 }
 
@@ -503,33 +591,9 @@ fn convStepSilu(
     c_lo: usize,
     c_hi: usize,
 ) void {
-    const k = d.conv_kernel;
-    const cdim = d.convDim();
-    std.debug.assert(conv_w.len == k * cdim);
-    std.debug.assert(conv_state.len == (k - 1) * cdim);
-    std.debug.assert(qkv.len == cdim);
-    std.debug.assert(c_lo < c_hi);
-    std.debug.assert(c_hi <= cdim);
-
-    var c: usize = c_lo;
-    while (c < c_hi) : (c += 1) {
-        var acc: f32 = 0;
-        var t: usize = 0;
-        while (t < k - 1) : (t += 1) {
-            acc += conv_w[c * k + t] * conv_state[t * cdim + c];
-        }
-
-        acc += conv_w[c * k + (k - 1)] * qkv[c];
-
-        // Advance the ring: drop the oldest entry, append the current input.
-        t = 0;
-        while (t < k - 2) : (t += 1) {
-            conv_state[t * cdim + c] = conv_state[(t + 1) * cdim + c];
-        }
-
-        conv_state[(k - 2) * cdim + c] = qkv[c];
-
-        qkv[c] = silu(acc);
+    convStep(d, conv_w, conv_state, qkv, c_lo, c_hi);
+    for (qkv[c_lo..c_hi]) |*x| {
+        x.* = silu(x.*);
     }
 }
 

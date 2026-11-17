@@ -295,9 +295,7 @@ pub const CpuLayerKernels = struct {
         defer sp.end();
 
         for (0..self.rows.len) |i| {
-            for (self.stripe(.attn_out, i), self.stripe(.gate, i)) |*o, gv| {
-                o.* *= 1.0 / (1.0 + @exp(-gv));
-            }
+            ops.sigmoidGate(self.stripe(.gate, i), self.stripe(.attn_out, i));
         }
     }
 
@@ -393,7 +391,7 @@ pub const CpuLayerKernels = struct {
                     o_row,
                 );
             } else {
-                parallel.gdnStep(self.pool, self.policy, d, qkv_row, conv1d, conv_state, .{
+                parallel.gdnStep(ops, self.pool, self.policy, d, qkv_row, conv1d, conv_state, .{
                     .qkv = qkv_row,
                     .z = z_row,
                     .a = a_row,

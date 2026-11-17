@@ -19,12 +19,19 @@
 //! Op list. The list below is the source of truth for which kernels the report verifies. To add
 //! a kernel, take its address here. The simd and simd_pf backends hand-write the matmul kernels
 //! and the attention part kernel. linearF32Q80, the hot quantized matmul, and the attention part
-//! kernel exist across all three backends, and linearF32, the dense f32 matmul, in simd alone.
-//! The list names those once per specializing backend. The Q8_0 linears of simd and simd_pf share
+//! kernel exist across all three backends. linearF32, the dense f32 matmul, exists in naive and
+//! in `linear_simd`, which both SIMD backends export. The list names those once per specializing
+//! backend. The Q8_0 linears of simd and simd_pf share
 //! the source of `linear_simd`, so a wrapper per backend gives each its own symbol.
+//! The lane-wise sigmoid of `exp_simd` and `sumSquares` of `lane_tree_simd` take one wrapper
+//! each, because naive has no such op and both SIMD backends share the one source. The
+//! elementwise ops `rmsnorm`, `swiglu`, `sigmoidGate`, and `residualAdd` are plain functions of
+//! `elementwise_simd` that both SIMD backends export, so the list names the naive op and the
+//! `simd_pf` op of each. The GDN step is a member of a `gdn.Kernels` type, so `gdnStep` pins the
+//! reference and `gdnStepSimd` the lane step that both SIMD backends share.
 //!
-//! Shared ops. Every other op is shared naive code that each backend re-exports unchanged. Its
-//! width is whatever the compiler auto-vectorizes for the target, which is the same width
+//! Shared ops. Every other op in the list is naive code that each backend re-exports unchanged.
+//! Its width is whatever the compiler auto-vectorizes for the target, which is the same width
 //! whichever backend ships.
 
 const std = @import("std");
@@ -43,7 +50,7 @@ const probed_ops = .{
     &linearF32Q80BatchSimd, // simd: batch panel path
     &linearF32Q80BatchSimdPf, // simd_pf: batch panel path
     &zigferencer.ops.linearF32, // naive: scalar reference
-    &zigferencer.ops_simd.linearF32, // simd: @Vector(8)
+    &zigferencer.ops_simd.linearF32, // simd and simd_pf: @Vector(8), 4 FMA chains + lane tree
     // The part kernel is generic over the KV element type. A wrapper per type
     // and backend pins one concrete instance each.
     &attentionPartF32, // naive: scalar reference
@@ -52,12 +59,21 @@ const probed_ops = .{
     &attentionPartF16, // naive: scalar reference
     &attentionPartF16Simd, // simd: @Vector(8) + F16C
     &attentionPartF16SimdPf, // simd_pf: @Vector(8) + F16C + prefetch
+    &sigmoidSimd, // simd and simd_pf: @Vector(8), expNeg + division
+    &gdnStep, // naive: scalar reference, column panels
+    &gdnStepSimd, // simd and simd_pf: @Vector(8), readout form, @mulAdd
+    &sumSquaresSimd, // simd and simd_pf: @Vector(8), 4 FMA chains + lane tree
+    // The elementwise ops of `elementwise_simd`, one symbol for both SIMD backends.
+    &zigferencer.ops.rmsnorm, // naive: scalar reference
+    &zigferencer.ops_simd_pf.rmsnorm, // simd and simd_pf: @Vector(8), sumSquares
+    &zigferencer.ops.swiglu, // naive: scalar reference
+    &zigferencer.ops_simd_pf.swiglu, // simd and simd_pf: @Vector(8), sigmoid
+    &zigferencer.ops.sigmoidGate, // naive: scalar reference
+    &zigferencer.ops_simd_pf.sigmoidGate, // simd and simd_pf: @Vector(8), sigmoid
+    &zigferencer.ops.residualAdd, // naive: scalar reference
+    &zigferencer.ops_simd_pf.residualAdd, // simd and simd_pf: @Vector(8)
     // Shared: defined once in naive, re-exported by every backend.
     &zigferencer.ops.linearF32Q40,
-    &zigferencer.ops.rmsnorm,
-    &zigferencer.ops.swiglu,
-    &zigferencer.ops.residualAdd,
-    &zigferencer.ops_simd_pf.residualAdd,
     &zigferencer.ops.ropeInplace,
     &zigferencer.ops.ropeHeads,
     &zigferencer.ops.attentionMerge,
@@ -65,7 +81,6 @@ const probed_ops = .{
     &zigferencer.ops.dequantQ40,
     &zigferencer.ops.dequantQ6K,
     &zigferencer.ops.embedLookup,
-    &zigferencer.gdn.step,
     &zigferencer.gdn.chunkScan,
 };
 
@@ -94,6 +109,24 @@ fn PartArgs(comptime E: type) type {
         rec_stride: usize,
     };
 }
+
+/// The arguments of one GDN step. A wrapper takes them as one value, so each wrapper stays one
+/// line.
+const GdnArgs = struct {
+    d: zigferencer.gdn.Dims,
+    qkv: []f32,
+    z: []const f32,
+    a: []const f32,
+    b: []const f32,
+    conv_w: []const f32,
+    ssm_a: []const f32,
+    dt_bias: []const f32,
+    ssm_norm: []const f32,
+    rms_eps: f32,
+    state: []f32,
+    conv_state: []f32,
+    o_out: []f32,
+};
 
 // -- api --------------------------------------------------------------------
 
@@ -133,6 +166,30 @@ inline fn partCall(comptime Kernels: type, comptime E: type, a: PartArgs(E)) voi
     );
 }
 
+/// Inline the GDN step of `Kernels` into the calling wrapper, so the body lands under the name of
+/// the wrapper.
+inline fn gdnCall(comptime Kernels: type, a: GdnArgs) void {
+    @call(
+        .always_inline,
+        Kernels.step,
+        .{
+            a.d,
+            a.qkv,
+            a.z,
+            a.a,
+            a.b,
+            a.conv_w,
+            a.ssm_a,
+            a.dt_bias,
+            a.ssm_norm,
+            a.rms_eps,
+            a.state,
+            a.conv_state,
+            a.o_out,
+        },
+    );
+}
+
 fn attentionPartF32(a: PartArgs(f32)) void {
     partCall(zigferencer.ops, f32, a);
 }
@@ -155,6 +212,22 @@ fn attentionPartF16Simd(a: PartArgs(f16)) void {
 
 fn attentionPartF16SimdPf(a: PartArgs(f16)) void {
     partCall(zigferencer.ops_simd_pf, f16, a);
+}
+
+fn sumSquaresSimd(x: []const f32) f32 {
+    return @call(.always_inline, zigferencer.lane_tree_simd.sumSquares, .{x});
+}
+
+fn sigmoidSimd(x: zigferencer.exp_simd.Vec) zigferencer.exp_simd.Vec {
+    return zigferencer.exp_simd.sigmoid(x);
+}
+
+fn gdnStep(a: GdnArgs) void {
+    gdnCall(zigferencer.gdn.reference, a);
+}
+
+fn gdnStepSimd(a: GdnArgs) void {
+    gdnCall(zigferencer.gdn_simd.kernels, a);
 }
 
 fn linearF32Q80Simd(input: []const f32, weight: Tensor, out: []f32) void {

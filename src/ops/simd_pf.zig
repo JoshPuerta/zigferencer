@@ -1,6 +1,8 @@
-//! The backend that prefetches. It takes the Q8_0 linears from `linear_simd.prefetched`, the
-//! attention kernels from `attention_simd.prefetched`, `residualAdd` from `elementwise_simd`, and
-//! every other op from `naive`. This is the auto default on a target with AVX2 and FMA.
+//! The backend that prefetches. It takes the Q8_0 linears from `linear_simd.prefetched`, the f32
+//! linears from `linear_simd`, the attention kernels from `attention_simd.prefetched`,
+//! `residualAdd`, `rmsnorm`, `swiglu`, and `sigmoidGate` from `elementwise_simd`, the GDN key-head
+//! unit from `gdn_simd`, and every other op from `naive`. The f32 linears are the ones of `simd`,
+//! with no prefetch. This is the auto default on a target with AVX2 and FMA.
 //!
 //! Requirements. Every AVX2 target also carries F16C. Without F16C the f16 widening stays
 //! correct and runs scalar, so `requires` does not list it.
@@ -11,6 +13,7 @@
 const std = @import("std");
 const attention_simd = @import("attention_simd.zig");
 const elementwise_simd = @import("elementwise_simd.zig");
+const gdn_simd = @import("gdn_simd.zig");
 const linear_simd = @import("linear_simd.zig");
 const naive = @import("naive.zig");
 const op_requires = @import("../core/op_requires.zig");
@@ -25,23 +28,24 @@ pub const requires: op_requires.OpRequires = .{
     .needs_fma = true,
 };
 
-pub const rmsnorm = naive.rmsnorm;
-pub const swiglu = naive.swiglu;
+pub const swiglu_flops_per_element = elementwise_simd.swiglu_flops_per_element;
 
 // -- api --------------------------------------------------------------------
 
 pub const dequantQ80 = naive.dequantQ80;
 pub const embedLookup = naive.embedLookup;
-pub const linearF32 = naive.linearF32;
-pub const linearF32Batch = naive.linearF32Batch;
 
 pub const residualAdd = elementwise_simd.residualAdd;
+pub const rmsnorm = elementwise_simd.rmsnorm;
+pub const swiglu = elementwise_simd.swiglu;
+pub const sigmoidGate = elementwise_simd.sigmoidGate;
 pub const ropeInplace = naive.ropeInplace;
 pub const ropeHeads = naive.ropeHeads;
 pub const RopeTable = naive.RopeTable;
 pub const attentionPartTyped = attention_simd.prefetched.attentionPartTyped;
 pub const attentionMerge = attention_simd.prefetched.attentionMerge;
 pub const attentionRowTyped = attention_simd.prefetched.attentionRowTyped;
+pub const gdnStepKeyHead = gdn_simd.kernels.stepKeyHead;
 
 pub const linearF32Q40 = naive.linearF32Q40;
 pub const linearF32Q40Batch = naive.linearF32Q40Batch;
@@ -51,6 +55,8 @@ pub const linearF32Q6K = naive.linearF32Q6K;
 pub const linearF32Q6KBatch = naive.linearF32Q6KBatch;
 pub const linearF32Q80 = linear_simd.prefetched.linearF32Q80;
 pub const linearF32Q80Batch = linear_simd.prefetched.linearF32Q80Batch;
+pub const linearF32 = linear_simd.linearF32;
+pub const linearF32Batch = linear_simd.linearF32Batch;
 
 // -- tests ------------------------------------------------------------------
 

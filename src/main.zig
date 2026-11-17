@@ -51,6 +51,9 @@ pub const step_stats = @import("core/step_stats.zig");
 pub const time = @import("core/utils/time.zig");
 pub const ops = @import("ops/naive.zig");
 pub const gdn = @import("ops/gdn.zig");
+pub const gdn_simd = @import("ops/gdn_simd.zig");
+pub const exp_simd = @import("ops/exp_simd.zig");
+pub const lane_tree_simd = @import("ops/lane_tree_simd.zig");
 pub const vocab = @import("core/tokenizer/vocab.zig");
 pub const bpe = @import("core/tokenizer/bpe.zig");
 pub const chat = @import("core/chat.zig");
@@ -389,6 +392,8 @@ test {
     _ = ops_simd;
     _ = ops_simd_pf;
     _ = @import("ops/attention_simd.zig");
+    _ = lane_tree_simd;
+    _ = gdn_simd;
     _ = @import("ops/linear_simd.zig");
     _ = @import("ops/elementwise_simd.zig");
     if (build_options.use_vulkan) {

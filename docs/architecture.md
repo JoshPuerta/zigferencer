@@ -580,10 +580,10 @@ is the op module of the build, and a shader name is its file in
 | `rope` | `ops.ropeHeads` once per row, with the base angles that the runner fills at init | `rope_multi` for `step`, `rope_multi_batch` for the other steps |
 | `kvCommit` | a copy into the slot, narrowed to the KV type | a buffer copy, after `kv_commit_f16` at f16 KV |
 | `attention` | `ops.attentionPartTyped` for each part on the pool, then `ops.attentionMerge` | `attention` for `step`, `attention_multi_stream` for `stepBatch`, `attention_batch` for a prompt chunk. A row past `limits.attn_split_len` adds `attention_split` and `attention_merge`. |
-| `gate` | a sigmoid product inside `CpuLayerKernels.gate` | `sigmoid_gate` |
+| `gate` | `ops.sigmoidGate` once per row | `sigmoid_gate` |
 | `residual` | `ops.residualAdd` | `residual_add` |
 | `swiglu` | `parallel.swiglu` on the pool, which runs `ops.swiglu` over element ranges | `swiglu` |
-| `gdn` | `gdn.stepKeyHead` for each key head on the pool (`ops/gdn.zig`) | `gdn_decode` for `step` and `stepBatch`. A prompt chunk records `gdn_chunk_conv`, `gdn_chunk_scan`, and `gdn_chunk_norm`. |
+| `gdn` | `ops.gdnStepKeyHead` for each key head on the pool: `gdn.stepKeyHead` under naive, the lane step of `ops/gdn_simd.zig` under the SIMD backends | `gdn_decode` for `step` and `stepBatch`. A prompt chunk records `gdn_chunk_conv`, `gdn_chunk_scan`, and `gdn_chunk_norm`. |
 
 All three layers share the norms, the projections, the residual adds, and the
 feed-forward, on the same CPU functions. The Qwen3.5 attention layer adds

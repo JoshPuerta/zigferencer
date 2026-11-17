@@ -1,10 +1,17 @@
 //! Gated-DeltaNet (Qwen3.5 hybrid) benchmarks. The recurrent GDN layer is the one op of the
 //! hybrid that no other section covers, and its two paths cost very different amounts.
-//! `gdn.step` is a real CPU op, because the CPU Qwen runner drives the GDN layers with it, so
-//! its reference row runs on every build. The GPU rows for `GdnDecode` (one token) and
-//! `GdnChunkParallel` (a whole chunk of prefill) run under vulkan.
+//! `gdn.step` is the reference of the CPU op. The naive CPU Qwen runner drives the GDN layers
+//! with its key-head unit, and its line runs on every build. The `simd_pf` line runs the lane step
+//! that the SIMD backends drive, `gdn_simd.kernels.step`, against that reference. The GPU lines
+//! for `GdnDecode` (one token) and `GdnChunkParallel` (a whole chunk of prefill) run under vulkan.
 //!
-//! Comptime. `build_options.use_vulkan` gates the GPU code, so a CPU build never reads it.
+//! Lane error. The rel_err column of the `simd_pf` line holds the normwise error
+//! `max |ref - got| / max |ref|`. The gated norm multiplies by `silu(z)`, so some readouts lie
+//! near zero, and the largest per-element relative error measures their rounding, not the step.
+//!
+//! Comptime. `GdnCpu` takes its `gdn.Kernels` type at compile time, so the naive and the `simd_pf`
+//! lines share one body. `build_options.use_vulkan` gates the GPU code, so a CPU build never reads
+//! it.
 //!
 //! Not covered. The Qwen full-attention helpers that exist only as `recordInto` (QkNorm and the
 //! batched rmsnorm, rope, and attention) go into the fused command buffer, so no section here
@@ -127,39 +134,52 @@ const GdnRef = struct {
     hash: u64,
 };
 
-/// The CPU reference: `tokens` sequential `gdn.step` calls that carry state and conv forward.
+/// One CPU line: `tokens` sequential `Kernels.step` calls that carry state and conv forward.
 /// Each call mutates its qkv row, so the scratch copies keep the inputs intact.
-const GdnCpu = struct {
-    inputs: *const GdnInputs,
-    sr: []f32,
-    cr: []f32,
-    qr: []f32,
-    o: []f32,
+fn GdnCpu(comptime Kernels: type) type {
+    return struct {
+        inputs: *const GdnInputs,
+        sr: []f32,
+        cr: []f32,
+        qr: []f32,
+        o: []f32,
 
-    pub fn run(self: @This()) !void {
-        const in = self.inputs;
-        @memcpy(self.sr, in.state0);
-        @memcpy(self.cr, in.conv0);
-        for (0..in.tokens) |ti| {
-            @memcpy(self.qr, in.qkv[ti * in.conv_dim ..][0..in.conv_dim]);
-            zigferencer.gdn.step(
-                in.dims,
-                self.qr,
-                in.zg[ti * in.value_dim ..][0..in.value_dim],
-                in.alpha[ti * in.n_v ..][0..in.n_v],
-                in.beta[ti * in.n_v ..][0..in.n_v],
-                in.conv_w,
-                in.ssm_a,
-                in.dt_bias,
-                in.ssm_norm,
-                eps,
-                self.sr,
-                self.cr,
-                self.o[ti * in.value_dim ..][0..in.value_dim],
-            );
+        /// Allocate the scratch from `arena`, before the timed loop.
+        fn init(arena: std.mem.Allocator, inputs: *const GdnInputs, o: []f32) !@This() {
+            return .{
+                .inputs = inputs,
+                .sr = try arena.alloc(f32, inputs.state_len),
+                .cr = try arena.alloc(f32, inputs.conv_state_len),
+                .qr = try arena.alloc(f32, inputs.conv_dim),
+                .o = o,
+            };
         }
-    }
-};
+
+        pub fn run(self: @This()) !void {
+            const in = self.inputs;
+            @memcpy(self.sr, in.state0);
+            @memcpy(self.cr, in.conv0);
+            for (0..in.tokens) |ti| {
+                @memcpy(self.qr, in.qkv[ti * in.conv_dim ..][0..in.conv_dim]);
+                Kernels.step(
+                    in.dims,
+                    self.qr,
+                    in.zg[ti * in.value_dim ..][0..in.value_dim],
+                    in.alpha[ti * in.n_v ..][0..in.n_v],
+                    in.beta[ti * in.n_v ..][0..in.n_v],
+                    in.conv_w,
+                    in.ssm_a,
+                    in.dt_bias,
+                    in.ssm_norm,
+                    eps,
+                    self.sr,
+                    self.cr,
+                    self.o[ti * in.value_dim ..][0..in.value_dim],
+                );
+            }
+        }
+    };
+}
 
 // -- api --------------------------------------------------------------------
 
@@ -215,8 +235,9 @@ pub fn benchGdnChunked(gpa: std.mem.Allocator, io: std.Io, runner: anytype) !voi
 
 // -- helpers ----------------------------------------------------------------
 
-/// Run the CPU reference once, print the `naive` row, and return the reference for the GPU row.
-/// The scratch is allocated before the timed loop, which keeps allocation out of the measurement.
+/// Run the CPU reference once, print the `naive` line and the `simd_pf` line, and return the
+/// reference for the GPU line. The scratch is allocated before the timed loop, which keeps
+/// allocation out of the measurement.
 fn gdnCpuRow(
     arena: std.mem.Allocator,
     io: std.Io,
@@ -224,13 +245,7 @@ fn gdnCpuRow(
     label: []const u8,
 ) !GdnRef {
     const o_ref = try arena.alloc(f32, inputs.tokens * inputs.value_dim);
-    const cpu: GdnCpu = .{
-        .inputs = inputs,
-        .sr = try arena.alloc(f32, inputs.state_len),
-        .cr = try arena.alloc(f32, inputs.conv_state_len),
-        .qr = try arena.alloc(f32, inputs.conv_dim),
-        .o = o_ref,
-    };
+    const cpu = try GdnCpu(zigferencer.gdn.reference).init(arena, inputs, o_ref);
     try cpu.run(); // populate o_ref as the reference
     // The work is the dxd recurrent state, which is also what GDN time scales with.
     const scale = inputs.tokens * inputs.state_len;
@@ -242,6 +257,17 @@ fn gdnCpuRow(
         .hash = hashOut(o_ref),
     };
     try cpuRow(io, ref.scale, label, "naive", ref.work, ref.hash, cpu);
+
+    // The lane step of the SIMD backends, against the reference.
+    const o_lane = try arena.alloc(f32, inputs.tokens * inputs.value_dim);
+    const lane = try GdnCpu(zigferencer.gdn_simd.kernels).init(arena, inputs, o_lane);
+    try lane.run();
+    const norm = bench_util.normwiseError(o_ref, o_lane);
+    const hash = hashOut(o_lane);
+    const tol = zigferencer.ops_simd_pf.requires.tolerance;
+    const t = try bench_util.timed(io, ref.scale, lane);
+    const status = bench_util.opStatus(tol, norm, hash == ref.hash);
+    bench_util.rawRow(label, "simd_pf", t.ms, bench_util.rate(t, ref.work), norm, hash, status);
     return ref;
 }
 

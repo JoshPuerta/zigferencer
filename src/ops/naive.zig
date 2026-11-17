@@ -1,8 +1,9 @@
-//! Scalar f32 reference ops, the full set a Llama forward pass needs. That set is matmul, embed
-//! lookup, RMSNorm, SwiGLU/SiLU, residual add, RoPE, and decode attention as row parts with an
-//! ordered merge. Every other ops variant re-exports the remaining ops from here. It overrides
-//! the linear kernels, and the SIMD variants also override the attention part kernel and the
-//! serial row.
+//! Scalar f32 reference ops, the full set a Llama or Qwen3.5 forward pass needs. That set is
+//! matmul, embed lookup, RMSNorm, SwiGLU/SiLU, residual add, RoPE, decode attention as row parts
+//! with an ordered merge, and the key-head unit of the GDN step. Every other backend re-exports
+//! the remaining ops from here. It overrides the linear kernels, and the SIMD backends also
+//! override the attention part kernel, the serial row, the elementwise ops, and the GDN key-head
+//! unit.
 //!
 //! Comptime. `E` makes the kernels generic over f32 and f16, and `kernel` binds a row kernel at
 //! build time.
@@ -57,6 +58,7 @@
 
 const std = @import("std");
 const attn_cpu = @import("../core/attn_cpu.zig");
+const gdn = @import("gdn.zig");
 const limits = @import("../core/limits.zig");
 const op_requires = @import("../core/op_requires.zig");
 const Tensor = @import("../core/tensor.zig").Tensor;
@@ -72,6 +74,11 @@ const rope_block_pairs: usize = limits.attn_max_head_dim / 2;
 
 /// The naive variant runs anywhere.
 pub const requires: op_requires.OpRequires = .{ .arch = .any };
+
+/// The weight of one `swiglu` element in FLOPs of the `simd_pf` Q8_0 matmul, the op of the floor
+/// sweep. One scalar element takes as long as this many FLOPs of that matmul. The `linearF32Q80`
+/// and `swiglu` lines of `zig build bench` give both rates.
+pub const swiglu_flops_per_element: u64 = 176;
 
 // -- types ------------------------------------------------------------------
 
@@ -93,6 +100,9 @@ pub const RopeTable = struct {
 };
 
 // -- api --------------------------------------------------------------------
+
+/// The key-head unit of the GDN step, the scalar reference of `gdn.zig`.
+pub const gdnStepKeyHead = gdn.stepKeyHead;
 
 /// Linear layer: `out = input @ W.T`.
 pub fn linearF32(input: []const f32, weight: Tensor, out: []f32) void {
@@ -712,6 +722,21 @@ pub fn swiglu(gate: []const f32, up: []const f32, dst: []f32) void {
 
     if (std.debug.runtime_safety) {
         for (dst[0..gate.len]) |v| {
+            std.debug.assert(std.math.isFinite(v));
+        }
+    }
+}
+
+/// out[i] *= sigmoid(gate[i]), the attention gate of the Qwen full-attention layers.
+pub fn sigmoidGate(gate: []const f32, out: []f32) void {
+    std.debug.assert(gate.len == out.len);
+
+    for (out, gate) |*o, gv| {
+        o.* *= 1.0 / (1.0 + @exp(-gv));
+    }
+
+    if (std.debug.runtime_safety) {
+        for (out) |v| {
             std.debug.assert(std.math.isFinite(v));
         }
     }
