@@ -54,7 +54,6 @@ const limits = @import("../core/limits.zig");
 const lane_tree = @import("lane_tree_simd.zig");
 const naive = @import("naive.zig");
 const Tensor = @import("../core/tensor.zig").Tensor;
-const f16BitsToF32 = naive.f16BitsToF32;
 
 // -- constants --------------------------------------------------------------
 
@@ -459,7 +458,7 @@ inline fn dequantTile(
             }
 
             const at = row_offs[r] + blk_off;
-            const scale_v: Vec = @splat(blockScale(data, at));
+            const scale_v = blockScale(data, at);
             inline for (0..4) |q| {
                 panel[r][t * 32 + q * lanes ..][0..lanes].* = scaledQuarter(data, at, scale_v, q);
             }
@@ -577,7 +576,7 @@ inline fn rowPass(input: []const f32, data: []const u8, row_off: usize, n_blocks
 /// `scaledQuarter`.
 inline fn blockStep(data: []const u8, blk_off: usize, x: [4]Vec, acc: Vec) Vec {
     std.debug.assert(blk_off + 34 <= data.len);
-    const scale_v: Vec = @splat(blockScale(data, blk_off));
+    const scale_v = blockScale(data, blk_off);
     var a = acc;
     inline for (0..4) |q| {
         a = @mulAdd(Vec, scaledQuarter(data, blk_off, scale_v, q), x[q], a);
@@ -585,9 +584,13 @@ inline fn blockStep(data: []const u8, blk_off: usize, x: [4]Vec, acc: Vec) Vec {
     return a;
 }
 
-/// The f32 scale of the Q8_0 block at `blk_off`.
-inline fn blockScale(data: []const u8, blk_off: usize) f32 {
-    return f16BitsToF32(std.mem.readInt(u16, data[blk_off..][0..2], .little));
+/// The f32 scale of the Q8_0 block at `blk_off`, in every lane.
+/// A scalar f16 bitcast lowers to an insert into a live register, a false dependency on an
+/// accumulator. A broadcast of the u16 writes the whole register. The widening is exact.
+inline fn blockScale(data: []const u8, blk_off: usize) Vec {
+    const bits: @Vector(lanes, u16) = @splat(std.mem.readInt(u16, data[blk_off..][0..2], .little));
+    const halves: @Vector(lanes, f16) = @bitCast(bits);
+    return @floatCast(halves);
 }
 
 /// The 8 weights `w` of quarter `q` of the block at `blk_off`. The panel and the B = 1 path take
@@ -842,12 +845,17 @@ test "linear_simd stays inside the gamma bound of an f64 dot" {
     }
 }
 
+/// The scale of the block at `blk_off` by the scalar widening, the reference for `blockScale`.
+fn scalarScale(data: []const u8, blk_off: usize) f32 {
+    return naive.f16BitsToF32(std.mem.readInt(u16, data[blk_off..][0..2], .little));
+}
+
 /// The f64 dot of one Q8_0 output against `x`, and the sum of the absolute products.
 fn dotF64(data: []const u8, output_off: usize, x: []const f32) struct { sum: f64, abs_sum: f64 } {
     var sum: f64 = 0;
     var abs_sum: f64 = 0;
     for (0..x.len / 32) |blk| {
-        const scale: f64 = blockScale(data, output_off + blk * 34);
+        const scale: f64 = scalarScale(data, output_off + blk * 34);
         for (0..32) |i| {
             const q: i8 = @bitCast(data[output_off + blk * 34 + 2 + i]);
             const p = scale * @as(f64, @floatFromInt(q)) * @as(f64, x[blk * 32 + i]);
@@ -864,7 +872,7 @@ fn bitRuleScalar(data: []const u8, output_off: usize, x: []const f32) f32 {
     var acc: [lanes]f32 = @splat(0);
     for (0..x.len / 32) |blk| {
         const at = output_off + blk * 34;
-        const scale = blockScale(data, at);
+        const scale = scalarScale(data, at);
         for (0..32) |i| {
             const q: i8 = @bitCast(data[at + 2 + i]);
             const w = scale * @as(f32, @floatFromInt(q));
