@@ -13,7 +13,7 @@ binary runs, if the build has `-Dtrace=true`.
 | Linux, x86_64 | `make profile`, `tools/profile.sh` | A Linux virtual machine works. |
 | `perf` with libelf and DWARF support | every perf step | The `linux-tools` package of the distribution. A perf without libelf cannot name a Zig function. `PERF=` names another binary. |
 | The FlameGraph scripts and `perl` | the `.svg` files and `diff` | `git clone https://github.com/brendangregg/FlameGraph`, then put `flamegraph.pl` on `PATH` or set `FLAMEGRAPH=` to the clone. |
-| `python3` and `addr2line` (binutils) | the report step | `tools/profile_convert.py` uses only the Python standard library. |
+| `uv` and `addr2line` (binutils) | the report step | `uv` runs `tools/profile_convert.py` and supplies its Python. The script uses only the Python standard library. |
 | A browser | the results | Open `.svg` files directly, `.pftrace` files in ui.perfetto.dev, and `samples.perf` in profiler.firefox.com or speedscope.app. |
 
 A command writes the trace of the engine to a Perfetto protobuf file when
@@ -125,7 +125,7 @@ step.
 | `ZIGFERENCER_TRACE_GPU=off\|submit\|phases` | the engine | Needs `-Dtrace=true`. The GPU timestamp level. `submit` stamps the start and the end of each command buffer. `phases` also stamps each op of a step. `off`, the default, records no timestamp, so the commands to the GPU do not change. |
 | `ZIGFERENCER_TRACE_SPANS=N` | the engine | Needs `-Dtrace=true`. The capacity of each span log. `limits.spans_per_thread_max` is the largest value. The engine refuses a value out of range at the start. |
 | `TRACE` | `tools/profile.sh` | Any value sets `ZIGFERENCER_TRACE_OUT=DIR/trace.pftrace` for `record`, and copies the trace file for `attach`. |
-| `PERF`, `FLAMEGRAPH`, `FREQ`, `PYTHON` | `tools/profile.sh` | The perf binary, the FlameGraph directory, the sample rate, and the python3 of the converter. |
+| `PERF`, `FLAMEGRAPH`, `FREQ` | `tools/profile.sh` | The perf binary, the FlameGraph directory, and the sample rate. |
 | `BACKEND`, `FLAGS`, `FLAVOR`, `CELL`, `PROFILE_DIR`, `ZIG` | `tools/profile.sh all` | The ops backend, more `zig build` flags, the flavor, the cell name, the profile root, and the zig binary. |
 
 ## Read the results

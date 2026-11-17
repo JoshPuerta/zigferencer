@@ -7,7 +7,7 @@
 //! A stable hash across runs proves the forward pass is deterministic. A stable
 //! hash across binaries built with different `-Dops-backend` values is the
 //! cross-backend gate, because a backend that changes the tokens changed the math.
-//! `tools/gate.sh` drives that loop.
+//! `tools/gate.py` drives that loop.
 //!
 //! This file checks the flags. `common.loadAndRun` loads the model, and this file picks one
 //! path. Each path owns its runner: `bench_model_host.zig` (CPU and per-op Vulkan),

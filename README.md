@@ -108,7 +108,7 @@ sudo apt install glslc libvulkan-dev
 | Tool | Needed for |
 | --- | --- |
 | GNU make, bash | the `Makefile` and `tools/*.sh` |
-| `python3` | the profiler |
+| `uv` | the Python scripts of `tools/`: `make gate` and the report step of `make profile` |
 | `libzmq5` | the ZMQ interop test, which skips without the library |
 | `perf`, the FlameGraph scripts | `make profile`, see [`docs/profiling.md`](docs/profiling.md) |
 | `lldb` or `gdb` | `make debug`, see [`docs/debugging.md`](docs/debugging.md) |

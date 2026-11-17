@@ -22,6 +22,9 @@
 //!
 //! CPU batch alone. `zig build bench -- matmul-batch-cpu` runs the CPU batched Q8_0 matmul rows
 //! alone.
+//!
+//! Roofs alone. `zig build bench -- peak` runs the compute and cache roofs of `bench_peak` and then
+//! the DRAM bandwidth table, before the GPU runner starts.
 
 const std = @import("std");
 const builtin = @import("builtin");
@@ -34,6 +37,7 @@ const layer = @import("bench_layer.zig");
 const gdn = @import("bench_gdn.zig");
 const par = @import("bench_parallel.zig");
 const transfer = @import("bench_transfer.zig");
+const peak = @import("bench_peak.zig");
 
 // -- api --------------------------------------------------------------------
 
@@ -55,6 +59,13 @@ pub fn main(init: std.process.Init) !void {
     // Run the CPU batched matmul rows alone when asked, before the GPU runner starts.
     if (args.len >= 2 and std.mem.eql(u8, args[1], "matmul-batch-cpu")) {
         try matmul.benchBatchCpu(gpa, io);
+        return;
+    }
+
+    // Run the roofs alone when asked, before the GPU runner starts.
+    if (args.len >= 2 and std.mem.eql(u8, args[1], "peak")) {
+        try peak.benchPeak(gpa, io);
+        try par.benchBandwidth(gpa, io);
         return;
     }
 

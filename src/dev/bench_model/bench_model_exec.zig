@@ -4,6 +4,9 @@
 //!
 //! Comptime. Build options and runner declarations pick the chunked prefill and the recurrent
 //! state prongs.
+//!
+//! Logits. Under `--logits-out` or `--force-tokens`, `runOnce` decodes through a
+//! `LogitsRecorder`. Without the flags, the decode steps the runner directly.
 
 const std = @import("std");
 const zigferencer = @import("zigferencer");
@@ -13,6 +16,7 @@ const build_options = @import("build_options");
 const context = zigferencer.cli.context;
 const common = @import("bench_model_common.zig");
 const report = @import("bench_model_report.zig");
+const logits = @import("bench_model_logits.zig");
 const bpe = zigferencer.bpe;
 const chat_mod = zigferencer.chat;
 const vocab_mod = zigferencer.vocab;
@@ -30,6 +34,9 @@ pub const Turn = struct {
     prompt_ids: []const u32,
     decode_len: u32,
     ignore_eos: bool,
+    /// The logit count of one entry.
+    vocab_size: u32,
+    logits: logits.Paths = .{},
 };
 
 const HashSink = struct {
@@ -46,6 +53,20 @@ const HashSink = struct {
 };
 
 // -- api --------------------------------------------------------------------
+
+/// The turn of the flags of `b` over `prompt_ids`.
+pub fn turnOf(b: *const Bench, v: *const vocab_mod.Vocab, prompt_ids: []const u32) Turn {
+    std.debug.assert(prompt_ids.len >= 1);
+
+    return .{
+        .vocab = v,
+        .prompt_ids = prompt_ids,
+        .decode_len = b.opt.max_tokens,
+        .ignore_eos = b.opt.ignore_eos,
+        .vocab_size = b.loaded.card.vocab_size,
+        .logits = .{ .out = b.opt.logits_out, .force = b.opt.force_tokens },
+    };
+}
 
 /// The token ids of the bench: synthetic under `--prompt-tokens`, otherwise the
 /// encoded prompt. The ids and the decode budget must fit `max_seq`.
@@ -86,6 +107,20 @@ pub fn warmup(runner: anytype, prompt_ids: []const u32) !void {
 pub fn runOnce(runner: anytype, turn: Turn, ctx: context.Context) !RunResult {
     std.debug.assert(turn.prompt_ids.len >= 1);
 
+    // The logits files open before the clock starts, so the open adds no TTFT.
+    const prompt_len: u32 = @intCast(turn.prompt_ids.len);
+    const header: logits.Header = .{
+        .vocab = turn.vocab_size,
+        .prompt_len = prompt_len,
+        .first_pos = prompt_len,
+        .prompt_hash = if (turn.logits.active()) logits.promptHash(turn.prompt_ids) else 0,
+    };
+    var files: logits.RunFiles = if (turn.logits.active())
+        try .open(ctx.io, ctx.arena, turn.logits, header, turn.decode_len)
+    else
+        .{};
+    defer files.close(ctx.io);
+
     // TTFT spans the prefill and the first token.
     const t_start = Io.Clock.Timestamp.now(ctx.io, .awake);
     const prefilled = try prefill(runner, turn.prompt_ids);
@@ -93,18 +128,18 @@ pub fn runOnce(runner: anytype, turn: Turn, ctx: context.Context) !RunResult {
     var hasher = std.hash.Fnv1a_64.init();
     var depth: common.DepthCurve = .{};
     var sink: HashSink = .{ .hasher = &hasher, .depth = &depth };
-    const generated = try generate.decode(
-        runner,
-        prefilled.last_logits,
-        prefilled.pos,
-        turn.decode_len,
-        runner.max_seq,
-        turn.vocab.eos_id,
-        turn.ignore_eos,
-        ctx.io,
-        t_start,
-        &sink,
-    );
+    const max_seq: u32 = runner.max_seq;
+    const generated = if (turn.logits.active()) blk: {
+        std.debug.assert(prefilled.pos == header.first_pos);
+        std.debug.assert(prefilled.last_logits.len == header.vocab);
+
+        const out = if (files.out) |*w| w else null;
+        var recorder = logits.LogitsRecorder(@TypeOf(runner))
+            .init(runner, prefilled.last_logits, out, files.forced);
+        const g = try decodeTurn(&recorder, max_seq, prefilled, turn, ctx.io, t_start, &sink);
+        try recorder.finish();
+        break :blk g;
+    } else try decodeTurn(runner, max_seq, prefilled, turn, ctx.io, t_start, &sink);
     const t_end = Io.Clock.Timestamp.now(ctx.io, .awake);
     const turn_s = zigferencer.time.msBetween(t_start, t_end) / 1000.0;
 
@@ -162,6 +197,29 @@ pub fn printReport(b: *const Bench, prompt_len: usize, results: []const RunResul
 }
 
 // -- helpers ----------------------------------------------------------------
+
+fn decodeTurn(
+    runner: anytype,
+    max_seq: u32,
+    prefilled: generate.Prefilled,
+    turn: Turn,
+    io: Io,
+    t_start: Io.Clock.Timestamp,
+    sink: *HashSink,
+) !generate.Generated {
+    return generate.decode(
+        runner,
+        prefilled.last_logits,
+        prefilled.pos,
+        turn.decode_len,
+        max_seq,
+        turn.vocab.eos_id,
+        turn.ignore_eos,
+        io,
+        t_start,
+        sink,
+    );
+}
 
 fn prefill(runner: anytype, prompt_ids: []const u32) !generate.Prefilled {
     const chunked = comptime build_options.use_vulkan_fused_ops or

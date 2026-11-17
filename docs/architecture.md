@@ -95,7 +95,7 @@ This document explains how zigferencer works, from the build to a served token.
 | Artifact | Root file | Where it goes | What it is |
 | --- | --- | --- | --- |
 | `zigferencer` | `src/main.zig` | `zig-out/bin/` | The release binary: `list`, `fetch`, `inspect`, `info`, `run`, `serve`, `serve-openai`, and `client`. |
-| `zigferencer-dev` | `src/dev/dev_main.zig` | `zig-out/bin/` | The release commands, plus the developer commands: `bench-model`, `bench-serve`, `bench-swap`, `bench-decode-host`, `gpu-selftest`, `tokens`, `serve-demo`, and `dispatch-list`. |
+| `zigferencer-dev` | `src/dev/dev_main.zig` | `zig-out/bin/` | The release commands, plus the developer commands: `bench-model`, `bench-serve`, `bench-swap`, `bench-decode-host`, `gpu-selftest`, `tokens`, `serve-demo`, `dispatch-list`, and `compare-logits`. |
 | `zigferencer-bench` | `tools/bench.zig` | not installed | The op micro-benchmarks. `zig build bench` builds and runs it. |
 | `zigferencer-simd-probe` | `tools/simd_probe.zig` | `zig-out/` | The assembly of each op, for `make simd-report`. `zig build simd-probe` installs only the `.s` file. |
 | test binaries | `src/main.zig`, `src/dev/dev_main.zig`, `tools/shader_lint.zig`, `tests/*_test.zig` | `zig-out/test/` | The unit tests of each module, the shader lint tests, and one binary for each integration test. Only `test-install` installs one. |
@@ -348,7 +348,7 @@ the lessons from digital design in VHDL I had many years ago.
 | [`src/runtime/`](../src/runtime/README.md) | The runners and their state. | `cpu_runner.zig`, `fused_runner.zig`, `hybrid_runner.zig`, `session.zig`, `sampler.zig`, `parallel.zig` |
 | [`src/serve/`](../src/serve/README.md) | The server. | `scheduler.zig`, `engine.zig`, `protocol.zig`, `server.zig`, `openai/`, `residency.zig`, `prefix_manager.zig` |
 | [`tests/`](../tests/README.md) | The integration tests against real model files. | `snapshot_smollm2_test.zig`, the `*_equivalence_test.zig` files |
-| [`tools/`](../tools/README.md) | The op micro-benchmarks, the gates, the profiler driver, and the shader lint. | `bench.zig`, `gate.sh`, `profile.sh`, `shader_lint.zig` |
+| [`tools/`](../tools/README.md) | The op micro-benchmarks, the gates, the profiler driver, and the shader lint. | `bench.zig`, `gate.py`, `profile.sh`, `shader_lint.zig` |
 
 ### The surface between the CLI and the engine
 
@@ -662,7 +662,7 @@ The result of a unit does not depend on the thread that runs it. A matrix row is
 kernel call. An attention part writes its own record, and the caller adds the parts
 in order. A key head and its value heads write only their own channels, conv ring
 entries, and states. The token hash therefore holds across thread counts, floors,
-spin budgets, and claim orders. `tools/gate.sh threads` checks the thread counts.
+spin budgets, and claim orders. `tools/gate.py threads` checks the thread counts.
 
 ## 9. Memory
 
@@ -1230,7 +1230,7 @@ backends the greedy tokens are equal. Section 11 names the tests that check it.
   inputs.
 - **The token hash.** `bench-model` prints an FNV-1a hash of the generated token
   ids. Equal hashes across thread counts check determinism. Equal hashes across
-  backends and placements check that the paths agree. `tools/gate.sh` holds the gates as
+  backends and placements check that the paths agree. `tools/gate.py` holds the gates as
   tables. `backends` covers the CPU backends and the per-op Vulkan backend. `threads`
   covers the thread counts, `hybrid` the CPU runner, the fused runner, and three hybrid
   splits, and `deep` a deep prompt.

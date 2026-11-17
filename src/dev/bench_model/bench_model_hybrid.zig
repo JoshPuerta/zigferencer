@@ -78,12 +78,7 @@ pub fn bench(comptime Family: type, b: *const Bench) !void {
     try exec.warmup(runner, prompt_ids);
 
     // Run the series.
-    const turn: exec.Turn = .{
-        .vocab = &v,
-        .prompt_ids = prompt_ids,
-        .decode_len = opt.max_tokens,
-        .ignore_eos = opt.ignore_eos,
-    };
+    const turn = exec.turnOf(b, &v, prompt_ids);
     const plan_info: common.PlanInfo = .{
         .n_slots = plan.n_slots,
         .window = plan.window,

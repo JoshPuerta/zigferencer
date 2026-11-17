@@ -17,12 +17,14 @@ holds no path back, so the release binary cannot hold a file of this directory.
 | `bench_swap_cmd.zig` | `bench-swap`: the cost of a KV eviction and restore. |
 | `bench_decode_host_cmd.zig` | `bench-decode-host`: the host steps of one decode step. |
 | `dispatch_list_cmd.zig` | `dispatch-list`: the Vulkan commands of six runner sections. |
+| `compare_logits_cmd.zig` | `compare-logits REF CAND`: the entry-by-entry distance of the logits files of a reference run and a candidate run. |
 | `bench_model/bench_model_cmd.zig` | `bench-model`: the flags, the load, and the choice of path. |
 | `bench_model/bench_model_common.zig` | `Options`, `Bench`, `loadAndRun`, and the other shared values. |
 | `bench_model/bench_model_host.zig` | The path of the CPU backends and the per-op Vulkan backend. |
 | `bench_model/bench_model_fused.zig` | The path of the whole model on the GPU. |
 | `bench_model/bench_model_hybrid.zig` | The path of a CPU and GPU split. |
 | `bench_model/bench_model_exec.zig` | The run body of the three paths. |
+| `bench_model/bench_model_logits.zig` | The logits file and its runner wrapper, `LogitsRecorder`. |
 | `bench_model/bench_model_profile.zig` | `--profile-cpu-decode`: the per-op timer. |
 | `bench_model/bench_model_report.zig` | The result table and the JSON. |
 | `gpu_selftest/gpu_selftest_cmd.zig` | `gpu-selftest`: the choice of kernel family. |

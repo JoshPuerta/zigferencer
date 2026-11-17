@@ -21,7 +21,6 @@ source "$here/common.sh"
 # -- constants ---------------------------------------------------------------
 
 readonly freq="${FREQ:-999}"
-readonly python="${PYTHON:-python3}"
 
 # -- state -------------------------------------------------------------------
 
@@ -43,7 +42,8 @@ Usage:
   tools/profile.sh -h | --help                      print this text
 
 `offcpu` needs root for the kernel trace interface. It calls sudo for each step that needs it,
-and it runs nothing else as root.
+and it runs nothing else as root. `all`, `report`, and `offcpu` need uv on PATH, because uv runs
+tools/profile_convert.py.
 
 Environment:
   PERF        A perf binary built with libelf and DWARF support. The default is the first such
@@ -52,7 +52,6 @@ Environment:
               (git clone https://github.com/brendangregg/FlameGraph). The default is the
               directory of flamegraph.pl on PATH.
   FREQ        The sample rate in Hz (default 999).
-  PYTHON      The python3 that runs tools/profile_convert.py (default python3).
   TRACE       Any value, such as 1, turns on the span recorder of the engine. `record` sets
               ZIGFERENCER_TRACE_OUT=DIR/trace.pftrace for the command. `attach` copies the trace
               file that the process names in its own ZIGFERENCER_TRACE_OUT into DIR/trace.pftrace
@@ -98,6 +97,11 @@ find_perf() {
         fi
     done
     die "no perf with libelf and DWARF support. Set PERF."
+}
+
+# The converter is a uv script, so its shebang needs uv.
+need_uv() {
+    command -v uv >/dev/null || die "no uv on PATH. It runs tools/profile_convert.py"
 }
 
 find_flamegraph() {
@@ -152,6 +156,7 @@ keep_binary() {
 cmd_all() {
     [ $# -gt 0 ] || die_usage "all needs a command, for example: all bench-model MODEL"
     find_flamegraph >/dev/null
+    need_uv
     local flavor="${FLAVOR:-release}" opt=ReleaseFast trace=()
     case "$flavor" in
         release) ;;
@@ -246,6 +251,7 @@ cmd_report() {
     local dir="$1"
     [ -f "$dir/perf.data" ] || die "$dir holds no perf.data"
     [ -f "$dir/binary.txt" ] || die "$dir holds no binary.txt. Record the cell with this script."
+    need_uv
     local fg title bin sym=()
     fg="$(find_flamegraph)"
     title="$(head -c 120 "$dir/command.txt" 2>/dev/null || basename "$dir")"
@@ -257,14 +263,14 @@ cmd_report() {
     note "folded stacks with inlined frames"
     run_perf script -i "$dir/perf.data" "${sym[@]}" \
         -F comm,pid,tid,time,period,event,ip,sym,dso --ns 2>/dev/null >"$dir/samples.raw"
-    "$python" "$here/profile_convert.py" fold \
+    "$here/profile_convert.py" fold \
         "$dir/samples.raw" "$bin" "$dir/symfs$bin" "$dir/stacks.raw.folded"
     shorten_names <"$dir/stacks.raw.folded" >"$dir/stacks.folded"
 
     # The samples carry perf times on CLOCK_MONOTONIC, as the engine spans do, so the two files
     # concatenate into one timeline.
     note "samples as a Perfetto trace"
-    "$python" "$here/profile_convert.py" samples \
+    "$here/profile_convert.py" samples \
         "$dir/samples.raw" "$bin" "$dir/symfs$bin" "$dir/samples.pftrace"
     rm -f "$dir/timeline.pftrace"
     if [ -f "$dir/trace.pftrace" ]; then
@@ -275,7 +281,7 @@ cmd_report() {
         --countname ns "$dir/stacks.folded" >"$dir/flame.svg"
 
     note "caller and callee trees"
-    "$python" "$here/profile_convert.py" tree \
+    "$here/profile_convert.py" tree \
         "$dir/stacks.folded" "$dir/callees.txt" "$dir/callers.txt"
 
     note "hot source lines"
@@ -300,6 +306,7 @@ cmd_report() {
 cmd_offcpu() {
     [ $# -eq 3 ] || die_usage "offcpu needs DIR PID SECONDS"
     local dir="$1" pid="$2" seconds="$3" fg
+    need_uv
     mkdir -p "$dir"
     fg="$(find_flamegraph)"
     note "scheduler switches of every CPU for $seconds s"
@@ -310,7 +317,7 @@ cmd_offcpu() {
     # the reading user does not own.
     sudo_perf script -f -i "$dir/offcpu.data" \
         -F comm,pid,tid,time,event,trace,ip,sym --ns >"$dir/offcpu.raw"
-    "$python" "$here/profile_convert.py" offcpu "$dir/offcpu.raw" "$pid" "$dir/offcpu.folded"
+    "$here/profile_convert.py" offcpu "$dir/offcpu.raw" "$pid" "$dir/offcpu.folded"
     shorten_names <"$dir/offcpu.folded" >"$dir/offcpu.short.folded"
     if [ -s "$dir/offcpu.short.folded" ]; then
         "$fg/flamegraph.pl" --title "off-CPU time, pid $pid" --countname us --colors io \

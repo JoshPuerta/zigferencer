@@ -984,6 +984,8 @@ test "every script and the Makefile keep the script rules" {
         if (entry.kind != .file) continue;
         if (std.mem.endsWith(u8, entry.path, ".zig")) continue;
         if (std.mem.endsWith(u8, entry.path, ".md")) continue;
+        // The `py_compile` check of the script rules leaves a bytecode cache beside the script.
+        if (std.mem.endsWith(u8, entry.path, ".pyc")) continue;
 
         breaks += try checkScript(gpa, dir, "tools", entry.path);
     }

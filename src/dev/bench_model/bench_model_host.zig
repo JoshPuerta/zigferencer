@@ -70,12 +70,7 @@ pub fn bench(comptime Family: type, b: *const Bench) !void {
     }
 
     // Run the series on a fresh runner per run.
-    const turn: exec.Turn = .{
-        .vocab = &v,
-        .prompt_ids = prompt_ids,
-        .decode_len = b.opt.max_tokens,
-        .ignore_eos = b.opt.ignore_eos,
-    };
+    const turn = exec.turnOf(b, &v, prompt_ids);
     const results = try ctx.arena.alloc(RunResult, b.opt.runs);
     for (results) |*result| {
         var runner = try Family.Cpu.init(ctx.arena, b.loaded, .{
@@ -86,6 +81,7 @@ pub fn bench(comptime Family: type, b: *const Bench) !void {
             .kv_dtype = b.kvDtype(),
         });
         result.* = try exec.runOnce(&runner, turn, ctx);
+        result.plan = .{ .kv_dtype = b.kvDtype() };
     }
 
     return exec.printReport(b, prompt_ids.len, results);

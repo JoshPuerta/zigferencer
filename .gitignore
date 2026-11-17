@@ -11,6 +11,7 @@ models/
 .vscode/
 .idea/
 .DS_Store
+__pycache__/
 
 # Runtime artifacts: prompt-cache snapshots, log capture.
 .prompt_cache/

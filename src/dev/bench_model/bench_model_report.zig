@@ -189,9 +189,12 @@ fn printDepthJson(w: *Io.Writer, buckets: []const DepthBucket) !void {
     try w.writeAll("]");
 }
 
-/// The KV shape of the run. Zero slots mean no device KV plan, and the header stays unchanged.
+/// The KV shape of the run. Zero slots mean no device KV plan, and the header names the dtype only.
 fn printPlan(w: *Io.Writer, plan: PlanInfo) !void {
-    if (plan.n_slots == 0) return;
+    if (plan.n_slots == 0) {
+        try w.print("kv dtype: {t}\n", .{plan.kv_dtype});
+        return;
+    }
     try w.print(
         "kv plan:  {d} slots x {d} window{s} = {d} MiB\n",
         .{ plan.n_slots, plan.window, plan.kv_dtype.planToken(), plan.kv_mib },

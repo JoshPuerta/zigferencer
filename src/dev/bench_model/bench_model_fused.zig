@@ -53,12 +53,7 @@ pub fn bench(comptime Family: type, b: *const Bench) !void {
         if (opt.profile_decode) return profileOneStep(runner, ctx.io, prompt_ids);
     }
 
-    const turn: exec.Turn = .{
-        .vocab = &v,
-        .prompt_ids = prompt_ids,
-        .decode_len = opt.max_tokens,
-        .ignore_eos = opt.ignore_eos,
-    };
+    const turn = exec.turnOf(b, &v, prompt_ids);
     const plan = common.PlanInfo.fromPlan(f.plan, kv_dtype);
     return exec.runSeries(runner, b, turn, plan, false);
 }

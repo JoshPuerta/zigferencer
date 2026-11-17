@@ -68,6 +68,7 @@ pub const dev_names = [_][]const u8{
     "tokens",
     "serve-demo",
     "dispatch-list",
+    "compare-logits",
 };
 
 // -- types ------------------------------------------------------------------

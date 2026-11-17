@@ -74,6 +74,10 @@ pub const Options = struct {
     /// qwen35 fused only: print the per-stage GPU breakdown of one step, then exit.
     profile_prefill: bool = false,
     profile_decode: bool = false,
+    /// Write the logits after the prefill and after every decode step to this file.
+    logits_out: ?[]const u8 = null,
+    /// Feed the ids of this logits file in place of the argmax ids.
+    force_tokens: ?[]const u8 = null,
 
     pub const docs_from = flags_mod.EngineDocs;
     pub const positional = "pub_name";
@@ -86,6 +90,9 @@ pub const Options = struct {
         \\examples:
         \\  zigferencer-dev bench-model SmolLM2-135M-Instruct-Q8_0 --runs 5
         \\  zigferencer-dev bench-model --prompt-tokens 512 --max-tokens 64 --json
+        \\  zigferencer-dev bench-model --runs 1 --ignore-eos --logits-out ref.bin
+        \\  zigferencer-dev bench-model --runs 1 --ignore-eos --force-tokens ref.bin \
+        \\      --logits-out cand.bin
         \\
         ,
     };
@@ -105,7 +112,7 @@ pub const Options = struct {
         .chat = args.Doc{ .group = "common", .text = "apply the chat template of the model" },
         .json = args.Doc{
             .group = "common",
-            .text = "machine-readable output (tools/gate.sh).\n" ++
+            .text = "machine-readable output (tools/gate.py).\n" ++
                 "Each run adds itl_by_depth, the mean ITL per 512 KV positions",
         },
         .prompt_tokens = args.Doc{
@@ -115,6 +122,17 @@ pub const Options = struct {
         .ignore_eos = args.Doc{
             .group = "prompt shape",
             .text = "use the full decode budget per run (clean ITL)",
+        },
+        .logits_out = args.Doc{
+            .group = "logits (compare-logits reads the files)",
+            .text = "write the logits after the prefill and after every decode step to FILE",
+            .value = "FILE",
+        },
+        .force_tokens = args.Doc{
+            .group = "logits (compare-logits reads the files)",
+            .text = "feed the ids of the logits file FILE in place of the argmax.\n" ++
+                "The token hash still takes the argmax ids",
+            .value = "FILE",
         },
         .profile_cpu_decode = args.Doc{
             .group = "profiling (cpu, trace build only: -Dtrace=true)",
@@ -312,6 +330,7 @@ pub fn refuseBadFlags(io: std.Io, opt: Options) !void {
 
     try refuseGpuFlags(io, opt);
     try refuseCpuProfile(io, opt);
+    try refuseLogitsFlags(io, opt);
 }
 
 // -- helpers ----------------------------------------------------------------
@@ -334,6 +353,23 @@ fn refuseGpuFlags(io: std.Io, opt: Options) error{UsageError}!void {
             "--gpu-layers benches the hybrid runner and does not combine with profile flags",
             .{},
         );
+    }
+}
+
+/// A logits file holds one run of a fixed entry count, so both flags need one run that ignores EOS.
+fn refuseLogitsFlags(io: std.Io, opt: Options) error{UsageError}!void {
+    const flag = if (opt.logits_out != null)
+        "--logits-out"
+    else if (opt.force_tokens != null)
+        "--force-tokens"
+    else
+        return;
+
+    if (opt.runs != 1) return args.fail(io, "{s} needs --runs 1", .{flag});
+    if (!opt.ignore_eos) return args.fail(io, "{s} needs --ignore-eos", .{flag});
+
+    if (opt.profile_cpu_decode or opt.profile_prefill or opt.profile_decode) {
+        return args.fail(io, "{s} does not combine with profile flags", .{flag});
     }
 }
 

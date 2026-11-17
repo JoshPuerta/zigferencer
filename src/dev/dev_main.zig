@@ -23,7 +23,9 @@ test {
     _ = &dev_command.dispatch;
     _ = @import("bench_decode_host_cmd.zig");
     _ = @import("bench_model/bench_model_common.zig");
+    _ = @import("bench_model/bench_model_logits.zig");
     _ = @import("bench_model/bench_model_report.zig");
     _ = @import("bench_serve_cmd.zig");
     _ = @import("bench_swap_cmd.zig");
+    _ = @import("compare_logits_cmd.zig");
 }

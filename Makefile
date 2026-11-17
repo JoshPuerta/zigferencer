@@ -81,7 +81,7 @@ profile: ## Profile one command with perf: make profile ARGS="bench-model MODEL"
 	tools/profile.sh all $(ARGS)
 
 gate: ## Run a token-hash gate: make gate ARGS="backends|threads|hybrid|deep"
-	tools/gate.sh $(ARGS)
+	tools/gate.py $(ARGS)
 
 ##@ Debug
 debug: ## Build both binaries in Debug with LLVM, for lldb or gdb
