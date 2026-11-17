@@ -1124,10 +1124,13 @@ pub fn Scheduler(comptime SessionPool: type, comptime CodecT: type) type {
             const entry = self.sessionOf(req, sink) orelse return;
             if (entry.resume_wait != null) return self.refuseWaiting(req, sink);
             switch (entry.state) {
-                .prefill => if (entry.kind == .append) self.cancelAppend(
-                    entry,
-                    sink,
-                ) else self.cancelTurn(entry),
+                // An opening has no turn to cut, and its open must end with `session_opened`.
+                // So the opening prefill runs on, as it does at a drop.
+                .prefill => switch (entry.kind) {
+                    .turn => self.cancelTurn(entry),
+                    .append => self.cancelAppend(entry, sink),
+                    .opening => {},
+                },
                 .decode => self.cancelTurn(entry),
                 else => {}, // an idle cancel has nothing in flight, so it is a no-op
             }
@@ -1139,7 +1142,7 @@ pub fn Scheduler(comptime SessionPool: type, comptime CodecT: type) type {
 
             if (entry.state == .prefill) {
                 // The partial turn stays in context. A client that cares closes the session.
-                std.debug.assert(entry.kind != .append);
+                std.debug.assert(entry.kind == .turn);
 
                 log.info("stop: session {d} cancelled (prefill state)", .{entry.proto_id});
                 self.gpa.free(entry.turn_tokens);
@@ -6874,6 +6877,10 @@ const LeaseTrace = struct {
     req_conn: [trace_steps]u32 = @splat(0),
     /// An open holds an entry until its `session_opened`, so it counts against the share.
     open_pending: [trace_steps]bool = @splat(false),
+    /// The id that each admitted open takes, or 0 for an open refused at once. Ids come from a
+    /// counter in admission order, so a reply to a guessed id names its open.
+    open_sid: [trace_steps]u32 = @splat(0),
+    next_sid: u32 = 1,
     n_opens: u32 = 0,
     /// The session that a resume with a live token must reach.
     req_sid: [trace_steps]?u32 = @splat(null),
@@ -6884,11 +6891,35 @@ const LeaseTrace = struct {
         t.req_conn[t.next_request - trace_request_base] = conn;
         t.open_pending[t.next_request - trace_request_base] = body == .session_open;
         t.n_opens += @intFromBool(body == .session_open);
+        const open = body == .session_open;
         _ = t.fx.sched.handle(
             .{ .conn = conn, .request_id = t.next_request, .session_id = sid, .body = body },
             t.fx.sink,
         );
+        if (open) {
+            // A refusal of an open comes at once, so an open with no reply took an id.
+            const refused = for (t.fx.sink.seen()) |e| {
+                if (e.ev.request_id == t.next_request and e.ev.body == .err) break true;
+            } else false;
+
+            if (!refused) {
+                t.open_sid[t.next_request - trace_request_base] = t.next_sid;
+                t.next_sid += 1;
+            }
+        }
+
         t.next_request += 1;
+    }
+
+    /// The opens of `conn` before request `index` that wait for `session_opened`. A reply to a
+    /// guessed id can name the session of an open first, and the model then counts it.
+    fn pendingOpens(t: *const LeaseTrace, conn: u32, index: usize) usize {
+        var n: usize = 0;
+        for (t.open_pending[0..index], t.req_conn[0..index], t.open_sid[0..index]) |p, c, sid| {
+            n += @intFromBool(p and c == conn and !t.knows(sid));
+        }
+
+        return n;
     }
 
     fn knows(t: *const LeaseTrace, sid: u32) bool {
@@ -6925,10 +6956,7 @@ const LeaseTrace = struct {
 
         const rid = t.next_request;
         const index = rid - trace_request_base;
-        for (t.open_pending[0..index], t.req_conn[0..index]) |pending, c| {
-            attached += @intFromBool(pending and c == conn);
-        }
-
+        attached += t.pendingOpens(conn, index);
         const full = attached >= t.fx.sched.cfg.sessions_per_connection;
 
         // Send the resume, and check any immediate reply.
@@ -6988,6 +7016,9 @@ const LeaseTrace = struct {
                 .done => {
                     try std.testing.expect(tracked);
                     try std.testing.expect(!t.finished[rid - trace_request_base]);
+                    // An admitted open ends with `session_opened` or `err`, and only a turn
+                    // ends with `done`.
+                    try std.testing.expectEqual(@as(u32, 0), t.open_sid[rid - trace_request_base]);
                     t.finished[rid - trace_request_base] = true;
                 },
                 .err => if (tracked) {
@@ -6995,7 +7026,9 @@ const LeaseTrace = struct {
                     t.open_pending[rid - trace_request_base] = false;
                 },
                 .session_opened => {
-                    t.open_pending[rid - trace_request_base] = false;
+                    const index = rid - trace_request_base;
+                    try std.testing.expectEqual(t.open_sid[index], e.ev.session_id);
+                    t.open_pending[index] = false;
                     if (!t.knows(e.ev.session_id)) {
                         t.addSid(e.ev.session_id);
                         t.modelOf(e.ev.session_id).conn = t.req_conn[rid - trace_request_base];
@@ -7027,10 +7060,9 @@ const LeaseTrace = struct {
                     if (!m.opened) {
                         // The close hit an opening prefill, so its `session_opened` never comes.
                         const used = t.next_request - trace_request_base;
-                        for (t.open_pending[0..used], t.req_conn[0..used]) |*pending, c| {
-                            if (pending.* and c == t.req_conn[rid - trace_request_base]) {
+                        for (t.open_pending[0..used], t.open_sid[0..used]) |*pending, sid| {
+                            if (sid == e.ev.session_id) {
                                 pending.* = false;
-                                break;
                             }
                         }
                     }
@@ -7216,8 +7248,8 @@ const LeaseTrace = struct {
 };
 
 /// A random wire trace keeps the lease table and the streams sound. Live sessions fit the entries
-/// and the shares. No token sits on two entries, and no token event follows a finish. Every lease
-/// ends within its time to live plus one tick.
+/// and the shares. No token sits on two entries, and no token event follows a finish. No open
+/// ends with `done`. Every lease ends within its time to live plus one tick.
 fn checkLeaseTrace(_: void, seed: u64) anyerror!void {
     var prng = std.Random.DefaultPrng.init(seed);
     const r = prng.random();
@@ -7298,4 +7330,81 @@ test "property: random wire traces keep the table, end leases, and stop tokens a
         prop.genSeed(void),
         checkLeaseTrace,
     );
+}
+
+test "wire trace: a cancel in an opening prefill leaves the open to end with session_opened" {
+    var t: LeaseTrace = .{ .fx = try leaseFixture(2, 1) };
+    defer t.fx.tearDown();
+
+    // A guessed id cancels the opening prefill of session 1.
+    t.request(1, 0, .{ .session_open = .{
+        .sampling = protocol.Sampling.greedy,
+        .system_prompt = try std.testing.allocator.dupe(u8, "s"),
+    } });
+    t.request(1, 1, .cancel);
+    t.fx.drain();
+    for (t.fx.sink.seen()) |e| {
+        try std.testing.expect(e.ev.body != .done);
+    }
+
+    try std.testing.expectEqual(OutEvent.Body.session_opened, std.meta.activeTag(
+        t.fx.sink.last().ev.body,
+    ));
+    try t.absorbEvents();
+
+    // Connection 2 takes the session over with its token. Connection 1 then holds no session,
+    // so its share admits a resume, and an unknown token answers `unknown_session`.
+    t.request(1, 1, .{ .session_keep = .{ .ttl_ms = 50 } });
+    try t.absorbEvents();
+    try std.testing.expectEqual(@as(usize, 1), t.n_tokens);
+    try t.resumeWith(2, t.tokens[0]);
+    try t.absorbEvents();
+    try t.resumeWith(1, @splat(0xA5));
+    try t.absorbEvents();
+    try t.expectTable();
+}
+
+test "wire trace: a keep in an opening prefill counts the session once against the share" {
+    var t: LeaseTrace = .{ .fx = try leaseFixture(2, 2) };
+    defer t.fx.tearDown();
+
+    t.request(1, 0, .{ .session_open = .{
+        .sampling = protocol.Sampling.greedy,
+        .system_prompt = try std.testing.allocator.dupe(u8, "s"),
+    } });
+    t.request(1, 1, .{ .session_keep = .{ .ttl_ms = 50 } });
+    try t.absorbEvents();
+    try std.testing.expectEqual(@as(usize, 1), t.n_tokens);
+
+    // Connection 1 holds one session of two, so its own token resumes, and the reply waits.
+    try t.resumeWith(1, t.tokens[0]);
+    try std.testing.expect(t.modelOf(1).pending_resume);
+    t.fx.drain();
+    try t.absorbEvents();
+    try std.testing.expect(!t.modelOf(1).pending_resume);
+    try t.expectTable();
+}
+
+test "wire trace: a close in an opening prefill ends the open of that session" {
+    var t: LeaseTrace = .{ .fx = try leaseFixture(2, 2) };
+    defer t.fx.tearDown();
+
+    for (0..2) |_| {
+        t.request(2, 0, .{ .session_open = .{
+            .sampling = protocol.Sampling.greedy,
+            .system_prompt = try std.testing.allocator.dupe(u8, "s"),
+        } });
+    }
+
+    // The close names the second open. The first open still ends with `session_opened`.
+    t.request(2, 2, .session_close);
+    t.fx.drain();
+    try t.absorbEvents();
+    try std.testing.expect(t.modelOf(1).opened);
+    try std.testing.expect(t.modelOf(2).gone);
+
+    // Connection 2 holds one session of two, so an unknown token answers `unknown_session`.
+    try t.resumeWith(2, @splat(0xA5));
+    try t.absorbEvents();
+    try t.expectTable();
 }

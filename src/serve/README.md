@@ -344,7 +344,7 @@ against a live server in `tests/serve_integration_test.zig`.
 | `session_clone` | `cloneSession`, or `cloneSessionInfo` for the `kv_pos` too | terminal-wait | `session_opened`, the new id in the header |
 | `generate` | `generate`, then `next` per frame, `collectTurn`, or `collectTurnWith` for a hook per token | send-only | `done` |
 | `session_append` | `append`, or `sendAppend` then `next` | terminal-wait | `appended` with the position after each pair, or `err`. A `turn_too_long` refusal feeds no pair. A `cancel` during the append gives `err` with `cancelled`, and the fed rows stay, so the client closes the session |
-| `cancel` | `cancel` | send-only | the turn's `done` with `cancelled`, under the request id of the `generate`. A cancel on an idle session produces no frame, so a turn of that session must be in flight |
+| `cancel` | `cancel` | send-only | the turn's `done` with `cancelled`, under the request id of the `generate`. A cancel on an idle session or on a session in its opening prefill produces no frame, so a turn of that session must be in flight |
 | `session_close` | `closeSession` | terminal-wait | `session_closed`. Frames of an in-flight turn drain first, and the method skips them |
 | `stats` | `stats` | terminal-wait | `stats_ack` |
 | `ping` | `ping` | terminal-wait | `pong` |
