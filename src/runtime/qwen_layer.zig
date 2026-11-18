@@ -345,7 +345,7 @@ test "forward: each op occurs at most once, on exactly the weights and buffers o
     }
 }
 
-test "forward: the two layer kinds call each Qwen CPU row of a layer, and no other op" {
+test "forward: the two layer kinds call each Qwen CPU profile line of a layer, and no other op" {
     const card = test_fakes.testCard(.qwen35);
     var called: std.EnumSet(LayerOp) = .initEmpty();
     for ([_]u32{ 0, 3 }) |layer| {

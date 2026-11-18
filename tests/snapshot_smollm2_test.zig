@@ -9,7 +9,7 @@
 //! scheduler or the sampler surfaces here.
 //!
 //! Q4_0 file. The Q4_0 case also drives the q4_0 and q4_1 CPU dequant-and-dot kernels. That file is
-//! a mixed quant: a q4_0 body, a few q4_1 ffn_down rows, and a q8_0 tied embedding.
+//! a mixed quant: a q4_0 body, a few q4_1 ffn_down tensors, and a q8_0 tied embedding.
 //!
 //! Capture. Both snapshots come from x86_64-linux with f32 activations and naive scalar kernels,
 //! and with the BOS handling of `vocab.addBos`. The ids match the llama.cpp reference for the Q4_0

@@ -1,7 +1,7 @@
 //! Golden-id gate for the llama3 (`llama-bpe`) pre-tokenizer against the real
 //! Meta-Llama-3.1-8B-Instruct-Q8_0 GGUF.
 //!
-//! Comptime. `row` takes its text and ids at comptime, so each golden case is a constant.
+//! Comptime. `case` takes its text and ids at comptime, so each golden case is a constant.
 //!
 //! Reference. The expected ids come from the llama.cpp `llama-tokenize --ids` reference, so the ids
 //! must match it exactly. The gate pins the regex pre-split and `ignore_merges` to that reference.
@@ -24,17 +24,17 @@ const Case = struct { text: []const u8, ids: []const u32 };
 // is the case the pre-split fixes: 2147 becomes 11584 ("214") plus 22 ("7").
 const bos = 128000;
 
-fn row(comptime text: []const u8, comptime ids: []const u32) Case {
+fn case(comptime text: []const u8, comptime ids: []const u32) Case {
     return .{ .text = text, .ids = ids };
 }
 
 const code_ids = [_]u32{ bos, 2900, 2120, 11, 379, 8, 314, 471, 865, 44110, 26, 335 };
 
 const golden = [_]Case{
-    row("The year is 2147.", &.{ bos, 791, 1060, 374, 220, 11584, 22, 13 }),
-    row("I don't think it's ready", &.{ bos, 40, 1541, 956, 1781, 433, 596, 5644 }),
-    row("func(x, y) { return x+y; }", &code_ids),
-    row("12345 67", &.{ bos, 4513, 1774, 220, 3080 }),
+    case("The year is 2147.", &.{ bos, 791, 1060, 374, 220, 11584, 22, 13 }),
+    case("I don't think it's ready", &.{ bos, 40, 1541, 956, 1781, 433, 596, 5644 }),
+    case("func(x, y) { return x+y; }", &code_ids),
+    case("12345 67", &.{ bos, 4513, 1774, 220, 3080 }),
 };
 
 // -- tests ------------------------------------------------------------------

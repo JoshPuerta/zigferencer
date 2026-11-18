@@ -1,4 +1,4 @@
-//! The build-time check of a runner. A family row states the check for each of its runners, and
+//! The build-time check of a runner. A family entry states the check for each of its runners, and
 //! `Sessions` states the check for the part it reads.
 //!
 //! Comptime. The whole file runs at build time, so a runner that drifts from the table in
@@ -9,7 +9,7 @@ const StepRow = @import("step_row.zig").StepRow;
 
 // -- api --------------------------------------------------------------------
 
-/// The whole surface of one runner row: the single-row step, the swap hooks of a runner that
+/// The whole surface of one runner: the single-row step, the swap hooks of a runner that
 /// serves, and the plan value it takes at `init`.
 pub fn requireSurface(comptime T: type, comptime Plan: type) void {
     requireStepSurface(T);
@@ -37,7 +37,7 @@ pub fn requireNoRecurrentState(comptime T: type) void {
     }
 }
 
-/// The surface `Sessions` reads. The optional rows can be absent. `evictSlot` brings the swap
+/// The surface `Sessions` reads. The optional entries can be absent. `evictSlot` brings the swap
 /// surface with it.
 pub fn requireSessionsSurface(comptime T: type) void {
     requireFn(T, "stepBatch", &.{[]const StepRow}, void);

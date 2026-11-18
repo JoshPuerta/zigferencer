@@ -346,7 +346,7 @@ cmd_diff() {
         "$fg/flamegraph.pl" --title "$(basename "$b") against $(basename "$a")" >"$out"
 }
 
-# One static page per profile root: a row per cell, a link per file, and how to open each kind of
+# One static page per profile root: an entry per cell, a link per file, and how to open each kind of
 # file. It holds no script.
 cmd_index() {
     [ $# -eq 1 ] || die_usage "index needs ROOT"

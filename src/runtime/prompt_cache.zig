@@ -31,9 +31,9 @@
 //! hash collisions across models. A bad file is deleted and reads as a miss.
 //!
 //! Disk index. `lookupBestPrefix` needs the disk tier scannable, because its callers track no
-//! boundary lists. A row holds the key and the tokens of one file, never the blob. A row goes
-//! stale when its file is evicted or torn, and the verified load at promotion drops it, so the
-//! index heals itself. `loadDiskIndex` is bounded by `limits.serve_prefix_disk_index_max` and
+//! boundary lists. An entry holds the key and the tokens of one file, never the blob. An entry
+//! goes stale when its file is evicted or torn, and the verified load at promotion drops it, so
+//! the index heals itself. `loadDiskIndex` is bounded by `limits.serve_prefix_disk_index_max` and
 //! reports the files past the bound, because a capped index must never read as a complete one.
 //!
 //! Namespaces. `model_fp` names the namespace of every file a cache writes, and `disk_budget`
@@ -52,7 +52,7 @@
 //! only until the next mutating call, because an insert reallocates the RAM list. `hits` counts
 //! longest-prefix queries that an entry served, so it reads as restore demand. Exact lookups stay
 //! out of it. Every scan is linear over at most budget/snapshot_size entries, which is tens of
-//! rows.
+//! entries.
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
@@ -119,7 +119,7 @@ const Entry = struct {
     hits: u64 = 0, // longest-prefix queries served
 };
 
-/// One row of the disk index: the key and the prefix tokens of a file, never the blob.
+/// One entry of the disk index: the key and the prefix tokens of a file, never the blob.
 const DiskIndexEntry = struct {
     key: u64,
     tokens: []u32, // owned
@@ -298,8 +298,8 @@ pub const PromptCache = struct {
         }
     }
 
-    /// Try the index rows longer than `floor_n`, longest first, and promote the first file that
-    /// loads. A failed row drops, so the loop ends within the index length.
+    /// Try the index entries longer than `floor_n`, longest first, and promote the first file
+    /// that loads. A failed entry drops, so the loop ends within the index length.
     fn promoteBestFromDisk(self: *PromptCache, tokens: []const u32, floor_n: u32) ?*Entry {
         while (true) {
             var best_i: ?usize = null;
@@ -318,7 +318,7 @@ pub const PromptCache = struct {
                 key,
                 self.disk_index.items[i].tokens,
             ) catch null) orelse {
-                self.removeIndexRow(key);
+                self.removeIndexEntry(key);
                 continue;
             };
             self.insertEntry(loaded) catch return null;
@@ -328,8 +328,8 @@ pub const PromptCache = struct {
 
     // -- the disk index -----------------------------------------------------
 
-    /// Build the disk index: one row per `.zkv` file of this namespace. Best-effort, because a
-    /// missing row is a cache miss.
+    /// Build the disk index: one entry per `.zkv` file of this namespace. Best-effort, because a
+    /// missing entry is a cache miss.
     pub fn loadDiskIndex(self: *PromptCache) void {
         const io = self.io orelse return;
         var dir = Io.Dir.cwd().openDir(io, self.dir.?, .{ .iterate = true }) catch return;
@@ -348,11 +348,12 @@ pub const PromptCache = struct {
                 continue;
             }
 
-            self.addIndexRow(prefixKey(self.model_fp, tokens), tokens) catch self.gpa.free(tokens);
+            self.addIndexEntry(prefixKey(self.model_fp, tokens), tokens) catch
+                self.gpa.free(tokens);
         }
 
         if (skipped > 0) {
-            log.warn("disk index full at {d} rows: {d} files not indexed in {s}", .{
+            log.warn("disk index full at {d} entries: {d} files not indexed in {s}", .{
                 limits.serve_prefix_disk_index_max, skipped, self.dir.?,
             });
         }
@@ -389,9 +390,9 @@ pub const PromptCache = struct {
         return tokens;
     }
 
-    /// Take ownership of `tokens` and record the row. A row for the same key is replaced.
-    fn addIndexRow(self: *PromptCache, key: u64, tokens: []u32) !void {
-        if (self.indexRowOf(key)) |i| {
+    /// Take ownership of `tokens` and record the entry. An entry for the same key is replaced.
+    fn addIndexEntry(self: *PromptCache, key: u64, tokens: []u32) !void {
+        if (self.indexEntryOf(key)) |i| {
             self.gpa.free(self.disk_index.items[i].tokens);
             self.disk_index.items[i].tokens = tokens;
             return;
@@ -400,7 +401,7 @@ pub const PromptCache = struct {
         try self.disk_index.append(self.gpa, .{ .key = key, .tokens = tokens });
     }
 
-    fn indexRowOf(self: *const PromptCache, key: u64) ?usize {
+    fn indexEntryOf(self: *const PromptCache, key: u64) ?usize {
         for (self.disk_index.items, 0..) |*ie, i| {
             if (ie.key == key) return i;
         }
@@ -408,8 +409,8 @@ pub const PromptCache = struct {
         return null;
     }
 
-    fn removeIndexRow(self: *PromptCache, key: u64) void {
-        const i = self.indexRowOf(key) orelse return;
+    fn removeIndexEntry(self: *PromptCache, key: u64) void {
+        const i = self.indexEntryOf(key) orelse return;
         self.gpa.free(self.disk_index.items[i].tokens);
         _ = self.disk_index.swapRemove(i);
     }
@@ -441,11 +442,11 @@ pub const PromptCache = struct {
                 @as(f64, @floatFromInt(blob.len)) / self.disk_bw_bps * 1e9,
             );
             if (worthwhile(prefill_ns, restore_ns + disk_read_ns)) {
-                // The index row lands only with the file, so an evicted RAM entry stays findable.
+                // The index entry lands only with the file, so an evicted RAM entry stays findable.
                 if (self.persistToDisk(key, tokens, blob, last_logits)) |_| {
                     self.last_admit_disk = true;
                     if (self.gpa.dupe(u32, tokens)) |dup| {
-                        self.addIndexRow(key, dup) catch self.gpa.free(dup);
+                        self.addIndexEntry(key, dup) catch self.gpa.free(dup);
                     } else |_| {}
                 } else |_| {}
             }
@@ -585,7 +586,7 @@ pub const PromptCache = struct {
     /// Delete a bad or stale disk file, and report a miss.
     fn dropDisk(self: *PromptCache, key: u64) ?Entry {
         const io = self.io orelse return null;
-        self.removeIndexRow(key);
+        self.removeIndexEntry(key);
         var pathbuf: [512]u8 = undefined;
         const path = self.diskPath(key, &pathbuf) catch return null;
         Io.Dir.cwd().deleteFile(io, path) catch {};

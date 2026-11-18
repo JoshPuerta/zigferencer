@@ -43,7 +43,7 @@ pub fn printTable(
     try printPlan(w, results[0].plan);
     try w.print("decode:   {d} tokens, {d} run(s)\n", .{ decode_len, results.len });
 
-    // Print one row per run.
+    // Print one line per run.
     try w.writeAll("\n");
     try w.print(
         "{s:>4}  {s:>10}  {s:>10}  {s:>10}  {s}\n",

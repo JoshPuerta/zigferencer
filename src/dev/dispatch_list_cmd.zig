@@ -8,7 +8,7 @@
 //! at position 300. An `argmax` line follows each section.
 //!
 //! Placement. No `--gpu-layers` builds the fused runner. A count builds the hybrid runner of the
-//! family row through the placement path of `bench-model`. The boot resolves as a serve of 2
+//! family entry through the placement path of `bench-model`. The boot resolves as a serve of 2
 //! sessions, because a run and a bench plan 1 slot.
 //!
 //! Host layers. `--host-layers K` builds the fused runner over the layers after the first `K`,

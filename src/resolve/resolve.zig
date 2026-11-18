@@ -552,9 +552,9 @@ const qwen_entry: Entry = .{
     .context_limit = null,
 };
 
-/// One row of the CPU boot-log oracle: the command and its flags, and the
+/// One case of the CPU boot-log oracle: the command and its flags, and the
 /// figures its log lines state.
-const Row = struct {
+const CpuCase = struct {
     name: []const u8,
     kind: Kind,
     qwen: bool,
@@ -564,7 +564,7 @@ const Row = struct {
     want: CpuWant,
 };
 
-/// The models of the tables. The name of a row joins the kind, the model, and the label.
+/// The models of the tables. The name of a case joins the kind, the model, and the label.
 const Model = enum {
     smollm,
     qwen,
@@ -580,7 +580,7 @@ const Model = enum {
 const smollm: Model = .smollm;
 const qwen: Model = .qwen;
 
-/// The flags that rows share.
+/// The flags that cases share.
 const seq512: EngineFlags = .{ .max_seq = 512 };
 const seq1024: EngineFlags = .{ .max_seq = 1024 };
 const seq_huge: EngineFlags = .{ .max_seq = 99999999 };
@@ -623,7 +623,7 @@ fn serveIn(base: ServeShape, over: anytype) Input {
     return input;
 }
 
-/// The figures of a CPU row that resolves.
+/// The figures of a CPU case that resolves.
 const CpuWant = union(enum) {
     ok: struct { window: u32, slots: u32, host_kv_mib: u64, prefix_mib: u64 },
     refused: std.meta.Tag(Refusal),
@@ -649,9 +649,14 @@ fn serve4(over: anytype) Input {
 
 const serve2: Input = serve4(.{ .max_sessions = 2, .structural_slots = 2 });
 
-/// Rows of one kind and model. A case is a label, an input, a want, and optional row fields.
-fn cpuRows(comptime kind: Kind, comptime model: Model, comptime cases: anytype) [cases.len]Row {
-    var out: [cases.len]Row = undefined;
+/// Cases of one kind and model. Each tuple holds a label, an input, a want, and optional
+/// case fields.
+fn cpuCases(
+    comptime kind: Kind,
+    comptime model: Model,
+    comptime cases: anytype,
+) [cases.len]CpuCase {
+    var out: [cases.len]CpuCase = undefined;
     inline for (cases, 0..) |c, i| {
         out[i] = .{
             .name = @tagName(kind) ++ "-" ++ model.label() ++ "-" ++ c[0],
@@ -668,15 +673,15 @@ fn cpuRows(comptime kind: Kind, comptime model: Model, comptime cases: anytype) 
     return out;
 }
 
-const rows =
-    cpuRows(.run, smollm, .{
+const cpu_cases =
+    cpuCases(.run, smollm, .{
         .{ "default", .{}, ok(8192, 1, 360, 0) },
         .{ "maxseq512", .{ .engine = seq512 }, ok(512, 1, 22, 0) },
         .{ "maxseq-huge", .{ .engine = seq_huge }, rejects(.window_out_of_range) },
         .{ "f16", .{ .engine = f16kv }, ok(8192, 1, 180, 0) },
         .{ "chat-thinking-on", .{ .engine = think_on }, rejects(.thinking_unsupported) },
     }) ++
-    cpuRows(.run, qwen, .{
+    cpuCases(.run, qwen, .{
         .{ "default", .{}, ok(174592, 1, 2065, 0) },
         .{ "maxseq-huge", .{ .engine = seq_huge }, rejects(.window_out_of_range) },
         .{ "maxseq512", .{ .engine = seq512 }, ok(512, 1, 25, 0) },
@@ -684,7 +689,7 @@ const rows =
         .{ "chat-thinking-on", .{ .engine = think_on }, ok(174592, 1, 2065, 0) },
         .{ "ram-small", .{}, rejects(.host_ram), .{ .ram_mib = 64 } },
     }) ++
-    cpuRows(.serve, smollm, .{
+    cpuCases(.serve, smollm, .{
         .{ "default", serve4(.{}), ok(2816, 4, 495, 1024) },
         .{ "kvram1", serve4(.{ .kv_ram_bytes = 1 * mib }), ok(2816, 4, 495, 1) },
         .{ "maxseq1024", serve4(.{ .engine = seq1024 }), ok(1024, 4, 180, 1024) },
@@ -696,7 +701,7 @@ const rows =
         .{ "ram-small", serve4(.{}), rejects(.host_ram), .{ .ram_mib = 600 } },
         .{ "cpu-slots-below-sessions", serve4(.{ .structural_slots = 2 }), rejects(.cpu_slots) },
     }) ++
-    cpuRows(.serve, qwen, .{
+    cpuCases(.serve, qwen, .{
         .{ "default", serve4(.{}), ok(10752, 4, 581, 1024) },
         .{ "sessions2", serve2, ok(10752, 2, 290, 1024) },
         .{ "maxseq1024", serve4(.{ .engine = seq1024 }), ok(1024, 4, 125, 1024) },
@@ -706,30 +711,30 @@ const rows =
         .{ "f16", serve4(.{ .engine = f16kv }), ok(10752, 4, 581, 1024) },
         .{ "maxseq-huge", serve4(.{ .engine = seq_huge }), rejects(.window_out_of_range) },
     }) ++
-    cpuRows(.bench, smollm, .{
+    cpuCases(.bench, smollm, .{
         .{ "default", .{}, ok(8192, 1, 360, 0) },
         .{ "maxseq512", .{ .engine = seq512 }, ok(512, 1, 22, 0) },
         .{ "f16", .{ .engine = f16kv }, ok(8192, 1, 180, 0) },
     }) ++
-    cpuRows(.bench, qwen, .{
+    cpuCases(.bench, qwen, .{
         .{ "default", .{}, ok(174592, 1, 2065, 0) },
         .{ "maxseq512", .{ .engine = seq512 }, ok(512, 1, 25, 0) },
         .{ "f16", .{ .engine = f16kv }, ok(174592, 1, 2065, 0) },
     });
 
-test "resolve: the CPU oracle rows resolve to their logged window, slots, and RAM" {
+test "resolve: the CPU oracle cases resolve to their logged window, slots, and RAM" {
     if (comptime build_options.use_vulkan_ops or build_options.use_vulkan_fused_ops) {
         return error.SkipZigTest;
     }
 
-    for (rows) |row| {
-        const resources: Resources = .{ .ram_free = row.ram_mib * mib };
-        const card = if (row.qwen) qwenCard() else smollm2Card();
-        const entry = if (row.qwen) qwen_entry else smollm2_entry;
-        const got = resolve(row.kind, row.input, entry, card, resources);
-        errdefer std.debug.print("row {s}\n", .{row.name});
+    for (cpu_cases) |case| {
+        const resources: Resources = .{ .ram_free = case.ram_mib * mib };
+        const card = if (case.qwen) qwenCard() else smollm2Card();
+        const entry = if (case.qwen) qwen_entry else smollm2_entry;
+        const got = resolve(case.kind, case.input, entry, card, resources);
+        errdefer std.debug.print("case {s}\n", .{case.name});
 
-        switch (row.want) {
+        switch (case.want) {
             .refused => |tag| {
                 // A window or flag refusal stops the boot. A RAM or slot refusal goes with the host
                 // placement.
@@ -906,10 +911,10 @@ test "resolve: no window past the ceiling, no plan past the RAM it was given" {
     try prop.forAll(.{ .site = 0x7265736f6c766521 }, {}, Case, genCase, checkCase);
 }
 
-// -- tests: the device rows -------------------------------------------------
+// -- tests: the device oracle cases -----------------------------------------
 
 /// The weight census of SmolLM2-135M-Instruct-Q8_0: 30 equal layers and a tied
-/// head. The ledger lines of the device rows state 50 MiB for six layers.
+/// head. The ledger lines of the device cases state 50 MiB for six layers.
 fn smollm2Model() ModelNeeds {
     var m: ModelNeeds = .{ .n_layers = 30, .layer_weights = @splat(0), .head_weights = 30_083_328 };
     for (m.layer_weights[0..30]) |*w| {
@@ -941,9 +946,9 @@ fn qwenModel() ModelNeeds {
     return m;
 }
 
-/// The device of the capture: the storage range it reports, which no row of
-/// the default storage range passes. The rows log no VRAM cut, so any figure
-/// that holds every row stands for the live budget.
+/// The device of the capture: the storage range it reports, which no case of
+/// the default storage range passes. The cases log no VRAM cut, so any figure
+/// that holds every case stands for the live budget.
 const capture_device: DeviceCapacity = .{
     .vram = 12 << 30,
     .driver = .other,
@@ -954,9 +959,9 @@ const capture_device: DeviceCapacity = .{
     },
 };
 
-/// One row of the device boot-log oracle: the command, its flags, the storage
+/// One case of the device boot-log oracle: the command, its flags, the storage
 /// range, and the figures its log lines state. The RAM figures are MiB.
-const DeviceRow = struct {
+const DeviceCase = struct {
     name: []const u8,
     kind: Kind,
     qwen: bool,
@@ -966,16 +971,16 @@ const DeviceRow = struct {
     /// makes the VRAM budgets refuse.
     vram_mib: u64 = 12 * 1024,
     ram_mib: u64 = 64 * 1024,
-    /// The window a clamped row cuts to.
+    /// The window a clamped case cuts to.
     clamp_window: u32 = 131_072,
-    /// The split of the placement line, for a `--gpu-layers` row.
+    /// The split of the placement line, for a `--gpu-layers` case.
     host_layers: ?u32 = null,
     /// True when the window line names the storage-buffer range.
     clamped: bool = false,
     want: DeviceWant,
 };
 
-/// The figures of a placement row, in MiB.
+/// The figures of a placement case, in MiB.
 const PlacementWant = struct {
     tag: device_placement.PlacementKind,
     slots: u32,
@@ -1055,18 +1060,19 @@ const gl0_in: Input = .{ .engine = gl0 };
 const glall30_in: Input = .{ .engine = .{ .gpu_layers = .{ .count = 30 } } };
 const glall24_in: Input = .{ .engine = .{ .gpu_layers = .{ .count = 24 } } };
 
-/// Row fields that name the storage range or the VRAM budget of a capture.
+/// Case fields that name the storage range or the VRAM budget of a capture.
 const range_1gib = .{ .storage_range = 1 << 30 };
 const range_64mib = .{ .storage_range = 64 << 20, .clamp_window = 65_536, .clamped = true };
 const tight_vram = .{ .vram_mib = 512, .clamped = true };
 
-/// Rows of one kind and model. A case is a label, an input, a want, and optional row fields.
-fn deviceRows(
+/// Cases of one kind and model. Each tuple holds a label, an input, a want, and optional
+/// case fields.
+fn deviceCases(
     comptime kind: Kind,
     comptime model: Model,
     comptime cases: anytype,
-) [cases.len]DeviceRow {
-    var out: [cases.len]DeviceRow = undefined;
+) [cases.len]DeviceCase {
+    var out: [cases.len]DeviceCase = undefined;
     inline for (cases, 0..) |c, i| {
         out[i] = .{
             .name = @tagName(kind) ++ "-" ++ model.label() ++ "-" ++ c[0],
@@ -1083,8 +1089,8 @@ fn deviceRows(
     return out;
 }
 
-const device_rows =
-    deviceRows(.run, smollm, .{
+const device_cases =
+    deviceCases(.run, smollm, .{
         .{ "default", .{}, fused(1, 8192, 360) },
         .{ "maxseq512", .{ .engine = seq512 }, fused(1, 512, 22) },
         .{ "f16", .{ .engine = f16kv }, fused(1, 8192, 180) },
@@ -1093,7 +1099,7 @@ const device_rows =
         .{ "range1073741824", .{}, fused(1, 8192, 360), range_1gib },
         .{ "gl31", .{ .engine = gl31 }, refused(.gpu_layers_past_model) },
     }) ++
-    deviceRows(.serve, smollm, .{
+    deviceCases(.serve, smollm, .{
         .{ "default", gpu4(.{}), fusedS(4, 2816, 495, 1024, 247) },
         .{ "sessions2", gpu2, fusedS(2, 2816, 247, 1024, 247) },
         .{ "maxseq1024", gpu4(.{ .engine = seq1024 }), fusedS(4, 1024, 180, 1024, 90) },
@@ -1120,7 +1126,7 @@ const device_rows =
         .{ "kvvram512", kv_vram512, fusedS(4, 2816, 495, 1024, 247) },
         .{ "kvvram-tiny", kv_vram1, refused(.kv_vram_small) },
     }) ++
-    deviceRows(.bench, smollm, .{
+    deviceCases(.bench, smollm, .{
         .{ "default", .{}, fused(1, 8192, 360) },
         .{ "maxseq512", .{ .engine = seq512 }, fused(1, 512, 22) },
         .{ "f16", .{ .engine = f16kv }, fused(1, 8192, 180) },
@@ -1129,7 +1135,7 @@ const device_rows =
         .{ "glall", glall30_in, refused(.whole_model_split), .{ .host_layers = 0 } },
         .{ "glauto", auto_in, refused(.whole_model_split), .{ .host_layers = 0 } },
     }) ++
-    deviceRows(.run, qwen, .{
+    deviceCases(.run, qwen, .{
         .{ "default", .{}, fused(1, 131072, 1555), .{ .clamped = true } },
         .{ "maxseq512", .{ .engine = seq512 }, fused(1, 512, 25) },
         .{
@@ -1143,7 +1149,7 @@ const device_rows =
         .{ "gl6-vram-small", .{ .engine = gl6 }, refused(.layer_split_vram), tight_vram },
         .{ "range64MiB", .{}, fused(1, 65_536, 787), range_64mib },
     }) ++
-    deviceRows(.serve, qwen, .{
+    deviceCases(.serve, qwen, .{
         .{ "default", gpu4(.{}), fusedS(4, 10752, 581, 1024, 290) },
         .{ "sessions2", gpu2, fusedS(2, 10752, 290, 1024, 290) },
         .{ "maxseq1024", gpu4(.{ .engine = seq1024 }), fusedS(4, 1024, 125, 1024, 62) },
@@ -1163,7 +1169,7 @@ const device_rows =
         },
         .{ "range1073741824", gpu4(.{}), fusedS(4, 10752, 581, 1024, 290), range_1gib },
     }) ++
-    deviceRows(.bench, qwen, .{
+    deviceCases(.bench, qwen, .{
         .{ "default", .{}, fused(1, 131072, 1555), .{ .clamped = true } },
         .{ "maxseq512", .{ .engine = seq512 }, fused(1, 512, 25) },
         .{ "range1073741824", .{}, fused(1, 174592, 2065), range_1gib },
@@ -1198,7 +1204,7 @@ fn deviceRefusal(placement: Result(device_placement.Placement)) ?Refusal {
     };
 }
 
-/// The window, slots, VRAM KV, and RAM plan of the placement a device row takes.
+/// The window, slots, VRAM KV, and RAM plan of the placement a device case takes.
 fn deviceShape(placement: device_placement.Placement) struct {
     slots: u32,
     window: u32,
@@ -1305,25 +1311,25 @@ test "mostSessions: a host with no device stops at the decode width it holds" {
     try std.testing.expectEqual(@as(?u16, null), none);
 }
 
-test "resolve: the device oracle rows resolve to their logged split, window, slots, and RAM" {
+test "resolve: the device oracle cases resolve to their logged split, window, slots, and RAM" {
     if (comptime build_options.use_vulkan_ops) return error.SkipZigTest;
-    for (device_rows) |row| {
-        const card = if (row.qwen) qwenCard() else smollm2Card();
-        const entry = if (row.qwen) qwen_entry else smollm2_entry;
+    for (device_cases) |case| {
+        const card = if (case.qwen) qwenCard() else smollm2Card();
+        const entry = if (case.qwen) qwen_entry else smollm2_entry;
         var device = capture_device;
-        device.buffer_limits.storage_range = row.storage_range;
-        device.vram = row.vram_mib * mib;
+        device.buffer_limits.storage_range = case.storage_range;
+        device.vram = case.vram_mib * mib;
         const resources: Resources = .{
-            .ram_free = row.ram_mib * mib,
-            .model = if (row.qwen) qwenModel() else smollm2Model(),
+            .ram_free = case.ram_mib * mib,
+            .model = if (case.qwen) qwenModel() else smollm2Model(),
             .device = device,
         };
-        // A host build resolves no device placement, so the row takes the window of
+        // A host build resolves no device placement, so the case takes the window of
         // the boot and calls the device placement itself.
-        const pre = early(row.kind, row.input, entry).ok;
+        const pre = early(case.kind, case.input, entry).ok;
         const base = switch (resolve(
-            row.kind,
-            row.input,
+            case.kind,
+            case.input,
             entry,
             card,
             .{ .ram_free = resources.ram_free },
@@ -1333,24 +1339,24 @@ test "resolve: the device oracle rows resolve to their logged split, window, slo
         };
 
         const dev = device_placement.choosePlacement(
-            row.kind,
-            row.input,
+            case.kind,
+            case.input,
             card,
             pre.kv_dtype,
             base,
             resources,
         );
-        errdefer std.debug.print("row {s}\n", .{row.name});
+        errdefer std.debug.print("case {s}\n", .{case.name});
 
-        if (row.host_layers) |want| {
+        if (case.host_layers) |want| {
             try std.testing.expectEqual(want, dev.layer_choice.?.layer_split.?.host_layers);
         }
 
-        if (row.host_layers == null and row.want != .refused) {
+        if (case.host_layers == null and case.want != .refused) {
             try std.testing.expect(dev.layer_choice == null);
         }
 
-        switch (row.want) {
+        switch (case.want) {
             .refused => |tag| try std.testing.expectEqual(
                 tag,
                 std.meta.activeTag(
@@ -1369,7 +1375,7 @@ test "resolve: the device oracle rows resolve to their logged split, window, slo
                 try std.testing.expectEqual(w.prefix_mib, got.ram.prefix / mib);
                 try std.testing.expectEqual(w.stages_mib, got.ram.swap_stages / mib);
                 // The run of a llama model states the all-device placement.
-                if (placement == .fused and row.kind == .run and !row.qwen) {
+                if (placement == .fused and case.kind == .run and !case.qwen) {
                     const report = placement.fused.report.?;
                     try std.testing.expectEqual(@as(u32, 0), report.host_layers);
                 }
@@ -1383,13 +1389,13 @@ test "resolve: the device oracle rows resolve to their logged split, window, slo
         else
             null;
 
-        try std.testing.expectEqual(row.clamped, clamp != null);
+        try std.testing.expectEqual(case.clamped, clamp != null);
         if (clamp) |c| {
             // The logged line: 178782208 bytes at 174592 positions, past the
             // storage-buffer range of 134217728 bytes.
             try std.testing.expectEqual(@as(u64, 178_782_208), c.need);
-            try std.testing.expectEqual(row.storage_range, c.limit.value);
-            try std.testing.expectEqual(row.clamp_window, c.window);
+            try std.testing.expectEqual(case.storage_range, c.limit.value);
+            try std.testing.expectEqual(case.clamp_window, c.window);
         }
     }
 }

@@ -1,7 +1,7 @@
 //! `bench-model --profile-cpu-decode`: the per-op decode timer of the CPU runners.
 //! It prefills the prompt unprofiled, so its numbers are steady-state decode, and
 //! prints the breakdown to stderr, because it is a diagnostic and not a result.
-//! The sums fill in a trace build only. The ops of `layer_op.LayerOp` are the one list of rows,
+//! The sums fill in a trace build only. The ops of `layer_op.LayerOp` are the one list of lines,
 //! grouped by `OpClass`, so a new op reaches the table with no edit here.
 //!
 //! Comptime. Generic over the model family and the runner, so every CPU runner shares one timer
@@ -30,12 +30,12 @@ const OpClass = layer_op.OpClass;
 
 const stderr_buffer_bytes = 4096;
 
-/// The width of the row label: an op name under the indent of its class.
+/// The width of the line label: an op name under the indent of its class.
 const label_width = 16;
 
 // -- types ------------------------------------------------------------------
 
-/// The decode steps and the total nanoseconds that turn a sum into a table row.
+/// The decode steps and the total nanoseconds that turn a sum into a table line.
 const Scale = struct { steps: f64, total: f64 };
 
 // -- api --------------------------------------------------------------------
@@ -131,7 +131,8 @@ fn reportCpuProfile(
     const serial_ns = total - parallel_ns;
     const serial_frac = serial_ns / total;
     const n: f64 = @floatFromInt(@max(policy.n_threads, 1));
-    // The ceiling treats every parallel row as perfectly parallel. The matmuls are bandwidth-bound.
+    // The ceiling treats every parallel line as perfectly parallel.
+    // The matmuls are bandwidth-bound.
     const amdahl = 1.0 / (serial_frac + (1.0 - serial_frac) / n);
 
     // Print the header lines.
@@ -158,7 +159,7 @@ fn reportCpuProfile(
 
     // Print the totals and the ceiling.
     try w.writeAll("  " ++ "-" ** 56 ++ "\n");
-    try printRow(w, scale, "TOTAL", 0, total, null);
+    try printLine(w, scale, "TOTAL", 0, total, null);
     try w.print(
         "\n  parallel: {d:.1}%   serial: {d:.1}%\n",
         .{ 100.0 * (1.0 - serial_frac), 100.0 * serial_frac },
@@ -171,7 +172,7 @@ fn reportCpuProfile(
     try w.flush();
 }
 
-/// One row for each class that the family times, then one row for each of its ops.
+/// One line for each class that the family times, then one line for each of its ops.
 fn printClasses(w: *Io.Writer, p: *const CpuProfile, scale: Scale) !void {
     for (std.enums.values(OpClass)) |class| {
         var class_ns: u64 = 0;
@@ -186,18 +187,18 @@ fn printClasses(w: *Io.Writer, p: *const CpuProfile, scale: Scale) !void {
         if (class_ns == 0) continue;
 
         const kind: []const u8 = if (parallel_class) "parallel" else "serial";
-        try printRow(w, scale, @tagName(class), 0, @floatFromInt(class_ns), kind);
+        try printLine(w, scale, @tagName(class), 0, @floatFromInt(class_ns), kind);
         for (std.enums.values(LayerOp)) |op| {
             if (op.class() != class or !cpu_profile.usedBy(op, p.family)) continue;
 
-            try printRow(w, scale, @tagName(op), 2, @floatFromInt(p.nsOf(op)), null);
+            try printLine(w, scale, @tagName(op), 2, @floatFromInt(p.nsOf(op)), null);
         }
     }
 }
 
-/// One table row: the label at `indent`, the time per step, the share of the step, and the kind of
-/// a class row.
-fn printRow(
+/// One table line: the label at `indent`, the time per step, the share of the step, and the kind of
+/// a class line.
+fn printLine(
     w: *Io.Writer,
     scale: Scale,
     label: []const u8,

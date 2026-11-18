@@ -2,8 +2,8 @@
 //! prints it and marks the backend linked into this binary. The notes carry the limits that a
 //! reader otherwise finds in the runners: the weight quants a backend accepts, and what runs where.
 //!
-//! Comptime. A check pins every row to `op_requires.ops_backend_names`, in order, so a
-//! new backend forces every architecture to state its support.
+//! Comptime. A check pins every architecture entry to `op_requires.ops_backend_names`, in order,
+//! so a new backend forces every architecture to state its support.
 
 const std = @import("std");
 const Io = std.Io;
@@ -14,7 +14,7 @@ const op_requires = @import("../../core/op_requires.zig");
 
 // -- constants --------------------------------------------------------------
 
-const arch_rows = [_]ArchRow{
+const arch_entries = [_]ArchEntry{
     .{
         .title = "llama: SmolLM2, Llama 3.x (full softmax attention)",
         .entries = .{
@@ -47,10 +47,10 @@ const arch_rows = [_]ArchRow{
 };
 
 comptime {
-    for (arch_rows) |row| {
-        for (row.entries, op_requires.ops_backend_names) |entry, canonical| {
+    for (arch_entries) |arch| {
+        for (arch.entries, op_requires.ops_backend_names) |entry, canonical| {
             if (!std.mem.eql(u8, entry.backend, canonical)) {
-                @compileError("arch matrix row '" ++ row.title ++ "' diverges from " ++
+                @compileError("arch matrix entry '" ++ arch.title ++ "' diverges from " ++
                     "op_requires.ops_backend_names at '" ++ canonical ++ "'");
             }
         }
@@ -66,7 +66,7 @@ const Entry = struct {
     note: []const u8,
 };
 
-const ArchRow = struct {
+const ArchEntry = struct {
     title: []const u8,
     /// One entry per backend, in the order of `ops_backend_names`.
     entries: [op_requires.ops_backend_names.len]Entry,
@@ -87,10 +87,10 @@ pub fn print(w: *Io.Writer, p: style.Palette) Io.Writer.Error!void {
         p.dim, build_options.ops_backend, p.reset,
     });
 
-    for (&arch_rows) |*row| {
-        try w.print("\n{s}{s}{s}\n", .{ p.bold, row.title, p.reset });
+    for (&arch_entries) |*arch| {
+        try w.print("\n{s}{s}{s}\n", .{ p.bold, arch.title, p.reset });
 
-        for (&row.entries) |*entry| {
+        for (&arch.entries) |*entry| {
             const linked = std.mem.eql(u8, entry.backend, build_options.ops_backend);
             const mark_c = if (linked) p.green else p.dim;
             const mark: []const u8 = if (linked) "+" else "-";
@@ -139,10 +139,10 @@ test "print names every architecture and marks exactly the linked backend" {
     try print(&w, style.Palette.init(false));
 
     const text = w.buffered();
-    for (arch_rows) |row| {
-        try std.testing.expect(std.mem.find(u8, text, row.title) != null);
+    for (arch_entries) |arch| {
+        try std.testing.expect(std.mem.find(u8, text, arch.title) != null);
     }
 
-    // One linked mark per architecture row, plus the legend.
-    try std.testing.expectEqual(arch_rows.len + 1, std.mem.count(u8, text, "[+]"));
+    // One linked mark per architecture entry, plus the legend.
+    try std.testing.expectEqual(arch_entries.len + 1, std.mem.count(u8, text, "[+]"));
 }

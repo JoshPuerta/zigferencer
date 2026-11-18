@@ -408,8 +408,8 @@ test "body: the framing table" {
     const big = std.fmt.comptimePrint("{d}", .{body_bytes_max + 1});
     const cap = std.fmt.comptimePrint("{d}", .{body_bytes_max});
     // A null want is a head that the std parser refuses, and the server answers it with 400.
-    const Row = struct { head: []const u8, want: ?Framing };
-    const rows = [_]Row{
+    const Case = struct { head: []const u8, want: ?Framing };
+    const cases = [_]Case{
         .{ .head = post ++ "\r\n", .want = .none },
         .{ .head = post ++ "Content-Length: 0\r\n\r\n", .want = .none },
         .{ .head = post ++ "Content-Length: 12\r\n\r\n", .want = .{ .length = 12 } },
@@ -457,9 +457,9 @@ test "body: the framing table" {
             .want = .{ .refused = .too_large },
         },
     };
-    for (rows) |row| {
-        testing.expectEqualDeep(row.want, headFraming(row.head)) catch |err| {
-            std.debug.print("head: {s}\n", .{row.head});
+    for (cases) |case| {
+        testing.expectEqualDeep(case.want, headFraming(case.head)) catch |err| {
+            std.debug.print("head: {s}\n", .{case.head});
             return err;
         };
     }
@@ -488,8 +488,8 @@ test "body: a chunked body decodes, with every accepted form of size line and tr
     defer arena_state.deinit();
 
     const arena = arena_state.allocator();
-    const Row = struct { wire: []const u8, want: []const u8 };
-    const rows = [_]Row{
+    const Case = struct { wire: []const u8, want: []const u8 };
+    const cases = [_]Case{
         .{ .wire = "0\r\n\r\n", .want = "" },
         .{ .wire = "5\r\nhello\r\n0\r\n\r\n", .want = "hello" },
         .{ .wire = "0005\r\nhello\r\n000\r\n\r\n", .want = "hello" },
@@ -500,8 +500,8 @@ test "body: a chunked body decodes, with every accepted form of size line and tr
         .{ .wire = "2;name=value\r\nhi\r\n0 ; last\r\n\r\n", .want = "hi" },
         .{ .wire = "2\r\nhi\r\n0\r\nX-One: 1\r\nX-Two: 2\r\n\r\n", .want = "hi" },
     };
-    for (rows) |row| {
-        try testing.expectEqualStrings(row.want, try decode(arena, row.wire));
+    for (cases) |case| {
+        try testing.expectEqualStrings(case.want, try decode(arena, case.wire));
     }
 
     // Many small chunks.
@@ -552,8 +552,8 @@ test "body: each malformed framing gets its typed error" {
     const arena = arena_state.allocator();
     const ext = "1;" ++ "a" ** (ext_bytes_max + 1);
     const trailer = "0\r\nX: " ++ "a" ** trailer_bytes_max ++ "\r\n\r\n";
-    const Row = struct { wire: []const u8, want: ChunkError };
-    const rows = [_]Row{
+    const Case = struct { wire: []const u8, want: ChunkError };
+    const cases = [_]Case{
         .{ .wire = "ffffffffffffffff\r\n", .want = error.SizeInvalid },
         .{ .wire = "1g\r\n", .want = error.SizeInvalid },
         .{ .wire = "+1\r\n", .want = error.SizeInvalid },
@@ -580,9 +580,9 @@ test "body: each malformed framing gets its typed error" {
         .{ .wire = "5\r\nhello\r\n", .want = error.Truncated },
         .{ .wire = "0\r\n", .want = error.Truncated },
     };
-    for (rows) |row| {
-        testing.expectError(row.want, decode(arena, row.wire)) catch |err| {
-            std.debug.print("wire: {s}\n", .{row.wire[0..@min(row.wire.len, 40)]});
+    for (cases) |case| {
+        testing.expectError(case.want, decode(arena, case.wire)) catch |err| {
+            std.debug.print("wire: {s}\n", .{case.wire[0..@min(case.wire.len, 40)]});
             return err;
         };
     }

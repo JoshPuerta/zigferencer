@@ -351,7 +351,7 @@ test "folded: one line per runner, label, and op key with the summed time" {
 test "tickSpan: wrap, step back, equal ticks, and normal order" {
     const narrow: u64 = (1 << 36) - 1;
     const wide: u64 = std.math.maxInt(u64);
-    const Row = struct {
+    const Case = struct {
         name: []const u8,
         ts: []const u64,
         mask: u64,
@@ -360,7 +360,7 @@ test "tickSpan: wrap, step back, equal ticks, and normal order" {
         backsteps: u32,
         deltas: []const u64,
     };
-    const rows = [_]Row{
+    const cases = [_]Case{
         .{
             .name = "normal order",
             .ts = &.{ 100, 150, 400 },
@@ -419,16 +419,16 @@ test "tickSpan: wrap, step back, equal ticks, and normal order" {
             .deltas = &.{0},
         },
     };
-    for (rows) |row| {
-        errdefer std.debug.print("tickSpan row: {s}\n", .{row.name});
+    for (cases) |case| {
+        errdefer std.debug.print("tickSpan case: {s}\n", .{case.name});
 
         var deltas: [4]u64 = undefined;
-        const got = tickSpan(row.ts, row.mask, deltas[0 .. row.ts.len - 1]);
-        try testing.expectEqual(row.start, got.start);
-        try testing.expectEqual(row.end, got.end);
-        try testing.expectEqual(row.backsteps, got.backsteps);
-        try testing.expectEqualSlices(u64, row.deltas, deltas[0 .. row.ts.len - 1]);
+        const got = tickSpan(case.ts, case.mask, deltas[0 .. case.ts.len - 1]);
+        try testing.expectEqual(case.start, got.start);
+        try testing.expectEqual(case.end, got.end);
+        try testing.expectEqual(case.backsteps, got.backsteps);
+        try testing.expectEqualSlices(u64, case.deltas, deltas[0 .. case.ts.len - 1]);
         // The staging record passes no delta buffer and reads the same span.
-        try testing.expectEqual(got, tickSpan(row.ts, row.mask, null));
+        try testing.expectEqual(got, tickSpan(case.ts, case.mask, null));
     }
 }

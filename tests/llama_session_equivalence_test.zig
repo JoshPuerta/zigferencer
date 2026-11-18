@@ -11,8 +11,8 @@
 //!      the other two sessions, the composed-tick shape of the serve scheduler.
 //!   e. clone: a session forked partway through a conversation continues bit-identically to its
 //!      source, which pins the KV row copy.
-//!   f. forced parallelism: pass b with the row-parallel matmuls and the attention units forced on.
-//!      A unit is one KV group over one part of an attention row.
+//!   f. forced parallelism: pass b with the output-parallel matmuls and the attention units forced
+//!      on. A unit is one KV group over one part of an attention row.
 //!
 //! Exactness. The token streams and the FNV-1a hashes of the raw logits bytes must match pass a
 //! exactly, and not within a tolerance. The batch linear kernels repeat the per-(row, output)
@@ -24,11 +24,11 @@
 //! when that row took an lm_head. So they sit at base+p, where base is 1 on the final chunk and 0
 //! otherwise.
 //!
-//! Forced parallelism. `min_parallel_flops = 0` spreads the row-parallel matmuls and the attention
-//! units (parallel.attentionTyped) across `n_threads`. The matmul partition keeps the reduction
-//! order of every output. An attention unit writes the same records on any worker, and the merge
-//! adds them in part order. So multi-slot and multi-thread output is bit-exact. This pins the
-//! determinism of the parallel paths that the serve runner uses.
+//! Forced parallelism. `min_parallel_flops = 0` spreads the output-parallel matmuls and the
+//! attention units (parallel.attentionTyped) across `n_threads`. The matmul partition keeps the
+//! reduction order of every output. An attention unit writes the same records on any worker, and
+//! the merge adds them in part order. So multi-slot and multi-thread output is bit-exact. This pins
+//! the determinism of the parallel paths that the serve runner uses.
 //!
 //! Prefix restore. This is the prefix-cache path of the serve scheduler on the CPU runner. The GPU
 //! equivalence file pins the twin path for the fused runner. A cold session feeds the whole prompt

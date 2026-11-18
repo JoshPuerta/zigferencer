@@ -3,7 +3,7 @@
 //! Comptime. `HarnessFor` builds one harness type per runner, so each runner family shares one
 //! boot.
 //!
-//! Boot. A harness loads the SmolLM2 fixture, builds the CPU runner of the Llama row and its
+//! Boot. A harness loads the SmolLM2 fixture, builds the CPU runner of the Llama entry and its
 //! session pool, and starts an in-process binary server. `QwenHarness` does the same with the CPU
 //! runner over the Qwen fixture.
 //!

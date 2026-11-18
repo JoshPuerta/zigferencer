@@ -18,12 +18,12 @@
 //! thinking mode, so `enable_thinking: true` gets a 400 in one sentence. `false` and an absent
 //! switch give the plain reply, byte for byte.
 //!
-//! Sampling. The fixture serves a sampled card row as the default of each omitted field, the shape
-//! of a model with a card under `--sampling model`. Every test that compares reply text therefore
-//! sends `temperature: 0`. Two requests without a seed give two replies, one fixed seed gives one
-//! reply, and the greedy defaults give one reply. A sampling field out of its range and a frequency
-//! penalty get a 400 that names the field. A repetition penalty changes the greedy reply, so the
-//! server never drops it.
+//! Sampling. The fixture serves a sampled card entry as the default of each omitted field, the
+//! shape of a model with a card under `--sampling model`. Every test that compares reply text
+//! therefore sends `temperature: 0`. Two requests without a seed give two replies, one fixed seed
+//! gives one reply, and the greedy defaults give one reply. A sampling field out of its range and a
+//! frequency penalty get a 400 that names the field. A repetition penalty changes the greedy reply,
+//! so the server never drops it.
 //!
 //! Plain text. A user content that holds the control strings of the template encodes as plain
 //! text. The prefill holds the count of the prompt encode, which differs from the count of the
@@ -94,18 +94,18 @@ const OpenAiServer = http_server.Server(Sessions(LlamaCpu));
 const map = zigferencer.serve_openai_map;
 const CacheConfig = @FieldType(zigferencer.serve_scheduler.Config, "cache");
 
-/// A sampled row in both modes. SmolLM2 has no card, so the test supplies one.
-const card_row: zigferencer.serve_protocol.Sampling = .{
+/// A sampled entry in both modes. SmolLM2 has no card, so the test supplies one.
+const card_entry: zigferencer.serve_protocol.Sampling = .{
     .temperature = 1.5,
     .top_k = 40,
     .top_p = 0.95,
     .seed = 0,
 };
-const card_defaults: map.DefaultRows = .init(.model, card_row, card_row);
+const card_defaults: map.DefaultEntries = .init(.model, card_entry, card_entry);
 
 /// The server shape of one test. The default is the shape most tests share.
 const Setup = struct {
-    defaults: map.DefaultRows = card_defaults,
+    defaults: map.DefaultEntries = card_defaults,
     cache: CacheConfig = .{},
     max_sessions: u16 = 4,
     max_connections: u32 = 8,
@@ -809,7 +809,7 @@ test "openai loopback: seed omitted draws, seed fixed reproduces, temperature 0 
 
     const arena = arena_state.allocator();
 
-    // The card row samples at temperature 1.5 over 32 tokens. Two equal
+    // The card entry samples at temperature 1.5 over 32 tokens. Two equal
     // replies from two drawn seeds therefore do not occur in practice.
     const drawn_a = try replyText(&fx, arena, open_prompt, ",\"max_tokens\":32");
     const drawn_b = try replyText(&fx, arena, open_prompt, ",\"max_tokens\":32");
@@ -819,7 +819,7 @@ test "openai loopback: seed omitted draws, seed fixed reproduces, temperature 0 
     const seeded_b = try replyText(&fx, arena, open_prompt, ",\"max_tokens\":32,\"seed\":7");
     try std.testing.expectEqualStrings(seeded_a, seeded_b);
 
-    // A request field beats the card row, so temperature 0 is greedy and
+    // A request field beats the card entry, so temperature 0 is greedy and
     // ignores the drawn seed.
     const greedy_a = try replyText(&fx, arena, open_prompt, ",\"max_tokens\":32,\"temperature\":0");
     const greedy_b = try replyText(&fx, arena, open_prompt, ",\"max_tokens\":32,\"temperature\":0");
@@ -828,7 +828,7 @@ test "openai loopback: seed omitted draws, seed fixed reproduces, temperature 0 
 
 test "openai loopback: the greedy defaults give one reply to equal requests without a seed" {
     var fx: Fixture = undefined;
-    try fx.setUpWith(.{ .defaults = .init(.greedy, card_row, card_row) });
+    try fx.setUpWith(.{ .defaults = .init(.greedy, card_entry, card_entry) });
     defer fx.tearDown();
 
     var arena_state = std.heap.ArenaAllocator.init(fx.gpa);

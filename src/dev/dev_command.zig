@@ -22,15 +22,15 @@ const command = zigferencer.cli.command;
 
 /// The commands that only `zigferencer-dev` holds.
 const dev = [_]command.Subcommand{
-    row("bench-model", "Benchmark a model: TTFT, ITL, hash", bench_model_cmd.run),
-    row("bench-serve", "Benchmark serve throughput vs batch size", bench_serve_cmd.run),
-    row("bench-swap", "Benchmark tiered-KV swap cost (go/no-go)", bench_swap_cmd.run),
-    row("bench-decode-host", "Time the host steps of one decode step", bench_decode_host_cmd.run),
-    row("gpu-selftest", "Bit-check a GPU kernel vs its CPU reference", gpu_selftest_cmd.run),
-    row("tokens", "Print a prompt's token ids", tokens_cmd.run),
-    row("serve-demo", "Demo the serve connector end-to-end", serve_demo_cmd.run),
-    row("dispatch-list", "Write the Vulkan commands of six sections", dispatch_list_cmd.run),
-    row("compare-logits", "Compare two logits files of bench-model", compare_logits_cmd.run),
+    entry("bench-model", "Benchmark a model: TTFT, ITL, hash", bench_model_cmd.run),
+    entry("bench-serve", "Benchmark serve throughput vs batch size", bench_serve_cmd.run),
+    entry("bench-swap", "Benchmark tiered-KV swap cost (go/no-go)", bench_swap_cmd.run),
+    entry("bench-decode-host", "Time the host steps of one decode step", bench_decode_host_cmd.run),
+    entry("gpu-selftest", "Bit-check a GPU kernel vs its CPU reference", gpu_selftest_cmd.run),
+    entry("tokens", "Print a prompt's token ids", tokens_cmd.run),
+    entry("serve-demo", "Demo the serve connector end-to-end", serve_demo_cmd.run),
+    entry("dispatch-list", "Write the Vulkan commands of six sections", dispatch_list_cmd.run),
+    entry("compare-logits", "Compare two logits files of bench-model", compare_logits_cmd.run),
 };
 
 comptime {
@@ -52,7 +52,7 @@ pub fn dispatch(init: std.process.Init, stdout: *std.Io.File.Writer) !void {
 
 // -- helpers ----------------------------------------------------------------
 
-/// One table row. A function keeps the rows inside 100 columns.
-fn row(name: []const u8, summary: []const u8, handler: command.Handler) command.Subcommand {
+/// One table entry. A function keeps the entries inside 100 columns.
+fn entry(name: []const u8, summary: []const u8, handler: command.Handler) command.Subcommand {
     return .{ .name = name, .summary = summary, .handler = handler };
 }

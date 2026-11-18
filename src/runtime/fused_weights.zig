@@ -8,7 +8,8 @@
 //! Upload stage. One host buffer pair carries every weight to the device, because one pair per
 //! tensor creates and frees a host heap for each tensor. `plan` also finds the largest view of each
 //! arena, and `stageBytes` caps the pair at one swap chunk. A weight past the pair uploads in
-//! passes of whole rows, and the device gets the bytes of a whole-tensor upload.
+//! passes over the weights of whole outputs, and the device gets the bytes of a whole-tensor
+//! upload.
 //!
 //! Heaps. The `runner` debug log prints the usage and the budget of each memory heap before and
 //! after the upload. A device loss during the upload then has the heap state of its run beside it.
@@ -173,7 +174,7 @@ pub const WeightMemory = struct {
 
         // Each tensor view pads at most the offset alignment (256 bytes by the Vulkan limits), so
         // the padding stays under 1 MiB at `limits.max_layers`, inside the preflight reserve of
-        // every row of `limits.vram_shares`.
+        // every entry of `limits.vram_shares`.
         assert(self.viewBytes() <= planned);
         assert(self.heldBytes() <= planned + self.paddingBound());
     }
@@ -261,12 +262,12 @@ pub const WeightMemory = struct {
         defer gpa.free(q40_bytes);
 
         const in_features: usize = @intCast(output.shape[0]);
-        const row_bytes: u32 = @intCast((in_features / 32) * kernels.q4_0_block_bytes);
+        const bytes_per_output: u32 = @intCast((in_features / 32) * kernels.q4_0_block_bytes);
         const t40: Tensor = .{
             .dtype = .q4_0,
             .n_dims = 2,
             .shape = output.shape,
-            .byte_stride = .{ row_bytes, 0, 0, 0 },
+            .byte_stride = .{ bytes_per_output, 0, 0, 0 },
             .data = q40_bytes,
         };
         t40.assertValid();
@@ -351,7 +352,7 @@ test "upload stage: each buffer holds the largest view of its arena, at most one
     try testing.expectEqual(@as(u64, 4096), small.small);
     try testing.expectEqual(@as(u64, 1 << 20), small.quants);
 
-    // A Llama-8B Q8_0 lm_head holds 128256 rows of 4096 quants, past one chunk.
+    // A Llama-8B Q8_0 lm_head holds 128256 outputs of 4096 quants, past one chunk.
     const head: ArenaBytes = .{ .small = 128256 * 128 * 2, .quants = 128256 * 4096 };
     const capped = stageBytes(head, chunk);
     try testing.expectEqual(head.small, capped.small);

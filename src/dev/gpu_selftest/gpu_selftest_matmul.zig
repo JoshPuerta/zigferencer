@@ -80,9 +80,9 @@ fn matmulCheckDims(
 
     // Build the random weight and input.
     const a = ctx.arena;
-    const blocks_per_row = k / q80_block_values;
-    const row_bytes = blocks_per_row * q80_block_bytes;
-    const weight = try a.alloc(u8, n * row_bytes);
+    const blocks_per_output = k / q80_block_values;
+    const output_bytes = blocks_per_output * q80_block_bytes;
+    const weight = try a.alloc(u8, n * output_bytes);
     const input = try a.alloc(f32, @as(usize, b) * k);
 
     var prng = std.Random.DefaultPrng.init(0x6EA77 + @as(u64, b) * 1_000 + n);
@@ -95,7 +95,7 @@ fn matmulCheckDims(
         .dtype = .q8_0,
         .n_dims = 2,
         .shape = .{ k, n, 0, 0 },
-        .byte_stride = .{ row_bytes, 0, 0, 0 },
+        .byte_stride = .{ output_bytes, 0, 0, 0 },
         .data = weight,
     };
     const out_cpu = try a.alloc(f32, @as(usize, b) * n);
@@ -123,17 +123,17 @@ fn matmulCheckDims(
     return ok;
 }
 
-/// Build a synthetic Q8_0 weight in GGUF layout: `n` rows of `k/32` blocks, each block 34 bytes.
+/// Build a synthetic Q8_0 weight in GGUF layout: `n` outputs of `k/32` blocks, each block 34 bytes.
 /// Small random scales with full-range i8 quants give a realistic numeric spread.
 fn buildRandomQ80(r: std.Random, data: []u8, k: u32, n: u32) void {
-    const blocks_per_row = k / q80_block_values;
-    const row_bytes = blocks_per_row * q80_block_bytes;
-    std.debug.assert(data.len == @as(usize, n) * row_bytes);
+    const blocks_per_output = k / q80_block_values;
+    const output_bytes = blocks_per_output * q80_block_bytes;
+    std.debug.assert(data.len == @as(usize, n) * output_bytes);
 
     for (0..n) |j| {
-        const row_off = j * row_bytes;
-        for (0..blocks_per_row) |blk| {
-            const blk_off = row_off + blk * q80_block_bytes;
+        const output_off = j * output_bytes;
+        for (0..blocks_per_output) |blk| {
+            const blk_off = output_off + blk * q80_block_bytes;
             const scale: f16 = @floatCast(0.005 + 0.02 * r.float(f32));
             std.mem.writeInt(u16, data[blk_off..][0..2], @bitCast(scale), .little);
             for (0..q80_block_values) |i| {

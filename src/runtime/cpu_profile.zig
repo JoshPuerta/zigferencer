@@ -1,9 +1,9 @@
 //! The per-op CPU decode profile, shared by the CPU runners of both families.
 //!
-//! Rows. The ops of `layer_op.LayerOp` are the rows of both families, and a report groups them by
+//! Lines. The ops of `layer_op.LayerOp` are the lines of both families, and a report groups them by
 //! `OpClass`. A family times a fixed set of ops, and that set partitions one decode step: the timed
 //! brackets do not overlap, and together they cover the step. `CpuProfile` records its family, so
-//! the report prints only the rows of the family. Every Llama op is also a Qwen op.
+//! the report prints only the lines of the family. Every Llama op is also a Qwen op.
 //!
 //! Source. The runners open one `span.begin` scope per op. A caller installs `CpuProfile.sums`
 //! with `span.installSums` on the decode thread, and each closed op scope adds its time there.
@@ -61,7 +61,7 @@ pub const CpuProfile = struct {
 // -- api --------------------------------------------------------------------
 
 /// True for the ops that fan out on the pool: the matmuls, the attention, and the GDN step. The
-/// report labels the other rows serial.
+/// report labels the other lines serial.
 pub fn isParallel(op: LayerOp) bool {
     return switch (op.class()) {
         .matmul, .attention, .recurrent => true,
@@ -108,7 +108,7 @@ test "cpu profile: each family times a fixed op set" {
         const gpu_only = op == .stage_in or op == .readback;
         try std.testing.expectEqual(!gpu_only, usedBy(op, .llama) or usedBy(op, .qwen));
         if (usedBy(op, .llama)) {
-            // One op has one name, so a Llama row is also a Qwen row.
+            // One op has one name, so a Llama line is also a Qwen line.
             try std.testing.expect(usedBy(op, .qwen));
             llama += 1;
         }
@@ -122,7 +122,7 @@ test "cpu profile: each family times a fixed op set" {
     try std.testing.expectEqual(@as(u32, 20), qwen);
 }
 
-test "cpu profile: the parallel rows are the matmul, attention, and recurrent classes" {
+test "cpu profile: the parallel lines are the matmul, attention, and recurrent classes" {
     for (std.enums.values(LayerOp)) |op| {
         const pooled = op.class() == .matmul or op == .attention or op == .gdn;
         try std.testing.expectEqual(pooled, isParallel(op));

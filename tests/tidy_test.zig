@@ -795,7 +795,7 @@ test "the shape rules find a bare loop body, a long line, and a section out of p
         .{ .src = "fn f(a: bool) u32 {\n    return if (a) 1 else 2;\n}\n", .want = null },
         .{ .src = "// " ++ long ++ "\n", .want = .width },
         .{ .src = "test \"" ++ long ++ "\" {}\n", .want = .width },
-        .{ .src = "const rows = .{\n    .{ " ++ long ++ " },\n};\n", .want = .width },
+        .{ .src = "const entries = .{\n    .{ " ++ long ++ " },\n};\n", .want = .width },
         .{ .src = "const j = f(\"{\\\"" ++ long ++ "\\\"}\");\n", .want = .width },
         .{ .src = "// https://" ++ long ++ "\n", .want = null },
         .{ .src = "const s = .{\n    \"" ++ long ++ "\",\n};\n", .want = null },

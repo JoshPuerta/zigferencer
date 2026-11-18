@@ -58,7 +58,8 @@ const OpenAiLauncher = struct {
             .defaults = .init(defaults, sched_cfg.recommended_think, sched_cfg.recommended_plain),
             .think_forced_close = sched_cfg.think.force_len > 0,
         };
-        log.info("sampling defaults: {t}, think row temperature {d}, plain row temperature {d}", .{
+        log.info("sampling defaults: {t}, card think temperature {d}, " ++
+            "card plain temperature {d}", .{
             defaults, codec.defaults.think.temperature, codec.defaults.plain.temperature,
         });
 
@@ -113,7 +114,7 @@ const Flags = struct {
         },
         .sampling = args.Doc{
             .group = "requests",
-            .text = "sampling of the fields a request omits: model (the card row\n" ++
+            .text = "sampling of the fields a request omits: model (the card entry\n" ++
                 "of the thinking mode of the request) or greedy",
         },
         .max_sessions = args.Doc{

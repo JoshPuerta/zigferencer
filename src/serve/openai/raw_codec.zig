@@ -32,8 +32,8 @@ pub const RawCodec = struct {
     model_id: []const u8, // for response JSON + /v1/models
     max_seq: u32, // hard ceiling on a turn
     default_max_tokens: u32, // when a request omits a budget
-    /// The sampling of each omitted request field, one row per thinking mode.
-    defaults: map.DefaultRows = .greedy,
+    /// The sampling of each omitted request field, one entry per thinking mode.
+    defaults: map.DefaultEntries = .greedy,
     /// True when the scheduler holds a forced think close, so a budget above 0 can close the block.
     think_forced_close: bool = false,
 

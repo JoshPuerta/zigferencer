@@ -98,7 +98,7 @@ device. This mode is for logic and token streams:
 
 - Times mean nothing.
 - The subgroup-size pin stays off, because such a device holds fewer lanes.
-- A numeric check can differ. `gpu-selftest matmul` can report a row past its tolerance that a GPU
+- A numeric check can differ. `gpu-selftest matmul` can report a case past its tolerance that a GPU
   passes.
 - The faults of a GPU driver do not show, such as a lost device.
 

@@ -117,15 +117,15 @@ void main() {
     // A lane past the output tail must not return, because it still owns a column of LDS.
     bool lane_active = (n_out < params.n);
 
-    uint blocks_per_row = params.k / K_TILE;
-    uint words_per_row = params.k / 8u;  // 4 words (16 bytes) per block
+    uint blocks_per_output = params.k / K_TILE;
+    uint words_per_output = params.k / 8u;  // 4 words (16 bytes) per block
 
     float partials[B_TILE];
     for (uint i = 0u; i < B_TILE; ++i) {
         partials[i] = 0.0;
     }
 
-    for (uint blk = 0u; blk < blocks_per_row; ++blk) {
+    for (uint blk = 0u; blk < blocks_per_output; ++blk) {
         // Pass 1: stage one input column per lane. All lanes take part, tail lanes included.
         for (uint bi = 0u; bi < B_TILE; ++bi) {
             uint b = b_base + bi;
@@ -140,8 +140,8 @@ void main() {
 
         // Pass 2: dequantize the 32-weight block of this lane into registers from 4 uints.
         if (lane_active) {
-            float scale = float(scales_buf.data[n_out * blocks_per_row + blk]);
-            uint word_base = n_out * words_per_row + blk * 4u;
+            float scale = float(scales_buf.data[n_out * blocks_per_output + blk]);
+            uint word_base = n_out * words_per_output + blk * 4u;
 
             float q[K_TILE];
             for (uint i = 0u; i < 16u; ++i) {

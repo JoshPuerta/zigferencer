@@ -158,7 +158,7 @@ pub const UnknownFields = struct {
     }
 };
 
-/// The source of an omitted sampling field. `model` takes the card row of
+/// The source of an omitted sampling field. `model` takes the card entry of
 /// the resolved thinking mode, the vLLM priority. `greedy` keeps the greedy
 /// identity for every omitted field.
 pub const SamplingDefaults = enum {
@@ -170,13 +170,13 @@ pub const SamplingDefaults = enum {
     }
 };
 
-/// The default sampling row of each thinking mode. A model with no card has
-/// the greedy row in both modes.
-pub const DefaultRows = struct {
+/// The default sampling entry of each thinking mode. A model with no card has
+/// the greedy entry in both modes.
+pub const DefaultEntries = struct {
     think: protocol.Sampling,
     plain: protocol.Sampling,
 
-    pub const greedy: DefaultRows = .{
+    pub const greedy: DefaultEntries = .{
         .think = protocol.Sampling.greedy,
         .plain = protocol.Sampling.greedy,
     };
@@ -185,8 +185,8 @@ pub const DefaultRows = struct {
         mode: SamplingDefaults,
         card_think: protocol.Sampling,
         card_plain: protocol.Sampling,
-    ) DefaultRows {
-        // The engine has no frequency penalty, so a card row never carries one.
+    ) DefaultEntries {
+        // The engine has no frequency penalty, so a card entry never carries one.
         std.debug.assert(card_think.frequency_penalty == 0);
         std.debug.assert(card_plain.frequency_penalty == 0);
 
@@ -196,13 +196,13 @@ pub const DefaultRows = struct {
         };
     }
 
-    pub fn row(self: DefaultRows, think_open: bool) protocol.Sampling {
+    pub fn entry(self: DefaultEntries, think_open: bool) protocol.Sampling {
         return if (think_open) self.think else self.plain;
     }
 };
 
 /// The sampling fields as the request sent them. Null is an omitted field,
-/// which takes the default row of the resolved thinking mode.
+/// which takes the default entry of the resolved thinking mode.
 pub const SamplingFields = struct {
     temperature: ?f32 = null,
     top_k: ?u32 = null,
@@ -520,24 +520,24 @@ pub fn resolveTurn(
 }
 
 /// The sampling of one request: each field the request sent, else the field
-/// of the default row. `seed` is the request seed or a fresh draw.
+/// of the default entry. `seed` is the request seed or a fresh draw.
 pub fn resolveSampling(
     fields: SamplingFields,
-    row: protocol.Sampling,
+    entry: protocol.Sampling,
     seed: u64,
 ) protocol.Sampling {
-    std.debug.assert(row.frequency_penalty == 0);
+    std.debug.assert(entry.frequency_penalty == 0);
 
     if (fields.seed) |s| std.debug.assert(s == seed);
 
     const out: protocol.Sampling = .{
-        .temperature = fields.temperature orelse row.temperature,
-        .top_k = fields.top_k orelse row.top_k,
-        .top_p = fields.top_p orelse row.top_p,
+        .temperature = fields.temperature orelse entry.temperature,
+        .top_k = fields.top_k orelse entry.top_k,
+        .top_p = fields.top_p orelse entry.top_p,
         .seed = seed,
-        .presence_penalty = fields.presence_penalty orelse row.presence_penalty,
-        .repetition_penalty = fields.repetition_penalty orelse row.repetition_penalty,
-        .min_p = fields.min_p orelse row.min_p,
+        .presence_penalty = fields.presence_penalty orelse entry.presence_penalty,
+        .repetition_penalty = fields.repetition_penalty orelse entry.repetition_penalty,
+        .min_p = fields.min_p orelse entry.min_p,
     };
     // The binary wire guards hold, so no request value reaches a sampler assert.
     std.debug.assert(out.temperature >= 0);
@@ -1197,9 +1197,9 @@ const test_card_plain: protocol.Sampling = .{
     .repetition_penalty = 1.1,
 };
 
-test "resolveSampling: an omitted field takes the row of the resolved mode, a sent field wins" {
-    const rows: DefaultRows = .init(.model, test_card_think, test_card_plain);
-    const think = resolveSampling(.{}, rows.row(true), 9);
+test "resolveSampling: an omitted field takes the entry of the resolved mode, a sent field wins" {
+    const entries: DefaultEntries = .init(.model, test_card_think, test_card_plain);
+    const think = resolveSampling(.{}, entries.entry(true), 9);
     try std.testing.expectEqual(
         protocol.Sampling{
             .temperature = 0.6,
@@ -1210,7 +1210,7 @@ test "resolveSampling: an omitted field takes the row of the resolved mode, a se
         },
         think,
     );
-    const plain = resolveSampling(.{}, rows.row(false), 9);
+    const plain = resolveSampling(.{}, entries.entry(false), 9);
     try std.testing.expectEqual(
         protocol.Sampling{
             .temperature = 0.7,
@@ -1235,31 +1235,35 @@ test "resolveSampling: an omitted field takes the row of the resolved mode, a se
     };
     try std.testing.expectEqual(
         protocol.Sampling{ .temperature = 0, .top_k = 0, .top_p = 1, .seed = 5 },
-        resolveSampling(sent, rows.row(true), 5),
+        resolveSampling(sent, entries.entry(true), 5),
     );
-    const one = resolveSampling(.{ .min_p = 0.2 }, rows.row(true), 3);
+    const one = resolveSampling(.{ .min_p = 0.2 }, entries.entry(true), 3);
     try std.testing.expectEqual(@as(f32, 0.2), one.min_p);
     try std.testing.expectEqual(@as(f32, 0.6), one.temperature);
     try std.testing.expectEqual(@as(f32, 1.5), one.presence_penalty);
 }
 
 test "resolveSampling: greedy defaults keep every omitted field at the greedy identity" {
-    const rows: DefaultRows = .init(.greedy, test_card_think, test_card_plain);
+    const entries: DefaultEntries = .init(.greedy, test_card_think, test_card_plain);
     for ([_]bool{ true, false }) |open| {
-        const s = resolveSampling(.{}, rows.row(open), 11);
+        const s = resolveSampling(.{}, entries.entry(open), 11);
         try std.testing.expectEqual(
             protocol.Sampling{ .temperature = 0, .top_k = 0, .top_p = 1, .seed = 11 },
             s,
         );
     }
 
-    // A model with no card has the greedy rows under `model` too.
-    const no_card: DefaultRows = .init(.model, protocol.Sampling.greedy, protocol.Sampling.greedy);
-    try std.testing.expectEqual(DefaultRows.greedy, no_card);
+    // A model with no card has the greedy entries under `model` too.
+    const no_card: DefaultEntries = .init(
+        .model,
+        protocol.Sampling.greedy,
+        protocol.Sampling.greedy,
+    );
+    try std.testing.expectEqual(DefaultEntries.greedy, no_card);
     // A sent field still wins under the greedy defaults.
     try std.testing.expectEqual(
         @as(f32, 0.9),
-        resolveSampling(.{ .temperature = 0.9 }, rows.row(false), 1).temperature,
+        resolveSampling(.{ .temperature = 0.9 }, entries.entry(false), 1).temperature,
     );
     try std.testing.expectEqual(SamplingDefaults.greedy, SamplingDefaults.parse("greedy").?);
     try std.testing.expectEqual(SamplingDefaults.model, SamplingDefaults.parse("model").?);
@@ -1763,11 +1767,11 @@ fn checkChatMutation(_: void, seed: u64) anyerror!void {
                 );
                 continue;
             };
-            const rows = DefaultRows.init(.model, test_card_think, test_card_plain);
+            const entries = DefaultEntries.init(.model, test_card_think, test_card_plain);
             // The resolver asserts every range that the wire guards hold.
             _ = resolveSampling(
                 req.sampling,
-                rows.row(chat.thinkOpen(turn.kind)),
+                entries.entry(chat.thinkOpen(turn.kind)),
                 req.sampling.seed orelse 0,
             );
         }

@@ -7,8 +7,8 @@
 //!
 //! Paths. The reference path runs `step` per token at one thread with `max_rows = 0`, the shape of
 //! the per-token prefill. The chunked paths run chunks of 1, 17, and 64 rows over a 70-token
-//! prompt, so a chunk boundary falls inside and outside the 4-row groups of the batch kernel. Each
-//! chunked path runs at one thread and at four threads with the fan-out forced on.
+//! prompt, so a chunk is one row, an odd batch, or the full production chunk.
+//! Each chunked path runs at one thread and at four threads with the fan-out forced on.
 //!
 //! Fixtures. The SmolLM2 and Qwen3.5-2B fixtures come from `test_fixtures.path`.
 

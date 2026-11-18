@@ -793,8 +793,8 @@ pub fn faultReason() ?Fault {
 
 /// The name of the SPIR-V blob at `code`, or `unknown` for an address outside the table.
 pub fn shaderName(code: *const anyopaque) []const u8 {
-    for (kernels.spv_names) |row| {
-        if (row.code == code) return row.name;
+    for (kernels.spv_names) |spv_name| {
+        if (spv_name.code == code) return spv_name.name;
     }
 
     return shader_unknown;
@@ -1478,9 +1478,9 @@ test "a binding keeps the buffer size of its update after the buffer goes away" 
 test "a known blob address gives its name, and an unknown address gives unknown" {
     try testing.expect(kernels.spv_names.len > 0);
 
-    for (kernels.spv_names) |row| {
-        try testing.expectEqualStrings(row.name, shaderName(row.code));
-        try testing.expect(!std.mem.eql(u8, row.name, "unknown"));
+    for (kernels.spv_names) |spv_name| {
+        try testing.expectEqualStrings(spv_name.name, shaderName(spv_name.code));
+        try testing.expect(!std.mem.eql(u8, spv_name.name, "unknown"));
     }
 
     const elsewhere: u32 = 0;

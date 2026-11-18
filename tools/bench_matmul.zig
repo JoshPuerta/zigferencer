@@ -2,7 +2,7 @@
 //! kernel, and the batched (prefill) Q8_0 kernels. The matmul is the bandwidth-bound op that
 //! decides decode speed, so every variant reports GFLOP/s next to its relative error against
 //! `naive`, the scalar reference. `runQ80` owns the variant table and the eligibility report
-//! that the decode matmul rows share.
+//! that the decode matmul lines share.
 //!
 //! Comptime. `build_options.use_vulkan` gates the GPU code, so a CPU build never reads it.
 //!
@@ -14,18 +14,18 @@
 //! the source model, so each label states the shape alone.
 //!
 //! Skipped variants. A variant declines a case it cannot serve, such as an LDS-staged input
-//! kernel at k past the LDS capacity. The bench buffers a `skip(<reason>)` row and goes on.
+//! kernel at k past the LDS capacity. The bench buffers a `skip(<reason>)` line and goes on.
 //!
 //! Q4_0. Decode is bandwidth-bound, and Q4_0 reads about half the weight bytes of Q8_0. On the
 //! large shapes the Q4_0 GFLOP/s therefore reaches about 2x the Q8_0 GFLOP/s.
 //!
 //! Batched. `benchBatchedMatmul` runs B input rows per dispatch, so the weight streams once for
-//! B outputs. Compare its GFLOP/s against the decode `vk_q8_0_re` row to see the prefill
+//! B outputs. Compare its GFLOP/s against the decode `vk_q8_0_re` line to see the prefill
 //! amortization. It is GPU-only. The CPU reference is the naive kernel looped over the B rows.
 //!
 //! CPU batched. `benchBatchCpu` times `simd_pf.linearF32Q80Batch` on one thread at B = 1, 8, and
 //! 64 over four prefill shapes. The rel_err column holds the normwise error, `max |ref - got| /
-//! max |ref|` against `naive` over all rows of the call, and the row passes at the declared
+//! max |ref|` against `naive` over all rows of the call, and the line passes at the declared
 //! `requires.tolerance`. The max-relative error of `computeErrors` prints on a line below each
 //! case, because one cancelling output decides it.
 
@@ -39,10 +39,10 @@ const ops_vulkan = zigferencer.ops_vulkan;
 
 const bench_util = @import("bench_util.zig");
 const Case = bench_util.Case;
-const cpuRow = bench_util.cpuRow;
-const gpuRow = bench_util.gpuRow;
-const rawRow = bench_util.rawRow;
-const skipRow = bench_util.skipRow;
+const cpuLine = bench_util.cpuLine;
+const gpuLine = bench_util.gpuLine;
+const rawLine = bench_util.rawLine;
+const skipLine = bench_util.skipLine;
 const flush = bench_util.flush;
 const hashOut = bench_util.hashOut;
 const computeErrors = bench_util.computeErrors;
@@ -126,14 +126,14 @@ pub fn runQ80(gpa: std.mem.Allocator, io: std.Io, runner: anytype) !void {
         if (runner) |r| {
             variants_buf[n] = .{
                 .name = "vk_q8_0",
-                .desc = "GPU: 1 invocation per output row",
+                .desc = "GPU: 1 invocation per output",
                 .requires = zigferencer.ops_vulkan.LinearQ80.requires,
                 .kernel = .{ .gpu_q8_0 = &r.linear_q8_0 },
             };
             n += 1;
             variants_buf[n] = .{
                 .name = "vk_q8_0_re",
-                .desc = "GPU: workgroup-per-row LDS reduce",
+                .desc = "GPU: workgroup-per-output LDS reduce",
                 .requires = zigferencer.ops_vulkan.LinearQ80Reduce.requires,
                 .kernel = .{ .gpu_q8_0_reduce = &r.linear_q8_0_reduce },
             };
@@ -175,8 +175,8 @@ pub fn runQ80(gpa: std.mem.Allocator, io: std.Io, runner: anytype) !void {
         // kernels, and the `Q80Weight` upload for GPU kernels.
         std.debug.assert(c.in % 32 == 0);
 
-        const row_bytes = (c.in / 32) * 34;
-        const total_w_bytes = c.out * row_bytes;
+        const output_bytes = (c.in / 32) * 34;
+        const total_w_bytes = c.out * output_bytes;
 
         const input = try gpa.alignedAlloc(f32, .of(f32), c.in);
         defer gpa.free(input);
@@ -190,7 +190,7 @@ pub fn runQ80(gpa: std.mem.Allocator, io: std.Io, runner: anytype) !void {
             .dtype = .q8_0,
             .n_dims = 2,
             .shape = .{ @intCast(c.in), @intCast(c.out), 0, 0 },
-            .byte_stride = .{ @intCast(row_bytes), 0, 0, 0 },
+            .byte_stride = .{ @intCast(output_bytes), 0, 0, 0 },
             .data = w_bytes,
         };
 
@@ -238,7 +238,7 @@ pub fn runQ80(gpa: std.mem.Allocator, io: std.Io, runner: anytype) !void {
                 out,
             ) catch |e| switch (e) {
                 error.InFeaturesTooLargeForLdsKernel => {
-                    skipRow(c.label, v.name, "skip(lds)");
+                    skipLine(c.label, v.name, "skip(lds)");
                     continue;
                 },
                 else => return e,
@@ -254,7 +254,7 @@ pub fn runQ80(gpa: std.mem.Allocator, io: std.Io, runner: anytype) !void {
                 r.hash == hashOut(ref_out),
             );
             const status: []const u8 = if (ok) "ok" else "FAIL";
-            rawRow(c.label, v.name, r.ms, r.gflops, errs.rel, r.hash, status);
+            rawLine(c.label, v.name, r.ms, r.gflops, errs.rel, r.hash, status);
         }
 
         flush();
@@ -277,8 +277,8 @@ pub fn benchQ40(gpa: std.mem.Allocator, io: std.Io, runner: anytype) !void {
         // Build the fixtures.
         std.debug.assert(c.in % 32 == 0);
 
-        const row_bytes = (c.in / 32) * 18;
-        const total_w_bytes = c.out * row_bytes;
+        const output_bytes = (c.in / 32) * 18;
+        const total_w_bytes = c.out * output_bytes;
 
         const input = try gpa.alignedAlloc(f32, .of(f32), c.in);
         defer gpa.free(input);
@@ -292,7 +292,7 @@ pub fn benchQ40(gpa: std.mem.Allocator, io: std.Io, runner: anytype) !void {
             .dtype = .q4_0,
             .n_dims = 2,
             .shape = .{ @intCast(c.in), @intCast(c.out), 0, 0 },
-            .byte_stride = .{ @intCast(row_bytes), 0, 0, 0 },
+            .byte_stride = .{ @intCast(output_bytes), 0, 0, 0 },
             .data = w_bytes,
         };
 
@@ -302,7 +302,7 @@ pub fn benchQ40(gpa: std.mem.Allocator, io: std.Io, runner: anytype) !void {
         const work: f64 = @floatFromInt(c.in * c.out * f32_flops_per_mac);
         const scale = c.in * c.out;
 
-        // Time the CPU reference row, which every build runs.
+        // Time the CPU reference line, which every build runs.
         zigferencer.ops.linearF32Q40(input, w_tensor, ref_out);
         const ref_hash = hashOut(ref_out);
         const CpuQ4 = struct {
@@ -314,7 +314,7 @@ pub fn benchQ40(gpa: std.mem.Allocator, io: std.Io, runner: anytype) !void {
                 zigferencer.ops.linearF32Q40(self.input, self.w, self.out);
             }
         };
-        try cpuRow(
+        try cpuLine(
             io,
             scale,
             c.label,
@@ -324,7 +324,7 @@ pub fn benchQ40(gpa: std.mem.Allocator, io: std.Io, runner: anytype) !void {
             CpuQ4{ .input = input, .w = w_tensor, .out = ref_out },
         );
 
-        // Time the GPU row.
+        // Time the GPU line.
         if (comptime build_options.use_vulkan) {
             if (runner) |r| {
                 var gpu_weight = try ops_vulkan.Q80Weight.initQ40(
@@ -349,7 +349,7 @@ pub fn benchQ40(gpa: std.mem.Allocator, io: std.Io, runner: anytype) !void {
                         try self.r.linear_q4_0_reduce.dispatch(self.w, self.input, self.out);
                     }
                 };
-                try gpuRow(
+                try gpuLine(
                     io,
                     scale,
                     c.label,
@@ -391,11 +391,11 @@ pub fn benchBatchedMatmul(
         // Build the fixtures.
         std.debug.assert(c.in % 32 == 0);
 
-        const row_bytes = (c.in / 32) * 34;
+        const output_bytes = (c.in / 32) * 34;
         const input = try gpa.alignedAlloc(f32, .of(f32), B * c.in);
         defer gpa.free(input);
 
-        const w_bytes = try gpa.alignedAlloc(u8, .@"32", c.out * row_bytes);
+        const w_bytes = try gpa.alignedAlloc(u8, .@"32", c.out * output_bytes);
         defer gpa.free(w_bytes);
 
         // Fill the weight. The input rows get their own values below.
@@ -408,7 +408,7 @@ pub fn benchBatchedMatmul(
             .dtype = .q8_0,
             .n_dims = 2,
             .shape = .{ @intCast(c.in), @intCast(c.out), 0, 0 },
-            .byte_stride = .{ @intCast(row_bytes), 0, 0, 0 },
+            .byte_stride = .{ @intCast(output_bytes), 0, 0, 0 },
             .data = w_bytes,
         };
 
@@ -448,7 +448,7 @@ pub fn benchBatchedMatmul(
                 try self.k.runOneShot(self.input, self.w, self.b, self.in, self.out, self.o);
             }
         };
-        try gpuRow(
+        try gpuLine(
             io,
             scale,
             c.label,
@@ -483,7 +483,7 @@ pub fn benchBatchedMatmul(
                 try self.k.runOneShot(self.input, self.w, self.b, self.in, self.out, self.o);
             }
         };
-        try gpuRow(
+        try gpuLine(
             io,
             scale,
             c.label,
@@ -523,11 +523,11 @@ pub fn benchBatchCpu(gpa: std.mem.Allocator, io: std.Io) !void {
     for (cases) |c| {
         std.debug.assert(c.in % 32 == 0);
 
-        const row_bytes = (c.in / 32) * 34;
+        const output_bytes = (c.in / 32) * 34;
         const input = try gpa.alignedAlloc(f32, .of(f32), max_b * c.in);
         defer gpa.free(input);
 
-        const w_bytes = try gpa.alignedAlloc(u8, .@"32", c.out * row_bytes);
+        const w_bytes = try gpa.alignedAlloc(u8, .@"32", c.out * output_bytes);
         defer gpa.free(w_bytes);
 
         fillSyntheticInputAndWeight(input[0..c.in], w_bytes, c.in, c.out);
@@ -539,7 +539,7 @@ pub fn benchBatchCpu(gpa: std.mem.Allocator, io: std.Io) !void {
             .dtype = .q8_0,
             .n_dims = 2,
             .shape = .{ @intCast(c.in), @intCast(c.out), 0, 0 },
-            .byte_stride = .{ @intCast(row_bytes), 0, 0, 0 },
+            .byte_stride = .{ @intCast(output_bytes), 0, 0, 0 },
             .data = w_bytes,
         };
 
@@ -575,7 +575,7 @@ pub fn benchBatchCpu(gpa: std.mem.Allocator, io: std.Io) !void {
             const hsh = hashOut(out[0 .. b * c.out]);
             const work: f64 = @floatFromInt(b * c.in * c.out * f32_flops_per_mac);
             const t = try bench_util.timed(io, b * c.in * c.out, ctx);
-            bench_util.rawRow(
+            bench_util.rawLine(
                 c.label,
                 batch_names[bi],
                 t.ms,
@@ -690,14 +690,14 @@ fn fillSyntheticInputAndWeight(
         x.* = @sin(@as(f32, @floatFromInt(i)));
     }
 
-    const row_bytes = (in_features / 32) * 34;
-    for (0..out_features) |row| {
-        const off = row * row_bytes;
+    const output_bytes = (in_features / 32) * 34;
+    for (0..out_features) |j| {
+        const off = j * output_bytes;
         for (0..in_features / 32) |blk| {
             const blk_off = off + blk * 34;
             std.mem.writeInt(u16, w_bytes[blk_off..][0..2], 0x3c00, .little);
             for (0..32) |i| {
-                const v_i32: i32 = @as(i32, @intCast((row + blk * 32 + i) % 13)) - 6;
+                const v_i32: i32 = @as(i32, @intCast((j + blk * 32 + i) % 13)) - 6;
                 const v: i8 = @intCast(v_i32);
                 w_bytes[blk_off + 2 + i] = @bitCast(v);
             }
@@ -716,16 +716,16 @@ fn fillSyntheticInputAndWeightQ4(
         x.* = @sin(@as(f32, @floatFromInt(i)));
     }
 
-    const row_bytes = (in_features / 32) * 18;
-    for (0..out_features) |row| {
-        const off = row * row_bytes;
+    const output_bytes = (in_features / 32) * 18;
+    for (0..out_features) |j| {
+        const off = j * output_bytes;
         for (0..in_features / 32) |blk| {
             const blk_off = off + blk * 18;
             std.mem.writeInt(u16, w_bytes[blk_off..][0..2], 0x3c00, .little); // fp16 1.0
             for (0..16) |i| {
                 // Pack two 4-bit nibbles per byte, each in [0, 15].
-                const lo: u8 = @intCast((row + blk * 16 + i) % 16);
-                const hi: u8 = @intCast((row + blk * 16 + i + 7) % 16);
+                const lo: u8 = @intCast((j + blk * 16 + i) % 16);
+                const hi: u8 = @intCast((j + blk * 16 + i + 7) % 16);
                 w_bytes[blk_off + 2 + i] = lo | (hi << 4);
             }
         }

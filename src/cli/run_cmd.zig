@@ -3,7 +3,7 @@
 //! stdout. Decoding is greedy, so the output is deterministic. `--chat` wraps the prompt with the
 //! chat template of the model.
 //!
-//! Comptime. `inline else` turns the architecture into a family row once, so the rest is generic.
+//! Comptime. `inline else` turns the architecture into a family entry once, so the rest is generic.
 //!
 //! Placement. No `--gpu-layers` flag runs the whole-model fused path. A zero pin runs the CPU
 //! runner with no device context. A pin of one layer or more, or auto, sizes a split. A split with

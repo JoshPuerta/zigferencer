@@ -70,7 +70,7 @@ clean: ## Remove .zig-cache and zig-out
 run: build ## Build, then run the developer binary: make run ARGS="bench-model MODEL"
 	$(DEV) $(ARGS)
 
-bench: ## Run the op micro-benchmarks. A GPU BACKEND adds the GPU rows
+bench: ## Run the op micro-benchmarks. A GPU BACKEND adds the GPU lines
 	$(ZIG) build bench -Doptimize=$(OPT) $(CONFIG) -- $(ARGS)
 
 simd-report: ## Print the SIMD width of each op, or the assembly of the kernels in ARGS

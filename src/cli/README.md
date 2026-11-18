@@ -123,8 +123,8 @@ A command that runs a model takes four steps:
   empty codes, so a piped run or a `$NO_COLOR` run prints plain text with no
   branch at any call site.
 - A command branches on the model family once, with an `inline else` switch over
-  `family.Of`. A new family adds one row in `resolve/family.zig`, and the build fails
-  until the row is complete.
+  `family.Of`. A new family adds one entry in `resolve/family.zig`, and the build fails
+  until the entry is complete.
 - A handler exchanges values, never handles. It takes the immutable `Context`,
   resolves a `*const registry.Model`, and passes `ModelCard`, `Vocab`,
   `KvPlan`, and result structs to the layers below.

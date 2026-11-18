@@ -3,7 +3,7 @@
 // What
 //   This kernel has the result shape of `linear_q8_0.comp` and a different work assignment. That
 //   kernel gives one invocation to an output j. This one gives one workgroup to an output j, with
-//   32 lanes that sum the row together. That is 32 times more workgroups for the same n and 32
+//   32 lanes that sum the output together. That is 32 times more workgroups for the same n and 32
 //   times less work per lane. It wins when n is small enough that the per-invocation kernel has
 //   too few workgroups to keep the WGPs busy.
 //
@@ -13,13 +13,13 @@
 //     partial[L] = sum_{blk % 32 = L} input[blk] . dequant(weight[j][blk])
 //     out[j]     = sum_{L in 0..31} partial[L]
 //
-//   Each block belongs to exactly one lane, so the partials cover the row once.
+//   Each block belongs to exactly one lane, so the partials cover the output once.
 //
 // Schedule
 //   grid       (min(n, GRID_X), ceil(n / GRID_X), 1)
 //   workgroup  32 lanes. One workgroup owns one output j = gl_WorkGroupID.y * GRID_X +
 //              gl_WorkGroupID.x, so a vocabulary past one axis of the grid folds onto y.
-//   lane       Lane L owns the weight blocks L, L + 32, L + 64, ... of row j.
+//   lane       Lane L owns the weight blocks L, L + 32, L + 64, ... of output j.
 //
 //     lane L sums blocks L, L+32, L+64, ...     (strided, so a wave reads one run)
 //           \____________ 32 lane partials ____________/
@@ -43,8 +43,8 @@
 //   those loads can share a line, and 128 bytes apart in the input.
 //   Pass 2: the reduction is a sequential lane-0 sum of 32 partials. A log-N tree saves little at
 //   32 elements.
-//   Tails: the last grid row can hold workgroups past n. Such a workgroup still stores a zero
-//   partial and reaches the barrier, so every lane leaves through the same barrier.
+//   Tails: the workgroups at the last y of the grid can lie past n. Such a workgroup still
+//   stores a zero partial and reaches the barrier, so every lane leaves through the same barrier.
 //
 // Numerics
 //   Tolerance: `LinearQ80Reduce` declares `.relative = 2e-4`. f32 add is not associative, so the
@@ -113,14 +113,14 @@ void main() {
         return;
     }
 
-    uint blocks_per_row = params.k / 32u;
-    uint words_per_row = params.k / 4u;
+    uint blocks_per_output = params.k / 32u;
+    uint words_per_output = params.k / 4u;
 
     // Pass 1: sum the strided blocks of this lane.
     float partial = 0.0;
-    for (uint blk = local; blk < blocks_per_row; blk += 32u) {
-        float scale = float(scales_buf.data[j * blocks_per_row + blk]);
-        uint word_base = j * words_per_row + blk * 8u;
+    for (uint blk = local; blk < blocks_per_output; blk += 32u) {
+        float scale = float(scales_buf.data[j * blocks_per_output + blk]);
+        uint word_base = j * words_per_output + blk * 8u;
 
         for (uint i = 0u; i < 32u; ++i) {
             float in_v = input_buf.data[blk * 32u + i];

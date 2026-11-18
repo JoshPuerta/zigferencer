@@ -109,7 +109,7 @@ pool, and `core/ring_fsm.zig` holds its slot table. No runner drives it.
 - **Declared tolerance, never a guessed one.** `wrap.requires.tolerance` is `.relative = 2e-3`, the
   loosest per-op value with a cushion. No op in the chain widens the drift past its own declared
   value. `VecAdd`, `ResidualAdd`, `LinearQ80`, and `KvCommitF16` declare `.bit_exact`. The rest
-  declare a measured `.relative` value that `tools/bench.zig` checks per row. `QwenQkNorm` is the
+  declare a measured `.relative` value that `tools/bench.zig` checks per line. `QwenQkNorm` is the
   one kernel struct with no `requires`, and the token-hash gates cover it.
 - **`Pipeline.init` asserts its inputs.** The SPIR-V length must be a multiple of four. The binding
   count must be at least one. The push-constant size must be a multiple of four and at least four. A

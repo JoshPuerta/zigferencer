@@ -563,12 +563,12 @@ pub fn bindTensors(
             };
         }
 
-        // Check that the row holds whole blocks and size the tensor.
+        // Check that one run of the first axis holds whole blocks and size the tensor.
         const block = dtype.blockSize(ti.dtype);
         if (shape32[0] % block != 0) {
             refuse(
                 refusal_level,
-                "{s}: tensor {s} has a row of {d} elements, " ++
+                "{s}: tensor {s} has a first dimension of {d} elements, " ++
                     "which is not a multiple of the {d}-element block of its dtype",
                 .{
                     file, ti.name, shape32[0], block,
@@ -577,7 +577,8 @@ pub fn bindTensors(
             return error.BadTensorShape;
         }
 
-        // Every axis past the row counts whole rows, so the tensor is a whole number of blocks.
+        // Every axis past the first counts whole runs of the first axis, so the tensor is a
+        // whole number of blocks.
         const total_bytes = dtype.bytesForNumelChecked(ti.dtype, numel) orelse {
             refuse(
                 refusal_level,
@@ -586,8 +587,8 @@ pub fn bindTensors(
             );
             return error.TensorSizeOverflow;
         };
-        const row_bytes = dtype.bytesForNumelChecked(ti.dtype, shape32[0]).?;
-        std.debug.assert(row_bytes <= total_bytes);
+        const stride_bytes = dtype.bytesForNumelChecked(ti.dtype, shape32[0]).?;
+        std.debug.assert(stride_bytes <= total_bytes);
 
         // Check that the byte range lies inside the file.
         const start = std.math.add(u64, parsed.data_offset, ti.offset_in_data) catch {
@@ -640,11 +641,11 @@ pub fn bindTensors(
         }
 
         // Build the tensor.
-        const stride = std.math.cast(u32, row_bytes) orelse {
+        const stride = std.math.cast(u32, stride_bytes) orelse {
             refuse(
                 refusal_level,
-                "{s}: tensor {s} has a row of {d} bytes, which passes the 32-bit stride limit",
-                .{ file, ti.name, row_bytes },
+                "{s}: tensor {s} has a stride of {d} bytes, which passes the 32-bit stride limit",
+                .{ file, ti.name, stride_bytes },
             );
             return error.TensorSizeOverflow;
         };
@@ -1246,7 +1247,7 @@ test "cardFromParsed: each card rule refuses a file value that breaks it" {
         .{ .arch = .llama, .edit = &E.freqBaseNan, .want = bad },
         .{ .arch = .llama, .edit = &E.freqBaseInf, .want = bad },
     };
-    // Every row runs, so one failure does not hide the next.
+    // Every case runs, so one failure does not hide the next.
     var failed: u32 = 0;
     for (cases, 0..) |c, i| {
         expectCardCase(c) catch {
@@ -1264,7 +1265,7 @@ const BindCase = struct {
     data_offset: u64 = 0,
     offset_in_data: u64 = 0,
     file_len: usize = bind_capacity,
-    /// Null binds, with the row stride and the byte length below.
+    /// Null binds, with the stride and the byte length below.
     want: ?Error = null,
     stride: u32 = 0,
     len: usize = 0,
@@ -1273,7 +1274,7 @@ const BindCase = struct {
 const bind_capacity = 256;
 
 /// One tensor descriptor binds over a 16-byte aligned file of `file_len`
-/// bytes, or it fails with the row's error.
+/// bytes, or it fails with the error of the case.
 fn checkBind(c: BindCase) !void {
     var file: [bind_capacity]u8 align(16) = @splat(0);
     var shape: [4]u64 = .{ 1, 1, 1, 1 };
@@ -1304,7 +1305,7 @@ fn checkBind(c: BindCase) !void {
     try std.testing.expectEqual(c.len, refs[0].tensor.data.len);
 }
 
-test "bindTensors: a descriptor binds inside the file at its row stride, or fails typed" {
+test "bindTensors: a descriptor binds inside the file at its stride, or fails typed" {
     const max_u32: u64 = std.math.maxInt(u32);
     const max_u64: u64 = std.math.maxInt(u64);
     const overflow = error.TensorSizeOverflow;
@@ -1371,7 +1372,7 @@ test "bindTensors: a tensor that starts inside the tensor before it refuses" {
 
 /// A random mutation of the parser sample: byte writes in the header, the metadata pairs, and the
 /// tensor table, one 8-byte edge value, and one cut. `parse` then `bindTensors` gives a typed
-/// error, or tensors inside the bytes with a row stride that tiles the data and an aligned start.
+/// error, or tensors inside the bytes with a stride that tiles the data and an aligned start.
 fn checkParseBind(sample: *const parser.Sample, seed: u64) anyerror!void {
     var prng = std.Random.DefaultPrng.init(seed);
     const r = prng.random();

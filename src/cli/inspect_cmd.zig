@@ -331,7 +331,7 @@ fn printTensorStructure(w: *std.Io.Writer, arena: Allocator, loaded: *const load
         try printIndexRanges(w, members.items);
         try w.writeAll("):\n");
         for (roles) |rr| {
-            try printTensorRow(w, rr.role, rr.tensor);
+            try printTensorLine(w, rr.role, rr.tensor);
         }
     }
 }
@@ -345,7 +345,7 @@ fn printGlobals(w: *std.Io.Writer, tensors: []const loader.TensorRef, embedding:
         const is_embd = std.mem.startsWith(u8, ref.name, "token_embd");
         if (is_embd != embedding) continue;
 
-        try printTensorRow(w, ref.name, ref.tensor);
+        try printTensorLine(w, ref.name, ref.tensor);
         n += 1;
     }
 
@@ -395,7 +395,7 @@ fn printIndexRanges(w: *std.Io.Writer, idx: []const u32) !void {
     }
 }
 
-fn printTensorRow(w: *std.Io.Writer, label: []const u8, t: Tensor) !void {
+fn printTensorLine(w: *std.Io.Writer, label: []const u8, t: Tensor) !void {
     const type_name = std.enums.tagName(dtype.GgmlType, t.dtype) orelse "unknown";
     try w.print("  {s:<24} {s:<5} ", .{ label, type_name });
     try printShape(w, t);

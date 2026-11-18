@@ -3,14 +3,14 @@
 // What
 //   This is the correctness-gate kernel, written for bit-exactness and not for speed. It validates
 //   the GPU stack against the token-hash gate, with the same matvec as `linearF32Q80` in
-//   ops/naive.zig. One invocation computes one output j, with no intra-row reduction, no LDS
+//   ops/naive.zig. One invocation computes one output j, with no intra-output reduction, no LDS
 //   tiling, and no subgroup op. The faster variants, which stage the input in LDS, reduce across
 //   the subgroup, or block the GEMM in registers, are the sibling `linear_q8_0_*` shaders.
 //
 // Hardware
 //   Waves: the workgroup is 32 lanes, one wave32 wave with every lane active and no fragmentation.
 //   The grid is (ceil(n / 32), 1, 1). The out_features of Llama, 4k to 128k, give enough waves to
-//   keep the WGPs fed even at this thread-per-row pattern with no data sharing.
+//   keep the WGPs fed even at this thread-per-output pattern with no data sharing.
 //
 // Numerics
 //   Bit-exact: the kernel runs the scalar loop of `linearF32Q80`, block-major and element-minor,
@@ -66,14 +66,14 @@ void main() {
     uint j = gl_GlobalInvocationID.x;
     if (j >= params.n) return;
 
-    uint blocks_per_row = params.k / 32u;
-    uint words_per_row = params.k / 4u;  // 4 i8 per u32
+    uint blocks_per_output = params.k / 32u;
+    uint words_per_output = params.k / 4u;  // 4 i8 per u32
 
     precise float sum = 0.0;
 
-    for (uint blk = 0u; blk < blocks_per_row; ++blk) {
-        precise float scale = float(scales_buf.data[j * blocks_per_row + blk]);
-        uint word_base = j * words_per_row + blk * 8u;  // 8 u32 words hold the 32 quants
+    for (uint blk = 0u; blk < blocks_per_output; ++blk) {
+        precise float scale = float(scales_buf.data[j * blocks_per_output + blk]);
+        uint word_base = j * words_per_output + blk * 8u;  // 8 u32 words hold the 32 quants
 
         for (uint i = 0u; i < 32u; ++i) {
             precise float in_v = input_buf.data[blk * 32u + i];

@@ -2421,9 +2421,9 @@ test "kvPlan: a named window is refused past the model ceiling, an unnamed one s
 }
 
 test "defaultWindow: the registry models get their byte-budget windows" {
-    // One row per registry shape at its registry KV dtype. The run budget is
+    // One case per registry shape at its registry KV dtype. The run budget is
     // 2147483648 bytes and the serve budget 134217728.
-    const Row = struct {
+    const Case = struct {
         shape: KvShape,
         kv_dtype: dtype.KvDtype,
         declared: u32,
@@ -2443,7 +2443,7 @@ test "defaultWindow: the registry models get their byte-budget windows" {
     };
     var qwen_9b = qwen_2b;
     qwen_9b.time_step_rank = 32;
-    const rows = [_]Row{
+    const cases = [_]Case{
         // SmolLM2-135M at f32: `2 * 30 * 192 * 4 = 46080` bytes a token.
         // `2147483648 / 46080 = 46603` rounds down to 46592, which the 8192
         // ceiling cuts, and `134217728 / 46080 = 2912` rounds down to 2816.
@@ -2521,24 +2521,24 @@ test "defaultWindow: the registry models get their byte-budget windows" {
             .serve = 4096,
         },
     };
-    for (rows) |row| {
-        const cost = costModel(row.shape, row.kv_dtype);
-        try std.testing.expectEqual(row.cost, cost.kv_bytes_per_token);
-        try std.testing.expectEqual(row.fixed, cost.fixed_state_bytes_per_slot);
-        const ceiling = limits.contextCeiling(row.declared, row.override);
-        try std.testing.expectEqual(row.ceiling, ceiling);
+    for (cases) |case| {
+        const cost = costModel(case.shape, case.kv_dtype);
+        try std.testing.expectEqual(case.cost, cost.kv_bytes_per_token);
+        try std.testing.expectEqual(case.fixed, cost.fixed_state_bytes_per_slot);
+        const ceiling = limits.contextCeiling(case.declared, case.override);
+        try std.testing.expectEqual(case.ceiling, ceiling);
         try std.testing.expectEqual(
-            row.run,
+            case.run,
             defaultWindow(cost, ceiling, limits.run_session_kv_bytes),
         );
         try std.testing.expectEqual(
-            row.serve,
+            case.serve,
             defaultWindow(cost, ceiling, limits.serve_session_kv_bytes),
         );
         // No registry model gets a window under 8192 for `run` or under 512
         // per serve session.
-        try std.testing.expect(row.run >= 8192);
-        try std.testing.expect(row.serve >= 512);
+        try std.testing.expect(case.run >= 8192);
+        try std.testing.expect(case.serve >= 512);
     }
 }
 
@@ -2685,9 +2685,9 @@ test "largestFittingWindow: the widest fit sits between the floor and the refuse
     );
 }
 
-test "largestFittingWindow: the translation-layer row uses three quarters of the budget" {
-    // 8000000 available bytes leave 6000000 usable on that row. A 5500000 reservation leaves
-    // 500000, which holds 500 tokens. The default row leaves 1500000, past the refused window.
+test "largestFittingWindow: the translation-layer entry uses three quarters of the budget" {
+    // 8000000 available bytes leave 6000000 usable on that entry. A 5500000 reservation leaves
+    // 500000, which holds 500 tokens. The default entry leaves 1500000, past the refused window.
     const cost: KvCostModel = .{ .kv_bytes_per_token = 1000 };
     try std.testing.expectEqual(
         @as(?u32, 500),
@@ -3937,7 +3937,7 @@ test "planLayerSplit: the RAM vector, and both staging buffers at high water" {
     try std.testing.expectEqual(@as(u64, 96), bridge.kv_host);
     try std.testing.expectEqual(@as(u64, 192), bridge.ram.swap_stages);
 
-    // The f16 companion row of the same bridge: 2 elements per row at 2 bytes
+    // The f16 companion of the same bridge: 2 elements per row at 2 bytes
     // halve the per-layer figure to 8, and every framing figure halves with it.
     const bridge_kv_f16: KvStructure = .{
         .n_slots = 1,

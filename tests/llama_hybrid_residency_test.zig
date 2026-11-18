@@ -46,8 +46,8 @@ const tensor_lookup = zigferencer.tensor_lookup;
 const vocab_mod = zigferencer.vocab;
 const vulkan_ctx = zigferencer.vulkan_ctx;
 
-const LlamaRow = zigferencer.family.Of(.llama);
-const LlamaHybrid = LlamaRow.Hybrid;
+const LlamaEntry = zigferencer.family.Of(.llama);
+const LlamaHybrid = LlamaEntry.Hybrid;
 const LlamaCpu = zigferencer.family.Of(.llama).Cpu;
 const Sessions = zigferencer.session.Sessions;
 
@@ -387,14 +387,14 @@ test "llama hybrid swap: a fork decodes beside its source" {
 }
 
 test "llama hybrid provenance: the tag names the split, the quant, and the dtype" {
-    var buf_15: [LlamaRow.hybrid_tag_buf_len]u8 = undefined;
-    var buf_16: [LlamaRow.hybrid_tag_buf_len]u8 = undefined;
-    var buf_q4: [LlamaRow.hybrid_tag_buf_len]u8 = undefined;
-    var buf_f16: [LlamaRow.hybrid_tag_buf_len]u8 = undefined;
-    const at_15 = LlamaRow.hybridBackendTag(&buf_15, 15, .q8_0, .f32);
-    const at_16 = LlamaRow.hybridBackendTag(&buf_16, 16, .q8_0, .f32);
-    const at_15_q4 = LlamaRow.hybridBackendTag(&buf_q4, 15, .q4_0, .f32);
-    const at_15_f16 = LlamaRow.hybridBackendTag(&buf_f16, 15, .q8_0, .f16);
+    var buf_15: [LlamaEntry.hybrid_tag_buf_len]u8 = undefined;
+    var buf_16: [LlamaEntry.hybrid_tag_buf_len]u8 = undefined;
+    var buf_q4: [LlamaEntry.hybrid_tag_buf_len]u8 = undefined;
+    var buf_f16: [LlamaEntry.hybrid_tag_buf_len]u8 = undefined;
+    const at_15 = LlamaEntry.hybridBackendTag(&buf_15, 15, .q8_0, .f32);
+    const at_16 = LlamaEntry.hybridBackendTag(&buf_16, 16, .q8_0, .f32);
+    const at_15_q4 = LlamaEntry.hybridBackendTag(&buf_q4, 15, .q4_0, .f32);
+    const at_15_f16 = LlamaEntry.hybridBackendTag(&buf_f16, 15, .q8_0, .f16);
 
     // The split, the quant and the KV dtype are the three parts of a tag,
     // and each one alone must move the tag.
@@ -436,22 +436,22 @@ test "llama hybrid provenance: a foreign tag is another namespace" {
     var dirbuf: [128]u8 = undefined;
     const dir = try std.fmt.bufPrint(&dirbuf, ".zig-cache/tmp/{s}/hybrid", .{&tmp.sub_path});
 
-    var buf_mine: [LlamaRow.hybrid_tag_buf_len]u8 = undefined;
-    var buf_theirs: [LlamaRow.hybrid_tag_buf_len]u8 = undefined;
-    var buf_half: [LlamaRow.hybrid_tag_buf_len]u8 = undefined;
+    var buf_mine: [LlamaEntry.hybrid_tag_buf_len]u8 = undefined;
+    var buf_theirs: [LlamaEntry.hybrid_tag_buf_len]u8 = undefined;
+    var buf_half: [LlamaEntry.hybrid_tag_buf_len]u8 = undefined;
     const model_fp = prompt_cache.modelFingerprint("smollm2-135m", 145_000_000);
     const mine = prompt_cache.backendFingerprint(
         model_fp,
-        LlamaRow.hybridBackendTag(&buf_mine, 15, .q8_0, .f32),
+        LlamaEntry.hybridBackendTag(&buf_mine, 15, .q8_0, .f32),
     );
     const theirs = prompt_cache.backendFingerprint(
         model_fp,
-        LlamaRow.hybridBackendTag(&buf_theirs, 16, .q8_0, .f32),
+        LlamaEntry.hybridBackendTag(&buf_theirs, 16, .q8_0, .f32),
     );
     // The same split at the other KV dtype. A blob that crosses the dtype lands wrong bytes.
     const half = prompt_cache.backendFingerprint(
         model_fp,
-        LlamaRow.hybridBackendTag(&buf_half, 15, .q8_0, .f16),
+        LlamaEntry.hybridBackendTag(&buf_half, 15, .q8_0, .f16),
     );
 
     const seq = [_]u32{ 1, 2, 3, 4 };

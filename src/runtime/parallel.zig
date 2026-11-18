@@ -1,7 +1,7 @@
-//! Row-parallel matmul dispatcher over the fork-join `Pool`. It wraps a linear-kernel function
+//! Output-parallel matmul dispatcher over the fork-join `Pool`. It wraps a linear-kernel function
 //! pointer. When serial (one pool thread), below the FLOPs floor, or with fewer than two units, it
 //! calls the kernel directly, at zero overhead: no pool touch, no alloc, no sync. Otherwise it
-//! splits the output rows into units and runs them on the pool.
+//! splits the outputs into units and runs them on the pool.
 //!
 //! Comptime. `E` and `Kernels` make the fan-out generic, so f32 and f16 share one body.
 //!
@@ -9,7 +9,7 @@
 //! spread their work units over the same pool, with the same gate, `Policy.parts`.
 //!
 //! Determinism. The dispatcher is bit-deterministic across thread counts. Exactly one unit
-//! computes each output row in the reduction order of the kernel. The bench token hash therefore
+//! computes each output in the reduction order of the kernel. The bench token hash therefore
 //! holds across thread counts. `--threads N`, `--min-parallel-flops F`, and `--spin-us N` override
 //! the defaults.
 //!
@@ -27,12 +27,12 @@
 //! dual-channel desktop between 4 and 8 threads, and prefill keeps gaining to 8. The default thread
 //! count stops at 8 to keep sustained load off the rest of the cores. `--threads N` raises it.
 //!
-//! Matmul units. The partition stays over output rows, not the batch. Each unit streams a disjoint
+//! Matmul units. The partition stays over outputs, not the batch. Each unit streams a disjoint
 //! weight chunk once for all rows, which is bandwidth-optimal. A batch partition streams the full
 //! weight per thread, the traffic that batching exists to remove. A unit is a chunk of
-//! `matmulUnitRows` output rows, about four units per participant, so a participant that finishes
+//! `matmulUnitOutputs` outputs, about four units per participant, so a participant that finishes
 //! early claims more. The chunk size is a function of the shape and the pool size. It never
-//! changes a bit, because the kernels give a row the same bits at every chunk boundary.
+//! changes a bit, because the kernels give an output the same bits at every chunk boundary.
 //!
 //! Attention units. The geometry of `attn_cpu` splits the row into `c = attn_cpu.partCount(t_len)`
 //! parts. A unit is one KV group over one part, so the row holds `n_kv_heads * c` units. Unit `u`
@@ -52,7 +52,7 @@
 //! the flat gate buffer. Any partition gives the bits of the serial op.
 //!
 //! Weight slices. `Tensor.byte_stride` carries per-axis strides, but the kernels compute the bytes
-//! of one output row as the data length divided by the output count (`shape[1]`). The slice math
+//! of one output as the data length divided by the output count (`shape[1]`). The slice math
 //! uses the same rule, so it works for f32, Q8_0, and any dtype added later.
 //!
 //! To fan out a new op on the pool, do these steps:
@@ -99,7 +99,7 @@ const sibling_text_max: usize = 48;
 
 /// A batched linear kernel: `out = input @ weight.T` with weight in `[in, out]` (GGUF row-major).
 /// Row b reads `inputs[b*in ..]` and writes `outs[b*out_stride ..][0..out]`.
-/// `out_stride` lets a kernel that gets a weight-row slice still write full-width rows.
+/// `out_stride` lets a kernel that gets a slice of the outputs still write full-width rows.
 pub const LinearBatchKernel = *const fn (
     inputs: []const f32,
     weight: Tensor,
@@ -177,7 +177,8 @@ pub const PoolError = pool_mod.InitError || error{TooManyThreads};
 /// The flag values that `resolve` refuses.
 pub const ResolveError = error{ TooManyThreads, SpinTooLong };
 
-/// The inputs of one matmul. Unit `u` covers the output rows `[u * rows, min(n, (u + 1) * rows))`.
+/// The inputs of one matmul. Unit `u` covers the outputs
+/// `[u * outputs_per_unit, min(n, (u + 1) * outputs_per_unit))`.
 const MatmulUnits = struct {
     kernel: LinearBatchKernel,
     inputs: []const f32,
@@ -185,13 +186,13 @@ const MatmulUnits = struct {
     outs: []f32,
     batch: usize,
     n: usize,
-    rows: usize,
+    outputs_per_unit: usize,
 
     fn unit(self: *const MatmulUnits, u: u32) void {
-        const start = @as(usize, u) * self.rows;
+        const start = @as(usize, u) * self.outputs_per_unit;
         std.debug.assert(start < self.n);
-        const end = @min(self.n, start + self.rows);
-        const slice = sliceWeightRows(self.weight, start, end);
+        const end = @min(self.n, start + self.outputs_per_unit);
+        const slice = sliceWeightOutputs(self.weight, start, end);
         self.kernel(self.inputs, slice, self.outs[start..], self.batch, self.n);
     }
 };
@@ -440,8 +441,8 @@ pub fn linearBatch(
     const threads = pool.threads();
     std.debug.assert(@max(policy.n_threads, 1) == threads);
     const flops: u64 = 2 * @as(u64, k) * @as(u64, n) * @as(u64, batch);
-    const rows = matmulUnitRows(n, threads);
-    const n_units = std.math.divCeil(usize, n, rows) catch unreachable;
+    const outputs_per_unit = matmulUnitOutputs(n, threads);
+    const n_units = std.math.divCeil(usize, n, outputs_per_unit) catch unreachable;
 
     // Call the kernel directly when one participant is enough.
     const parts = policy.parts(threads, n_units, flops);
@@ -454,10 +455,10 @@ pub fn linearBatch(
         return;
     }
 
-    // Run the row chunks on the pool.
+    // Run the output chunks on the pool.
     log.debug(
-        "linearBatch fanout: {d} parts, {d} units of {d} rows over n {d}, batch {d}, flops {d}",
-        .{ parts, n_units, rows, n, batch, flops },
+        "linearBatch fanout: {d} parts, {d} units of {d} outputs over n {d}, batch {d}, flops {d}",
+        .{ parts, n_units, outputs_per_unit, n, batch, flops },
     );
     const ctx: MatmulUnits = .{
         .kernel = kernel,
@@ -466,21 +467,21 @@ pub fn linearBatch(
         .outs = outs,
         .batch = batch,
         .n = n,
-        .rows = rows,
+        .outputs_per_unit = outputs_per_unit,
     };
     pool.run(MatmulUnits, &ctx, MatmulUnits.unit, @intCast(n_units), parts);
 }
 
-/// The output rows of one matmul unit: `ceil(n / (4 * threads))` rounded up to a multiple of 4.
-pub fn matmulUnitRows(n: usize, threads: u32) usize {
+/// The outputs of one matmul unit: `ceil(n / (4 * threads))` rounded up to a multiple of 4.
+pub fn matmulUnitOutputs(n: usize, threads: u32) usize {
     std.debug.assert(n > 0);
     std.debug.assert(threads >= 1);
 
     const per_unit = std.math.divCeil(usize, n, 4 * @as(usize, threads)) catch unreachable;
-    const rows = std.mem.alignForward(usize, per_unit, 4);
-    std.debug.assert(rows >= 4);
-    std.debug.assert(rows % 4 == 0);
-    return rows;
+    const outputs = std.mem.alignForward(usize, per_unit, 4);
+    std.debug.assert(outputs >= 4);
+    std.debug.assert(outputs % 4 == 0);
+    return outputs;
 }
 
 /// The control unit of one CPU decode attention row.
@@ -707,15 +708,15 @@ fn readSysfsCores(io: std.Io) ?u32 {
     return countCores(lists[0..n]);
 }
 
-/// Build a Tensor view of `weight` over the output rows `[start, end)` (`shape[1]` in GGUF
+/// Build a Tensor view of `weight` over the outputs `[start, end)` (`shape[1]` in GGUF
 /// reversed-shape order).
-fn sliceWeightRows(weight: Tensor, start: usize, end: usize) Tensor {
+fn sliceWeightOutputs(weight: Tensor, start: usize, end: usize) Tensor {
     std.debug.assert(weight.n_dims == 2);
 
     const out_features: usize = @intCast(weight.shape[1]);
     std.debug.assert(out_features > 0);
     std.debug.assert(weight.data.len % out_features == 0);
-    const row_bytes: usize = weight.data.len / out_features;
+    const output_bytes: usize = weight.data.len / out_features;
     std.debug.assert(end <= out_features);
     return .{
         .dtype = weight.dtype,
@@ -727,7 +728,7 @@ fn sliceWeightRows(weight: Tensor, start: usize, end: usize) Tensor {
             weight.shape[3],
         },
         .byte_stride = weight.byte_stride,
-        .data = weight.data[start * row_bytes .. end * row_bytes],
+        .data = weight.data[start * output_bytes .. end * output_bytes],
     };
 }
 
@@ -813,8 +814,8 @@ test "resolve: zero keeps auto, a flag replaces, the bound refuses, fused gets 1
     logResolved(fused);
 }
 
-test "sliceWeightRows preserves layout, slices data" {
-    // 4 output rows x 34 bytes each (Q8_0 with in_features=32 -> 1 block of 34).
+test "sliceWeightOutputs preserves layout, slices data" {
+    // 4 outputs x 34 bytes each (Q8_0 with in_features=32 -> 1 block of 34).
     var fake_bytes: [4 * 34]u8 = .{0} ** (4 * 34);
     const w: Tensor = .{
         .dtype = .q8_0,
@@ -823,14 +824,14 @@ test "sliceWeightRows preserves layout, slices data" {
         .byte_stride = .{ 34, 0, 0, 0 },
         .data = &fake_bytes,
     };
-    const slice = sliceWeightRows(w, 1, 3);
+    const slice = sliceWeightOutputs(w, 1, 3);
     try std.testing.expectEqual(.q8_0, slice.dtype);
     try std.testing.expectEqual(@as(u32, 32), slice.shape[0]);
     try std.testing.expectEqual(@as(u32, 2), slice.shape[1]);
-    try std.testing.expectEqual(@as(usize, 68), slice.data.len); // 2 output rows x 34 bytes
+    try std.testing.expectEqual(@as(usize, 68), slice.data.len); // 2 outputs x 34 bytes
 }
 
-/// A q8_0 matmul fixture: seeded inputs and a weight with distinct rows.
+/// A q8_0 matmul fixture: seeded inputs and a weight with distinct outputs.
 const Q80Fixture = struct {
     inputs: []f32,
     w_data: []align(32) u8,
@@ -845,24 +846,24 @@ const Q80Fixture = struct {
         std.debug.assert(in_features % 32 == 0);
 
         // Allocate the inputs and the weights.
-        const row_bytes = (in_features / 32) * 34;
+        const output_bytes = (in_features / 32) * 34;
         const inputs = try gpa.alloc(f32, batch * in_features);
         errdefer gpa.free(inputs);
 
-        const w_data = try gpa.alignedAlloc(u8, .@"32", out_features * row_bytes);
+        const w_data = try gpa.alignedAlloc(u8, .@"32", out_features * output_bytes);
 
-        // Fill the inputs and the quant rows.
+        // Fill the inputs and the quants of each output.
         for (inputs, 0..) |*x, i| {
             x.* = @sin(@as(f32, @floatFromInt(i)) * 0.02);
         }
 
-        for (0..out_features) |row| {
-            const off = row * row_bytes;
+        for (0..out_features) |j| {
+            const off = j * output_bytes;
             for (0..in_features / 32) |blk| {
                 const blk_off = off + blk * 34;
                 std.mem.writeInt(u16, w_data[blk_off..][0..2], 0x3c00, .little);
                 for (0..32) |i| {
-                    const v: i8 = @intCast(@as(i32, @intCast((row + blk * 32 + i) % 13)) - 6);
+                    const v: i8 = @intCast(@as(i32, @intCast((j + blk * 32 + i) % 13)) - 6);
                     w_data[blk_off + 2 + i] = @bitCast(v);
                 }
             }
@@ -875,7 +876,7 @@ const Q80Fixture = struct {
                 .dtype = .q8_0,
                 .n_dims = 2,
                 .shape = .{ @intCast(in_features), @intCast(out_features), 0, 0 },
-                .byte_stride = .{ @intCast(row_bytes), 0, 0, 0 },
+                .byte_stride = .{ @intCast(output_bytes), 0, 0, 0 },
                 .data = w_data,
             },
         };
@@ -908,9 +909,9 @@ fn expectFanOutMatchesSerial(out_features: usize, batch: usize, thread_counts: [
         defer pool.deinit();
 
         const policy: Policy = .{ .n_threads = n_threads, .min_parallel_flops = 0 };
-        // Every pool above one thread splits the rows into two units or more.
+        // Every pool above one thread splits the outputs into two units or more.
         if (n_threads > 1) {
-            try std.testing.expect(out_features > matmulUnitRows(out_features, n_threads));
+            try std.testing.expect(out_features > matmulUnitOutputs(out_features, n_threads));
         }
 
         @memset(outs_fanout, std.math.nan(f32));
@@ -933,19 +934,19 @@ test "linearBatch: bits-equal across thread counts (q8_0, forced fan-out)" {
     try expectFanOutMatchesSerial(32, 3, &.{ 1, 4 });
 }
 
-test "linearBatch: 37 rows over 3, 5, and 7 threads cut odd chunk boundaries" {
-    // 37 rows give 4-row units at 3 and 5 threads and a 1-row tail unit.
-    try std.testing.expectEqual(@as(usize, 4), matmulUnitRows(37, 3));
-    try std.testing.expectEqual(@as(usize, 4), matmulUnitRows(37, 5));
-    try std.testing.expectEqual(@as(usize, 4), matmulUnitRows(37, 7));
+test "linearBatch: 37 outputs over 3, 5, and 7 threads cut odd chunk boundaries" {
+    // 37 outputs give 4-output units at 3 and 5 threads and a 1-output tail unit.
+    try std.testing.expectEqual(@as(usize, 4), matmulUnitOutputs(37, 3));
+    try std.testing.expectEqual(@as(usize, 4), matmulUnitOutputs(37, 5));
+    try std.testing.expectEqual(@as(usize, 4), matmulUnitOutputs(37, 7));
     try expectFanOutMatchesSerial(37, 3, &.{ 3, 5, 7 });
 }
 
-test "matmulUnitRows: about four units per thread, a multiple of 4" {
-    try std.testing.expectEqual(@as(usize, 4), matmulUnitRows(1, 1));
-    try std.testing.expectEqual(@as(usize, 128), matmulUnitRows(2048, 4));
-    try std.testing.expectEqual(@as(usize, 64), matmulUnitRows(2048, 8));
-    try std.testing.expectEqual(@as(usize, 4748), matmulUnitRows(151_936, 8));
+test "matmulUnitOutputs: about four units per thread, a multiple of 4" {
+    try std.testing.expectEqual(@as(usize, 4), matmulUnitOutputs(1, 1));
+    try std.testing.expectEqual(@as(usize, 128), matmulUnitOutputs(2048, 4));
+    try std.testing.expectEqual(@as(usize, 64), matmulUnitOutputs(2048, 8));
+    try std.testing.expectEqual(@as(usize, 4748), matmulUnitOutputs(151_936, 8));
 }
 
 test "attention: forced fan-out at 1, 2, 3, 4, and 16 threads gives the bits of the serial row" {

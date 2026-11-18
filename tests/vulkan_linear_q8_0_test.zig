@@ -6,7 +6,7 @@
 //!
 //! Bit equality. Bit equality is reachable, so the gate asks for it. The kernel reproduces the
 //! exact f32 reduction order of the naive op: a scalar accumulate, block-major and i-minor, with
-//! one invocation per output row. Vulkan mandates IEEE 754 single precision for f32 multiply and
+//! one invocation per output. Vulkan mandates IEEE 754 single precision for f32 multiply and
 //! add without FMA contraction unless `precise` is set.
 //!
 //! Faults. A divergence names one of three faults. The reduction order does not match, the f16 to
@@ -25,24 +25,25 @@ const Tensor = zigferencer.tensor.Tensor;
 const q8_0_block_elems: usize = 32;
 const q8_0_block_bytes: usize = 34;
 
-/// Fill `weight_data` with a synthetic Q8_0 weight. Every block takes the f16 scale 1.0, and the
-/// quants step through the full signed i8 range with a per-row offset, which drives sign extension.
+/// Fill `weight_data` with a synthetic Q8_0 weight. Every block takes the f16 scale 1.0, and
+/// the quants step through the full signed i8 range with a per-output offset, which drives sign
+/// extension.
 fn buildSyntheticWeight(
     weight_data: []u8,
     in_features: usize,
     out_features: usize,
 ) void {
-    const blocks_per_row = in_features / q8_0_block_elems;
-    const row_bytes = blocks_per_row * q8_0_block_bytes;
-    std.debug.assert(weight_data.len == out_features * row_bytes);
+    const blocks_per_output = in_features / q8_0_block_elems;
+    const output_bytes = blocks_per_output * q8_0_block_bytes;
+    std.debug.assert(weight_data.len == out_features * output_bytes);
     for (0..out_features) |j| {
-        const row_off = j * row_bytes;
-        for (0..blocks_per_row) |blk| {
-            const blk_off = row_off + blk * q8_0_block_bytes;
+        const output_off = j * output_bytes;
+        for (0..blocks_per_output) |blk| {
+            const blk_off = output_off + blk * q8_0_block_bytes;
             // The f16 value 1.0 has the bit pattern 0x3c00.
             std.mem.writeInt(u16, weight_data[blk_off..][0..2], 0x3c00, .little);
             for (0..q8_0_block_elems) |i| {
-                // The row, block and element offsets make every (j, blk, i)
+                // The output, block and element offsets make every (j, blk, i)
                 // cell distinct across the full i8 range.
                 const raw: i32 = @intCast((j + blk * 32 + i) % 251);
                 const v: i8 = @intCast(raw - 125);
@@ -69,9 +70,9 @@ fn runLinearQ80Check(
 
     const kernel = &runner.linear_q8_0;
 
-    const blocks_per_row = in_features / q8_0_block_elems;
-    const row_bytes = blocks_per_row * q8_0_block_bytes;
-    const total_w_bytes = out_features * row_bytes;
+    const blocks_per_output = in_features / q8_0_block_elems;
+    const output_bytes = blocks_per_output * q8_0_block_bytes;
+    const total_w_bytes = out_features * output_bytes;
 
     const input = try allocator.alloc(f32, in_features);
     defer allocator.free(input);
@@ -99,7 +100,7 @@ fn runLinearQ80Check(
         .dtype = .q8_0,
         .n_dims = 2,
         .shape = .{ @intCast(in_features), @intCast(out_features), 0, 0 },
-        .byte_stride = .{ @intCast(row_bytes), 0, 0, 0 },
+        .byte_stride = .{ @intCast(output_bytes), 0, 0, 0 },
         .data = weight_bytes,
     };
     cpu_ops.linearF32Q80(input, w_tensor, out_cpu);

@@ -3,9 +3,9 @@
 //! Comptime. The command tables are comptime parameters, and a check rejects a command name in
 //! both tables.
 //!
-//! Tables. Each command is a `{ name, summary, handler }` row. `zigferencer` dispatches `release`.
-//! `zigferencer-dev` dispatches `release` plus the table of `src/dev/dev_command.zig`. The usage
-//! screen reads the same `summary`, so help and dispatch cannot drift.
+//! Tables. Each command is a `{ name, summary, handler }` entry. `zigferencer` dispatches
+//! `release`. `zigferencer-dev` dispatches `release` plus the table of `src/dev/dev_command.zig`.
+//! The usage screen reads the same `summary`, so help and dispatch cannot drift.
 //!
 //! Dev names. The release binary names the dev commands only as strings, because its module holds
 //! no path to a dev file. `dev_command.zig` checks that the strings match its table.
@@ -48,14 +48,14 @@ const pad = " " ** 32;
 
 /// The commands of the release binary.
 pub const release = [_]Subcommand{
-    row("list", "List registered models (and which are on disk)", list_cmd.run),
-    row("fetch", "Download a model (registry name or HF path)", fetch_cmd.run),
-    row("inspect", "Print a downloaded GGUF's metadata", inspect_cmd.run),
-    row("run", "Generate text from a prompt (greedy)", run_cmd.run),
-    row("serve", "Serve sessions over TCP/unix, batched decode", serve_cmd.run),
-    row("serve-openai", "Serve an OpenAI-compatible HTTP API", serve_openai_cmd.run),
-    row("client", "Chat with a running server over the binary wire", client_cmd.run),
-    row("info", "Print the build, host card, and support matrix", info_cmd.run),
+    entry("list", "List registered models (and which are on disk)", list_cmd.run),
+    entry("fetch", "Download a model (registry name or HF path)", fetch_cmd.run),
+    entry("inspect", "Print a downloaded GGUF's metadata", inspect_cmd.run),
+    entry("run", "Generate text from a prompt (greedy)", run_cmd.run),
+    entry("serve", "Serve sessions over TCP/unix, batched decode", serve_cmd.run),
+    entry("serve-openai", "Serve an OpenAI-compatible HTTP API", serve_openai_cmd.run),
+    entry("client", "Chat with a running server over the binary wire", client_cmd.run),
+    entry("info", "Print the build, host card, and support matrix", info_cmd.run),
 };
 
 /// The dev command names as strings, for the hint of the release binary.
@@ -170,7 +170,7 @@ pub fn dispatchOver(
 
 // -- helpers ----------------------------------------------------------------
 
-fn row(comptime name: []const u8, comptime summary: []const u8, handler: Handler) Subcommand {
+fn entry(comptime name: []const u8, comptime summary: []const u8, handler: Handler) Subcommand {
     return .{ .name = name, .summary = summary, .handler = handler };
 }
 

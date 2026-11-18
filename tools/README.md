@@ -15,7 +15,7 @@ needs more than 3 lines.
 | `bench_parallel.zig` | The CPU thread-pool section. |
 | `bench_transfer.zig` | The host-to-device copy section. |
 | `bench_peak.zig` | The compute and cache roofs of the host, which `zig build bench -- peak` runs alone. |
-| `bench_util.zig` | The row helpers: timing, relative error, output hash, and the reporter. |
+| `bench_util.zig` | The line helpers: timing, relative error, output hash, and the reporter. |
 | `simd_probe.zig` | The export probe of `zig build simd-probe`. |
 | `shader_lint.zig` | The shader rules of `zig build lint-shaders`. |
 | `gate.py` | The token-hash gates of `make gate`. |
@@ -33,7 +33,7 @@ output, and the scripts drive the two binaries.
 
 | Value | File | Holds | Made by | Read by |
 | --- | --- | --- | --- | --- |
-| Bench row | `bench_util.zig` | A label, a time, an output hash, and a relative error against `naive` | `cpuRow`, `gpuRow` | `bench.zig`, the section files |
+| Bench line | `bench_util.zig` | A label, a time, an output hash, and a relative error against `naive` | `cpuLine`, `gpuLine` | `bench.zig`, the section files |
 | `probed_ops` | `simd_probe.zig` | The op functions that the probe exports | the file itself | `simd-report.sh` |
 | `zig_build` | `common.sh` | One `zig build` call that installs both binaries | the file itself | `profile.sh` |
 | Gate case | `gate.py` | A token hash of one `bench-model` run | `zigferencer-dev bench-model` | `gate.py`, against the first case or a record |
@@ -56,7 +56,7 @@ runs any command of that binary.
 
 ## Rules
 
-- **Every bench row carries an output hash and a relative error against `naive`.** A missing GPU
+- **Every bench line carries an output hash and a relative error against `naive`.** A missing GPU
   degrades with a skip banner and never aborts.
 - **The bench kernels follow `-Doptimize`.** A bare `zig build bench` uses Debug kernels.
   It says so.

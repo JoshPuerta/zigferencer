@@ -8,30 +8,30 @@
 //! op. Its rel_err column holds the error against the naive line, because the vector sigmoid and
 //! the fixed-order sum change the bits.
 //!
-//! Comptime. `build_options.use_vulkan` gates the GPU rows, so a CPU build never reads them. The
+//! Comptime. `build_options.use_vulkan` gates the GPU lines, so a CPU build never reads them. The
 //! element type and kernel set are parameters.
 //!
 //! Attention grid. The attention section also walks a context-depth grid on the two qwen
 //! full-attention shapes, the last ten cases. Qwen3.5-2B states 8 query heads over 2 kv heads,
 //! and Qwen3.5-9B states 16 over 4, both at head_dim 256. Attention is the one per-token cost
 //! that grows with the context, so the grid measures the CPU against the GPU at depth. The f16
-//! rows read the KV cache in the dtype that the qwen registry entries default to. The f16 caches
-//! hold the same values at storage precision, so the gap to the f32 row is the element type
+//! lines read the KV cache in the dtype that the qwen registry entries default to. The f16 caches
+//! hold the same values at storage precision, so the gap to the f32 line is the element type
 //! alone.
 //!
-//! Threaded rows. Every attention case also runs a 16-thread row through the attention control
-//! unit. That row must give the bits of the serial row, because the part geometry does not
+//! Threaded lines. Every attention case also runs a 16-thread line through the attention control
+//! unit. That line must give the bits of the serial line, because the part geometry does not
 //! depend on the thread count.
 //!
-//! Vector rows. The `simd` rows run the vector part kernel of the `simd` backend, and the
-//! `simd_pf` rows run the prefetching kernel of the `simd_pf` backend. Their rel_err column
-//! holds the error against the naive row of the same dtype. Every threaded vector row must give
-//! the bits of the serial `simd` row. The prefetch changes the timing alone.
+//! Vector lines. The `simd` lines run the vector part kernel of the `simd` backend, and the
+//! `simd_pf` lines run the prefetching kernel of the `simd_pf` backend. Their rel_err column
+//! holds the error against the naive line of the same dtype. Every threaded vector line must give
+//! the bits of the serial `simd` line. The prefetch changes the timing alone.
 //!
-//! f16 hash. The f16 naive row carries its own hash, because a narrower store moves the output
+//! f16 hash. The f16 naive line carries its own hash, because a narrower store moves the output
 //! bits. A gate against the f32 hash claims an equality that the dtype does not promise.
 //!
-//! GPU attention rows. They stay f32, because the per-op runner builds `Attention` for f32
+//! GPU attention lines. They stay f32, because the per-op runner builds `Attention` for f32
 //! caches and the bench calls `Attention.run`. `Attention.runTyped` takes f16 caches on an f16
 //! pipeline, and the kernel tests and `gpu-selftest attn` use it.
 //!
@@ -43,8 +43,8 @@
 //!
 //! Dispatch amortization. The section shows how far the per-dispatch wall clock drops when N
 //! dispatches share one command buffer and one submit. It runs `ResidualAdd.runRepeat(N)` for a
-//! few N on one shape and prints the ms per dispatch. The N=1 row is the per-call overhead of
-//! the `run()` path. A later row shows how much of that overhead many ops amortize between them.
+//! few N on one shape and prints the ms per dispatch. The N=1 line is the per-call overhead of
+//! the `run()` path. A later line shows how much of that overhead many ops amortize between them.
 
 const std = @import("std");
 const build_options = @import("build_options");
@@ -54,9 +54,9 @@ const vkops = zigferencer.ops_vulkan;
 const Runner = zigferencer.vulkan_runner.Runner;
 
 const bench_util = @import("bench_util.zig");
-const cpuRow = bench_util.cpuRow;
-const gpuRow = bench_util.gpuRow;
-const rawRow = bench_util.rawRow;
+const cpuLine = bench_util.cpuLine;
+const gpuLine = bench_util.gpuLine;
+const rawLine = bench_util.rawLine;
 const flush = bench_util.flush;
 const printSectionHeader = bench_util.printSectionHeader;
 const hashOut = bench_util.hashOut;
@@ -67,7 +67,7 @@ const rate = bench_util.rate;
 
 // -- constants --------------------------------------------------------------
 
-/// The fan-out of every threaded attention row. The count is fixed, so the rows of two hosts
+/// The fan-out of every threaded attention line. The count is fixed, so the lines of two hosts
 /// compare.
 const bench_threaded: zigferencer.parallel.Policy = .{ .n_threads = 16, .min_parallel_flops = 0 };
 
@@ -76,7 +76,7 @@ const atn_cases = [_]AtnCase{
     atnCase("attn 32h,8kv,d64,t512", 32, 8, 64, 512, false),
     atnCase("attn 32h,8kv,d128,t512", 32, 8, 128, 512, false),
     // This shape is the widest GQA group the kernel blocks for. No loaded
-    // model states it, so the row measures the block bound alone.
+    // model states it, so the case measures the block bound alone.
     atnCase("attn 16h,2kv,d256,t512 group 8", 16, 2, 256, 512, false),
     atnCase("attn 8h,2kv,d256,t512", 8, 2, 256, 512, true),
     atnCase("attn 8h,2kv,d256,t1024", 8, 2, 256, 1024, true),
@@ -105,7 +105,7 @@ const grid_row_counts = [_]u32{ 1, 8, 128 };
 // -- types ------------------------------------------------------------------
 
 /// One CPU attention closure per KV storage type `E` and kernel set `Kernels`. One generic body
-/// keeps the f32 and f16 rows from drifting. Without `pool` it runs the serial row, and with
+/// keeps the f32 and f16 lines from drifting. Without `pool` it runs the serial line, and with
 /// `pool` the attention control unit at `bench_threaded`.
 fn AtnCpu(comptime E: type, comptime Kernels: type) type {
     return struct {
@@ -172,7 +172,7 @@ fn AtnCpu(comptime E: type, comptime Kernels: type) type {
     };
 }
 
-/// One row of the kernel set grid: a head geometry, the KV type of its registry
+/// One entry of the kernel set grid: a head geometry, the KV type of its registry
 /// default, and the deepest row its declared context holds.
 const GridShape = struct {
     label: []const u8,
@@ -193,7 +193,7 @@ const AtnCase = struct {
     kv_f16: bool,
 };
 
-/// The input slices that the f32 and the f16 rows of one attention case share.
+/// The input slices that the f32 and the f16 lines of one attention case share.
 const AtnData = struct {
     q: []const f32,
     k_cache: []const f32,
@@ -217,7 +217,7 @@ const DescriptorBufferInfo = @typeInfo(
     @typeInfo(@TypeOf(vkops.updateStorageBindings)).@"fn".params[2].type.?,
 ).pointer.child;
 
-/// The kernels, descriptor sets, and buffers that every row of one shape shares.
+/// The kernels, descriptor sets, and buffers that every line of one shape shares.
 const GridRig = struct {
     ctx: *GridCtx,
     single: *vkops.Attention,
@@ -284,7 +284,7 @@ const GridStep = struct {
 // -- api --------------------------------------------------------------------
 
 /// The elementwise sections and the attention sections, in print order. Each section prints a
-/// header, then one row per variant for each case.
+/// header, then one line per variant for each case.
 pub fn benchElementwise(gpa: std.mem.Allocator, io: std.Io, runner: anytype) !void {
     try benchResidualAdd(gpa, io, runner);
     try benchSwiglu(gpa, io, runner);
@@ -340,7 +340,7 @@ pub fn benchSigmoidGate(gpa: std.mem.Allocator, io: std.Io, runner: *Runner) !vo
         const ref_hash = hashOut(dst_ref);
         const work: f64 = @floatFromInt(c.n);
 
-        // Time the GPU row.
+        // Time the GPU line.
         const Gpu = struct {
             k: *zigferencer.ops_vulkan.SigmoidGate,
             gate: []const f32,
@@ -353,7 +353,7 @@ pub fn benchSigmoidGate(gpa: std.mem.Allocator, io: std.Io, runner: *Runner) !vo
             }
         };
         const tol: op_requires.Tolerance = .{ .relative = 1e-5 };
-        try gpuRow(
+        try gpuLine(
             io,
             c.n,
             c.label,
@@ -459,7 +459,7 @@ fn benchResidualAdd(gpa: std.mem.Allocator, io: std.Io, runner: anytype) !void {
         const ref_hash = hashOut(dst_ref);
         const work: f64 = @floatFromInt(c.n);
 
-        // Time the CPU row.
+        // Time the CPU line.
         const Cpu = struct {
             x: []const f32,
             dst_init: []const f32,
@@ -470,7 +470,7 @@ fn benchResidualAdd(gpa: std.mem.Allocator, io: std.Io, runner: anytype) !void {
                 zigferencer.ops.residualAdd(self.x, self.dst_work);
             }
         };
-        try cpuRow(
+        try cpuLine(
             io,
             c.n,
             c.label,
@@ -480,7 +480,7 @@ fn benchResidualAdd(gpa: std.mem.Allocator, io: std.Io, runner: anytype) !void {
             Cpu{ .x = x, .dst_init = dst_init, .dst_work = dst_work },
         );
 
-        // Time the GPU row.
+        // Time the GPU line.
         if (comptime build_options.use_vulkan) {
             if (runner) |r| {
                 const Gpu = struct {
@@ -494,7 +494,7 @@ fn benchResidualAdd(gpa: std.mem.Allocator, io: std.Io, runner: anytype) !void {
                         try self.r.residual_add.run(self.x, self.dst_work);
                     }
                 };
-                try gpuRow(
+                try gpuLine(
                     io,
                     c.n,
                     c.label,
@@ -548,7 +548,7 @@ fn benchSwiglu(gpa: std.mem.Allocator, io: std.Io, runner: anytype) !void {
         const ref_hash = hashOut(dst_ref);
         const work: f64 = @floatFromInt(c.n);
 
-        // Time the CPU row.
+        // Time the CPU line.
         const Cpu = struct {
             gate: []const f32,
             up: []const f32,
@@ -558,7 +558,7 @@ fn benchSwiglu(gpa: std.mem.Allocator, io: std.Io, runner: anytype) !void {
                 zigferencer.ops.swiglu(self.gate, self.up, self.dst);
             }
         };
-        try cpuRow(
+        try cpuLine(
             io,
             c.n,
             c.label,
@@ -578,7 +578,7 @@ fn benchSwiglu(gpa: std.mem.Allocator, io: std.Io, runner: anytype) !void {
                 zigferencer.ops_simd_pf.swiglu(self.gate, self.up, self.out);
             }
         };
-        _ = try cpuCheckedRow(
+        _ = try cpuCheckedLine(
             io,
             c.n,
             c.label,
@@ -589,7 +589,7 @@ fn benchSwiglu(gpa: std.mem.Allocator, io: std.Io, runner: anytype) !void {
             Vector{ .gate = gate, .up = up, .out = dst_work },
         );
 
-        // Time the GPU row.
+        // Time the GPU line.
         if (comptime build_options.use_vulkan) {
             if (runner) |r| {
                 const Gpu = struct {
@@ -602,7 +602,7 @@ fn benchSwiglu(gpa: std.mem.Allocator, io: std.Io, runner: anytype) !void {
                         try self.r.swiglu.run(self.gate, self.up, self.dst);
                     }
                 };
-                try gpuRow(
+                try gpuLine(
                     io,
                     c.n,
                     c.label,
@@ -657,7 +657,7 @@ fn benchRmsnorm(gpa: std.mem.Allocator, io: std.Io, runner: anytype) !void {
         // 3 FLOPs per element: the square, the add via FMA, and the scale multiply.
         const work: f64 = @as(f64, @floatFromInt(c.d)) * 3.0;
 
-        // Time the CPU row.
+        // Time the CPU line.
         const Cpu = struct {
             x: []const f32,
             w: []const f32,
@@ -668,7 +668,7 @@ fn benchRmsnorm(gpa: std.mem.Allocator, io: std.Io, runner: anytype) !void {
                 zigferencer.ops.rmsnorm(self.x, self.w, self.eps, self.y);
             }
         };
-        try cpuRow(
+        try cpuLine(
             io,
             c.d,
             c.label,
@@ -689,7 +689,7 @@ fn benchRmsnorm(gpa: std.mem.Allocator, io: std.Io, runner: anytype) !void {
                 zigferencer.ops_simd_pf.rmsnorm(self.x, self.w, self.eps, self.out);
             }
         };
-        _ = try cpuCheckedRow(
+        _ = try cpuCheckedLine(
             io,
             c.d,
             c.label,
@@ -700,7 +700,7 @@ fn benchRmsnorm(gpa: std.mem.Allocator, io: std.Io, runner: anytype) !void {
             Vector{ .x = x, .w = w, .eps = eps, .out = y_work },
         );
 
-        // Time the GPU row.
+        // Time the GPU line.
         if (comptime build_options.use_vulkan) {
             if (runner) |r| {
                 const Gpu = struct {
@@ -714,7 +714,7 @@ fn benchRmsnorm(gpa: std.mem.Allocator, io: std.Io, runner: anytype) !void {
                         try self.r.rmsnorm.run(self.x, self.w, self.eps, self.y);
                     }
                 };
-                try gpuRow(
+                try gpuLine(
                     io,
                     c.d,
                     c.label,
@@ -780,7 +780,7 @@ fn benchSigmoidGateCpu(gpa: std.mem.Allocator, io: std.Io) !void {
                 zigferencer.ops.sigmoidGate(self.gate, self.out);
             }
         };
-        try cpuRow(
+        try cpuLine(
             io,
             c.n,
             c.label,
@@ -800,7 +800,7 @@ fn benchSigmoidGateCpu(gpa: std.mem.Allocator, io: std.Io) !void {
                 zigferencer.ops_simd_pf.sigmoidGate(self.gate, self.out);
             }
         };
-        _ = try cpuCheckedRow(
+        _ = try cpuCheckedLine(
             io,
             c.n,
             c.label,
@@ -844,7 +844,7 @@ fn benchRope(gpa: std.mem.Allocator, io: std.Io, runner: anytype) !void {
         const ref_hash = hashOut(x_ref);
         const work: f64 = @floatFromInt(c.head_dim);
 
-        // Time the CPU row.
+        // Time the CPU line.
         const Cpu = struct {
             x_init: []const f32,
             x_work: []f32,
@@ -864,7 +864,7 @@ fn benchRope(gpa: std.mem.Allocator, io: std.Io, runner: anytype) !void {
                 );
             }
         };
-        try cpuRow(io, c.head_dim, c.label, "naive", work, ref_hash, Cpu{
+        try cpuLine(io, c.head_dim, c.label, "naive", work, ref_hash, Cpu{
             .x_init = x_init,
             .x_work = x_work,
             .pos = pos,
@@ -872,7 +872,7 @@ fn benchRope(gpa: std.mem.Allocator, io: std.Io, runner: anytype) !void {
             .freq_base = freq_base,
         });
 
-        // Time the GPU row.
+        // Time the GPU line.
         if (comptime build_options.use_vulkan) {
             if (runner) |r| {
                 const Gpu = struct {
@@ -895,7 +895,7 @@ fn benchRope(gpa: std.mem.Allocator, io: std.Io, runner: anytype) !void {
                         );
                     }
                 };
-                try gpuRow(
+                try gpuLine(
                     io,
                     c.head_dim,
                     c.label,
@@ -923,7 +923,7 @@ fn benchRope(gpa: std.mem.Allocator, io: std.Io, runner: anytype) !void {
 
 fn benchFusedAttention(gpa: std.mem.Allocator, io: std.Io, runner: anytype) !void {
     printSectionHeader("fused attention");
-    // One pool serves every threaded row of the section.
+    // One pool serves every threaded line of the section.
     var pool: zigferencer.pool.Pool = undefined;
     try zigferencer.parallel.initPool(&pool, io, bench_threaded);
     defer pool.deinit();
@@ -933,8 +933,8 @@ fn benchFusedAttention(gpa: std.mem.Allocator, io: std.Io, runner: anytype) !voi
     }
 }
 
-/// The f16 rows of one attention case. They carry their own reference hash.
-fn attentionF16Rows(
+/// The f16 lines of one attention case. They carry their own reference hash.
+fn attentionF16Lines(
     io: std.Io,
     pool: *zigferencer.pool.Pool,
     c: AtnCase,
@@ -958,10 +958,10 @@ fn attentionF16Rows(
     try cpu16.run();
     @memcpy(k16.out_ref, d.out_work);
     const hash16 = hashOut(k16.out_ref);
-    try cpuRow(io, total_work_elems, c.label, "naive_f16", work, hash16, cpu16);
+    try cpuLine(io, total_work_elems, c.label, "naive_f16", work, hash16, cpu16);
     var cpu16_mt = cpu16;
     cpu16_mt.pool = pool;
-    _ = try cpuCheckedRow(
+    _ = try cpuCheckedLine(
         io,
         total_work_elems,
         c.label,
@@ -971,11 +971,11 @@ fn attentionF16Rows(
         hash16,
         cpu16_mt,
     );
-    try simdRows(f16, io, pool, total_work_elems, c.label, "_f16", work, k16.out_ref, cpu16);
+    try simdLines(f16, io, pool, total_work_elems, c.label, "_f16", work, k16.out_ref, cpu16);
 }
 
-/// The GPU row of one attention case, f32 caches only.
-fn attentionGpuRow(
+/// The GPU line of one attention case, f32 caches only.
+fn attentionGpuLine(
     io: std.Io,
     r: *Runner,
     c: AtnCase,
@@ -1010,8 +1010,8 @@ fn attentionGpuRow(
         }
     };
 
-    // Run the GPU row against the reference.
-    try gpuRow(
+    // Run the GPU line against the reference.
+    try gpuLine(
         io,
         total_work_elems,
         c.label,
@@ -1118,7 +1118,7 @@ fn attentionCase(
     ) * @as(usize, c.n_heads);
     const work: f64 = @as(f64, @floatFromInt(total_work_elems)) * 4.0;
 
-    // Time the f32 CPU rows.
+    // Time the f32 CPU lines.
     const cpu32: AtnCpu(f32, zigferencer.ops) = .{
         .q = q,
         .n_heads = c.n_heads,
@@ -1130,11 +1130,11 @@ fn attentionCase(
         .parts = parts,
         .out = out_work,
     };
-    try cpuRow(io, total_work_elems, c.label, "naive", work, ref_hash, cpu32);
+    try cpuLine(io, total_work_elems, c.label, "naive", work, ref_hash, cpu32);
 
     var cpu32_mt = cpu32;
     cpu32_mt.pool = pool;
-    _ = try cpuCheckedRow(
+    _ = try cpuCheckedLine(
         io,
         total_work_elems,
         c.label,
@@ -1144,9 +1144,9 @@ fn attentionCase(
         ref_hash,
         cpu32_mt,
     );
-    try simdRows(f32, io, pool, total_work_elems, c.label, "", work, out_ref, cpu32);
+    try simdLines(f32, io, pool, total_work_elems, c.label, "", work, out_ref, cpu32);
 
-    // Time the f16 rows and the GPU row.
+    // Time the f16 lines and the GPU line.
     const data: AtnData = .{
         .q = q,
         .k_cache = k_cache,
@@ -1156,12 +1156,12 @@ fn attentionCase(
     };
     if (c.kv_f16) {
         const f16_data: AtnF16 = .{ .k = k16, .v = v16, .parts = parts, .out_ref = out_ref16 };
-        try attentionF16Rows(io, pool, c, data, f16_data, total_work_elems, work);
+        try attentionF16Lines(io, pool, c, data, f16_data, total_work_elems, work);
     }
 
     if (comptime build_options.use_vulkan) {
         if (runner) |r| {
-            try attentionGpuRow(io, r, c, data, total_work_elems, work, ref_hash);
+            try attentionGpuLine(io, r, c, data, total_work_elems, work, ref_hash);
         }
     }
 
@@ -1261,7 +1261,7 @@ fn benchGridShape(gpa: std.mem.Allocator, io: std.Io, ctx: *GridCtx, sh: GridSha
         // The f16 shaders read the caches as 32-bit words, so each binding covers whole words.
         const kv_bytes = std.mem.alignForward(usize, stream_elems * elem_bytes, 4);
         if (kv_bytes > ctx.buffer_limits.storage_range) {
-            bench_util.skipRow(sh.label, "attn", "range");
+            bench_util.skipLine(sh.label, "attn", "range");
             continue;
         }
 
@@ -1341,7 +1341,7 @@ fn gridUploadStream(rig: GridRig, sh: GridShape, stream: GridStream) !void {
 }
 
 /// One grid point: record `rows` query rows that end at the stream depth, time one submission,
-/// and print the row.
+/// and print the line.
 fn benchGridPoint(
     gpa: std.mem.Allocator,
     io: std.Io,
@@ -1422,7 +1422,7 @@ fn benchGridPoint(
     const deepest = out[(rows - 1) * row_elems ..][0..row_elems];
     const errs = try gridReferenceErrors(gpa, sh, stream, last_q, deepest);
 
-    // Time the submission and print the row.
+    // Time the submission and print the line.
     const t = try timed(io, rows * depth * row_elems, step);
     const unique_kv_bytes: f64 = @floatFromInt(2 * stream.stream_elems * stream.elem_bytes);
     const gbs = unique_kv_bytes / (t.ms * 1e6);
@@ -1433,7 +1433,7 @@ fn benchGridPoint(
     ) catch unreachable;
     const variant: []const u8 = if (sh.kv_f16) "attn_f16" else "attn_f32";
     const tol = vkops.AttnKernels.tolerance;
-    rawRow(label, variant, t.ms, gbs, errs.rel, hsh, opStatus(tol, errs.rel, false));
+    rawLine(label, variant, t.ms, gbs, errs.rel, hsh, opStatus(tol, errs.rel, false));
 }
 
 /// Point the four descriptor sets at the device buffers of one grid point.
@@ -1520,9 +1520,9 @@ fn gridReferenceErrors(
     return computeErrors(ref, device_row);
 }
 
-/// The vector rows of one attention case: the serial `simd` row, then the 16-thread rows of the
-/// `simd` and `simd_pf` kernels. `ref_out` holds the naive row of the same dtype.
-fn simdRows(
+/// The vector lines of one attention case: the serial `simd` line, then the 16-thread lines of
+/// the `simd` and `simd_pf` kernels. `ref_out` holds the naive output of the same dtype.
+fn simdLines(
     comptime E: type,
     io: std.Io,
     pool: *zigferencer.pool.Pool,
@@ -1533,8 +1533,8 @@ fn simdRows(
     ref_out: []const f32,
     naive_ctx: AtnCpu(E, zigferencer.ops),
 ) !void {
-    // Time the serial `simd` row, which sets the hash.
-    const simd_hash = try cpuCheckedRow(
+    // Time the serial `simd` line, which sets the hash.
+    const simd_hash = try cpuCheckedLine(
         io,
         scale,
         label,
@@ -1544,8 +1544,8 @@ fn simdRows(
         null,
         naive_ctx.over(zigferencer.ops_simd, null),
     );
-    // Time the threaded `simd` row.
-    _ = try cpuCheckedRow(
+    // Time the threaded `simd` line.
+    _ = try cpuCheckedLine(
         io,
         scale,
         label,
@@ -1555,8 +1555,8 @@ fn simdRows(
         simd_hash,
         naive_ctx.over(zigferencer.ops_simd, pool),
     );
-    // Time the threaded prefetch row. It must give the same bits as the serial row.
-    _ = try cpuCheckedRow(
+    // Time the threaded prefetch line. It must give the same bits as the serial line.
+    _ = try cpuCheckedLine(
         io,
         scale,
         label,
@@ -1568,9 +1568,9 @@ fn simdRows(
     );
 }
 
-/// One CPU row with a checked output: its error against `ref_out` fills rel_err, and a hash
+/// One CPU line with a checked output: its error against `ref_out` fills rel_err, and a hash
 /// that differs from `want_hash` prints FAIL. Returns the output hash.
-fn cpuCheckedRow(
+fn cpuCheckedLine(
     io: std.Io,
     scale: usize,
     label: []const u8,
@@ -1585,7 +1585,7 @@ fn cpuCheckedRow(
     const errs = computeErrors(ref_out, ctx.out);
     const t = try timed(io, scale, ctx);
     const ok = if (want_hash) |want| got == want else true;
-    rawRow(label, name, t.ms, rate(t, work), errs.rel, got, if (ok) "ok" else "FAIL");
+    rawLine(label, name, t.ms, rate(t, work), errs.rel, got, if (ok) "ok" else "FAIL");
     return got;
 }
 
@@ -1631,7 +1631,7 @@ fn benchDispatchAmortization(
 
         const ref_hash = hashOut(dst_ref);
 
-        // Run the GPU repeat kernel and print the row.
+        // Run the GPU repeat kernel and print the line.
         const Gpu = struct {
             r: *Runner,
             n: u32,
@@ -1664,7 +1664,7 @@ fn benchDispatchAmortization(
             .{ n_dispatches, n_elems },
         ) catch unreachable;
         const tol = zigferencer.ops_vulkan.ResidualAdd.requires.tolerance;
-        rawRow(
+        rawLine(
             label,
             "vk_resid_x",
             ms_per_dispatch,

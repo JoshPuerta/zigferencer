@@ -177,8 +177,8 @@ fn adoptAttempt(c: *Chat, result: Attempt) !Outcome {
     c.client.deinit();
     c.client.* = result.client.?;
 
-    // The new server can differ in its think mode and card rows, and the rebuild opens its session
-    // from them.
+    // The new server can differ in its think mode and card entries, and the rebuild opens its
+    // session from them.
     c.info = result.info.?;
     c.sampling = c.opts.sessionSampling(c.info);
     if (c.info.resume_ttl_max_ms == 0 and c.keep_ttl > 0) {

@@ -134,8 +134,8 @@ The layers inside the tree point one way:
 **Extending commands**
 
 1. A release command takes `src/cli/NAME_cmd.zig`, or a directory with its name when it
-   needs more than one file. Add one row to `command.release` in `src/cli/command.zig`.
-2. A developer command takes `src/dev/NAME_cmd.zig`, or a directory. Add one row to the
+   needs more than one file. Add one entry to `command.release` in `src/cli/command.zig`.
+2. A developer command takes `src/dev/NAME_cmd.zig`, or a directory. Add one entry to the
    table in `src/dev/dev_command.zig` and the name to `command.dev_names`. Add a file
    that holds tests to the `test {}` block of `src/dev/dev_main.zig`.
 3. When a dev file needs an engine module that `src/main.zig` does not re-export, add one
@@ -204,7 +204,7 @@ therefore a new module. It holds the op functions and a
 `cpuOpsBackend` get a case for it, and `addBuildOptions` gets a flag. The `ops`
 alias in `cpu_runner.zig`, `cpu_layer_kernels.zig`, and `linear_dispatch.zig`
 gets one branch each. `op_requires.ops_backend_names` and the backend tables of
-`cli/info/` get a row, so that `info` lists it. No layer file changes.
+`cli/info/` get an entry, so that `info` lists it. No layer file changes.
 
 ### The other build options
 
@@ -653,12 +653,12 @@ A dispatch takes no lock and allocates nothing.
 
 | Op | One unit |
 | --- | --- |
-| Matrix product | A chunk of output rows, a multiple of 4, about four chunks for each participant. |
+| Matrix product | A chunk of outputs, a multiple of 4, about four chunks for each participant. |
 | Attention | One KV head group over one part of the row. |
 | Gated-DeltaNet | One key head with its value heads. No serial part runs on the caller. |
 | `swiglu` | A range of elements of the flat gate buffer, about four ranges for each participant. |
 
-The result of a unit does not depend on the thread that runs it. A matrix row is one
+The result of a unit does not depend on the thread that runs it. A chunk of outputs is one
 kernel call. An attention part writes its own record, and the caller adds the parts
 in order. A key head and its value heads write only their own channels, conv ring
 entries, and states. The token hash therefore holds across thread counts, floors,
@@ -930,10 +930,10 @@ the smaller of `--max-seq` and the window that the VRAM budget can hold.
    the example shrinks this way, from 174,592 to 131,072 positions.
 2. **The VRAM preflight.** A fused or hybrid runner adds up its plan: the weights,
    the KV, the recurrent state, the logits, and the scratch. The plan must fit the
-   usable share of the free VRAM. `limits.vram_shares` holds one row for each
+   usable share of the free VRAM. `limits.vram_shares` holds one entry for each
    driver: 3/4 on the translation-layer driver of the reference setup, the one
-   driver id that `vulkan_ctx.driverRow` names, and 7/8 on every other driver. The
-   3/4 row is a heuristic of that setup. On the whole-model fused path, a default
+   driver id that `vulkan_ctx.driverEntry` names, and 7/8 on every other driver. The
+   3/4 entry is a heuristic of that setup. On the whole-model fused path, a default
    window first shrinks to the widest window that fits. A plan that still does not
    fit stops with `error.VramBudgetExceeded`. The message names the needed, free,
    and usable bytes, the largest window that fits, and the flags that lower the
@@ -986,7 +986,7 @@ the ledger is full.
 ### Example: use 14 GiB of VRAM and 28 GiB of RAM on `serve`
 
 This example asks how many Qwen3.5-2B sessions fit when 16 GiB of VRAM and 32 GiB
-of RAM are free, on a driver of the default row. The 7/8 rules leave 14 GiB of VRAM
+of RAM are free, on a driver of the default entry. The 7/8 rules leave 14 GiB of VRAM
 and 28 GiB of RAM. The planner
 computed every number below.
 
@@ -998,7 +998,7 @@ Three limits decide the answer:
 2. **One region limits slots x window.** One region holds every slot, at 1024 B for
    each position. A range of 128 MiB therefore holds slots x window up to 131,072,
    which is 12 slots at 10,752 positions. `$ZIGFERENCER_VK_STORAGE_RANGE` lifts this
-   limit. The rows with a 1 GiB range set it to 1073741824.
+   limit. The entries with a 1 GiB range set it to 1073741824.
 3. **RAM holds the sessions that have no slot.** Each one needs a blob of up to
    145.3 MiB. `--max-sessions` stops at `limits.max_logical_sessions`, which is 128.
 
@@ -1010,7 +1010,7 @@ Three limits decide the answer:
 | Long sessions | 1 GiB | `--max-sessions 7 --vram-slots 7 --max-seq 131072` | 7 | 131,072 | 7 | 12,857 MiB | 1536 MiB |
 | The longest sessions | 1 GiB | `--max-sessions 4 --vram-slots 4 --max-seq 262144` | 4 | 262,144 | 4 | 14,333 MiB | 1536 MiB |
 
-With the 128 MiB range, the long rows hold 2 slots at 65,536 positions and 1 slot at
+With the 128 MiB range, the long entries hold 2 slots at 65,536 positions and 1 slot at
 131,072. No slot fits at 262,144. RAM also limits the blobs of long sessions: 28 GiB
 holds 35 sessions at 65,536 positions and 17 at 131,072.
 
@@ -1025,7 +1025,7 @@ The flags to set:
 - `--kv-vram` sets a VRAM budget instead, and the budget holds slots at the window.
 - `--kv-ram` sizes the RAM tier. With no flag, the plan holds every blob and a prefix
   cache of 1024 MiB. A larger value gives the rest to the prefix cache. On the first
-  row, `--kv-ram 21093` leaves 4 GiB for it.
+  entry, `--kv-ram 21093` leaves 4 GiB for it.
 - `--max-connections` limits the clients (default 8). One connection can hold many
   sessions.
 
@@ -1224,7 +1224,7 @@ backends the greedy tokens are equal. Section 11 names the tests that check it.
 - **The reference.** `naive` is scalar code that every other backend must match.
   Each backend declares its tolerance in its `OpRequires`: bit-exact where the
   kernel keeps the reduction order of `naive`, otherwise a measured relative error.
-  `tools/bench.zig` prints the relative error of each kernel and marks a row `FAIL`
+  `tools/bench.zig` prints the relative error of each kernel and marks a line `FAIL`
   when the error passes the tolerance.
 - **`gpu-selftest`** checks one GPU kernel against its CPU reference on random
   inputs.

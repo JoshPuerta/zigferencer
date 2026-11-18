@@ -55,8 +55,8 @@
 //!
 //! Runner surface. `Sessions` reaches a runner through a duck-typed surface. A renamed member
 //! breaks only the call sites that instantiate it, and a GPU-only runner can break where no CPU
-//! test looks. So `Sessions(RunnerT)` checks the rows it reads when the pool type is built, and
-//! each family row checks the whole surface of its runners in `resolve/family.zig`. A runner
+//! test looks. So `Sessions(RunnerT)` checks the entries it reads when the pool type is built, and
+//! each family entry checks the whole surface of its runners in `resolve/family.zig`. A runner
 //! that holds recurrent state must declare `has_recurrent_state` and both slot hooks, because
 //! `@hasDecl` alone lets a runner omit `resetSlotState` and inherit the state of the last
 //! conversation.

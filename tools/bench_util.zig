@@ -1,8 +1,8 @@
 //! Shared bench helpers: timing, error measurement, and the colored table reporter. No section
-//! logic lives here. The per-op files build their rows on these helpers.
+//! logic lives here. The per-op files build their lines on these helpers.
 //!
-//! Reporter. The reporter buffers a group of rows, the variants benched for one case, and prints
-//! them together. The fastest row tints green and the slowest red. The buffer is display state
+//! Reporter. The reporter buffers a group of lines, the variants benched for one case, and prints
+//! them together. The fastest line tints green and the slowest red. The buffer is display state
 //! local to the bench tool: a single-threaded accumulator, reset after every group, never read
 //! outside this file. Color stays off unless stderr is a terminal, so piped output stays plain.
 
@@ -30,7 +30,7 @@ pub const Timed = struct { ms: f64, iters: usize };
 
 pub const Errors = struct { abs: f32, rel: f32 };
 
-const Row = struct {
+const Line = struct {
     label: []const u8,
     variant: []const u8,
     ms: f64,
@@ -38,12 +38,12 @@ const Row = struct {
     rel: f32,
     hash: u64,
     status: []const u8,
-    ranked: bool, // false for skip rows (excluded from fastest/slowest)
+    ranked: bool, // false for skip lines (excluded from fastest/slowest)
 };
 
 // -- state ------------------------------------------------------------------
 
-var group: [16]Row = undefined;
+var group: [16]Line = undefined;
 var group_len: usize = 0;
 var color_on: bool = false;
 
@@ -84,7 +84,7 @@ pub fn rate(t: Timed, work_per_call: f64) f64 {
     return work_per_call / (t.ms * 1e6);
 }
 
-/// Wyhash of the output bytes, the token that a row carries to show bit equality.
+/// Wyhash of the output bytes, the token that a line carries to show bit equality.
 pub fn hashOut(out: []const f32) u64 {
     const bytes = std.mem.sliceAsBytes(out);
     return std.hash.Wyhash.hash(0, bytes);
@@ -145,7 +145,7 @@ pub fn pickIters(scale: usize) usize {
     return 16384;
 }
 
-/// The status cell of a row: `ok` when the tolerance holds, `FAIL` otherwise.
+/// The status cell of a line: `ok` when the tolerance holds, `FAIL` otherwise.
 pub fn opStatus(tol: op_requires.Tolerance, rel: f32, hash_match: bool) []const u8 {
     return if (op_requires.toleranceSatisfied(tol, rel, hash_match)) "ok" else "FAIL";
 }
@@ -161,9 +161,9 @@ pub fn printSectionHeader(name: []const u8) void {
     std.debug.print(header_fmt, .{ "case", "variant", "ms", "G/s", "rel_err", "hash", "status" });
 }
 
-/// Buffer a row that records a declined case, such as an LDS too small for the
+/// Buffer a line that records a declined case, such as an LDS too small for the
 /// variant. The ranking over fastest and slowest skips it.
-pub fn skipRow(label: []const u8, variant: []const u8, reason: []const u8) void {
+pub fn skipLine(label: []const u8, variant: []const u8, reason: []const u8) void {
     add(.{
         .label = label,
         .variant = variant,
@@ -176,8 +176,8 @@ pub fn skipRow(label: []const u8, variant: []const u8, reason: []const u8) void 
     });
 }
 
-/// Buffer a pre-timed row, for a section that times by hand.
-pub fn rawRow(
+/// Buffer a pre-timed line, for a section that times by hand.
+pub fn rawLine(
     label: []const u8,
     variant: []const u8,
     ms: f64,
@@ -198,7 +198,7 @@ pub fn rawRow(
     });
 }
 
-/// Print the buffered group, then clear it. With more than one ranked row, the
+/// Print the buffered group, then clear it. With more than one ranked line, the
 /// fastest tints green and the slowest red.
 pub fn flush() void {
     defer group_len = 0;
@@ -235,9 +235,9 @@ pub fn flush() void {
     }
 }
 
-/// One CPU reference row, at rel_err 0 and the reference hash. The caller
+/// One CPU reference line, at rel_err 0 and the reference hash. The caller
 /// computes `ref_hash` from the one-shot reference output.
-pub fn cpuRow(
+pub fn cpuLine(
     io: std.Io,
     scale: usize,
     label: []const u8,
@@ -247,12 +247,12 @@ pub fn cpuRow(
     ctx: anytype,
 ) !void {
     const t = try timed(io, scale, ctx);
-    rawRow(label, name, t.ms, rate(t, work), 0.0, ref_hash, "ok");
+    rawLine(label, name, t.ms, rate(t, work), 0.0, ref_hash, "ok");
 }
 
-/// One GPU-variant row: run once to fill `out_buf`, hash it, diff it against the
-/// reference, time the closure, then buffer the row with the tolerance verdict.
-pub fn gpuRow(
+/// One GPU-variant line: run once to fill `out_buf`, hash it, diff it against the
+/// reference, time the closure, then buffer the line with the tolerance verdict.
+pub fn gpuLine(
     io: std.Io,
     scale: usize,
     label: []const u8,
@@ -268,7 +268,7 @@ pub fn gpuRow(
     const hsh = hashOut(out_buf);
     const errs = computeErrors(ref_out, out_buf);
     const t = try timed(io, scale, ctx);
-    rawRow(
+    rawLine(
         label,
         name,
         t.ms,
@@ -281,9 +281,9 @@ pub fn gpuRow(
 
 // -- helpers ----------------------------------------------------------------
 
-fn add(row: Row) void {
+fn add(line: Line) void {
     std.debug.assert(group_len < group.len);
 
-    group[group_len] = row;
+    group[group_len] = line;
     group_len += 1;
 }

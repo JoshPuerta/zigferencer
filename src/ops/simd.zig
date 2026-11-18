@@ -17,7 +17,7 @@
 //! correct and runs scalar, so `requires` does not list it.
 //!
 //! Q4 and Q6_K. The q4 CPU path exists for completeness, so it reuses the naive scalar
-//! dequant-and-dot. The runner still parallelizes it across rows.
+//! dequant-and-dot. The runner still parallelizes it across outputs.
 //!
 //! Batch. The Q8_0 batch form is the panel path of `linear_simd`, bit-identical to per-row calls.
 //! The f32 batch form runs one B = 1 call per row, so it matches the single-row call bit for bit.
@@ -77,12 +77,12 @@ test "simd linearF32Q80Batch is bit-identical to per-row simd linearF32Q80" {
     const in_features: usize = 64;
     const out_features: usize = 10;
     const batch: usize = 3;
-    const row_bytes = (in_features / 32) * 34;
+    const output_bytes = (in_features / 32) * 34;
 
     const inputs = try gpa.alloc(f32, batch * in_features);
     defer gpa.free(inputs);
 
-    const w_data = try gpa.alignedAlloc(u8, .@"32", out_features * row_bytes);
+    const w_data = try gpa.alignedAlloc(u8, .@"32", out_features * output_bytes);
     defer gpa.free(w_data);
 
     const outs = try gpa.alloc(f32, batch * out_features);
@@ -95,13 +95,13 @@ test "simd linearF32Q80Batch is bit-identical to per-row simd linearF32Q80" {
         x.* = @sin(@as(f32, @floatFromInt(i)) * 0.04);
     }
 
-    linear_simd.fillTestWeight(w_data, in_features, out_features, row_bytes);
+    linear_simd.fillTestWeight(w_data, in_features, out_features, output_bytes);
 
     const w: Tensor = .{
         .dtype = .q8_0,
         .n_dims = 2,
         .shape = .{ @intCast(in_features), @intCast(out_features), 0, 0 },
-        .byte_stride = .{ @intCast(row_bytes), 0, 0, 0 },
+        .byte_stride = .{ @intCast(output_bytes), 0, 0, 0 },
         .data = w_data,
     };
 
@@ -162,12 +162,12 @@ test "simd linearF32Q80 matches naive within tolerance" {
     const gpa = std.testing.allocator;
     const in_features: usize = 576;
     const out_features: usize = 1536;
-    const row_bytes = (in_features / 32) * 34;
+    const output_bytes = (in_features / 32) * 34;
 
     const input = try gpa.alignedAlloc(f32, .of(f32), in_features);
     defer gpa.free(input);
 
-    const w_data = try gpa.alignedAlloc(u8, .@"32", out_features * row_bytes);
+    const w_data = try gpa.alignedAlloc(u8, .@"32", out_features * output_bytes);
     defer gpa.free(w_data);
 
     const out_naive = try gpa.alloc(f32, out_features);
@@ -180,13 +180,13 @@ test "simd linearF32Q80 matches naive within tolerance" {
         x.* = @sin(@as(f32, @floatFromInt(i)) * 0.01);
     }
 
-    linear_simd.fillTestWeight(w_data, in_features, out_features, row_bytes);
+    linear_simd.fillTestWeight(w_data, in_features, out_features, output_bytes);
 
     const w: Tensor = .{
         .dtype = .q8_0,
         .n_dims = 2,
         .shape = .{ @intCast(in_features), @intCast(out_features), 0, 0 },
-        .byte_stride = .{ @intCast(row_bytes), 0, 0, 0 },
+        .byte_stride = .{ @intCast(output_bytes), 0, 0, 0 },
         .data = w_data,
     };
 

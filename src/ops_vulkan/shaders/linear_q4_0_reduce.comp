@@ -16,13 +16,13 @@
 //
 //   The ggml Q4_0 block packs each 32-weight block into 16 bytes, which is 4 uint32 words. Weight
 //   i (i < 16) is the low nibble of byte i, and weight i + 16 is the high nibble of byte i.
-//   Each block belongs to exactly one lane, so the partials cover the row once.
+//   Each block belongs to exactly one lane, so the partials cover the output once.
 //
 // Schedule
 //   grid       (min(n, GRID_X), ceil(n / GRID_X), 1)
 //   workgroup  32 lanes. One workgroup owns one output j = gl_WorkGroupID.y * GRID_X +
 //              gl_WorkGroupID.x, so a vocabulary past one axis of the grid folds onto y.
-//   lane       Lane L owns the weight blocks L, L + 32, L + 64, ... of row j.
+//   lane       Lane L owns the weight blocks L, L + 32, L + 64, ... of output j.
 //
 //     lane L sums blocks L, L+32, L+64, ...     (strided, so a wave reads one run)
 //           \____________ 32 lane partials ____________/
@@ -41,8 +41,8 @@
 //   Waves: local_size_x = 32 is one wave32 wave, so a barrier waits for no other wave.
 //   Pass 1: Q4_0 reads about half the bytes of Q8_0: 16 packed bytes against 32 per 32-weight
 //   block, plus the same 2-byte scale. Adjacent lanes read adjacent weight blocks.
-//   Tails: the last grid row can hold workgroups past n. Such a workgroup still stores a zero
-//   partial and reaches the barrier, so every lane leaves through the same barrier.
+//   Tails: the workgroups at the last y of the grid can lie past n. Such a workgroup still
+//   stores a zero partial and reaches the barrier, so every lane leaves through the same barrier.
 //
 // Numerics
 //   Tolerance: `LinearQ40Reduce` declares `.relative = 2e-4`. The lane partials accumulate in lane
@@ -107,14 +107,14 @@ void main() {
         return;
     }
 
-    uint blocks_per_row = params.k / 32u;
-    uint words_per_row = params.k / 8u;  // 4 words (16 bytes) per block
+    uint blocks_per_output = params.k / 32u;
+    uint words_per_output = params.k / 8u;  // 4 words (16 bytes) per block
 
     // Pass 1: sum the strided blocks of this lane.
     float partial = 0.0;
-    for (uint blk = local; blk < blocks_per_row; blk += 32u) {
-        float scale = float(scales_buf.data[j * blocks_per_row + blk]);
-        uint word_base = j * words_per_row + blk * 4u;
+    for (uint blk = local; blk < blocks_per_output; blk += 32u) {
+        float scale = float(scales_buf.data[j * blocks_per_output + blk]);
+        uint word_base = j * words_per_output + blk * 4u;
 
         for (uint i = 0u; i < 16u; ++i) {
             uint word = quants_buf.data[word_base + (i >> 2)];

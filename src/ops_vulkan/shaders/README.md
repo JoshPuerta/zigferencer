@@ -91,7 +91,7 @@ changes. In `attention_batch` the rows share one cache and differ by causal `t_l
   `kv_commit_f16`. A kernel that reorders a reduction, or that reads a GPU transcendental, declares
   a measured `.relative` value on its `Pipeline` wrapper in `../kernels/`. The `Numerics` section
   of each header names the value its wrapper declares. `tools/bench.zig` prints the relative error
-  per variant and fails the row on drift. `qwen_qk_norm.comp` is the one kernel whose wrapper
+  per variant and fails the line on drift. `qwen_qk_norm.comp` is the one kernel whose wrapper
   declares no tolerance, and the token-hash gates cover it.
 - **The split length bounds the resident attention shaders.** `attention.comp`,
   `attention_multi_stream.comp`, and `attention_batch.comp` hold every score of a row in shared
@@ -133,4 +133,4 @@ changes. In `attention_batch` the rows share one cache and differ by causal `t_l
 The header comment of each shader is its specification. It holds labeled sections in this order:
 `What`, `Math`, `Schedule`, `Memory`, `Hardware`, `Numerics`, `Bindings`, and `Defines`. A tiny
 kernel keeps `What`, `Hardware`, `Numerics`, and `Bindings`. Inside `main`, `// Pass N:` labels
-match the pass rows of `Schedule`.
+match the pass entries of `Schedule`.

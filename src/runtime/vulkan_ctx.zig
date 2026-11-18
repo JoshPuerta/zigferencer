@@ -720,7 +720,7 @@ fn apiAtLeast12(api_version: u32) bool {
     return v.major > 1 or (v.major == 1 and v.minor >= 2);
 }
 
-/// Read the driver id and map it to a row of `limits.Driver`. The caller checks that the device
+/// Read the driver id and map it to an entry of `limits.Driver`. The caller checks that the device
 /// is at Vulkan 1.2 or states `VK_KHR_driver_properties`.
 fn readDriver(vki: vk.InstanceWrapper, dev: vk.PhysicalDevice) limits.Driver {
     var driver_props: vk.PhysicalDeviceDriverProperties = .{
@@ -734,8 +734,8 @@ fn readDriver(vki: vk.InstanceWrapper, dev: vk.PhysicalDevice) limits.Driver {
         .p_next = @ptrCast(&driver_props),
     };
     vki.getPhysicalDeviceProperties2(dev, &props2);
-    const driver = driverRow(driver_props.driver_id);
-    log.debug("driver: {s} (id {d}), limits row {t}", .{
+    const driver = driverEntry(driver_props.driver_id);
+    log.debug("driver: {s} (id {d}), limits entry {t}", .{
         std.mem.sliceTo(&driver_props.driver_name, 0),
         @intFromEnum(driver_props.driver_id),
         driver,
@@ -743,8 +743,8 @@ fn readDriver(vki: vk.InstanceWrapper, dev: vk.PhysicalDevice) limits.Driver {
     return driver;
 }
 
-/// The one map from a Vulkan driver id to a row of `limits.Driver`.
-fn driverRow(id: vk.DriverId) limits.Driver {
+/// The one map from a Vulkan driver id to an entry of `limits.Driver`.
+fn driverEntry(id: vk.DriverId) limits.Driver {
     return switch (id) {
         .mesa_dozen => .vulkan_on_d3d12,
         else => .other,
@@ -886,9 +886,9 @@ test "pickHostType: the cached type wins before and after a coherent-only type" 
     try std.testing.expectEqual(@as(?u32, 1), pickHostType(cached_last, all_types));
 }
 
-test "driverRow: only the translation-layer driver id takes its row" {
-    try std.testing.expectEqual(limits.Driver.vulkan_on_d3d12, driverRow(.mesa_dozen));
-    try std.testing.expectEqual(limits.Driver.other, driverRow(.mesa_llvmpipe));
-    try std.testing.expectEqual(limits.Driver.other, driverRow(.amd_proprietary));
-    try std.testing.expectEqual(limits.Driver.other, driverRow(@enumFromInt(9999)));
+test "driverEntry: only the translation-layer driver id takes its entry" {
+    try std.testing.expectEqual(limits.Driver.vulkan_on_d3d12, driverEntry(.mesa_dozen));
+    try std.testing.expectEqual(limits.Driver.other, driverEntry(.mesa_llvmpipe));
+    try std.testing.expectEqual(limits.Driver.other, driverEntry(.amd_proprietary));
+    try std.testing.expectEqual(limits.Driver.other, driverEntry(@enumFromInt(9999)));
 }

@@ -13,7 +13,7 @@ device, and nothing logs, so a table test runs every boot shape with no GPU.
 | `flags.zig` | `EngineFlags`, the options of one boot. |
 | `resolve.zig` | `early` and `resolve`: flags and resources in, `Resolved` or `Refusal` out. |
 | `device_placement.zig` | The device placement: the fused fit, the VRAM budgets, and the hybrid split. |
-| `family.zig` | One row per model family: the runner of each placement. |
+| `family.zig` | One entry per model family: the runner of each placement. |
 
 ## How the pieces fit
 
@@ -56,7 +56,7 @@ The boot is one pass:
   Resolved | Refusal --> the command logs it and builds the runner it names
 ```
 
-The runner comes from a family row:
+The runner comes from a family entry:
 
 ```
   loader.card.arch --> switch (arch) { inline else => |a| family.Of(a) }
@@ -73,8 +73,8 @@ Inside the directory, `resolve` imports `device_placement`, and `device_placemen
 
 - **Pure values.** A function here takes values and returns a value. A new boot decision goes here,
   not in a command, so a table test can reach it.
-- **One row per family.** `family.Of` names every architecture, so a new one fails the build until
-  its row exists. No command holds an `arch ==` branch.
+- **One entry per family.** `family.Of` names every architecture, so a new one fails the build until
+  its entry exists. No command holds an `arch ==` branch.
 - **Refusals before the load.** `early` refuses what needs no model file, so a bad flag costs no
   load.
 - **The header of `resolve.zig` holds the per-kind rules.** The table tests show every boot shape.

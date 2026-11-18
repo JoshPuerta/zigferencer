@@ -115,7 +115,8 @@ pub fn CpuRunner(comptime Family: type) type {
         const Self = @This();
 
         card: loader.ModelCard,
-        /// Row-parallel matmul and attention fan-out. The caller owns the pool and must outlive it.
+        /// Output-parallel matmul and attention fan-out. The caller owns the pool and must
+        /// outlive it.
         pool: *Pool,
         policy: parallel.Policy,
 

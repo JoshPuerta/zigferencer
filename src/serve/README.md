@@ -305,9 +305,9 @@ byte: 0 content, 1 reasoning, 2 the open tag of a think block, 3 its close tag. 
 text, so a client that ignores the channel prints the same bytes. `done` counts the reasoning
 tokens. `hello_ack` names the think mode of the server (0 no tags, 1 off, 2 on) and the think budget
 (0 is unbounded). It also names `resume_ttl_max_ms`, the longest lease (0 is resumption off). It
-also carries two card rows, `recommended_think` and `recommended_plain`. They hold the sampling that
-the model card recommends for a turn inside the think block and for a turn outside it. A model with
-no card values gets greedy. A client picks the row of the mode of each turn.
+also carries two card entries, `recommended_think` and `recommended_plain`. They hold the sampling
+that the model card recommends for a turn inside the think block and for a turn outside it. A model
+with no card values gets greedy. A client picks the entry of the mode of each turn.
 
 `Sampling` is 36 bytes. It carries a presence penalty in [-2, 2], a repetition
 penalty in (0, 2], and a min_p in [0, 1]. The identity values are 0, 1, and 0.
@@ -334,7 +334,7 @@ and the wrap of the turn and the think state of the entry read that one value.
 A budget above 0 on a model with no forced close also gets `err` with `forbidden`.
 
 `next` and `send` touch disjoint fields, so one task can read while another task
-writes. `deinit` runs after both tasks return. Every row of the table runs
+writes. `deinit` runs after both tasks return. Every entry of the table runs
 against a live server in `tests/serve_integration_test.zig`.
 
 | Wire verb | Client method | Family | Terminal message |
@@ -473,7 +473,7 @@ cut.
 ### Validated clients
 
 Compatibility is a claim about named clients. The table names each client and the way
-the claim holds for it: a test keeps the first row true, and the second row is a manual check.
+the claim holds for it: a test keeps the first entry true, and the second entry is a manual check.
 
 | Client | Version | Transports | How |
 | --- | --- | --- | --- |
@@ -565,9 +565,9 @@ error reply carry `content-length` for every version. A stream to an HTTP/1.0 cl
 chunked coding, and it ends at the close.
 
 An omitted sampling field takes a default. Under `--sampling model`,
-the default, it takes the field of the registry card row of the resolved
-thinking mode, the vLLM priority. A model with no card row takes the greedy
-row. Under `--sampling greedy`, every omitted field keeps the greedy
+the default, it takes the field of the registry card entry of the resolved
+thinking mode, the vLLM priority. A model with no card entry takes the greedy
+entry. Under `--sampling greedy`, every omitted field keeps the greedy
 identity. A field that the request sends always wins over the card. A client
 that needs a fixed reply sends `temperature: 0` or a fixed `seed`. One seed,
 one build, and one request give one reply. Under the card defaults,

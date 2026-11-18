@@ -62,7 +62,7 @@ pub const OpRequires = struct {
     /// True when the variant uses FMA (x86) or fused multiply-add (ARM).
     needs_fma: bool = false,
     /// Tolerance against `naive`. The default of 1e-3 relative error admits SIMD reordering and
-    /// FMA, and it rejects sign swaps, row mis-indexing, and scale decode bugs.
+    /// FMA, and it rejects sign swaps, output mis-indexing, and scale decode bugs.
     tolerance: Tolerance = .{ .relative = 1e-3 },
 };
 
@@ -85,7 +85,7 @@ pub fn runtimeMatches(req: OpRequires, host: Runtime) bool {
 }
 
 /// Build-time eligibility check using a resolved `std.Target.Cpu`.
-/// `tools/bench_matmul.zig` calls this to filter its rows, and `build.zig` keeps its own mirror.
+/// `tools/bench_matmul.zig` calls this to filter its lines, and `build.zig` keeps its own mirror.
 pub fn isMetBy(req: OpRequires, cpu: std.Target.Cpu) bool {
     const arch_ok = switch (req.arch) {
         .any => true,

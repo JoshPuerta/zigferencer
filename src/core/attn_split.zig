@@ -672,11 +672,11 @@ test "fits: the 31-bit index and the storage range pass at their bounds, fail on
 test "fits: every registry model at its declared context fits the spec-minimum limits" {
     // The shapes come from a pinned table and not from the model files. So the
     // test runs where no file is present, and it opens no model file. Each
-    // registry entry must have exactly one row, so a new entry fails the test
-    // until it gets a row.
+    // registry entry must have exactly one pinned entry, so a new registry entry
+    // fails the test until it gets one.
     const registry = @import("registry.zig");
-    const Row = struct { name: []const u8, n_heads: u32, head_dim: u32, ctx: u32 };
-    const pinned = [_]Row{
+    const Entry = struct { name: []const u8, n_heads: u32, head_dim: u32, ctx: u32 };
+    const pinned = [_]Entry{
         .{ .name = "SmolLM2-135M-Instruct-Q8_0", .n_heads = 9, .head_dim = 64, .ctx = 8192 },
         .{ .name = "SmolLM2-135M-Instruct-Q4_0", .n_heads = 9, .head_dim = 64, .ctx = 8192 },
         .{
@@ -697,11 +697,11 @@ test "fits: every registry model at its declared context fits the spec-minimum l
     try testing.expectEqual(registry.all().len, pinned.len);
     for (registry.all()) |m| {
         var matches: u32 = 0;
-        for (pinned) |row| {
-            if (!std.mem.eql(u8, row.name, m.pub_name)) continue;
+        for (pinned) |entry| {
+            if (!std.mem.eql(u8, entry.name, m.pub_name)) continue;
 
             matches += 1;
-            const scratch = Scratch.init(row.n_heads, row.head_dim, row.ctx);
+            const scratch = Scratch.init(entry.n_heads, entry.head_dim, entry.ctx);
             try testing.expectEqual(limits.BufferVerdict.fits, fits(scratch, spec_min_limits));
         }
 

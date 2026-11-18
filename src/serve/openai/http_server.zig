@@ -464,7 +464,7 @@ fn HttpTasks(comptime Eng: type) type {
             };
             const sampling = map.resolveSampling(
                 req.sampling,
-                codec.defaults.row(input.think_open),
+                codec.defaults.entry(input.think_open),
                 seed,
             );
             log.debug(

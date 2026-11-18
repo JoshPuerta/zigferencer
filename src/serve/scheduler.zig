@@ -89,8 +89,8 @@
 //! because the acceptor numbers from 1. A request on it is the process owner, and it always stops.
 //!
 //! Card sampling. `hello_ack` carries the sampling that the model card recommends inside and
-//! outside the think block. A client picks the row of the mode of each turn. The launcher reads the
-//! model registry, so the engine holds no per-model table. The default is greedy.
+//! outside the think block. A client picks the entry of the mode of each turn. The launcher reads
+//! the model registry, so the engine holds no per-model table. The default is greedy.
 //!
 //! Pool boundary. `SessionPool` is the session pool of the runtime (`Sessions(RunnerT)`,
 //! `Residency`, or a test fake). The scheduler calls only its composed `advance`. `CodecT` is the

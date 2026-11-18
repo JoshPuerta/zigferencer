@@ -3,7 +3,7 @@
 # compiler, which `zig build simd-probe` emits for the build target. It therefore works for any
 # architecture Zig can compile, cross-compilation included, and needs no multi-arch objdump.
 #
-# The width table is the overview across every kernel, one row each. A kernel name is the
+# The width table is the overview across every kernel, one line each. A kernel name is the
 # drill-down. One kernel already runs to dozens or hundreds of instructions, so the script takes
 # one name and dumps only the kernels that match it.
 set -euo pipefail
@@ -29,7 +29,7 @@ Usage: tools/simd-report.sh [KERNEL]
 
 Print the SIMD width of every probed kernel, or the assembly of the kernels that match KERNEL.
 
-  (no argument)  Print the build target, then one row per kernel with its vector width.
+  (no argument)  Print the build target, then one line per kernel with its vector width.
   KERNEL         Print the assembly and the mnemonic histogram of each kernel whose name
                  holds the substring. For example, linearF32Q80 matches the naive, simd, and
                  simd_pf variants together.

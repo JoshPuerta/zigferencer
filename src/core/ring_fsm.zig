@@ -81,8 +81,8 @@ pub fn next(s: SlotState, op: OpTag) ?SlotState {
 // The three tests below run at comptime, so drift in the table or the trace fails the build.
 test "ring_fsm: the transition table, exhaustively" {
     comptime {
-        // Rows follow `SlotState` order, columns follow `OpTag` order. The nulls pin the negative
-        // space that the ring asserts depend on.
+        // The outer index follows `SlotState` order, the inner index follows `OpTag` order. The
+        // nulls pin the negative space that the ring asserts depend on.
         const expected = [4][4]?SlotState{
             .{ .filling, null, null, null },
             .{ null, .in_flight, null, null },

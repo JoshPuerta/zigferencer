@@ -15,12 +15,12 @@
 //! or of four. Every path below follows this rule. So each output value has the same bits at
 //! every batch size, with or without prefetch.
 //!
-//! B = 1. `groupPass` takes `mr = 4` output rows at once, one Q8_0 block at a time. The four
-//! accumulators sit in registers and each input vector loads once for the four rows.
+//! B = 1. `groupPass` takes `mr = 4` outputs at once, one Q8_0 block at a time. The four
+//! accumulators sit in registers and each input vector loads once for the four outputs.
 //!
 //! Panel path. The B = 1 path repeats the i8 to f32 widening and the scale multiply for every
 //! batch row. So with more batch rows a group widens its weights once per K tile and per pass
-//! of `accumulator_rows` batch rows, and keeps them in a stack panel of `mr` rows by `k_tile`
+//! of `accumulator_rows` batch rows, and keeps them in a stack panel of `mr` outputs by `k_tile`
 //! weights. The panel stays in L1, and the inner loop reuses it for every batch row of the pass,
 //! `b_tile` rows per register tile. The inner loop then holds loads and a fused multiply-add.
 //! A batch over `accumulator_rows` widens again for each pass. Each batch row still sees the K
@@ -28,17 +28,17 @@
 //! from memory once per pass, not once per batch row.
 //!
 //! Prefetch. Only `prefetched` prefetches. Each block of a group prefetches the same block of the
-//! next 4-row group with `.locality = 0`, because the pass reads those bytes once. So the lines
+//! next 4-output group with `.locality = 0`, because the pass reads those bytes once. So the lines
 //! are warm when the outer loop arrives, and they do not pollute L1. Shapes that stream past the
 //! last-level cache gain from it. Prefetch changes no bit.
 //!
-//! Tail. The outputs left when `out_features % mr != 0` take `rowPass`: one output, no prefetch,
+//! Tail. The outputs left when `out_features % mr != 0` take `outputPass`: one output, no prefetch,
 //! the same vector walk, and the same lane tree.
 //!
 //! Tiles. No tile size enters the order of a lane, so the tiles change the speed, never a bit.
-//! `linearTilesForCpu` holds one row, measured on a core with 16 vector registers of 256 bits and
+//! `linearTilesForCpu` holds one entry, measured on a core with 16 vector registers of 256 bits and
 //! a 32 KiB L1 data cache. Comptime asserts tie the tiles to those two figures and to
-//! `limits.cpu_prefill_chunk`. A class of CPU gets its own row only with a measurement on it.
+//! `limits.cpu_prefill_chunk`. A class of CPU gets its own entry only with a measurement on it.
 //!
 //! F32. `linearF32` takes the bit rule with `w` read from the weight. The last `in_features % 8`
 //! dims add with one vector whose other lanes are zero in `w` and in `x`. The f32 kernel takes
@@ -59,20 +59,20 @@ const Tensor = @import("../core/tensor.zig").Tensor;
 
 const lanes = 8;
 
-/// Output rows per group. `groupPass` and the offsets of a group spell out four rows, so this
+/// Outputs per group. `groupPass` and the offsets of a group spell out four outputs, so this
 /// size stays out of the tile table.
 const mr = 4;
 
 /// The vector registers of the narrowest target that the SIMD backends accept: AVX2 names 16.
 const vector_registers_min = 16;
 
-/// The L1 data cache of the measured row, 32 KiB on Zen 3 (AMD publication 56665).
+/// The L1 data cache of the measured entry, 32 KiB on Zen 3 (AMD publication 56665).
 const l1_data_bytes = 32 * 1024;
 
 /// The tile sizes of the build target.
 const tiles = linearTilesForCpu(builtin.cpu);
 
-/// Weights per row in one panel.
+/// Weights per output in one panel.
 const k_tile = tiles.k_tile;
 
 /// Batch rows per register tile.
@@ -96,7 +96,7 @@ comptime {
 /// The kernels without software prefetch. The `simd` backend exports them.
 pub const plain = Kernels(.{});
 
-/// The kernels that prefetch the next 4-row group. The `simd_pf` backend exports them. They give
+/// The kernels that prefetch the next 4-output group. The `simd_pf` backend exports them. They give
 /// the bits of `plain`.
 pub const prefetched = Kernels(.{ .prefetch = true });
 
@@ -107,13 +107,13 @@ const VecI8 = @Vector(lanes, i8);
 
 /// The compile-time choices of one kernel set.
 const Options = struct {
-    /// Prefetch the matching block of the next 4-row group.
+    /// Prefetch the matching block of the next 4-output group.
     prefetch: bool = false,
 };
 
 /// The tile sizes of the panel path on one class of CPU.
 const Tiles = struct {
-    /// Weights per row in one panel, a multiple of the 32 weights of a Q8_0 block.
+    /// Weights per output in one panel, a multiple of the 32 weights of a Q8_0 block.
     k_tile: usize,
     /// Batch rows per register tile.
     b_tile: usize,
@@ -128,10 +128,10 @@ const BatchShape = struct {
     out_stride: usize,
 };
 
-/// The dequantized weights of one K tile, one row of `k_tile` weights per group row.
+/// The dequantized weights of one K tile, `k_tile` weights per group output.
 const Panel = [mr][k_tile]f32;
 
-/// One accumulator vector per group row and batch row of one pass.
+/// One accumulator vector per group output and batch row of one pass.
 const Accumulators = [accumulator_rows][mr]Vec;
 
 /// One kernel set: the two Q8_0 linear names of an ops backend.
@@ -163,25 +163,25 @@ fn Kernels(comptime opts: Options) type {
             std.debug.assert(outs.len >= (batch - 1) * out_stride + out_features);
             std.debug.assert(in_features % 32 == 0);
 
-            const row_bytes = (in_features / 32) * 34;
+            const output_bytes = (in_features / 32) * 34;
             const n_blocks = in_features / 32;
 
-            // Take the full 4-row groups.
+            // Take the full 4-output groups.
             var j: usize = 0;
             while (j + mr <= out_features) : (j += mr) {
-                const row_offs: [mr]usize = .{
-                    (j + 0) * row_bytes,
-                    (j + 1) * row_bytes,
-                    (j + 2) * row_bytes,
-                    (j + 3) * row_bytes,
+                const output_offs: [mr]usize = .{
+                    (j + 0) * output_bytes,
+                    (j + 1) * output_bytes,
+                    (j + 2) * output_bytes,
+                    (j + 3) * output_bytes,
                 };
                 // The last group has no next group to prefetch.
                 const has_next = j + 2 * mr <= out_features;
                 const pf_offs: [mr]usize = .{
-                    (j + mr + 0) * row_bytes,
-                    (j + mr + 1) * row_bytes,
-                    (j + mr + 2) * row_bytes,
-                    (j + mr + 3) * row_bytes,
+                    (j + mr + 0) * output_bytes,
+                    (j + mr + 1) * output_bytes,
+                    (j + mr + 2) * output_bytes,
+                    (j + mr + 3) * output_bytes,
                 };
 
                 if (batch > 1) {
@@ -191,7 +191,7 @@ fn Kernels(comptime opts: Options) type {
                         .out_stride = out_stride,
                     };
                     const panelFn = if (opts.prefetch) panelGroupPrefetched else panelGroupPlain;
-                    panelFn(inputs, weight.data, outs, shape, j, row_offs, pf_offs, has_next);
+                    panelFn(inputs, weight.data, outs, shape, j, output_offs, pf_offs, has_next);
                     continue;
                 }
 
@@ -199,7 +199,7 @@ fn Kernels(comptime opts: Options) type {
                     opts.prefetch,
                     inputs[0..in_features],
                     weight.data,
-                    row_offs,
+                    output_offs,
                     pf_offs,
                     has_next,
                     n_blocks,
@@ -210,13 +210,13 @@ fn Kernels(comptime opts: Options) type {
                 outs[j + 3] = sums[3];
             }
 
-            // Take the tail rows one at a time.
+            // Take the tail outputs one at a time.
             while (j < out_features) : (j += 1) {
-                const row_off = j * row_bytes;
+                const output_off = j * output_bytes;
                 var b: usize = 0;
                 while (b < batch) : (b += 1) {
                     const input = inputs[b * in_features ..][0..in_features];
-                    outs[b * out_stride + j] = rowPass(input, weight.data, row_off, n_blocks);
+                    outs[b * out_stride + j] = outputPass(input, weight.data, output_off, n_blocks);
                 }
             }
 
@@ -313,14 +313,14 @@ inline fn f32Chains(comptime m: usize, input: []const f32, w: []const f32, out0:
 }
 
 /// The tile sizes for `cpu`, a function of the target in the way of `std.atomic.cacheLineForCpu`.
-/// A class with 32 vector registers, such as AVX-512VL or NEON, gets its own row only after a
-/// measurement on that class. Until then every target takes the row measured on AVX2.
+/// A class with 32 vector registers, such as AVX-512VL or NEON, gets its own entry only after a
+/// measurement on that class. Until then every target takes the entry measured on AVX2.
 fn linearTilesForCpu(cpu: std.Target.Cpu) Tiles {
     _ = cpu;
     return .{ .k_tile = 512, .b_tile = 2, .accumulator_rows = 64 };
 }
 
-/// One 4-row weight group against every batch row, in passes of `accumulator_rows` rows.
+/// One 4-output weight group against every batch row, in passes of `accumulator_rows` rows.
 inline fn panelGroup(
     comptime prefetch: bool,
     inputs: []const f32,
@@ -328,7 +328,7 @@ inline fn panelGroup(
     outs: []f32,
     shape: BatchShape,
     j: usize,
-    row_offs: [mr]usize,
+    output_offs: [mr]usize,
     pf_offs: [mr]usize,
     has_next: bool,
 ) void {
@@ -339,7 +339,8 @@ inline fn panelGroup(
 
     var accs: Accumulators = undefined;
 
-    // `dequantTile` writes the first `tile` weights of each row before `accumulateTile` reads them.
+    // `dequantTile` writes the first `tile` weights of each output before `accumulateTile` reads
+    // them.
     var panel: Panel align(32) = undefined;
     var pass0: usize = 0;
     while (pass0 < shape.batch) : (pass0 += accumulator_rows) {
@@ -359,7 +360,7 @@ inline fn panelGroup(
             std.debug.assert(tile % 32 == 0);
             covered += tile;
 
-            dequantTile(prefetch, &panel, data, row_offs, pf_offs, has_next, k0 / 32, tile / 32);
+            dequantTile(prefetch, &panel, data, output_offs, pf_offs, has_next, k0 / 32, tile / 32);
 
             var b: usize = 0;
             while (b + b_tile <= rows) : (b += b_tile) {
@@ -408,11 +409,11 @@ noinline fn panelGroupPlain(
     outs: []f32,
     shape: BatchShape,
     j: usize,
-    row_offs: [mr]usize,
+    output_offs: [mr]usize,
     pf_offs: [mr]usize,
     has_next: bool,
 ) void {
-    panelGroup(false, inputs, data, outs, shape, j, row_offs, pf_offs, has_next);
+    panelGroup(false, inputs, data, outs, shape, j, output_offs, pf_offs, has_next);
 }
 
 /// `panelGroup` with prefetch, as its own function. Inlined into the B = 1 entry, the panel gives
@@ -423,11 +424,11 @@ noinline fn panelGroupPrefetched(
     outs: []f32,
     shape: BatchShape,
     j: usize,
-    row_offs: [mr]usize,
+    output_offs: [mr]usize,
     pf_offs: [mr]usize,
     has_next: bool,
 ) void {
-    panelGroup(true, inputs, data, outs, shape, j, row_offs, pf_offs, has_next);
+    panelGroup(true, inputs, data, outs, shape, j, output_offs, pf_offs, has_next);
 }
 
 /// Widen `n_blk` blocks of the 4 outputs into `panel` with `scaledQuarter`, the `w` of `blockStep`.
@@ -435,7 +436,7 @@ inline fn dequantTile(
     comptime prefetch: bool,
     panel: *Panel,
     data: []const u8,
-    row_offs: [mr]usize,
+    output_offs: [mr]usize,
     pf_offs: [mr]usize,
     has_next: bool,
     blk0: usize,
@@ -445,7 +446,7 @@ inline fn dequantTile(
     if (prefetch and has_next) {
         std.debug.assert(pf_offs[mr - 1] + (blk0 + n_blk) * 34 <= data.len);
     }
-    std.debug.assert(row_offs[mr - 1] + (blk0 + n_blk) * 34 <= data.len);
+    std.debug.assert(output_offs[mr - 1] + (blk0 + n_blk) * 34 <= data.len);
 
     for (0..n_blk) |t| {
         const blk_off = (blk0 + t) * 34;
@@ -457,7 +458,7 @@ inline fn dequantTile(
                 );
             }
 
-            const at = row_offs[r] + blk_off;
+            const at = output_offs[r] + blk_off;
             const scale_v = blockScale(data, at);
             inline for (0..4) |q| {
                 panel[r][t * 32 + q * lanes ..][0..lanes].* = scaledQuarter(data, at, scale_v, q);
@@ -509,32 +510,32 @@ inline fn accumulateTile(
     }
 }
 
-/// One input row against one 4-row weight group, the register-blocked core.
+/// One input row against one 4-output weight group, the register-blocked core.
 /// With `prefetch` and `has_next`, each iteration stages the next group's matching block.
 inline fn groupPass(
     comptime prefetch: bool,
     input: []const f32,
     data: []const u8,
-    row_offs: [mr]usize,
+    output_offs: [mr]usize,
     pf_offs: [mr]usize,
     has_next: bool,
     n_blocks: usize,
 ) [mr]f32 {
     std.debug.assert(input.len == n_blocks * 32);
-    std.debug.assert(row_offs[mr - 1] + n_blocks * 34 <= data.len);
+    std.debug.assert(output_offs[mr - 1] + n_blocks * 34 <= data.len);
     if (prefetch and has_next) std.debug.assert(pf_offs[mr - 1] + n_blocks * 34 <= data.len);
 
     var acc = [_]Vec{@splat(0)} ** mr;
 
     var blk: usize = 0;
     while (blk < n_blocks) : (blk += 1) {
-        const blk_off_in_row = blk * 34;
+        const blk_off_in_output = blk * 34;
 
         // Prefetch the matching block of the next group.
         if (prefetch and has_next) {
             inline for (0..mr) |r| {
                 @prefetch(
-                    &data[pf_offs[r] + blk_off_in_row],
+                    &data[pf_offs[r] + blk_off_in_output],
                     .{ .rw = .read, .locality = 0, .cache = .data },
                 );
             }
@@ -546,7 +547,7 @@ inline fn groupPass(
         }
 
         inline for (0..mr) |r| {
-            acc[r] = blockStep(data, row_offs[r] + blk_off_in_row, x, acc[r]);
+            acc[r] = blockStep(data, output_offs[r] + blk_off_in_output, x, acc[r]);
         }
     }
 
@@ -554,10 +555,10 @@ inline fn groupPass(
     return sums[0..mr].*;
 }
 
-/// One tail row.
-inline fn rowPass(input: []const f32, data: []const u8, row_off: usize, n_blocks: usize) f32 {
+/// One tail output.
+inline fn outputPass(input: []const f32, data: []const u8, output_off: usize, n_blocks: usize) f32 {
     std.debug.assert(input.len == n_blocks * 32);
-    std.debug.assert(row_off + n_blocks * 34 <= data.len);
+    std.debug.assert(output_off + n_blocks * 34 <= data.len);
 
     var acc: Vec = @splat(0);
     var blk: usize = 0;
@@ -566,7 +567,7 @@ inline fn rowPass(input: []const f32, data: []const u8, row_off: usize, n_blocks
         inline for (0..4) |q| {
             x[q] = input[blk * 32 + q * lanes ..][0..lanes].*;
         }
-        acc = blockStep(data, row_off + blk * 34, x, acc);
+        acc = blockStep(data, output_off + blk * 34, x, acc);
     }
 
     return lane_tree.laneSum(acc);
@@ -608,17 +609,17 @@ pub fn fillTestWeight(
     w_data: []u8,
     in_features: usize,
     out_features: usize,
-    row_bytes: usize,
+    output_bytes: usize,
 ) void {
-    for (0..out_features) |row| {
-        const off = row * row_bytes;
+    for (0..out_features) |j| {
+        const off = j * output_bytes;
         var blk: usize = 0;
         while (blk < in_features / 32) : (blk += 1) {
             const blk_off = off + blk * 34;
             std.mem.writeInt(u16, w_data[blk_off..][0..2], 0x3c00, .little);
             var i: usize = 0;
             while (i < 32) : (i += 1) {
-                const v_i32: i32 = @as(i32, @intCast((row + blk * 32 + i) % 13)) - 6;
+                const v_i32: i32 = @as(i32, @intCast((j + blk * 32 + i) % 13)) - 6;
                 const v: i8 = @intCast(v_i32);
                 w_data[blk_off + 2 + i] = @bitCast(v);
             }
@@ -628,12 +629,17 @@ pub fn fillTestWeight(
 
 /// Fill like `fillTestWeight`, then vary the f16 scale per block, so a scale mix-up between
 /// blocks changes the bits.
-fn fillScaledWeight(w_data: []u8, in_features: usize, out_features: usize, row_bytes: usize) void {
-    fillTestWeight(w_data, in_features, out_features, row_bytes);
-    for (0..out_features) |row| {
+fn fillScaledWeight(
+    w_data: []u8,
+    in_features: usize,
+    out_features: usize,
+    output_bytes: usize,
+) void {
+    fillTestWeight(w_data, in_features, out_features, output_bytes);
+    for (0..out_features) |j| {
         for (0..in_features / 32) |blk| {
-            const scale_bits: u16 = @intCast(0x3c00 + (row + blk) % 64);
-            const at = row * row_bytes + blk * 34;
+            const scale_bits: u16 = @intCast(0x3c00 + (j + blk) % 64);
+            const at = j * output_bytes + blk * 34;
             std.mem.writeInt(u16, w_data[at..][0..2], scale_bits, .little);
         }
     }
@@ -658,7 +664,7 @@ fn panelCheck(
     batches: []const usize,
 ) !void {
     const gpa = std.testing.allocator;
-    const row_bytes = (in_features / 32) * 34;
+    const output_bytes = (in_features / 32) * 34;
     const gap: usize = 5;
     const out_stride = out_features + gap;
     const nan_bits: u32 = @bitCast(std.math.nan(f32));
@@ -671,7 +677,7 @@ fn panelCheck(
     const inputs = try gpa.alignedAlloc(f32, .of(f32), max_batch * in_features);
     defer gpa.free(inputs);
 
-    const w_data = try gpa.alignedAlloc(u8, .@"32", out_features * row_bytes);
+    const w_data = try gpa.alignedAlloc(u8, .@"32", out_features * output_bytes);
     defer gpa.free(w_data);
 
     const outs = try gpa.alloc(f32, max_batch * out_stride);
@@ -685,7 +691,7 @@ fn panelCheck(
         x.* = prng.random().float(f32) * 2.0 - 1.0;
     }
 
-    fillScaledWeight(w_data, in_features, out_features, row_bytes);
+    fillScaledWeight(w_data, in_features, out_features, output_bytes);
     const w = q80Tensor(w_data, in_features, out_features);
 
     for (batches) |batch| {
@@ -708,7 +714,7 @@ test "linear_simd panel path equals per-row calls across K tiles" {
     // Two full K tiles and a 64-weight tail tile.
     const in_features: usize = 2 * k_tile + 64;
 
-    // Batch 130 is two full passes and 2 rows. The out sizes leave tails of 1, 2, and 3 rows.
+    // Batch 130 is two full passes and 2 rows. The out sizes leave tails of 1, 2, and 3 outputs.
     const batches = [_]usize{ 1, 2, 3, accumulator_rows, 2 * accumulator_rows + 2 };
     inline for (.{ plain, prefetched }) |K| {
         for ([_]usize{ 1037, 1038, 1039 }) |out_features| {
@@ -718,7 +724,7 @@ test "linear_simd panel path equals per-row calls across K tiles" {
 }
 
 test "linear_simd panel path on a last group with a tail" {
-    // One group with no next group to prefetch, and a 3-row tail.
+    // One group with no next group to prefetch, and a 3-output tail.
     inline for (.{ plain, prefetched }) |K| {
         try panelCheck(K, 1088, 7, &.{ 2, 3 });
     }
@@ -728,13 +734,13 @@ test "linear_simd plain and prefetched give the same bits at every batch size" {
     const gpa = std.testing.allocator;
     const in_features: usize = 1088;
     const out_features: usize = 1037;
-    const row_bytes = (in_features / 32) * 34;
+    const output_bytes = (in_features / 32) * 34;
     const batches = [_]usize{ 1, 3, 64 };
 
     const inputs = try gpa.alignedAlloc(f32, .of(f32), 64 * in_features);
     defer gpa.free(inputs);
 
-    const w_data = try gpa.alignedAlloc(u8, .@"32", out_features * row_bytes);
+    const w_data = try gpa.alignedAlloc(u8, .@"32", out_features * output_bytes);
     defer gpa.free(w_data);
 
     const outs_plain = try gpa.alloc(f32, 64 * out_features);
@@ -748,7 +754,7 @@ test "linear_simd plain and prefetched give the same bits at every batch size" {
         x.* = prng.random().float(f32) * 2.0 - 1.0;
     }
 
-    fillScaledWeight(w_data, in_features, out_features, row_bytes);
+    fillScaledWeight(w_data, in_features, out_features, output_bytes);
     const w = q80Tensor(w_data, in_features, out_features);
 
     for (batches) |batch| {
@@ -762,16 +768,16 @@ test "linear_simd plain and prefetched give the same bits at every batch size" {
     }
 }
 
-test "linear_simd rowPass equals the group path of linearF32Q80" {
+test "linear_simd outputPass equals the group path of linearF32Q80" {
     const gpa = std.testing.allocator;
     const in_features: usize = 1088;
-    const out_features: usize = 13; // 3 groups and a 1-row tail
-    const row_bytes = (in_features / 32) * 34;
+    const out_features: usize = 13; // 3 groups and a 1-output tail
+    const output_bytes = (in_features / 32) * 34;
 
     const input = try gpa.alignedAlloc(f32, .of(f32), in_features);
     defer gpa.free(input);
 
-    const w_data = try gpa.alignedAlloc(u8, .@"32", out_features * row_bytes);
+    const w_data = try gpa.alignedAlloc(u8, .@"32", out_features * output_bytes);
     defer gpa.free(w_data);
 
     const out = try gpa.alloc(f32, out_features);
@@ -782,13 +788,13 @@ test "linear_simd rowPass equals the group path of linearF32Q80" {
         x.* = prng.random().float(f32) * 2.0 - 1.0;
     }
 
-    fillScaledWeight(w_data, in_features, out_features, row_bytes);
+    fillScaledWeight(w_data, in_features, out_features, output_bytes);
     const w = q80Tensor(w_data, in_features, out_features);
 
     inline for (.{ plain, prefetched }) |K| {
         K.linearF32Q80(input, w, out);
-        for (out, 0..) |g, row| {
-            const one = rowPass(input, w_data, row * row_bytes, in_features / 32);
+        for (out, 0..) |g, j| {
+            const one = outputPass(input, w_data, j * output_bytes, in_features / 32);
             try std.testing.expectEqual(@as(u32, @bitCast(one)), @as(u32, @bitCast(g)));
         }
     }

@@ -8,7 +8,7 @@
 //! correct and runs scalar, so `requires` does not list it.
 //!
 //! Q4 and Q6_K. The q4 CPU path exists for completeness, so it reuses the naive scalar
-//! dequant-and-dot. The runner still parallelizes it across rows.
+//! dequant-and-dot. The runner still parallelizes it across outputs.
 
 const std = @import("std");
 const attention_simd = @import("attention_simd.zig");
@@ -62,12 +62,12 @@ pub const linearF32Batch = linear_simd.linearF32Batch;
 
 fn roundtripCheck(in_features: usize, out_features: usize) !void {
     const gpa = std.testing.allocator;
-    const row_bytes = (in_features / 32) * 34;
+    const output_bytes = (in_features / 32) * 34;
 
     const input = try gpa.alignedAlloc(f32, .of(f32), in_features);
     defer gpa.free(input);
 
-    const w_data = try gpa.alignedAlloc(u8, .@"32", out_features * row_bytes);
+    const w_data = try gpa.alignedAlloc(u8, .@"32", out_features * output_bytes);
     defer gpa.free(w_data);
 
     const out_naive = try gpa.alloc(f32, out_features);
@@ -80,12 +80,12 @@ fn roundtripCheck(in_features: usize, out_features: usize) !void {
         x.* = @sin(@as(f32, @floatFromInt(i)) * 0.01);
     }
 
-    linear_simd.fillTestWeight(w_data, in_features, out_features, row_bytes);
+    linear_simd.fillTestWeight(w_data, in_features, out_features, output_bytes);
     const w: Tensor = .{
         .dtype = .q8_0,
         .n_dims = 2,
         .shape = .{ @intCast(in_features), @intCast(out_features), 0, 0 },
-        .byte_stride = .{ @intCast(row_bytes), 0, 0, 0 },
+        .byte_stride = .{ @intCast(output_bytes), 0, 0, 0 },
         .data = w_data,
     };
 
@@ -108,15 +108,15 @@ test "simd_pf linearF32Q80 matches naive with tail (out%4 != 0)" {
 test "simd_pf linearF32Q80Batch is bit-identical to per-row linearF32Q80" {
     const gpa = std.testing.allocator;
     const in_features: usize = 96;
-    const out_features: usize = 11; // group rows + a 3-row tail
+    const out_features: usize = 11; // group outputs + a 3-output tail
     const batch: usize = 5;
     const out_stride: usize = 16; // > out_features: exercise the stride path
-    const row_bytes = (in_features / 32) * 34;
+    const output_bytes = (in_features / 32) * 34;
 
     const inputs = try gpa.alignedAlloc(f32, .of(f32), batch * in_features);
     defer gpa.free(inputs);
 
-    const w_data = try gpa.alignedAlloc(u8, .@"32", out_features * row_bytes);
+    const w_data = try gpa.alignedAlloc(u8, .@"32", out_features * output_bytes);
     defer gpa.free(w_data);
 
     const outs = try gpa.alloc(f32, (batch - 1) * out_stride + out_features);
@@ -129,12 +129,12 @@ test "simd_pf linearF32Q80Batch is bit-identical to per-row linearF32Q80" {
         x.* = @sin(@as(f32, @floatFromInt(i)) * 0.013);
     }
 
-    linear_simd.fillTestWeight(w_data, in_features, out_features, row_bytes);
+    linear_simd.fillTestWeight(w_data, in_features, out_features, output_bytes);
     const w: Tensor = .{
         .dtype = .q8_0,
         .n_dims = 2,
         .shape = .{ @intCast(in_features), @intCast(out_features), 0, 0 },
-        .byte_stride = .{ @intCast(row_bytes), 0, 0, 0 },
+        .byte_stride = .{ @intCast(output_bytes), 0, 0, 0 },
         .data = w_data,
     };
 

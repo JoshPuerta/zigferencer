@@ -40,8 +40,8 @@
 //! faster with the units spread over 16 workers.
 //!
 //! Prefetch distance. At depth 8192 with the units spread over 16 workers, distance 16 measures
-//! 6 to 26 percent faster on the three bench rows that stream from DRAM, and 2 to 4 percent
-//! faster on the row that stays in the last-level cache. At a tile of 256 the same rows measured
+//! 6 to 26 percent faster on the three bench lines that stream from DRAM, and 2 to 4 percent
+//! faster on the line that stays in the last-level cache. At a tile of 256 the same lines measured
 //! 4 to 33 percent, one worker gained 21 to 38 percent, and distances 8 and 32 measured within 6
 //! percent of 16.
 //!

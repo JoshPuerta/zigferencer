@@ -1,5 +1,5 @@
-# Print `make help` from the Makefile. A `##@ Title` line opens a section, a `target: ## text` line
-# is one row, and a `## text` line joins the variables at the end.
+# Print `make help` from the Makefile. A `##@ Title` line opens a section, a `target: ## text`
+# line prints one line of the help, and a `## text` line joins the variables at the end.
 
 BEGIN {
     FS = ":.*## "

@@ -313,8 +313,8 @@ test "lookup returns null for unknown" {
 }
 
 test "the KV and context defaults match each entry's verification record" {
-    // Every no-flag byte and token hash stands on these rows. A change to one must break this test
-    // on purpose and cite its own verification record. Every entry the list omits stays f32.
+    // Every no-flag byte and token hash stands on these entries. A change to one must break this
+    // test on purpose and cite its own verification record. Every entry the list omits stays f32.
     const flipped = [_][]const u8{
         "Meta-Llama-3.1-8B-Instruct-Q8_0",
         "Qwen3.5-2B-Q8_0",

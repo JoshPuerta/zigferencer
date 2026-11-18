@@ -17,7 +17,7 @@
 //! GGUF stores. GGUF's `weight.shape = [in, out]` is the reversed shape. The embed table is
 //! PyTorch `[vocab, embed_dim]`, so GGUF `shape[0]` is `embed_dim` and `shape[1]` is the vocab.
 //!
-//! Quant blocks. Each row is `in / 32` blocks, except Q6_K.
+//! Quant blocks. The weights of one output take `in / 32` blocks, except Q6_K.
 //! - Q8_0: 34 bytes, an f16 scale and 32 i8 values.
 //! - Q4_0: 18 bytes, an f16 scale and 16 packed bytes. Weight `i` (i < 16) is the LOW nibble of
 //!   byte `i`, and weight `i + 16` is the HIGH nibble. A nibble in [0, 15] dequantizes as
@@ -32,10 +32,10 @@
 //!
 //! Batch. A batched linear runs `batch` input rows against one weight. Row b reads
 //! `inputs[b * in ..][0..in]` and writes `outs[b * out_stride ..][0..out]`. `out_stride` lets a
-//! caller slice the output rows of the weight and still write into full-width rows, as
-//! `parallel.linearBatch` does. The j-outer and b-inner nest streams each weight row once for all
-//! inputs. For one (row, output) pair the reduction order is exactly the B=1 order, so each row
-//! is bit-identical to a B=1 call. The engine batch tests pin that.
+//! caller slice the outputs of the weight and still write into full-width rows, as
+//! `parallel.linearBatch` does. The j-outer and b-inner nest streams the weights of each output
+//! once for all inputs. For one (row, output) pair the reduction order is exactly the B=1 order,
+//! so each row is bit-identical to a B=1 call. The engine batch tests pin that.
 //!
 //! RoPE. `RopeStyle` follows the llama.cpp rope type per architecture: the llama family is
 //! `norm`, the qwen family is `neox`. The style must match how the conversion laid out the GGUF Q
@@ -144,14 +144,14 @@ pub fn linearF32Q80(input: []const f32, weight: Tensor, out: []f32) void {
     std.debug.assert(out.len >= out_features);
     std.debug.assert(in_features % 32 == 0);
 
-    const row_bytes = (in_features / 32) * 34;
+    const output_bytes = (in_features / 32) * 34;
     var j: usize = 0;
     while (j < out_features) : (j += 1) {
-        const row_off = j * row_bytes;
+        const output_off = j * output_bytes;
         var sum: f32 = 0;
         var blk: usize = 0;
         while (blk < in_features / 32) : (blk += 1) {
-            const blk_off = row_off + blk * 34;
+            const blk_off = output_off + blk * 34;
             const scale = f16BitsToF32(std.mem.readInt(u16, weight.data[blk_off..][0..2], .little));
             var i: usize = 0;
             while (i < 32) : (i += 1) {
@@ -190,7 +190,7 @@ pub fn linearF32Batch(
     std.debug.assert(out_stride >= out_features);
     std.debug.assert(outs.len >= (batch - 1) * out_stride + out_features);
 
-    // Dot each batch row with each weight row.
+    // Dot each batch row with the weights of each output.
     const w = std.mem.bytesAsSlice(f32, weight.data);
     var j: usize = 0;
     while (j < out_features) : (j += 1) {
@@ -238,18 +238,18 @@ pub fn linearF32Q80Batch(
     std.debug.assert(outs.len >= (batch - 1) * out_stride + out_features);
     std.debug.assert(in_features % 32 == 0);
 
-    // Walk the weight rows once, and every batch row against each.
-    const row_bytes = (in_features / 32) * 34;
+    // Walk the outputs of the weight once, and every batch row against each.
+    const output_bytes = (in_features / 32) * 34;
     var j: usize = 0;
     while (j < out_features) : (j += 1) {
-        const row_off = j * row_bytes;
+        const output_off = j * output_bytes;
         var b: usize = 0;
         while (b < batch) : (b += 1) {
             const input = inputs[b * in_features ..][0..in_features];
             var sum: f32 = 0;
             var blk: usize = 0;
             while (blk < in_features / 32) : (blk += 1) {
-                const blk_off = row_off + blk * 34;
+                const blk_off = output_off + blk * 34;
                 const scale = f16BitsToF32(
                     std.mem.readInt(u16, weight.data[blk_off..][0..2], .little),
                 );
@@ -315,14 +315,14 @@ pub fn linearF32Q40(input: []const f32, weight: Tensor, out: []f32) void {
     std.debug.assert(out.len >= out_features);
     std.debug.assert(in_features % 32 == 0);
 
-    const row_bytes = (in_features / 32) * 18;
+    const output_bytes = (in_features / 32) * 18;
     var j: usize = 0;
     while (j < out_features) : (j += 1) {
-        const row_off = j * row_bytes;
+        const output_off = j * output_bytes;
         var sum: f32 = 0;
         var blk: usize = 0;
         while (blk < in_features / 32) : (blk += 1) {
-            const blk_off = row_off + blk * 18;
+            const blk_off = output_off + blk * 18;
             const scale = f16BitsToF32(std.mem.readInt(u16, weight.data[blk_off..][0..2], .little));
             var i: usize = 0;
             while (i < 16) : (i += 1) {
@@ -369,15 +369,15 @@ pub fn linearF32Q41(input: []const f32, weight: Tensor, out: []f32) void {
     std.debug.assert(out.len >= out_features);
     std.debug.assert(in_features % 32 == 0);
 
-    // Dot each weight row, one block at a time.
-    const row_bytes = (in_features / 32) * 20;
+    // Dot the weights of each output, one block at a time.
+    const output_bytes = (in_features / 32) * 20;
     var j: usize = 0;
     while (j < out_features) : (j += 1) {
-        const row_off = j * row_bytes;
+        const output_off = j * output_bytes;
         var sum: f32 = 0;
         var blk: usize = 0;
         while (blk < in_features / 32) : (blk += 1) {
-            const blk_off = row_off + blk * 20;
+            const blk_off = output_off + blk * 20;
             const d = f16BitsToF32(std.mem.readInt(u16, weight.data[blk_off..][0..2], .little));
             const m = f16BitsToF32(
                 std.mem.readInt(u16, weight.data[blk_off + 2 ..][0..2], .little),
@@ -416,7 +416,7 @@ pub fn linearF32Q41Batch(
     linearBatchPerRow(linearF32Q41, inputs, weight, outs, batch, out_stride);
 }
 
-/// Linear layer with Q6_K weights, with `in / 256` superblocks per row. It allocates nothing.
+/// Linear layer with Q6_K weights, with `in / 256` superblocks per output. It allocates nothing.
 pub fn linearF32Q6K(input: []const f32, weight: Tensor, out: []f32) void {
     std.debug.assert(weight.dtype == .q6_k);
     std.debug.assert(weight.n_dims == 2);
@@ -428,15 +428,15 @@ pub fn linearF32Q6K(input: []const f32, weight: Tensor, out: []f32) void {
     std.debug.assert(in_features % 256 == 0);
 
     const n_super = in_features / 256;
-    const row_bytes = n_super * 210;
+    const output_bytes = n_super * 210;
     var j: usize = 0;
     while (j < out_features) : (j += 1) {
-        const row_off = j * row_bytes;
+        const output_off = j * output_bytes;
         var sum: f32 = 0;
         var sb: usize = 0;
         while (sb < n_super) : (sb += 1) {
             var tmp: [256]f32 = undefined;
-            dequantQ6K(weight.data[row_off + sb * 210 ..][0..210], &tmp);
+            dequantQ6K(weight.data[output_off + sb * 210 ..][0..210], &tmp);
             for (0..256) |i| {
                 sum += input[sb * 256 + i] * tmp[i];
             }
@@ -649,7 +649,7 @@ pub fn embedLookup(weight: Tensor, token_id: u32, dim: usize, dst: []f32) void {
     std.debug.assert(token_id < weight.shape[1]);
     std.debug.assert(dst.len >= dim);
 
-    // Copy or dequantize the row of the token.
+    // Copy or dequantize the embedding of the token.
     switch (weight.dtype) {
         .f32 => {
             const view = std.mem.bytesAsSlice(f32, weight.data);
@@ -659,28 +659,28 @@ pub fn embedLookup(weight: Tensor, token_id: u32, dim: usize, dst: []f32) void {
         .q8_0 => {
             std.debug.assert(dim % 32 == 0);
 
-            const row_bytes = (dim / 32) * 34;
-            const row_start = @as(usize, token_id) * row_bytes;
-            dequantQ80(weight.data[row_start..][0..row_bytes], dst[0..dim]);
+            const embedding_bytes = (dim / 32) * 34;
+            const embedding_start = @as(usize, token_id) * embedding_bytes;
+            dequantQ80(weight.data[embedding_start..][0..embedding_bytes], dst[0..dim]);
         },
         .q4_0 => {
             std.debug.assert(dim % 32 == 0);
 
-            const row_bytes = (dim / 32) * 18;
-            const row_start = @as(usize, token_id) * row_bytes;
-            dequantQ40(weight.data[row_start..][0..row_bytes], dst[0..dim]);
+            const embedding_bytes = (dim / 32) * 18;
+            const embedding_start = @as(usize, token_id) * embedding_bytes;
+            dequantQ40(weight.data[embedding_start..][0..embedding_bytes], dst[0..dim]);
         },
         .q4_1 => {
             std.debug.assert(dim % 32 == 0);
 
-            const row_bytes = (dim / 32) * 20;
-            const row_start = @as(usize, token_id) * row_bytes;
-            dequantQ41(weight.data[row_start..][0..row_bytes], dst[0..dim]);
+            const embedding_bytes = (dim / 32) * 20;
+            const embedding_start = @as(usize, token_id) * embedding_bytes;
+            dequantQ41(weight.data[embedding_start..][0..embedding_bytes], dst[0..dim]);
         },
         else => unreachable, // `requireWeights` refuses any other dtype at runner init
     }
 
-    // Check that the row is finite.
+    // Check that the embedding is finite.
     if (std.debug.runtime_safety) {
         for (dst[0..dim]) |v| {
             std.debug.assert(std.math.isFinite(v));
@@ -1241,18 +1241,18 @@ noinline fn widenRow(comptime E: type, noalias src: []const E, noalias dst: []f3
 
 // -- tests ------------------------------------------------------------------
 
-// Build a synthetic Q8_0 weight with scale 1.0. The i8 ramp varies per (row, element).
+// Build a synthetic Q8_0 weight with scale 1.0. The i8 ramp varies per (output, element).
 fn fillTestQ80(w_data: []u8, in_features: usize, out_features: usize) void {
-    const row_bytes = (in_features / 32) * 34;
-    for (0..out_features) |row| {
-        const off = row * row_bytes;
+    const output_bytes = (in_features / 32) * 34;
+    for (0..out_features) |j| {
+        const off = j * output_bytes;
         var blk: usize = 0;
         while (blk < in_features / 32) : (blk += 1) {
             const blk_off = off + blk * 34;
             std.mem.writeInt(u16, w_data[blk_off..][0..2], 0x3c00, .little);
             var i: usize = 0;
             while (i < 32) : (i += 1) {
-                const v: i8 = @intCast(@as(i32, @intCast((row + blk * 32 + i) % 13)) - 6);
+                const v: i8 = @intCast(@as(i32, @intCast((j + blk * 32 + i) % 13)) - 6);
                 w_data[blk_off + 2 + i] = @bitCast(v);
             }
         }
@@ -1309,16 +1309,16 @@ test "Q4_1 dequant: nibble*d + m, low/high nibble split" {
 
 test "linearF32Q41 matches dequantize-then-dot" {
     const gpa = std.testing.allocator;
-    const in_features: usize = 64; // two blocks per row
+    const in_features: usize = 64; // two blocks per output
     const out_features: usize = 3;
-    const row_bytes = (in_features / 32) * 20;
+    const output_bytes = (in_features / 32) * 20;
 
-    const w_data = try gpa.alignedAlloc(u8, .@"32", out_features * row_bytes);
+    const w_data = try gpa.alignedAlloc(u8, .@"32", out_features * output_bytes);
     defer gpa.free(w_data);
 
     for (0..out_features) |j| {
         for (0..in_features / 32) |blk| {
-            const off = j * row_bytes + blk * 20;
+            const off = j * output_bytes + blk * 20;
             std.mem.writeInt(u16, w_data[off..][0..2], 0x3800, .little); // d = 0.5
             std.mem.writeInt(u16, w_data[off + 2 ..][0..2], 0xbc00, .little); // m = -1.0
             for (0..16) |i| {
@@ -1333,7 +1333,7 @@ test "linearF32Q41 matches dequantize-then-dot" {
         .dtype = .q4_1,
         .n_dims = 2,
         .shape = .{ @intCast(in_features), @intCast(out_features), 0, 0 },
-        .byte_stride = .{ @intCast(row_bytes), 0, 0, 0 },
+        .byte_stride = .{ @intCast(output_bytes), 0, 0, 0 },
         .data = w_data,
     };
 
@@ -1347,12 +1347,12 @@ test "linearF32Q41 matches dequantize-then-dot" {
     var got: [out_features]f32 = undefined;
     linearF32Q41(input, w, &got);
 
-    var row_f32: [in_features]f32 = undefined;
+    var output_f32: [in_features]f32 = undefined;
     for (0..out_features) |j| {
-        dequantQ41(w_data[j * row_bytes ..][0..row_bytes], &row_f32);
+        dequantQ41(w_data[j * output_bytes ..][0..output_bytes], &output_f32);
         var sum: f32 = 0;
         for (0..in_features) |i| {
-            sum += input[i] * row_f32[i];
+            sum += input[i] * output_f32[i];
         }
 
         try std.testing.expectApproxEqAbs(sum, got[j], 1e-5);
@@ -1386,15 +1386,15 @@ test "Q6_K dequant: bit assembly, -32 bias, and per-group scale" {
 
 test "linearF32Q6K matches dequantize-then-dot" {
     const gpa = std.testing.allocator;
-    const in_features: usize = 256; // one superblock per row
+    const in_features: usize = 256; // one superblock per output
     const out_features: usize = 3;
-    const row_bytes = (in_features / 256) * 210;
+    const output_bytes = (in_features / 256) * 210;
 
-    const w_data = try gpa.alignedAlloc(u8, .@"32", out_features * row_bytes);
+    const w_data = try gpa.alignedAlloc(u8, .@"32", out_features * output_bytes);
     defer gpa.free(w_data);
 
     for (0..out_features) |j| {
-        const off = j * row_bytes;
+        const off = j * output_bytes;
         for (0..210) |b| {
             w_data[off + b] = @intCast((b * 7 + j * 13) % 251);
         }
@@ -1406,7 +1406,7 @@ test "linearF32Q6K matches dequantize-then-dot" {
         .dtype = .q6_k,
         .n_dims = 2,
         .shape = .{ @intCast(in_features), @intCast(out_features), 0, 0 },
-        .byte_stride = .{ @intCast(row_bytes), 0, 0, 0 },
+        .byte_stride = .{ @intCast(output_bytes), 0, 0, 0 },
         .data = w_data,
     };
 
@@ -1420,12 +1420,12 @@ test "linearF32Q6K matches dequantize-then-dot" {
     var got: [out_features]f32 = undefined;
     linearF32Q6K(input, w, &got);
 
-    var row_f32: [in_features]f32 = undefined;
+    var output_f32: [in_features]f32 = undefined;
     for (0..out_features) |j| {
-        dequantQ6K(w_data[j * row_bytes ..][0..row_bytes], &row_f32);
+        dequantQ6K(w_data[j * output_bytes ..][0..output_bytes], &output_f32);
         var sum: f32 = 0;
         for (0..in_features) |i| {
-            sum += input[i] * row_f32[i];
+            sum += input[i] * output_f32[i];
         }
 
         try std.testing.expectApproxEqAbs(sum, got[j], 1e-4);
@@ -1638,12 +1638,12 @@ test "linearF32Q80Batch is bit-identical to per-row linearF32Q80 (strided outs)"
     const out_features: usize = 11;
     const batch: usize = 4;
     const out_stride: usize = 13;
-    const row_bytes = (in_features / 32) * 34;
+    const output_bytes = (in_features / 32) * 34;
 
     const inputs = try gpa.alloc(f32, batch * in_features);
     defer gpa.free(inputs);
 
-    const w_data = try gpa.alignedAlloc(u8, .@"32", out_features * row_bytes);
+    const w_data = try gpa.alignedAlloc(u8, .@"32", out_features * output_bytes);
     defer gpa.free(w_data);
 
     const outs_batch = try gpa.alloc(f32, (batch - 1) * out_stride + out_features);
@@ -1661,7 +1661,7 @@ test "linearF32Q80Batch is bit-identical to per-row linearF32Q80 (strided outs)"
         .dtype = .q8_0,
         .n_dims = 2,
         .shape = .{ @intCast(in_features), @intCast(out_features), 0, 0 },
-        .byte_stride = .{ @intCast(row_bytes), 0, 0, 0 },
+        .byte_stride = .{ @intCast(output_bytes), 0, 0, 0 },
         .data = w_data,
     };
 
@@ -1679,12 +1679,12 @@ test "linearBatchPerRow over linearF32Q80 is bit-identical to per-row calls" {
     const in_features: usize = 64;
     const out_features: usize = 5;
     const batch: usize = 2;
-    const row_bytes = (in_features / 32) * 34;
+    const output_bytes = (in_features / 32) * 34;
 
     const inputs = try gpa.alloc(f32, batch * in_features);
     defer gpa.free(inputs);
 
-    const w_data = try gpa.alignedAlloc(u8, .@"32", out_features * row_bytes);
+    const w_data = try gpa.alignedAlloc(u8, .@"32", out_features * output_bytes);
     defer gpa.free(w_data);
 
     const outs = try gpa.alloc(f32, batch * out_features);
@@ -1702,7 +1702,7 @@ test "linearBatchPerRow over linearF32Q80 is bit-identical to per-row calls" {
         .dtype = .q8_0,
         .n_dims = 2,
         .shape = .{ @intCast(in_features), @intCast(out_features), 0, 0 },
-        .byte_stride = .{ @intCast(row_bytes), 0, 0, 0 },
+        .byte_stride = .{ @intCast(output_bytes), 0, 0, 0 },
         .data = w_data,
     };
 

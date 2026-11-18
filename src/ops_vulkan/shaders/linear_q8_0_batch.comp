@@ -54,7 +54,7 @@
 //   Pass 1: lanes read adjacent K elements of one row, so the input loads coalesce.
 //   Pass 2: each lane reads the 32 contiguous quant bytes of its own block. Adjacent lanes sit k
 //   bytes apart, so these loads coalesce inside a lane and not across the wave. The scales[n][blk]
-//   loads stride blocks_per_row * 2 bytes across lanes. They do not coalesce, but they are
+//   loads stride blocks_per_output * 2 bytes across lanes. They do not coalesce, but they are
 //   L2-resident at these sizes.
 //   Pass 3: all 32 lanes read the same `lds_input[bi * K_TILE + i]`, an LDS broadcast with no bank
 //   conflict and no L1 transaction. The K-outer, B-inner loop runs slower.
@@ -130,15 +130,15 @@ void main() {
     // A lane past the output tail must not return, because it still owns a column of LDS.
     bool lane_active = (n_out < params.n);
 
-    uint blocks_per_row = params.k / K_TILE;
-    uint words_per_row = params.k / 4u;
+    uint blocks_per_output = params.k / K_TILE;
+    uint words_per_output = params.k / 4u;
 
     float partials[B_TILE];
     for (uint i = 0u; i < B_TILE; ++i) {
         partials[i] = 0.0;
     }
 
-    for (uint blk = 0u; blk < blocks_per_row; ++blk) {
+    for (uint blk = 0u; blk < blocks_per_output; ++blk) {
         // Pass 1: stage one input column per lane. All lanes take part, tail lanes included.
         for (uint bi = 0u; bi < B_TILE; ++bi) {
             uint b = b_base + bi;
@@ -153,8 +153,8 @@ void main() {
 
         // Pass 2: dequantize the weight block of this lane into 32 register floats.
         if (lane_active) {
-            float scale = float(scales_buf.data[n_out * blocks_per_row + blk]);
-            uint word_base = n_out * words_per_row + blk * 8u;
+            float scale = float(scales_buf.data[n_out * blocks_per_output + blk]);
+            uint word_base = n_out * words_per_output + blk * 8u;
 
             float q[K_TILE];
             for (uint i = 0u; i < K_TILE; ++i) {

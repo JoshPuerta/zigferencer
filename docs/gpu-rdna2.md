@@ -55,12 +55,12 @@ Two failures set the line and the messages of this driver.
 - A Llama-8B plan of 13524 MiB (9086 MiB of weights and 4438 MiB of KV) passed the 7/8
   line and lost the device during the weight upload. A plan of about 11.1 GB then ran in
   the same virtual machine. The usual budget of the card is 15568 MiB, and 3/4 of it is
-  11676 MiB, between the two plans. So the Vulkan-on-D3D12 row of `limits.vram_shares` is
-  3/4. This row is a heuristic from this one setup. Another setup, for example a native
-  Linux driver, uses the default row of 7/8 and can plan more of the card.
+  11676 MiB, between the two plans. So the Vulkan-on-D3D12 entry of `limits.vram_shares` is
+  3/4. This entry is a heuristic from this one setup. Another setup, for example a native
+  Linux driver, uses the default entry of 7/8 and can plan more of the card.
 - A Llama-8B Q8_0 fused run at a plan of 9737 MiB loses the device during the weight
   upload in some runs. The same command passes in other runs of the same build, and the
-  cause is not proven. This plan is under both lines, so the 3/4 row does not explain it.
+  cause is not proven. This plan is under both lines, so the 3/4 entry does not explain it.
 
 What changed after these failures:
 
@@ -115,7 +115,7 @@ the Q8_0 files:
 | Qwen3.5-2B | 2.00 GB | 2.00 GB | 3.9 ms | 256 |
 | Llama-3.1-8B | 8.53 GB | 7.97 GB | 15.6 ms | 64 |
 
-A step reads only one row of the embedding table. Llama-3.1-8B has a separate
+A step reads only the embedding of one token from the embedding table. Llama-3.1-8B has a separate
 lm_head, so a step skips the rest of its 0.56 GB table. Qwen3.5-2B ties its lm_head
 to the embedding table, so its lm_head reads the whole table on each step. These
 limits leave out the KV reads, which grow with the context.
@@ -198,7 +198,7 @@ How the kernels use this:
 
 - The elementwise kernels give lane `i` element `i`.
 - The decode matrix-vector kernel `linear_q8_0_reduce` gives one workgroup to each
-  output row. Lane `L` reads the quant blocks `L`, `L + 32`, `L + 64`, and so on, so
+  output. Lane `L` reads the quant blocks `L`, `L + 32`, `L + 64`, and so on, so
   the lanes of the wave read adjacent blocks. Lane 0 then adds the 32 partial sums
   in LDS. Vulkan guarantees only 65535 workgroups on each grid axis, and an lm_head
   of a registered model has up to 248320 outputs. The loader takes up to

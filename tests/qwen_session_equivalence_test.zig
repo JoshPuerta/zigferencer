@@ -18,11 +18,11 @@
 //!      GDN state routing of either slot.
 //!   F. clone. A session forked partway through a conversation continues bit-identically to its
 //!      source, which pins the KV row copy and the GDN slab copy.
-//!   G. forced parallelism. Pass B with the row-parallel matmuls and the attention units forced
+//!   G. forced parallelism. Pass B with the output-parallel matmuls and the attention units forced
 //!      on. A unit is one KV group over one part of an attention row.
 //!
 //! Exactness. The token streams and the logits-row hashes must equal pass A exactly. Pass G sets
-//! `min_parallel_flops = 0`, which spreads the row-parallel matmuls and the attention units
+//! `min_parallel_flops = 0`, which spreads the output-parallel matmuls and the attention units
 //! (parallel.attentionTyped) across 4 threads, even at short rows. The matmul partition keeps the
 //! reduction order of every output. An attention unit writes the same records on any worker, and
 //! the merge adds them in part order.

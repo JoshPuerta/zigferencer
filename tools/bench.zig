@@ -1,6 +1,6 @@
 //! Op micro-benchmarks. `zig build bench` builds them at `-O ReleaseFast` with the CPU kernels,
 //! and `zig build bench -Druntime=vulkan` adds the GPU kernels. One table makes a speed
-//! regression visible next to a correctness regression, because every row carries an output hash
+//! regression visible next to a correctness regression, because every line carries an output hash
 //! and a time. Each GPU variant also carries a relative error and a pass/fail mark against its
 //! CPU reference.
 //!
@@ -11,8 +11,8 @@
 //! `bench_layer`, `bench_gdn`, `bench_parallel`, and `bench_transfer`.
 //!
 //! GPU runner. One runner gives every GPU variant the same Context and the same persistent
-//! buffers inside each kernel. A Vulkan init failure prints a banner and leaves every CPU row to
-//! run. Each section skips its own GPU rows when no runner is present.
+//! buffers inside each kernel. A Vulkan init failure prints a banner and leaves every CPU line to
+//! run. Each section skips its own GPU lines when no runner is present.
 //!
 //! Order. The crossing latency section runs before the staged-copy sweep, because the sweep
 //! returns early when its 512 MiB pair does not fit.
@@ -20,7 +20,7 @@
 //! Attention grid alone. `zig build bench -- attn-grid` runs the attention kernel set grid alone,
 //! so a kernel experiment skips the full table.
 //!
-//! CPU batch alone. `zig build bench -- matmul-batch-cpu` runs the CPU batched Q8_0 matmul rows
+//! CPU batch alone. `zig build bench -- matmul-batch-cpu` runs the CPU batched Q8_0 matmul lines
 //! alone.
 //!
 //! Roofs alone. `zig build bench -- peak` runs the compute and cache roofs of `bench_peak` and then
@@ -56,7 +56,7 @@ pub fn main(init: std.process.Init) !void {
         .{ @tagName(builtin.cpu.arch), builtin.cpu.model.name },
     );
 
-    // Run the CPU batched matmul rows alone when asked, before the GPU runner starts.
+    // Run the CPU batched matmul lines alone when asked, before the GPU runner starts.
     if (args.len >= 2 and std.mem.eql(u8, args[1], "matmul-batch-cpu")) {
         try matmul.benchBatchCpu(gpa, io);
         return;

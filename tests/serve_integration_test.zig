@@ -236,8 +236,8 @@ fn unusedListener() std.Io.net.Server {
 // -- tests ------------------------------------------------------------------
 
 test "acceptAction: every error name has its action" {
-    const Row = struct { err: AcceptScript.AcceptError, want: serve_engine.AcceptAction };
-    const rows = [_]Row{
+    const Case = struct { err: AcceptScript.AcceptError, want: serve_engine.AcceptAction };
+    const cases = [_]Case{
         .{ .err = error.Canceled, .want = .stop },
         .{ .err = error.SocketNotListening, .want = .stop },
         .{ .err = error.WouldBlock, .want = .stop },
@@ -252,9 +252,9 @@ test "acceptAction: every error name has its action" {
     };
     // A new error name in std fails this count, so the table stays complete.
     const names = @typeInfo(AcceptScript.AcceptError).error_set.?;
-    try std.testing.expectEqual(names.len, rows.len);
-    for (rows) |row| {
-        try std.testing.expectEqual(row.want, serve_engine.acceptAction(row.err));
+    try std.testing.expectEqual(names.len, cases.len);
+    for (cases) |case| {
+        try std.testing.expectEqual(case.want, serve_engine.acceptAction(case.err));
     }
 }
 
@@ -670,20 +670,20 @@ test "four connections interleave sessions and each stream equals its solo refer
     // The test sends every turn before it reads any frame, so the eight
     // sessions share the batch.
     var sids: [n_clients][prompts.len]u32 = undefined;
-    for (&clients, &sids) |*c, *row| {
-        for (row) |*sid| {
+    for (&clients, &sids) |*c, *client_sids| {
+        for (client_sids) |*sid| {
             sid.* = try openGreedy(c);
         }
     }
 
-    for (&clients, sids) |*c, row| {
-        for (row, prompts) |sid, prompt| {
+    for (&clients, sids) |*c, client_sids| {
+        for (client_sids, prompts) |sid, prompt| {
             _ = try c.generate(sid, prompt, turn_tokens_max, null);
         }
     }
 
-    for (&clients, sids) |*c, row| {
-        const got = try collectInterleaved(c, row);
+    for (&clients, sids) |*c, client_sids| {
+        const got = try collectInterleaved(c, client_sids);
         for (reference, got) |ref, g| {
             try expectSameStream(ref, g);
         }

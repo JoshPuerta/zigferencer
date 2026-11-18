@@ -230,12 +230,12 @@ pub const spv_names: []const SpvName = if (core_log.hot) &.{
 
 // -- types ------------------------------------------------------------------
 
-/// One row of `spv_names`.
+/// One entry of `spv_names`.
 pub const SpvName = struct { code: *const anyopaque, name: []const u8 };
 
 // -- tests ------------------------------------------------------------------
 
-test "spv_names holds a row for every SPIR-V blob of this file" {
+test "spv_names holds an entry for every SPIR-V blob of this file" {
     const source = @embedFile("spirv.zig");
     var declared: usize = 0;
     var lines = std.mem.splitScalar(u8, source, '\n');
@@ -249,7 +249,7 @@ test "spv_names holds a row for every SPIR-V blob of this file" {
         var needle_buffer: [96]u8 = undefined;
         const needle = try std.fmt.bufPrint(&needle_buffer, ".code = &{s},", .{name});
         std.testing.expect(std.mem.indexOf(u8, source, needle) != null) catch |err| {
-            std.debug.print("spv_names lacks a row for {s}\n", .{name});
+            std.debug.print("spv_names lacks an entry for {s}\n", .{name});
             return err;
         };
         declared += 1;

@@ -1,7 +1,7 @@
 //! Role. The device placements of a boot: the fused fit, the VRAM budgets, and the hybrid
 //! placement. The CLI measures the device once (`ModelNeeds`, `DeviceCapacity`), `resolve` calls
 //! `choosePlacement`, and the CLI logs the value and constructs the runner it names. Nothing here
-//! reads a device or logs, so a table test runs every device row with no GPU.
+//! reads a device or logs, so a table test runs every device entry with no GPU.
 //!
 //! Log order. The value keeps the order of the boot lines. A `LayerChoice` value holds the lines
 //! before the split and the split itself. The placement holds the lines of the runner the split
@@ -22,12 +22,12 @@
 //! with the numbers. A default window shrinks, first to the device buffer limits and then to the
 //! VRAM figure. When no granule fits, the default stands and the runner refuses it.
 //!
-//! Slots. A fused serve plan holds at least the `fused_min_slots` of the family row: the llama
+//! Slots. A fused serve plan holds at least the `fused_min_slots` of the family entry: the llama
 //! runner keeps a spare stream. The hybrid runner indexes its device suffix by `limits.max_batch`,
 //! so a hybrid slot count past that ceiling refuses when a flag pinned it and clamps when the
 //! serve options derived it.
 //!
-//! Family. A placement reads the values of the family row of the card, never the layer shape.
+//! Family. A placement reads the values of the family entry of the card, never the layer shape.
 //!
 //! Per-kind rules.
 //!
@@ -59,8 +59,8 @@ const Result = resolve.Result;
 
 // -- types ------------------------------------------------------------------
 
-/// The values of a family row that a placement reads.
-const RowValues = struct {
+/// The values of a family entry that a placement reads.
+const EntryValues = struct {
     /// The fewest slots of a fused serve plan.
     fused_min_slots: u32,
     /// The fused path of `run` honors `--prompt-cache`.
@@ -515,7 +515,7 @@ fn serveFused(
     const shape = input.serve;
     const m = resources.model.?;
     const d = resources.device.?;
-    const min_slots = rowValues(&card).fused_min_slots;
+    const min_slots = entryValues(&card).fused_min_slots;
     const cost = kv_budget.costModel(card.kvShape(), kv_dtype);
     // The flag checks fixed every count at one or more, so a floor of one keeps each count.
     std.debug.assert(shape.batch >= 1);
@@ -748,13 +748,13 @@ fn sessionFused(
     const fitted = fitDefault(c, cost, 1, clamped.window.base, clamped.window.flag);
     std.debug.assert(fitted.window <= clamped.window.base);
     // The batch of one states the one slot, and the plan sizes no RAM.
-    const row = rowValues(&card);
+    const entry = entryValues(&card);
     const plan = planShape(c, cost, .{ .window = fitted.window, .batch = 1 });
     std.debug.assert(plan.n_slots == 1);
     std.debug.assert(plan.ram.blobs == 0);
     std.debug.assert(plan.ram.prefix == 0);
     // The run RAM plan of a family that honors the prompt cache sizes its snapshots and stages.
-    const cache = kind == .run and row.prompt_cache and input.prompt_cache;
+    const cache = kind == .run and entry.prompt_cache and input.prompt_cache;
     const ram_split: kv_budget.KvPlan.Ram = .{
         .blobs = 0,
         .prefix = if (cache) limits.prompt_cache_ram_default else 0,
@@ -781,7 +781,7 @@ fn sessionFused(
             false,
             resources.ram_free,
         ),
-        .report = if (kind == .run and row.run_logs_every_placement) report(
+        .report = if (kind == .run and entry.run_logs_every_placement) report(
             c,
             card,
             m,
@@ -1029,8 +1029,8 @@ fn layerSplitRefusal(
     };
 }
 
-/// The values of the family row of `card`.
-fn rowValues(card: *const loader.ModelCard) RowValues {
+/// The values of the family entry of `card`.
+fn entryValues(card: *const loader.ModelCard) EntryValues {
     return switch (card.arch) {
         inline else => |arch| .{
             .fused_min_slots = family.Of(arch).fused_min_slots,

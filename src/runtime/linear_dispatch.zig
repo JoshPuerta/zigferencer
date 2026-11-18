@@ -1,6 +1,6 @@
 //! The batched-linear interface: one function picks the kernel by the weight dtype and fans the
-//! quantized paths across rows. Both CPU runners call it, so the dtype ladder cannot drift between
-//! the two families.
+//! quantized paths across outputs. Both CPU runners call it, so the dtype ladder cannot drift
+//! between the two families.
 //!
 //! Comptime. `build_options.use_vulkan_ops` picks the Vulkan path, so a CPU build never reads it.
 //!
@@ -8,9 +8,9 @@
 //! `requireWeights` refuses such a file at runner init and names the tensor. The step functions
 //! then carry no dtype error, and the dispatch treats any other dtype as unreachable.
 //!
-//! Fan-out. The quantized paths split rows across CPU threads. The f32 path serves norms, which
+//! Fan-out. The quantized paths split outputs across CPU threads. The f32 path serves norms, which
 //! are tiny, so it stays serial. The Vulkan backend submits one workgroup grid for the whole
-//! matmul, because N independent submits from a row split lose against one. That backend also
+//! matmul, because N independent submits from an output split lose against one. That backend also
 //! has no q4 or q6_k kernel.
 
 const std = @import("std");
@@ -206,8 +206,8 @@ test "refusedWeight: the embedding, the lm_head, and a block weight in range" {
     const norm = "blk.0.attn_norm.weight";
     const q0 = "blk.0.attn_q.weight";
     const q1 = "blk.1.attn_q.weight";
-    const Row = struct { refs: []const loader.TensorRef, want: ?[]const u8 };
-    const rows = [_]Row{
+    const Case = struct { refs: []const loader.TensorRef, want: ?[]const u8 };
+    const cases = [_]Case{
         .{ .refs = &.{ refFor(embed_name, .q8_0), refFor(q0, .q8_0) }, .want = null },
         .{ .refs = &.{ refFor(embed_name, .q5_0), refFor(q0, .q8_0) }, .want = embed_name },
         .{ .refs = &.{ refFor(embed_name, .q8_0), refFor(q0, .q5_0) }, .want = q0 },
@@ -222,9 +222,9 @@ test "refusedWeight: the embedding, the lm_head, and a block weight in range" {
         .{ .refs = &.{refFor("blk.0.ssm_a", .q8_0)}, .want = "blk.0.ssm_a" },
         .{ .refs = &.{refFor("blk.1.ssm_a", .q8_0)}, .want = null },
     };
-    for (rows) |row| {
-        const got = refusedWeight(row.refs, 1);
-        if (row.want) |want| {
+    for (cases) |case| {
+        const got = refusedWeight(case.refs, 1);
+        if (case.want) |want| {
             try std.testing.expectEqualStrings(want, got.?.name);
             var buf: [96]u8 = undefined;
             const text = try std.fmt.bufPrint(&buf, refusal_fmt, .{ want, got.?.tensor.dtype });

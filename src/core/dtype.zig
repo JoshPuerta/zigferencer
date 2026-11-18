@@ -8,8 +8,8 @@
 //! k-quants, only q6_k has kernels: a CPU dequant-and-dot linear for the Q6_K logit head of a Q4_0
 //! file, and a load-time requantize to q4_0 for the GPU path.
 //!
-//! Block geometry. It is the unit every kernel iterates over. A row of N weights is N/32
-//! contiguous blocks. An f16 scale `d` leads each block:
+//! Block geometry. It is the unit every kernel iterates over. The N elements of one run of the
+//! first axis are N/32 contiguous blocks. An f16 scale `d` leads each block:
 //!
 //!   Q8_0   32 weights -> 34 bytes          value[i] = d * q[i]
 //!     +--------+-----------------------------------+
@@ -206,7 +206,10 @@ pub fn bytesForNumelChecked(t: GgmlType, numel: u64) ?u64 {
 /// The literal block geometry of each wire tag. Null is a tag that the engine
 /// cannot size. The values are the ggml type traits, typed out by hand so a
 /// change to a geometry switch fails here without a model file.
-const geometry_rows = [_]struct { t: GgmlType, geometry: ?struct { block: usize, bytes: usize } }{
+const geometry_entries = [_]struct {
+    t: GgmlType,
+    geometry: ?struct { block: usize, bytes: usize },
+}{
     .{ .t = .f32, .geometry = .{ .block = 1, .bytes = 4 } },
     .{ .t = .f16, .geometry = .{ .block = 1, .bytes = 2 } },
     .{ .t = .q4_0, .geometry = .{ .block = 32, .bytes = 18 } },
@@ -243,10 +246,10 @@ const geometry_rows = [_]struct { t: GgmlType, geometry: ?struct { block: usize,
 
 test "geometry: each wire tag has its literal block and block bytes, or no geometry" {
     const tags = std.enums.values(GgmlType);
-    try std.testing.expectEqual(tags.len, geometry_rows.len);
-    for (tags, geometry_rows) |t, row| {
-        try std.testing.expectEqual(t, row.t);
-        const g = row.geometry orelse {
+    try std.testing.expectEqual(tags.len, geometry_entries.len);
+    for (tags, geometry_entries) |t, entry| {
+        try std.testing.expectEqual(t, entry.t);
+        const g = entry.geometry orelse {
             try std.testing.expect(!hasBlockGeometry(t));
             continue;
         };

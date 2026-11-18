@@ -7,14 +7,14 @@
 //!
 //! Layout. GGUF stores 2D weight shapes REVERSED vs PyTorch: a linear weight that is
 //! PyTorch [out_features, in_features] arrives here as shape = [in, out].
-//! Memory is row-major by OUTPUT row, so the linear kernels read w[j*in + k]
+//! Memory is row-major by output, so the linear kernels read w[j*in + k]
 //! for output j, input k:
 //!
-//!   shape = [in, out]                 memory (row-major, one row per output)
+//!   shape = [in, out]                 memory (row-major, by output)
 //!                                       +------------------------------+
-//!                              row 0 -> | w[0,0] w[0,1] ... w[0,in-1]  |
-//!                              row 1 -> | w[1,0] w[1,1] ...            |
-//!                                ...    |          (out rows)          |
+//!                           output 0 -> | w[0,0] w[0,1] ... w[0,in-1]  |
+//!                           output 1 -> | w[1,0] w[1,1] ...            |
+//!                                ...    |        (out outputs)         |
 //!                                       +------------------------------+
 //!
 //! Rank. It is fixed at 4 (`limits.max_n_dims`). `data` is the raw byte view (use
@@ -28,8 +28,8 @@ pub const Tensor = struct {
     dtype: dtype.GgmlType,
     n_dims: u8,
     shape: [limits.max_n_dims]u32,
-    /// Only `byte_stride[0]` has a meaning: the bytes of one row of `shape[0]`
-    /// elements. No reader uses the other entries.
+    /// Only `byte_stride[0]` has a meaning: the bytes of `shape[0]` elements: one output of a
+    /// linear weight, or the embedding of one token. No reader uses the other entries.
     byte_stride: [limits.max_n_dims]u32,
     /// Caller-owned. Tensor never frees.
     data: []const u8,

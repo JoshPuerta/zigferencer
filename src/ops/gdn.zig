@@ -83,7 +83,7 @@ const gdn = @This();
 /// state size.
 const max_head_dim: usize = limits.gdn_head_dim;
 
-/// The panel vector width of `recurStep`. One panel row is one AVX2 register.
+/// The panel vector width of `recurStep`. One panel vector is one AVX2 register.
 const lanes = 8;
 const Vec = @Vector(lanes, f32);
 
@@ -471,9 +471,9 @@ pub fn chunkScan(
         const coef = plast / P[sidx];
         for (0..d) |i| {
             const ci = coef * ks[i];
-            const row = s[i * d ..][0..d];
+            const cols = s[i * d ..][0..d];
             for (0..d) |j| {
-                row[j] += ci * ds[j];
+                cols[j] += ci * ds[j];
             }
         }
     }
@@ -646,9 +646,9 @@ fn recurStep(
         var acc: f32 = 0;
         i = 0;
         while (i < dim) : (i += 1) {
-            const row = (s[i * dim + j0] * decay) + k[i] * delta;
-            s[i * dim + j0] = row;
-            acc += row * q[i];
+            const updated = (s[i * dim + j0] * decay) + k[i] * delta;
+            s[i * dim + j0] = updated;
+            acc += updated * q[i];
         }
 
         o[j0] = acc;
@@ -680,9 +680,9 @@ fn recurPanel(
     var i: usize = 0;
     while (i < dim) : (i += 1) {
         const kv: Vec = @splat(k[i]);
-        const row = s[i * dim + j0 ..][0 .. n * lanes];
+        const cols = s[i * dim + j0 ..][0 .. n * lanes];
         inline for (0..n) |c| {
-            const sd = @as(Vec, row[c * lanes ..][0..lanes].*) * decay_v;
+            const sd = @as(Vec, cols[c * lanes ..][0..lanes].*) * decay_v;
             mem[c] = mem[c] + sd * kv;
         }
     }
@@ -698,11 +698,11 @@ fn recurPanel(
     while (i < dim) : (i += 1) {
         const kv: Vec = @splat(k[i]);
         const qv: Vec = @splat(q[i]);
-        const row = s[i * dim + j0 ..][0 .. n * lanes];
+        const cols = s[i * dim + j0 ..][0 .. n * lanes];
         inline for (0..n) |c| {
-            const sd = @as(Vec, row[c * lanes ..][0..lanes].*) * decay_v;
+            const sd = @as(Vec, cols[c * lanes ..][0..lanes].*) * decay_v;
             const nv = sd + kv * delta[c];
-            row[c * lanes ..][0..lanes].* = nv;
+            cols[c * lanes ..][0..lanes].* = nv;
             ov[c] = ov[c] + nv * qv;
         }
     }
@@ -816,11 +816,11 @@ fn recurStepScalar(
     while (i < dim) : (i += 1) {
         const ki = k[i];
         const qi = q[i];
-        const row = s[i * dim ..][0..dim];
+        const cols = s[i * dim ..][0..dim];
         j = 0;
         while (j < dim) : (j += 1) {
-            row[j] += ki * delta[j];
-            o[j] += row[j] * qi;
+            cols[j] += ki * delta[j];
+            o[j] += cols[j] * qi;
         }
     }
 }

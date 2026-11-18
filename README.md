@@ -158,7 +158,7 @@ zigferencer-dev bench-serve MODEL --max-tokens 128
 - [`docs/debugging.md`](docs/debugging.md): step through a command, a test, or `build.zig` in lldb
   or gdb.
 - Each top-level source directory (`src/*`, `tests/`, `tools/`) has a `README.md`
-  with one row per file and a short guide to the directory.
+  with one entry per file and a short guide to the directory.
 
 ## Roadmap
 

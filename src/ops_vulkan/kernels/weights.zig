@@ -1,6 +1,6 @@
 //! The resident Q8_0 and Q4_0 weights of the Vulkan backend, and the bulk upload that fills them.
 //!
-//! Comptime. `UploadStage.uploadRows` takes the block form as a comptime value, so one function
+//! Comptime. `UploadStage.uploadOutputs` takes the block form as a comptime value, so one function
 //! uploads both forms.
 //!
 //! Resident weights. Each weight becomes one `Q80Weight` at model-load time and stays in VRAM for
@@ -84,12 +84,12 @@ pub const Q80Weight = struct {
         // Refuse a weight that does not fill whole blocks.
         if (in_features % q8_0_block_elems != 0) return error.InFeaturesNotMultipleOf32;
 
-        const blocks_per_row = in_features / q8_0_block_elems;
-        const row_bytes = blocks_per_row * q8_0_block_bytes;
-        if (weight_bytes.len < out_features * row_bytes) return error.WeightSizeMismatch;
+        const blocks_per_output = in_features / q8_0_block_elems;
+        const output_bytes = blocks_per_output * q8_0_block_bytes;
+        if (weight_bytes.len < out_features * output_bytes) return error.WeightSizeMismatch;
 
         // Repack the weight into host staging.
-        const scales_bytes: vk.DeviceSize = @intCast(out_features * blocks_per_row * 2);
+        const scales_bytes: vk.DeviceSize = @intCast(out_features * blocks_per_output * 2);
         const quants_bytes: vk.DeviceSize = @intCast(out_features * in_features);
 
         var staging_scales: HostBuffer = .{ .ctx = ctx };
@@ -150,12 +150,12 @@ pub const Q80Weight = struct {
         // Refuse a weight that does not fill whole blocks.
         if (in_features % q4_0_block_elems != 0) return error.InFeaturesNotMultipleOf32;
 
-        const blocks_per_row = in_features / q4_0_block_elems;
-        const row_bytes = blocks_per_row * q4_0_block_bytes;
-        if (weight_bytes.len < out_features * row_bytes) return error.WeightSizeMismatch;
+        const blocks_per_output = in_features / q4_0_block_elems;
+        const output_bytes = blocks_per_output * q4_0_block_bytes;
+        if (weight_bytes.len < out_features * output_bytes) return error.WeightSizeMismatch;
 
         // Repack the weight into host staging.
-        const scales_bytes: vk.DeviceSize = @intCast(out_features * blocks_per_row * 2);
+        const scales_bytes: vk.DeviceSize = @intCast(out_features * blocks_per_output * 2);
         const quants_bytes: vk.DeviceSize = @intCast(out_features * (in_features / 2));
 
         var staging_scales: HostBuffer = .{ .ctx = ctx };
@@ -219,17 +219,17 @@ pub const Q80Weight = struct {
         // Refuse a weight that does not fill whole blocks.
         if (in_features % q8_0_block_elems != 0) return error.InFeaturesNotMultipleOf32;
 
-        const blocks_per_row = in_features / q8_0_block_elems;
-        const row_bytes = blocks_per_row * q8_0_block_bytes;
-        if (weight_bytes.len < out_features * row_bytes) return error.WeightSizeMismatch;
+        const blocks_per_output = in_features / q8_0_block_elems;
+        const output_bytes = blocks_per_output * q8_0_block_bytes;
+        if (weight_bytes.len < out_features * output_bytes) return error.WeightSizeMismatch;
 
-        // Reserve the views, then repack and upload the rows into them.
-        const scales_bytes: vk.DeviceSize = @intCast(out_features * blocks_per_row * 2);
+        // Reserve the views, then repack and upload the weights of each output into them.
+        const scales_bytes: vk.DeviceSize = @intCast(out_features * blocks_per_output * 2);
         const quants_bytes: vk.DeviceSize = @intCast(out_features * in_features);
         const scales_view = try scales_arena.alloc(scales_bytes);
         const quants_view = try quants_arena.alloc(quants_bytes);
         const views: UploadStage.Views = .{ .scales = scales_view, .quants = quants_view };
-        try stage.uploadRows(ctx, .q8_0, weight_bytes, in_features, out_features, views);
+        try stage.uploadOutputs(ctx, .q8_0, weight_bytes, in_features, out_features, views);
 
         return .{
             .ctx = ctx,
@@ -255,17 +255,17 @@ pub const Q80Weight = struct {
         // Refuse a weight that does not fill whole blocks.
         if (in_features % q4_0_block_elems != 0) return error.InFeaturesNotMultipleOf32;
 
-        const blocks_per_row = in_features / q4_0_block_elems;
-        const row_bytes = blocks_per_row * q4_0_block_bytes;
-        if (weight_bytes.len < out_features * row_bytes) return error.WeightSizeMismatch;
+        const blocks_per_output = in_features / q4_0_block_elems;
+        const output_bytes = blocks_per_output * q4_0_block_bytes;
+        if (weight_bytes.len < out_features * output_bytes) return error.WeightSizeMismatch;
 
-        // Reserve the views, then repack and upload the rows into them.
-        const scales_bytes: vk.DeviceSize = @intCast(out_features * blocks_per_row * 2);
+        // Reserve the views, then repack and upload the weights of each output into them.
+        const scales_bytes: vk.DeviceSize = @intCast(out_features * blocks_per_output * 2);
         const quants_bytes: vk.DeviceSize = @intCast(out_features * (in_features / 2));
         const scales_view = try scales_arena.alloc(scales_bytes);
         const quants_view = try quants_arena.alloc(quants_bytes);
         const views: UploadStage.Views = .{ .scales = scales_view, .quants = quants_view };
-        try stage.uploadRows(ctx, .q4_0, weight_bytes, in_features, out_features, views);
+        try stage.uploadOutputs(ctx, .q4_0, weight_bytes, in_features, out_features, views);
 
         return .{
             .ctx = ctx,
@@ -289,7 +289,7 @@ pub const Q80Weight = struct {
 
 /// The one host buffer pair of a bulk weight upload. `small` stages the f16 scales and the f32
 /// vectors, and `quants` stages the quants. The caller sizes the pair once and frees it after the
-/// last weight. A matrix past the pair uploads in passes of whole rows.
+/// last weight. A matrix past the pair uploads in passes over the weights of whole outputs.
 pub const UploadStage = struct {
     small: HostBuffer,
     quants: HostBuffer,
@@ -321,10 +321,10 @@ pub const UploadStage = struct {
         try self.quants.ensure(quants_bytes);
     }
 
-    /// Repack the rows of one matrix into the pair and copy them to `views`, one submit per pass.
-    /// Row r of the repacked form starts at r times the row bytes in each view, so a pass of rows
-    /// lands at the offset of its first row, and the views get the bytes of a single pass.
-    fn uploadRows(
+    /// Repack the weights of the outputs of one matrix into the pair and copy them to `views`, one
+    /// submit per pass. Output r starts at r times its byte size in each view. A pass of outputs
+    /// thus lands at the offset of its first output, and the views get the bytes of a single pass.
+    fn uploadOutputs(
         self: *UploadStage,
         ctx: *const vulkan_ctx.Context,
         comptime form: Form,
@@ -341,51 +341,54 @@ pub const UploadStage = struct {
             .q8_0 => repackQ80ToScalesQuants,
             .q4_0 => repackQ40ToScalesQuants,
         };
-        const quant_row: usize = switch (form) {
+        const quant_bytes_per_output: usize = switch (form) {
             .q8_0 => in_features,
             .q4_0 => in_features / 2,
         };
         // Both forms hold 32 weights in a block.
-        const blocks_per_row = in_features / q8_0_block_elems;
-        const src_row = blocks_per_row * block_bytes;
-        const scale_row = blocks_per_row * 2;
-        std.debug.assert(views.scales.range == out_features * scale_row);
-        std.debug.assert(views.quants.range == out_features * quant_row);
+        const blocks_per_output = in_features / q8_0_block_elems;
+        const src_bytes_per_output = blocks_per_output * block_bytes;
+        const scale_bytes_per_output = blocks_per_output * 2;
+        std.debug.assert(views.scales.range == out_features * scale_bytes_per_output);
+        std.debug.assert(views.quants.range == out_features * quant_bytes_per_output);
 
-        // A pass holds the most whole rows that both buffers fit.
-        const rows_max = @min(self.small.capacity / scale_row, self.quants.capacity / quant_row);
-        std.debug.assert(rows_max >= 1);
+        // A pass holds the most whole outputs that both buffers fit.
+        const outputs_max = @min(
+            self.small.capacity / scale_bytes_per_output,
+            self.quants.capacity / quant_bytes_per_output,
+        );
+        std.debug.assert(outputs_max >= 1);
 
-        var walk = kv_budget.ChunkWalk.init(out_features, rows_max);
+        var walk = kv_budget.ChunkWalk.init(out_features, outputs_max);
         var passes: u64 = 0;
-        while (walk.next()) |rows| : (passes += 1) {
-            const first: usize = @intCast(rows.offset);
-            const n: usize = @intCast(rows.len);
+        while (walk.next()) |chunk| : (passes += 1) {
+            const first: usize = @intCast(chunk.offset);
+            const n: usize = @intCast(chunk.len);
             repack(
-                weight_bytes[first * src_row ..][0 .. n * src_row],
+                weight_bytes[first * src_bytes_per_output ..][0 .. n * src_bytes_per_output],
                 in_features,
                 n,
-                self.small.sliceTyped(u8, n * scale_row),
-                self.quants.sliceTyped(u8, n * quant_row),
+                self.small.sliceTyped(u8, n * scale_bytes_per_output),
+                self.quants.sliceTyped(u8, n * quant_bytes_per_output),
             );
             const copies = [_]Copy{
                 .{
                     .src = self.small.buffer,
                     .dst = views.scales.buffer,
-                    .size = n * scale_row,
-                    .dst_offset = views.scales.offset + first * scale_row,
+                    .size = n * scale_bytes_per_output,
+                    .dst_offset = views.scales.offset + first * scale_bytes_per_output,
                 },
                 .{
                     .src = self.quants.buffer,
                     .dst = views.quants.buffer,
-                    .size = n * quant_row,
-                    .dst_offset = views.quants.offset + first * quant_row,
+                    .size = n * quant_bytes_per_output,
+                    .dst_offset = views.quants.offset + first * quant_bytes_per_output,
                 },
             };
             try runStagingCopies(ctx, &copies);
         }
 
-        std.debug.assert(passes == kv_budget.ChunkWalk.count(out_features, rows_max));
+        std.debug.assert(passes == kv_budget.ChunkWalk.count(out_features, outputs_max));
     }
 };
 
@@ -400,16 +403,16 @@ fn repackQ80ToScalesQuants(
     scales_out: []u8,
     quants_out: []u8,
 ) void {
-    const blocks_per_row = in_features / q8_0_block_elems;
-    const row_bytes = blocks_per_row * q8_0_block_bytes;
-    std.debug.assert(scales_out.len >= out_features * blocks_per_row * 2);
+    const blocks_per_output = in_features / q8_0_block_elems;
+    const output_bytes = blocks_per_output * q8_0_block_bytes;
+    std.debug.assert(scales_out.len >= out_features * blocks_per_output * 2);
     std.debug.assert(quants_out.len >= out_features * in_features);
     for (0..out_features) |j| {
-        const row_off = j * row_bytes;
-        for (0..blocks_per_row) |blk| {
-            const blk_off = row_off + blk * q8_0_block_bytes;
-            // 2 bytes of f16 scale -> scales_out at j * blocks_per_row + blk.
-            const scales_idx = (j * blocks_per_row + blk) * 2;
+        const output_off = j * output_bytes;
+        for (0..blocks_per_output) |blk| {
+            const blk_off = output_off + blk * q8_0_block_bytes;
+            // 2 bytes of f16 scale -> scales_out at j * blocks_per_output + blk.
+            const scales_idx = (j * blocks_per_output + blk) * 2;
             scales_out[scales_idx + 0] = weight_data[blk_off + 0];
             scales_out[scales_idx + 1] = weight_data[blk_off + 1];
             // 32 bytes of i8 quants -> quants_out at j * in_features + blk * 32.
@@ -422,8 +425,8 @@ fn repackQ80ToScalesQuants(
     }
 }
 
-/// The Q4_0 form of `repackQ80ToScalesQuants`. A row holds `in/32` blocks of a 2-byte f16 scale
-/// plus 16 packed bytes. The packed bytes keep every bit pattern, and the shader extracts the
+/// The Q4_0 form of `repackQ80ToScalesQuants`. An output holds `in/32` blocks of a 2-byte f16
+/// scale plus 16 packed bytes. The packed bytes keep every bit pattern, and the shader extracts the
 /// nibbles in the layout of the CPU kernel.
 fn repackQ40ToScalesQuants(
     weight_data: []const u8,
@@ -432,15 +435,15 @@ fn repackQ40ToScalesQuants(
     scales_out: []u8,
     quants_out: []u8,
 ) void {
-    const blocks_per_row = in_features / q4_0_block_elems;
-    const row_bytes = blocks_per_row * q4_0_block_bytes;
-    std.debug.assert(scales_out.len >= out_features * blocks_per_row * 2);
+    const blocks_per_output = in_features / q4_0_block_elems;
+    const output_bytes = blocks_per_output * q4_0_block_bytes;
+    std.debug.assert(scales_out.len >= out_features * blocks_per_output * 2);
     std.debug.assert(quants_out.len >= out_features * (in_features / 2));
     for (0..out_features) |j| {
-        const row_off = j * row_bytes;
-        for (0..blocks_per_row) |blk| {
-            const blk_off = row_off + blk * q4_0_block_bytes;
-            const scales_idx = (j * blocks_per_row + blk) * 2;
+        const output_off = j * output_bytes;
+        for (0..blocks_per_output) |blk| {
+            const blk_off = output_off + blk * q4_0_block_bytes;
+            const scales_idx = (j * blocks_per_output + blk) * 2;
             scales_out[scales_idx + 0] = weight_data[blk_off + 0];
             scales_out[scales_idx + 1] = weight_data[blk_off + 1];
             // 16 packed bytes -> quants_out at j * (in/2) + blk * 16.

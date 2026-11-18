@@ -1,6 +1,6 @@
-//! The model families. One row per architecture holds the runner of each
+//! The model families. One entry per architecture holds the runner of each
 //! placement and the few values that differ between families. A command turns
-//! the architecture into a row once, and stays generic below that point:
+//! the architecture into an entry once, and stays generic below that point:
 //!
 //!     switch (loaded.card.arch) {
 //!         inline else => |arch| return bench(family.Of(arch), ...),
@@ -8,8 +8,8 @@
 //!
 //! No command needs an edit after that.
 //!
-//! Comptime. `Of` returns the row of an architecture, so a new architecture fails the build until
-//! its row exists.
+//! Comptime. `Of` returns the entry of an architecture, so a new architecture fails the build until
+//! its entry exists.
 
 const std = @import("std");
 const build_options = @import("build_options");
@@ -31,7 +31,7 @@ const hybrid_runner = if (fused_build) @import("../runtime/hybrid_runner.zig") e
 
 // -- types ------------------------------------------------------------------
 
-/// The row of `arch`. The return value is a namespace, so each row can hold
+/// The entry of `arch`. The return value is a namespace, so each entry can hold
 /// types and functions with signatures of its own.
 pub fn Of(comptime arch: loader.Arch) type {
     return switch (arch) {
@@ -48,7 +48,7 @@ const Llama = struct {
     pub const Layer = llama_layer;
     pub const profile_family = llama_layer.profile_family;
 
-    // A build that names the row checks its runners. The llama runners hold no recurrent state.
+    // A build that names the entry checks its runners. The llama runners hold no recurrent state.
     comptime {
         runner_surface.requireSurface(Cpu, kv_budget.KvPlan);
         runner_surface.requireNoRecurrentState(Cpu);
@@ -110,7 +110,7 @@ const Qwen = struct {
     pub const Layer = qwen_layer;
     pub const profile_family = qwen_layer.profile_family;
 
-    // A build that names the row checks its runners. The qwen runners hold the GDN state.
+    // A build that names the entry checks its runners. The qwen runners hold the GDN state.
     comptime {
         runner_surface.requireSurface(Cpu, kv_budget.KvPlan);
         runner_surface.requireRecurrentState(Cpu);
@@ -162,7 +162,7 @@ const Qwen = struct {
 
 // -- helpers ----------------------------------------------------------------
 
-/// Bytes of the widest hybrid tag of a row: the literal frame, the widest u32 layer count, the
+/// Bytes of the widest hybrid tag of an entry: the literal frame, the widest u32 layer count, the
 /// separator, the longest weight quant name, and the widest KV dtype component.
 fn hybridTagBufLen(comptime prefix: []const u8) usize {
     var widest: usize = 0;
@@ -196,7 +196,7 @@ fn formatHybridTag(
 
 // -- tests ------------------------------------------------------------------
 
-test "runner surface: every family row holds the session surface" {
+test "runner surface: every family entry holds the session surface" {
     // A comptime block of a container runs only when the build analyzes the container.
     inline for (comptime std.enums.values(loader.Arch)) |arch| {
         _ = &Of(arch).Cpu;
@@ -204,29 +204,29 @@ test "runner surface: every family row holds the session surface" {
 }
 
 test "hybrid tag: the texts on disk stay the shipped literals of both families" {
-    const LlamaRow = Of(.llama);
-    const QwenRow = Of(.qwen35);
-    var buf_a: [LlamaRow.hybrid_tag_buf_len]u8 = undefined;
-    var buf_b: [LlamaRow.hybrid_tag_buf_len]u8 = undefined;
-    var buf_c: [QwenRow.hybrid_tag_buf_len]u8 = undefined;
-    var buf_d: [QwenRow.hybrid_tag_buf_len]u8 = undefined;
-    var buf_e: [QwenRow.hybrid_tag_buf_len]u8 = undefined;
+    const LlamaEntry = Of(.llama);
+    const QwenEntry = Of(.qwen35);
+    var buf_a: [LlamaEntry.hybrid_tag_buf_len]u8 = undefined;
+    var buf_b: [LlamaEntry.hybrid_tag_buf_len]u8 = undefined;
+    var buf_c: [QwenEntry.hybrid_tag_buf_len]u8 = undefined;
+    var buf_d: [QwenEntry.hybrid_tag_buf_len]u8 = undefined;
+    var buf_e: [QwenEntry.hybrid_tag_buf_len]u8 = undefined;
 
     // The tags stay the shipped literals byte for byte, so no cached blob moves. A Qwen runner
     // holds Q8_0 weights only.
-    const llama_15 = LlamaRow.hybridBackendTag(&buf_a, 15, .q8_0, .f32);
-    const llama_15_f16 = LlamaRow.hybridBackendTag(&buf_b, 15, .q8_0, .f16);
+    const llama_15 = LlamaEntry.hybridBackendTag(&buf_a, 15, .q8_0, .f32);
+    const llama_15_f16 = LlamaEntry.hybridBackendTag(&buf_b, 15, .q8_0, .f16);
     try std.testing.expectEqualStrings("vulkan_hybrid:k=15:q8_0", llama_15);
     try std.testing.expectEqualStrings("vulkan_hybrid:k=15:q8_0:kv=f16", llama_15_f16);
-    const qwen_6 = QwenRow.hybridBackendTag(&buf_c, 6, .q8_0, .f32);
-    const qwen_12 = QwenRow.hybridBackendTag(&buf_d, 12, .q8_0, .f32);
-    const qwen_6_f16 = QwenRow.hybridBackendTag(&buf_e, 6, .q8_0, .f16);
+    const qwen_6 = QwenEntry.hybridBackendTag(&buf_c, 6, .q8_0, .f32);
+    const qwen_12 = QwenEntry.hybridBackendTag(&buf_d, 12, .q8_0, .f32);
+    const qwen_6_f16 = QwenEntry.hybridBackendTag(&buf_e, 6, .q8_0, .f16);
     try std.testing.expectEqualStrings("vulkan_hybrid_qwen:k=6:q8_0", qwen_6);
     try std.testing.expectEqualStrings("vulkan_hybrid_qwen:k=12:q8_0", qwen_12);
     try std.testing.expectEqualStrings("vulkan_hybrid_qwen:k=6:q8_0:kv=f16", qwen_6_f16);
     try std.testing.expectEqualStrings(
         "vulkan_hybrid:k=15:q4_0",
-        LlamaRow.hybridBackendTag(&buf_a, 15, .q4_0, .f32),
+        LlamaEntry.hybridBackendTag(&buf_a, 15, .q4_0, .f32),
     );
 
     // The family name leads, so a blob of one family never restores into the other.
@@ -234,10 +234,10 @@ test "hybrid tag: the texts on disk stay the shipped literals of both families" 
     try std.testing.expect(!std.mem.startsWith(u8, llama_15, "vulkan_hybrid_qwen:"));
 
     // The widest tag of each family fits its bound exactly.
-    const llama_widest = LlamaRow.hybridBackendTag(&buf_a, std.math.maxInt(u32), .q8_0, .f16);
-    try std.testing.expectEqual(LlamaRow.hybrid_tag_buf_len, llama_widest.len);
-    const qwen_widest = QwenRow.hybridBackendTag(&buf_c, std.math.maxInt(u32), .q8_0, .f16);
-    try std.testing.expectEqual(QwenRow.hybrid_tag_buf_len, qwen_widest.len);
+    const llama_widest = LlamaEntry.hybridBackendTag(&buf_a, std.math.maxInt(u32), .q8_0, .f16);
+    try std.testing.expectEqual(LlamaEntry.hybrid_tag_buf_len, llama_widest.len);
+    const qwen_widest = QwenEntry.hybridBackendTag(&buf_c, std.math.maxInt(u32), .q8_0, .f16);
+    try std.testing.expectEqual(QwenEntry.hybrid_tag_buf_len, qwen_widest.len);
 }
 
 test "hybrid surface: the marker follows the CPU runner, and the slot reset exists" {

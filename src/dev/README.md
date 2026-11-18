@@ -57,7 +57,7 @@ The dispatch runs from the root to one command:
   dev_main --> zigferencer.entry(dev_command.dispatch)
                        |
                        v
-  dev_command --> command rows --> <name>_cmd.run(Context)
+  dev_command --> command entries --> <name>_cmd.run(Context)
    (dev table + release table)
 ```
 
@@ -69,7 +69,7 @@ A model command boots like this:
   boot_resources --> resolve/resolve --> Resolved --> boot_lines     |
                                             |                        |
                                             v                        v
-                                      family.Of(arch) --> runner --> measured rows
+                                      family.Of(arch) --> runner --> measured lines
 ```
 
 `bench-model` has one file for each placement, and they share one run body:

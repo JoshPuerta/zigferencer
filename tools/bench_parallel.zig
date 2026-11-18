@@ -7,7 +7,7 @@
 //!                      smallest matmul that gains from a fan-out.
 //!   benchDispatchCost  the cost of one dispatch of empty units, one unit per
 //!                      participant, on an `Io.Group` and on the fork-join
-//!                      pool. The pool rows run with a spin budget of 0 and of
+//!                      pool. The pool lines run with a spin budget of 0 and of
 //!                      50 µs, so they show the sleep path and the spin path.
 //!   benchBandwidth     the DRAM read bandwidth of the host against thread
 //!                      count. It sum-reduces a buffer far larger than L3,
@@ -64,11 +64,11 @@ const EmptyUnits = struct { sink: u32 };
 
 pub fn benchFanoutCost(gpa: std.mem.Allocator, io: std.Io) !void {
     // Build a weight that gives two units or more at every pool size up to 64.
-    // The shape is n = 256 output rows with k = 32, one q8_0 block of 34 bytes per row.
+    // The shape is n = 256 outputs with k = 32, one q8_0 block of 34 bytes per output.
     const k: u32 = 32;
     const n: u32 = 256;
-    const row_bytes: usize = 34;
-    const w_data = try gpa.alloc(u8, n * row_bytes);
+    const output_bytes: usize = 34;
+    const w_data = try gpa.alloc(u8, n * output_bytes);
     defer gpa.free(w_data);
 
     @memset(w_data, 0);
@@ -76,7 +76,7 @@ pub fn benchFanoutCost(gpa: std.mem.Allocator, io: std.Io) !void {
         .dtype = .q8_0,
         .n_dims = 2,
         .shape = .{ k, n, 0, 0 },
-        .byte_stride = .{ @intCast(row_bytes), 0, 0, 0 },
+        .byte_stride = .{ @intCast(output_bytes), 0, 0, 0 },
         .data = w_data,
     };
     const input = try gpa.alloc(f32, k);
@@ -118,7 +118,7 @@ pub fn benchFanoutCost(gpa: std.mem.Allocator, io: std.Io) !void {
         .{ "threads", "us/call", "overhead_us", "us/thread" },
     );
 
-    // Time each thread count against the one-thread row.
+    // Time each thread count against the one-thread line.
     const threads = [_]u32{ 1, 2, 4, 8, 16, 32 };
     var base_us: f64 = 0;
     for (threads) |t| {
@@ -221,7 +221,7 @@ pub fn benchBandwidth(gpa: std.mem.Allocator, io: std.Io) !void {
     );
     std.debug.print("{s:>8}{s:>12}{s:>10}{s:>10}\n", .{ "threads", "ms", "GB/s", "scaling" });
 
-    // Time each thread count against the one-thread row.
+    // Time each thread count against the one-thread line.
     const threads = [_]usize{ 1, 2, 4, 8, 16, 32 };
     var base_gbs: f64 = 0;
     var sink: f64 = 0;

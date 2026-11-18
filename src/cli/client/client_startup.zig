@@ -94,7 +94,7 @@ pub const Options = struct {
         },
         .sampling = args.Doc{
             .group = "sampling",
-            .text = "model for the card row of the think mode of the turns, or greedy",
+            .text = "model for the card entry of the think mode of the turns, or greedy",
         },
         .temperature = args.Doc{
             .group = "sampling",
@@ -157,7 +157,7 @@ pub const Options = struct {
         return o.thinkOpen() orelse (info.think_mode == .on);
     }
 
-    /// The sampling of every session. `model` takes the card row that the server sends for the
+    /// The sampling of every session. `model` takes the card entry that the server sends for the
     /// think mode of the turns.
     pub fn sessionSampling(o: *const Options, info: Client.HelloInfo) protocol.Sampling {
         var s = switch (o.sampling) {

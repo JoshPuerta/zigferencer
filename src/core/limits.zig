@@ -144,7 +144,7 @@ pub const max_vocab: u32 = 262_144;
 /// a 256K context, so it is 1<<18. It sizes the static arrays and backs the kernel asserts.
 pub const max_model_ctx: u32 = 1 << 18; // 262144
 
-/// Ceiling on `--runs` of a model bench. The bench holds one result row per run.
+/// Ceiling on `--runs` of a model bench. The bench holds one result line per run.
 pub const bench_runs_max: u32 = 1000;
 
 /// KV bytes one `run` or `bench-model` session holds when no flag names a window.
@@ -173,7 +173,7 @@ pub const max_prefill_chunk: u32 = 256;
 
 /// Rows of one prompt chunk on the CPU runners in `run` and `bench-model`. One weight read serves
 /// every row, and only the last row runs the lm_head. The SIMD batch kernel reads each input row
-/// once per 4-row weight group. So a wide chunk leaves the L2 cache. Serve sizes its own chunk.
+/// once per 4-output weight group. So a wide chunk leaves the L2 cache. Serve sizes its own chunk.
 pub const cpu_prefill_chunk: u32 = 64;
 
 /// Ceiling on the threads of one CPU pool, the calling thread included. The pool packs the
@@ -318,7 +318,7 @@ pub const min_kv_window: u32 = 128;
 /// The prefix-cache RAM budget `serve` uses when `--kv-ram` names no budget.
 pub const serve_prefix_ram_default: u64 = 1 << 30;
 
-/// Ceiling on the serve prefix cache's disk-index rows, one key and token sequence per on-disk
+/// Ceiling on the serve prefix cache's disk-index entries, one key and token sequence per on-disk
 /// entry. The boot scan skips files past it with a warning, because a capped index must never read
 /// as complete.
 pub const serve_prefix_disk_index_max: usize = 1024;
@@ -352,10 +352,10 @@ pub const prompt_cache_disk_default: u64 = 16 << 30;
 /// plan omits: the upload stage, the alignment padding of the weight arenas, and driver overhead.
 pub const vram_share_default: VramShare = .{ .num = 7, .den = 8 };
 
-/// Usable share on the driver that `vulkan_ctx.driverRow` maps to this row, the translation-layer
-/// driver of the reference setup. This row is a heuristic from one measured setup: a plan under
-/// the default line lost the device there during the weight upload, and a smaller plan ran. Every
-/// other driver keeps the default row.
+/// Usable share on the driver that `vulkan_ctx.driverEntry` maps to this entry, the
+/// translation-layer driver of the reference setup. This entry is a heuristic from one measured
+/// setup: a plan under the default line lost the device there during the weight upload, and a
+/// smaller plan ran. Every other driver keeps the default entry.
 pub const vram_share_vulkan_on_d3d12: VramShare = .{ .num = 3, .den = 4 };
 
 /// The usable share of each driver. The preflight refuses a plan that cannot fit under this line.
@@ -474,8 +474,8 @@ pub fn vramUsable(driver: Driver, available_bytes: u64) u64 {
 }
 
 /// The grid of a reduce matvec over `n` outputs: at most `reduce_grid_x` workgroups on x, and
-/// the rows of that width on y. Output j runs in workgroup (j % x, j / x), and the last row can
-/// hold workgroups past `n`.
+/// `ceil(n / x)` on y. Output j runs in workgroup (j % x, j / x), and the workgroups at the last
+/// y index can lie past `n`.
 pub fn reduceGrid(n: u32) ReduceGrid {
     std.debug.assert(n >= 1);
     std.debug.assert(n <= max_vocab);
@@ -658,8 +658,8 @@ pub fn gdnScanCell(group: u32, lane: u32) GdnScanCell {
 }
 
 comptime {
-    // A power of two turns the row multiply of the reduce shaders into a shift, and one row fits
-    // the guaranteed count.
+    // A power of two turns the multiply by the grid width in the reduce shaders into a shift, and
+    // the width fits the guaranteed count.
     std.debug.assert(std.math.isPowerOfTwo(reduce_grid_x));
     std.debug.assert(reduce_grid_x <= max_workgroups);
     // The largest vocabulary folds into a grid inside the guaranteed count.
@@ -733,9 +733,9 @@ comptime {
 
 // -- tests ------------------------------------------------------------------
 
-test "reduceGrid: the rows of the grid cover every output once" {
-    const Row = struct { n: u32, x: u32, y: u32 };
-    const rows = [_]Row{
+test "reduceGrid: the grid covers every output once" {
+    const Case = struct { n: u32, x: u32, y: u32 };
+    const cases = [_]Case{
         .{ .n = 1, .x = 1, .y = 1 },
         .{ .n = 32767, .x = 32767, .y = 1 },
         .{ .n = 32768, .x = 32768, .y = 1 },
@@ -744,14 +744,14 @@ test "reduceGrid: the rows of the grid cover every output once" {
         .{ .n = 128256, .x = 32768, .y = 4 },
         .{ .n = 248320, .x = 32768, .y = 8 },
     };
-    for (rows) |row| {
-        const grid = reduceGrid(row.n);
-        try std.testing.expectEqual(row.x, grid.x);
-        try std.testing.expectEqual(row.y, grid.y);
+    for (cases) |case| {
+        const grid = reduceGrid(case.n);
+        try std.testing.expectEqual(case.x, grid.x);
+        try std.testing.expectEqual(case.y, grid.y);
     }
 
-    // Over every count to the largest vocabulary, the grid holds each output, and the last row
-    // starts below `n`.
+    // Over every count to the largest vocabulary, the grid holds each output, and the first
+    // output of the last y index lies below `n`.
     var n: u32 = 1;
     while (n <= max_vocab) : (n += 1) {
         const grid = reduceGrid(n);
@@ -781,9 +781,9 @@ test "vramUsable: seven eighths of the budget, rounded down" {
     try std.testing.expectEqual(@as(u64, 0), vramUsable(.other, 0));
 }
 
-test "vramUsable: each driver row takes its share of the budget, rounded down" {
-    const Row = struct { driver: Driver, available: u64, usable: u64 };
-    const rows = [_]Row{
+test "vramUsable: each driver entry takes its share of the budget, rounded down" {
+    const Case = struct { driver: Driver, available: u64, usable: u64 };
+    const cases = [_]Case{
         .{ .driver = .other, .available = 8 << 30, .usable = 7 << 30 },
         .{ .driver = .other, .available = 15, .usable = 7 },
         .{ .driver = .vulkan_on_d3d12, .available = 8 << 30, .usable = 6 << 30 },
@@ -792,8 +792,8 @@ test "vramUsable: each driver row takes its share of the budget, rounded down" {
         .{ .driver = .vulkan_on_d3d12, .available = 7, .usable = 3 },
         .{ .driver = .vulkan_on_d3d12, .available = 0, .usable = 0 },
     };
-    for (rows) |row| {
-        try std.testing.expectEqual(row.usable, vramUsable(row.driver, row.available));
+    for (cases) |case| {
+        try std.testing.expectEqual(case.usable, vramUsable(case.driver, case.available));
     }
 }
 

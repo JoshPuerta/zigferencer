@@ -150,7 +150,7 @@ has a flow arrow to each worker share of that dispatch. The slices carry these a
 
 **The timeline.** `timeline.pftrace` holds the engine trace and the perf samples in one
 file, both on `CLOCK_MONOTONIC`. Each thread shows its slices and its CPU samples on one
-row. In ui.perfetto.dev, select a time range on a thread to get the flame graph of the
+track. In ui.perfetto.dev, select a time range on a thread to get the flame graph of the
 samples in that range. `samples.pftrace` opens alone too.
 
 **Queries.** `trace_processor_shell`, from perfetto.dev, runs SQL on these files. For
@@ -229,7 +229,7 @@ Every span compiles only under `-Dtrace=true`.
 | `worker_sleep` | a pool worker that waits on the futex between two dispatches |
 | `layer_forward` | one layer of a CPU runner |
 | `host_prefix` | the CPU layers of a hybrid runner |
-| an op, such as `attn_proj` | one op of a CPU step, one row of `--profile-cpu-decode` |
+| an op, such as `attn_proj` | one op of a CPU step, one line of `--profile-cpu-decode` |
 
 The GPU labels are `decode`, `decode_batch`, `prefill_chunk`, and the one-shot
 labels `copy`, `fill`, `clone`, and `dispatch`.
@@ -246,7 +246,7 @@ Each op has a class: `matmul`, `attention`, `recurrent`, `elementwise`, `norm`, 
 `--profile-prefill` show each class, then the ops of the class.
 
 A GPU op of two passes marks each pass. The GPU table shows the passes under their op,
-and the op row holds their sum:
+and the op line holds their sum:
 
 | Op | Passes |
 | --- | --- |
@@ -256,5 +256,5 @@ and the op row holds their sum:
 
 A trace arg names a pass as `op.part`, for example `attention.split_ns`. A folded stack
 of `flame-gpu.svg` reads the runner, the label, the class, the op, and the pass. A
-kernel that fuses two ops marks both, and its row reads `a+b`. Each such set must stand
+kernel that fuses two ops marks both, and its line reads `a+b`. Each such set must stand
 in `fused_sets` of `layer_op.zig`.

@@ -92,8 +92,8 @@ const reduce_defines = [_][]const u8{
 
 // -- constants: shader table ------------------------------------------------
 
-/// The shaders that `-Druntime=vulkan` compiles. To add a kernel, add one row and the `.comp` file.
-/// A variant compiles the source of another shader with other defines.
+/// The shaders that `-Druntime=vulkan` compiles. To add a kernel, add one entry and the `.comp`
+/// file. A variant compiles the source of another shader with other defines.
 const vulkan_shaders = [_]Shader{
     .{ .name = "vec_add" },
     .{ .name = "linear_q8_0" },
@@ -224,7 +224,7 @@ const OpsBackendResolved = enum { naive, simd, simd_pf, vulkan, vulkan_fused };
 const RuntimeOption = enum { cpu, vulkan };
 const AttnKernelOption = enum { split };
 
-/// One row of `vulkan_shaders`. The import name that source passes to `@embedFile` is
+/// One entry of `vulkan_shaders`. The import name that source passes to `@embedFile` is
 /// `<name>.spv`, and the file is `src/ops_vulkan/shaders/<source>.comp`.
 const Shader = struct {
     name: []const u8,
@@ -705,7 +705,7 @@ fn addBench(b: *std.Build, config: Config, modules: Modules) void {
     bench_step.dependOn(&run_bench.step);
 
     // Some kernels have their only caller in the bench, so no other step type-checks those calls.
-    // This step also compiles the Vulkan rows on a host without a device.
+    // This step also compiles the Vulkan entries on a host without a device.
     const bench_build_step = b.step("bench-build", "Compile the bench without running it");
     bench_build_step.dependOn(&bench_exe.step);
 }
@@ -798,7 +798,7 @@ fn addShaderImport(b: *std.Build, exe_mod: *Module, shader: Shader) void {
     exe_mod.addAnonymousImport(import_name, .{ .root_source_file = spv });
 }
 
-/// Compile one shader row and return the blob. The release build passes `strict = false`, because
+/// Compile one shader entry and return the blob. The release build passes `strict = false`, because
 /// a newer `glslc` can add a warning and the build must not depend on that. The lint passes true.
 fn addGlslc(b: *std.Build, shader: Shader, strict: bool) std.Build.LazyPath {
     // `--target-env=vulkan1.2` keeps the output within the version the target driver advertises.

@@ -123,8 +123,8 @@ void main() {
     uint K = params.k;
     uint N = params.n;
     uint B = params.b;
-    uint blocks_per_row = K / BK;  // scales: blocks per weight row
-    uint words_per_row = K / 4u;   // quants: u32 words per weight row, 4 i8 each
+    uint blocks_per_output = K / BK;  // scales: blocks per output
+    uint words_per_output = K / 4u;   // quants: u32 words per output, 4 i8 each
 
     float acc[TM][TN];
     for (uint m = 0u; m < TM; m++) {
@@ -159,8 +159,8 @@ void main() {
             uint col = bn_base + c;
             float v = 0.0;
             if (col < N) {
-                float scale = float(scales_buf.data[col * blocks_per_row + kt]);
-                uint word = quants_buf.data[col * words_per_row + (k_base >> 2) + (kk >> 2)];
+                float scale = float(scales_buf.data[col * blocks_per_output + kt]);
+                uint word = quants_buf.data[col * words_per_output + (k_base >> 2) + (kk >> 2)];
                 int qi = bitfieldExtract(int(word), int((kk & 3u) * 8u), 8);
                 v = scale * float(qi);
             }

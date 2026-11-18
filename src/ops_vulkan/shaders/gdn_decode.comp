@@ -58,8 +58,8 @@
 //   Registers: each lane holds `vconv`, MAX_V_PER_K = 8 floats, from pass 1 into pass 3.
 //   Passes 1 to 3: the barriers of a token stay on chip at low cost. One dispatch per run removes
 //   the n_tokens - 1 host pipeline barriers and dispatches per layer.
-//   Pass 3: at one i, the lanes of a wave read adjacent elements of state row i, so the loads
-//   coalesce.
+//   Pass 3: at one i, the lanes of a wave read adjacent elements of the state at key index i, so
+//   the loads coalesce.
 //
 // Numerics
 //   Tolerance: `GdnDecode` declares `.relative = 1e-4`. The GPU `exp`, sigmoid, silu, and

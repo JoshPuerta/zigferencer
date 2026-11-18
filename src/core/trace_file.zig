@@ -576,13 +576,13 @@ test "name: an op name follows the tags, maps back to its key, and reads as the 
 const decoded_tracks_max = 16;
 const decoded_begins_max = 160;
 const decoded_flows_max = 128;
-const row_args_max = 4;
+const entry_args_max = 4;
 
 /// One decoded slice begin: its track, its name, its args, and its flows.
-const BeginRow = struct {
+const BeginEntry = struct {
     track: u64,
     name: []const u8,
-    args: [row_args_max]perfetto.Arg,
+    args: [entry_args_max]perfetto.Arg,
     n_args: u32,
     n_flows: u32,
     term: ?u64,
@@ -591,7 +591,7 @@ const BeginRow = struct {
 /// What a decoded trace holds. `decodeTrace` checks the per-track invariants as it reads.
 const Decoded = struct {
     interned: perfetto.TestInterned = .{},
-    begins: [decoded_begins_max]BeginRow = undefined,
+    begins: [decoded_begins_max]BeginEntry = undefined,
     n_begins: u32 = 0,
     n_ends: u32 = 0,
     flows: [decoded_flows_max]u64 = undefined,
@@ -609,8 +609,8 @@ const Decoded = struct {
         return self.find(m.args[0..m.n_args], key);
     }
 
-    fn argOfRow(self: *const Decoded, row: BeginRow, key: []const u8) ?u64 {
-        return self.find(row.args[0..row.n_args], key);
+    fn argOfEntry(self: *const Decoded, entry: BeginEntry, key: []const u8) ?u64 {
+        return self.find(entry.args[0..entry.n_args], key);
     }
 
     fn find(self: *const Decoded, args: []const perfetto.Arg, key: []const u8) ?u64 {
@@ -692,14 +692,14 @@ fn decodeTrace(bytes: []const u8, d: *Decoded) !void {
     try testing.expectEqual(d.n_begins, d.n_ends);
 }
 
-/// Keep one slice begin. A begin past the arg cap of a row fails the test.
+/// Keep one slice begin. A begin past the arg cap of an entry fails the test.
 fn keepBegin(d: *Decoded, e: perfetto.TestEvent) !void {
     const name = d.interned.event_names[@intCast(e.name_iid)];
     try testing.expect(name.len > 0);
-    try testing.expect(e.n_args <= row_args_max);
+    try testing.expect(e.n_args <= entry_args_max);
     try testing.expect(e.n_terms <= 1);
 
-    var row: BeginRow = .{
+    var entry: BeginEntry = .{
         .track = e.track_uuid,
         .name = name,
         .args = undefined,
@@ -707,9 +707,9 @@ fn keepBegin(d: *Decoded, e: perfetto.TestEvent) !void {
         .n_flows = e.n_flows,
         .term = if (e.n_terms == 1) e.terms[0] else null,
     };
-    @memcpy(row.args[0..row.n_args], e.args[0..row.n_args]);
+    @memcpy(entry.args[0..entry.n_args], e.args[0..entry.n_args]);
     if (d.n_begins < decoded_begins_max) {
-        d.begins[d.n_begins] = row;
+        d.begins[d.n_begins] = entry;
     }
 
     d.n_begins += 1;
@@ -921,8 +921,8 @@ test "trace: a pool run starts one flow per worker share, and trace_meta states 
     // Every span but the overlap, and both GPU records.
     try testing.expectEqual(@as(u32, 4 + 1 + 2 + 2), d.n_begins);
     try testing.expectEqualStrings("decode_step", d.begins[0].name);
-    try testing.expectEqual(@as(?u64, 1), d.argOfRow(d.begins[0], "rows"));
-    try testing.expectEqual(@as(?u64, 3), d.argOfRow(d.begins[1], "parts"));
+    try testing.expectEqual(@as(?u64, 1), d.argOfEntry(d.begins[0], "rows"));
+    try testing.expectEqual(@as(?u64, 3), d.argOfEntry(d.begins[1], "parts"));
 
     // Each terminating flow matches one flow of the pool run.
     try testing.expectEqual(@as(u32, 2), d.n_flows);
@@ -940,15 +940,15 @@ test "trace: a pool run starts one flow per worker share, and trace_meta states 
 
     // A worker share names its worker and its epoch.
     var shares: u32 = 0;
-    for (d.begins[0..d.n_begins]) |row| {
-        if (!std.mem.eql(u8, row.name, "attention")) continue;
+    for (d.begins[0..d.n_begins]) |entry| {
+        if (!std.mem.eql(u8, entry.name, "attention")) continue;
 
         shares += 1;
-        try testing.expectEqual(@as(?u64, 7), d.argOfRow(row, "epoch"));
+        try testing.expectEqual(@as(?u64, 7), d.argOfEntry(entry, "epoch"));
         // The flow that the share ends carries its worker index in the low byte.
-        const worker = d.argOfRow(row, "worker").?;
+        const worker = d.argOfEntry(entry, "worker").?;
         try testing.expect(worker >= 1);
-        try testing.expectEqual(worker, row.term.? & 0xff);
+        try testing.expectEqual(worker, entry.term.? & 0xff);
     }
 
     try testing.expectEqual(@as(u32, 2), shares);
@@ -1040,6 +1040,6 @@ test "trace: an arg of 0 writes when its flag is set, and a clear flag writes no
     const d = try writeAndDecode(&out, &tracks);
     defer testing.allocator.destroy(d);
 
-    try testing.expectEqual(@as(?u64, 0), d.argOfRow(d.begins[0], "rows"));
-    try testing.expectEqual(@as(?u64, null), d.argOfRow(d.begins[1], "rows"));
+    try testing.expectEqual(@as(?u64, 0), d.argOfEntry(d.begins[0], "rows"));
+    try testing.expectEqual(@as(?u64, null), d.argOfEntry(d.begins[1], "rows"));
 }

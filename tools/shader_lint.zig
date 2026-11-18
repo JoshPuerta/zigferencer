@@ -83,7 +83,7 @@ const Rule = enum {
     bit_exact_precise,
     tolerance,
     uniform_guard,
-    binding_row,
+    binding_entry,
 };
 
 const TextCheck = struct {
@@ -193,7 +193,7 @@ pub fn lint(arena: Allocator, input: Input) ![]const Finding {
     try braceRules(&shader, &report);
     try numericRules(arena, &shader, &report);
     try uniformRules(arena, &shader, &report);
-    try bindingRows(&shader, &report);
+    try bindingEntries(&shader, &report);
 
     std.mem.sort(Finding, report.findings.items, {}, Report.lessThan);
 
@@ -882,20 +882,20 @@ fn isAccessWord(word: []const u8) bool {
     return false;
 }
 
-/// Every `binding = N` of the code has a row in Bindings, and every row has a declaration unless
-/// the row says `unused`.
-fn bindingRows(shader: *const Shader, report: *Report) !void {
+/// Every `binding = N` of the code has an entry in Bindings, and every entry has a declaration
+/// unless the entry says `unused`.
+fn bindingEntries(shader: *const Shader, report: *Report) !void {
     const s = shader.span(.Bindings) orelse return;
-    var rows: [32]bool = @splat(false);
+    var entries: [32]bool = @splat(false);
     var unused: [32]bool = @splat(false);
     for (shader.lines[s.first..s.end]) |line| {
         var it = std.mem.tokenizeAny(u8, line.raw, "/ ");
         const word = it.next() orelse continue;
         const index = std.fmt.parseInt(usize, word, 10) catch continue;
         const access = it.next() orelse continue;
-        if (index >= rows.len or !isAccessWord(access)) continue;
+        if (index >= entries.len or !isAccessWord(access)) continue;
 
-        rows[index] = true;
+        entries[index] = true;
         unused[index] = std.mem.indexOf(u8, line.raw, "unused") != null;
     }
 
@@ -908,14 +908,14 @@ fn bindingRows(shader: *const Shader, report: *Report) !void {
         if (index >= declared.len) continue;
 
         declared[index] = true;
-        if (!rows[index]) {
-            try report.add(.binding_row, n, "binding {d} has no row in Bindings", .{index});
+        if (!entries[index]) {
+            try report.add(.binding_entry, n, "binding {d} has no entry in Bindings", .{index});
         }
     }
 
-    for (rows, 0..) |row, index| {
-        if (row and !declared[index] and !unused[index]) {
-            try report.add(.binding_row, s.first + 1, "row {d} has no declaration", .{index});
+    for (entries, 0..) |entry, index| {
+        if (entry and !declared[index] and !unused[index]) {
+            try report.add(.binding_entry, s.first + 1, "entry {d} has no declaration", .{index});
         }
     }
 }
@@ -1097,7 +1097,7 @@ test "a banned call fails and a longer name does not" {
 test "a header that lies about a binding or a tolerance fails" {
     const Case = struct { from: []const u8, to: []const u8, want: Rule };
     const cases = [_]Case{
-        .{ .from = "//   0     readonly", .to = "//   1     readonly", .want = .binding_row },
+        .{ .from = "//   0     readonly", .to = "//   1     readonly", .want = .binding_entry },
         .{ .from = "`.relative = 1e-3`", .to = "`.relative = 1e-4`", .want = .tolerance },
         .{ .from = "// demo: ", .to = "// other: ", .want = .title },
     };

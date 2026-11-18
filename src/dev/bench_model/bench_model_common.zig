@@ -2,7 +2,7 @@
 //! helpers.
 //!
 //! Comptime. An assert pins the depth buckets to divide the model context evenly. `loadAndRun`
-//! turns the architecture into a family row and calls a handler generic over it.
+//! turns the architecture into a family entry and calls a handler generic over it.
 
 const std = @import("std");
 const zigferencer = @import("zigferencer");
@@ -239,7 +239,7 @@ pub const RunResult = struct {
 // -- api --------------------------------------------------------------------
 
 /// Load the model of `opt`, resolve its placement as `kind` for `input`, and call
-/// `handler(Family, &bench, extra)` with the family row of its architecture.
+/// `handler(Family, &bench, extra)` with the family entry of its architecture.
 pub fn loadAndRun(
     ctx: context.Context,
     opt: Options,

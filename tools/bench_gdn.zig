@@ -33,8 +33,8 @@ const zigferencer = @import("zigferencer");
 const op_requires = zigferencer.op_requires;
 
 const bench_util = @import("bench_util.zig");
-const cpuRow = bench_util.cpuRow;
-const gpuRow = bench_util.gpuRow;
+const cpuLine = bench_util.cpuLine;
+const gpuLine = bench_util.gpuLine;
 const flush = bench_util.flush;
 const printSectionHeader = bench_util.printSectionHeader;
 const hashOut = bench_util.hashOut;
@@ -50,7 +50,7 @@ const chunk_tokens: usize = 64;
 
 const Cfg = struct { label: []const u8, n_k: u32, n_v: u32 };
 
-/// The inputs of a run of `tokens` GDN steps at one model size. A decode row uses one token.
+/// The inputs of a run of `tokens` GDN steps at one model size. A decode line uses one token.
 const GdnInputs = struct {
     dims: zigferencer.gdn.Dims,
     n_k: u32,
@@ -125,7 +125,7 @@ const GdnInputs = struct {
     }
 };
 
-/// The reference of one row: the CPU output and its hash, the work, and the timing scale.
+/// The reference of one line: the CPU output and its hash, the work, and the timing scale.
 const GdnRef = struct {
     label: []const u8,
     scale: usize,
@@ -196,11 +196,11 @@ pub fn benchGdn(gpa: std.mem.Allocator, io: std.Io, runner: anytype) !void {
 
         const arena = arena_state.allocator();
         const inputs = try GdnInputs.init(arena, 1, cf);
-        const ref = try gdnCpuRow(arena, io, &inputs, cf.label);
+        const ref = try gdnCpuLine(arena, io, &inputs, cf.label);
 
         if (comptime build_options.use_vulkan) {
             if (runner) |r| {
-                try gdnDecodeGpuRow(arena, io, r, &inputs, ref);
+                try gdnDecodeGpuLine(arena, io, r, &inputs, ref);
             }
         }
 
@@ -221,11 +221,11 @@ pub fn benchGdnChunked(gpa: std.mem.Allocator, io: std.Io, runner: anytype) !voi
 
         const arena = arena_state.allocator();
         const inputs = try GdnInputs.init(arena, chunk_tokens, cf);
-        const ref = try gdnCpuRow(arena, io, &inputs, cf.label);
+        const ref = try gdnCpuLine(arena, io, &inputs, cf.label);
 
         if (comptime build_options.use_vulkan) {
             if (runner) |r| {
-                try gdnChunkGpuRow(arena, io, r, &inputs, ref);
+                try gdnChunkGpuLine(arena, io, r, &inputs, ref);
             }
         }
 
@@ -238,7 +238,7 @@ pub fn benchGdnChunked(gpa: std.mem.Allocator, io: std.Io, runner: anytype) !voi
 /// Run the CPU reference once, print the `naive` line and the `simd_pf` line, and return the
 /// reference for the GPU line. The scratch is allocated before the timed loop, which keeps
 /// allocation out of the measurement.
-fn gdnCpuRow(
+fn gdnCpuLine(
     arena: std.mem.Allocator,
     io: std.Io,
     inputs: *const GdnInputs,
@@ -256,7 +256,7 @@ fn gdnCpuRow(
         .out = o_ref,
         .hash = hashOut(o_ref),
     };
-    try cpuRow(io, ref.scale, label, "naive", ref.work, ref.hash, cpu);
+    try cpuLine(io, ref.scale, label, "naive", ref.work, ref.hash, cpu);
 
     // The lane step of the SIMD backends, against the reference.
     const o_lane = try arena.alloc(f32, inputs.tokens * inputs.value_dim);
@@ -267,12 +267,12 @@ fn gdnCpuRow(
     const tol = zigferencer.ops_simd_pf.requires.tolerance;
     const t = try bench_util.timed(io, ref.scale, lane);
     const status = bench_util.opStatus(tol, norm, hash == ref.hash);
-    bench_util.rawRow(label, "simd_pf", t.ms, bench_util.rate(t, ref.work), norm, hash, status);
+    bench_util.rawLine(label, "simd_pf", t.ms, bench_util.rate(t, ref.work), norm, hash, status);
     return ref;
 }
 
-/// The GPU row of the one-token decode kernel.
-fn gdnDecodeGpuRow(
+/// The GPU line of the one-token decode kernel.
+fn gdnDecodeGpuLine(
     arena: std.mem.Allocator,
     io: std.Io,
     runner: anytype,
@@ -318,9 +318,9 @@ fn gdnDecodeGpuRow(
         }
     };
 
-    // Run the GPU row against the reference.
+    // Run the GPU line against the reference.
     const tol: op_requires.Tolerance = .{ .relative = 5e-3 };
-    try gpuRow(io, ref.scale, ref.label, "vk_gdn", ref.work, tol, ref.out, ref.hash, g_o, Gpu{
+    try gpuLine(io, ref.scale, ref.label, "vk_gdn", ref.work, tol, ref.out, ref.hash, g_o, Gpu{
         .k = &kern,
         .inputs = inputs,
         .state_w = try arena.alloc(f32, inputs.state_len),
@@ -329,8 +329,8 @@ fn gdnDecodeGpuRow(
     });
 }
 
-/// The GPU row of the chunk-parallel prefill kernel.
-fn gdnChunkGpuRow(
+/// The GPU line of the chunk-parallel prefill kernel.
+fn gdnChunkGpuLine(
     arena: std.mem.Allocator,
     io: std.Io,
     runner: anytype,
@@ -376,13 +376,24 @@ fn gdnChunkGpuRow(
     // The chunked scan reorders the recurrence, so the readout drifts about 1.5e-2.
     // The token hash is the exact signal, and 2e-2 is the rough gate.
     const tol: op_requires.Tolerance = .{ .relative = 2e-2 };
-    try gpuRow(io, ref.scale, ref.label, "vk_gdn_chunk", ref.work, tol, ref.out, ref.hash, g_o, Gpu{
-        .k = &kern,
-        .inputs = inputs,
-        .state_w = try arena.alloc(f32, inputs.state_len),
-        .conv_wk = try arena.alloc(f32, inputs.conv_state_len),
-        .o = g_o,
-    });
+    try gpuLine(
+        io,
+        ref.scale,
+        ref.label,
+        "vk_gdn_chunk",
+        ref.work,
+        tol,
+        ref.out,
+        ref.hash,
+        g_o,
+        Gpu{
+            .k = &kern,
+            .inputs = inputs,
+            .state_w = try arena.alloc(f32, inputs.state_len),
+            .conv_wk = try arena.alloc(f32, inputs.conv_state_len),
+            .o = g_o,
+        },
+    );
 }
 
 fn fillGdn(

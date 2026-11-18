@@ -3,7 +3,7 @@
 //! `[host_layers..n_layers)`, the final norm, and the lm_head. The planner picks `host_layers` so
 //! the GPU layers fit the VRAM budget.
 //!
-//! Comptime. `Family` is a row of `resolve/family.zig`, and the runner names only its `Cpu` and
+//! Comptime. `Family` is an entry of `resolve/family.zig`, and the runner names only its `Cpu` and
 //! `Fused` runners. A build check stops the compiler when a build without fused ops includes it.
 //!
 //! Composition. `Family.Cpu.initPrefix` builds the host layers, and the hidden-row entries of
@@ -29,7 +29,7 @@
 //! the host walk, and each call checks it against what the two runners report.
 //!
 //! Disk namespace. The CPU and GPU halves of a blob are not bit-identical. So a hybrid blob lives
-//! in its own disk namespace. The tag of each family row names the family, the host layer count,
+//! in its own disk namespace. The tag of each family entry names the family, the host layer count,
 //! the weight quant, and the KV dtype.
 //!
 //! Swap stages. A swap stage holds one chunk of the GPU half of a slot blob, or that whole half

@@ -2,10 +2,10 @@
 //
 // What
 //   This is the third Q8_0 matvec. It shares the shape and the tolerance class of
-//   `linear_q8_0_reduce.comp`, one workgroup per output j and 32 lanes that reduce the row. It has
-//   two changes: every multiply reads the input from LDS, and the reduction is a single
+//   `linear_q8_0_reduce.comp`, one workgroup per output j and 32 lanes that reduce the output. It
+//   has two changes: every multiply reads the input from LDS, and the reduction is a single
 //   `subgroupAdd` instead of an LDS store, a barrier, and a sequential sum in lane 0. This variant
-//   exists to test whether one `subgroupAdd` beats the LDS round trip. The bench row decides.
+//   exists to test whether one `subgroupAdd` beats the LDS round trip. The bench result decides.
 //
 // Math
 //   Here input_lds[blk] is the 32 elements at blk * 32, and blk runs over the k / 32 blocks:
@@ -14,7 +14,7 @@
 //     partial[L]   = sum_{blk % 32 = L} input_lds[blk] . dequant(weight[j][blk])
 //     out[j]       = subgroupAdd(partial[L])
 //
-//   Each block belongs to exactly one lane, so the partials cover the row once.
+//   Each block belongs to exactly one lane, so the partials cover the output once.
 //
 // Schedule
 //   grid       (min(n, GRID_X), ceil(n / GRID_X), 1)
@@ -34,10 +34,10 @@
 //
 //     input_lds  [LDS_CAPACITY] f32  16 KiB  the input vector
 //
-//   This covers every shape in the bench except the ffn_down rows (k = 8192 for Llama-1B, k = 14336
-//   for Llama-8B). For those the host dispatch returns `error.InFeaturesTooLargeForLdsKernel`, and
-//   the bench skips the row. RDNA2 has 64 KB of LDS per CU, so 16 KiB per workgroup still leaves 4
-//   workgroups in flight per CU.
+//   This covers every shape in the bench except the ffn_down lines (k = 8192 for Llama-1B,
+//   k = 14336 for Llama-8B). For those the host dispatch returns
+//   `error.InFeaturesTooLargeForLdsKernel`, and the bench skips the line. RDNA2 has 64 KB of LDS
+//   per CU, so 16 KiB per workgroup still leaves 4 workgroups in flight per CU.
 //
 // Hardware
 //   Waves: 32 lanes are one wave32 wave. The kernel expects one subgroup to hold the whole
@@ -123,14 +123,14 @@ void main() {
     }
     barrier();
 
-    uint blocks_per_row = k / 32u;
-    uint words_per_row = k / 4u;
+    uint blocks_per_output = k / 32u;
+    uint words_per_output = k / 4u;
 
     // Pass 2: sum the strided blocks of this lane against the LDS input.
     precise float partial = 0.0;
-    for (uint blk = local; blk < blocks_per_row; blk += 32u) {
-        precise float scale = float(scales_buf.data[j * blocks_per_row + blk]);
-        uint word_base = j * words_per_row + blk * 8u;
+    for (uint blk = local; blk < blocks_per_output; blk += 32u) {
+        precise float scale = float(scales_buf.data[j * blocks_per_output + blk]);
+        uint word_base = j * words_per_output + blk * 8u;
 
         for (uint i = 0u; i < 32u; ++i) {
             precise float in_v = input_lds[blk * 32u + i];

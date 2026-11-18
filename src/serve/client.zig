@@ -331,7 +331,7 @@ pub const Client = struct {
             return info.model_name_buf[0..info.model_name_len];
         }
 
-        /// The card row of a turn that opens inside the think block, or of
+        /// The card entry of a turn that opens inside the think block, or of
         /// one that stays outside it.
         pub fn recommendedFor(info: *const HelloInfo, open: bool) protocol.Sampling {
             return if (open) info.recommended_think else info.recommended_plain;
@@ -852,8 +852,8 @@ test "collectTurnWith: the hook sees every token frame, the end-of-sequence fram
 }
 
 test "the public methods name their error sets" {
-    const Row = struct { f: type, set: type };
-    const rows = [_]Row{
+    const Case = struct { f: type, set: type };
+    const cases = [_]Case{
         .{ .f = @TypeOf(Client.send), .set = Client.SendError },
         .{ .f = @TypeOf(Client.cancel), .set = Client.SendError },
         .{ .f = @TypeOf(Client.generate), .set = Client.GenerateError },
@@ -862,9 +862,9 @@ test "the public methods name their error sets" {
         .{ .f = @TypeOf(Client.shutdown), .set = Client.ReplyError },
         .{ .f = @TypeOf(Client.collectTurn), .set = Client.CollectError },
     };
-    comptime for (rows) |row| {
-        const returned = @typeInfo(row.f).@"fn".return_type.?;
-        std.debug.assert(@typeInfo(returned).error_union.error_set == row.set);
+    comptime for (cases) |case| {
+        const returned = @typeInfo(case.f).@"fn".return_type.?;
+        std.debug.assert(@typeInfo(returned).error_union.error_set == case.set);
     };
 }
 

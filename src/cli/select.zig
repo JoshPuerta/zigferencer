@@ -33,7 +33,7 @@ const name_pad_max = 64;
 
 // -- types ------------------------------------------------------------------
 
-/// The windows of one picker row, in positions: the model ceiling and the two default windows.
+/// The windows of one picker line, in positions: the model ceiling and the two default windows.
 const Windows = struct {
     ceiling: u32,
     run: u32,
@@ -204,7 +204,7 @@ fn printMenu(
         },
     );
 
-    // List one row per model.
+    // List one line per model.
     for (present, windows, 1..) |m, win, label| {
         const gap = padding(name_w - m.pub_name.len);
         try w.print(

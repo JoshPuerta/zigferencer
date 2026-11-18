@@ -416,7 +416,7 @@ pub fn preflightVram(
     const planned: u64 = vram.weights + vram.kv + recurrent + vram.logits + vram.scratch;
     log.debug(
         "vram preflight: planned {d} MiB (weights {d}, kv {d}, recurrent state {d}, " ++
-            "scratch {d}), available {d} MiB, usable {d} MiB ({t} row)",
+            "scratch {d}), available {d} MiB, usable {d} MiB ({t} entry)",
         .{
             planned / mib,
             vram.weights / mib,

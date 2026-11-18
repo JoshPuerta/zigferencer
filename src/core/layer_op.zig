@@ -4,16 +4,16 @@
 //! Ops. `LayerOp` holds the ops of a decoder layer, then the ops of the runner: the embed, the
 //! final norm, the lm_head, and the two transfers of a GPU step. A decoder layer calls each layer
 //! op at most once, so a layer op keys the binding of one call. Each op has one `OpClass`, so a
-//! profile table can group its rows.
+//! profile table can group its lines.
 //!
 //! Keys. A CPU span or a GPU mark times one `OpKey`: one op, one pass of a split op, or the op set
 //! of one fused kernel. A pass carries its `OpPart`, and each part belongs to one op. A profile
-//! sums the passes into the row of their op. A fused kernel records in the method of its first op
+//! sums the passes into the line of their op. A fused kernel records in the method of its first op
 //! and marks the whole set. The set must stand in `fused_sets`.
 //! `fused_sets` is empty when no kernel fuses two ops.
 //!
 //! Names. A key reads as its op, as `op.part` for a pass, or as `a+b` for a fused set. The span
-//! names, the profile rows, and the trace args read this text.
+//! names, the profile lines, and the trace args read this text.
 //!
 //! Comptime. The key count and the name table come from the enums and from `fused_sets`.
 
@@ -82,7 +82,7 @@ pub const LayerOp = enum(u8) {
     swiglu,
     down_proj,
     ffn_residual,
-    /// The lookup of the token rows in the embedding table.
+    /// The lookup of the embedding of each token.
     embed,
     final_norm,
     lm_head,
@@ -126,7 +126,7 @@ pub const OpPart = enum(u8) {
     }
 };
 
-/// The kind of work of an op: the group of its profile row.
+/// The kind of work of an op: the group of its profile line.
 pub const OpClass = enum(u8) { matmul, attention, recurrent, elementwise, norm, transfer };
 
 /// What one span or one mark times: one op, one pass of an op, or one fused op set. The values
@@ -176,7 +176,7 @@ pub const OpKey = enum(u8) {
         return @enumFromInt(i - op_count);
     }
 
-    /// The op of the row that holds the key: the op of a pass, or the first op of a fused set.
+    /// The op of the line that holds the key: the op of a pass, or the first op of a fused set.
     pub fn op(self: OpKey) LayerOp {
         return firstOp(self.ops());
     }

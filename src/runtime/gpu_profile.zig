@@ -69,10 +69,10 @@ pub const prof_max: u32 = 1 + limits.max_layers * layer_marks_max + head_marks;
 /// Stdout buffer of one `report`.
 const report_buffer_bytes = 4096;
 
-/// The deepest indent of a `report` row: a pass under its op under its class.
+/// The deepest indent of a `report` line: a pass under its op under its class.
 const report_indent_max = 4;
 
-/// The longest row label of `report`: the longest key name plus the deepest indent.
+/// The longest line label of `report`: the longest key name plus the deepest indent.
 const report_label_bytes = report_indent_max + keyNameMax();
 
 // -- types ------------------------------------------------------------------
@@ -126,7 +126,7 @@ pub const Readout = struct {
 
     /// Print the table of the op sums on stdout, because the output of an opt-in profiler is
     /// program output. `hdr` labels the run, as in "[qwen prefill warmup] b=411". The two host
-    /// times are the record step and the submit-plus-wait step. A row with no time stays out.
+    /// times are the record step and the submit-plus-wait step. A line with no time stays out.
     pub fn report(
         self: Readout,
         io: std.Io,
@@ -445,8 +445,8 @@ fn classNs(sums: *const [OpKey.count]f64, class: OpClass) f64 {
     return ns;
 }
 
-/// The row of an op key: its own sum, plus the sum of each pass of its op.
-fn rowNs(sums: *const [OpKey.count]f64, key: OpKey) f64 {
+/// The time of the line of an op key: its own sum, plus the sum of each pass of its op.
+fn lineNs(sums: *const [OpKey.count]f64, key: OpKey) f64 {
     assert(key.part() == null);
 
     var ns = sums[@intFromEnum(key)];
@@ -461,7 +461,7 @@ fn rowNs(sums: *const [OpKey.count]f64, key: OpKey) f64 {
     return ns;
 }
 
-/// The rows of `class` in a report: the class, each op with time, and each pass with time.
+/// The lines of `class` in a report: the class, each op with time, and each pass with time.
 fn printClass(
     w: *std.Io.Writer,
     sums: *const [OpKey.count]f64,
@@ -476,10 +476,10 @@ fn printClass(
         const key: OpKey = @enumFromInt(i);
         if (key.part() != null or key.class() != class) continue;
 
-        const row_ns = rowNs(sums, key);
-        if (row_ns == 0) continue;
+        const line_ns = lineNs(sums, key);
+        if (line_ns == 0) continue;
 
-        try printLine(w, key.name(), row_ns, total_ns, 2);
+        try printLine(w, key.name(), line_ns, total_ns, 2);
         if (key.ops().count() > 1) continue;
 
         for (std.enums.values(OpPart)) |p| {
@@ -493,7 +493,7 @@ fn printClass(
     }
 }
 
-/// The longest key name, which sizes the label of a report row.
+/// The longest key name, which sizes the label of a report line.
 fn keyNameMax() usize {
     var most: usize = 0;
     for (0..OpKey.count) |i| {
@@ -504,7 +504,7 @@ fn keyNameMax() usize {
     return most;
 }
 
-/// One report row. A nested row sits `indent` spaces in and keeps the columns.
+/// One report line. A nested line sits `indent` spaces in and keeps the columns.
 fn printLine(w: *std.Io.Writer, name: []const u8, ns: f64, total_ns: f64, indent: usize) !void {
     assert(indent <= report_indent_max);
     assert(indent + name.len <= report_label_bytes);
@@ -516,7 +516,7 @@ fn printLine(w: *std.Io.Writer, name: []const u8, ns: f64, total_ns: f64, indent
 
 // -- tests ------------------------------------------------------------------
 
-test "rowNs: an op row sums the op and each of its passes, and a class sums its keys" {
+test "lineNs: an op line sums the op and each of its passes, and a class sums its keys" {
     var sums: [OpKey.count]f64 = @splat(0);
     const attention: OpSet = .initOne(.attention);
     sums[@intFromEnum(OpKey.ofOp(.attention))] = 1;
@@ -524,8 +524,8 @@ test "rowNs: an op row sums the op and each of its passes, and a class sums its 
     sums[@intFromEnum(OpKey.of(attention, .merge))] = 4;
     sums[@intFromEnum(OpKey.of(.initOne(.gdn), .conv))] = 8;
     sums[@intFromEnum(OpKey.ofOp(.attn_proj))] = 16;
-    try std.testing.expectEqual(@as(f64, 7), rowNs(&sums, .ofOp(.attention)));
-    try std.testing.expectEqual(@as(f64, 8), rowNs(&sums, .ofOp(.gdn)));
+    try std.testing.expectEqual(@as(f64, 7), lineNs(&sums, .ofOp(.attention)));
+    try std.testing.expectEqual(@as(f64, 8), lineNs(&sums, .ofOp(.gdn)));
     try std.testing.expectEqual(@as(f64, 7), classNs(&sums, .attention));
     try std.testing.expectEqual(@as(f64, 8), classNs(&sums, .recurrent));
     try std.testing.expectEqual(@as(f64, 16), classNs(&sums, .matmul));
@@ -541,7 +541,7 @@ test "prof_max: the widest prefill chunk of the deepest stack fits one submit" {
     try std.testing.expect(prof_max >= 1 + limits.max_layers * richest_layer + head_marks);
 }
 
-test "a nested row keeps the columns of its class row" {
+test "a nested line keeps the columns of its class line" {
     var buf: [256]u8 = undefined;
     var w: std.Io.Writer = .fixed(&buf);
     try printLine(&w, "attention", 2e6, 4e6, 0);

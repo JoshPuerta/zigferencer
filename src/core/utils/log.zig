@@ -277,7 +277,8 @@ const EnvCase = struct {
     parallel: Level,
 };
 
-/// A table row: the env value, the threshold, the scope count, and the three probe ceilings.
+/// One case of the table: the env value, the threshold, the scope count, and the three probe
+/// ceilings.
 fn envCase(
     env: []const u8,
     global: Level,

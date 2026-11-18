@@ -50,12 +50,12 @@ fn allFinite(slice: []const f32) bool {
     return true;
 }
 
-/// Fill `data` with a synthetic Q8_0 weight: `n` rows of `k / 32` blocks, each
+/// Fill `data` with a synthetic Q8_0 weight: `n` outputs of `k / 32` blocks, each
 /// of a small random f16 scale and 32 random i8 quants.
 fn buildRandomQ80(r: std.Random, data: []u8, k: u32, n: u32) void {
     const block_bytes: usize = 34;
-    const blocks_per_row = k / 32;
-    std.debug.assert(data.len == @as(usize, n) * blocks_per_row * block_bytes);
+    const blocks_per_output = k / 32;
+    std.debug.assert(data.len == @as(usize, n) * blocks_per_output * block_bytes);
     var off: usize = 0;
     while (off < data.len) : (off += block_bytes) {
         const scale: f16 = @floatCast(0.005 + 0.02 * r.float(f32));
@@ -72,15 +72,15 @@ fn buildRandomQ80(r: std.Random, data: []u8, k: u32, n: u32) void {
 /// the form that the source holds.
 fn settle(
     comptime table: []const u8,
-    comptime rows: usize,
+    comptime cases: usize,
     comptime cols: usize,
-    want: [rows][cols]?u64,
-    got: [rows][cols]u64,
-    labels: [rows][]const u8,
+    want: [cases][cols]?u64,
+    got: [cases][cols]u64,
+    labels: [cases][]const u8,
 ) !void {
     var missing: u32 = 0;
     var moved: u32 = 0;
-    for (0..rows) |i| {
+    for (0..cases) |i| {
         for (0..cols) |c| {
             const w = want[i][c] orelse {
                 missing += 1;
@@ -102,8 +102,8 @@ fn settle(
         "mint: {d} digests missing, {d} moved in {s}. The table of this run:\n",
         .{ missing, moved, table },
     );
-    std.debug.print("const {s}: [{d}][{d}]?u64 = .{{\n", .{ table, rows, cols });
-    for (0..rows) |i| {
+    std.debug.print("const {s}: [{d}][{d}]?u64 = .{{\n", .{ table, cases, cols });
+    for (0..cases) |i| {
         std.debug.print("    .{{", .{});
         for (0..cols) |c| {
             std.debug.print(" 0x{x:0>16}{s}", .{ got[i][c], if (c + 1 < cols) "," else "" });
@@ -314,8 +314,8 @@ const batch_digests: [1][1]?u64 = .{.{0x8fe90b66cf02e893}};
 /// Run `kernel` on seeded activations and a seeded Q8_0 weight, and return the
 /// digest of the output bytes.
 fn runGemmCase(allocator: std.mem.Allocator, kernel: anytype, c: GemmCase) !u64 {
-    const row_bytes: usize = (c.k / 32) * 34;
-    const weight = try allocator.alloc(u8, @as(usize, c.n) * row_bytes);
+    const output_bytes: usize = (c.k / 32) * 34;
+    const weight = try allocator.alloc(u8, @as(usize, c.n) * output_bytes);
     defer allocator.free(weight);
 
     const input = try allocator.alloc(f32, @as(usize, c.b) * c.k);

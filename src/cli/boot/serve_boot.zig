@@ -2,7 +2,7 @@
 //! the model, builds the runner of its family on the selected placement, wraps it in the tiered-KV
 //! residency, and hands it to a launcher: a value with a `serve(SessionPool, ...)` method.
 //!
-//! Comptime. `inline else` turns the architecture into a family row once, so the rest is generic.
+//! Comptime. `inline else` turns the architecture into a family entry once, so the rest is generic.
 //!
 //! Placement. `--gpu-layers 0` and an auto split that holds no GPU layer take the CPU runner, and
 //! only the first of them skips the device. Every other flag state opens the device, resolves the
@@ -255,7 +255,7 @@ fn schedulerConfig(
         .think = think,
     };
 
-    // `hello_ack` carries the card row of each think mode.
+    // `hello_ack` carries the card entry of each think mode.
     if (registry.recommendedSampling(model.pub_name, true)) |r| {
         cfg.recommended_think = wireSampling(r);
     }
@@ -267,7 +267,7 @@ fn schedulerConfig(
     return cfg;
 }
 
-/// A card row as wire sampling. The card has no frequency penalty, so that field stays 0.
+/// A card entry as wire sampling. The card has no frequency penalty, so that field stays 0.
 fn wireSampling(r: registry.Recommended) protocol.Sampling {
     return .{
         .temperature = r.temperature,

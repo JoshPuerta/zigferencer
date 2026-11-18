@@ -27,7 +27,7 @@ comes in, and token ids go out.
 | `prompt_cache.zig` | `PromptCache`, the two-tier store of state snapshots. |
 | `sampler.zig` | The greedy and the seeded sampling of one logits row. |
 | `generate.zig` | The single-sequence decode loop, its `sink` boundary, and the two prefill loops. |
-| `parallel.zig` | The threading `Policy`, the row-parallel matmul, and CPU attention dispatch. |
+| `parallel.zig` | The threading `Policy`, the output-parallel matmul, and CPU attention dispatch. |
 | `pool.zig` | `Pool`, the fork-join pool of the CPU ops, and the spans of its work. |
 | `linear_dispatch.zig` | `linearBatchDispatch`, the batched linear by weight dtype. |
 | `tensor_lookup.zig` | The lookup of a weight by name over a `TensorRef` list. |
@@ -55,9 +55,9 @@ The runtime owns the middle of that chain.
 | `StepRow` | `step_row.zig` | One `(slot, token, pos)` row of a batch | `Sessions`, `generate` | Every runner `stepBatch` |
 | Decoder layer | `llama_layer.zig`, `qwen_layer.zig` | `forward`, which calls the ops of one layer on a kernel set, and the weight roles of the family | The files, as the `Family` of a runner | `CpuRunner`, `FusedRunner`, and their kernel sets |
 | Layer kernel set | `cpu_layer_kernels.zig`, `fused_layer_kernels.zig` | One method for each kind of layer op, over the step rows | `CpuRunner`, once per step. `FusedRunner`, once per record call | `forward` of the decoder layer |
-| `CpuRunner(Family)` | `cpu_runner.zig` | The weights, the KV slots, the recurrent slabs, and the scratch of the CPU | The `resolve/family` row | `Sessions`, `HybridRunner` |
-| `FusedRunner(Family)` | `fused_runner.zig` | The pipelines, the device buffers, the descriptor sets, and a `FusedCommands` | The `resolve/family` row | `Sessions`, `HybridRunner` |
-| `HybridRunner(Family)` | `hybrid_runner.zig` | A CPU prefix runner and a fused suffix runner | The `resolve/family` row | `Sessions` |
+| `CpuRunner(Family)` | `cpu_runner.zig` | The weights, the KV slots, the recurrent slabs, and the scratch of the CPU | The `resolve/family` entry | `Sessions`, `HybridRunner` |
+| `FusedRunner(Family)` | `fused_runner.zig` | The pipelines, the device buffers, the descriptor sets, and a `FusedCommands` | The `resolve/family` entry | `Sessions`, `HybridRunner` |
+| `HybridRunner(Family)` | `hybrid_runner.zig` | A CPU prefix runner and a fused suffix runner | The `resolve/family` entry | `Sessions` |
 | `KvCache` | `kv_cache.zig` | One flat K and V slab per slot | `CpuRunner` | `CpuLayerKernels` |
 | `Sessions` | `session.zig` | The slots, the positions, the RNG, and the sampling params | `cli/boot/serve_boot`, `dev/` tools | `serve/residency`, `serve/scheduler` |
 | `PromptCache` | `prompt_cache.zig` | State snapshots keyed by token prefix | `cli/run_cmd`, `serve/prefix_manager` | The same two |
@@ -84,8 +84,8 @@ A decoder layer is written once and runs on both kernel sets. The runner supplie
   HybridRunner(Family) = CpuRunner.initPrefix (host layers) + FusedRunner.initSuffix (GPU layers)
 ```
 
-A row of `resolve/family.zig` binds a family to its layer file and its three runners. A command
-selects the row with `family.Of(arch)` and stays generic below that point.
+An entry of `resolve/family.zig` binds a family to its layer file and its three runners. A command
+selects the entry with `family.Of(arch)` and stays generic below that point.
 
 A model file reaches the serving layer through this chain.
 
@@ -126,14 +126,14 @@ runner only through the `Sessions` surface.
 
 `Sessions(RunnerT)` names no interface type. It reaches a runner through a duck-typed surface, and
 `serve/residency.zig` reaches the swap hooks through `Sessions`. The table is that surface. Every
-row comes from a call site. A runner that satisfies the table composes with the session pool, the
+entry comes from a call site. A runner that satisfies the table composes with the session pool, the
 serve residency, and the CLI decode loop with no further work.
 
 | Declaration | Shape | The consumer that reads it | Carried by |
 | --- | --- | --- | --- |
 | `stepBatch` | `fn (*Self, []const StepRow) !void` | `session.advance`, the one row-assembly path under `feed` and `decodeBatch` | every runner |
 | `step` | `fn (*Self, u32, u32) ![]f32` | `generate.decode`, and `generate.prefillTokens` for a runner without `chunked_prefill` | every runner |
-| `chunked_prefill` | `bool` | `step_row.chunkedPrefill`, which picks the chunked prefill loop in `run_cmd.prefillAndStream` and `bench_model_exec.prefill` | `FusedRunner`, `HybridRunner`, and `CpuRunner` in a build without GPU ops. False, the prefill loop calls `step` per token. The Qwen row of `run` takes the prompt cache loop |
+| `chunked_prefill` | `bool` | `step_row.chunkedPrefill`, which picks the chunked prefill loop in `run_cmd.prefillAndStream` and `bench_model_exec.prefill` | `FusedRunner`, `HybridRunner`, and `CpuRunner` in a build without GPU ops. False, the prefill loop calls `step` per token. In `run`, the Qwen family entry takes the prompt cache loop |
 | `prefillBatch` | `fn (*Self, []const u32, u32) ![]f32` | `generate.prefillChunks` for `run` and `bench-model`. It passes chunks of slot 0 at consecutive positions | every runner |
 | `prefill_batch_max` | `u32` | the same two loops, which cut the prompt into chunks of at most this many rows | every runner |
 | `maxStepRows` | `fn (*const Self) u32` | `Sessions.init` sizes the row scratch with it. `cli/boot/serve_boot` clamps the prefill chunk to it | every runner |
@@ -150,12 +150,12 @@ serve residency, and the CLI decode loop with no further work.
 
 `Self` is the runner's own type, and every method takes a pointer to it. Each runner family declares
 its own error set, so the table states the payload a method yields and never the set. The last three
-rows are one unit: the pools test for `evictSlot` alone, so the sizing hook and the restore hook
+entries are one unit: the pools test for `evictSlot` alone, so the sizing hook and the restore hook
 must arrive with it.
 
-`Sessions(RunnerT)` checks the rows it reads when a pool type is built. Every build that names a
-pool, test fakes included, fails to compile on a drifted runner. Each row of `resolve/family.zig`
-calls `runner_surface.requireSurface` for its runners, `step` included. It checks every row of the
+`Sessions(RunnerT)` checks the entries it reads when a pool type is built. Every build that names a
+pool, test fakes included, fails to compile on a drifted runner. Each entry of `resolve/family.zig`
+calls `runner_surface.requireSurface` for its runners, `step` included. It checks every entry of the
 table against the CPU runner of each family always, and against the fused and the hybrid runner of
 each family on a `vulkan_fused` build. It checks that the fused and CPU runners read a `KvPlan` and
 that the hybrids read a `LayerSplit`. It checks the recurrent-state marker on the Qwen runners and

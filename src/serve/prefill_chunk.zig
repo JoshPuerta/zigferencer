@@ -98,7 +98,7 @@ const ChunkCase = struct {
     want: usize,
 };
 
-/// A table row. The fields follow the order of `chunk`, then the wanted rows.
+/// A test case. The fields follow the order of `chunk`, then the wanted rows.
 fn chunkCase(
     rule: Rule,
     remaining: usize,

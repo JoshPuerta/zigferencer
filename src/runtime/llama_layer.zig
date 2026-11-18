@@ -272,7 +272,7 @@ test "forward: the calls touch the weights and the buffers that the rules hold" 
     }
 }
 
-test "forward: a layer calls each Llama CPU row of a layer, and no other op" {
+test "forward: a layer calls each Llama CPU profile line of a layer, and no other op" {
     const card = test_fakes.testCard(.llama);
     var log: LogKernels.Log = .{};
     logLayer(&card, 0, &log);
