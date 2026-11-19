@@ -175,7 +175,7 @@ fn Kernels(comptime opts: Options) type {
             std.debug.assert(weight.n_dims == 2);
             std.debug.assert(batch > 0);
             // The limit bounds the pass loop of `panelGroup`.
-            std.debug.assert(batch <= limits.max_prefill_chunk);
+            std.debug.assert(batch <= limits.step_rows_max);
 
             const in_features: usize = @intCast(weight.shape[0]);
             const out_features: usize = @intCast(weight.shape[1]);
@@ -409,7 +409,7 @@ inline fn panelGroup(
     has_next: bool,
 ) void {
     std.debug.assert(shape.batch > 1);
-    std.debug.assert(shape.batch <= limits.max_prefill_chunk);
+    std.debug.assert(shape.batch <= limits.step_rows_max);
     std.debug.assert(j + n <= shape.out_stride);
     std.debug.assert((shape.batch - 1) * shape.out_stride + j + n <= outs.len);
 
@@ -841,6 +841,13 @@ test "linear_simd panel path on every small out size" {
         for (1..26) |out_features| {
             try panelCheck(K, 1088, out_features, &.{ 2, 3 });
         }
+    }
+}
+
+test "linear_simd panel path takes the widest step" {
+    // A serve step holds every decode slot and a full prefill chunk.
+    inline for (.{ plain, prefetched }) |K| {
+        try panelCheck(K, 1088, panel_outputs + mr + 1, &.{limits.step_rows_max});
     }
 }
 

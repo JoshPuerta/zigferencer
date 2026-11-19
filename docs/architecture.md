@@ -450,7 +450,8 @@ single row form. The rows of one slot are adjacent and ascend by one position, a
 rows that need logits come last.
 
 - **Prefill** feeds the prompt as rows of one slot, a chunk at a time. Only the last
-  row of the prompt asks for logits, so the lm_head runs once.
+  row of the prompt needs logits. The CPU runner runs the lm_head on that row only. The
+  fused and the hybrid runners run it on the last row of each chunk.
 - **Decode** feeds the last token of each session as one row and asks for logits.
 
 A row in a batch gets the same inputs as the same row alone. A batched step
@@ -656,7 +657,7 @@ A dispatch takes no lock and allocates nothing.
 | Op | One unit |
 | --- | --- |
 | Matrix product | A chunk of outputs, a multiple of 4, about four chunks for each participant. |
-| Attention | One KV head group over one part of the row. |
+| Attention | One KV head group over one part of one row of the step. |
 | Gated-DeltaNet | One key head with its value heads, over every row of the step, in row order. No serial part runs on the caller. |
 | `swiglu` | A range of elements of the flat gate buffer, about four ranges for each participant. |
 

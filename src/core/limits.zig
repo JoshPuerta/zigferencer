@@ -166,7 +166,7 @@ pub const max_batch: u32 = 8;
 pub const max_vram_slots: u32 = 128;
 
 /// Ceiling on a serve prefill chunk: the prompt tokens ingested in one forward pass, independent of
-/// `max_batch`. It bounds `--prefill-chunk N` and the runner row scratch. It caps each
+/// `max_batch`. It bounds `--prefill-chunk N` and the prefill rows of a runner. It caps each
 /// `prefill_batch_max` (llama fused 256 rows, qwen fused 128). Serve clamps a request to the real
 /// width of the runner at boot.
 pub const max_prefill_chunk: u32 = 256;
@@ -177,9 +177,9 @@ pub const max_prefill_chunk: u32 = 256;
 pub const step_rows_max: u32 = max_batch + max_prefill_chunk;
 
 /// Rows of one prompt chunk on the CPU runners in `run` and `bench-model`. One weight read serves
-/// every row, and only the last row runs the lm_head. The SIMD batch kernel reads each input row
-/// once per weight group of the batch path. So a wide chunk leaves the L2 cache. Serve sizes its
-/// own chunk.
+/// every row, and only the last row of the prompt runs the lm_head. The SIMD batch kernel reads
+/// each input row once per weight group of the batch path. So a wide chunk leaves the L2 cache.
+/// Serve sizes its own chunk.
 pub const cpu_prefill_chunk: u32 = 64;
 
 /// Ceiling on the threads of one CPU pool, the calling thread included. The pool packs the
