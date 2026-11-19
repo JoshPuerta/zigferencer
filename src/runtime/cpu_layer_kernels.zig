@@ -10,9 +10,9 @@
 //! stripe of each scratch buffer, and its attention reads only the KV of its slot up to its
 //! position. So the order of the ops across the rows changes no bit of a result.
 //!
-//! Pool. `project` calls the matmul dispatch once per weight, and `gdn` and `attention` call their
-//! pool function once per row. `swiglu` calls its pool function once per step. Every other op takes
-//! no pool.
+//! Pool. `project` calls the matmul dispatch once per weight. `gdn`, `attention`, and `swiglu` call
+//! their pool function once per step. Every other op takes no pool. The per-op GPU build calls one
+//! GPU kernel per row for each of these three ops.
 //!
 //! Comptime. `use_vulkan_ops` selects the op backend and the GPU forms of the recurrence and the
 //! attention.
@@ -23,6 +23,7 @@
 const std = @import("std");
 const build_options = @import("build_options");
 const span = @import("../core/span.zig");
+const limits = @import("../core/limits.zig");
 const Tensor = @import("../core/tensor.zig").Tensor;
 const dtype = @import("../core/dtype.zig");
 const loader = @import("../io/gguf/loader.zig");
@@ -52,6 +53,14 @@ else if (build_options.cpu_ops_simd)
 else
     @import("../ops/naive.zig");
 
+// The stack row arrays of `attention` and `gdn` stay at or below 64 KiB, the budget of the stack
+// score row in `limits.zig`.
+comptime {
+    assert(@sizeOf([limits.step_rows_max]parallel.GdnRow) <= 64 * 1024);
+    assert(@sizeOf([limits.step_rows_max]parallel.AttentionRow(f32)) <= 64 * 1024);
+    assert(@sizeOf([limits.step_rows_max]parallel.AttentionRow(f16)) <= 64 * 1024);
+}
+
 // -- types ------------------------------------------------------------------
 
 /// The layer kernel set of a CPU runner over the step rows of one call.
@@ -72,7 +81,8 @@ pub const CpuLayerKernels = struct {
     widths: *const std.EnumArray(Activation, u32),
     /// The scratch of each activation, one stripe per step row at the width of the activation.
     scratch: std.EnumArray(Activation, []f32),
-    /// The part records of one attention row. The rows of a step attend one at a time.
+    /// The part records of the attention rows of a step, `attn_cpu.partialLen` f32s for each row.
+    /// The rows of a step attend at the same time, so each row owns its records.
     attn_parts: []f32,
     kv_slots: []KvCache,
     kv_dtype: dtype.KvDtype,
@@ -220,69 +230,42 @@ pub const CpuLayerKernels = struct {
 
     /// Attend q of each row over the positions `0..=pos` of its slot, into `attn_out`.
     pub fn attention(self: *CpuLayerKernels, layer: u32) void {
-        // Read the KV region of the layer and the head shape.
         const index = self.kvIndex(layer);
-        const c = self.card;
-        const hd: usize = c.head_dim;
 
-        // Attend each row on the GPU kernel of the per-op build, or on the pool at the KV dtype.
-        for (self.rows, 0..) |r, i| {
-            const sp = span.begin(.ofOps(.initOne(.attention)));
-            defer sp.end();
+        // Attend each row on the GPU kernel of the per-op build.
+        if (comptime build_options.use_vulkan_ops) {
+            const c = self.card;
+            const hd: usize = c.head_dim;
+            for (self.rows, 0..) |r, i| {
+                const sp = span.begin(.ofOps(.initOne(.attention)));
+                defer sp.end();
 
-            const kv = &self.kv_slots[r.slot];
-            const q = self.stripe(.q, i);
-            const out = self.stripe(.attn_out, i);
-            const t_len: usize = @as(usize, r.pos) + 1;
-            if (comptime build_options.use_vulkan_ops) {
                 // Flag resolution refuses every dtype but f32 on this build,
                 // because `wrap.attentionSingle` uploads the slab as f32.
                 assert(self.kv_dtype == .f32);
 
+                const kv = &self.kv_slots[r.slot];
                 ops.attentionSingle(
-                    q,
+                    self.stripe(.q, i),
                     c.n_heads,
                     hd,
                     kv.kSlice(index, r.pos),
                     kv.vSlice(index, r.pos),
                     c.n_kv_heads,
-                    t_len,
-                    out,
+                    @as(usize, r.pos) + 1,
+                    self.stripe(.attn_out, i),
                 );
-            } else {
-                switch (self.kv_dtype) {
-                    .f32 => parallel.attentionTyped(
-                        f32,
-                        ops,
-                        self.pool,
-                        self.policy,
-                        q,
-                        c.n_heads,
-                        hd,
-                        kv.kSlice(index, r.pos),
-                        kv.vSlice(index, r.pos),
-                        c.n_kv_heads,
-                        t_len,
-                        self.attn_parts,
-                        out,
-                    ),
-                    .f16 => parallel.attentionTyped(
-                        f16,
-                        ops,
-                        self.pool,
-                        self.policy,
-                        q,
-                        c.n_heads,
-                        hd,
-                        kv.kSliceAs(f16, index, r.pos),
-                        kv.vSliceAs(f16, index, r.pos),
-                        c.n_kv_heads,
-                        t_len,
-                        self.attn_parts,
-                        out,
-                    ),
-                }
             }
+            return;
+        }
+
+        // Attend every row of the step in one fork on the pool, at the KV dtype.
+        const sp = span.begin(.ofOps(.initOne(.attention)));
+        defer sp.end();
+
+        switch (self.kv_dtype) {
+            .f32 => self.attentionRows(f32, index),
+            .f16 => self.attentionRows(f16, index),
         }
     }
 
@@ -356,7 +339,36 @@ pub const CpuLayerKernels = struct {
         const sp = span.begin(.ofOps(.initOne(.gdn)));
         defer sp.end();
 
-        // Step each row against the slabs of its slot.
+        // Step every row of the step in one fork on the pool, each against the slabs of its slot.
+        if (comptime !build_options.use_vulkan_ops) {
+            assert(self.rows.len <= limits.step_rows_max);
+
+            var rows_buf: [limits.step_rows_max]parallel.GdnRow = undefined;
+            const rows = rows_buf[0..self.rows.len];
+            for (self.rows, rows, 0..) |r, *dst, i| {
+                const slab = @as(usize, r.slot) * self.layers.len + layer;
+                dst.* = .{
+                    .qkv = self.stripe(.qkv, i),
+                    .z = self.stripe(.z, i),
+                    .a = self.stripe(.alpha, i),
+                    .b = self.stripe(.beta, i),
+                    .state = self.gdn_state[slab],
+                    .conv_state = self.gdn_conv_state[slab],
+                    .o_out = self.stripe(.mix_o, i),
+                };
+            }
+
+            parallel.gdnRows(ops, self.pool, self.policy, d, rows, .{
+                .conv_w = conv1d,
+                .ssm_a = ssm_a,
+                .dt_bias = dt_bias,
+                .ssm_norm = ssm_norm,
+                .rms_eps = eps,
+            });
+            return;
+        }
+
+        // Step each row against the slabs of its slot on the GPU kernel of the per-op build.
         for (self.rows, 0..) |r, i| {
             const slab = @as(usize, r.slot) * self.layers.len + layer;
             const state = self.gdn_state[slab];
@@ -369,45 +381,62 @@ pub const CpuLayerKernels = struct {
             const a_row = self.stripe(.alpha, i);
             const b_row = self.stripe(.beta, i);
             const o_row = self.stripe(.mix_o, i);
-            if (comptime build_options.use_vulkan_ops) {
-                // The GdnDecode kernel. `gpu-selftest` compares it with `gdn.step` within a
-                // tolerance, not by bits.
-                ops.gdnStep(
-                    @intCast(d.n_k_heads),
-                    @intCast(d.n_v_heads),
-                    @intCast(d.head_dim),
-                    @intCast(d.conv_kernel),
-                    qkv_row,
-                    z_row,
-                    a_row,
-                    b_row,
-                    conv1d,
-                    ssm_a,
-                    dt_bias,
-                    ssm_norm,
-                    eps,
-                    state,
-                    conv_state,
-                    o_row,
-                );
-            } else {
-                parallel.gdnStep(ops, self.pool, self.policy, d, qkv_row, conv1d, conv_state, .{
-                    .qkv = qkv_row,
-                    .z = z_row,
-                    .a = a_row,
-                    .b = b_row,
-                    .ssm_a = ssm_a,
-                    .dt_bias = dt_bias,
-                    .ssm_norm = ssm_norm,
-                    .rms_eps = eps,
-                    .state = state,
-                    .o_out = o_row,
-                });
-            }
+            // The GdnDecode kernel. `gpu-selftest` compares it with `gdn.step` within a tolerance,
+            // not by bits.
+            ops.gdnStep(
+                @intCast(d.n_k_heads),
+                @intCast(d.n_v_heads),
+                @intCast(d.head_dim),
+                @intCast(d.conv_kernel),
+                qkv_row,
+                z_row,
+                a_row,
+                b_row,
+                conv1d,
+                ssm_a,
+                dt_bias,
+                ssm_norm,
+                eps,
+                state,
+                conv_state,
+                o_row,
+            );
         }
     }
 
     // -- helpers ------------------------------------------------------------
+
+    /// Attend every row at the KV element type `E`, in one call of `parallel.attentionRowsTyped`.
+    /// `kvCommit` of the layer stored the K and V of every row before this call.
+    fn attentionRows(self: *CpuLayerKernels, comptime E: type, index: u32) void {
+        const c = self.card;
+        assert(self.rows.len <= limits.step_rows_max);
+
+        var rows_buf: [limits.step_rows_max]parallel.AttentionRow(E) = undefined;
+        const rows = rows_buf[0..self.rows.len];
+        for (self.rows, rows, 0..) |r, *dst, i| {
+            const kv = &self.kv_slots[r.slot];
+            dst.* = .{
+                .q = self.stripe(.q, i),
+                .k_cache = kv.kSliceAs(E, index, r.pos),
+                .v_cache = kv.vSliceAs(E, index, r.pos),
+                .t_len = r.pos + 1,
+                .out = self.stripe(.attn_out, i),
+            };
+        }
+
+        parallel.attentionRowsTyped(
+            E,
+            ops,
+            self.pool,
+            self.policy,
+            rows,
+            c.n_heads,
+            c.head_dim,
+            c.n_kv_heads,
+            self.attn_parts,
+        );
+    }
 
     /// The tensor of `weight` in the model layer `layer`.
     fn tensor(self: *const CpuLayerKernels, layer: u32, weight: Weight) *const Tensor {

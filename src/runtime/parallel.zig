@@ -34,19 +34,24 @@
 //! early claims more. The chunk size is a function of the shape and the pool size. It never
 //! changes a bit, because the kernels give an output the same bits at every chunk boundary.
 //!
-//! Attention units. The geometry of `attn_cpu` splits the row into `c = attn_cpu.partCount(t_len)`
-//! parts. A unit is one KV group over one part, so the row holds `n_kv_heads * c` units. Unit `u`
-//! is group `u / c` and part `u % c`. A unit writes the records of its group heads for its part,
-//! and no two units write one record. A unit runs the same kernel on the same inputs on every
-//! participant. After every unit ends, `Kernels.attentionMerge` combines the
-//! records on the calling thread, adding the parts in ascending order. The geometry is a function
-//! of `t_len` alone, so any assignment of units to participants gives the same bits.
+//! Attention units. `attentionRowsTyped` makes one fork for all attention rows of a step. The
+//! geometry of `attn_cpu` splits a row into `c = attn_cpu.partCount(t_len)` parts. A unit is one KV
+//! group of one row over one part, so a row holds `n_kv_heads * c` units. The units of a row follow
+//! the units of the row before it. Inside a row, unit `u` is group `u / c` and part `u % c`. A unit
+//! writes the records of its group heads for its part, inside the records of its row, so no two
+//! units write one record. After every unit ends, `Kernels.attentionMerge` combines the records of
+//! each row on the calling thread, adding the parts in ascending order. The geometry is a function
+//! of `t_len` alone, so any assignment of units to participants gives the bits of the serial row,
+//! `Kernels.attentionRowTyped`.
 //!
-//! GDN units. A unit is one key head, `Kernels.gdnStepKeyHead`. It runs the conv, the SiLU, and
-//! the norms of its q and k channels, then the conv and the recurrence of its value heads. Each
-//! channel, each conv ring entry, and each state belongs to one unit, so any assignment of units
-//! to participants gives the bits of the serial step of the backend: `gdn.step` for naive, and
-//! `gdn_simd.kernels.step` for the SIMD backends. The finite check runs after every unit ends.
+//! GDN units. `gdnRows` makes one fork for all GDN rows of a step. A unit is one key head, and it
+//! steps every row in row order with `Kernels.gdnStepKeyHead`. For each row it runs the conv, the
+//! SiLU, and the norms of its q and k channels, then the conv and the recurrence of its value
+//! heads. Each channel, each conv ring entry, and each state belongs to one key head. The rows of
+//! one slot are in time order in a step, and one unit keeps that order. So any assignment of units
+//! to participants gives the bits of the serial step of the backend, row by row: `gdn.step` for
+//! naive, and `gdn_simd.kernels.step` for the SIMD backends. The finite check runs after every unit
+//! ends.
 //!
 //! Swiglu units. The op is elementwise, so a unit is a range of `elementwiseUnitLen` elements of
 //! the flat gate buffer. Any partition gives the bits of the serial op.
@@ -197,25 +202,6 @@ const MatmulUnits = struct {
     }
 };
 
-/// The inputs of one GDN step. Unit `u` is key head `u` with its value heads.
-fn GdnUnits(comptime Kernels: type) type {
-    return struct {
-        d: gdn.Dims,
-        qkv: []f32,
-        conv_w: []const f32,
-        conv_state: []f32,
-        heads: gdn.Heads,
-
-        const Self = @This();
-
-        fn unit(self: *const Self, u: u32) void {
-            std.debug.assert(u < self.d.n_k_heads);
-
-            Kernels.gdnStepKeyHead(self.d, self.qkv, self.conv_w, self.conv_state, self.heads, u);
-        }
-    };
-}
-
 /// The inputs of one `swiglu` call. Unit `u` covers the elements
 /// `[u * len, min(n, (u + 1) * len))`.
 fn SwigluUnits(comptime Kernels: type) type {
@@ -237,8 +223,7 @@ fn SwigluUnits(comptime Kernels: type) type {
     };
 }
 
-/// The inputs of one attention row. The pool erases the context type, so this type binds `E` and
-/// the kernels.
+/// The inputs of one attention row of a step, over the part records of that row.
 fn Units(comptime E: type, comptime Kernels: type) type {
     return struct {
         q: []const f32,
@@ -289,9 +274,135 @@ fn Units(comptime E: type, comptime Kernels: type) type {
                 );
             }
         }
+    };
+}
+
+/// The inputs of one attention row of a step.
+pub fn AttentionRow(comptime E: type) type {
+    return struct {
+        q: []const f32,
+        k_cache: []const E,
+        v_cache: []const E,
+        t_len: u32,
+        out: []f32,
+    };
+}
+
+/// The inputs of the attention rows of one step. The pool erases the context type, so this type
+/// binds `E` and the kernels. The units of row `i` are `[unit_ends[i - 1], unit_ends[i])`, in the
+/// order of `Units` for that row.
+fn AttentionRowsUnits(comptime E: type, comptime Kernels: type) type {
+    return struct {
+        rows: []const AttentionRow(E),
+        unit_ends: []const u32,
+        n_heads: usize,
+        head_dim: usize,
+        n_kv_heads: usize,
+        parts_buf: []f32,
+        /// The elements of the part records of one row.
+        row_parts_len: usize,
+
+        const Self = @This();
 
         fn unit(self: *const Self, u: u32) void {
-            self.run(u, @as(usize, u) + 1);
+            const i = self.rowOf(u);
+            const unit_lo: u32 = if (i == 0) 0 else self.unit_ends[i - 1];
+            std.debug.assert(u >= unit_lo);
+            std.debug.assert(u < self.unit_ends[i]);
+
+            const units = self.rowUnits(i);
+            const local: usize = u - unit_lo;
+            units.run(local, local + 1);
+        }
+
+        /// The row that owns unit `u`: the first row whose units end past `u`.
+        fn rowOf(self: *const Self, u: u32) usize {
+            std.debug.assert(u < self.unit_ends[self.unit_ends.len - 1]);
+
+            var lo: usize = 0;
+            var hi: usize = self.unit_ends.len - 1;
+            while (lo < hi) {
+                const mid = lo + (hi - lo) / 2;
+                if (self.unit_ends[mid] > u) {
+                    hi = mid;
+                } else {
+                    lo = mid + 1;
+                }
+            }
+            std.debug.assert(self.unit_ends[lo] > u);
+            return lo;
+        }
+
+        /// The unit context of row `i`, over its own part records.
+        fn rowUnits(self: *const Self, i: usize) Units(E, Kernels) {
+            const r = self.rows[i];
+            return .{
+                .q = r.q,
+                .n_heads = self.n_heads,
+                .head_dim = self.head_dim,
+                .k_cache = r.k_cache,
+                .v_cache = r.v_cache,
+                .n_kv_heads = self.n_kv_heads,
+                .t_len = r.t_len,
+                .n_parts = attn_cpu.partCount(r.t_len),
+                .parts_buf = self.parts_buf[i * self.row_parts_len ..][0..self.row_parts_len],
+            };
+        }
+    };
+}
+
+/// The weights of one GDN layer and the epsilon of its gated norm, shared by every row.
+pub const GdnWeights = struct {
+    conv_w: []const f32,
+    ssm_a: []const f32,
+    dt_bias: []const f32,
+    ssm_norm: []const f32,
+    rms_eps: f32,
+};
+
+/// The inputs of one GDN row of a step: its stripes and the slabs of its slot.
+pub const GdnRow = struct {
+    qkv: []f32,
+    z: []const f32,
+    a: []const f32,
+    b: []const f32,
+    state: []f32,
+    conv_state: []f32,
+    o_out: []f32,
+};
+
+/// The inputs of the GDN rows of one step. Unit `u` is key head `u` over every row, in row order.
+fn GdnRowsUnits(comptime Kernels: type) type {
+    return struct {
+        d: gdn.Dims,
+        rows: []const GdnRow,
+        w: GdnWeights,
+
+        const Self = @This();
+
+        fn unit(self: *const Self, u: u32) void {
+            std.debug.assert(u < self.d.n_k_heads);
+
+            self.keyHead(u);
+        }
+
+        /// Step key head `kh` over every row in row order. The rows of one slot are in time
+        /// order, and a key head owns its channels, its ring entries, and its value heads.
+        fn keyHead(self: *const Self, kh: usize) void {
+            for (self.rows) |r| {
+                Kernels.gdnStepKeyHead(self.d, r.qkv, self.w.conv_w, r.conv_state, .{
+                    .qkv = r.qkv,
+                    .z = r.z,
+                    .a = r.a,
+                    .b = r.b,
+                    .ssm_a = self.w.ssm_a,
+                    .dt_bias = self.w.dt_bias,
+                    .ssm_norm = self.w.ssm_norm,
+                    .rms_eps = self.w.rms_eps,
+                    .state = r.state,
+                    .o_out = r.o_out,
+                }, kh);
+            }
         }
     };
 }
@@ -484,77 +595,90 @@ pub fn matmulUnitOutputs(n: usize, threads: u32) usize {
     return outputs;
 }
 
-/// The control unit of one CPU decode attention row.
-/// `Kernels` declares `attentionPartTyped` and `attentionMerge`. `E` is the KV element type.
-/// `parts_buf` holds at least `attn_cpu.partialLen(n_heads, head_dim)` f32s.
-pub fn attentionTyped(
+/// One fork over the attention units of every row of a step. Each row gets the bits of the serial
+/// row `Kernels.attentionRowTyped`. `parts_buf` holds `attn_cpu.partialLen` f32s for each row. The
+/// caller stores the K and V of every row first. `E` is the KV element type.
+pub fn attentionRowsTyped(
     comptime E: type,
     comptime Kernels: type,
     pool: *Pool,
     policy: Policy,
-    q: []const f32,
+    rows: []const AttentionRow(E),
     n_heads: usize,
     head_dim: usize,
-    k_cache: []const E,
-    v_cache: []const E,
     n_kv_heads: usize,
-    t_len: usize,
     parts_buf: []f32,
-    out: []f32,
 ) void {
     // Check the shapes and buffers.
     comptime std.debug.assert(E == f32 or E == f16);
+    std.debug.assert(rows.len >= 1);
+    std.debug.assert(rows.len <= limits.step_rows_max);
     std.debug.assert(n_kv_heads >= 1);
     std.debug.assert(n_heads >= n_kv_heads);
     std.debug.assert(n_heads % n_kv_heads == 0);
     std.debug.assert(head_dim >= 1);
-    std.debug.assert(t_len >= 1);
-    std.debug.assert(t_len <= limits.max_model_ctx);
-    std.debug.assert(q.len == n_heads * head_dim);
-    std.debug.assert(out.len == n_heads * head_dim);
-    std.debug.assert(k_cache.len >= t_len * n_kv_heads * head_dim);
-    std.debug.assert(v_cache.len >= t_len * n_kv_heads * head_dim);
-    const n_heads32: u32 = @intCast(n_heads);
-    const head_dim32: u32 = @intCast(head_dim);
-    std.debug.assert(parts_buf.len >= attn_cpu.partialLen(n_heads32, head_dim32));
+    const row_parts_len = attn_cpu.partialLen(@intCast(n_heads), @intCast(head_dim));
+    std.debug.assert(parts_buf.len >= rows.len * row_parts_len);
     const threads = pool.threads();
     std.debug.assert(@max(policy.n_threads, 1) == threads);
 
-    // Build the unit context and count the units.
-    const units: Units(E, Kernels) = .{
-        .q = q,
+    // Count the units of each row and the FLOPs of the step.
+    var unit_ends_buf: [limits.step_rows_max]u32 = undefined;
+    const unit_ends = unit_ends_buf[0..rows.len];
+    var units_sum: usize = 0;
+    var flops: u64 = 0;
+    for (rows, unit_ends) |r, *end| {
+        std.debug.assert(r.t_len >= 1);
+        std.debug.assert(r.t_len <= limits.max_model_ctx);
+        std.debug.assert(r.q.len == n_heads * head_dim);
+        std.debug.assert(r.out.len == n_heads * head_dim);
+        std.debug.assert(r.k_cache.len >= @as(usize, r.t_len) * n_kv_heads * head_dim);
+        std.debug.assert(r.v_cache.len >= @as(usize, r.t_len) * n_kv_heads * head_dim);
+
+        units_sum += n_kv_heads * attn_cpu.partCount(r.t_len);
+        end.* = @intCast(units_sum);
+        // 4 FLOP per (head, position, dim): the score dot plus the weighted-V sum.
+        flops += 4 * @as(u64, n_heads) * @as(u64, head_dim) * r.t_len;
+    }
+    std.debug.assert(units_sum <= limits.step_rows_max * n_kv_heads * limits.attn_cpu_parts);
+    std.debug.assert(units_sum <= std.math.maxInt(u32));
+    const n_units: u32 = @intCast(units_sum);
+
+    const units: AttentionRowsUnits(E, Kernels) = .{
+        .rows = rows,
+        .unit_ends = unit_ends,
         .n_heads = n_heads,
         .head_dim = head_dim,
-        .k_cache = k_cache,
-        .v_cache = v_cache,
         .n_kv_heads = n_kv_heads,
-        .t_len = @intCast(t_len),
-        .n_parts = attn_cpu.partCount(@intCast(t_len)),
         .parts_buf = parts_buf,
+        .row_parts_len = row_parts_len,
     };
-    const n_units: usize = n_kv_heads * units.n_parts;
-    std.debug.assert(n_units <= n_kv_heads * limits.attn_cpu_parts);
-    // 4 FLOP per (head, position, dim): the score dot plus the weighted-V sum.
-    const flops: u64 = 4 * @as(u64, n_heads) * @as(u64, head_dim) * @as(u64, t_len);
 
     // Run the units serially or on the pool.
     const parts = policy.parts(threads, n_units, flops);
     if (parts == 1) {
         log.debug(
-            "attention serial: flops {d}, floor {d}, t_len {d}, units {d}",
-            .{ flops, policy.min_parallel_flops, t_len, n_units },
+            "attention rows serial: flops {d}, floor {d}, rows {d}, units {d}",
+            .{ flops, policy.min_parallel_flops, rows.len, n_units },
         );
-        units.run(0, n_units);
+        for (0..rows.len) |i| {
+            const row_units = units.rowUnits(i);
+            row_units.run(0, n_kv_heads * row_units.n_parts);
+        }
     } else {
         log.debug(
-            "attention fanout: {d} parts over {d} units, t_len {d}",
-            .{ parts, n_units, t_len },
+            "attention rows fanout: {d} parts over {d} units, rows {d}",
+            .{ parts, n_units, rows.len },
         );
-        pool.run(Units(E, Kernels), &units, Units(E, Kernels).unit, @intCast(n_units), parts);
+        const Ctx = AttentionRowsUnits(E, Kernels);
+        pool.run(Ctx, &units, Ctx.unit, n_units, parts);
     }
 
-    // Merge the part records on the calling thread.
-    Kernels.attentionMerge(parts_buf, units.n_parts, n_heads, head_dim, out);
+    // Merge the part records of each row on the calling thread.
+    for (rows, 0..) |r, i| {
+        const row_units = units.rowUnits(i);
+        Kernels.attentionMerge(row_units.parts_buf, row_units.n_parts, n_heads, head_dim, r.out);
+    }
 }
 
 /// The elements of one `swiglu` unit: `ceil(n / (4 * threads))` rounded up to a multiple of 16.
@@ -610,57 +734,63 @@ pub fn swiglu(
     pool.run(Ctx, &ctx, Ctx.unit, @intCast(n_units), parts);
 }
 
-/// The control unit of one GDN step of one row. `Kernels` declares `gdnStepKeyHead`.
-/// `heads.qkv` must be `qkv`, the buffer that `Kernels.gdnStepKeyHead` writes in place.
-pub fn gdnStep(
+/// One fork over the key heads of the GDN rows of a step, each head over every row in row order.
+/// Each row gets the bits of the serial step of the backend. Each row holds the slabs of its own
+/// slot, and the rows of one slot must be in time order.
+pub fn gdnRows(
     comptime Kernels: type,
     pool: *Pool,
     policy: Policy,
     d: gdn.Dims,
-    qkv: []f32,
-    conv_w: []const f32,
-    conv_state: []f32,
-    heads: gdn.Heads,
+    rows: []const GdnRow,
+    w: GdnWeights,
 ) void {
-    std.debug.assert(heads.qkv.ptr == qkv.ptr);
-    std.debug.assert(heads.qkv.len == qkv.len);
+    std.debug.assert(rows.len >= 1);
+    std.debug.assert(rows.len <= limits.step_rows_max);
     std.debug.assert(d.n_k_heads >= 1);
     std.debug.assert(d.n_v_heads >= 1);
+    for (rows) |r| {
+        std.debug.assert(r.qkv.len == d.convDim());
+        std.debug.assert(r.o_out.len == d.valueDim());
+        std.debug.assert(r.state.len == d.stateLen());
+        std.debug.assert(r.conv_state.len == d.convStateLen());
+    }
 
     const threads = pool.threads();
     std.debug.assert(@max(policy.n_threads, 1) == threads);
-    // 7 FLOP per state element: decay 1, key read 2, rank-1 write 2, query read 2.
-    const flops: u64 = 7 * @as(u64, d.n_v_heads) * d.head_dim * d.head_dim;
+    // 7 FLOP per state element of each row: decay 1, key read 2, rank-1 write 2, query read 2.
+    const flops: u64 = 7 * @as(u64, d.n_v_heads) * d.head_dim * d.head_dim * rows.len;
+
+    const Ctx = GdnRowsUnits(Kernels);
+    const ctx: Ctx = .{
+        .d = d,
+        .rows = rows,
+        .w = w,
+    };
 
     // Run the key heads serially or on the pool.
     const n_units: u32 = @intCast(d.n_k_heads);
     const parts = policy.parts(threads, n_units, flops);
     if (parts == 1) {
         log.debug(
-            "gdn serial: flops {d}, floor {d}, key heads {d}",
-            .{ flops, policy.min_parallel_flops, d.n_k_heads },
+            "gdn rows serial: flops {d}, floor {d}, rows {d}",
+            .{ flops, policy.min_parallel_flops, rows.len },
         );
         for (0..d.n_k_heads) |kh| {
-            Kernels.gdnStepKeyHead(d, qkv, conv_w, conv_state, heads, kh);
+            ctx.keyHead(kh);
         }
     } else {
         log.debug(
-            "gdn fanout: {d} parts over {d} key heads, flops {d}",
-            .{ parts, n_units, flops },
+            "gdn rows fanout: {d} parts over {d} key heads, rows {d}, flops {d}",
+            .{ parts, n_units, rows.len, flops },
         );
-        const Ctx = GdnUnits(Kernels);
-        const ctx: Ctx = .{
-            .d = d,
-            .qkv = qkv,
-            .conv_w = conv_w,
-            .conv_state = conv_state,
-            .heads = heads,
-        };
         pool.run(Ctx, &ctx, Ctx.unit, n_units, parts);
     }
 
-    // Check the readout after every head ends.
-    gdn.assertFinite(d, heads.o_out);
+    // Check the readout of each row after every head ends.
+    for (rows) |r| {
+        gdn.assertFinite(d, r.o_out);
+    }
 }
 
 // -- helpers ----------------------------------------------------------------
@@ -970,171 +1100,6 @@ test "attention: forced fan-out at 1, 2, 3, 4, and 16 threads gives the bits of 
     }
 }
 
-test "gdnStep: forced fan-out at 1, 2, 3, 4, and 16 threads gives the bits of the serial step" {
-    const naive = @import("../ops/naive.zig");
-    const simd_pf = @import("../ops/simd_pf.zig");
-    const gdn_simd = @import("../ops/gdn_simd.zig");
-    const simd = @import("../ops/simd.zig");
-    // Both SIMD backends run one GDN unit, so the simd_pf run covers simd too.
-    comptime std.debug.assert(simd.gdnStepKeyHead == simd_pf.gdnStepKeyHead);
-    // Each backend with the serial step of its own arithmetic.
-    inline for (.{ .{ naive, gdn.reference }, .{ simd_pf, gdn_simd.kernels } }) |set| {
-        try expectGdnFanOut(set[0], set[1]);
-    }
-}
-
-/// Check that `gdnStep` over `Kernels` gives the bits of `Serial.step` at several thread counts.
-fn expectGdnFanOut(comptime Kernels: type, comptime Serial: type) !void {
-    const gpa = std.testing.allocator;
-    // The 2B, the 9B, and a small shape of 2 key heads. At 3 threads the key heads split unevenly.
-    const shapes = [_]gdn.Dims{
-        .{ .n_k_heads = 16, .n_v_heads = 16, .head_dim = 128, .conv_kernel = 4 },
-        .{ .n_k_heads = 16, .n_v_heads = 32, .head_dim = 128, .conv_kernel = 4 },
-        .{ .n_k_heads = 2, .n_v_heads = 6, .head_dim = 40, .conv_kernel = 4 },
-    };
-    const thread_counts = [_]u32{ 1, 2, 3, 4, 16 };
-    const tokens = 2;
-    var prng = std.Random.DefaultPrng.init(0x6D17_00A5);
-    const r = prng.random();
-    for (shapes) |d| {
-        // Carve the random inputs of one shape.
-        const cd = d.convDim();
-        const vd = d.valueDim();
-        const nv = d.n_v_heads;
-        const inputs = try gpa.alloc(
-            f32,
-            tokens * cd + vd + 4 * nv + d.conv_kernel * cd + d.head_dim,
-        );
-        defer gpa.free(inputs);
-
-        for (inputs) |*x| {
-            x.* = r.float(f32) * 2.0 - 1.0;
-        }
-
-        const qkv_in = inputs[0 .. tokens * cd];
-        var at: usize = tokens * cd;
-        const z = inputs[at..][0..vd];
-        at += vd;
-        const a = inputs[at..][0..nv];
-        const b = inputs[at + nv ..][0..nv];
-        const ssm_a = inputs[at + 2 * nv ..][0..nv];
-        const dt_bias = inputs[at + 3 * nv ..][0..nv];
-        at += 4 * nv;
-        const conv_w = inputs[at..][0 .. d.conv_kernel * cd];
-        at += d.conv_kernel * cd;
-        const ssm_norm = inputs[at..][0..d.head_dim];
-        for (ssm_a) |*x| {
-            x.* = -@abs(x.*) - 0.1;
-        }
-
-        const state0 = try gpa.alloc(f32, d.stateLen());
-        defer gpa.free(state0);
-
-        for (state0) |*x| {
-            x.* = (r.float(f32) - 0.5) * 0.2;
-        }
-
-        const conv0 = try gpa.alloc(f32, d.convStateLen());
-        defer gpa.free(conv0);
-
-        for (conv0) |*x| {
-            x.* = r.float(f32) - 0.5;
-        }
-
-        // Run the serial step over the tokens.
-        const state_ref = try gpa.dupe(f32, state0);
-        defer gpa.free(state_ref);
-
-        const conv_ref = try gpa.dupe(f32, conv0);
-        defer gpa.free(conv_ref);
-
-        const qkv_ref = try gpa.dupe(f32, qkv_in);
-        defer gpa.free(qkv_ref);
-
-        const o_ref = try gpa.alloc(f32, tokens * vd);
-        defer gpa.free(o_ref);
-
-        for (0..tokens) |t| {
-            Serial.step(
-                d,
-                qkv_ref[t * cd ..][0..cd],
-                z,
-                a,
-                b,
-                conv_w,
-                ssm_a,
-                dt_bias,
-                ssm_norm,
-                1e-6,
-                state_ref,
-                conv_ref,
-                o_ref[t * vd ..][0..vd],
-            );
-        }
-
-        // Run the fan-out at each thread count and compare the bytes.
-        const state = try gpa.alloc(f32, d.stateLen());
-        defer gpa.free(state);
-
-        const conv = try gpa.alloc(f32, d.convStateLen());
-        defer gpa.free(conv);
-
-        const qkv = try gpa.alloc(f32, tokens * cd);
-        defer gpa.free(qkv);
-
-        const o = try gpa.alloc(f32, tokens * vd);
-        defer gpa.free(o);
-
-        for (thread_counts) |n_threads| {
-            @memcpy(state, state0);
-            @memcpy(conv, conv0);
-            @memcpy(qkv, qkv_in);
-            @memset(o, std.math.nan(f32));
-            var pool: Pool = undefined;
-            try pool.init(std.testing.io, n_threads, 50_000);
-            defer pool.deinit();
-
-            const policy: Policy = .{ .n_threads = n_threads, .min_parallel_flops = 0 };
-            for (0..tokens) |t| {
-                const qkv_row = qkv[t * cd ..][0..cd];
-                gdnStep(Kernels, &pool, policy, d, qkv_row, conv_w, conv, .{
-                    .qkv = qkv_row,
-                    .z = z,
-                    .a = a,
-                    .b = b,
-                    .ssm_a = ssm_a,
-                    .dt_bias = dt_bias,
-                    .ssm_norm = ssm_norm,
-                    .rms_eps = 1e-6,
-                    .state = state,
-                    .o_out = o[t * vd ..][0..vd],
-                });
-            }
-
-            try std.testing.expectEqualSlices(
-                u8,
-                std.mem.sliceAsBytes(o_ref),
-                std.mem.sliceAsBytes(o),
-            );
-            try std.testing.expectEqualSlices(
-                u8,
-                std.mem.sliceAsBytes(state_ref),
-                std.mem.sliceAsBytes(state),
-            );
-            try std.testing.expectEqualSlices(
-                u8,
-                std.mem.sliceAsBytes(conv_ref),
-                std.mem.sliceAsBytes(conv),
-            );
-            try std.testing.expectEqualSlices(
-                u8,
-                std.mem.sliceAsBytes(qkv_ref),
-                std.mem.sliceAsBytes(qkv),
-            );
-        }
-    }
-}
-
 test "elementwiseUnitLen: about four units per thread, a multiple of 16" {
     try std.testing.expectEqual(@as(usize, 16), elementwiseUnitLen(1, 1));
     try std.testing.expectEqual(@as(usize, 16), elementwiseUnitLen(64, 1));
@@ -1201,4 +1166,554 @@ fn checkSwigluFanout(comptime Kernels: type) !void {
             );
         }
     }
+}
+
+/// The row counts and the thread counts of the step fan-out tests. The last count is the CPU
+/// prefill chunk of `run` and `bench-model`.
+const step_case_rows = [_]usize{ 1, 2, 5, limits.cpu_prefill_chunk };
+const step_case_threads = [_]u32{ 1, 2, 3, 4, 16 };
+
+const AttnShape = @import("../ops/attention_ref.zig").AttnShape;
+
+/// The slot of row `i` in a step of two slots: every third row is slot 1. The runner keeps the
+/// rows of one slot adjacent. These rows mix the slots, a stricter case for the disjoint writes.
+fn stepCaseSlot(i: usize) u32 {
+    return if (i % 3 == 1) 1 else 0;
+}
+
+test "attentionRowsTyped: one fork per step gives the bits of the serial row kernel" {
+    const naive = @import("../ops/naive.zig");
+    const simd_pf = @import("../ops/simd_pf.zig");
+    const tile = limits.attn_cpu_tile;
+    const shapes = [_]AttnShape{
+        .{ .n_heads = 4, .n_kv_heads = 2, .head_dim = 8 },
+        .{ .n_heads = 6, .n_kv_heads = 3, .head_dim = 16 },
+    };
+    // At the prefill chunk, slot 0 crosses from 1 part to 2, and slot 1 from 3 parts to 4.
+    const starts = [2]u32{ tile - 20, 3 * tile - 10 };
+    const chunk = limits.cpu_prefill_chunk;
+    const slot1_rows = (chunk + 1) / 3;
+    try std.testing.expectEqual(@as(u32, 1), attn_cpu.partCount(starts[0] + 1));
+    try std.testing.expectEqual(@as(u32, 2), attn_cpu.partCount(starts[0] + chunk - slot1_rows));
+    try std.testing.expectEqual(@as(u32, 3), attn_cpu.partCount(starts[1] + 1));
+    try std.testing.expectEqual(@as(u32, 4), attn_cpu.partCount(starts[1] + slot1_rows));
+    var prng = std.Random.DefaultPrng.init(0xA770_57E9);
+    const r = prng.random();
+    inline for (.{ naive, simd_pf }) |Kernels| {
+        inline for (.{ f32, f16 }) |E| {
+            for (shapes) |s| {
+                for (step_case_rows) |n_rows| {
+                    const threads = &step_case_threads;
+                    try expectAttentionRowsMatch(E, Kernels, r, s, starts, n_rows, threads);
+                }
+            }
+        }
+    }
+}
+
+test "attentionRowsTyped: the widest serve step gives the bits of the serial row kernel" {
+    const simd_pf = @import("../ops/simd_pf.zig");
+    // A small shape at shallow depths keeps the widest step short.
+    const s: AttnShape = .{ .n_heads = 2, .n_kv_heads = 1, .head_dim = 8 };
+    var prng = std.Random.DefaultPrng.init(0xA770_0108);
+    const r = prng.random();
+    try expectAttentionRowsMatch(f32, simd_pf, r, s, .{ 0, 0 }, limits.step_rows_max, &.{ 1, 4 });
+}
+
+/// Check that `attentionRowsTyped` over a step of `n_rows` rows of two slots gives the bits of
+/// `Kernels.attentionRowTyped` row by row, at each thread count. Slot `j` starts at the depth
+/// `starts[j]`, and its rows are in time order.
+fn expectAttentionRowsMatch(
+    comptime E: type,
+    comptime Kernels: type,
+    r: std.Random,
+    s: AttnShape,
+    starts: [2]u32,
+    n_rows: usize,
+    thread_counts: []const u32,
+) !void {
+    const gpa = std.testing.allocator;
+    const kv_row = s.n_kv_heads * s.head_dim;
+    const width = s.n_heads * s.head_dim;
+
+    // Fill the KV of both slots and the q of every row.
+    var kv: [2][2][]E = undefined;
+    for (&kv, starts) |*slot, start| {
+        for (slot) |*buf| {
+            buf.* = try gpa.alloc(E, (start + n_rows) * kv_row);
+            for (buf.*) |*x| {
+                x.* = @floatCast(r.float(f32) * 2.0 - 1.0);
+            }
+        }
+    }
+    defer for (kv) |slot| {
+        for (slot) |buf| {
+            gpa.free(buf);
+        }
+    };
+
+    const q = try gpa.alloc(f32, n_rows * width);
+    defer gpa.free(q);
+
+    for (q) |*x| {
+        x.* = r.float(f32) * 2.0 - 1.0;
+    }
+
+    // Lay out the rows: each slot in time order, the slots mixed.
+    const out_want = try gpa.alloc(f32, n_rows * width);
+    defer gpa.free(out_want);
+
+    const out_got = try gpa.alloc(f32, n_rows * width);
+    defer gpa.free(out_got);
+
+    const rows = try gpa.alloc(AttentionRow(E), n_rows);
+    defer gpa.free(rows);
+
+    var next_pos = starts;
+    for (rows, 0..) |*row, i| {
+        const slot = stepCaseSlot(i);
+        const t_len = next_pos[slot] + 1;
+        next_pos[slot] += 1;
+        row.* = .{
+            .q = q[i * width ..][0..width],
+            .k_cache = kv[slot][0][0 .. t_len * kv_row],
+            .v_cache = kv[slot][1][0 .. t_len * kv_row],
+            .t_len = t_len,
+            .out = out_got[i * width ..][0..width],
+        };
+    }
+
+    // Run the serial row kernel for the expected bits.
+    const row_parts_len = attn_cpu.partialLen(@intCast(s.n_heads), @intCast(s.head_dim));
+    const parts = try gpa.alloc(f32, n_rows * row_parts_len);
+    defer gpa.free(parts);
+
+    for (rows, 0..) |row, i| {
+        Kernels.attentionRowTyped(
+            E,
+            row.q,
+            s.n_heads,
+            s.head_dim,
+            row.k_cache,
+            row.v_cache,
+            s.n_kv_heads,
+            row.t_len,
+            parts[0..row_parts_len],
+            out_want[i * width ..][0..width],
+        );
+    }
+
+    // Run the step fork at each thread count over stale records.
+    for (thread_counts) |n_threads| {
+        for (parts) |*x| {
+            x.* = r.float(f32) * 200.0 - 100.0;
+        }
+
+        @memset(out_got, std.math.nan(f32));
+        var pool: Pool = undefined;
+        try pool.init(std.testing.io, n_threads, 50_000);
+        defer pool.deinit();
+
+        const policy: Policy = .{ .n_threads = n_threads, .min_parallel_flops = 0 };
+        const nh = s.n_heads;
+        attentionRowsTyped(E, Kernels, &pool, policy, rows, nh, s.head_dim, s.n_kv_heads, parts);
+        try std.testing.expectEqualSlices(
+            u8,
+            std.mem.sliceAsBytes(out_want),
+            std.mem.sliceAsBytes(out_got),
+        );
+    }
+}
+
+test "gdnRows: one fork per step gives the bits of the serial step" {
+    const naive = @import("../ops/naive.zig");
+    const simd_pf = @import("../ops/simd_pf.zig");
+    const gdn_simd = @import("../ops/gdn_simd.zig");
+    const simd = @import("../ops/simd.zig");
+    // Both SIMD backends run one GDN unit, so the simd_pf run covers simd too.
+    comptime std.debug.assert(simd.gdnStepKeyHead == simd_pf.gdnStepKeyHead);
+    // The 2B, the 9B, and a small shape of 2 key heads. At 3 threads the key heads split unevenly.
+    const small: gdn.Dims = .{ .n_k_heads = 2, .n_v_heads = 6, .head_dim = 40, .conv_kernel = 4 };
+    const qwen_2b: gdn.Dims = .{
+        .n_k_heads = 16,
+        .n_v_heads = 16,
+        .head_dim = 128,
+        .conv_kernel = 4,
+    };
+    const qwen_9b: gdn.Dims = .{
+        .n_k_heads = 16,
+        .n_v_heads = 32,
+        .head_dim = 128,
+        .conv_kernel = 4,
+    };
+    var prng = std.Random.DefaultPrng.init(0x6D17_57E9);
+    const r = prng.random();
+    // Each backend with the serial step of its own arithmetic.
+    inline for (.{ .{ naive, gdn.reference }, .{ simd_pf, gdn_simd.kernels } }) |set| {
+        for (step_case_rows) |n_rows| {
+            try expectGdnRowsMatch(set[0], set[1], r, small, n_rows, &step_case_threads);
+        }
+        // The large shapes at a few rows keep the test short.
+        try expectGdnRowsMatch(set[0], set[1], r, qwen_2b, 5, &step_case_threads);
+        try expectGdnRowsMatch(set[0], set[1], r, qwen_9b, 2, &step_case_threads);
+        try expectGdnRowsMatch(set[0], set[1], r, small, limits.step_rows_max, &.{ 1, 4 });
+    }
+}
+
+/// Check that `gdnRows` over `Kernels` and a step of `n_rows` rows of two slots gives the bits of
+/// `Serial.step` row by row, at each thread count: the readouts, the states, the conv rings, and
+/// the qkv stripes.
+fn expectGdnRowsMatch(
+    comptime Kernels: type,
+    comptime Serial: type,
+    r: std.Random,
+    d: gdn.Dims,
+    n_rows: usize,
+    thread_counts: []const u32,
+) !void {
+    const gpa = std.testing.allocator;
+    const cd = d.convDim();
+    const nv = d.n_v_heads;
+
+    // Draw the stripes of every row, the weights, and the start slabs of both slots.
+    const stripes0 = try gpa.alloc(f32, n_rows * gdnStripeLen(d));
+    defer gpa.free(stripes0);
+
+    for (stripes0) |*x| {
+        x.* = r.float(f32) * 2.0 - 1.0;
+    }
+
+    const weights = try gpa.alloc(f32, gdnWeightsLen(d));
+    defer gpa.free(weights);
+
+    for (weights) |*x| {
+        x.* = r.float(f32) * 2.0 - 1.0;
+    }
+
+    const conv_w = weights[0 .. d.conv_kernel * cd];
+    const ssm_a = weights[d.conv_kernel * cd ..][0..nv];
+    for (ssm_a) |*x| {
+        x.* = -@abs(x.*) - 0.1;
+    }
+
+    const w: GdnWeights = .{
+        .conv_w = conv_w,
+        .ssm_a = ssm_a,
+        .dt_bias = weights[d.conv_kernel * cd + nv ..][0..nv],
+        .ssm_norm = weights[d.conv_kernel * cd + 2 * nv ..][0..d.head_dim],
+        .rms_eps = 1e-6,
+    };
+    const slabs0 = try gpa.alloc(f32, 2 * gdnSlabLen(d));
+    defer gpa.free(slabs0);
+
+    for (slabs0) |*x| {
+        x.* = (r.float(f32) - 0.5) * 0.2;
+    }
+
+    // Each run works on copies: the stripes, the slabs, and the readouts.
+    const want = try gpa.alloc(f32, gdnCaseLen(d, n_rows));
+    defer gpa.free(want);
+
+    const got = try gpa.alloc(f32, want.len);
+    defer gpa.free(got);
+
+    // Run the serial step of the backend row by row for the expected bits.
+    {
+        const rows = try gdnCaseRows(gpa, d, want, stripes0, slabs0, n_rows);
+        defer gpa.free(rows);
+
+        for (rows) |row| {
+            Serial.step(
+                d,
+                row.qkv,
+                row.z,
+                row.a,
+                row.b,
+                w.conv_w,
+                w.ssm_a,
+                w.dt_bias,
+                w.ssm_norm,
+                w.rms_eps,
+                row.state,
+                row.conv_state,
+                row.o_out,
+            );
+        }
+    }
+
+    // Run the step fork at each thread count and compare every buffer.
+    for (thread_counts) |n_threads| {
+        var pool: Pool = undefined;
+        try pool.init(std.testing.io, n_threads, 50_000);
+        defer pool.deinit();
+
+        const policy: Policy = .{ .n_threads = n_threads, .min_parallel_flops = 0 };
+        const rows = try gdnCaseRows(gpa, d, got, stripes0, slabs0, n_rows);
+        defer gpa.free(rows);
+
+        gdnRows(Kernels, &pool, policy, d, rows, w);
+        try std.testing.expectEqualSlices(
+            u8,
+            std.mem.sliceAsBytes(want),
+            std.mem.sliceAsBytes(got),
+        );
+    }
+}
+
+test "gdnRows: one participant steps each key head over the rows in row order" {
+    if (builtin.single_threaded) return error.SkipZigTest;
+
+    const d: gdn.Dims = .{ .n_k_heads = 2, .n_v_heads = 6, .head_dim = 40, .conv_kernel = 4 };
+    const gpa = std.testing.allocator;
+    var prng = std.Random.DefaultPrng.init(0x6D17_0D3E);
+    const r = prng.random();
+    for ([_]usize{ 2, 5, 64 }) |n_rows| {
+        const stripes0 = try gpa.alloc(f32, n_rows * gdnStripeLen(d));
+        defer gpa.free(stripes0);
+
+        const slabs0 = try gpa.alloc(f32, 2 * gdnSlabLen(d));
+        defer gpa.free(slabs0);
+
+        const weights = try gpa.alloc(f32, gdnWeightsLen(d));
+        defer gpa.free(weights);
+
+        for ([_][]f32{ stripes0, slabs0, weights }) |buf| {
+            for (buf) |*x| {
+                x.* = (r.float(f32) - 0.5) * 0.2;
+            }
+        }
+
+        const cw_len = d.conv_kernel * d.convDim();
+        for (weights[cw_len..][0..d.n_v_heads]) |*x| {
+            x.* = -@abs(x.*) - 0.1;
+        }
+
+        const w: GdnWeights = .{
+            .conv_w = weights[0..cw_len],
+            .ssm_a = weights[cw_len..][0..d.n_v_heads],
+            .dt_bias = weights[cw_len + d.n_v_heads ..][0..d.n_v_heads],
+            .ssm_norm = weights[cw_len + 2 * d.n_v_heads ..][0..d.head_dim],
+            .rms_eps = 1e-6,
+        };
+        const buf = try gpa.alloc(f32, gdnCaseLen(d, n_rows));
+        defer gpa.free(buf);
+
+        for ([_]u32{ 2, 4, 16 }) |n_threads| {
+            var pool: Pool = undefined;
+            try pool.init(std.testing.io, n_threads, 50_000);
+            defer pool.deinit();
+
+            const rows = try gdnCaseRows(gpa, d, buf, stripes0, slabs0, n_rows);
+            defer gpa.free(rows);
+
+            GdnOrderKernels.reset(rows[0].o_out.ptr, d.valueDim());
+            const policy: Policy = .{ .n_threads = n_threads, .min_parallel_flops = 0 };
+            gdnRows(GdnOrderKernels, &pool, policy, d, rows, w);
+            try std.testing.expect(!GdnOrderKernels.gate_timed_out.load(.acquire));
+            try std.testing.expect(!GdnOrderKernels.out_of_order.load(.acquire));
+            for (GdnOrderKernels.next_row[0..d.n_k_heads]) |*next| {
+                try std.testing.expectEqual(@as(u32, @intCast(n_rows)), next.load(.acquire));
+            }
+        }
+    }
+}
+
+/// The naive key head with a check that each key head steps the rows one at a time, in row order.
+/// The pool runs unit 0 on the caller and unit 1 on a worker. Row 0 of key head 0 waits until a
+/// later row starts. Key head 1 ends the wait, but a unit split over rows ends it with a later row
+/// of key head 0, out of order.
+const GdnOrderKernels = struct {
+    const kh_max = 2;
+    /// The bound of the wait of row 0. Each yield lets another participant run.
+    const gate_yields_max = 1 << 22;
+
+    var o_base: usize = 0;
+    var o_stride: usize = 0;
+    var next_row: [kh_max]std.atomic.Value(u32) = @splat(.init(0));
+    var later_started: std.atomic.Value(bool) = .init(false);
+    var out_of_order: std.atomic.Value(bool) = .init(false);
+    var gate_timed_out: std.atomic.Value(bool) = .init(false);
+
+    fn reset(o_first: [*]const f32, value_dim: usize) void {
+        o_base = @intFromPtr(o_first);
+        o_stride = value_dim * @sizeOf(f32);
+        for (&next_row) |*next| {
+            next.store(0, .release);
+        }
+
+        later_started.store(false, .release);
+        out_of_order.store(false, .release);
+        gate_timed_out.store(false, .release);
+    }
+
+    pub fn gdnStepKeyHead(
+        d: gdn.Dims,
+        qkv: []f32,
+        conv_w: []const f32,
+        conv_state: []f32,
+        heads: gdn.Heads,
+        kh: usize,
+    ) void {
+        std.debug.assert(kh < kh_max);
+        const row: u32 = @intCast((@intFromPtr(heads.o_out.ptr) - o_base) / o_stride);
+        if (next_row[kh].load(.acquire) != row) {
+            out_of_order.store(true, .release);
+        }
+
+        if (row >= 1) {
+            later_started.store(true, .release);
+        }
+
+        if (kh == 0 and row == 0) {
+            for (0..gate_yields_max) |_| {
+                if (later_started.load(.acquire)) break;
+                std.Thread.yield() catch {};
+            } else gate_timed_out.store(true, .release);
+        }
+
+        gdn.stepKeyHead(d, qkv, conv_w, conv_state, heads, kh);
+        next_row[kh].store(row + 1, .release);
+    }
+};
+
+test "attentionRowsTyped and gdnRows: the floor counts the FLOPs of the whole step" {
+    const naive = @import("../ops/naive.zig");
+    const gpa = std.testing.allocator;
+    var pool: Pool = undefined;
+    try pool.init(std.testing.io, 4, 50_000);
+    defer pool.deinit();
+
+    // Three attention rows of one slot at depths 1, 2, and 3. The step holds
+    // 4 * n_heads * head_dim * (1 + 2 + 3) FLOPs, and each row alone holds less.
+    const s: AttnShape = .{ .n_heads = 4, .n_kv_heads = 2, .head_dim = 8 };
+    const width = s.n_heads * s.head_dim;
+    const kv = try gpa.alloc(f32, 2 * 3 * s.n_kv_heads * s.head_dim);
+    defer gpa.free(kv);
+
+    const io_buf = try gpa.alloc(f32, 2 * 3 * width);
+    defer gpa.free(io_buf);
+
+    const row_parts_len = attn_cpu.partialLen(@intCast(s.n_heads), @intCast(s.head_dim));
+    const parts = try gpa.alloc(f32, 3 * row_parts_len);
+    defer gpa.free(parts);
+
+    @memset(kv, 0.25);
+    @memset(io_buf, 0.5);
+    const kv_len = 3 * s.n_kv_heads * s.head_dim;
+    var rows: [3]AttentionRow(f32) = undefined;
+    for (&rows, 0..) |*row, i| {
+        row.* = .{
+            .q = io_buf[i * width ..][0..width],
+            .k_cache = kv[0..kv_len],
+            .v_cache = kv[kv_len..],
+            .t_len = @intCast(i + 1),
+            .out = io_buf[(3 + i) * width ..][0..width],
+        };
+    }
+
+    const attn_flops: u64 = 4 * s.n_heads * s.head_dim * (1 + 2 + 3);
+    for ([_]u64{ attn_flops, attn_flops + 1 }, [_]u32{ 1, 0 }) |floor, forks| {
+        const policy: Policy = .{ .n_threads = 4, .min_parallel_flops = floor };
+        const seq = pool.seq;
+        attentionRowsTyped(f32, naive, &pool, policy, &rows, s.n_heads, s.head_dim, 2, parts);
+        try std.testing.expectEqual(forks, pool.seq - seq);
+    }
+
+    // Three GDN rows. The step holds 7 * n_v_heads * head_dim^2 * 3 FLOPs.
+    const d: gdn.Dims = .{ .n_k_heads = 2, .n_v_heads = 6, .head_dim = 40, .conv_kernel = 4 };
+    const stripes0 = try gpa.alloc(f32, 3 * gdnStripeLen(d));
+    defer gpa.free(stripes0);
+
+    const slabs0 = try gpa.alloc(f32, 2 * gdnSlabLen(d));
+    defer gpa.free(slabs0);
+
+    const weights = try gpa.alloc(f32, gdnWeightsLen(d));
+    defer gpa.free(weights);
+
+    @memset(stripes0, 0.1);
+    @memset(slabs0, 0.01);
+    @memset(weights, -0.2);
+    const cw_len = d.conv_kernel * d.convDim();
+    const w: GdnWeights = .{
+        .conv_w = weights[0..cw_len],
+        .ssm_a = weights[cw_len..][0..d.n_v_heads],
+        .dt_bias = weights[cw_len + d.n_v_heads ..][0..d.n_v_heads],
+        .ssm_norm = weights[cw_len + 2 * d.n_v_heads ..][0..d.head_dim],
+        .rms_eps = 1e-6,
+    };
+    const buf = try gpa.alloc(f32, gdnCaseLen(d, 3));
+    defer gpa.free(buf);
+
+    const gdn_flops: u64 = 7 * d.n_v_heads * d.head_dim * d.head_dim * 3;
+    for ([_]u64{ gdn_flops, gdn_flops + 1 }, [_]u32{ 1, 0 }) |floor, forks| {
+        const policy: Policy = .{ .n_threads = 4, .min_parallel_flops = floor };
+        const gdn_rows = try gdnCaseRows(gpa, d, buf, stripes0, slabs0, 3);
+        defer gpa.free(gdn_rows);
+
+        const seq = pool.seq;
+        gdnRows(naive, &pool, policy, d, gdn_rows, w);
+        try std.testing.expectEqual(forks, pool.seq - seq);
+    }
+}
+
+/// The f32s of the weights of one GDN layer: the conv, `ssm_a`, `dt_bias`, and `ssm_norm`.
+fn gdnWeightsLen(d: gdn.Dims) usize {
+    return d.conv_kernel * d.convDim() + 2 * d.n_v_heads + d.head_dim;
+}
+
+/// The f32s of the stripes of one GDN row: qkv, z, alpha, and beta.
+fn gdnStripeLen(d: gdn.Dims) usize {
+    return d.convDim() + d.valueDim() + 2 * d.n_v_heads;
+}
+
+/// The f32s of the slabs of one slot: the state and the conv ring.
+fn gdnSlabLen(d: gdn.Dims) usize {
+    return d.stateLen() + d.convStateLen();
+}
+
+/// The f32s of one GDN case of `n_rows` rows: the stripes, the slabs of two slots, the readouts.
+fn gdnCaseLen(d: gdn.Dims, n_rows: usize) usize {
+    return n_rows * gdnStripeLen(d) + 2 * gdnSlabLen(d) + n_rows * d.valueDim();
+}
+
+/// Copy the start stripes and slabs into `buf`, fill the readouts with NaN, and carve the rows of
+/// a step of two slots. The caller frees the rows.
+fn gdnCaseRows(
+    gpa: std.mem.Allocator,
+    d: gdn.Dims,
+    buf: []f32,
+    stripes0: []const f32,
+    slabs0: []const f32,
+    n_rows: usize,
+) ![]GdnRow {
+    const cd = d.convDim();
+    const vd = d.valueDim();
+    const nv = d.n_v_heads;
+    const stripe_len = gdnStripeLen(d);
+    const slab_len = gdnSlabLen(d);
+    std.debug.assert(stripes0.len == n_rows * stripe_len);
+    std.debug.assert(slabs0.len == 2 * slab_len);
+    std.debug.assert(buf.len == gdnCaseLen(d, n_rows));
+
+    @memcpy(buf[0..stripes0.len], stripes0);
+    @memcpy(buf[stripes0.len..][0..slabs0.len], slabs0);
+    const slabs = buf[stripes0.len..][0..slabs0.len];
+    const outs = buf[stripes0.len + slabs0.len ..];
+    @memset(outs, std.math.nan(f32));
+
+    const rows = try gpa.alloc(GdnRow, n_rows);
+    for (rows, 0..) |*row, i| {
+        const stripe = buf[i * stripe_len ..][0..stripe_len];
+        const slab = slabs[stepCaseSlot(i) * slab_len ..][0..slab_len];
+        row.* = .{
+            .qkv = stripe[0..cd],
+            .z = stripe[cd..][0..vd],
+            .a = stripe[cd + vd ..][0..nv],
+            .b = stripe[cd + vd + nv ..][0..nv],
+            .state = slab[0..d.stateLen()],
+            .conv_state = slab[d.stateLen()..],
+            .o_out = outs[i * vd ..][0..vd],
+        };
+    }
+    return rows;
 }

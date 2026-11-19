@@ -171,6 +171,11 @@ pub const max_vram_slots: u32 = 128;
 /// width of the runner at boot.
 pub const max_prefill_chunk: u32 = 256;
 
+/// Ceiling on the rows of one CPU step: the decode slots and the widest prefill chunk. The CPU
+/// runner asserts at init that its row scratch fits. A comptime assert of `cpu_layer_kernels.zig`
+/// bounds the bytes of the stack row arrays that it sizes.
+pub const step_rows_max: u32 = max_batch + max_prefill_chunk;
+
 /// Rows of one prompt chunk on the CPU runners in `run` and `bench-model`. One weight read serves
 /// every row, and only the last row runs the lm_head. The SIMD batch kernel reads each input row
 /// once per 4-output weight group. So a wide chunk leaves the L2 cache. Serve sizes its own chunk.
@@ -717,6 +722,8 @@ comptime {
     // holds `max_prefill_chunk` rows.
     std.debug.assert(cpu_prefill_chunk >= 1);
     std.debug.assert(cpu_prefill_chunk <= max_prefill_chunk);
+    // A serve step holds every decode slot and a full prefill chunk.
+    std.debug.assert(step_rows_max >= max_batch + max_prefill_chunk);
     // The epoch word of the pool holds the participant count in 8 bits.
     std.debug.assert(max_threads >= 2);
     std.debug.assert(max_threads < 0xff);

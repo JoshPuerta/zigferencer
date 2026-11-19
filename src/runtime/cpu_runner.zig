@@ -38,8 +38,9 @@
 //! Scratch. Init sizes one buffer for each activation of the family at `max_rows` rows, from
 //! `Family.activationWidth`. Row i of a step owns the i-th stripe of each. `max_rows` is decoupled
 //! from `n_slots`, so a prefill chunk can be wider than the session count, and it is never
-//! narrower. One row of attention part records serves every row, because the rows attend one at a
-//! time. The per-op GPU attention keeps its own records, so that build holds none.
+//! narrower. Each of the `max_rows` rows owns its attention part records, because the rows of a
+//! step attend in one fork. The init log line gives their bytes. The per-op GPU attention keeps its
+//! own records, so that build holds none.
 //!
 //! Compact logits. Only the `want_logits` rows get an lm_head: the decode rows and the last row of
 //! the last chunk of a prompt. They number at most `n_slots`, so `logits` has `n_slots` rows. The
@@ -238,7 +239,7 @@ pub fn CpuRunner(comptime Family: type) type {
 
             // The row scratch holds the widest stepBatch, and never fewer rows than the slots.
             const rows_cap: u32 = @max(n_slots, options.max_rows);
-            assert(rows_cap <= limits.max_batch + limits.max_prefill_chunk);
+            assert(rows_cap <= limits.step_rows_max);
 
             // Find the weights that no layer owns, then the weights of each layer.
             const refs = loaded.tensors;
@@ -283,7 +284,7 @@ pub fn CpuRunner(comptime Family: type) type {
                 .gdn_state = gdn_state,
                 .gdn_conv_state = gdn_conv_state,
                 .scratch = try allocScratch(arena, &widths, rows_cap),
-                .attn_parts = try arena.alloc(f32, attnPartsLen(&c)),
+                .attn_parts = try arena.alloc(f32, attnPartsLen(&c, rows_cap)),
                 .logits = try arena.alloc(f32, logits_len),
             };
             runner.logInit(n_kv);
@@ -708,20 +709,24 @@ pub fn CpuRunner(comptime Family: type) type {
             return factors;
         }
 
-        /// The elements of the attention part records of one row. The per-op GPU attention keeps
-        /// its own records.
-        fn attnPartsLen(card: *const loader.ModelCard) usize {
+        /// The elements of the attention part records of `rows` rows. The rows of a step attend at
+        /// the same time, so each row owns its records. The per-op GPU attention keeps its own
+        /// records.
+        fn attnPartsLen(card: *const loader.ModelCard, rows: u32) usize {
+            assert(rows >= 1);
             if (build_options.use_vulkan_ops) return 0;
 
-            return attn_cpu.partialLen(card.n_heads, card.head_dim);
+            return attn_cpu.partialLen(card.n_heads, card.head_dim) * rows;
         }
 
         fn logInit(self: *const Self, n_kv: u32) void {
             const row_bytes = self.kv_dtype.rowBytes(self.card.n_kv_heads * self.card.head_dim);
             const kv_bytes: u64 = 2 * @as(u64, self.n_slots) * n_kv * self.max_seq * row_bytes;
+            const parts_bytes: u64 = @as(u64, self.attn_parts.len) * @sizeOf(f32);
             const head_word: []const u8 = if (self.output != null) "with" else "no";
             log.debug(
-                "init {t}: {d} layers ({d} kv), {s} head, {d} slots, max_seq {d}, kv {d:.0} MiB",
+                "init {t}: {d} layers ({d} kv), {s} head, {d} slots, max_seq {d}, " ++
+                    "kv {d:.0} MiB, attention parts {d:.1} MiB for {d} rows",
                 .{
                     Family.arch,
                     self.n_layers,
@@ -730,6 +735,8 @@ pub fn CpuRunner(comptime Family: type) type {
                     self.n_slots,
                     self.max_seq,
                     @as(f64, @floatFromInt(kv_bytes)) / (1024.0 * 1024.0),
+                    @as(f64, @floatFromInt(parts_bytes)) / (1024.0 * 1024.0),
+                    self.max_rows,
                 },
             );
         }
@@ -859,7 +866,7 @@ fn expectProfilePartition(comptime Family: type) !void {
     try std.testing.expect(prof.nsParallel() < prof.total());
 }
 
-test "pool joins: a layer forks per weight, per row of its stateful op, and once for swiglu" {
+test "pool joins: a layer forks per weight, once for its stateful op, and once for swiglu" {
     // A Debug build runs the forward too slowly for the unit run. The GPU per-op backend submits
     // the matmuls, the recurrent steps, and the attention rows without the pool.
     const skip = builtin.mode == .Debug or builtin.single_threaded or build_options.use_vulkan_ops;
@@ -903,23 +910,25 @@ fn expectPoolJoins(comptime Family: type) !void {
     // Count the epochs of a 7-row prefill chunk, then of one decode step.
     const seq_prompt = pool.seq;
     _ = try r.prefillBatch(&prompt, 0);
-    try std.testing.expectEqual(joinsOf(r.kv_index, n_prompt), pool.seq - seq_prompt);
+    try std.testing.expectEqual(joinsOf(r.kv_index), pool.seq - seq_prompt);
 
     const seq_decode = pool.seq;
     _ = try r.step(8, n_prompt);
-    try std.testing.expectEqual(joinsOf(r.kv_index, 1), pool.seq - seq_decode);
+    try std.testing.expectEqual(joinsOf(r.kv_index), pool.seq - seq_decode);
 }
 
-/// The fork-joins of one step of `n` rows with one logits row: one per weight of each layer, one
-/// per row of the attention or the recurrence of each layer, one for the `swiglu` of each layer,
-/// and one for the lm_head.
-fn joinsOf(kv_index: []const ?u32, n: u32) u32 {
+/// The fork-joins of one step with one logits row: one per weight of each layer, one for the
+/// attention or the recurrence of each layer, one for its `swiglu`, and one for the lm_head. At
+/// `min_parallel_flops = 0`, as this test sets it, each pooled op forks once per step.
+fn joinsOf(kv_index: []const ?u32) u32 {
+    assert(kv_index.len >= 1);
+
     var joins: u32 = 1;
     for (kv_index) |index| {
         // A KV layer of either family projects q, k, v, o, gate, up, and down. A GDN layer
         // projects qkv, z, alpha, beta, out, gate, up, and down.
         const weights: u32 = if (index != null) 7 else 8;
-        joins += weights + n + 1;
+        joins += weights + 2;
     }
 
     return joins;

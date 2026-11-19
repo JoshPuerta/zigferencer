@@ -122,20 +122,23 @@ fn AtnCpu(comptime E: type, comptime Kernels: type) type {
 
         pub fn run(self: @This()) !void {
             if (self.pool) |pool| {
-                zigferencer.parallel.attentionTyped(
+                const rows = [1]zigferencer.parallel.AttentionRow(E){.{
+                    .q = self.q,
+                    .k_cache = self.k_cache,
+                    .v_cache = self.v_cache,
+                    .t_len = self.t_len,
+                    .out = self.out,
+                }};
+                zigferencer.parallel.attentionRowsTyped(
                     E,
                     Kernels,
                     pool,
                     bench_threaded,
-                    self.q,
+                    &rows,
                     self.n_heads,
                     self.head_dim,
-                    self.k_cache,
-                    self.v_cache,
                     self.n_kv_heads,
-                    self.t_len,
                     self.parts,
-                    self.out,
                 );
             } else {
                 Kernels.attentionRowTyped(

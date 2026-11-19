@@ -314,21 +314,15 @@ pub fn expectFanOutMatchesRow(
             defer pool.deinit();
 
             const fanout: parallel.Policy = .{ .n_threads = n_threads, .min_parallel_flops = 0 };
-            parallel.attentionTyped(
-                E,
-                Kernels,
-                &pool,
-                fanout,
-                q,
-                nh,
-                hd,
-                k,
-                v,
-                shape.n_kv_heads,
-                t_len,
-                parts,
-                out,
-            );
+            const rows = [1]parallel.AttentionRow(E){.{
+                .q = q,
+                .k_cache = k,
+                .v_cache = v,
+                .t_len = @intCast(t_len),
+                .out = out,
+            }};
+            const nkv = shape.n_kv_heads;
+            parallel.attentionRowsTyped(E, Kernels, &pool, fanout, &rows, nh, hd, nkv, parts);
             try std.testing.expectEqualSlices(
                 u8,
                 std.mem.sliceAsBytes(out_row),

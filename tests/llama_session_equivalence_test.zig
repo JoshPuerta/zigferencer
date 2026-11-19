@@ -25,7 +25,7 @@
 //! otherwise.
 //!
 //! Forced parallelism. `min_parallel_flops = 0` spreads the output-parallel matmuls and the
-//! attention units (parallel.attentionTyped) across `n_threads`. The matmul partition keeps the
+//! attention units (parallel.attentionRowsTyped) across `n_threads`. The matmul partition keeps the
 //! reduction order of every output. An attention unit writes the same records on any worker, and
 //! the merge adds them in part order. So multi-slot and multi-thread output is bit-exact. This pins
 //! the determinism of the parallel paths that the serve runner uses.

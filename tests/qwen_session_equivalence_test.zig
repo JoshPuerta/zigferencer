@@ -23,9 +23,9 @@
 //!
 //! Exactness. The token streams and the logits-row hashes must equal pass A exactly. Pass G sets
 //! `min_parallel_flops = 0`, which spreads the output-parallel matmuls and the attention units
-//! (parallel.attentionTyped) across 4 threads, even at short rows. The matmul partition keeps the
-//! reduction order of every output. An attention unit writes the same records on any worker, and
-//! the merge adds them in part order.
+//! (parallel.attentionRowsTyped) across 4 threads, even at short rows. The matmul partition keeps
+//! the reduction order of every output. An attention unit writes the same records on any worker,
+//! and the merge adds them in part order.
 //!
 //! Compact logits. A single-session feed lands its final row at logits[0]. In an `advance` tick the
 //! decode row of the front session follows the final row of the chunk only when that row took an

@@ -657,7 +657,7 @@ A dispatch takes no lock and allocates nothing.
 | --- | --- |
 | Matrix product | A chunk of outputs, a multiple of 4, about four chunks for each participant. |
 | Attention | One KV head group over one part of the row. |
-| Gated-DeltaNet | One key head with its value heads. No serial part runs on the caller. |
+| Gated-DeltaNet | One key head with its value heads, over every row of the step, in row order. No serial part runs on the caller. |
 | `swiglu` | A range of elements of the flat gate buffer, about four ranges for each participant. |
 
 The result of a unit does not depend on the thread that runs it. A chunk of outputs is one
@@ -1300,8 +1300,8 @@ CpuRunner(llama_layer).stepBatch(rows)                     runtime/cpu_runner.zi
     CpuLayerKernels.project (q, k, v)                      -> linear_dispatch.linearBatchDispatch -> pool.run -> ops.linearF32Q80Batch
     CpuLayerKernels.rope                                   -> ops.ropeHeads, once per row
     CpuLayerKernels.kvCommit                               writes K and V into the slot, narrowed to the KV dtype
-    CpuLayerKernels.attention                              -> parallel.attentionTyped -> ops.attentionPartTyped for each KV head group and part
-                                                           -> ops.attentionMerge
+    CpuLayerKernels.attention                              -> parallel.attentionRowsTyped -> ops.attentionPartTyped, one fork for the step
+                                                           -> ops.attentionMerge, once per row
     CpuLayerKernels.project (out), .residual               -> linearBatchDispatch, ops.residualAdd
     CpuLayerKernels.norm, .project (gate, up)              -> ops.rmsnorm, linearBatchDispatch
     CpuLayerKernels.swiglu, .project (down), .residual     -> parallel.swiglu -> ops.swiglu, linearBatchDispatch, ops.residualAdd
