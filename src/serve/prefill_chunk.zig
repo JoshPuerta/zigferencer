@@ -20,6 +20,12 @@ const prop = @import("../core/utils/prop.zig");
 /// The CPU runners hold `limits.cpu_prefill_chunk` prompt rows per pass.
 pub const cpu_rule: Rule = .{ .derived = limits.cpu_prefill_chunk };
 
+/// The refusal text of `--prefill-chunk` for serve and `bench-model`: one range, one source.
+pub const flag_range_text = std.fmt.comptimePrint(
+    "--prefill-chunk must be in 0..{d}",
+    .{limits.max_prefill_chunk},
+);
+
 // -- types ------------------------------------------------------------------
 
 pub const Rule = union(enum) {
@@ -32,6 +38,11 @@ pub const Rule = union(enum) {
 };
 
 // -- api --------------------------------------------------------------------
+
+/// True when the `--prefill-chunk` value is unset or in `0..limits.max_prefill_chunk`.
+pub fn flagInRange(flag: ?u32) bool {
+    return (flag orelse 0) <= limits.max_prefill_chunk;
+}
 
 /// Map the `--prefill-chunk` value to a rule. Unset selects `derived` with the
 /// row width of the runner. Zero selects `spare_rows`.

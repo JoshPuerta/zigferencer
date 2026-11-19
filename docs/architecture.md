@@ -613,7 +613,9 @@ and used for a few floating-point operations, so the memory bandwidth limits the
 speed, not the arithmetic. More threads help only until they fill the memory
 bandwidth. Prefill feeds a chunk of prompt rows through one step. One read of a
 weight then serves every row of the chunk, so prefill gains from more threads for
-longer. `run` and `bench-model` prefill in chunks of `limits.cpu_prefill_chunk` rows.
+longer. `run` prefills in chunks of `limits.cpu_prefill_chunk` rows. `bench-model`
+takes the chunk from `--prefill-chunk`, and the default is the same limit. Only
+the last chunk of a prompt runs the final norm and the `lm_head`.
 
 ### The pool
 

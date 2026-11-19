@@ -42,8 +42,9 @@
 //! time. The per-op GPU attention keeps its own records, so that build holds none.
 //!
 //! Compact logits. Only the `want_logits` rows get an lm_head: the decode rows and the last row of
-//! a prefill chunk. They number at most `n_slots`, so `logits` has `n_slots` rows. The j-th such
-//! row lands at `logits[j * vocab_size ..]`, and `Sessions.advance` reads it at the same index.
+//! the last chunk of a prompt. They number at most `n_slots`, so `logits` has `n_slots` rows. The
+//! j-th such row lands at `logits[j * vocab_size ..]`, and `Sessions.advance` reads it at the same
+//! index.
 //!
 //! KV commit. The f32 scratch pipeline never learns the KV dtype. One conversion boundary narrows
 //! the finished K and V rows at commit. The compiler vectorizes the narrowing into
@@ -147,7 +148,7 @@ pub fn CpuRunner(comptime Family: type) type {
         n_slots: u32,
         /// Max rows in one `stepBatch`, the row-scratch capacity. At least `n_slots`.
         max_rows: u32,
-        /// Max prompt rows in one `prefillBatch`: `max_rows`, clamped to the stack row array.
+        /// Max prompt rows in one prefill chunk: `max_rows`, clamped to the stack row array.
         prefill_batch_max: u32,
         max_seq: u32,
 
@@ -312,12 +313,7 @@ pub fn CpuRunner(comptime Family: type) type {
         /// Consume `ids` on slot 0 at `pos..pos + ids.len` in one batched step, and return the
         /// logits of the last row only. Callers chunk a longer prompt by `prefill_batch_max`.
         pub fn prefillBatch(self: *Self, ids: []const u32, pos: u32) Error![]f32 {
-            assert(ids.len >= 1);
-
-            if (ids.len > self.prefill_batch_max) return error.TooManyRows;
-
-            var rows_buf: [limits.max_prefill_chunk]StepRow = undefined;
-            try self.stepBatch(step_row.chunkRows(&rows_buf, ids, pos));
+            try self.prefillRows(ids, pos, .last_row);
             const out = self.logits[0..self.card.vocab_size];
             assert(out.len == self.card.vocab_size);
             if (std.debug.runtime_safety) {
@@ -327,6 +323,34 @@ pub fn CpuRunner(comptime Family: type) type {
             }
 
             return out;
+        }
+
+        /// `prefillBatch` for a chunk that a later chunk of the same prompt follows. It skips the
+        /// final norm and the lm_head, and returns no logits to read. The debug finite check of the
+        /// logits covers the last chunk only.
+        pub fn prefillBatchNoLogits(self: *Self, ids: []const u32, pos: u32) Error!void {
+            return self.prefillRows(ids, pos, .none);
+        }
+
+        fn prefillRows(
+            self: *Self,
+            ids: []const u32,
+            pos: u32,
+            logits: step_row.ChunkLogits,
+        ) Error!void {
+            assert(ids.len >= 1);
+
+            if (ids.len > self.prefill_batch_max) return error.TooManyRows;
+
+            var rows_buf: [limits.max_prefill_chunk]StepRow = undefined;
+            const rows = step_row.chunkRows(&rows_buf, ids, pos, logits);
+            const first = step_row.wantLogitsFirst(rows);
+            switch (logits) {
+                .last_row => assert(first == rows.len - 1),
+                .none => assert(first == rows.len),
+            }
+
+            try self.stepBatch(rows);
         }
 
         /// Advance every row one position: embed, all layers, then the final norm and the lm_head

@@ -168,29 +168,40 @@ pub fn decode(
     };
 }
 
-/// Prefill `prompt_ids` from position zero in chunks of at most `prefill_batch_max` rows. Each
-/// chunk writes its KV rows before its rows attend, so the chunks compose. The callers refuse a
-/// prompt past `max_seq` first, so the bound at `max_seq` cuts nothing.
+/// Prefill `prompt_ids` from position zero in chunks of at most `prefill_batch_max` rows. Only the
+/// last chunk asks for logits, because decode reads no other. The callers refuse a prompt past
+/// `max_seq` first, so the bound at `max_seq` cuts nothing.
 pub fn prefillChunks(runner: anytype, prompt_ids: []const u32) !Prefilled {
-    const window: u32 = runner.max_seq;
-    var pos: u32 = 0;
-    var last_logits: []f32 = undefined;
+    std.debug.assert(prompt_ids.len >= 1);
+    std.debug.assert(runner.prefill_batch_max >= 1);
 
-    // Each pass feeds at least one token or stops, so the loop ends in
-    // `prompt_ids.len` passes.
-    while (pos < prompt_ids.len and pos < window) {
-        const room = @min(runner.prefill_batch_max, window - pos);
-        const remaining = prompt_ids.len - pos;
-        const chunk: u32 = @intCast(@min(remaining, @as(usize, room)));
+    const window: u32 = runner.max_seq;
+    const end: u32 = @intCast(@min(prompt_ids.len, @as(usize, window)));
+    // The last chunk exists, so the logits at the return exist.
+    std.debug.assert(end >= 1);
+    var pos: u32 = 0;
+    var last_logits: ?[]f32 = null;
+
+    // Each chunk writes its KV rows before its rows attend, so the chunks compose. Each pass
+    // feeds at least one token, so the loop ends in `end` passes.
+    while (pos < end) {
+        const chunk: u32 = @min(runner.prefill_batch_max, end - pos);
+        const ids = prompt_ids[pos..][0..chunk];
 
         const sp = span.beginArg(.prefill_chunk, chunk);
-        last_logits = try runner.prefillBatch(prompt_ids[pos..][0..chunk], pos);
+        if (pos + chunk < end) {
+            try runner.prefillBatchNoLogits(ids, pos);
+        } else {
+            last_logits = try runner.prefillBatch(ids, pos);
+        }
+
         sp.end();
 
         pos += chunk;
     }
 
-    return .{ .pos = pos, .last_logits = last_logits };
+    std.debug.assert(pos == end);
+    return .{ .pos = pos, .last_logits = last_logits.? };
 }
 
 /// Prefill `prompt_ids` one `step` per token, for a runner without `chunked_prefill`. The callers
@@ -413,4 +424,72 @@ test "decode: onStep fires once per step with the position the step wrote" {
     try std.testing.expectEqual(@as(u32, 2), ge.steps);
     try std.testing.expectEqual(ge.steps, eos.n_steps);
     try std.testing.expectEqualSlices(u32, &.{ 2, 3 }, eos.pos[0..eos.n_steps]);
+}
+
+// A counting runner records each prefill call, so the test sees which chunks ask for logits.
+const ChunkRunner = struct {
+    const calls_max = 8;
+
+    max_seq: u32,
+    prefill_batch_max: u32,
+    pos: [calls_max]u32 = undefined,
+    len: [calls_max]u32 = undefined,
+    first_id: [calls_max]u32 = undefined,
+    n_calls: usize = 0,
+    n_logits: usize = 0,
+    logits_call: usize = 0,
+    logits: [4]f32 = .{ 0, 1, 2, 3 },
+
+    fn record(self: *ChunkRunner, ids: []const u32, pos: u32) void {
+        self.pos[self.n_calls] = pos;
+        self.len[self.n_calls] = @intCast(ids.len);
+        self.first_id[self.n_calls] = ids[0];
+        self.n_calls += 1;
+    }
+
+    fn prefillBatch(self: *ChunkRunner, ids: []const u32, pos: u32) ![]f32 {
+        self.logits_call = self.n_calls;
+        self.record(ids, pos);
+        self.n_logits += 1;
+        return &self.logits;
+    }
+
+    fn prefillBatchNoLogits(self: *ChunkRunner, ids: []const u32, pos: u32) !void {
+        self.record(ids, pos);
+    }
+};
+
+test "prefillChunks: exactly the last chunk asks for logits, and the chunks tile the prompt" {
+    // Each id equals its position, so a chunk shows which ids it got.
+    var prompt: [12]u32 = undefined;
+    for (&prompt, 0..) |*id, i| {
+        id.* = @intCast(i);
+    }
+
+    const cases = [_]struct { len: usize, calls: usize, end: u32 }{
+        .{ .len = 1, .calls = 1, .end = 1 },
+        .{ .len = 4, .calls = 1, .end = 4 },
+        .{ .len = 5, .calls = 2, .end = 5 },
+        .{ .len = 8, .calls = 2, .end = 8 },
+        .{ .len = 12, .calls = 3, .end = 10 },
+    };
+    for (cases) |c| {
+        var runner: ChunkRunner = .{ .max_seq = 10, .prefill_batch_max = 4 };
+        const got = try prefillChunks(&runner, prompt[0..c.len]);
+
+        try std.testing.expectEqual(c.calls, runner.n_calls);
+        try std.testing.expectEqual(@as(usize, 1), runner.n_logits);
+        try std.testing.expectEqual(c.end, got.pos);
+        try std.testing.expectEqual(@as(usize, 4), got.last_logits.len);
+        try std.testing.expectEqual(runner.n_calls - 1, runner.logits_call);
+        var next: u32 = 0;
+        for (0..runner.n_calls) |i| {
+            try std.testing.expectEqual(next, runner.pos[i]);
+            try std.testing.expectEqual(next, runner.first_id[i]);
+            try std.testing.expect(runner.len[i] >= 1 and runner.len[i] <= 4);
+            next += runner.len[i];
+        }
+
+        try std.testing.expectEqual(c.end, next);
+    }
 }

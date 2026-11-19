@@ -394,12 +394,18 @@ pub fn HybridRunner(comptime Family: type) type {
             if (tokens.len > self.maxStepRows()) return error.TooManyRows;
 
             var rows_buf: [Fused.prefill_rows_max]StepRow = undefined;
-            const rows = step_row.chunkRows(&rows_buf, tokens, start_pos);
+            const rows = step_row.chunkRows(&rows_buf, tokens, start_pos, .last_row);
             _ = try step_row.validateRows(rows, self.n_slots, self.maxStepRows(), self.max_seq);
 
             const b: u32 = @intCast(tokens.len);
             self.hostPrefix(rows);
             return self.suffix.prefillBatchHidden(self.crossing(b), b, start_pos);
+        }
+
+        /// The method of the CPU runner for a chunk that a later chunk follows. The GPU suffix
+        /// keeps its head, so its dispatch list stays the one of `prefillBatch`.
+        pub fn prefillBatchNoLogits(self: *Self, tokens: []const u32, start_pos: u32) !void {
+            _ = try self.prefillBatch(tokens, start_pos);
         }
 
         // -- slot state -----------------------------------------------------

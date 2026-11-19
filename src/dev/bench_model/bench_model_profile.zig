@@ -52,7 +52,7 @@ pub fn bench(
 
     var runner = try Family.Cpu.init(ctx.arena, b.loaded, .{
         .plan = kv_budget.pinned(1, max_seq),
-        .max_rows = limits.cpu_prefill_chunk,
+        .max_rows = common.cpuPrefillRows(b.opt),
         .pool = pool,
         .policy = b.policy,
         .kv_dtype = b.kvDtype(),

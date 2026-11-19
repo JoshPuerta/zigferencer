@@ -134,7 +134,8 @@ serve residency, and the CLI decode loop with no further work.
 | `stepBatch` | `fn (*Self, []const StepRow) !void` | `session.advance`, the one row-assembly path under `feed` and `decodeBatch` | every runner |
 | `step` | `fn (*Self, u32, u32) ![]f32` | `generate.decode`, and `generate.prefillTokens` for a runner without `chunked_prefill` | every runner |
 | `chunked_prefill` | `bool` | `step_row.chunkedPrefill`, which picks the chunked prefill loop in `run_cmd.prefillAndStream` and `bench_model_exec.prefill` | `FusedRunner`, `HybridRunner`, and `CpuRunner` in a build without GPU ops. False, the prefill loop calls `step` per token. In `run`, the Qwen family entry takes the prompt cache loop |
-| `prefillBatch` | `fn (*Self, []const u32, u32) ![]f32` | `generate.prefillChunks` for `run` and `bench-model`. It passes chunks of slot 0 at consecutive positions | every runner |
+| `prefillBatch` | `fn (*Self, []const u32, u32) ![]f32` | `generate.prefillChunks` for `run` and `bench-model`, for the last chunk of the prompt. It passes chunks of slot 0 at consecutive positions | every runner |
+| `prefillBatchNoLogits` | `fn (*Self, []const u32, u32) !void` | `generate.prefillChunks`, for every chunk but the last. It returns no logits | `CpuRunner` skips the final norm and the `lm_head`. `FusedRunner` and `HybridRunner` call `prefillBatch` and drop the result |
 | `prefill_batch_max` | `u32` | the same two loops, which cut the prompt into chunks of at most this many rows | every runner |
 | `maxStepRows` | `fn (*const Self) u32` | `Sessions.init` sizes the row scratch with it. `cli/boot/serve_boot` clamps the prefill chunk to it | every runner |
 | `logits` | `[]f32` | `Sessions.init` derives the vocab stride from its length. `advance` and `copyFinalLogits` read the compact rows | every runner |

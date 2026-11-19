@@ -23,6 +23,7 @@ const boot_resources = zigferencer.cli.boot_resources;
 const boot_lines = zigferencer.cli.boot_lines;
 const select = zigferencer.cli.select;
 const family = zigferencer.family;
+const prefill_chunk = zigferencer.serve_prefill_chunk;
 const build_options = @import("build_options");
 const core_log = zigferencer.log;
 
@@ -69,6 +70,8 @@ pub const Options = struct {
     ignore_eos: bool = false,
     /// The bench takes no thinking option, so the engine thinking stays `auto`.
     engine: flags_mod.EngineFlags = .{},
+    /// CPU runners only: the prompt rows of one prefill pass. `cpuPrefillRows` reads it.
+    prefill_chunk: ?u32 = null,
     /// CPU backends only: print the per-op decode breakdown (`bench_model_profile`), then exit.
     profile_cpu_decode: bool = false,
     /// qwen35 fused only: print the per-stage GPU breakdown of one step, then exit.
@@ -122,6 +125,15 @@ pub const Options = struct {
         .ignore_eos = args.Doc{
             .group = "prompt shape",
             .text = "use the full decode budget per run (clean ITL)",
+        },
+        .prefill_chunk = args.Doc{
+            .group = "prompt shape",
+            .text = std.fmt.comptimePrint(
+                "prompt tokens prefilled per pass on a CPU runner, 0..{d}.\n" ++
+                    "0 = one token per pass (the serve value 0 at one slot)",
+                .{limits.max_prefill_chunk},
+            ),
+            .default = std.fmt.comptimePrint("{d}", .{limits.cpu_prefill_chunk}),
         },
         .logits_out = args.Doc{
             .group = "logits (compare-logits reads the files)",
@@ -319,6 +331,18 @@ pub fn synthPromptIds(arena: Allocator, n: u32, vocab: u32) ![]u32 {
     return ids;
 }
 
+/// The row scratch of a CPU runner of this bench: the rule of the serve flag `--prefill-chunk`,
+/// for the one slot of the bench and a pass with no decode row.
+pub fn cpuPrefillRows(opt: Options) u32 {
+    std.debug.assert(prefill_chunk.flagInRange(opt.prefill_chunk));
+
+    const rule = prefill_chunk.fromFlag(opt.prefill_chunk, limits.cpu_prefill_chunk);
+    const rows = prefill_chunk.stepRows(rule, 1, 0);
+    std.debug.assert(rows >= 1);
+    std.debug.assert(rows <= limits.max_prefill_chunk);
+    return rows;
+}
+
 /// Refuse a flag set that this build cannot run. `bench-model` and `dispatch-list` call it.
 pub fn refuseBadFlags(io: std.Io, opt: Options) !void {
     if (opt.runs == 0 or opt.runs > limits.bench_runs_max) {
@@ -326,6 +350,9 @@ pub fn refuseBadFlags(io: std.Io, opt: Options) !void {
     }
     if (opt.max_tokens < 2) {
         return args.fail(io, "--max-tokens must be >= 2 (need at least 1 step for ITL)", .{});
+    }
+    if (!prefill_chunk.flagInRange(opt.prefill_chunk)) {
+        return args.fail(io, prefill_chunk.flag_range_text, .{});
     }
 
     try refuseGpuFlags(io, opt);
@@ -337,6 +364,11 @@ pub fn refuseBadFlags(io: std.Io, opt: Options) !void {
 
 fn refuseGpuFlags(io: std.Io, opt: Options) error{UsageError}!void {
     const gpu_layers = opt.engine.gpu_layers;
+
+    // The GPU runners size their own prefill chunk.
+    if ((use_fused or use_per_op) and opt.prefill_chunk != null) {
+        return args.fail(io, "--prefill-chunk is for the CPU runners", .{});
+    }
 
     if (!use_fused) {
         const need_fused = "requires -Dops-backend=vulkan_fused";
@@ -396,6 +428,19 @@ fn refuseCpuProfile(io: std.Io, opt: Options) !void {
 }
 
 // -- tests ------------------------------------------------------------------
+
+test "cpuPrefillRows: the serve rule of --prefill-chunk at one slot and no decode row" {
+    const cases = [_]struct { flag: ?u32, want: u32 }{
+        .{ .flag = null, .want = limits.cpu_prefill_chunk },
+        .{ .flag = 0, .want = 1 },
+        .{ .flag = 1, .want = 1 },
+        .{ .flag = 128, .want = 128 },
+        .{ .flag = limits.max_prefill_chunk, .want = limits.max_prefill_chunk },
+    };
+    for (cases) |c| {
+        try std.testing.expectEqual(c.want, cpuPrefillRows(.{ .prefill_chunk = c.flag }));
+    }
+}
 
 test "DepthCurve: bucket steps and nanoseconds sum to the stream totals exactly" {
     // Positions span the whole engine bound. A stream holds at most 8192

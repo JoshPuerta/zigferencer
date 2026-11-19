@@ -1,6 +1,7 @@
 //! Chunked-prefill gate for the CPU runners. A prompt fed through `prefillBatch` in chunks must
 //! give the same last-row logits, bit for bit, and the same greedy continuation as the prompt fed
-//! one token at a time through `step`.
+//! one token at a time through `step`. A chunk fed through `prefillBatchNoLogits` must leave the
+//! same state for the next chunk, and must not write the logits rows.
 //!
 //! Comptime. Asserts pin the chunk sizes and the prompt length against the production chunk. The
 //! runner type is a parameter.
@@ -8,7 +9,10 @@
 //! Paths. The reference path runs `step` per token at one thread with `max_rows = 0`, the shape of
 //! the per-token prefill. The chunked paths run chunks of 1, 17, and 64 rows over a 70-token
 //! prompt, so a chunk is one row, an odd batch, or the full production chunk.
-//! Each chunked path runs at one thread and at four threads with the fan-out forced on.
+//! Each chunked path runs at one thread and at four threads with the fan-out forced on. At four
+//! threads, each chunk size runs again with the lm_head on the last chunk only. One more path takes
+//! the widest chunk, so the whole prompt is one chunk of 70 rows. It checks the row scratch of
+//! the widest chunk, and its single chunk always runs the lm_head.
 //!
 //! Fixtures. The SmolLM2 and Qwen3.5-2B fixtures come from `test_fixtures.path`.
 
@@ -33,6 +37,7 @@ const n_prompt: usize = 70;
 const n_decode: usize = 8;
 const max_seq: u32 = 256;
 const chunk_sizes = [_]u32{ 1, 17, 64 };
+const wide_chunk: u32 = zigferencer.limits.max_prefill_chunk;
 const serial_policy: test_policy.Policy = .{ .n_threads = 1 };
 const forced_policy: test_policy.Policy = .{ .n_threads = 4, .min_parallel_flops = 0 };
 
@@ -42,6 +47,7 @@ comptime {
     std.debug.assert(chunk_sizes[chunk_sizes.len - 1] == zigferencer.limits.cpu_prefill_chunk);
     std.debug.assert(n_prompt > zigferencer.limits.cpu_prefill_chunk);
     std.debug.assert(n_prompt + n_decode <= max_seq);
+    std.debug.assert(n_prompt < wide_chunk);
 }
 
 /// The first `n_prompt` ids of the prompt text under the fixture vocabulary.
@@ -51,6 +57,9 @@ fn promptIds(arena: std.mem.Allocator, loaded: *const loader.Loaded) ![]const u3
     try std.testing.expect(ids.len >= n_prompt);
     return ids[0..n_prompt];
 }
+
+/// The chunks of a chunked path that run the final norm and the lm_head.
+const Head = enum { every_chunk, last_chunk };
 
 const Outcome = struct {
     last_logits: []const f32,
@@ -102,8 +111,9 @@ fn referencePath(
     return o;
 }
 
-/// The chunked path: `prefillBatch` in chunks of `chunk` rows on a runner that
-/// holds the production row scratch.
+/// The chunked path: chunks of `chunk` rows on a runner whose row scratch holds `chunk` rows, and
+/// at least the production chunk.
+/// With `.last_chunk`, every chunk but the last goes through `prefillBatchNoLogits`.
 fn chunkedPath(
     comptime Runner: type,
     arena: std.mem.Allocator,
@@ -111,26 +121,33 @@ fn chunkedPath(
     ids: []const u32,
     chunk: u32,
     policy: test_policy.Policy,
+    head: Head,
 ) !Outcome {
     const io = std.testing.io;
     var cpu_pool: test_policy.Pool = undefined;
     try test_policy.startPool(&cpu_pool, io, policy);
     defer cpu_pool.deinit();
 
+    const rows = @max(chunk, zigferencer.limits.cpu_prefill_chunk);
     var runner = try Runner.init(arena, loaded, .{
         .plan = zigferencer.kv_budget.pinned(1, max_seq),
-        .max_rows = zigferencer.limits.cpu_prefill_chunk,
+        .max_rows = rows,
         .pool = &cpu_pool,
         .policy = policy,
         .kv_dtype = .f32,
     });
-    try std.testing.expectEqual(zigferencer.limits.cpu_prefill_chunk, runner.prefill_batch_max);
+    try std.testing.expectEqual(rows, runner.prefill_batch_max);
     var pos: u32 = 0;
     var last: []f32 = undefined;
     var calls: u32 = 0;
     while (pos < ids.len) {
         const n: u32 = @min(@as(u32, @intCast(ids.len)) - pos, chunk);
-        last = try runner.prefillBatch(ids[pos..][0..n], pos);
+        if (head == .last_chunk and pos + n < ids.len) {
+            try runner.prefillBatchNoLogits(ids[pos..][0..n], pos);
+        } else {
+            last = try runner.prefillBatch(ids[pos..][0..n], pos);
+        }
+
         pos += n;
         calls += 1;
     }
@@ -149,9 +166,15 @@ fn expectChunksMatch(
 ) !void {
     const ids = try promptIds(arena, loaded);
     const ref = try referencePath(Runner, arena, loaded, ids);
-    for ([_]test_policy.Policy{ serial_policy, forced_policy }) |policy| {
+    const Case = struct { policy: test_policy.Policy, head: Head };
+    const cases = [_]Case{
+        .{ .policy = serial_policy, .head = .every_chunk },
+        .{ .policy = forced_policy, .head = .every_chunk },
+        .{ .policy = forced_policy, .head = .last_chunk },
+    };
+    for (cases) |c| {
         for (chunk_sizes) |chunk| {
-            const got = try chunkedPath(Runner, arena, loaded, ids, chunk, policy);
+            const got = try chunkedPath(Runner, arena, loaded, ids, chunk, c.policy, c.head);
             // Bytes, not floats: the claim is bit identity, NaN included.
             try std.testing.expectEqualSlices(
                 u8,
@@ -161,6 +184,22 @@ fn expectChunksMatch(
             try std.testing.expectEqualSlices(u32, &ref.tokens, &got.tokens);
         }
     }
+
+    const wide = try chunkedPath(
+        Runner,
+        arena,
+        loaded,
+        ids,
+        wide_chunk,
+        forced_policy,
+        .every_chunk,
+    );
+    try std.testing.expectEqualSlices(
+        u8,
+        std.mem.sliceAsBytes(ref.last_logits),
+        std.mem.sliceAsBytes(wide.last_logits),
+    );
+    try std.testing.expectEqualSlices(u32, &ref.tokens, &wide.tokens);
 }
 
 // -- tests ------------------------------------------------------------------
@@ -252,4 +291,43 @@ test "qwen stepBatch and prefillBatch refuse rows past the row scratch" {
     try std.testing.expectError(error.TooManyRows, runner.stepBatch(&two));
     try std.testing.expectError(error.TooManyRows, runner.prefillBatch(&.{ 1, 1 }, 0));
     _ = try runner.prefillBatch(&.{1}, 0);
+}
+
+test "llama prefillBatchNoLogits writes no logits row" {
+    const io = std.testing.io;
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+
+    const arena = arena_state.allocator();
+    const fixture = try zigferencer.test_fixtures.path(arena, "SmolLM2-135M-Instruct-Q8_0");
+    var loaded = try loader.load(io, arena, fixture);
+    defer loaded.close();
+
+    var cpu_pool: test_policy.Pool = undefined;
+    try test_policy.startPool(&cpu_pool, io, serial_policy);
+    defer cpu_pool.deinit();
+
+    var runner = try LlamaCpu.init(arena, &loaded, .{
+        .plan = zigferencer.kv_budget.pinned(1, max_seq),
+        .max_rows = zigferencer.limits.cpu_prefill_chunk,
+        .pool = &cpu_pool,
+        .policy = serial_policy,
+        .kv_dtype = .f32,
+    });
+    const ids = try promptIds(arena, &loaded);
+
+    // A sentinel in every logits element shows that the chunk skipped the head.
+    const sentinel: f32 = 12345.0;
+    @memset(runner.logits, sentinel);
+    try runner.prefillBatchNoLogits(ids[0..17], 0);
+    for (runner.logits) |x| {
+        try std.testing.expectEqual(sentinel, x);
+    }
+
+    const last = try runner.prefillBatch(ids[17..34], 17);
+    for (last) |x| {
+        try std.testing.expect(x != sentinel);
+    }
+
+    try std.testing.expectError(error.TooManyRows, runner.prefillBatchNoLogits(ids[0..65], 34));
 }

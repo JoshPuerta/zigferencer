@@ -35,6 +35,14 @@ pub const StepRow = struct {
     want_logits: bool,
 };
 
+/// The logits that one prompt chunk asks for.
+pub const ChunkLogits = enum {
+    /// The last row of the chunk wants logits: the chunk ends the prompt.
+    last_row,
+    /// No row wants logits: a later chunk of the same prompt follows.
+    none,
+};
+
 // -- api --------------------------------------------------------------------
 
 /// Check the row rule that every runner shares, so they cannot drift. Returns the count of
@@ -78,9 +86,14 @@ pub fn validateRows(
     return n_logits;
 }
 
-/// The rows of a prompt chunk on slot 0: `tokens` at `start_pos` onward, with logits for the last
-/// row only. `out` must hold `tokens.len` rows.
-pub fn chunkRows(out: []StepRow, tokens: []const u32, start_pos: u32) []const StepRow {
+/// The rows of a prompt chunk on slot 0: `tokens` at `start_pos` onward. With `.last_row`, the
+/// last row wants logits. With `.none`, no row does. `out` must hold `tokens.len` rows.
+pub fn chunkRows(
+    out: []StepRow,
+    tokens: []const u32,
+    start_pos: u32,
+    logits: ChunkLogits,
+) []const StepRow {
     std.debug.assert(tokens.len >= 1);
     std.debug.assert(tokens.len <= out.len);
 
@@ -90,7 +103,7 @@ pub fn chunkRows(out: []StepRow, tokens: []const u32, start_pos: u32) []const St
             .slot = 0,
             .token = token,
             .pos = start_pos +| @as(u32, @intCast(i)),
-            .want_logits = i == tokens.len - 1,
+            .want_logits = logits == .last_row and i == tokens.len - 1,
         };
     }
 
@@ -109,7 +122,8 @@ pub fn wantLogitsFirst(rows: []const StepRow) u32 {
 }
 
 /// True when the runner behind `RunnerPtr` declares `chunked_prefill = true`. Such a runner
-/// prefills in `prefillBatch` chunks, and every other runner keeps the per-token loop.
+/// prefills in chunks, `prefillBatchNoLogits` for each chunk but the last and `prefillBatch` for
+/// the last. Every other runner keeps the per-token loop.
 pub fn chunkedPrefill(comptime RunnerPtr: type) bool {
     const R = @typeInfo(RunnerPtr).pointer.child;
     return @hasDecl(R, "chunked_prefill") and R.chunked_prefill;
@@ -143,13 +157,25 @@ test "validateRows: a row count past the cap is a typed error" {
 test "chunkRows: a chunk past the window is a typed error, at the u32 ceiling too" {
     var buf: [4]StepRow = undefined;
     const tokens = [_]u32{ 7, 8, 9 };
-    const rows = chunkRows(&buf, &tokens, 13);
+    const rows = chunkRows(&buf, &tokens, 13, .last_row);
     try std.testing.expectEqual(@as(u32, 1), try validateRows(rows, 1, 4, 16));
     try std.testing.expectEqual(@as(u32, 15), rows[2].pos);
     try std.testing.expect(!rows[1].want_logits);
     try std.testing.expect(rows[2].want_logits);
 
     try std.testing.expectError(error.PositionOutOfRange, validateRows(rows, 1, 4, 15));
-    const top = chunkRows(&buf, &tokens, std.math.maxInt(u32) - 1);
+    const top = chunkRows(&buf, &tokens, std.math.maxInt(u32) - 1, .last_row);
     try std.testing.expectError(error.PositionOutOfRange, validateRows(top, 1, 4, 16));
+}
+
+test "chunkRows: a chunk with no logits holds no want_logits row" {
+    var buf: [4]StepRow = undefined;
+    const tokens = [_]u32{ 7, 8, 9 };
+    const rows = chunkRows(&buf, &tokens, 0, .none);
+    try std.testing.expectEqual(@as(u32, 0), try validateRows(rows, 1, 4, 16));
+    try std.testing.expectEqual(@as(u32, 3), wantLogitsFirst(rows));
+    for (rows, 0..) |r, i| {
+        try std.testing.expect(!r.want_logits);
+        try std.testing.expectEqual(@as(u32, @intCast(i)), r.pos);
+    }
 }

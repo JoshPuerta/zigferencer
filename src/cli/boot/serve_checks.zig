@@ -80,8 +80,8 @@ pub fn checkFlags(
     const batch = try checkBatch(io, serve, slots.structural);
 
     // Check the ranges that stand alone.
-    if ((serve.prefill_chunk orelse 0) > limits.max_prefill_chunk) {
-        return args.fail(io, "--prefill-chunk must be in 0..{d}", .{limits.max_prefill_chunk});
+    if (!prefill_chunk.flagInRange(serve.prefill_chunk)) {
+        return args.fail(io, prefill_chunk.flag_range_text, .{});
     }
     if (serve.engine.thinking_budget > limits.max_model_ctx) {
         return args.fail(io, "--thinking-budget must be in 0..{d}", .{limits.max_model_ctx});
