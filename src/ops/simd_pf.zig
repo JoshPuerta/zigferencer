@@ -108,7 +108,7 @@ test "simd_pf linearF32Q80 matches naive with tail (out%4 != 0)" {
 test "simd_pf linearF32Q80Batch is bit-identical to per-row linearF32Q80" {
     const gpa = std.testing.allocator;
     const in_features: usize = 96;
-    const out_features: usize = 11; // group outputs + a 3-output tail
+    const out_features: usize = 11; // a wide group, a group of 4, and a 1-output tail
     const batch: usize = 5;
     const out_stride: usize = 16; // > out_features: exercise the stride path
     const output_bytes = (in_features / 32) * 34;

@@ -12,28 +12,33 @@
 //! `@mulAdd(w, x, acc)`, where `w = scale * @floatFromInt(q)`. That `w` is exact in f32, because
 //! the f16 scale holds 11 significant bits and q at most 7. `lane_tree_simd` adds the 8 lanes
 //! into the output in the lane tree order. A lane gets the same bits in a sum of one accumulator
-//! or of four. Every path below follows this rule. So each output value has the same bits at
+//! or of up to 8. Every path below follows this rule. So each output value has the same bits at
 //! every batch size, with or without prefetch.
 //!
-//! B = 1. `groupPass` takes `mr = 4` outputs at once, one Q8_0 block at a time. The four
+//! B = 1. `groupPass` takes groups of `mr = 4` outputs, one Q8_0 block at a time. The four
 //! accumulators sit in registers and each input vector loads once for the four outputs.
+//! `outputPass` takes the outputs after the last group.
 //!
-//! Panel path. The B = 1 path repeats the i8 to f32 widening and the scale multiply for every
-//! batch row. So with more batch rows a group widens its weights once per K tile and per pass
-//! of `accumulator_rows` batch rows, and keeps them in a stack panel of `mr` outputs by `k_tile`
-//! weights. The panel stays in L1, and the inner loop reuses it for every batch row of the pass,
-//! `b_tile` rows per register tile. The inner loop then holds loads and a fused multiply-add.
-//! A batch over `accumulator_rows` widens again for each pass. Each batch row still sees the K
-//! tiles in ascending order, so a pass leaves the bits unchanged. A group reads its weight bytes
-//! from memory once per pass, not once per batch row.
+//! Batch. A wide group is a group of `panel_outputs` outputs. The path takes wide groups, then
+//! groups of `mr` outputs, then single outputs. The B = 1 path repeats the i8 to f32 widening and
+//! the scale multiply for every batch row. So with more batch rows a group widens its weights once
+//! per K tile and per pass of `accumulator_rows` batch rows. It keeps them in a stack panel of one
+//! group by `k_tile` weights. The panel stays in L1, and the inner loop reuses it for every batch
+//! row of the pass, `b_tile` rows per register tile. The inner loop then holds loads and a fused
+//! multiply-add. Each input vector feeds one FMA per output of the group, so a wider group streams
+//! less input per product. A batch over `accumulator_rows` widens again for each pass. Each batch
+//! row still sees the K tiles in ascending order, so a pass leaves the bits unchanged. A group
+//! reads its weight bytes from memory once per pass, not once per batch row. The outputs after the
+//! wide groups take groups of `mr`. When the wide groups leave 2 or 3 outputs, `wideGroupsEnd`
+//! gives one wide group back to the groups of `mr`.
 //!
 //! Prefetch. Only `prefetched` prefetches. Each block of a group prefetches the same block of the
-//! next 4-output group with `.locality = 0`, because the pass reads those bytes once. So the lines
-//! are warm when the outer loop arrives, and they do not pollute L1. Shapes that stream past the
-//! last-level cache gain from it. Prefetch changes no bit.
+//! next group of the same width with `.locality = 0`, because the pass reads those bytes once. So
+//! the lines are warm when the outer loop arrives, and they do not pollute L1. Shapes that stream
+//! past the last-level cache gain from it. Prefetch changes no bit.
 //!
-//! Tail. The outputs left when `out_features % mr != 0` take `outputPass`: one output, no prefetch,
-//! the same vector walk, and the same lane tree.
+//! Tail. The outputs after the last group of `mr` take `outputPass`: one output, no prefetch, the
+//! same vector walk, and the same lane tree.
 //!
 //! Tiles. No tile size enters the order of a lane, so the tiles change the speed, never a bit.
 //! `linearTilesForCpu` holds one entry, measured on a core with 16 vector registers of 256 bits and
@@ -42,8 +47,9 @@
 //!
 //! F32. `linearF32` takes the bit rule with `w` read from the weight. The last `in_features % 8`
 //! dims add with one vector whose other lanes are zero in `w` and in `x`. The f32 kernel takes
-//! 4-output groups and tail outputs in the way of the Q8_0 kernels. It has no prefetch option,
-//! because no registry model sends a 2-D f32 weight to it, and a prefetch needs a measurement.
+//! groups of `mr` outputs and tail outputs in the way of the B = 1 Q8_0 path. It has no prefetch
+//! option, because no registry model sends a 2-D f32 weight to it, and a prefetch needs a
+//! measurement.
 //!
 //! Requirements. Every AVX2 target also carries F16C. Without F16C the f16 widening stays
 //! correct and runs scalar, so the backends do not list it in `requires`.
@@ -59,8 +65,8 @@ const Tensor = @import("../core/tensor.zig").Tensor;
 
 const lanes = 8;
 
-/// Outputs per group. `groupPass` and the offsets of a group spell out four outputs, so this
-/// size stays out of the tile table.
+/// Outputs per group of the B = 1 path, and of the batch groups after the wide groups. `groupPass`
+/// spells out four outputs, so this size stays out of the tile table.
 const mr = 4;
 
 /// The vector registers of the narrowest target that the SIMD backends accept: AVX2 names 16.
@@ -71,6 +77,9 @@ const l1_data_bytes = 32 * 1024;
 
 /// The tile sizes of the build target.
 const tiles = linearTilesForCpu(builtin.cpu);
+
+/// Outputs per group of the panel path.
+const panel_outputs = tiles.panel_outputs;
 
 /// Weights per output in one panel.
 const k_tile = tiles.k_tile;
@@ -85,10 +94,16 @@ const accumulator_rows = tiles.accumulator_rows;
 comptime {
     // A panel tile holds whole Q8_0 blocks.
     std.debug.assert(k_tile % 32 == 0);
+    // The register and L1 asserts below check the wide group. This relation covers the group of
+    // `mr` too.
+    std.debug.assert(panel_outputs >= mr);
+    // `transposeAdd` folds at most one accumulator per lane.
+    std.debug.assert(panel_outputs <= lanes);
     // The register tile, its input vectors, and one panel vector fit with no spill.
-    std.debug.assert(mr * b_tile + b_tile + 1 <= vector_registers_min);
+    std.debug.assert(panel_outputs * b_tile + b_tile + 1 <= vector_registers_min);
     // The panel and the accumulators take half of L1, and the streamed input rows the rest.
-    std.debug.assert(@sizeOf(Panel) + @sizeOf(Accumulators) <= l1_data_bytes / 2);
+    const stack_bytes = @sizeOf(Panel(panel_outputs)) + @sizeOf(Accumulators(panel_outputs));
+    std.debug.assert(stack_bytes <= l1_data_bytes / 2);
     // A chunk of the default prefill size runs whole passes.
     std.debug.assert(limits.cpu_prefill_chunk % accumulator_rows == 0);
 }
@@ -96,8 +111,8 @@ comptime {
 /// The kernels without software prefetch. The `simd` backend exports them.
 pub const plain = Kernels(.{});
 
-/// The kernels that prefetch the next 4-output group. The `simd_pf` backend exports them. They give
-/// the bits of `plain`.
+/// The kernels that prefetch the next group. The `simd_pf` backend exports them. They give the
+/// bits of `plain`.
 pub const prefetched = Kernels(.{ .prefetch = true });
 
 // -- types ------------------------------------------------------------------
@@ -107,12 +122,14 @@ const VecI8 = @Vector(lanes, i8);
 
 /// The compile-time choices of one kernel set.
 const Options = struct {
-    /// Prefetch the matching block of the next 4-output group.
+    /// Prefetch the matching block of the next group.
     prefetch: bool = false,
 };
 
 /// The tile sizes of the panel path on one class of CPU.
 const Tiles = struct {
+    /// Outputs per group of the panel path, from `mr` to the 8 accumulators of `transposeAdd`.
+    panel_outputs: usize,
     /// Weights per output in one panel, a multiple of the 32 weights of a Q8_0 block.
     k_tile: usize,
     /// Batch rows per register tile.
@@ -128,11 +145,15 @@ const BatchShape = struct {
     out_stride: usize,
 };
 
-/// The dequantized weights of one K tile, `k_tile` weights per group output.
-const Panel = [mr][k_tile]f32;
+/// The dequantized weights of one K tile, `k_tile` weights per output of an `n`-output group.
+fn Panel(comptime n: usize) type {
+    return [n][k_tile]f32;
+}
 
-/// One accumulator vector per group output and batch row of one pass.
-const Accumulators = [accumulator_rows][mr]Vec;
+/// One accumulator vector per output of an `n`-output group and per batch row of one pass.
+fn Accumulators(comptime n: usize) type {
+    return [accumulator_rows][n]Vec;
+}
 
 /// One kernel set: the two Q8_0 linear names of an ops backend.
 fn Kernels(comptime opts: Options) type {
@@ -166,34 +187,27 @@ fn Kernels(comptime opts: Options) type {
             const output_bytes = (in_features / 32) * 34;
             const n_blocks = in_features / 32;
 
-            // Take the full 4-output groups.
             var j: usize = 0;
-            while (j + mr <= out_features) : (j += mr) {
-                const output_offs: [mr]usize = .{
-                    (j + 0) * output_bytes,
-                    (j + 1) * output_bytes,
-                    (j + 2) * output_bytes,
-                    (j + 3) * output_bytes,
+            if (batch > 1) {
+                const shape: BatchShape = .{
+                    .in_features = in_features,
+                    .batch = batch,
+                    .out_stride = out_stride,
                 };
+                const wide_end = wideGroupsEnd(out_features);
+                const pf = opts.prefetch;
+                j = panelGroups(pf, panel_outputs, inputs, weight, outs, shape, j, wide_end);
+                std.debug.assert(j == wide_end);
+                j = panelGroups(pf, mr, inputs, weight, outs, shape, j, out_features);
+                std.debug.assert(out_features - j < mr);
+            }
+
+            // Take the full 4-output groups of one batch row.
+            while (batch == 1 and j + mr <= out_features) : (j += mr) {
+                const output_offs = groupOffsets(mr, j, output_bytes);
                 // The last group has no next group to prefetch.
                 const has_next = j + 2 * mr <= out_features;
-                const pf_offs: [mr]usize = .{
-                    (j + mr + 0) * output_bytes,
-                    (j + mr + 1) * output_bytes,
-                    (j + mr + 2) * output_bytes,
-                    (j + mr + 3) * output_bytes,
-                };
-
-                if (batch > 1) {
-                    const shape: BatchShape = .{
-                        .in_features = in_features,
-                        .batch = batch,
-                        .out_stride = out_stride,
-                    };
-                    const panelFn = if (opts.prefetch) panelGroupPrefetched else panelGroupPlain;
-                    panelFn(inputs, weight.data, outs, shape, j, output_offs, pf_offs, has_next);
-                    continue;
-                }
+                const pf_offs = groupOffsets(mr, j + mr, output_bytes);
 
                 const sums = groupPass(
                     opts.prefetch,
@@ -317,31 +331,93 @@ inline fn f32Chains(comptime m: usize, input: []const f32, w: []const f32, out0:
 /// measurement on that class. Until then every target takes the entry measured on AVX2.
 fn linearTilesForCpu(cpu: std.Target.Cpu) Tiles {
     _ = cpu;
-    return .{ .k_tile = 512, .b_tile = 2, .accumulator_rows = 64 };
+    return .{ .panel_outputs = 6, .k_tile = 384, .b_tile = 2, .accumulator_rows = 32 };
 }
 
-/// One 4-output weight group against every batch row, in passes of `accumulator_rows` rows.
+/// The byte offsets of the `n` outputs from `j0`.
+inline fn groupOffsets(comptime n: usize, j0: usize, output_bytes: usize) [n]usize {
+    var offs: [n]usize = undefined;
+    inline for (0..n) |r| {
+        offs[r] = (j0 + r) * output_bytes;
+    }
+    return offs;
+}
+
+/// The end of the most wide groups that leave the fewest outputs to the single-output path. A full
+/// pool unit holds a multiple of 4 outputs, so a remainder of 2 is frequent. One wide group less
+/// then leaves `panel_outputs + 2` outputs to the groups of `mr`.
+fn wideGroupsEnd(out_features: usize) usize {
+    const wide_max = out_features / panel_outputs;
+    var wide = wide_max;
+    // The single outputs of `w` wide groups repeat with a period of at most `mr` in `w`.
+    var w = wide_max;
+    while (w > 0 and wide_max - w + 1 < mr) {
+        w -= 1;
+        if ((out_features - w * panel_outputs) % mr < (out_features - wide * panel_outputs) % mr) {
+            wide = w;
+        }
+    }
+    const end = wide * panel_outputs;
+    std.debug.assert(end <= out_features);
+    std.debug.assert(out_features - end < mr * panel_outputs);
+    return end;
+}
+
+/// Run every full `n`-output group from output `j0` up to output `end` through the panel path.
+/// Return the first output after the last full group.
+inline fn panelGroups(
+    comptime prefetch: bool,
+    comptime n: usize,
+    inputs: []const f32,
+    weight: Tensor,
+    outs: []f32,
+    shape: BatchShape,
+    j0: usize,
+    end: usize,
+) usize {
+    const output_bytes = (shape.in_features / 32) * 34;
+    std.debug.assert(j0 <= end);
+    std.debug.assert(end <= @as(usize, @intCast(weight.shape[1])));
+
+    var j = j0;
+    while (j + n <= end) : (j += n) {
+        const output_offs = groupOffsets(n, j, output_bytes);
+        // The last group of this width has no next group to prefetch.
+        const has_next = j + 2 * n <= end;
+        const pf_offs = groupOffsets(n, j + n, output_bytes);
+        const panelFn = if (n == panel_outputs)
+            (if (prefetch) widePanelPrefetched else widePanelPlain)
+        else
+            (if (prefetch) narrowPanelPrefetched else narrowPanelPlain);
+        panelFn(inputs, weight.data, outs, shape, j, output_offs, pf_offs, has_next);
+    }
+    std.debug.assert(end - j < n);
+    return j;
+}
+
+/// One `n`-output weight group against every batch row, in passes of `accumulator_rows` rows.
 inline fn panelGroup(
     comptime prefetch: bool,
+    comptime n: usize,
     inputs: []const f32,
     data: []const u8,
     outs: []f32,
     shape: BatchShape,
     j: usize,
-    output_offs: [mr]usize,
-    pf_offs: [mr]usize,
+    output_offs: [n]usize,
+    pf_offs: [n]usize,
     has_next: bool,
 ) void {
     std.debug.assert(shape.batch > 1);
     std.debug.assert(shape.batch <= limits.max_prefill_chunk);
-    std.debug.assert(j + mr <= shape.out_stride);
-    std.debug.assert((shape.batch - 1) * shape.out_stride + j + mr <= outs.len);
+    std.debug.assert(j + n <= shape.out_stride);
+    std.debug.assert((shape.batch - 1) * shape.out_stride + j + n <= outs.len);
 
-    var accs: Accumulators = undefined;
+    var accs: Accumulators(n) = undefined;
 
     // `dequantTile` writes the first `tile` weights of each output before `accumulateTile` reads
     // them.
-    var panel: Panel align(32) = undefined;
+    var panel: Panel(n) align(32) = undefined;
     var pass0: usize = 0;
     while (pass0 < shape.batch) : (pass0 += accumulator_rows) {
         const rows = @min(accumulator_rows, shape.batch - pass0);
@@ -349,7 +425,7 @@ inline fn panelGroup(
         std.debug.assert(pass0 + rows <= shape.batch);
 
         for (accs[0..rows]) |*acc| {
-            acc.* = .{ @splat(0), @splat(0), @splat(0), @splat(0) };
+            acc.* = [_]Vec{@splat(0)} ** n;
         }
 
         // Each batch row sees the K tiles in ascending order, so a pass leaves the bits unchanged.
@@ -360,11 +436,13 @@ inline fn panelGroup(
             std.debug.assert(tile % 32 == 0);
             covered += tile;
 
-            dequantTile(prefetch, &panel, data, output_offs, pf_offs, has_next, k0 / 32, tile / 32);
+            const blk0 = k0 / 32;
+            dequantTile(prefetch, n, &panel, data, output_offs, pf_offs, has_next, blk0, tile / 32);
 
             var b: usize = 0;
             while (b + b_tile <= rows) : (b += b_tile) {
                 accumulateTile(
+                    n,
                     b_tile,
                     &panel,
                     inputs,
@@ -384,7 +462,7 @@ inline fn panelGroup(
             inline while (nb > 0) : (nb -= 1) {
                 if (rows - b >= nb) {
                     const in_f = shape.in_features;
-                    accumulateTile(nb, &panel, inputs, in_f, k0, tile, pass0, b, &accs);
+                    accumulateTile(n, nb, &panel, inputs, in_f, k0, tile, pass0, b, &accs);
                     b += nb;
                 }
             }
@@ -393,17 +471,46 @@ inline fn panelGroup(
         std.debug.assert(covered == shape.in_features);
 
         for (0..rows) |b| {
-            const sums = lane_tree.transposeAdd(mr, accs[b]);
-            inline for (0..mr) |r| {
+            const sums = lane_tree.transposeAdd(n, accs[b]);
+            inline for (0..n) |r| {
                 outs[(pass0 + b) * shape.out_stride + j + r] = sums[r];
             }
         }
     }
 }
 
-/// `panelGroup` without prefetch, as its own function. Inlined into the B = 1 entry, the panel
-/// gives that entry a large stack frame.
-noinline fn panelGroupPlain(
+/// `panelGroup` of `panel_outputs` outputs without prefetch, as its own function. Inlined into the
+/// B = 1 entry, the panel gives that entry a large stack frame. Each width and prefetch mode has
+/// its own entry, so the symbol keeps a plain name for `tools/simd-report.sh`.
+noinline fn widePanelPlain(
+    inputs: []const f32,
+    data: []const u8,
+    outs: []f32,
+    shape: BatchShape,
+    j: usize,
+    output_offs: [panel_outputs]usize,
+    pf_offs: [panel_outputs]usize,
+    has_next: bool,
+) void {
+    panelGroup(false, panel_outputs, inputs, data, outs, shape, j, output_offs, pf_offs, has_next);
+}
+
+/// `widePanelPlain` with prefetch.
+noinline fn widePanelPrefetched(
+    inputs: []const f32,
+    data: []const u8,
+    outs: []f32,
+    shape: BatchShape,
+    j: usize,
+    output_offs: [panel_outputs]usize,
+    pf_offs: [panel_outputs]usize,
+    has_next: bool,
+) void {
+    panelGroup(true, panel_outputs, inputs, data, outs, shape, j, output_offs, pf_offs, has_next);
+}
+
+/// `panelGroup` of `mr` outputs without prefetch.
+noinline fn narrowPanelPlain(
     inputs: []const f32,
     data: []const u8,
     outs: []f32,
@@ -413,12 +520,11 @@ noinline fn panelGroupPlain(
     pf_offs: [mr]usize,
     has_next: bool,
 ) void {
-    panelGroup(false, inputs, data, outs, shape, j, output_offs, pf_offs, has_next);
+    panelGroup(false, mr, inputs, data, outs, shape, j, output_offs, pf_offs, has_next);
 }
 
-/// `panelGroup` with prefetch, as its own function. Inlined into the B = 1 entry, the panel gives
-/// that entry a large stack frame.
-noinline fn panelGroupPrefetched(
+/// `narrowPanelPlain` with prefetch.
+noinline fn narrowPanelPrefetched(
     inputs: []const f32,
     data: []const u8,
     outs: []f32,
@@ -428,29 +534,31 @@ noinline fn panelGroupPrefetched(
     pf_offs: [mr]usize,
     has_next: bool,
 ) void {
-    panelGroup(true, inputs, data, outs, shape, j, output_offs, pf_offs, has_next);
+    panelGroup(true, mr, inputs, data, outs, shape, j, output_offs, pf_offs, has_next);
 }
 
-/// Widen `n_blk` blocks of the 4 outputs into `panel` with `scaledQuarter`, the `w` of `blockStep`.
+/// Widen `n_blk` blocks of the `n` outputs into `panel` with `scaledQuarter`, the `w` of
+/// `blockStep`.
 inline fn dequantTile(
     comptime prefetch: bool,
-    panel: *Panel,
+    comptime n: usize,
+    panel: *Panel(n),
     data: []const u8,
-    output_offs: [mr]usize,
-    pf_offs: [mr]usize,
+    output_offs: [n]usize,
+    pf_offs: [n]usize,
     has_next: bool,
     blk0: usize,
     n_blk: usize,
 ) void {
     std.debug.assert(n_blk * 32 <= k_tile);
     if (prefetch and has_next) {
-        std.debug.assert(pf_offs[mr - 1] + (blk0 + n_blk) * 34 <= data.len);
+        std.debug.assert(pf_offs[n - 1] + (blk0 + n_blk) * 34 <= data.len);
     }
-    std.debug.assert(output_offs[mr - 1] + (blk0 + n_blk) * 34 <= data.len);
+    std.debug.assert(output_offs[n - 1] + (blk0 + n_blk) * 34 <= data.len);
 
     for (0..n_blk) |t| {
         const blk_off = (blk0 + t) * 34;
-        inline for (0..mr) |r| {
+        inline for (0..n) |r| {
             if (prefetch and has_next) {
                 @prefetch(
                     &data[pf_offs[r] + blk_off],
@@ -469,15 +577,16 @@ inline fn dequantTile(
 
 /// Add the products of one panel tile for `nb` batch rows of a pass into their accumulators.
 inline fn accumulateTile(
+    comptime n: usize,
     comptime nb: usize,
-    panel: *const Panel,
+    panel: *const Panel(n),
     inputs: []const f32,
     in_features: usize,
     k0: usize,
     tile: usize,
     pass0: usize,
     b0: usize,
-    accs: *Accumulators,
+    accs: *Accumulators(n),
 ) void {
     std.debug.assert(tile <= k_tile);
     std.debug.assert(k0 + tile <= in_features);
@@ -485,7 +594,7 @@ inline fn accumulateTile(
     std.debug.assert((pass0 + b0 + nb) * in_features <= inputs.len);
     std.debug.assert(b0 + nb <= accs.len);
 
-    var acc: [nb][mr]Vec = undefined;
+    var acc: [nb][n]Vec = undefined;
     inline for (0..nb) |bi| {
         acc[bi] = accs[b0 + bi];
     }
@@ -497,7 +606,7 @@ inline fn accumulateTile(
             x[bi] = inputs[(pass0 + b0 + bi) * in_features + k0 + k ..][0..lanes].*;
         }
 
-        inline for (0..mr) |r| {
+        inline for (0..n) |r| {
             const w: Vec = panel[r][k..][0..lanes].*;
             inline for (0..nb) |bi| {
                 acc[bi][r] = @mulAdd(Vec, w, x[bi], acc[bi][r]);
@@ -714,19 +823,50 @@ test "linear_simd panel path equals per-row calls across K tiles" {
     // Two full K tiles and a 64-weight tail tile.
     const in_features: usize = 2 * k_tile + 64;
 
-    // Batch 130 is two full passes and 2 rows. The out sizes leave tails of 1, 2, and 3 outputs.
+    // The last batch is two full passes and 2 rows. Eight consecutive large out sizes leave every
+    // remainder of the wide group and both parities of the count of outputs after it.
     const batches = [_]usize{ 1, 2, 3, accumulator_rows, 2 * accumulator_rows + 2 };
     inline for (.{ plain, prefetched }) |K| {
-        for ([_]usize{ 1037, 1038, 1039 }) |out_features| {
-            try panelCheck(K, in_features, out_features, &batches);
+        for (0..8) |extra| {
+            try panelCheck(K, in_features, 1032 + extra, &batches);
+        }
+    }
+}
+
+test "linear_simd panel path on every small out size" {
+    // Out sizes 1 to 25 cover fewer outputs than one group of `mr`, fewer than one wide group,
+    // every remainder of the wide group, and every tail of 0 to 3 outputs after the groups of
+    // `mr`.
+    inline for (.{ plain, prefetched }) |K| {
+        for (1..26) |out_features| {
+            try panelCheck(K, 1088, out_features, &.{ 2, 3 });
         }
     }
 }
 
 test "linear_simd panel path on a last group with a tail" {
-    // One group with no next group to prefetch, and a 3-output tail.
+    // One wide group and one group of `mr` with no next group to prefetch, and a 1-output tail.
     inline for (.{ plain, prefetched }) |K| {
-        try panelCheck(K, 1088, 7, &.{ 2, 3 });
+        try panelCheck(K, 1088, panel_outputs + mr + 1, &.{ 2, 3 });
+    }
+}
+
+test "linear_simd wideGroupsEnd leaves the fewest single outputs and keeps the most wide groups" {
+    for (0..200) |n| {
+        const end = wideGroupsEnd(n);
+        try std.testing.expect(n - end < mr * panel_outputs);
+
+        // The model tries every count of whole wide groups. The fewest single outputs win, and a
+        // tie goes to the most wide groups.
+        var best: usize = 0;
+        var wide: usize = 0;
+        while (wide * panel_outputs <= n) : (wide += 1) {
+            const singles = (n - wide * panel_outputs) % mr;
+            if (wide == 0 or singles <= (n - best * panel_outputs) % mr) {
+                best = wide;
+            }
+        }
+        try std.testing.expectEqual(best * panel_outputs, end);
     }
 }
 
@@ -890,8 +1030,8 @@ fn bitRuleScalar(data: []const u8, output_off: usize, x: []const f32) f32 {
 
 test "linear_simd gives the bits of the scalar order of its bit rule" {
     const gpa = std.testing.allocator;
-    // The out size leaves a 3-output tail. Batches 3, 65 leave batch rows under one register
-    // tile.
+    // At B = 1 the out size leaves a 3-output tail. At B > 1 it leaves 5 wide groups, 2 groups of
+    // `mr`, and a 1-output tail. Batches 3, 65 leave batch rows under one register tile.
     const out_features: usize = 39;
     const max_in: usize = 2112;
     const batches = [_]usize{ 1, 2, 3, 8, 64, 65 };

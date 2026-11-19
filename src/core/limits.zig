@@ -178,7 +178,8 @@ pub const step_rows_max: u32 = max_batch + max_prefill_chunk;
 
 /// Rows of one prompt chunk on the CPU runners in `run` and `bench-model`. One weight read serves
 /// every row, and only the last row runs the lm_head. The SIMD batch kernel reads each input row
-/// once per 4-output weight group. So a wide chunk leaves the L2 cache. Serve sizes its own chunk.
+/// once per weight group of the batch path. So a wide chunk leaves the L2 cache. Serve sizes its
+/// own chunk.
 pub const cpu_prefill_chunk: u32 = 64;
 
 /// Ceiling on the threads of one CPU pool, the calling thread included. The pool packs the
