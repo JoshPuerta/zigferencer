@@ -28,7 +28,7 @@
 //! after the rank-1 write. With `S' = decay * S + k delta^T`, the readout is
 //! `o = S'^T q = (decay * S)^T q + (k . q) delta`. So pass 1 reads the state once and accumulates
 //! both `(decay * S)^T k` and `(decay * S)^T q`. Pass 2 reads each state value again and writes
-//! `decay * S + k delta^T`, with no readout. This is the form of the MLAS kernels of ONNX Runtime.
+//! `decay * S + k delta^T`, with no readout.
 //!
 //! Panels. A wide panel holds 4 vectors of columns, so pass 1 keeps 8 independent multiply-add
 //! chains in flight. Zen 3 has two FMA pipes at a latency of 4 cycles (the AMD optimization guide

@@ -19,8 +19,8 @@ const arch_entries = [_]ArchEntry{
         .title = "llama: SmolLM2, Llama 3.x (full softmax attention)",
         .entries = .{
             cpu("naive", "scalar f32 reference. q8_0 linears"),
-            cpu("simd", "AVX2 @Vector(8) linear kernels, rest shared with naive. q8_0 linears"),
-            cpu("simd_pf", "AVX2+FMA register-blocked + prefetch (the auto pick). q8_0 linears"),
+            cpu("simd", "@Vector(8) linears, attention, norm, and activations. q8_0 linears"),
+            cpu("simd_pf", "simd with prefetch in linears and attention (the auto pick). q8_0"),
             vulkan("vulkan", "per-op GPU submits (correctness/bench reference). q8_0 linears"),
             vulkan(
                 "vulkan_fused",
@@ -32,8 +32,8 @@ const arch_entries = [_]ArchEntry{
         .title = "qwen35: Qwen3.5 hybrid (Gated-DeltaNet + full attention)",
         .entries = .{
             cpu("naive", "GDN recurrence + attention on CPU. q8_0"),
-            cpu("simd", "SIMD linear kernels, GDN shared with naive. q8_0"),
-            cpu("simd_pf", "register-blocked linears, GDN shared with naive. q8_0"),
+            cpu("simd", "the simd kernels of llama, and the GDN key-head unit. q8_0"),
+            cpu("simd_pf", "simd with prefetch (the auto pick), and the GDN key-head unit. q8_0"),
             vulkan(
                 "vulkan",
                 "run only: matmuls per-op on GPU, GDN stays on CPU. bench-model unsupported",

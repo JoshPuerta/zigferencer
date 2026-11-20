@@ -112,9 +112,11 @@ fn printBuild(w: *Io.Writer, p: style.Palette) !void {
     // Asserts run in Debug and ReleaseSafe. ReleaseFast strips them.
     const asserts_on = builtin.mode == .Debug or builtin.mode == .ReleaseSafe;
     const ac = if (asserts_on) p.green else p.dim;
-    try w.print("  asserts:         {s}{s}{s}\n", .{
-        ac, if (asserts_on) "on" else "off (ReleaseFast, set OPT=ReleaseSafe to enable)", p.reset,
-    });
+    const asserts_text = if (asserts_on)
+        "on"
+    else
+        "off (ReleaseFast, build with -Doptimize=ReleaseSafe to enable)";
+    try w.print("  asserts:         {s}{s}{s}\n", .{ ac, asserts_text, p.reset });
     try w.print(
         "  runtime:         {s}{s:<8}{s}  (cpu | vulkan)\n",
         .{ p.green, build_options.runtime, p.reset },
