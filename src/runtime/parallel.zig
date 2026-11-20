@@ -95,7 +95,8 @@ pub const max_spin_us: u64 = 1_000_000;
 /// The cap on the default thread count. `--threads N` raises it.
 pub const max_default_threads: u32 = 8;
 
-/// The cap on the logical CPUs that `hostCores` reads. A host with more CPUs logs the cause.
+/// The cap on the logical CPUs or the core records that `hostCores` reads. A host with more logs
+/// the cause.
 const max_host_cpus: u32 = 512;
 
 // -- types ------------------------------------------------------------------
@@ -150,7 +151,8 @@ pub const Policy = struct {
 /// The physical core count of the host, and where it came from.
 pub const HostCores = struct {
     physical: u32,
-    /// True for the topology of the OS, false for the estimate of half the logical CPUs.
+    /// True for the topology of the OS (sysfs on Linux, the processor records on Windows), false
+    /// for the estimate of half the logical CPUs.
     from_os_topology: bool,
 };
 

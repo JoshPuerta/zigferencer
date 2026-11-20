@@ -22,6 +22,7 @@ const dtype = @import("../../core/dtype.zig");
 const kv_budget = @import("../../core/kv_budget.zig");
 const limits = @import("../../core/limits.zig");
 const span = @import("../../core/span.zig");
+const file_map = @import("../../os/file_map.zig");
 const mmap = @import("../mmap.zig");
 const parser = @import("parser.zig");
 const prop = @import("../../core/utils/prop.zig");
@@ -67,8 +68,7 @@ pub const Error = error{
 } || parser.Error;
 
 /// What `load` and `loadWith` return: a refused file, or a failed map of the file.
-pub const LoadError = Error || Allocator.Error || Io.File.OpenError || Io.File.LengthError ||
-    Io.File.MemoryMap.CreateError;
+pub const LoadError = Error || Allocator.Error || mmap.OpenError;
 
 /// Architectures the engine understands. The `general.architecture` string is the metadata key
 /// prefix.
@@ -273,11 +273,21 @@ pub fn loadWith(
     }
 
     const t_start = Io.Clock.Timestamp.now(io, .awake);
-    var map = if (opts.prefault)
-        try mmap.openReadOnly(io, path)
+    const opened = if (opts.prefault)
+        mmap.openReadOnly(io, path)
     else
-        try mmap.openReadOnlyLazy(io, path);
+        mmap.openReadOnlyLazy(io, path);
+    var map = opened catch |err| {
+        if (err == error.ModelFileNotMapped) {
+            if (opts.quiet) {
+                log.debug("{s}: {s}", .{ file, file_map.not_mapped_message });
+            } else {
+                log.err("{s}: {s}", .{ file, file_map.not_mapped_message });
+            }
+        }
 
+        return err;
+    };
     errdefer map.close();
 
     const bytes = map.bytes();

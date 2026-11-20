@@ -3,7 +3,8 @@
 //!
 //! Platforms. On Linux three signals decide, in order: the PCI vendor id of the primary DRM card on
 //! native Linux, the paravirtual compute device `/dev/dxg` on WSL2 (the real GPU is hidden there),
-//! and a render node without a card0 vendor file. Another OS reports no GPU.
+//! and a render node without a card0 vendor file. On Windows the signal is the Vulkan loader file
+//! `vulkan-1.dll` in the System32 directory. Another OS reports no GPU.
 
 const std = @import("std");
 const builtin = @import("builtin");
@@ -24,6 +25,7 @@ pub const Gpu = struct {
 /// Detect a GPU. A vendor label that no table entry names lands on `arena`.
 pub const detect = switch (builtin.os.tag) {
     .linux => detectLinux,
+    .windows => detectWindows,
     else => detectNone,
 };
 
@@ -58,6 +60,27 @@ fn exists(io: Io, path: []const u8) bool {
     var cwd = Io.Dir.cwd();
     cwd.access(io, path, .{}) catch return false;
     return true;
+}
+
+/// The `vulkan-1.dll` file in the System32 directory, where the Windows GPU drivers install the
+/// Vulkan loader.
+fn detectWindows(io: Io, arena: Allocator) Gpu {
+    _ = arena;
+
+    const loader_name = "\\vulkan-1.dll";
+    const system_directory = std.os.windows.getSystemDirectoryWtf16Le();
+    var path_buf: [1024]u8 = undefined;
+    if (std.unicode.calcWtf8Len(system_directory) + loader_name.len > path_buf.len) {
+        return .{ .present = false, .label = "unknown (Windows: no probe)" };
+    }
+
+    const n = std.unicode.wtf16LeToWtf8(&path_buf, system_directory);
+    @memcpy(path_buf[n..][0..loader_name.len], loader_name);
+    if (exists(io, path_buf[0 .. n + loader_name.len])) {
+        return .{ .present = true, .label = "Vulkan loader installed" };
+    }
+
+    return .{ .present = false, .label = "no Vulkan loader" };
 }
 
 fn detectNone(io: Io, arena: Allocator) Gpu {

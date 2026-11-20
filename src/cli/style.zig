@@ -26,18 +26,29 @@ pub const Palette = struct {
 
 // -- api --------------------------------------------------------------------
 
-/// True when stdout gets color: stdout is a TTY and `$NO_COLOR` is unset. The no-color.org rule
-/// disables color at any value, even an empty one, so `no_color_set` means "the key is present".
+/// True when stdout gets color: stdout is a terminal and `$NO_COLOR` is unset. The no-color.org
+/// rule disables color at any value, even an empty one, so `no_color_set` means "the key is
+/// present". The test comes first, so a run without color leaves the console mode alone.
 pub fn stdoutColor(io: Io, no_color_set: bool) bool {
     if (no_color_set) return false;
-    return Io.File.stdout().isTty(io) catch false;
+    return enablesAnsi(Io.File.stdout(), io);
 }
 
 /// True when stderr gets color, by the rule of `stdoutColor`. The two streams redirect
 /// independently, so the pickers key their palette on this value.
 pub fn stderrColor(io: Io, no_color_set: bool) bool {
     if (no_color_set) return false;
-    return Io.File.stderr().isTty(io) catch false;
+    return enablesAnsi(Io.File.stderr(), io);
+}
+
+// -- helpers ----------------------------------------------------------------
+
+/// True when `file` reads ANSI codes. On Windows the call also switches virtual terminal
+/// processing on, which a console needs before it reads a code. Elsewhere it succeeds when the
+/// file is a terminal.
+fn enablesAnsi(file: Io.File, io: Io) bool {
+    file.enableAnsiEscapeCodes(io) catch return false;
+    return true;
 }
 
 // -- tests ------------------------------------------------------------------

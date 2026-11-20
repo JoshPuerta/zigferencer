@@ -41,6 +41,7 @@ const builtin = @import("builtin");
 const limits = @import("../core/limits.zig");
 const prop = @import("../core/utils/prop.zig");
 const span = @import("../core/span.zig");
+const os_threads = @import("../os/threads.zig");
 
 const assert = std.debug.assert;
 const cache_line = std.atomic.cache_line;
@@ -135,7 +136,7 @@ pub const Pool = struct {
         while (spawned < n_threads - 1) : (spawned += 1) {
             // Pass the idle word in: a load at thread start can miss a dispatch that ran first.
             self.workers[spawned] = try std.Thread.spawn(
-                .{},
+                .{ .stack_size = os_threads.pool_worker_stack_bytes },
                 workerMain,
                 .{ self, spawned + 1, ctl_idle },
             );

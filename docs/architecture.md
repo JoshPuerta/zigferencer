@@ -343,7 +343,7 @@ the lessons from digital design in VHDL I had many years ago.
 | [`src/resolve/`](../src/resolve/) | The boot decisions. | `resolve.zig`, `device_placement.zig` (the GPU fit), `family.zig` (the runners of each family) |
 | [`src/core/`](../src/core/README.md) | The shared values and helpers. | `tensor.zig`, `dtype.zig`, `limits.zig` (every bound), `kv_budget.zig` (the plans), `registry.zig` (the model table), `tokenizer/` |
 | [`src/io/`](../src/io/README.md) | Files and the network. | `gguf/parser.zig`, `gguf/loader.zig`, `mmap.zig`, `download.zig` |
-| [`src/os/`](../src/os/README.md) | Every OS condition: the calls that differ between systems. | `host_memory.zig`, `host_cores.zig`, `socket_wait.zig` (the selector of the serve socket calls) |
+| [`src/os/`](../src/os/README.md) | Every OS condition: the calls that differ between Linux and Windows. | `host_memory.zig`, `file_map.zig`, `socket_wait.zig` (the selector of the serve socket calls) |
 | [`src/ops/`](../src/ops/README.md) | The CPU kernels. | `naive.zig` (the reference), `simd_pf.zig` (the default), `gdn.zig` |
 | [`src/ops_vulkan/`](../src/ops_vulkan/README.md) | The GPU kernels. | `shaders/`, `kernels.zig` and `kernels/` (one pipeline for each shader), `wrap.zig` (the per-op GPU backend) |
 | [`src/runtime/`](../src/runtime/README.md) | The runners and their state. | `cpu_runner.zig`, `fused_runner.zig`, `hybrid_runner.zig`, `session.zig`, `sampler.zig`, `parallel.zig` |
@@ -638,7 +638,7 @@ A dispatch takes no lock and allocates nothing.
 ### The policy controls
 
 - **`--threads N`** sets the participants. `0` or no flag takes the physical cores
-  from the OS topology (sysfs on Linux), at most 8.
+  from the OS topology (sysfs on Linux, the processor records on Windows), at most 8.
   Without a topology it takes half the logical CPUs.
   On a desktop with two memory channels, decode fills the bandwidth between 4 and 8 threads, 
   and prefill gains up to 8. A named value can go up to `limits.max_threads`.

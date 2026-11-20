@@ -12,5 +12,6 @@ file outside this directory, except the OS files of `src/os/`.
 | `time.zig` | Elapsed-time arithmetic. |
 | `log.zig` | The process log, gated at run time. |
 | `hwinfo.zig` | The host hardware card. |
+| `x86_cpu_brand_string.zig` | The CPU name of an x86_64 host. |
 | `perfetto.zig` | The protobuf encoder and the nesting walk. |
 | `prop.zig` | The property test driver. |

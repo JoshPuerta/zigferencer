@@ -9,9 +9,10 @@
 //! Sources:
 //!   - `builtin.cpu.features` for the SIMD flags. That is the BUILD target's
 //!     set. On `-Dtarget=native`, the default, it matches the host. A binary
-//!     copied elsewhere reports the build host's features, because no runtime
-//!     cpuid runs.
-//!   - `os/host_cpu_name.zig` for the CPU model name.
+//!     copied elsewhere reports the build host's features, because the flags
+//!     come from no runtime CPUID.
+//!   - The CPUID brand string (x86_64, every OS) for the CPU model name, and
+//!     the name that the OS states on another arch (`os/host_cpu_name.zig`).
 //!   - `os/host_memory.zig` for the total RAM, and `os/host_gpu.zig` for the GPU.
 //!   - `std.Thread.getCpuCount` for online cores.
 
@@ -23,6 +24,7 @@ const host_cpu_name = @import("../../os/host_cpu_name.zig");
 const host_gpu = @import("../../os/host_gpu.zig");
 const host_memory = @import("../../os/host_memory.zig");
 const os_process = @import("../../os/process.zig");
+const x86_cpu_brand_string = @import("x86_cpu_brand_string.zig");
 
 // -- types ------------------------------------------------------------------
 
@@ -64,7 +66,7 @@ pub fn detect(io: Io, arena: Allocator) HwCard {
     return .{
         .arch = @tagName(builtin.cpu.arch),
         .os = os_process.os_name,
-        .cpu_model = host_cpu_name.read(io, arena),
+        .cpu_model = readCpuModel(io, arena),
         .cores_total = std.Thread.getCpuCount() catch 1,
         .ram_total_bytes = host_memory.totalBytes(io),
         .simd = detectSimd(),
@@ -106,8 +108,38 @@ pub fn detectSimd() SimdFeatures {
     return s;
 }
 
+// -- helpers ----------------------------------------------------------------
+
+fn readCpuModel(io: Io, arena: Allocator) ?[]const u8 {
+    if (builtin.cpu.arch == .x86_64) {
+        var buf: [48]u8 = undefined;
+        const name = x86_cpu_brand_string.readCpuBrandString(&buf) orelse return null;
+        return arena.dupe(u8, name) catch null;
+    }
+
+    return host_cpu_name.read(io, arena);
+}
+
 // -- tests ------------------------------------------------------------------
+
+test {
+    _ = x86_cpu_brand_string;
+}
 
 test "detectSimd does not panic for the current target" {
     _ = detectSimd();
+}
+
+test "readCpuModel: the CPUID name equals the cpuinfo name on Linux x86_64" {
+    if (builtin.os.tag != .linux) return error.SkipZigTest;
+    if (builtin.cpu.arch != .x86_64) return error.SkipZigTest;
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    const from_cpuid = readCpuModel(std.testing.io, arena.allocator()) orelse
+        return error.TestUnexpectedResult;
+    const from_cpuinfo = host_cpu_name.read(std.testing.io, arena.allocator()) orelse
+        return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings(from_cpuinfo, from_cpuid);
 }

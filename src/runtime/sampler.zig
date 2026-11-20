@@ -1404,7 +1404,7 @@ test "penalize reads no padding bit past the vocab" {
     try std.testing.expectEqualSlices(f32, &.{ -0.5, 0, 0.5, 7 }, &y);
 }
 
-test "repetition golden row: the context rule, then presence, in the vLLM order" {
+test "repetition golden row: the context rule, then presence" {
     // Row [2, 1, 0, -1], r = 2, presence 1, context {0, 1, 2}, seen {1, 2}.
     // id 0: 2 / 2 = 1. id 1: 1 / 2 - 1 = -0.5. id 2: 0 * 2 - 1 = -1. id 3 is
     // in neither set and keeps -1.

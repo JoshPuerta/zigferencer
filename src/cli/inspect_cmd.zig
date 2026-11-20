@@ -13,6 +13,7 @@ const select = @import("select.zig");
 const registry = @import("../core/registry.zig");
 const dtype = @import("../core/dtype.zig");
 const loader = @import("../io/gguf/loader.zig");
+const file_map = @import("../os/file_map.zig");
 const mmap = @import("../io/mmap.zig");
 const parser = @import("../io/gguf/parser.zig");
 const Tensor = @import("../core/tensor.zig").Tensor;
@@ -152,7 +153,13 @@ fn printChatTemplate(w: *Io.Writer, template: []const u8) !void {
 }
 
 fn dumpRaw(ctx: context.Context, path: []const u8) !void {
-    var map = try mmap.openReadOnlyLazy(ctx.io, path);
+    var map = mmap.openReadOnlyLazy(ctx.io, path) catch |err| {
+        if (err == error.ModelFileNotMapped) {
+            log.err("{s}: {s}", .{ std.Io.Dir.path.basename(path), file_map.not_mapped_message });
+        }
+
+        return err;
+    };
     defer map.close();
 
     const parsed = parser.parse(ctx.arena, map.bytes()) catch |err| {

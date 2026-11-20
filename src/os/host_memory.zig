@@ -1,11 +1,12 @@
 //! The free RAM and the total RAM of the host. The RAM plan checks a model against the free
 //! figure, and `info` prints the total.
 //!
-//! Platforms. Linux reads `/proc/meminfo`. Another OS gives null, and the RAM plan then skips its
-//! check.
+//! Platforms. Linux reads `/proc/meminfo`. Windows calls `GlobalMemoryStatusEx`. Another OS gives
+//! null, and the RAM plan then skips its check.
 
 const std = @import("std");
 const builtin = @import("builtin");
+const kernel32 = @import("windows_kernel32_declarations.zig");
 const Io = std.Io;
 
 // -- constants --------------------------------------------------------------
@@ -19,12 +20,14 @@ const meminfo_text_max: usize = 4096;
 /// The RAM that a new allocation can get now without swap, or null when the read fails.
 pub const availableBytes = switch (builtin.os.tag) {
     .linux => availableBytesLinux,
+    .windows => availableBytesWindows,
     else => bytesNone,
 };
 
 /// The physical RAM of the host, or null when the read fails.
 pub const totalBytes = switch (builtin.os.tag) {
     .linux => totalBytesLinux,
+    .windows => totalBytesWindows,
     else => bytesNone,
 };
 
@@ -71,6 +74,31 @@ fn meminfoBytes(text: []const u8, field: []const u8) ?u64 {
     return null;
 }
 
+/// The lower of the free physical RAM and the free commit.
+fn availableBytesWindows(io: Io) ?u64 {
+    _ = io;
+    const status = memoryStatusWindows() orelse return null;
+
+    // Windows refuses an allocation at the commit limit, and the free commit can be below the
+    // free physical RAM.
+    const available = @min(status.ullAvailPhys, status.ullAvailPageFile);
+    std.debug.assert(available <= status.ullAvailPhys);
+    return available;
+}
+
+fn totalBytesWindows(io: Io) ?u64 {
+    _ = io;
+    const status = memoryStatusWindows() orelse return null;
+    return status.ullTotalPhys;
+}
+
+fn memoryStatusWindows() ?kernel32.MEMORYSTATUSEX {
+    var status: kernel32.MEMORYSTATUSEX = std.mem.zeroes(kernel32.MEMORYSTATUSEX);
+    status.dwLength = @sizeOf(kernel32.MEMORYSTATUSEX);
+    if (!kernel32.GlobalMemoryStatusEx(&status).toBool()) return null;
+    return status;
+}
+
 fn bytesNone(io: Io) ?u64 {
     _ = io;
     return null;
@@ -113,7 +141,7 @@ test "meminfoBytes: a fixed meminfo sample, a missing field, and malformed lines
 }
 
 test "host_memory: each figure is nonzero, and the free RAM stays inside the total" {
-    if (builtin.os.tag != .linux) return error.SkipZigTest;
+    if (builtin.os.tag != .linux and builtin.os.tag != .windows) return error.SkipZigTest;
 
     const available = availableBytes(std.testing.io) orelse return error.TestUnexpectedResult;
     const total = totalBytes(std.testing.io) orelse return error.TestUnexpectedResult;

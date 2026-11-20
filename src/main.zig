@@ -24,6 +24,7 @@ const build_options = @import("build_options");
 pub const cli = @import("cli.zig");
 pub const log = @import("core/utils/log.zig");
 pub const span = @import("core/span.zig");
+const console = @import("os/console.zig");
 
 // -- constants --------------------------------------------------------------
 
@@ -138,6 +139,10 @@ pub fn entry(
     init: std.process.Init,
     comptime dispatch: fn (std.process.Init, *File.Writer) anyerror!void,
 ) !void {
+    // A Ctrl-C leaves the console in UTF-8, because no handler runs the restore.
+    const old_code_page = console.setUtf8Output(init.io);
+    defer console.restoreOutput(init.io, old_code_page);
+
     var stdout_buffer: [cli.context.stdout_buffer_bytes]u8 = undefined;
     var stdout: File.Writer = .initStreaming(.stdout(), init.io, &stdout_buffer);
 
@@ -155,7 +160,7 @@ pub fn entry(
         .spans = trace_spans,
     }) catch {
         printBadTraceSpans(init.io, trace_spans.?);
-        std.process.exit(1);
+        exitAfterRestore(init.io, old_code_page);
     };
     defer span.finish();
 
@@ -163,7 +168,7 @@ pub fn entry(
     dispatch(init, &stdout) catch |err| {
         if (isUserError(err)) {
             span.finish();
-            std.process.exit(1);
+            exitAfterRestore(init.io, old_code_page);
         }
 
         // A reader that closes the pipe ends the output on purpose.
@@ -173,7 +178,7 @@ pub fn entry(
             }
 
             span.finish();
-            std.process.exit(1);
+            exitAfterRestore(init.io, old_code_page);
         }
 
         return err;
@@ -181,6 +186,12 @@ pub fn entry(
 }
 
 // -- helpers ----------------------------------------------------------------
+
+/// Exit with status 1. A `defer` does not run before `exit`, so this restores the code page first.
+fn exitAfterRestore(io: std.Io, old_code_page: ?u32) noreturn {
+    console.restoreOutput(io, old_code_page);
+    std.process.exit(1);
+}
 
 fn printBadTraceSpans(io: std.Io, text: []const u8) void {
     var buf: [256]u8 = undefined;
@@ -223,6 +234,8 @@ fn isUserError(err: anyerror) bool {
         error.UnexpectedEncoding,
         error.DownloadTruncated,
         error.NotAGguf,
+        // The loader or `inspect` logged the file and the local-disk advice.
+        loader.LoadError.ModelFileNotMapped,
         // Load failures: the loader logged the file and the key or the tensor.
         loader.LoadError.MissingKey,
         loader.LoadError.WrongKeyType,
@@ -378,7 +391,9 @@ test {
     _ = parallel;
     _ = pool;
     _ = hwinfo;
+    _ = console;
     _ = os_process;
+    _ = @import("os/file_map.zig");
     _ = @import("os/host_cores.zig");
     _ = @import("os/host_cpu_name.zig");
     _ = @import("os/host_gpu.zig");
