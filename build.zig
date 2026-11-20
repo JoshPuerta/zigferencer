@@ -285,7 +285,7 @@ pub fn build(b: *std.Build) void {
 
 /// Read every build option. `--help` lists the options in this order.
 fn readConfig(b: *std.Build) Config {
-    const target = b.standardTargetOptions(.{});
+    const target = resolveTarget(b);
     const optimize = b.standardOptimizeOption(.{});
     const requested_backend =
         b.option(OpsBackendOption, "ops-backend", ops_backend_help) orelse .auto;
@@ -310,6 +310,19 @@ fn readConfig(b: *std.Build) Config {
         .use_llvm = b.option(bool, "llvm", llvm_help),
         .test_bin = b.option([]const u8, "test-bin", test_bin_help) orelse "unit",
     };
+}
+
+/// Resolve `-Dtarget` and `-Dcpu`. A build that names an x86_64 target and no CPU gets the
+/// `x86_64_v3` level, which has AVX2 and FMA. Without this rule such a target has the baseline CPU,
+/// and `auto` then selects `naive` with no message. A build with no `-Dtarget` keeps the CPU of the
+/// host, and an explicit `-Dcpu` always wins.
+fn resolveTarget(b: *std.Build) std.Build.ResolvedTarget {
+    var query = b.standardTargetOptionsQueryOnly(.{});
+    if (query.cpu_arch == .x86_64 and query.cpu_model == .determined_by_arch_os) {
+        query.cpu_model = .{ .explicit = &std.Target.x86.cpu.x86_64_v3 };
+    }
+
+    return b.resolveTargetQuery(query);
 }
 
 fn checkTestThreads(test_threads: u32) u32 {
