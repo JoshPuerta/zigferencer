@@ -25,6 +25,7 @@ const style = @import("style.zig");
 const context = @import("context.zig");
 const registry = @import("../core/registry.zig");
 const limits = @import("../core/limits.zig");
+const SlabArena = @import("../core/utils/slab_arena.zig").SlabArena;
 const prompt_cache = @import("../runtime/prompt_cache.zig");
 
 comptime {
@@ -107,8 +108,7 @@ pub fn dispatchOver(
     comptime binary_name: []const u8,
 ) !void {
     // Read argv and the color choice.
-    const arena = init.arena.allocator();
-    const args = try init.minimal.args.toSlice(arena);
+    const args = try init.minimal.args.toSlice(init.arena.allocator());
     std.debug.assert(args.len >= 1);
 
     const no_color = init.environ_map.get("NO_COLOR") != null;
@@ -136,13 +136,17 @@ pub fn dispatchOver(
         .software = try resolveSoftwareDevice(init),
     };
 
+    // A handler takes its large buffers from an arena that asks the OS for their exact size.
+    var command_arena: SlabArena = .init(std.heap.page_allocator);
+    defer command_arena.deinit();
+
     // Run the handler that matches the name.
     const sub = args[1];
     for (table) |s| {
         if (std.mem.eql(u8, s.name, sub)) {
             return s.handler(.{
                 .io = init.io,
-                .arena = arena,
+                .arena = command_arena.allocator(),
                 .gpa = init.gpa,
                 .args = args[2..],
                 .stdout = stdout,

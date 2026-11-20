@@ -15,3 +15,4 @@ file outside this directory, except the OS files of `src/os/`.
 | `x86_cpu_brand_string.zig` | The CPU name of an x86_64 host. |
 | `perfetto.zig` | The protobuf encoder and the nesting walk. |
 | `prop.zig` | The property test driver. |
+| `slab_arena.zig` | An arena that gives each large request its own pages. |

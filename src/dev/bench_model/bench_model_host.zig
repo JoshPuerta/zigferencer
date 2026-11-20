@@ -18,6 +18,7 @@ const limits = zigferencer.limits;
 const vocab_mod = zigferencer.vocab;
 const parallel = zigferencer.parallel;
 const Pool = zigferencer.pool.Pool;
+const SlabArena = zigferencer.slab_arena.SlabArena;
 
 const per_op_build = build_options.use_vulkan_ops;
 const vulkan_ops_wrap = if (per_op_build) zigferencer.ops_vulkan_wrap else void;
@@ -69,11 +70,15 @@ pub fn bench(comptime Family: type, b: *const Bench) !void {
         }
     }
 
-    // Run the series on a fresh runner per run.
+    // Run the series on a fresh runner per run. Each run has its own arena, so the KV of one run
+    // is free before the next run allocates its own.
     const turn = exec.turnOf(b, &v, prompt_ids);
     const results = try ctx.arena.alloc(RunResult, b.opt.runs);
     for (results) |*result| {
-        var runner = try Family.Cpu.init(ctx.arena, b.loaded, .{
+        var run_arena: SlabArena = .init(ctx.gpa);
+        defer run_arena.deinit();
+
+        var runner = try Family.Cpu.init(run_arena.allocator(), b.loaded, .{
             .plan = kv_budget.pinned(1, max_seq),
             .max_rows = common.cpuPrefillRows(b.opt),
             .pool = &pool,

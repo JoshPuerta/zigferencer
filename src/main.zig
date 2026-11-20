@@ -72,6 +72,7 @@ pub const pool = @import("runtime/pool.zig");
 pub const prompt_cache = @import("runtime/prompt_cache.zig");
 pub const tensor_lookup = @import("runtime/tensor_lookup.zig");
 pub const hwinfo = @import("core/utils/hwinfo.zig");
+pub const slab_arena = @import("core/utils/slab_arena.zig");
 pub const os_process = @import("os/process.zig");
 pub const op_requires = @import("core/op_requires.zig");
 pub const serve_protocol = @import("serve/protocol.zig");
