@@ -6,7 +6,7 @@ the host hardware card, what each backend needs from the target, the model table
 module here owns engine state, and what crosses its edges is a plain immutable
 struct. Four files touch the outside and take an `Io` for it. `utils/log.zig` writes
 the diagnostics to stderr, `span.zig` writes the trace file, `utils/hwinfo.zig` reads
-the host details from `/proc`, and `registry.locate` checks a path on disk.
+the host details through `src/os/`, and `registry.locate` checks a path on disk.
 
 ## Files
 

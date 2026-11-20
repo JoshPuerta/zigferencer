@@ -12,37 +12,30 @@
 //! Wake. A task cancel does not wake a waiting `poll`. Teardown wakes it by a socket shutdown,
 //! which makes the socket readable and writable.
 //!
-//! Platforms. Linux has the deadline, the probe, and the keepalive. The read waits in `poll`, and
-//! the write uses a send that does not block, because a blocking send on a full buffer waits with
-//! no bound. Std `Io.Threaded` reports `EAGAIN` from its own socket read as a bug, so a socket
-//! receive timeout is no option. The drain of input (`endOutput`, `dropArrived`, `lingerOutput`)
-//! and the `sendOnce` that does not wait also exist on Linux only. On the other platforms the
-//! reader and the writer call the std socket path with no deadline, the probe reports no hang-up,
-//! and the keepalive does nothing. These platforms drop no input in the drain functions, and
-//! `sendOnce` is the blocking std write.
+//! Platforms. `os/socket_wait.zig` makes the OS calls. Linux has the deadline, the probe, and the
+//! keepalive. The read waits in `poll`, and the write uses a send that does not block. The drain
+//! of input (`endOutput`, `dropArrived`, `lingerOutput`) and the `sendOnce` that does not wait
+//! also exist on Linux only. On the other platforms the reader and the writer call the std socket
+//! path with no deadline, the probe reports no hang-up, and the keepalive does nothing. These
+//! platforms drop no input in the drain functions, and `sendOnce` is the blocking std write.
 //!
 //! Threads. A reader or a writer belongs to one connection task. The value must not move after
 //! `init`, because the interface finds its parent by address.
 
 const std = @import("std");
-const builtin = @import("builtin");
 const Io = std.Io;
 const net = Io.net;
-const posix = std.posix;
 const limits = @import("../core/limits.zig");
+const socket_wait = @import("../os/socket_wait.zig");
 
 // -- constants --------------------------------------------------------------
 
-pub const has_deadline = builtin.os.tag == .linux;
+pub const has_deadline = socket_wait.has_deadline;
 
 /// The iovec count of one read. The std socket reader uses the same small fixed array.
 const read_iovecs_max = 8;
 
 // -- types ------------------------------------------------------------------
-
-const Wait = enum { ready, timed_out, failed };
-
-const SendResult = union(enum) { sent: usize, again, failed };
 
 pub const Reader = struct {
     io: Io,
@@ -82,7 +75,7 @@ pub const Reader = struct {
         std.debug.assert(dest[0].len > 0);
 
         if (r.timeout_ms > 0) {
-            switch (waitReady(r.io, r.stream, .readable, deadlineAfter(r.io, r.timeout_ms))) {
+            switch (socket_wait.waitReadable(r.io, r.stream, deadlineAfter(r.io, r.timeout_ms))) {
                 .ready => {},
                 .timed_out => {
                     r.timed_out = true;
@@ -162,9 +155,9 @@ pub const Writer = struct {
         const passes_max = 64;
         var pass: u32 = 0;
         while (pass < passes_max) : (pass += 1) {
-            switch (sendNow(w.stream, bytes)) {
+            switch (socket_wait.sendNow(w.stream, bytes)) {
                 .sent => |n| return n,
-                .again => switch (waitReady(w.io, w.stream, .writable, deadline)) {
+                .again => switch (socket_wait.waitWritable(w.io, w.stream, deadline)) {
                     .ready => {},
                     .timed_out => {
                         w.timed_out = true;
@@ -185,34 +178,19 @@ pub const Writer = struct {
 /// True when the peer has closed the connection or its send side. Readable data alone is no
 /// hang-up, because a client can send its next request before it reads the reply.
 pub fn peerClosed(stream: net.Stream) bool {
-    if (!has_deadline) return false;
-
-    // Linux defines POLLRDHUP with the bit of EPOLLRDHUP, and std names only the second one.
-    const rdhup: i16 = std.os.linux.EPOLL.RDHUP;
-    var fds = [_]posix.pollfd{.{ .fd = stream.socket.handle, .events = rdhup, .revents = 0 }};
-    const n = posix.poll(&fds, 0) catch return false;
-    if (n == 0) return false;
-
-    return fds[0].revents & (rdhup | posix.POLL.HUP | posix.POLL.ERR) != 0;
+    return socket_wait.peerClosed(stream);
 }
 
 /// Turn on the TCP keepalive of an accepted socket, so a peer that vanishes without a close frees
 /// its connection. A unix socket has no keepalive, and a refused option leaves the socket as it
 /// is, so this reports nothing.
 pub fn enableKeepalive(stream: net.Stream) void {
-    if (!has_deadline) return;
-
-    const fd = stream.socket.handle;
-    const tcp = posix.IPPROTO.TCP;
-    const options = [_]struct { level: i32, name: u32, value: c_int }{
-        .{ .level = posix.SOL.SOCKET, .name = posix.SO.KEEPALIVE, .value = 1 },
-        .{ .level = tcp, .name = posix.TCP.KEEPIDLE, .value = limits.keepalive_idle_s },
-        .{ .level = tcp, .name = posix.TCP.KEEPINTVL, .value = limits.keepalive_interval_s },
-        .{ .level = tcp, .name = posix.TCP.KEEPCNT, .value = limits.keepalive_probes },
-    };
-    for (options) |o| {
-        posix.setsockopt(fd, o.level, o.name, std.mem.asBytes(&o.value)) catch return;
-    }
+    socket_wait.enableKeepalive(
+        stream,
+        limits.keepalive_idle_s,
+        limits.keepalive_interval_s,
+        limits.keepalive_probes,
+    );
 }
 
 /// Send `bytes` once with no wait. A short send drops the rest, because a refusal must not stall
@@ -224,7 +202,7 @@ pub fn sendOnce(io: Io, stream: net.Stream, bytes: []const u8) void {
         return;
     }
 
-    _ = sendNow(stream, bytes);
+    _ = socket_wait.sendNow(stream, bytes);
 }
 
 /// Close a refused socket in the order of `endOutput`.
@@ -238,13 +216,13 @@ pub fn closeRefused(io: Io, stream: *net.Stream) void {
 /// the last reply. Input that arrives later can still cause the reset.
 pub fn endOutput(io: Io, stream: net.Stream) void {
     stream.shutdown(io, .send) catch {};
-    drainNow(stream);
+    socket_wait.drainNow(stream, limits.close_drain_bytes);
 }
 
 /// Drop at most `limits.close_drain_bytes` of arrived input, with no wait and no shutdown. Call it
 /// before a close that must send its end of stream only at the close itself.
 pub fn dropArrived(stream: net.Stream) void {
-    drainNow(stream);
+    socket_wait.drainNow(stream, limits.close_drain_bytes);
 }
 
 /// Shut the send side, then read and drop input until the end of the stream, until
@@ -252,117 +230,22 @@ pub fn dropArrived(stream: net.Stream) void {
 /// after a refusal, because the client can still be sending its request.
 pub fn lingerOutput(io: Io, stream: net.Stream, wait_ms: u32) void {
     stream.shutdown(io, .send) catch {};
-    if (!has_deadline) return;
-
-    const linux = std.os.linux;
-    const deadline = deadlineAfter(io, wait_ms);
-    const fd = stream.socket.handle;
-    var buf: [4096]u8 = undefined;
-    var dropped: usize = 0;
-    // A pass drops at least one byte, or it finds no byte after a wake. The byte bound and the
-    // deadline end the loop, and the pass bound also ends a storm of empty wakes.
-    const passes_max = limits.close_drain_bytes + 64;
-    for (0..passes_max) |_| {
-        if (dropped >= limits.close_drain_bytes) return;
-        if (waitReady(io, stream, .readable, deadline) != .ready) return;
-
-        const want = @min(buf.len, limits.close_drain_bytes - dropped);
-        const rc = linux.recvfrom(fd, &buf, want, linux.MSG.DONTWAIT, null, null);
-        switch (linux.errno(rc)) {
-            .SUCCESS => {
-                if (rc == 0) return;
-                dropped += rc;
-            },
-            .AGAIN, .INTR => {},
-            else => return,
-        }
-    }
+    socket_wait.drainUntil(io, stream, limits.close_drain_bytes, deadlineAfter(io, wait_ms));
 }
 
 // -- helpers ----------------------------------------------------------------
-
-/// Read and drop what the peer has sent so far, with no wait. The bound keeps the acceptor from
-/// looping on a peer that keeps sending.
-fn drainNow(stream: net.Stream) void {
-    if (!has_deadline) return;
-
-    const linux = std.os.linux;
-    var buf: [4096]u8 = undefined;
-    const reads_max = (limits.close_drain_bytes + buf.len - 1) / buf.len;
-    for (0..reads_max) |_| {
-        const fd = stream.socket.handle;
-        const rc = linux.recvfrom(fd, &buf, buf.len, linux.MSG.DONTWAIT, null, null);
-        switch (linux.errno(rc)) {
-            .SUCCESS => if (rc == 0) return,
-            else => return,
-        }
-    }
-}
-
-fn sendNow(stream: net.Stream, bytes: []const u8) SendResult {
-    std.debug.assert(has_deadline);
-    const linux = std.os.linux;
-    const flags = linux.MSG.DONTWAIT | linux.MSG.NOSIGNAL;
-    const fd = stream.socket.handle;
-    // A signal before any byte moves restarts the send. The bound turns a signal storm into a
-    // failure.
-    const passes_max = 64;
-    for (0..passes_max) |_| {
-        const rc = linux.sendto(fd, bytes.ptr, bytes.len, flags, null, 0);
-        switch (linux.errno(rc)) {
-            .SUCCESS => return .{ .sent = rc },
-            .INTR => continue,
-            .AGAIN => return .again,
-            else => return .failed,
-        }
-    }
-
-    return .failed;
-}
 
 fn deadlineAfter(io: Io, timeout_ms: u32) Io.Clock.Timestamp {
     const now = Io.Clock.Timestamp.now(io, .awake);
     return now.addDuration(.{ .raw = .fromMilliseconds(timeout_ms), .clock = .awake });
 }
 
-/// Wait until the socket is ready, or until `deadline`. A hang-up or an error counts as ready, so
-/// the next read or write reports it. A failed `poll` is `failed`, so no caller falls into a
-/// blocking call.
-fn waitReady(
-    io: Io,
-    stream: net.Stream,
-    ready: enum { readable, writable },
-    deadline: Io.Clock.Timestamp,
-) Wait {
-    if (!has_deadline) return .ready;
-
-    const events: i16 = switch (ready) {
-        .readable => posix.POLL.IN,
-        .writable => posix.POLL.OUT,
-    };
-    // A signal ends `poll` early, and the next pass waits the rest. The bound turns a signal
-    // storm into a failure.
-    const passes_max = 64;
-    for (0..passes_max) |_| {
-        const left_ms = deadline.durationFromNow(io).raw.toMilliseconds();
-        if (left_ms <= 0) return .timed_out;
-
-        var fds = [_]posix.pollfd{.{ .fd = stream.socket.handle, .events = events, .revents = 0 }};
-        const wait: i32 = @intCast(@min(left_ms, std.math.maxInt(i32)));
-        const rc = posix.system.poll(&fds, @intCast(fds.len), wait);
-        switch (posix.errno(rc)) {
-            .SUCCESS => if (rc > 0) return .ready else return .timed_out,
-            .INTR => continue,
-            else => return .failed,
-        }
-    }
-
-    return .failed;
-}
-
 // -- tests ------------------------------------------------------------------
 
 const testing = std.testing;
+
+/// The deadline of a wait that a close of the peer ends at once.
+const close_wait_ms: u32 = 60_000;
 
 const Pair = struct {
     server: net.Server,
@@ -437,9 +320,8 @@ test "timed_stream: the probe tells a close from a pipelined request" {
     try testing.expect(!peerClosed(p.conn));
 
     p.client.close(io);
-    const fd = p.conn.socket.handle;
-    var fds = [_]posix.pollfd{.{ .fd = fd, .events = posix.POLL.IN, .revents = 0 }};
-    // The close reaches the socket as an event, so this wait returns at once.
-    _ = try posix.poll(&fds, -1);
+    // The close reaches the socket as an event, so this wait returns long before its deadline.
+    const wait = socket_wait.waitReadable(io, p.conn, deadlineAfter(io, close_wait_ms));
+    try testing.expectEqual(socket_wait.Wait.ready, wait);
     try testing.expect(peerClosed(p.conn));
 }

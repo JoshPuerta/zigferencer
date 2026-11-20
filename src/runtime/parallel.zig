@@ -76,6 +76,7 @@ const gdn = @import("../ops/gdn.zig");
 const limits = @import("../core/limits.zig");
 const Tensor = @import("../core/tensor.zig").Tensor;
 const pool_mod = @import("pool.zig");
+const host_cores = @import("../os/host_cores.zig");
 const Pool = pool_mod.Pool;
 
 const log = std.log.scoped(.parallel);
@@ -96,9 +97,6 @@ pub const max_default_threads: u32 = 8;
 
 /// The cap on the logical CPUs that `hostCores` reads. A host with more CPUs logs the cause.
 const max_host_cpus: u32 = 512;
-
-/// The longest `thread_siblings_list` text that `hostCores` keeps.
-const sibling_text_max: usize = 48;
 
 // -- types ------------------------------------------------------------------
 
@@ -152,8 +150,8 @@ pub const Policy = struct {
 /// The physical core count of the host, and where it came from.
 pub const HostCores = struct {
     physical: u32,
-    /// True for the sysfs topology, false for the estimate of half the logical CPUs.
-    from_sysfs: bool,
+    /// True for the topology of the OS, false for the estimate of half the logical CPUs.
+    from_os_topology: bool,
 };
 
 /// Where a field of a resolved policy came from.
@@ -490,42 +488,20 @@ pub fn logResolved(r: Resolved) void {
     });
 }
 
-/// The physical cores of the host: the distinct `thread_siblings_list` texts in sysfs, because
-/// SMT siblings share one text. Without a readable topology, half the logical CPUs (SMT-2).
+/// The physical cores of the host from the topology of the OS. Without a readable topology, half
+/// the logical CPUs (SMT-2).
 pub fn hostCores(io: std.Io) HostCores {
-    if (readSysfsCores(io)) |physical| {
+    if (host_cores.physicalCoreCount(io, max_host_cpus)) |physical| {
         std.debug.assert(physical >= 1);
 
-        return .{ .physical = physical, .from_sysfs = true };
+        return .{ .physical = physical, .from_os_topology = true };
     }
 
     const logical: u32 = @intCast(@max(1, @min(std.Thread.getCpuCount() catch 1, max_host_cpus)));
     const physical: u32 = @max(1, logical / 2);
     std.debug.assert(1 <= physical);
     std.debug.assert(physical <= logical);
-    return .{ .physical = physical, .from_sysfs = false };
-}
-
-/// The number of distinct sibling-list texts in `lists`, with surrounding white space ignored.
-pub fn countCores(lists: []const []const u8) u32 {
-    std.debug.assert(lists.len >= 1);
-    std.debug.assert(lists.len <= max_host_cpus);
-
-    var distinct: u32 = 0;
-    for (lists, 0..) |list, i| {
-        const text = std.mem.trim(u8, list, " \t\r\n");
-        const seen = for (lists[0..i]) |earlier| {
-            if (std.mem.eql(u8, std.mem.trim(u8, earlier, " \t\r\n"), text)) break true;
-        } else false;
-
-        if (!seen) {
-            distinct += 1;
-        }
-    }
-
-    std.debug.assert(distinct >= 1);
-    std.debug.assert(distinct <= lists.len);
-    return distinct;
+    return .{ .physical = physical, .from_os_topology = false };
 }
 
 /// Run a linear matmul over `batch` input rows, on the pool when the work is large enough.
@@ -795,49 +771,6 @@ pub fn gdnRows(
 
 // -- helpers ----------------------------------------------------------------
 
-/// Count the physical cores from the sibling list of each logical CPU in sysfs. It returns null
-/// when no CPU has a topology file, when a read fails, or when a cap cuts the read, which logs.
-fn readSysfsCores(io: std.Io) ?u32 {
-    if (builtin.os.tag != .linux) return null;
-
-    var texts: [max_host_cpus][sibling_text_max]u8 = undefined;
-    var lists: [max_host_cpus][]const u8 = undefined;
-    var n: u32 = 0;
-    const cwd = std.Io.Dir.cwd();
-    while (n < max_host_cpus) : (n += 1) {
-        var path_buf: [96]u8 = undefined;
-        const path = std.fmt.bufPrint(
-            &path_buf,
-            "/sys/devices/system/cpu/cpu{d}/topology/thread_siblings_list",
-            .{n},
-        ) catch unreachable;
-        const text = cwd.readFile(io, path, &texts[n]) catch |err| switch (err) {
-            error.FileNotFound => break,
-            else => return null,
-        };
-        if (text.len == sibling_text_max) {
-            log.info(
-                "cpu{d} sibling list is longer than {d} bytes. " ++
-                    "The thread default uses the logical estimate",
-                .{ n, sibling_text_max },
-            );
-            return null;
-        }
-
-        lists[n] = text;
-    } else {
-        log.info(
-            "the host has more than {d} CPUs. The thread default uses the logical estimate",
-            .{max_host_cpus},
-        );
-        return null;
-    }
-
-    if (n == 0) return null;
-
-    return countCores(lists[0..n]);
-}
-
 /// Build a Tensor view of `weight` over the outputs `[start, end)` (`shape[1]` in GGUF
 /// reversed-shape order).
 fn sliceWeightOutputs(weight: Tensor, start: usize, end: usize) Tensor {
@@ -863,18 +796,6 @@ fn sliceWeightOutputs(weight: Tensor, start: usize, end: usize) Tensor {
 }
 
 // -- tests ------------------------------------------------------------------
-
-test "countCores: SMT pairs, single threads, and comma lists" {
-    // An SMT-2 host lists each pair twice, once per logical CPU.
-    const smt = [_][]const u8{ "0-1\n", "0-1\n", "2-3\n", "2-3\n", "4-5\n", "4-5\n" };
-    try std.testing.expectEqual(@as(u32, 3), countCores(&smt));
-    // A host without SMT lists each CPU alone.
-    const solo = [_][]const u8{ "0\n", "1\n", "2\n", "3\n" };
-    try std.testing.expectEqual(@as(u32, 4), countCores(&solo));
-    // A host that numbers the siblings apart writes a comma list.
-    const comma = [_][]const u8{ "0,16\n", "1,17\n", "0,16\n", "1,17\n" };
-    try std.testing.expectEqual(@as(u32, 2), countCores(&comma));
-}
 
 test "forHost: min(physical cores, 8), the default floor and spin" {
     const cores = hostCores(std.testing.io);

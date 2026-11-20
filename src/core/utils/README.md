@@ -3,7 +3,7 @@
 This directory holds the general services of the process: the clock arithmetic, the log, the
 host probe, the Perfetto encoder, and the property test driver. These files serve any program.
 None of them names an op, a model, or a runner of the inference engine. No file here imports a
-file outside this directory.
+file outside this directory, except the OS files of `src/os/`.
 
 ## Files
 

@@ -52,14 +52,18 @@
 //! Clock. It is `.awake` (`CLOCK_MONOTONIC` on Linux), the clock of `perf record -k mono`, so a
 //! span file and a perf file share one time base. A GPU clock maps to that base only through the
 //! submit and wait points of each record, with `gpu_record.hostInterval`.
+//!
+//! Platforms. Only Linux gives a thread its name in the kernel, for perf, and gives the real
+//! process id. On another OS a trace has process id 1.
 
 const std = @import("std");
-const builtin = @import("builtin");
 const limits = @import("limits.zig");
 const core_log = @import("utils/log.zig");
 const gpu_record = @import("gpu_record.zig");
 const layer_op = @import("layer_op.zig");
 const trace_file = @import("trace_file.zig");
+const os_process = @import("../os/process.zig");
+const os_threads = @import("../os/threads.zig");
 
 const OpKey = layer_op.OpKey;
 const assert = std.debug.assert;
@@ -563,7 +567,7 @@ const Recorder = struct {
             written = try trace_file.writeTrace(&fw.interface, .{
                 .monotonic_ns = monotonic_ns,
                 .boottime_ns = boottime,
-                .pid = processId(),
+                .pid = os_process.processId(),
                 .threads = got.tracks[0..got.n_tracks],
                 .gpu_records = gpu_records,
                 .gpu_slots = gpu_slots,
@@ -765,12 +769,7 @@ pub fn nameThread(name: []const u8) void {
     const n: u8 = @intCast(@min(name.len, tl_name_buf.len - 1));
     @memcpy(tl_name_buf[0..n], name[0..n]);
     tl_name_len = n;
-    if (builtin.os.tag == .linux) {
-        var z: [16:0]u8 = @splat(0);
-        @memcpy(z[0..n], name[0..n]);
-        // A name that the kernel refuses changes only the perf label.
-        _ = std.posix.prctl(.SET_NAME, .{@intFromPtr(&z)}) catch {};
-    }
+    os_threads.nameCurrentThread(name[0..n]);
 
     if (tl_ring) |r| {
         r.setName(name[0..n]);
@@ -867,11 +866,6 @@ fn nowNs() u64 {
 
 fn currentTid() u64 {
     return @intCast(std.Thread.getCurrentId());
-}
-
-fn processId() u32 {
-    if (builtin.os.tag == .linux) return @intCast(std.os.linux.getpid());
-    return 1;
 }
 
 fn windowMain(io: std.Io, seconds: u32) void {

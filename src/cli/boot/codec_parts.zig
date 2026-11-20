@@ -39,8 +39,8 @@ pub const ThinkTags = struct {
 // -- api --------------------------------------------------------------------
 
 /// Decode the displayable bytes of every id once at startup. A piece past the serve cap fails the
-/// boot, never a silent truncation. A control token gets the empty piece, as llama.cpp
-/// `llama_token_to_piece` gives with `special` false. A user-defined token keeps its text.
+/// boot, never a silent truncation. A control token gets the empty piece. A user-defined token
+/// keeps its text.
 pub fn buildPieces(arena: std.mem.Allocator, v: *const vocab_mod.Vocab) ![]const []const u8 {
     std.debug.assert(v.is_control.len == v.tokens.len);
 

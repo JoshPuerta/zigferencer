@@ -20,9 +20,10 @@
 //!    `api`, `helpers`, `tests`. A function in `api` is public, a function in
 //!    `helpers` is private, and neither section declares a type.
 //! 6. Every script keeps the rules that tools/README.md states and a program can check.
-//! 7. An import points down the layers. The engine reads no CLI file. The CLI
-//!    building blocks read no command. No command reads another command. No
-//!    file outside `src/dev/` reads a developer file.
+//! 7. An import points down the layers. A file in `src/os/`, the lowest layer,
+//!    reads only `std`, `builtin`, and the files of `src/os/`. The engine reads
+//!    no CLI file. The CLI building blocks read no command. No command reads
+//!    another command. No file outside `src/dev/` reads a developer file.
 //! 8. An interior comment block in `src/` and `tools/` holds at most 6 lines.
 //!    Test blocks are exempt.
 //! 9. A doc comment in `src/` and `tools/` holds at most 3 lines on a function,
@@ -33,6 +34,12 @@
 //! 12. A file that holds the keyword `comptime` states what it does in a
 //!     `Comptime.` paragraph of its `//!` header. This rule covers `src/`,
 //!     `tests/`, `tools/`, and `build.zig`.
+//! 13. An OS condition lives only in `src/os/`: no other file names
+//!     `builtin.os.tag`, `builtin.target.os`, `std.os.linux`, `std.os.windows`,
+//!     or `std.posix`. This rule covers `src/`, `tests/`, and `tools/`. Test
+//!     blocks are exempt. Four files make raw socket calls or branch on
+//!     purpose. `build.zig` makes the build decisions of each OS, so the rule
+//!     does not read it.
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
@@ -94,6 +101,27 @@ const building_blocks = [_][]const u8{
     "cli/style.zig",
 };
 
+/// The directory of `src/` that holds every OS condition. It is the lowest layer.
+const os_dir = "os/";
+
+/// The names that make an OS condition. Each one is split, so this file holds none of them.
+const os_tokens = [_][]const u8{
+    "builtin" ++ ".os.tag",
+    "builtin" ++ ".target.os",
+    "std.os" ++ ".linux",
+    "std.os" ++ ".windows",
+    "std" ++ ".posix",
+};
+
+/// The files outside `src/os/` that make raw socket calls on purpose: the serve tests and the
+/// serve demo.
+const os_allowed = [_][]const u8{
+    "tests/serve_harness.zig",
+    "tests/zmq_interop_test.zig",
+    "tests/serve_integration_test.zig",
+    "src/dev/serve_demo_cmd.zig",
+};
+
 /// The declaration qualifiers that sit between a doc comment and the keyword it documents.
 const qualifiers = [_][]const u8{ "pub ", "export ", "inline ", "noinline ", "extern " };
 
@@ -113,6 +141,7 @@ const Rule = enum {
     header,
     alias,
     comptime_note,
+    os_condition,
 };
 
 /// The sections in file order. Every label under `tests` counts as `tests`.
@@ -149,6 +178,24 @@ const LayerCheck = struct {
         defer found.deinit(gpa);
 
         try layerViolations(gpa, &found, file.path, file.source);
+        return report(file.root, file.path, &found);
+    }
+};
+
+const OsCheck = struct {
+    fn visit(_: OsCheck, gpa: Allocator, file: File) !usize {
+        const in_os_dir = std.mem.eql(u8, file.root, "src") and
+            std.mem.startsWith(u8, file.path, os_dir);
+        if (in_os_dir) return 0;
+
+        var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+        const joined = try std.fmt.bufPrint(&path_buf, "{s}/{s}", .{ file.root, file.path });
+        if (containsString(&os_allowed, joined)) return 0;
+
+        var found: Found = .empty;
+        defer found.deinit(gpa);
+
+        try osViolations(gpa, &found, file.source);
         return report(file.root, file.path, &found);
     }
 };
@@ -279,6 +326,33 @@ fn streamViolations(gpa: Allocator, found: *Found, source: []const u8) !void {
         for (stream_tokens) |token| {
             if (std.mem.indexOf(u8, line, token) != null) {
                 try found.append(gpa, .{ .rule = .stream, .line = line_no });
+            }
+        }
+    }
+}
+
+/// Find each OS condition in a line of non-test code.
+fn osViolations(gpa: Allocator, found: *Found, source: []const u8) !void {
+    var in_test = false;
+    var line_no: usize = 0;
+    var lines = std.mem.splitScalar(u8, source, '\n');
+    while (lines.next()) |line| {
+        line_no += 1;
+        if (std.mem.startsWith(u8, line, "test ")) {
+            in_test = true;
+        }
+
+        defer if (std.mem.eql(u8, line, "}")) {
+            in_test = false;
+        };
+
+        const code = std.mem.trimStart(u8, line, " ");
+        if (in_test or std.mem.startsWith(u8, code, "//")) continue;
+
+        for (os_tokens) |token| {
+            if (std.mem.indexOf(u8, line, token) != null) {
+                try found.append(gpa, .{ .rule = .os_condition, .line = line_no });
+                break;
             }
         }
     }
@@ -629,6 +703,13 @@ fn layerViolations(gpa: Allocator, found: *Found, path: []const u8, source: []co
 }
 
 fn importBreaksLayer(path: []const u8, target: []const u8) bool {
+    if (std.mem.startsWith(u8, path, os_dir)) {
+        const names_std = std.mem.eql(u8, target, "std") or std.mem.eql(u8, target, "builtin");
+        const names_sibling = std.mem.endsWith(u8, target, ".zig") and
+            std.mem.indexOfScalar(u8, target, '/') == null;
+        return !names_std and !names_sibling;
+    }
+
     const in_dev = std.mem.startsWith(u8, path, "dev/");
     const names_dev = std.mem.indexOf(u8, target, "dev/") != null or
         std.mem.indexOf(u8, target, "dev_") != null or
@@ -912,6 +993,9 @@ test "the layer rule finds an import that points up" {
         .{ .path = "cli/boot/boot_lines.zig", .target = "../serve_cmd.zig" },
         .{ .path = "cli/boot/serve_boot.zig", .target = "../client/client_cmd.zig" },
         .{ .path = "cli/run_cmd.zig", .target = "serve_cmd.zig" },
+        .{ .path = "os/process.zig", .target = "../core/limits.zig" },
+        .{ .path = "os/console.zig", .target = "zigferencer" },
+        .{ .path = "os/threads.zig", .target = "build_options" },
     };
     for (bad) |case| {
         try std.testing.expect(importBreaksLayer(case.path, case.target));
@@ -924,6 +1008,10 @@ test "the layer rule finds an import that points up" {
         .{ .path = "cli/run_cmd.zig", .target = "boot/boot_resources.zig" },
         .{ .path = "cli/boot/boot_resources.zig", .target = "../args.zig" },
         .{ .path = "serve/server.zig", .target = "client.zig" },
+        .{ .path = "os/socket_wait.zig", .target = "socket_wait_linux.zig" },
+        .{ .path = "os/console.zig", .target = "std" },
+        .{ .path = "os/console.zig", .target = "builtin" },
+        .{ .path = "core/span.zig", .target = "../os/threads.zig" },
     };
     for (good) |case| {
         try std.testing.expect(!importBreaksLayer(case.path, case.target));
@@ -935,6 +1023,44 @@ test "every import points down the layers" {
         @as(usize, 0),
         try walkTree(std.testing.allocator, "src", LayerCheck{}),
     );
+}
+
+test "the OS rule finds an OS condition outside test blocks" {
+    const open = "fn f() void {\n    _ = ";
+    const close = ";\n}\n";
+    const Case = struct { src: []const u8, want: ?Rule };
+    const cases = [_]Case{
+        .{ .src = open ++ os_tokens[0] ++ close, .want = .os_condition },
+        .{ .src = open ++ os_tokens[1] ++ close, .want = .os_condition },
+        .{ .src = open ++ os_tokens[2] ++ close, .want = .os_condition },
+        .{ .src = open ++ os_tokens[3] ++ close, .want = .os_condition },
+        .{ .src = open ++ os_tokens[4] ++ close, .want = .os_condition },
+        .{ .src = "test \"t\" {\n    _ = " ++ os_tokens[0] ++ close, .want = null },
+        .{ .src = "// " ++ os_tokens[2] ++ "\n", .want = null },
+        .{
+            .src = "const os = @tagName(" ++ os_tokens[0] ++ ");\n",
+            .want = .os_condition,
+        },
+        .{ .src = open ++ "std.os.argv" ++ close, .want = null },
+    };
+    for (cases, 0..) |c, i| {
+        errdefer std.debug.print("tidy OS case {d}\n", .{i});
+
+        var found: Found = .empty;
+        defer found.deinit(std.testing.allocator);
+
+        try osViolations(std.testing.allocator, &found, c.src);
+        try std.testing.expectEqual(c.want, firstRule(found));
+    }
+}
+
+test "no file outside src/os/ holds an OS condition" {
+    const gpa = std.testing.allocator;
+    var breaks: usize = 0;
+    breaks += try walkTree(gpa, "src", OsCheck{});
+    breaks += try walkTree(gpa, "tests", OsCheck{});
+    breaks += try walkTree(gpa, "tools", OsCheck{});
+    try std.testing.expectEqual(@as(usize, 0), breaks);
 }
 
 test "no test sleeps and no non-test code prints" {

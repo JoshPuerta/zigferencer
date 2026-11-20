@@ -12,6 +12,7 @@
 const std = @import("std");
 const zigferencer = @import("zigferencer");
 const time = zigferencer.time;
+const os_process = zigferencer.os_process;
 const Io = std.Io;
 const build_options = @import("build_options");
 
@@ -50,9 +51,6 @@ const swap_warm_reps = 5;
 /// Bound on `--chunk-mib`. The sweep reaches 256 MiB, and the bound leaves one
 /// step of headroom above it.
 const chunk_mib_max: u32 = 1024;
-
-/// Bytes of `/proc/self/status` the probe reads. The file is about 1.5 KiB.
-const status_text_max: usize = 4096;
 
 /// Bound on the fd walk of one probe. A count at the bound prints as a floor.
 const fd_count_max: u32 = 1 << 16;
@@ -529,61 +527,19 @@ fn printProbe(io: Io, ctxp: *const vulkan_ctx_mod.Context, label: []const u8, w:
         }
     }
 
-    var status_buf: [status_text_max]u8 = undefined;
-    const status = Io.Dir.cwd().readFile(io, "/proc/self/status", &status_buf) catch null;
-    if (if (status) |text| statusKib(text, "VmRSS") else null) |kib| {
+    if (os_process.residentKib(io)) |kib| {
         try w.print("   VmRSS {d} KiB", .{kib});
     } else {
         try w.print("   VmRSS unknown", .{});
     }
 
-    if (countFds(io)) |fds| {
+    if (os_process.openFileCount(io, fd_count_max)) |fds| {
         try w.print("   fds {s}{d}\n", .{ if (fds >= fd_count_max) ">=" else "", fds });
     } else {
         try w.print("   fds unknown\n", .{});
     }
 
     try w.flush();
-}
-
-/// The value of the `key:` line of a `/proc/<pid>/status` text, in KiB. The
-/// kernel prints these lines as `VmRSS:\t   1234 kB`. `null` when no line has
-/// the key or the value is not a KiB count.
-fn statusKib(text: []const u8, key: []const u8) ?u64 {
-    std.debug.assert(key.len >= 1);
-
-    var lines = std.mem.splitScalar(u8, text, '\n');
-    while (lines.next()) |line| {
-        if (line.len <= key.len) continue;
-        if (!std.mem.startsWith(u8, line, key)) continue;
-        if (line[key.len] != ':') continue;
-
-        const rest = std.mem.trim(u8, line[key.len + 1 ..], " \t");
-        const unit = std.mem.findScalar(u8, rest, ' ') orelse return null;
-        if (!std.mem.eql(u8, std.mem.trimStart(u8, rest[unit..], " "), "kB")) return null;
-
-        return std.fmt.parseInt(u64, rest[0..unit], 10) catch null;
-    }
-
-    return null;
-}
-
-/// Open file descriptors of this process, at most `fd_count_max`. The walk
-/// holds one descriptor of its own, which the count leaves out.
-fn countFds(io: Io) ?u32 {
-    var dir = Io.Dir.cwd().openDir(io, "/proc/self/fd", .{ .iterate = true }) catch return null;
-    defer dir.close(io);
-
-    var it = dir.iterate();
-    var count: u32 = 0;
-    while (count < fd_count_max + 1) {
-        const entry = (it.next(io) catch return null) orelse break;
-        _ = entry;
-        count += 1;
-    }
-
-    std.debug.assert(count >= 1);
-    return @min(count - 1, fd_count_max);
 }
 
 // -- helpers: timing + stats ------------------------------------------------
@@ -617,41 +573,4 @@ fn mib(bytes: usize) f64 {
 
 fn gib(bytes: u64) f64 {
     return @as(f64, @floatFromInt(bytes)) / (1 << 30);
-}
-
-// -- tests ------------------------------------------------------------------
-
-test "statusKib: reads the KiB count of the named line only" {
-    const text = "Name:\tzigferencer\nVmPeak:\t  912345 kB\nVmRSSX:\t       7 kB\n" ++
-        "VmRSS:\t  654321 kB\nThreads:\t17\n";
-    try std.testing.expectEqual(@as(?u64, 654321), statusKib(text, "VmRSS"));
-    try std.testing.expectEqual(@as(?u64, 912345), statusKib(text, "VmPeak"));
-    // A line without the kB unit, a missing key, and a key prefix all read as null.
-    try std.testing.expectEqual(@as(?u64, null), statusKib(text, "Threads"));
-    try std.testing.expectEqual(@as(?u64, null), statusKib(text, "VmSwap"));
-    try std.testing.expectEqual(@as(?u64, null), statusKib(text, "VmR"));
-    try std.testing.expectEqual(@as(?u64, null), statusKib("VmRSS:\t12x kB\n", "VmRSS"));
-    try std.testing.expectEqual(@as(?u64, null), statusKib("", "VmRSS"));
-}
-
-test "statusKib: reads the live status of this process" {
-    if (@import("builtin").os.tag != .linux) return error.SkipZigTest;
-
-    var buf: [status_text_max]u8 = undefined;
-    const text = try Io.Dir.cwd().readFile(std.testing.io, "/proc/self/status", &buf);
-    try std.testing.expect(text.len < buf.len);
-    const kib = statusKib(text, "VmRSS") orelse return error.TestUnexpectedResult;
-    try std.testing.expect(kib >= 1);
-}
-
-test "countFds: counts open descriptors and leaves out its own" {
-    if (@import("builtin").os.tag != .linux) return error.SkipZigTest;
-
-    const before = countFds(std.testing.io) orelse return error.TestUnexpectedResult;
-    var dir = try Io.Dir.cwd().openDir(std.testing.io, "/proc", .{});
-    const during = countFds(std.testing.io) orelse return error.TestUnexpectedResult;
-    dir.close(std.testing.io);
-    const after = countFds(std.testing.io) orelse return error.TestUnexpectedResult;
-    try std.testing.expectEqual(before + 1, during);
-    try std.testing.expectEqual(before, after);
 }

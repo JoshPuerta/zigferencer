@@ -171,7 +171,7 @@ fn printThreading(ctx: context.Context, w: *Io.Writer, p: style.Palette) !void {
     const host_policy = parallel.Policy.forHost(ctx.io);
 
     try w.print("\n{s}Threading defaults:{s}\n", .{ p.bold, p.reset });
-    const source = if (cores.from_sysfs) "sysfs topology" else "half the logical CPUs";
+    const source = if (cores.from_os_topology) "OS topology" else "half the logical CPUs";
     try w.print("  physical cores:        {d}  {s}({s}){s}\n", .{
         cores.physical, p.dim, source, p.reset,
     });

@@ -17,11 +17,11 @@ const family = @import("../../resolve/family.zig");
 const weight_check = @import("../../runtime/weight_check.zig");
 const resolve_mod = @import("../../resolve/resolve.zig");
 const dtype = @import("../../core/dtype.zig");
-const hwinfo = @import("../../core/utils/hwinfo.zig");
 const kv_budget = @import("../../core/kv_budget.zig");
 const limits = @import("../../core/limits.zig");
 const registry = @import("../../core/registry.zig");
 const loader = @import("../../io/gguf/loader.zig");
+const host_memory = @import("../../os/host_memory.zig");
 const parallel = @import("../../runtime/parallel.zig");
 const tensor_lookup = @import("../../runtime/tensor_lookup.zig");
 // The device context resolves to `void` on a CPU build, which never analyzes it.
@@ -216,12 +216,11 @@ pub fn modelNeeds(loaded: *const loader.Loaded) resolve_mod.ModelNeeds {
     return m;
 }
 
-/// `MemAvailable` at boot: the free RAM that every RAM plan checks against.
+/// The available RAM at boot: the free RAM that every RAM plan checks against.
 pub fn hostRamFree(io: Io) ?u64 {
-    const free = hwinfo.readMemAvailable(io);
+    const free = host_memory.availableBytes(io);
     if (free == null) {
-        log.info("the RAM check is off: /proc/meminfo states no MemAvailable figure " ++
-            "on this platform", .{});
+        log.info("the RAM check is off: this platform gives no available-RAM figure", .{});
     }
 
     return free;
