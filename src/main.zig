@@ -234,6 +234,7 @@ fn isUserError(err: anyerror) bool {
         error.UnexpectedEncoding,
         error.DownloadTruncated,
         error.NotAGguf,
+        error.TargetInUse,
         // The loader or `inspect` logged the file and the local-disk advice.
         loader.LoadError.ModelFileNotMapped,
         // Load failures: the loader logged the file and the key or the tensor.

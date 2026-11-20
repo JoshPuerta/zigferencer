@@ -57,6 +57,7 @@
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 const Io = std.Io;
+const file_map = @import("../os/file_map.zig");
 const mmap = @import("../io/mmap.zig");
 const limits = @import("../core/limits.zig");
 const prop = @import("../core/utils/prop.zig");
@@ -123,6 +124,13 @@ const Entry = struct {
 const DiskIndexEntry = struct {
     key: u64,
     tokens: []u32, // owned
+};
+
+/// The result of one read of a disk file: an owned entry, a miss, or a file that fails validation.
+const DiskLoad = union(enum) {
+    entry: Entry,
+    miss,
+    invalid,
 };
 
 pub const PromptCache = struct {
@@ -544,23 +552,46 @@ pub const PromptCache = struct {
     /// Load and verify the snapshot for `key` and `tokens`. Returns an owned entry, or null
     /// for an absent, corrupt, or mismatched file. A bad file is deleted.
     fn loadFromDisk(self: *PromptCache, key: u64, tokens: []const u32) !?Entry {
+        // Windows refuses to delete a mapped file, so the delete starts after the map closes.
+        return switch (try self.readDiskEntry(key, tokens)) {
+            .entry => |e| e,
+            .miss => null,
+            .invalid => self.dropDisk(key),
+        };
+    }
+
+    /// Map, verify, and copy the snapshot for `key` and `tokens`. The map closes when this
+    /// function returns, so the entry owns copies of all its bytes.
+    fn readDiskEntry(self: *PromptCache, key: u64, tokens: []const u32) !DiskLoad {
         // Map the file.
-        const io = self.io orelse return null;
+        const io = self.io orelse return .miss;
         var pathbuf: [512]u8 = undefined;
-        const path = self.diskPath(key, &pathbuf) catch return null;
-        var mapped = mmap.openReadOnly(io, path) catch return null; // not found => miss
+        const path = self.diskPath(key, &pathbuf) catch return .miss;
+        var mapped = mmap.openReadOnly(io, path) catch |err| {
+            // A file that is absent is a plain miss. A directory that Windows cannot map gives
+            // only misses, so that case gets a line.
+            if (err == error.ModelFileNotMapped) {
+                log.warn("disk cache: {x:0>16}.zkv: {s}", .{ key, file_map.not_mapped_message });
+            }
+
+            return .miss;
+        };
         defer mapped.close();
 
         // Validate the image, then the collision guard.
         const bytes = mapped.bytes();
         const image = parseImage(bytes, self.model_fp) catch |err| {
-            log.warn("disk cache: {x:0>16}.zkv is not a valid snapshot ({t}), so it is a miss", .{
-                key, err,
-            });
-            return self.dropDisk(key);
+            const format = "disk cache: {x:0>16}.zkv is not a valid snapshot ({t}), " ++
+                "so it is a miss";
+            if (mismatch_level == .debug) {
+                log.debug(format, .{ key, err });
+            } else {
+                log.warn(format, .{ key, err });
+            }
+            return .invalid;
         };
         if (!std.mem.eql(u8, image.tokens, std.mem.sliceAsBytes(tokens))) {
-            return null; // collision: different prompt
+            return .miss; // collision: different prompt
         }
 
         // Copy the payload into an owned entry.
@@ -573,14 +604,14 @@ pub const PromptCache = struct {
         @memcpy(std.mem.sliceAsBytes(e_logits), image.logits);
         const e_blob = try self.gpa.dupe(u8, image.blob);
         log.debug("disk restore: {x:0>16}.zkv, {d} bytes read", .{ key, bytes.len });
-        return Entry{
+        return .{ .entry = .{
             .key = key,
             .tokens = e_tokens,
             .n = image.n_tokens,
             .blob = e_blob,
             .last_logits = e_logits,
             .last_used = 0,
-        };
+        } };
     }
 
     /// Delete a bad or stale disk file, and report a miss.
@@ -913,7 +944,11 @@ fn testDiskPath(buf: []u8, dir: []const u8, key: u64) ![]u8 {
 fn testSetMtime(io: Io, dir: []const u8, key: u64, ns: i96) !void {
     var buf: [256]u8 = undefined;
     const path = try testDiskPath(&buf, dir, key);
-    try Io.Dir.cwd().setTimestamps(io, path, .{
+    // Windows sets the time through a handle, and the write mode grants the attribute write right.
+    const file = try Io.Dir.cwd().openFile(io, path, .{ .mode = .write_only });
+    defer file.close(io);
+
+    try file.setTimestamps(io, .{
         .modify_timestamp = .{ .new = .{ .nanoseconds = ns } },
     });
 }
@@ -1415,6 +1450,52 @@ test "PromptCache: the disk index survives a new instance and promotes on best-p
     try other.enableDisk(io, dir, 1 << 20, modelFingerprint("other", 2));
     other.loadDiskIndex();
     try std.testing.expectEqual(@as(usize, 0), other.diskIndexLen());
+}
+
+test "PromptCache: a disk file that fails validation leaves no file and no index entry" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var dirbuf: [128]u8 = undefined;
+    const dir = try std.fmt.bufPrint(&dirbuf, ".zig-cache/tmp/{s}/pc", .{&tmp.sub_path});
+
+    const fp = modelFingerprint("m", 1);
+    const seq = [_]u32{ 1, 2, 3, 4 };
+    const key = prefixKey(fp, &seq);
+    const blob = [_]u8{7} ** 64;
+    const logits = [_]f32{ 0, 1 };
+
+    // A first instance writes a valid file, so a second instance indexes the key.
+    {
+        var writer = PromptCache.init(gpa, 1 << 20);
+        defer writer.deinit();
+
+        try writer.enableDisk(io, dir, 1 << 20, fp);
+        try std.testing.expect(
+            writer.admit(key, &seq, &blob, &logits, 100_000_000, 1_000_000),
+        );
+        try std.testing.expect(writer.last_admit_disk);
+    }
+
+    var cache = PromptCache.init(gpa, 1 << 20);
+    defer cache.deinit();
+
+    try cache.enableDisk(io, dir, 1 << 20, fp);
+    cache.loadDiskIndex();
+    try std.testing.expect(cache.indexEntryOf(key) != null);
+
+    // A header of zero bytes has the wrong magic, so the load maps it and refuses it.
+    var pathbuf: [256]u8 = undefined;
+    const path = try testDiskPath(&pathbuf, dir, key);
+    const zero_header = [_]u8{0} ** @sizeOf(DiskHeader);
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = path, .data = &zero_header });
+
+    try std.testing.expect(cache.lookup(key, &seq) == null);
+    try std.testing.expect(!cache.last_hit_from_disk);
+    try std.testing.expect(!testDiskFileExists(io, dir, key));
+    try std.testing.expect(cache.indexEntryOf(key) == null);
 }
 
 test "PromptCache: admit and find an entry that carries no logits" {

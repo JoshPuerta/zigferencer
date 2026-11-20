@@ -204,10 +204,21 @@ pub fn fetchModel(
         log.info("done: {d:.1} MiB", .{mib(downloaded)});
     }
 
-    // Replace the target in one rename.
-    errdefer cwd.deleteFile(io, tmp_path) catch {};
+    // Replace the target in one rename. On Windows, a process that maps the target blocks the
+    // rename. The finished temp file stays then, because the user can rename it later.
+    cwd.rename(tmp_path, cwd, file_path, io) catch |err| {
+        if (err == error.AccessDenied) {
+            log.err(
+                "the download is complete at {s}. Another process uses {s}. " ++
+                    "Close that process, then rename the file",
+                .{ tmp_path, file_path },
+            );
+            return error.TargetInUse;
+        }
 
-    try cwd.rename(tmp_path, cwd, file_path, io);
+        cwd.deleteFile(io, tmp_path) catch {};
+        return err;
+    };
 }
 
 /// Read the Content-Length of `url` for `fetch --dry-run`, or null when the server sends none.
