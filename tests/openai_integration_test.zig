@@ -1074,16 +1074,13 @@ fn rawExchange(fx: *const Fixture, request: []const u8) !u16 {
     var w = stream.writer(fx.io, &.{});
     try w.interface.writeAll(request);
 
-    const posix = std.posix;
-    const fd = stream.socket.handle;
-    var fds = [_]posix.pollfd{.{ .fd = fd, .events = posix.POLL.IN, .revents = 0 }};
-    if (try posix.poll(&fds, harness.close_wait_ms) == 0) return error.NotClosed;
-
     var head: [64]u8 = undefined;
-    const n = posix.read(fd, &head) catch |err| switch (err) {
+    const wait_ms = harness.close_wait_ms;
+    const got = harness.readWithinWait(stream, &head, wait_ms) catch |err| switch (err) {
         error.ConnectionResetByPeer => return 0,
         else => return err,
     };
+    const n = got orelse return error.NotClosed;
     _ = try harness.awaitServerClose(stream);
     const prefix = "HTTP/1.1 ";
     if (n < prefix.len + 3) return 0;
@@ -1175,13 +1172,7 @@ test "openai deadline: a client that stops reading is closed, and the engine ser
     // A small receive buffer keeps the window small, so the server send buffer fills early.
     const stalled = try connectRaw(&fx);
     defer stalled.close(fx.io);
-    const rcvbuf: c_int = 4096;
-    try std.posix.setsockopt(
-        stalled.socket.handle,
-        std.posix.SOL.SOCKET,
-        std.posix.SO.RCVBUF,
-        std.mem.asBytes(&rcvbuf),
-    );
+    try harness.setReceiveBufferBytes(stalled, 4096);
 
     // The replies of the requests are far larger than the loopback buffers. The server stops
     // reading once its writes stall, so the client writes through a deadline too. A write that
@@ -1353,13 +1344,9 @@ fn postChunked(fx: *const Fixture, body: []const u8, chunk_bytes: usize) !u16 {
     w.interface.writeAll("0\r\n\r\n") catch {};
     w.interface.flush() catch {};
 
-    const posix = std.posix;
-    const fd = stream.socket.handle;
-    var fds = [_]posix.pollfd{.{ .fd = fd, .events = posix.POLL.IN, .revents = 0 }};
-    if (try posix.poll(&fds, harness.close_wait_ms) == 0) return error.NotClosed;
-
     var head: [64]u8 = undefined;
-    const n = try posix.read(fd, &head);
+    const got = try harness.readWithinWait(stream, &head, harness.close_wait_ms);
+    const n = got orelse return error.NotClosed;
     const prefix = "HTTP/1.1 ";
     if (n < prefix.len + 3) return 0;
     return std.fmt.parseInt(u16, head[prefix.len..][0..3], 10);
@@ -1563,20 +1550,18 @@ fn rawRepliesThen(
 /// Read until the server closes. A server that keeps the socket open fails with
 /// `error.NotClosed`.
 fn readToClose(stream: std.Io.net.Stream, arena: std.mem.Allocator) ![]const u8 {
-    const posix = std.posix;
-    const fd = stream.socket.handle;
     var got: std.ArrayList(u8) = .empty;
     var buf: [4096]u8 = undefined;
     // The replies of these tests hold a few KiB, so the bound has a wide margin.
     const reads_max = 1024;
     for (0..reads_max) |_| {
-        var fds = [_]posix.pollfd{.{ .fd = fd, .events = posix.POLL.IN, .revents = 0 }};
-        if (try posix.poll(&fds, harness.close_wait_ms) == 0) return error.NotClosed;
-
-        const n = posix.read(fd, &buf) catch |err| switch (err) {
-            error.ConnectionResetByPeer => break,
-            else => return err,
+        const read = harness.readWithinWait(stream, &buf, harness.close_wait_ms) catch |err| {
+            switch (err) {
+                error.ConnectionResetByPeer => break,
+                else => return err,
+            }
         };
+        const n = read orelse return error.NotClosed;
         if (n == 0) break;
         try got.appendSlice(arena, buf[0..n]);
     }
@@ -1832,12 +1817,9 @@ test "openai framing: Expect 100-continue gets the interim reply, then the body 
     const interim = "HTTP/1.1 100 Continue\r\n\r\n";
     var got: [interim.len]u8 = undefined;
     var have: usize = 0;
-    const posix = std.posix;
     while (have < got.len) {
-        const fd = stream.socket.handle;
-        var fds = [_]posix.pollfd{.{ .fd = fd, .events = posix.POLL.IN, .revents = 0 }};
-        if (try posix.poll(&fds, harness.close_wait_ms) == 0) return error.NoInterimReply;
-        const n = try posix.read(fd, got[have..]);
+        const read = try harness.readWithinWait(stream, got[have..], harness.close_wait_ms);
+        const n = read orelse return error.NoInterimReply;
         if (n == 0) return error.NoInterimReply;
         have += n;
     }
@@ -1928,14 +1910,11 @@ test "openai framing: a client still sending after a 413 gets the reply and a cl
     try w.interface.writeAll(chat_head ++ big);
 
     // Read the whole refusal first, so the body below reaches a server that has already replied.
-    const posix = std.posix;
-    const fd = stream.socket.handle;
     var got: [4096]u8 = undefined;
     var have: usize = 0;
     while (std.mem.find(u8, got[0..have], "}}") == null) {
-        var fds = [_]posix.pollfd{.{ .fd = fd, .events = posix.POLL.IN, .revents = 0 }};
-        if (try posix.poll(&fds, harness.close_wait_ms) == 0) return error.NoReply;
-        const n = try posix.read(fd, got[have..]);
+        const read = try harness.readWithinWait(stream, got[have..], harness.close_wait_ms);
+        const n = read orelse return error.NoReply;
         if (n == 0) return error.NoReply;
         have += n;
     }
@@ -1949,9 +1928,8 @@ test "openai framing: a client still sending after a 413 gets the reply and a cl
         try w.interface.writeAll(&chunk);
     }
     try stream.shutdown(fx.io, .send);
-    var fds = [_]posix.pollfd{.{ .fd = fd, .events = posix.POLL.IN, .revents = 0 }};
-    if (try posix.poll(&fds, harness.close_wait_ms) == 0) return error.NotClosed;
-    try std.testing.expectEqual(@as(usize, 0), try posix.read(fd, &got));
+    const last = try harness.readWithinWait(stream, &got, harness.close_wait_ms);
+    try std.testing.expectEqual(@as(usize, 0), last orelse return error.NotClosed);
 }
 
 test "openai framing: a chunked request on a kept connection, then a pipelined request" {

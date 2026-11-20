@@ -12,6 +12,7 @@
 //! Skips. Every test also returns `error.SkipZigTest` when no fixture exists.
 
 const std = @import("std");
+const builtin = @import("builtin");
 const zigferencer = @import("zigferencer");
 const protocol = zigferencer.serve_protocol;
 const Client = zigferencer.serve_client.Client;
@@ -59,6 +60,11 @@ const Zmq = struct {
     /// Null when the library is absent. A library without one of the symbols
     /// is not the libzmq the tests target, and that fails the test.
     fn open() !?Zmq {
+        // Std 0.16 has no dynamic library loading on Windows, so every test skips there.
+        if (builtin.os.tag == .windows) {
+            return null;
+        }
+
         var lib = std.DynLib.open("libzmq.so.5") catch return null;
         errdefer lib.close();
 
@@ -75,7 +81,9 @@ const Zmq = struct {
     }
 
     fn deinit(self: *Zmq) void {
-        self.lib.close();
+        if (builtin.os.tag != .windows) {
+            self.lib.close();
+        }
         self.* = undefined;
     }
 

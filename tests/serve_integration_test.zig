@@ -46,6 +46,7 @@
 //! Skips. Every test over a model returns `error.SkipZigTest` when no fixture exists.
 
 const std = @import("std");
+const builtin = @import("builtin");
 const zigferencer = @import("zigferencer");
 const protocol = zigferencer.serve_protocol;
 const Client = zigferencer.serve_client.Client;
@@ -229,7 +230,10 @@ const AcceptScript = struct {
 /// A listener for `acceptNext` when the script ends in a failure, so no real socket is read.
 fn unusedListener() std.Io.net.Server {
     var server: std.Io.net.Server = undefined;
-    server.options = {};
+    server.options = switch (builtin.os.tag) {
+        .windows => .{ .mode = .stream, .protocol = null },
+        else => {},
+    };
     return server;
 }
 
@@ -887,10 +891,7 @@ test "a binary client that floods PING and never reads frees its slot" {
         var stalled = try h.connect();
         defer stalled.deinit();
 
-        const fd = stalled.stream.socket.handle;
-        const rcvbuf: c_int = 4096;
-        const posix = std.posix;
-        try posix.setsockopt(fd, posix.SOL.SOCKET, posix.SO.RCVBUF, std.mem.asBytes(&rcvbuf));
+        try harness.setReceiveBufferBytes(stalled.stream, 4096);
 
         // The writer meets its deadline on the full socket, and the reader waits on the full
         // queue. The flood stops at its own write deadline, once the reader stops reading.
@@ -986,10 +987,7 @@ test "a stop while a binary client does not read returns before the io deadline"
     defer stalled.deinit();
 
     // A small receive buffer keeps the window small, so the server send buffer fills early.
-    const fd = stalled.stream.socket.handle;
-    const rcvbuf: c_int = 4096;
-    const posix = std.posix;
-    try posix.setsockopt(fd, posix.SOL.SOCKET, posix.SO.RCVBUF, std.mem.asBytes(&rcvbuf));
+    try harness.setReceiveBufferBytes(stalled.stream, 4096);
 
     // The reader answers a ZMTP PING with a PONG in the out-queue and waits while the queue is
     // full. So once the writer blocks on the full socket, the reader stops reading, and the

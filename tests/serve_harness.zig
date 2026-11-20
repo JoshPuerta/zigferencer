@@ -17,6 +17,8 @@
 //!
 //! Close waits. `awaitServerClose` reads a raw socket until the server closes it. Each read waits
 //! at most `close_wait_ms`, so a server with no deadline fails a test and does not hang it.
+//! `readWithinWait` and `setReceiveBufferBytes` make raw socket calls, and they return
+//! `error.SkipZigTest` on Windows.
 //!
 //! Chat template. The kind defaults to `.none`, because template wrapping has its own unit tests
 //! and the reference comparison holds for any template. A test of the turn wraps names its kind.
@@ -29,6 +31,7 @@
 //! control end-of-sequence token.
 
 const std = @import("std");
+const builtin = @import("builtin");
 const Io = std.Io;
 const Allocator = std.mem.Allocator;
 const zigferencer = @import("zigferencer");
@@ -373,26 +376,49 @@ pub fn oneTurn(client: *Client, sid: u32, prompt: []const u8) !Stream {
 /// Read until the server closes `stream`, and return the count of bytes read. A reset counts as a
 /// close. Each read waits at most `close_wait_ms`, and a longer wait returns `error.NotClosed`.
 pub fn awaitServerClose(stream: Io.net.Stream) !usize {
-    const posix = std.posix;
-    const fd = stream.socket.handle;
     var buf: [4096]u8 = undefined;
     var total: usize = 0;
     // The tests read at most a few MiB before the close, so the bound has a wide margin.
     const reads_max = 1 << 16;
     var reads: u32 = 0;
     while (reads < reads_max) : (reads += 1) {
-        var fds = [_]posix.pollfd{.{ .fd = fd, .events = posix.POLL.IN, .revents = 0 }};
-        if (try posix.poll(&fds, close_wait_ms) == 0) return error.NotClosed;
-
-        const n = posix.read(fd, &buf) catch |err| switch (err) {
+        const got = readWithinWait(stream, &buf, close_wait_ms) catch |err| switch (err) {
             error.ConnectionResetByPeer => return total,
             else => return err,
         };
+        const n = got orelse return error.NotClosed;
         if (n == 0) return total;
         total += n;
     }
 
     return error.NotClosed;
+}
+
+/// Wait at most `wait_ms` for bytes or a close on `stream`, then read once into `buf`.
+/// Null means that the wait ended first. Zero means that the peer closed.
+pub fn readWithinWait(
+    stream: Io.net.Stream,
+    buf: []u8,
+    wait_ms: i32,
+) (std.posix.PollError || std.posix.ReadError || error{SkipZigTest})!?usize {
+    std.debug.assert(wait_ms >= 0);
+    return switch (builtin.os.tag) {
+        .windows => skipOnWindows(),
+        else => readWithinWaitPosix(stream, buf, wait_ms),
+    };
+}
+
+/// Set the receive buffer of `stream` to `bytes`, so a test can fill the send path of the server
+/// with few bytes.
+pub fn setReceiveBufferBytes(
+    stream: Io.net.Stream,
+    bytes: c_int,
+) (std.posix.SetSockOptError || error{SkipZigTest})!void {
+    std.debug.assert(bytes > 0);
+    return switch (builtin.os.tag) {
+        .windows => skipOnWindows(),
+        else => setReceiveBufferBytesPosix(stream, bytes),
+    };
 }
 
 /// The serving invariant for one turn: the same token ids and the same
@@ -419,4 +445,34 @@ pub fn controlVocab(arena: Allocator) !vocab_mod.Vocab {
         .alignment = 1,
     };
     return vocab_mod.buildFromParsed(arena, parsed);
+}
+
+// -- helpers ----------------------------------------------------------------
+
+/// A std socket on Windows is not a POSIX descriptor, so the raw socket calls skip the test there.
+fn skipOnWindows() error{SkipZigTest} {
+    return error.SkipZigTest;
+}
+
+fn readWithinWaitPosix(
+    stream: Io.net.Stream,
+    buf: []u8,
+    wait_ms: i32,
+) (std.posix.PollError || std.posix.ReadError)!?usize {
+    const posix = std.posix;
+    const fd = stream.socket.handle;
+    var fds = [_]posix.pollfd{.{ .fd = fd, .events = posix.POLL.IN, .revents = 0 }};
+    if (try posix.poll(&fds, wait_ms) == 0) {
+        return null;
+    }
+
+    const n = try posix.read(fd, buf);
+    std.debug.assert(n <= buf.len);
+    return n;
+}
+
+fn setReceiveBufferBytesPosix(stream: Io.net.Stream, bytes: c_int) std.posix.SetSockOptError!void {
+    const posix = std.posix;
+    const fd = stream.socket.handle;
+    try posix.setsockopt(fd, posix.SOL.SOCKET, posix.SO.RCVBUF, std.mem.asBytes(&bytes));
 }

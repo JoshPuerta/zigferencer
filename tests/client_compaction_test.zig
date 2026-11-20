@@ -216,6 +216,7 @@ const Setup = struct {
 
         s.client = try s.h.connect();
         errdefer s.client.deinit();
+        const verbose = try std.testing.environ.contains(gpa, "ZIGFERENCER_TEST_VERBOSE");
 
         const info = try s.client.hello();
         try std.testing.expectEqual(max_seq, info.max_seq);
@@ -227,7 +228,7 @@ const Setup = struct {
             .t = s.t,
             .session = session,
             .system_rows = session.kv_pos,
-            .verbose = std.testing.environ.getPosix("ZIGFERENCER_TEST_VERBOSE") != null,
+            .verbose = verbose,
         };
     }
 

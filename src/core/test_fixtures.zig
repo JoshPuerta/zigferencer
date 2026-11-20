@@ -22,7 +22,14 @@ pub fn path(arena: Allocator, pub_name: []const u8) (Error || Allocator.Error)![
     const entry = registry.lookup(pub_name);
     assert(entry != null);
     const model = entry.?.*;
-    const env = std.testing.environ.getPosix(registry.models_dir_env);
+    const env: ?[]const u8 = std.testing.environ.getAlloc(
+        arena,
+        registry.models_dir_env,
+    ) catch |err| switch (err) {
+        error.EnvironmentVariableMissing => null,
+        error.InvalidWtf8 => unreachable,
+        error.OutOfMemory => return error.OutOfMemory,
+    };
     const env_set = if (env) |v| v.len > 0 else false;
     const root = registry.resolveRoot(env);
     const found = try registry.locate(arena, std.testing.io, root, model);

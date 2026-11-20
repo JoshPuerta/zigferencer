@@ -51,9 +51,10 @@ test: ## Run the unit and integration tests and the format check in ReleaseSafe
 fmt: ## Format the sources. zig fmt prints each file it changes
 	$(ZIG) fmt src tests tools build.zig build.zig.zon
 
-check-targets: ## Type-check the CPU: default, naive, Windows, and macOS
+check-targets: ## Type-check the CPU: default, naive, Windows, and macOS. Compile the Windows tests
 	$(ZIG) build check -Dops-backend=naive $(FLAGS)
 	for t in native $(CROSS); do $(ZIG) build check -Dtarget=$$t $(FLAGS); done
+	$(ZIG) build test-build -Dtarget=x86_64-windows-gnu $(FLAGS)
 
 ci: FLAGS += -Dtrace=true --seed 0x2a
 ci: check-targets test ## Run the CPU part of CI. It needs no GPU and no model file
