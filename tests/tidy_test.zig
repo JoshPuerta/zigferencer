@@ -37,14 +37,14 @@
 //! 13. An OS condition lives only in `src/os/`: no other file names
 //!     `builtin.os.tag`, `builtin.target.os`, `std.os.linux`, `std.os.windows`,
 //!     or `std.posix`. This rule covers `src/`, `tests/`, and `tools/`. Test
-//!     blocks are exempt. Four files make raw socket calls or branch on
-//!     purpose. `build.zig` makes the build decisions of each OS, so the rule
+//!     blocks are exempt. Three files branch on the OS on purpose.
+//!     `build.zig` makes the build decisions of each OS, so the rule
 //!     does not read it.
 //! 14. In `src/serve/` and `src/cli/`, only `serve/timed_stream.zig` reads or
 //!     writes a socket. On Windows a wake cancels the socket requests, and std
-//!     stops at `unreachable` when a cancel ends one of its own requests. A
-//!     line that names `File` anywhere, a trailing comment included, reads or
-//!     writes a file, so the rule skips the whole line.
+//!     stops at `unreachable` when a cancel ends one of its own requests. The
+//!     rule skips each line that names `File`, a trailing comment included,
+//!     because a file reader has the same call names.
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
@@ -118,10 +118,9 @@ const os_tokens = [_][]const u8{
     "std" ++ ".posix",
 };
 
-/// The files outside `src/os/` that make raw socket calls on purpose: the serve tests and the
-/// serve demo.
+/// The files outside `src/os/` that branch on the OS on purpose: two serve tests and the serve
+/// demo.
 const os_allowed = [_][]const u8{
-    "tests/serve_harness.zig",
     "tests/zmq_interop_test.zig",
     "tests/serve_integration_test.zig",
     "src/dev/serve_demo_cmd.zig",
@@ -275,6 +274,17 @@ fn lineLessThan(_: void, a: Violation, b: Violation) bool {
     return a.line < b.line;
 }
 
+/// `path` of a walker entry with the native separator written as `/`, in `buf`. The allowlists and
+/// the layer prefixes use `/`. The walker joins with `\` on Windows and reuses its own buffer.
+fn slashPath(buf: *[std.fs.max_path_bytes]u8, path: []const u8) ![]const u8 {
+    if (path.len > buf.len) return error.NameTooLong;
+
+    const out = buf[0..path.len];
+    @memcpy(out, path);
+    std.mem.replaceScalar(u8, out, std.fs.path.sep, '/');
+    return out;
+}
+
 /// Run `context.visit` on every Zig file under `root`, and return the total of breaks.
 fn walkTree(gpa: Allocator, root: []const u8, context: anytype) !usize {
     const io = std.testing.io;
@@ -284,6 +294,7 @@ fn walkTree(gpa: Allocator, root: []const u8, context: anytype) !usize {
     var walker = try dir.walk(gpa);
     defer walker.deinit();
 
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
     var total: usize = 0;
     while (try walker.next(io)) |entry| {
         if (entry.kind != .file or !std.mem.endsWith(u8, entry.path, ".zig")) continue;
@@ -291,7 +302,8 @@ fn walkTree(gpa: Allocator, root: []const u8, context: anytype) !usize {
         const source = try dir.readFileAlloc(io, entry.path, gpa, .limited(max_file_bytes));
         defer gpa.free(source);
 
-        total += try context.visit(gpa, .{ .root = root, .path = entry.path, .source = source });
+        const path = try slashPath(&path_buf, entry.path);
+        total += try context.visit(gpa, .{ .root = root, .path = path, .source = source });
     }
 
     return total;
