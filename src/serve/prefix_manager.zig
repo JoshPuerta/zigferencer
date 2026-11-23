@@ -25,6 +25,7 @@
 //! generate turn stores the logits of its final row, because this tick is the only one in which
 //! the engine still holds them. An exact-duplicate prompt then needs zero forward rows. An
 //! opening turn stores none. A failed logits allocation downgrades the entry to restore-only.
+//! When `pinned_times` holds a value, the gate reads it in place of the two measured times.
 //!
 //! Lifetime. A `Hit` points into the cache entry. The caller must use it before the next insert
 //! reallocates the RAM list. The strings of `CacheConfig.dir` and `preload` must outlive the
@@ -68,6 +69,12 @@ pub const CacheConfig = struct {
     model_fp: u64 = 0,
     /// Boot warm-up texts (`--preload`), at most `limits.serve_preload_max`.
     preload: []const []const u8 = &.{},
+};
+
+/// The two times that the admission gate reads, in nanoseconds.
+pub const AdmitTimes = struct {
+    prefill_ns: u64,
+    restore_ns: u64,
 };
 
 /// One cache entry offered to a restore.
@@ -130,6 +137,9 @@ pub const PrefixManager = struct {
     // Disk-tier splits of the aggregates. A disk hit also promotes into RAM.
     disk_hits: u64 = 0,
     disk_inserts: u64 = 0,
+    /// A fake runner has no real cost, so a preempted copy decides the gate unless its test pins
+    /// the times. Null means that `insert` measures. Only the engine thread uses it.
+    pinned_times: ?AdmitTimes = null,
 
     /// Without `can_snapshot` or a RAM budget, the cache stays null and every turn runs cold.
     pub fn init(gpa: Allocator, io: Io, cfg: CacheConfig, can_snapshot: bool) PrefixManager {
@@ -251,7 +261,11 @@ pub const PrefixManager = struct {
         }
 
         // Admit the entry and count it.
-        const admitted = cache.admit(key, tokens, buf, logits, prefill_ns, restore_ns);
+        const times: AdmitTimes = self.pinned_times orelse .{
+            .prefill_ns = prefill_ns,
+            .restore_ns = restore_ns,
+        };
+        const admitted = cache.admit(key, tokens, buf, logits, times.prefill_ns, times.restore_ns);
         if (admitted) {
             self.inserts += 1;
             if (cache.last_admit_disk) {

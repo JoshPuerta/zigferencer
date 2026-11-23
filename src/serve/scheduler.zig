@@ -49,8 +49,8 @@
 //! alone. It ends with one `appended` reply and moves `turns_done` by the pair count.
 //!
 //! Id sets. Each entry owns two id sets of `set_words` words at its entry index. The presence set
-//! holds the ids accepted since the turn began (the penalty counts this completion only, as OpenAI
-//! and vLLM do), and it clears at each admission. The context set
+//! holds the ids accepted since the turn began (the penalty counts this completion only, as the
+//! OpenAI API defines it), and it clears at each admission. The context set
 //! holds every id fed to the session since it opened. The engine reads both through the sampling
 //! params, and the scheduler marks them. They live outside `SessionEntry`, so a reset keeps them.
 //!
@@ -2651,6 +2651,19 @@ const StepRow = @import("../runtime/step_row.zig").StepRow;
 const test_fakes = @import("../runtime/test_fakes.zig");
 const test_vocab = test_fakes.vocab;
 
+/// Admission times that `worthwhile` admits, from its own unit test. The fake runner has no real
+/// cost, so the measured times let a preempted snapshot copy refuse an entry.
+const admit_times_pass: prefix_manager.AdmitTimes = .{
+    .prefill_ns = 270_000_000,
+    .restore_ns = 4_000_000,
+};
+
+/// Admission times that `worthwhile` refuses, from its own unit test.
+const admit_times_fail: prefix_manager.AdmitTimes = .{
+    .prefill_ns = 3_000_000,
+    .restore_ns = 4_000_000,
+};
+
 const TestRunner = struct {
     n_slots: u32,
     max_seq: u32,
@@ -2964,6 +2977,7 @@ const Fixture = struct {
             .cache = cache,
             .think = think,
         });
+        sched.prefix.pinned_times = admit_times_pass;
         const sink = try arena.create(FakeSink);
         sink.* = .{};
 
@@ -3857,8 +3871,7 @@ test "prefix cache: a repeated system prompt restores with zero engine rows" {
     var fx = try Fixture.setUpPrefix(std.testing.allocator, 2, 64, null, 1 << 20);
     defer fx.tearDown();
 
-    // The cold open offers the prefix. The measured admission gate compares a
-    // multi-tick prefill against a four-byte snapshot copy, so it admits.
+    // The cold open offers the prefix. The fixture pins admission times that the gate admits.
     const sa = try fx.openSession(1, "abcdefab");
     try std.testing.expectEqual(@as(u64, 0), fx.sched.prefix.hits);
     try std.testing.expectEqual(@as(u64, 1), fx.sched.prefix.misses);
@@ -3884,6 +3897,30 @@ test "prefix cache: a repeated system prompt restores with zero engine rows" {
     const toks_a = tokenIds(fx.sink.seen(), sa);
     const toks_b = tokenIds(fx.sink.seen(), sb);
     try std.testing.expectEqualSlices(u32, toks_a[0..3], toks_b[0..3]);
+}
+
+test "prefix admission: pinned times decide the gate both ways" {
+    var fx = try Fixture.setUpPrefix(std.testing.allocator, 4, 64, null, 1 << 20);
+    defer fx.tearDown();
+
+    // Refused times: the cold open offers the prefix, the gate refuses it, and a repeat misses.
+    fx.sched.prefix.pinned_times = admit_times_fail;
+    _ = try fx.openSession(1, "abcdefab");
+    const rows_refused = fx.runner.rows_log_len;
+    _ = try fx.openSession(2, "abcdefab");
+    try std.testing.expectEqual(@as(u64, 0), fx.sched.prefix.inserts);
+    try std.testing.expectEqual(@as(u64, 0), fx.sched.prefix.hits);
+    try std.testing.expectEqual(@as(u64, 2), fx.sched.prefix.misses);
+    try std.testing.expectEqual(rows_refused + 8, fx.runner.rows_log_len);
+
+    // Admitted times: the next cold open inserts, and a repeat restores with no forward row.
+    fx.sched.prefix.pinned_times = admit_times_pass;
+    _ = try fx.openSession(3, "abcdefab");
+    try std.testing.expectEqual(@as(u64, 1), fx.sched.prefix.inserts);
+    const rows_admitted = fx.runner.rows_log_len;
+    _ = try fx.openSession(4, "abcdefab");
+    try std.testing.expectEqual(@as(u64, 1), fx.sched.prefix.hits);
+    try std.testing.expectEqual(rows_admitted, fx.runner.rows_log_len);
 }
 
 test "prefix cache: a generate turn restores the longest prefix and feeds only the suffix" {
