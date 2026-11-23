@@ -24,3 +24,35 @@ jobs:
           echo "$RUNNER_TEMP/zig-dl/zig-x86_64-linux-0.16.0" >> "$GITHUB_PATH"
       - name: Run the CPU checks
         run: make ci
+
+  windows:
+    runs-on: windows-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - name: Install Zig 0.16.0
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          # Keep the progress bar out of the job log.
+          $ProgressPreference = 'SilentlyContinue'
+          $url = 'https://ziglang.org/download/0.16.0/zig-x86_64-windows-0.16.0.zip'
+          $sha = '68659eb5f1e4eb1437a722f1dd889c5a322c9954607f5edcf337bc3684a75a7e'
+          $dl = Join-Path $env:RUNNER_TEMP 'zig-dl'
+          $zip = Join-Path $dl 'zig.zip'
+          New-Item -ItemType Directory -Force -Path $dl | Out-Null
+          Invoke-WebRequest -Uri $url -OutFile $zip
+          $got = (Get-FileHash -Algorithm SHA256 -Path $zip).Hash.ToLowerInvariant()
+          if ($got -ne $sha) { throw "SHA-256 of $zip is $got, expected $sha" }
+          Expand-Archive -Path $zip -DestinationPath $dl
+          Add-Content -Path $env:GITHUB_PATH -Value (Join-Path $dl 'zig-x86_64-windows-0.16.0')
+      - name: Run the tests in ReleaseSafe
+        shell: pwsh
+        run: >-
+          zig build test -Doptimize=ReleaseSafe -Dtrace=true --seed 0x2a
+          --test-timeout 120s --summary all
+      - name: Run the unit tests in Debug and compile the bench
+        shell: pwsh
+        run: >-
+          zig build test-unit bench-build -Dtrace=true --seed 0x2a
+          --test-timeout 120s --summary all
