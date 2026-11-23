@@ -38,9 +38,10 @@
 //! there comes after the store, and the load of `sessions` then reads the new count.
 //!
 //! Socket close. Exactly one actor closes the socket of a connection. The first to claim it owns
-//! the close. The claim is `live -> task` when the last task exits, or `live -> teardown` when
-//! teardown must shut the fd down to wake a blocked task. The other actor must not touch the fd,
-//! because a `shutdown` or `close` after the other `close` is an EBADF.
+//! the close. The claim is `live -> task` when the last task exits. The claim is
+//! `live -> teardown` when teardown must wake a blocked task with `timed_stream.wake`. The other
+//! actor must not touch the fd, because a wake or a `close` after the other `close` fails on a
+//! closed handle.
 //!
 //! Adapter surface. All methods are duck-typed over the engine and a `*Conn`:
 //!   - `pub const ConnExt`            per-connection state the adapter owns
@@ -50,8 +51,8 @@
 //!                                    (with the stream closed and the started
 //!                                    tasks awaited) if spawning failed
 //!   - `beginClose(engine, conn)`     unblock the task(s) at teardown. Close
-//!                                    the out-queue, and shut the socket down
-//!                                    so a blocked read or write returns
+//!                                    the out-queue, and wake the socket so
+//!                                    a blocked read or write returns
 //!   - `awaitConn(engine, conn)`      await the task futures in `conn.ext`
 //!   - `refuse(io, *Stream)`          reject a connection at the cap with one
 //!                                    send that does not wait
@@ -385,15 +386,15 @@ pub fn ServeEngine(comptime SessionPool: type, comptime CodecT: type, comptime A
         }
 
         /// Idempotent: exactly one close reaches the queue. A binary writer then drains what is
-        /// buffered, flushes, shuts the socket down, and exits. The HTTP task ends its turn with
+        /// buffered, flushes, wakes the socket, and exits. The HTTP task ends its turn with
         /// `error.ConnClosed`.
         pub fn closeOutput(self: *Self, conn: *Conn) void {
             if (conn.out_closed.swap(true, .acq_rel)) return;
             conn.out_q.close(self.io);
         }
 
-        /// Teardown claims the socket of a connection so it can shut it down to wake a blocked
-        /// task. Returns true only if the last task has not claimed it.
+        /// Teardown claims the socket of a connection so it can wake a blocked task. Returns true
+        /// only if the last task has not claimed it.
         pub fn claimStreamForTeardown(self: *Self, conn: *Conn) bool {
             _ = self;
             return conn.fin.cmpxchgStrong(fin_live, fin_teardown, .acq_rel, .acquire) == null;

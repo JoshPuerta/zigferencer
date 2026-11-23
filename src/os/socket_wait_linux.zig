@@ -28,6 +28,25 @@ const signal_passes_max: u32 = 64;
 
 // -- api --------------------------------------------------------------------
 
+pub fn read(io: Io, stream: net.Stream, dest: [][]u8) ?usize {
+    return io.vtable.netRead(io.userdata, stream.socket.handle, dest) catch null;
+}
+
+pub fn write(
+    io: Io,
+    stream: net.Stream,
+    buffered: []const u8,
+    data: []const []const u8,
+    splat: usize,
+) ?usize {
+    const handle = stream.socket.handle;
+    return io.vtable.netWrite(io.userdata, handle, buffered, data, splat) catch null;
+}
+
+pub fn wake(io: Io, stream: net.Stream) void {
+    stream.shutdown(io, .both) catch {};
+}
+
 pub fn waitReadable(io: Io, stream: net.Stream, deadline: Io.Clock.Timestamp) Wait {
     return waitEvents(io, stream, posix.POLL.IN, deadline);
 }

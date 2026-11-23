@@ -13,7 +13,8 @@ checks both rules.
   no implementation: null, false, or nothing.
 - The serve socket calls have one file for each OS. `socket_wait.zig` selects one file at compile
   time, and a comptime check asserts that the selected file declares every function with the
-  expected type.
+  expected type. An OS file can take a body of another OS file by name. The Windows file takes the
+  waits, the probe, the keepalive, and the drains of `socket_wait_none.zig`.
 
 `builtin.os.tag` is fixed at compile time, so Zig never analyzes the case of another OS.
 
@@ -30,6 +31,7 @@ checks both rules.
 | `process.zig` | The OS name, the process id, the resident memory, and the open files. |
 | `threads.zig` | The stack size of a pool worker, and the thread name in the kernel. |
 | `socket_wait.zig` | The selector of the serve socket calls, with their result types. |
-| `socket_wait_linux.zig` | The socket calls on Linux: the wait with a deadline, the send and drains that do not block, the hang-up probe, and the keepalive. |
-| `socket_wait_none.zig` | The socket calls on every other OS: no deadline, no probe, and no keepalive. |
+| `socket_wait_linux.zig` | The socket calls on Linux: the std read and write, the wake by shutdown, the wait with a deadline, the send and drains that do not block, the hang-up probe, and the keepalive. |
+| `socket_wait_windows.zig` | The socket calls on Windows: the read and write as requests of the project, and the wake that cancels them. No deadline, no probe, and no keepalive. |
+| `socket_wait_none.zig` | The socket calls on every other OS: the std read and write, the wake by shutdown, no deadline, no probe, and no keepalive. |
 | `windows_kernel32_declarations.zig` | The kernel32 functions that the standard library does not declare. |

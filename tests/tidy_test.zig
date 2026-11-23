@@ -40,6 +40,11 @@
 //!     blocks are exempt. Four files make raw socket calls or branch on
 //!     purpose. `build.zig` makes the build decisions of each OS, so the rule
 //!     does not read it.
+//! 14. In `src/serve/` and `src/cli/`, only `serve/timed_stream.zig` reads or
+//!     writes a socket. On Windows a wake cancels the socket requests, and std
+//!     stops at `unreachable` when a cancel ends one of its own requests. A
+//!     line that names `File` anywhere, a trailing comment included, reads or
+//!     writes a file, so the rule skips the whole line.
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
@@ -122,6 +127,25 @@ const os_allowed = [_][]const u8{
     "src/dev/serve_demo_cmd.zig",
 };
 
+/// The directories of `src/` whose code reads or writes a connection socket.
+const socket_dirs = [_][]const u8{ "serve/", "cli/" };
+
+/// The one file of `socket_dirs` that reads and writes a socket.
+const socket_file = "serve/timed_stream.zig";
+
+/// The std socket reads and writes, and the std types that make them. The rule reads only
+/// `socket_dirs`, so this file can hold the tokens whole.
+const socket_tokens = [_][]const u8{
+    "netRead",
+    "netWrite",
+    "netSend",
+    "netReceive",
+    ".reader(",
+    ".writer(",
+    "net.Stream.Reader",
+    "net.Stream.Writer",
+};
+
 /// The declaration qualifiers that sit between a doc comment and the keyword it documents.
 const qualifiers = [_][]const u8{ "pub ", "export ", "inline ", "noinline ", "extern " };
 
@@ -142,6 +166,7 @@ const Rule = enum {
     alias,
     comptime_note,
     os_condition,
+    socket_call,
 };
 
 /// The sections in file order. Every label under `tests` counts as `tests`.
@@ -196,6 +221,18 @@ const OsCheck = struct {
         defer found.deinit(gpa);
 
         try osViolations(gpa, &found, file.source);
+        return report(file.root, file.path, &found);
+    }
+};
+
+const SocketCheck = struct {
+    fn visit(_: SocketCheck, gpa: Allocator, file: File) !usize {
+        if (!isSocketScope(file.path)) return 0;
+
+        var found: Found = .empty;
+        defer found.deinit(gpa);
+
+        try socketViolations(gpa, &found, file.source);
         return report(file.root, file.path, &found);
     }
 };
@@ -352,6 +389,32 @@ fn osViolations(gpa: Allocator, found: *Found, source: []const u8) !void {
         for (os_tokens) |token| {
             if (std.mem.indexOf(u8, line, token) != null) {
                 try found.append(gpa, .{ .rule = .os_condition, .line = line_no });
+                break;
+            }
+        }
+    }
+}
+
+/// True when the rule of socket calls covers `path`, a path under `src/`.
+fn isSocketScope(path: []const u8) bool {
+    if (std.mem.eql(u8, path, socket_file)) return false;
+    return startsWithAny(path, &socket_dirs);
+}
+
+/// Find each std socket read or write in a line that is no comment. Test blocks count, because a
+/// test of a connection can meet a wake too.
+fn socketViolations(gpa: Allocator, found: *Found, source: []const u8) !void {
+    var line_no: usize = 0;
+    var lines = std.mem.splitScalar(u8, source, '\n');
+    while (lines.next()) |line| {
+        line_no += 1;
+        const code = std.mem.trimStart(u8, line, " ");
+        if (std.mem.startsWith(u8, code, "//")) continue;
+        if (std.mem.indexOf(u8, line, "File") != null) continue;
+
+        for (socket_tokens) |token| {
+            if (std.mem.indexOf(u8, line, token) != null) {
+                try found.append(gpa, .{ .rule = .socket_call, .line = line_no });
                 break;
             }
         }
@@ -1061,6 +1124,52 @@ test "no file outside src/os/ holds an OS condition" {
     breaks += try walkTree(gpa, "tests", OsCheck{});
     breaks += try walkTree(gpa, "tools", OsCheck{});
     try std.testing.expectEqual(@as(usize, 0), breaks);
+}
+
+test "the socket rule finds a std socket read or write outside timed_stream" {
+    const open = "fn f() void {\n    _ = ";
+    const close = ";\n}\n";
+    const Case = struct { src: []const u8, want: ?Rule };
+    const wrapped = "stream.reader(\n        io,\n        &buf,\n    )";
+    const in_test = "test \"t\" {\n    _ = s.writer(io, &b)" ++ close;
+    const cases = [_]Case{
+        .{ .src = open ++ "io.vtable.netRead(u, h, d)" ++ close, .want = .socket_call },
+        .{ .src = open ++ "io.vtable.netWrite(u, h, b, d, 1)" ++ close, .want = .socket_call },
+        .{ .src = open ++ "io.vtable.netSend(u, h, m, f)" ++ close, .want = .socket_call },
+        .{ .src = open ++ "io.vtable.netReceive(u, h, m, d, f, t)" ++ close, .want = .socket_call },
+        .{ .src = open ++ "stream.reader(io, &buf)" ++ close, .want = .socket_call },
+        .{ .src = open ++ "conn.stream.writer(engine.io, &buf)" ++ close, .want = .socket_call },
+        .{ .src = open ++ wrapped ++ close, .want = .socket_call },
+        .{ .src = "const R = Io.net.Stream.Reader;\n", .want = .socket_call },
+        .{ .src = "const W = net.Stream.Writer;\n", .want = .socket_call },
+        .{ .src = in_test, .want = .socket_call },
+        .{ .src = open ++ "Io.File.stdin().reader(io, &buf)" ++ close, .want = null },
+        .{ .src = "// stream.reader(io, &buf)\n", .want = null },
+        .{ .src = open ++ "stream.shutdown(io, .send)" ++ close, .want = null },
+        .{ .src = "const R = timed_stream.Reader;\n", .want = null },
+    };
+    for (cases, 0..) |c, i| {
+        errdefer std.debug.print("tidy socket case {d}\n", .{i});
+
+        var found: Found = .empty;
+        defer found.deinit(std.testing.allocator);
+
+        try socketViolations(std.testing.allocator, &found, c.src);
+        try std.testing.expectEqual(c.want, firstRule(found));
+    }
+
+    try std.testing.expect(isSocketScope("serve/client.zig"));
+    try std.testing.expect(isSocketScope("cli/client/client_streaming.zig"));
+    try std.testing.expect(!isSocketScope("serve/timed_stream.zig"));
+    try std.testing.expect(!isSocketScope("os/socket_wait_linux.zig"));
+    try std.testing.expect(!isSocketScope("dev/bench_model/bench_model_logits.zig"));
+}
+
+test "no serve or CLI file reads or writes a socket outside timed_stream" {
+    try std.testing.expectEqual(
+        @as(usize, 0),
+        try walkTree(std.testing.allocator, "src", SocketCheck{}),
+    );
 }
 
 test "no test sleeps and no non-test code prints" {

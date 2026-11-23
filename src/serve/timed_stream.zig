@@ -9,18 +9,24 @@
 //! normal path. The wait measures the deadline on the monotonic clock, so a signal that restarts
 //! the wait does not extend it.
 //!
-//! Wake. A task cancel does not wake a waiting `poll`. Teardown wakes it by a socket shutdown,
-//! which makes the socket readable and writable.
+//! Wake. A task cancel does not wake a waiting `poll`. A shutdown alone does not end a pending
+//! read or write on Windows. So teardown, a writer that stops, and a client that hangs up call
+//! `wake`. This one socket call ends every read and write that waits on the socket. It also fails
+//! the later ones. Linux shuts the socket down. Windows also cancels the I/O requests of the
+//! socket.
 //!
 //! Platforms. `os/socket_wait.zig` makes the OS calls. Linux has the deadline, the probe, and the
 //! keepalive. The read waits in `poll`, and the write uses a send that does not block. The drain
 //! of input (`endOutput`, `dropArrived`, `lingerOutput`) and the `sendOnce` that does not wait
-//! also exist on Linux only. On the other platforms the reader and the writer call the std socket
-//! path with no deadline, the probe reports no hang-up, and the keepalive does nothing. These
-//! platforms drop no input in the drain functions, and `sendOnce` is the blocking std write.
+//! also exist on Linux only. On the other platforms the reader and the writer have no deadline,
+//! the probe reports no hang-up, and the keepalive does nothing. These platforms drop no input in
+//! the drain functions, and `sendOnce` is a write that blocks. Windows sends the reads and the
+//! writes as I/O requests of its own, so the wake can cancel them. Every other OS calls the std
+//! socket path.
 //!
-//! Threads. A reader or a writer belongs to one connection task. The value must not move after
-//! `init`, because the interface finds its parent by address.
+//! Threads. A reader or a writer belongs to one connection task. The interface finds its parent
+//! by address. So a caller must not copy the interface out of its value. A caller also must not
+//! move the value while a pointer to its interface is in use.
 
 const std = @import("std");
 const Io = std.Io;
@@ -85,10 +91,7 @@ pub const Reader = struct {
             }
         }
 
-        const io = r.io;
-        const n = io.vtable.netRead(io.userdata, r.stream.socket.handle, dest) catch {
-            return error.ReadFailed;
-        };
+        const n = socket_wait.read(r.io, r.stream, dest) orelse return error.ReadFailed;
         if (n == 0) return error.EndOfStream;
         if (n > data_size) {
             io_r.end += n - data_size;
@@ -134,10 +137,8 @@ pub const Writer = struct {
     }
 
     fn drainBlocking(w: *Writer, data: []const []const u8, splat: usize) Io.Writer.Error!usize {
-        const io = w.io;
-        const handle = w.stream.socket.handle;
         const buffered = w.interface.buffered();
-        const n = io.vtable.netWrite(io.userdata, handle, buffered, data, splat) catch {
+        const n = socket_wait.write(w.io, w.stream, buffered, data, splat) orelse {
             return error.WriteFailed;
         };
         return w.interface.consume(n);
@@ -194,15 +195,22 @@ pub fn enableKeepalive(stream: net.Stream) void {
 }
 
 /// Send `bytes` once with no wait. A short send drops the rest, because a refusal must not stall
-/// the acceptor. Off Linux this is the std blocking write, so a peer that never reads can hold it.
+/// the acceptor. Off Linux this is a write that blocks, so a peer that never reads can hold it.
 pub fn sendOnce(io: Io, stream: net.Stream, bytes: []const u8) void {
     if (!has_deadline) {
-        var w = stream.writer(io, &.{});
+        var w: Writer = .init(stream, io, &.{}, 0);
         w.interface.writeAll(bytes) catch {};
         return;
     }
 
     _ = socket_wait.sendNow(stream, bytes);
+}
+
+/// End every read and write that waits on the socket, and fail the later ones. The handle must
+/// stay open until the wake returns. Every read and write of the socket must go through this
+/// file, because on Windows the wake cancels them and std does not accept a cancelled request.
+pub fn wake(io: Io, stream: net.Stream) void {
+    socket_wait.wake(io, stream);
 }
 
 /// Close a refused socket in the order of `endOutput`.
@@ -246,6 +254,26 @@ const testing = std.testing;
 
 /// The deadline of a wait that a close of the peer ends at once.
 const close_wait_ms: u32 = 60_000;
+
+/// The bound for tests from a wake to the return of the last read or write that it ends, on the
+/// `.awake` clock. The TCP timer of a half-closed connection ends a waiting read at 120 s, which is
+/// also the limit of the test runner. Without this bound, a regression fails only at that limit.
+/// The tests of this file and the loopback test of `server.zig` read it.
+pub const wake_bound_ms: i64 = 10_000;
+
+/// The passes of the order in which the read waits first. Without the handshake of the test, the
+/// read already waited at the wake in most passes. With it, a few passes are enough.
+const wake_read_passes = 4;
+
+/// Loopback buffers hold a few MiB, so the chunk bound passes them with a wide margin.
+const wake_chunks_max = 4096;
+const wake_chunk = [_]u8{'x'} ** (64 * 1024);
+
+/// The end of one read or write task of the wake test, on the `.awake` clock.
+const WakeEnd = struct { failed: bool, at: Io.Clock.Timestamp };
+
+/// The ends of one order of the wake test, from the time of the wake.
+const WakeOrder = struct { woke_at: Io.Clock.Timestamp, read: WakeEnd, write: ?WakeEnd };
 
 const Pair = struct {
     server: net.Server,
@@ -305,6 +333,96 @@ test "timed_stream: a peer that never reads fails the write at the deadline" {
 
     try testing.expect(sent < chunks_max);
     try testing.expect(w.timed_out);
+}
+
+fn readUntilWake(io: Io, stream: net.Stream) WakeEnd {
+    var buf: [64]u8 = undefined;
+    var r: Reader = .init(stream, io, &buf, 0);
+    const failed = if (r.interface.takeByte()) |_| false else |_| true;
+    return .{ .failed = failed, .at = .now(io, .awake) };
+}
+
+fn writeUntilWake(io: Io, stream: net.Stream) WakeEnd {
+    var buf: [4096]u8 = undefined;
+    var w: Writer = .init(stream, io, &buf, 0);
+    var sent: u32 = 0;
+    while (sent < wake_chunks_max) : (sent += 1) {
+        w.interface.writeAll(&wake_chunk) catch break;
+    }
+
+    return .{ .failed = sent < wake_chunks_max, .at = .now(io, .awake) };
+}
+
+/// Read the one byte of the peer, set `got_byte`, and read again until the wake. A first read that
+/// fails also sets `got_byte`, so the test never waits for it in vain.
+fn readByteThenWait(io: Io, stream: net.Stream, got_byte: *Io.Event) WakeEnd {
+    var buf: [64]u8 = undefined;
+    var r: Reader = .init(stream, io, &buf, 0);
+    const first = r.interface.takeByte();
+    got_byte.set(io);
+    const first_ok = if (first) |byte| byte == 'a' else |_| false;
+    const second_failed = if (r.interface.takeByte()) |_| false else |_| true;
+    return .{ .failed = first_ok and second_failed, .at = .now(io, .awake) };
+}
+
+/// Order A: the wake comes first, and then a read and a write start on the socket.
+fn wakeThenCall(io: Io, stream: net.Stream) !WakeOrder {
+    const woke_at: Io.Clock.Timestamp = .now(io, .awake);
+    wake(io, stream);
+    var reader = try io.concurrent(readUntilWake, .{ io, stream });
+    errdefer _ = reader.cancel(io);
+    var writer = try io.concurrent(writeUntilWake, .{ io, stream });
+    return .{ .woke_at = woke_at, .read = reader.await(io), .write = writer.await(io) };
+}
+
+/// Order B: the read consumes the byte of the peer and reads again, and then the wake comes.
+fn readThenWake(io: Io, p: *Pair) !WakeOrder {
+    var cw = p.client.writer(io, &.{});
+    try cw.interface.writeAll("a");
+
+    var got_byte: Io.Event = .unset;
+    var reader = try io.concurrent(readByteThenWait, .{ io, p.conn, &got_byte });
+    errdefer _ = reader.cancel(io);
+    try got_byte.wait(io);
+
+    const woke_at: Io.Clock.Timestamp = .now(io, .awake);
+    wake(io, p.conn);
+    return .{ .woke_at = woke_at, .read = reader.await(io), .write = null };
+}
+
+fn expectWakeEnds(order: WakeOrder) !void {
+    try testing.expect(order.read.failed);
+    const read_ms = order.woke_at.durationTo(order.read.at).raw.toMilliseconds();
+    try testing.expect(read_ms < wake_bound_ms);
+    if (order.write) |write| {
+        try testing.expect(write.failed);
+        const write_ms = order.woke_at.durationTo(write.at).raw.toMilliseconds();
+        try testing.expect(write_ms < wake_bound_ms);
+    }
+}
+
+test "timed_stream: a wake ends a later read and write, and a read that waits" {
+    // Order A shows that a call after the wake fails. In order B the event proves that the reader
+    // task runs and consumed the byte, so its second read starts at once. That read can still
+    // start a few instructions after the wake, and the wake ends a read in either order.
+    //
+    // A write that already waits is not covered here. It waits only after megabytes fill the
+    // buffers, and nothing tells the test when that happened. A failed bound still awaits the
+    // tasks, and the TCP timer ends a read that waits.
+    const io = testing.io;
+    {
+        var p = try Pair.open(io);
+        defer p.close(io);
+
+        try expectWakeEnds(try wakeThenCall(io, p.conn));
+    }
+
+    for (0..wake_read_passes) |_| {
+        var p = try Pair.open(io);
+        defer p.close(io);
+
+        try expectWakeEnds(try readThenWake(io, &p));
+    }
 }
 
 test "timed_stream: the probe tells a close from a pipelined request" {

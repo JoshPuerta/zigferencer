@@ -61,6 +61,12 @@ comptime {
 
 // -- api --------------------------------------------------------------------
 
+/// A null `lpOverlapped` cancels every request of `hFile` from every thread of the process.
+pub extern "kernel32" fn CancelIoEx(
+    hFile: windows.HANDLE,
+    lpOverlapped: ?*anyopaque,
+) callconv(.winapi) windows.BOOL;
+
 pub extern "kernel32" fn GlobalMemoryStatusEx(
     lpBuffer: *MEMORYSTATUSEX,
 ) callconv(.winapi) windows.BOOL;

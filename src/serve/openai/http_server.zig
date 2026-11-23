@@ -44,9 +44,9 @@
 //! carries its length, and a stream ends at the close, because HTTP/1.0 has no chunked coding.
 //!
 //! Teardown. The task can block in `receiveHead` or while it drains its out-queue. `beginClose`
-//! closes the queue and shuts the socket down to wake a blocked read. It shuts down only after it
-//! claims the fd. If the task already exited and claimed it, the task closes the fd itself, and a
-//! shutdown after that close is EBADF.
+//! closes the queue and wakes the socket, which ends a blocked read or write. It wakes only after
+//! it claims the fd. If the task already exited and claimed it, the task closes the fd itself, and
+//! a wake after that close fails on a closed handle.
 
 const std = @import("std");
 const Io = std.Io;
@@ -165,11 +165,11 @@ const HttpAdapter = struct {
         return true;
     }
 
-    /// Unblock the task: close the queue, and shut the socket down.
+    /// Unblock the task: close the queue, and wake the socket.
     pub fn beginClose(engine: anytype, conn: anytype) void {
         engine.closeOutput(conn);
         if (engine.claimStreamForTeardown(conn)) {
-            conn.stream.shutdown(engine.io, .both) catch {};
+            timed_stream.wake(engine.io, conn.stream);
         }
     }
 

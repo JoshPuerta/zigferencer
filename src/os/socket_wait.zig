@@ -1,10 +1,11 @@
-//! The OS calls of the serve sockets: the wait with a deadline, the send and the drain that do not
-//! block, the hang-up probe, and the TCP keepalive. `serve/timed_stream.zig` builds its reader and
-//! writer on them.
+//! The OS calls of the serve sockets. They are the read, the write, the wake, the wait with a
+//! deadline, the send and the drain that do not block, the hang-up probe, and the TCP keepalive.
+//! `serve/timed_stream.zig` builds its reader and writer on them.
 //!
 //! Platforms. One file holds the calls of each OS, and this file selects one at compile time.
-//! Linux uses `socket_wait_linux.zig`. Every other OS uses `socket_wait_none.zig`: no deadline, a
-//! probe that reports no hang-up, no keepalive, and drains that drop nothing.
+//! Linux uses `socket_wait_linux.zig`. Windows uses `socket_wait_windows.zig`: its own read, write,
+//! and wake, and no deadline. Every other OS uses `socket_wait_none.zig`: no deadline, a probe that
+//! reports no hang-up, no keepalive, and drains that drop nothing.
 //!
 //! Comptime. A check below asserts that the selected file declares every function with the type
 //! that this file expects, so an incomplete OS file fails the build.
@@ -23,6 +24,7 @@ comptime {
 /// The file that holds the calls of the target OS.
 const Impl = switch (builtin.os.tag) {
     .linux => @import("socket_wait_linux.zig"),
+    .windows => @import("socket_wait_windows.zig"),
     else => @import("socket_wait_none.zig"),
 };
 
@@ -36,6 +38,16 @@ pub const SendResult = union(enum) { sent: usize, again, failed };
 
 /// True when the OS file has the deadline, the probe, the keepalive, and the drains.
 pub const has_deadline: bool = Impl.has_deadline;
+
+/// Read once into the buffers of `dest`. Null when the read failed. Zero is the end of the stream.
+pub const read = Impl.read;
+
+/// Send bytes from the front of `buffered`, then `data`, then the last slice of `data` `splat`
+/// times, as std `netWrite` does. Return the count that it sent, or null when the write failed.
+pub const write = Impl.write;
+
+/// End every read and write that waits on the socket, and fail the later ones.
+pub const wake = Impl.wake;
 
 /// Wait until the socket is readable, or until the deadline. A hang-up or an error counts as ready,
 /// so the next read reports it.
@@ -68,6 +80,9 @@ pub const enableKeepalive = Impl.enableKeepalive;
 fn assertImpl(comptime T: type) void {
     const Deadline = Io.Clock.Timestamp;
     const expected = .{
+        .{ "read", fn (Io, net.Stream, [][]u8) ?usize },
+        .{ "write", fn (Io, net.Stream, []const u8, []const []const u8, usize) ?usize },
+        .{ "wake", fn (Io, net.Stream) void },
         .{ "waitReadable", fn (Io, net.Stream, Deadline) Wait },
         .{ "waitWritable", fn (Io, net.Stream, Deadline) Wait },
         .{ "sendNow", fn (net.Stream, []const u8) SendResult },

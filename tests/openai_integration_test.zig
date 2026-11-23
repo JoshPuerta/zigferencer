@@ -41,7 +41,8 @@
 //! socket, so no test sleeps.
 //!
 //! Hang-up. A buffered request whose client hangs up frees its session at the first token. The
-//! session count is one, so the next request opens only after that session closes.
+//! session count is one, so the next request opens only after that session closes. The test
+//! needs the hang-up probe, so it skips on an OS with no deadline.
 //!
 //! Framing. Each framing rule of a head and each chunk framing error gets its one reply and then
 //! the close, from raw bytes on a socket. A second client then gets its reply, so no refusal stops
@@ -1219,6 +1220,7 @@ test "openai churn: a new connection per request at one allowed connection is ne
 }
 
 test "openai hang-up: a buffered request whose client hangs up frees its session early" {
+    if (!timed_stream.has_deadline) return error.SkipZigTest;
     var fx: Fixture = undefined;
     try fx.setUpWith(.{ .max_sessions = 1 });
     defer fx.tearDown();

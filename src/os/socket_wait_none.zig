@@ -16,6 +16,25 @@ pub const has_deadline: bool = false;
 
 // -- api --------------------------------------------------------------------
 
+pub fn read(io: Io, stream: net.Stream, dest: [][]u8) ?usize {
+    return io.vtable.netRead(io.userdata, stream.socket.handle, dest) catch null;
+}
+
+pub fn write(
+    io: Io,
+    stream: net.Stream,
+    buffered: []const u8,
+    data: []const []const u8,
+    splat: usize,
+) ?usize {
+    const handle = stream.socket.handle;
+    return io.vtable.netWrite(io.userdata, handle, buffered, data, splat) catch null;
+}
+
+pub fn wake(io: Io, stream: net.Stream) void {
+    stream.shutdown(io, .both) catch {};
+}
+
 pub fn waitReadable(io: Io, stream: net.Stream, deadline: Io.Clock.Timestamp) Wait {
     _ = io;
     _ = stream;
@@ -30,7 +49,7 @@ pub fn waitWritable(io: Io, stream: net.Stream, deadline: Io.Clock.Timestamp) Wa
     return .ready;
 }
 
-/// The caller sends through std when `has_deadline` is false, so no call reaches this body.
+/// The caller sends through `write` when `has_deadline` is false, so no call reaches this body.
 pub fn sendNow(stream: net.Stream, bytes: []const u8) SendResult {
     _ = stream;
     _ = bytes;

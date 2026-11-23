@@ -39,6 +39,7 @@ const Allocator = std.mem.Allocator;
 const protocol = @import("protocol.zig");
 const zmtp = @import("zmtp.zig");
 const limits = @import("../core/limits.zig");
+const timed_stream = @import("timed_stream.zig");
 
 const log = std.log.scoped(.serve_client);
 
@@ -86,8 +87,8 @@ pub const Client = struct {
     gpa: Allocator,
     io: Io,
     stream: net.Stream,
-    reader: net.Stream.Reader,
-    writer: net.Stream.Writer,
+    reader: timed_stream.Reader,
+    writer: timed_stream.Writer,
     read_buf: []u8,
     write_buf: []u8,
     payload_buf: []u8,
@@ -125,7 +126,7 @@ pub const Client = struct {
         WriteFailed,
     } || zmtp.Error;
 
-    /// A send fails only on the socket. `writer.err` holds the cause.
+    /// A send fails only on the socket. The client does not keep the cause.
     pub const SendError = Io.Writer.Error;
 
     /// `error.TextTooLong` is a text past the bound of one `generate` frame.
@@ -191,8 +192,8 @@ pub const Client = struct {
             .gpa = gpa,
             .io = io,
             .stream = stream,
-            .reader = stream.reader(io, read_buf),
-            .writer = stream.writer(io, write_buf),
+            .reader = .init(stream, io, read_buf, 0),
+            .writer = .init(stream, io, write_buf, 0),
             .read_buf = read_buf,
             .write_buf = write_buf,
             .payload_buf = payload_buf,
@@ -244,10 +245,10 @@ pub const Client = struct {
         log.debug("handshake: accepted server type '{s}'", .{ready.socket_type});
     }
 
-    /// End the connection from this side and wake a task blocked in `next`.
-    /// `deinit` must run after every task that uses the client returns.
+    /// End the connection from this side. A task blocked in `next` or in a send returns, and a
+    /// later call fails. `deinit` must run after every task that uses the client returns.
     pub fn hangUp(self: *Client) void {
-        self.stream.shutdown(self.io, .both) catch {};
+        timed_stream.wake(self.io, self.stream);
     }
 
     pub fn deinit(self: *Client) void {

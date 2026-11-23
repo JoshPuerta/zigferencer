@@ -70,7 +70,7 @@ const BinaryAdapter = struct {
             return false;
         };
         conn.ext.reader_future = engine.io.concurrent(Tasks.reader, .{ engine, conn }) catch {
-            // The writer is up, so close its queue and let it shut the stream down.
+            // The writer is up, so close its queue and let it wake the socket.
             engine.closeOutput(conn);
             conn.ext.writer_future.await(engine.io);
             conn.stream.close(engine.io);
@@ -79,13 +79,13 @@ const BinaryAdapter = struct {
         return true;
     }
 
-    /// Close the out-queue, and shut the socket down. A writer blocked on a client that does not
-    /// read and a reader blocked on a silent client then return at once.
+    /// Close the out-queue, and wake the socket. A writer blocked on a client that does not read
+    /// and a reader blocked on a silent client then return at once.
     pub fn beginClose(engine: anytype, conn: anytype) void {
         log.debug("close: conn {d}", .{engine.connId(conn)});
         engine.closeOutput(conn);
         if (engine.claimStreamForTeardown(conn)) {
-            conn.stream.shutdown(engine.io, .both) catch {};
+            timed_stream.wake(engine.io, conn.stream);
         }
     }
 
@@ -154,7 +154,7 @@ fn BinaryTasks(comptime Eng: type) type {
                 }
             }
 
-            conn.stream.shutdown(engine.io, .both) catch {};
+            timed_stream.wake(engine.io, conn.stream);
             engine.taskExit(conn, .writer);
         }
     };
@@ -623,8 +623,12 @@ test "loopback: hello, system-prompt session, one turn, clean shutdown" {
     try std.testing.expectEqualSlices(u32, &.{ 3, 4 }, appended.positions());
     try client.closeSession(kept);
 
+    // The client holds its socket open, so the wake alone must end the connection tasks.
     try client.shutdown();
+    const shut_at: Io.Clock.Timestamp = .now(io, .awake);
     run_future.await(io);
+    const teardown_ms = shut_at.untilNow(io).raw.toMilliseconds();
+    try std.testing.expect(teardown_ms < timed_stream.wake_bound_ms);
 }
 
 test "loopback: keep, hang up, resume, and the next turn equals an undropped twin" {

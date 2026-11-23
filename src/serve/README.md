@@ -242,7 +242,7 @@ session table consumes. The manager makes the calls whose result only the cache 
   the task exits, so the slot and the sessions of the connection free as after a hang-up. Only Linux
   has the deadline. On other platforms a socket wait has no bound. The input drain before a close
   and the refusal send that does not wait are Linux only too. On other platforms the server drops no
-  input before a close, and the refusal send is the blocking std write.
+  input before a close, and the refusal send is a write that blocks.
 - **An idle binary connection closes when it holds nothing.** A binary reader waits for the first
   byte of a frame with no bound while its connection holds a session or a request in the engine,
   because an idle session is normal. A connection with neither closes after one deadline with no

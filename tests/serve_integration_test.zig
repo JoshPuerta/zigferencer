@@ -43,7 +43,9 @@
 //! model file. A control token frame carries its id and no text. The reply text and the kept reply
 //! hold the text of every other token, a user-defined tag included.
 //!
-//! Skips. Every test over a model returns `error.SkipZigTest` when no fixture exists.
+//! Skips. Every test over a model returns `error.SkipZigTest` when no fixture exists. The unix
+//! transport test skips on a target with no unix sockets. The two tests of a refusal at the cap
+//! skip on an OS file with no deadline.
 
 const std = @import("std");
 const builtin = @import("builtin");
@@ -55,6 +57,7 @@ const chat = zigferencer.chat;
 const bpe = zigferencer.bpe;
 const limits = zigferencer.limits;
 const serve_engine = zigferencer.serve_engine;
+const timed_stream = zigferencer.serve_timed_stream;
 const harness = @import("serve_harness.zig");
 const Harness = harness.Harness;
 const Stream = harness.Stream;
@@ -628,6 +631,7 @@ test "cancel on an unknown session fails with unknown_session" {
 }
 
 test "the unix transport carries the same stream as tcp" {
+    if (!std.Io.net.has_unix_sockets) return error.SkipZigTest;
     const gpa = std.testing.allocator;
     const io = std.testing.io;
     const over_tcp = blk: {
@@ -699,6 +703,8 @@ test "four connections interleave sessions and each stream equals its solo refer
 }
 
 test "the connection past the cap is refused after the handshake" {
+    // Where a late input can drop the unread refusal, the refusal needs a linger with a deadline.
+    if (!timed_stream.has_deadline) return error.SkipZigTest;
     var h = try Harness.boot(std.testing.allocator, std.testing.io, .tcp, clients_opts);
     defer h.deinit();
 
@@ -953,6 +959,8 @@ test "a client that half-closes after a request still gets the reply" {
 }
 
 test "a stop while the acceptor refuses a client returns" {
+    // Where a late input can drop the unread refusal, the refusal needs a linger with a deadline.
+    if (!timed_stream.has_deadline) return error.SkipZigTest;
     const opts: harness.Options = .{ .max_connections = 1 };
     var h = try Harness.boot(std.testing.allocator, std.testing.io, .tcp, opts);
     defer h.deinit();
