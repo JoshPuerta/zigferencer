@@ -40,8 +40,8 @@
 //! Socket close. Exactly one actor closes the socket of a connection. The first to claim it owns
 //! the close. The claim is `live -> task` when the last task exits. The claim is
 //! `live -> teardown` when teardown must wake a blocked task with `timed_stream.wake`. The other
-//! actor must not touch the fd, because a wake or a `close` after the other `close` fails on a
-//! closed handle.
+//! actor must not touch the socket, because a wake or a `close` after the other `close` meets a
+//! closed socket.
 //!
 //! Adapter surface. All methods are duck-typed over the engine and a `*Conn`:
 //!   - `pub const ConnExt`            per-connection state the adapter owns
@@ -490,7 +490,7 @@ pub fn ServeEngine(comptime SessionPool: type, comptime CodecT: type, comptime A
                     Adapter.refuse(self.io, &stream);
                     continue;
                 };
-                timed_stream.enableKeepalive(stream);
+                timed_stream.enableKeepalive(self.io, stream);
                 const conn = &self.conns[claim.index];
                 if (claim.reused) {
                     Adapter.awaitConn(self, conn);

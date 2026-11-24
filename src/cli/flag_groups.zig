@@ -87,7 +87,7 @@ pub const ServeFlags = struct {
     engine: EngineFlags = .{},
     max_sessions: u16 = 4,
     max_connections: u32 = 8,
-    /// The default is the default of the llama.cpp server option `--timeout`.
+    /// The default is a project choice, not a measurement.
     io_timeout: u32 = 600,
     max_batch: ?u16 = null,
     prefill_chunk: ?u32 = null,
@@ -130,8 +130,8 @@ pub const ServeFlags = struct {
             .value = "S",
             .text = std.fmt.comptimePrint(
                 "The seconds that one socket read or write can wait,\n" ++
-                    "cap {d}. 0 sets no deadline. The deadline works on\n" ++
-                    "Linux only. A binary client that holds a session\n" ++
+                    "cap {d}. 0 sets no deadline. Linux and Windows have\n" ++
+                    "the deadline. A binary client that holds a session\n" ++
                     "keeps its connection when idle.",
                 .{limits.max_io_timeout_s},
             ),
@@ -310,7 +310,7 @@ test "ServeFlags: every shared serve flag reaches its field" {
     try std.testing.expectEqual(@as(u32, 7), p.engine.thinking_budget);
 }
 
-test "ServeFlags: the help names the io deadline, its cap, and the llama.cpp default" {
+test "ServeFlags: the help names the io deadline, its cap, and its default" {
     const Probe = struct {
         serve: ServeFlags = .{},
         pub const help: args.Help = .{ .usage = "probe", .about = "" };
@@ -320,7 +320,7 @@ test "ServeFlags: the help names the io deadline, its cap, and the llama.cpp def
     try std.testing.expect(std.mem.find(u8, body, "--io-timeout S") != null);
     const cap = std.fmt.comptimePrint("cap {d}", .{limits.max_io_timeout_s});
     try std.testing.expect(std.mem.find(u8, body, cap) != null);
-    try std.testing.expect(std.mem.find(u8, body, "Linux only") != null);
+    try std.testing.expect(std.mem.find(u8, body, "Linux and Windows") != null);
     const flag = std.mem.find(u8, body, "--io-timeout S").?;
     const default = std.mem.find(u8, body[flag..], "[default: 600]").?;
     // The default closes the entry of the flag, before the next flag starts.

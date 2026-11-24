@@ -282,6 +282,10 @@ pub const close_drain_bytes: usize = openai_max_header_bytes + openai_max_reques
 /// it bounds the whole drain. The error reply before the drain has its own `--io-timeout`
 /// deadline per write.
 pub const close_linger_ms: u32 = 5_000;
+/// The longest wait of a refusal at the connection cap for the end of the client input, where late
+/// input drops the unread refusal. The value is a project choice, not a measurement. A refused
+/// client that keeps its socket open holds the acceptor for at most this time.
+pub const refuse_linger_ms: u32 = 250;
 /// The most messages in one rendered conversation. A render holds one plain range per message.
 pub const max_chat_messages: usize = 64;
 /// The most messages in one OpenAI request, equal to the render bound.

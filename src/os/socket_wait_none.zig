@@ -1,6 +1,6 @@
-//! The serve socket calls on an OS with no implementation. The wait returns at once, the drains
-//! drop nothing, the probe reports no hang-up, and the keepalive does nothing. The reader and the
-//! writer then use the std socket path with no deadline.
+//! The serve socket calls on an OS with no deadline. The read, the write, and the wake are the std
+//! calls. The wait returns at once, the drain drops nothing, the probe reports no hang-up, and the
+//! keepalive does nothing.
 
 const std = @import("std");
 const socket_wait = @import("socket_wait.zig");
@@ -8,11 +8,13 @@ const Io = std.Io;
 const net = Io.net;
 
 const Wait = socket_wait.Wait;
-const SendResult = socket_wait.SendResult;
+const TimedSendResult = socket_wait.TimedSendResult;
 
 // -- constants --------------------------------------------------------------
 
 pub const has_deadline: bool = false;
+pub const late_input_drops_reply: bool = false;
+pub const unix_path_absolute_only: bool = false;
 
 // -- api --------------------------------------------------------------------
 
@@ -42,38 +44,42 @@ pub fn waitReadable(io: Io, stream: net.Stream, deadline: Io.Clock.Timestamp) Wa
     return .ready;
 }
 
-pub fn waitWritable(io: Io, stream: net.Stream, deadline: Io.Clock.Timestamp) Wait {
+/// The caller sends through `write` when `has_deadline` is false, so no call reaches this body.
+pub fn sendUntil(
+    io: Io,
+    stream: net.Stream,
+    bytes: []const u8,
+    deadline: Io.Clock.Timestamp,
+) TimedSendResult {
     _ = io;
     _ = stream;
-    _ = deadline;
-    return .ready;
-}
-
-/// The caller sends through `write` when `has_deadline` is false, so no call reaches this body.
-pub fn sendNow(stream: net.Stream, bytes: []const u8) SendResult {
-    _ = stream;
     _ = bytes;
+    _ = deadline;
     unreachable;
 }
 
-pub fn drainNow(stream: net.Stream, max_bytes: usize) void {
-    _ = stream;
-    _ = max_bytes;
-}
-
-pub fn drainUntil(io: Io, stream: net.Stream, max_bytes: usize, deadline: Io.Clock.Timestamp) void {
+pub fn drainUntil(io: Io, stream: net.Stream, max_bytes: usize, deadline: Io.Clock.Timestamp) bool {
     _ = io;
     _ = stream;
     _ = max_bytes;
     _ = deadline;
+    return false;
 }
 
-pub fn peerClosed(stream: net.Stream) bool {
+pub fn peerClosed(io: Io, stream: net.Stream) bool {
+    _ = io;
     _ = stream;
     return false;
 }
 
-pub fn enableKeepalive(stream: net.Stream, idle_s: c_int, interval_s: c_int, probes: c_int) void {
+pub fn enableKeepalive(
+    io: Io,
+    stream: net.Stream,
+    idle_s: c_int,
+    interval_s: c_int,
+    probes: c_int,
+) void {
+    _ = io;
     _ = stream;
     _ = idle_s;
     _ = interval_s;

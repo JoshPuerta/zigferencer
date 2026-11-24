@@ -1,7 +1,7 @@
 //! Tiered KV residency: a swap pool over `Sessions(RunnerT)` that lets the serve layer hold more
 //! *logical* sessions than there are *physical* VRAM KV slots. Active sessions keep their KV in
 //! VRAM. This layer evicts idle ones to a host (RAM) blob and restores them on their next turn.
-//! This is sequence-level swap (the vLLM and LMCache shape), not per-token streaming.
+//! This is sequence-level swap, not per-token streaming.
 //!
 //! Comptime. Generic over the pool type, so the swap path compiles out without `evictSlot`.
 //!

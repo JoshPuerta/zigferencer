@@ -321,6 +321,12 @@ fn resolveTarget(b: *std.Build) std.Build.ResolvedTarget {
     if (query.cpu_arch == .x86_64 and query.cpu_model == .determined_by_arch_os) {
         query.cpu_model = .{ .explicit = &std.Target.x86.cpu.x86_64_v3 };
     }
+    // Std has unix sockets only for a Windows minimum of 1803 or later (`Io/net.zig`), and the
+    // serve tests run them on a build for 1809. A native build takes the version of the host, and
+    // a minimum that the user names stays.
+    if (query.os_tag == .windows and query.os_version_min == null) {
+        query.os_version_min = .{ .windows = .win10_rs5 };
+    }
 
     return b.resolveTargetQuery(query);
 }

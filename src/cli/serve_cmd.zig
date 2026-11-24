@@ -17,6 +17,7 @@ const codec_parts = @import("boot/codec_parts.zig");
 const serve_boot = @import("boot/serve_boot.zig");
 const serve_checks = @import("boot/serve_checks.zig");
 const limits = @import("../core/limits.zig");
+const socket_wait = @import("../os/socket_wait.zig");
 const event = @import("../serve/event.zig");
 const scheduler_mod = @import("../serve/scheduler.zig");
 const server_mod = @import("../serve/server.zig");
@@ -105,7 +106,10 @@ const Flags = struct {
         .socket = args.Doc{
             .group = "bind",
             .value = "PATH",
-            .text = "unix socket instead of TCP",
+            .text = if (socket_wait.unix_path_absolute_only)
+                "unix socket instead of TCP, an absolute path"
+            else
+                "unix socket instead of TCP",
         },
         .allow_shutdown = args.Doc{
             .group = "bind",
@@ -136,6 +140,11 @@ pub fn run(ctx: context.Context) !void {
     const socket_path = flags.socket;
     if (socket_path != null and (flags.host != null or flags.port != null)) {
         return args.fail(ctx.io, "--socket and --host/--port are mutually exclusive", .{});
+    }
+    if (socket_path) |sp| {
+        if (socket_wait.unix_path_absolute_only and !std.fs.path.isAbsolute(sp)) {
+            return args.fail(ctx.io, "--socket needs an absolute path on this OS: {s}", .{sp});
+        }
     }
 
     const wire: serve_checks.Wire = .{

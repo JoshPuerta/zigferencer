@@ -44,8 +44,7 @@
 //! hold the text of every other token, a user-defined tag included.
 //!
 //! Skips. Every test over a model returns `error.SkipZigTest` when no fixture exists. The unix
-//! transport test skips on a target with no unix sockets. The two tests of a refusal at the cap
-//! skip on an OS file with no deadline.
+//! transport test skips on a target with no unix sockets.
 
 const std = @import("std");
 const builtin = @import("builtin");
@@ -703,8 +702,6 @@ test "four connections interleave sessions and each stream equals its solo refer
 }
 
 test "the connection past the cap is refused after the handshake" {
-    // Where a late input can drop the unread refusal, the refusal needs a linger with a deadline.
-    if (!timed_stream.has_deadline) return error.SkipZigTest;
     var h = try Harness.boot(std.testing.allocator, std.testing.io, .tcp, clients_opts);
     defer h.deinit();
 
@@ -897,8 +894,6 @@ test "a binary client that floods PING and never reads frees its slot" {
         var stalled = try h.connect();
         defer stalled.deinit();
 
-        try harness.setReceiveBufferBytes(stalled.stream, 4096);
-
         // The writer meets its deadline on the full socket, and the reader waits on the full
         // queue. The flood stops at its own write deadline, once the reader stops reading.
         const body = [_]u8{ 4, 'P', 'I', 'N', 'G', 0, 0 } ++ [_]u8{'x'} ** 16;
@@ -914,7 +909,33 @@ test "a binary client that floods PING and never reads frees its slot" {
             w.interface.writeAll(head[0..head_len]) catch break;
             w.interface.writeAll(&body) catch break;
         }
+        // A failed write proves that the server stopped reading, which it does only once its own
+        // send path is full. A flood that ends at the bound frees the slot by its own close.
+        try std.testing.expect(pings < pings_max);
     }
+
+    try expectSlotServes(&h);
+}
+
+test "a silent client past the cap does not hold the acceptor" {
+    var h = try Harness.boot(std.testing.allocator, std.testing.io, .tcp, .{
+        .max_connections = 1,
+    });
+    defer h.deinit();
+
+    const silent = refused: {
+        var a = try h.connect();
+        defer a.deinit();
+
+        try a.ping();
+        // A slot holder gets no end of stream, so this close proves a refusal.
+        const silent = try h.connectRaw();
+        errdefer silent.close(h.io);
+        try std.testing.expect(try harness.awaitServerClose(silent) > 0);
+        break :refused silent;
+    };
+    // The silent client keeps its socket open while the next client takes the free slot.
+    defer silent.close(h.io);
 
     try expectSlotServes(&h);
 }
@@ -958,9 +979,99 @@ test "a client that half-closes after a request still gets the reply" {
     try std.testing.expectError(error.EndOfStream, c.next());
 }
 
+/// The input that a client sends after a message head over the size cap, or after a refused
+/// greeting. It is far over the read buffer of the server reader, so most of it stays in the
+/// socket when the reader stops.
+const oversize_body_bytes = 64 * 1024;
+
+/// Send a message head over the size cap and `oversize_body_bytes` of its body in writes of
+/// `chunk_bytes`, with no read between them. Then shut the send side and read the reply.
+fn expectOversizeReply(chunk_bytes: usize) !void {
+    std.debug.assert(chunk_bytes > 0);
+    std.debug.assert(oversize_body_bytes % chunk_bytes == 0);
+    var h = try Harness.boot(std.testing.allocator, std.testing.io, .tcp, .{});
+    defer h.deinit();
+
+    var c = try h.connect();
+    defer c.deinit();
+    // A lost end of stream fails the test at this wait and does not hang it.
+    c.reader.timeout_ms = @intCast(harness.close_wait_ms);
+
+    const head_bytes = zigferencer.serve_zmtp.long_head_bytes;
+    var frame: [head_bytes + oversize_body_bytes]u8 = @splat('x');
+    const size_max = zigferencer.serve_zmtp.max_message_bytes;
+    const head_len = zigferencer.serve_zmtp.encodeFrameHead(size_max, false, frame[0..head_bytes]);
+    try std.testing.expectEqual(head_bytes, head_len);
+    // The encoder refuses a size over the cap, so the test writes the size of the long head.
+    std.mem.writeInt(u64, frame[1..head_bytes], size_max + 1, .big);
+
+    // The server can end the connection while the client still sends. The reads below state the
+    // invariant, so a failed send does not fail the test.
+    var w = c.stream.writer(h.io, &.{});
+    send: {
+        if (chunk_bytes == oversize_body_bytes) {
+            w.interface.writeAll(&frame) catch {};
+            break :send;
+        }
+        w.interface.writeAll(frame[0..head_bytes]) catch break :send;
+        var at: usize = head_bytes;
+        while (at < frame.len) : (at += chunk_bytes) {
+            w.interface.writeAll(frame[at..][0..chunk_bytes]) catch break :send;
+        }
+    }
+    c.stream.shutdown(h.io, .send) catch {};
+
+    const ev = try c.next();
+    try std.testing.expect(ev.msg == .err);
+    try std.testing.expectEqual(protocol.ErrorCode.frame_too_large, ev.msg.err.code);
+    try std.testing.expectError(error.EndOfStream, c.next());
+}
+
+test "a fatal reply reaches a client that has not read it, with the body in the head write" {
+    try expectOversizeReply(oversize_body_bytes);
+}
+
+test "a fatal reply reaches a client that has not read it, with the body in later writes" {
+    try expectOversizeReply(4096);
+}
+
+test "a refused handshake reaches a client that has not read it" {
+    var h = try Harness.boot(std.testing.allocator, std.testing.io, .tcp, .{});
+    defer h.deinit();
+
+    const raw = try h.connectRaw();
+    defer raw.close(h.io);
+
+    // The header of `serve/zmtp.zig` puts the security field at offset 12 of the greeting.
+    const zmtp = zigferencer.serve_zmtp;
+    const security_offset = 12;
+    var input: [zmtp.greeting_bytes + oversize_body_bytes]u8 = @splat('x');
+    const greeting = input[0..zmtp.greeting_bytes];
+    zmtp.encodeGreeting(greeting);
+    greeting[security_offset..][0.."PLAIN".len].* = "PLAIN".*;
+
+    // The server can end the connection while the client still sends. The reads below state the
+    // invariant, so a failed send does not fail the test.
+    var w = raw.writer(h.io, &.{});
+    w.interface.writeAll(&input) catch {};
+    raw.shutdown(h.io, .send) catch {};
+
+    // A lost end of stream fails the test at a read deadline and does not hang it.
+    var buf: [4096]u8 = undefined;
+    var r: timed_stream.Reader = .init(raw, h.io, &buf, @intCast(harness.close_wait_ms));
+    try zmtp.decodeGreeting(try r.interface.takeArray(zmtp.greeting_bytes));
+    const ready_head = try zmtp.readFrameHead(&r.interface);
+    try std.testing.expect(ready_head.command);
+    const ready = try zmtp.decodeCommand(try r.interface.take(@intCast(ready_head.size)));
+    try std.testing.expect(ready == .ready);
+    const error_head = try zmtp.readFrameHead(&r.interface);
+    try std.testing.expect(error_head.command);
+    const refusal = try zmtp.decodeCommand(try r.interface.take(@intCast(error_head.size)));
+    try std.testing.expect(refusal == .err);
+    try std.testing.expectError(error.EndOfStream, r.interface.takeByte());
+}
+
 test "a stop while the acceptor refuses a client returns" {
-    // Where a late input can drop the unread refusal, the refusal needs a linger with a deadline.
-    if (!timed_stream.has_deadline) return error.SkipZigTest;
     const opts: harness.Options = .{ .max_connections = 1 };
     var h = try Harness.boot(std.testing.allocator, std.testing.io, .tcp, opts);
     defer h.deinit();
@@ -993,9 +1104,6 @@ test "a stop while a binary client does not read returns before the io deadline"
 
     var stalled = try h.connect();
     defer stalled.deinit();
-
-    // A small receive buffer keeps the window small, so the server send buffer fills early.
-    try harness.setReceiveBufferBytes(stalled.stream, 4096);
 
     // The reader answers a ZMTP PING with a PONG in the out-queue and waits while the queue is
     // full. So once the writer blocks on the full socket, the reader stops reading, and the

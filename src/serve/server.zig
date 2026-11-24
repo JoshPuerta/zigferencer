@@ -30,6 +30,7 @@ const event = @import("event.zig");
 const chat = @import("../core/chat.zig");
 const engine_mod = @import("engine.zig");
 const timed_stream = @import("timed_stream.zig");
+const limits = @import("../core/limits.zig");
 const Request = event.Request;
 const OutEvent = event.OutEvent;
 
@@ -95,7 +96,8 @@ const BinaryAdapter = struct {
     }
 
     /// Sends the greeting and READY of the ROUTER side, then the refusal as one message, in one
-    /// send that does not wait, and closes. A silent peer cannot stall the acceptor.
+    /// send that does not wait, and closes. A silent peer holds the acceptor at most for the
+    /// linger of `timed_stream.closeRefused`.
     pub fn refuse(io: Io, stream: *net.Stream) void {
         log.debug("refuse: connection slots full", .{});
         const ev = OutEvent.fail(0, 0, .connections_exhausted, "connection slots full");
@@ -309,6 +311,8 @@ fn fatalFrame(engine: anytype, conn: anytype, code: protocol.ErrorCode, detail: 
             engine.connId(conn),
         });
     }
+
+    dropInputAfterFatal(engine, conn);
 }
 
 fn decodeErrorCode(e: protocol.DecodeError) protocol.ErrorCode {
@@ -324,6 +328,25 @@ fn decodeErrorCode(e: protocol.DecodeError) protocol.ErrorCode {
 fn fatalHandshake(engine: anytype, conn: anytype, reason: []const u8) void {
     log.debug("handshake: conn {d} refused, {s}", .{ engine.connId(conn), reason });
     _ = conn.out_q.put(engine.io, &.{OutEvent.zmtpError(reason)}, 0) catch {};
+    dropInputAfterFatal(engine, conn);
+}
+
+/// The writer wakes the socket after the reply that the reader queued. Where late input drops an
+/// unread reply, the reader drops the client input first, with the wait of the HTTP refusal.
+/// Elsewhere it returns at once.
+fn dropInputAfterFatal(engine: anytype, conn: anytype) void {
+    if (!timed_stream.late_input_drops_reply) return;
+
+    const timeout_ms = engine.io_timeout_ms;
+    const wait_ms = if (timeout_ms > 0)
+        @min(timeout_ms, limits.close_linger_ms)
+    else
+        limits.close_linger_ms;
+    if (!timed_stream.dropInputUntilEnd(engine.io, conn.stream, wait_ms)) {
+        log.debug("read: conn {d}, the drop of input stopped before its end", .{
+            engine.connId(conn),
+        });
+    }
 }
 
 /// Writes the greeting and the READY command of the ROUTER side. `frame` holds the READY frame.

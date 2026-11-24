@@ -1170,15 +1170,15 @@ test "openai deadline: a client that stops reading is closed, and the engine ser
     };
     try std.testing.expect(one_reply > 0);
 
-    // A small receive buffer keeps the window small, so the server send buffer fills early.
     const stalled = try connectRaw(&fx);
     defer stalled.close(fx.io);
-    try harness.setReceiveBufferBytes(stalled, 4096);
 
-    // The replies of the requests are far larger than the loopback buffers. The server stops
-    // reading once its writes stall, so the client writes through a deadline too. A write that
-    // fails before that deadline found the connection closed.
-    const pipelined = 20_000;
+    // The replies of the requests are four times the largest send path that a test host showed,
+    // so the server cannot send them all. The server stops reading once its writes stall, so the
+    // client writes through a deadline too. A write that fails before that deadline found the
+    // connection closed.
+    const send_path_bytes_seen = 4_784_128;
+    const pipelined: u32 = @intCast((4 * send_path_bytes_seen + one_reply - 1) / one_reply);
     var write_buf: [4096]u8 = undefined;
     const close_wait: u32 = @intCast(harness.close_wait_ms);
     var w: timed_stream.Writer = .init(stalled, fx.io, &write_buf, close_wait);
@@ -1189,7 +1189,7 @@ test "openai deadline: a client that stops reading is closed, and the engine ser
     w.interface.flush() catch {};
     try std.testing.expect(!w.timed_out);
 
-    // The engine thread serves another client while the stalled one holds its connection.
+    // The engine thread still serves another client.
     const extra = ",\"max_tokens\":2,\"temperature\":0";
     const reply = try post(&fx, arena, try chatBody(arena, "Hi", extra));
     try std.testing.expectEqual(std.http.Status.ok, reply.status);

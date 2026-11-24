@@ -45,8 +45,8 @@
 //!
 //! Teardown. The task can block in `receiveHead` or while it drains its out-queue. `beginClose`
 //! closes the queue and wakes the socket, which ends a blocked read or write. It wakes only after
-//! it claims the fd. If the task already exited and claimed it, the task closes the fd itself, and
-//! a wake after that close fails on a closed handle.
+//! it claims the socket. If the task already exited and claimed it, the task closes the socket
+//! itself, and a wake after that close meets a closed socket.
 
 const std = @import("std");
 const Io = std.Io;
@@ -177,7 +177,8 @@ const HttpAdapter = struct {
         conn.ext.task_future.await(engine.io);
     }
 
-    /// One send that does not wait, so a client that does not read cannot stall the acceptor.
+    /// One send that does not wait, so a client that does not read cannot stall the acceptor. The
+    /// close can wait for the end of the client input, at most `limits.refuse_linger_ms`.
     pub fn refuse(io: Io, stream: *net.Stream) void {
         timed_stream.sendOnce(
             io,
@@ -305,7 +306,7 @@ fn HttpTasks(comptime Eng: type) type {
                         limits.close_linger_ms;
                     timed_stream.lingerOutput(engine.io, c.stream, wait_ms);
                 },
-                .ended => timed_stream.dropArrived(c.stream),
+                .ended => timed_stream.dropArrived(engine.io, c.stream),
             }
         }
 
@@ -597,7 +598,7 @@ fn HttpTasks(comptime Eng: type) type {
                 // A streamed reply sees it as a write error. The `done` completes the reply, so
                 // the probe skips it, and a client that closed its send side still gets it.
                 const probe = @TypeOf(sink) == *BufSink and ev.body != .done;
-                if (probe and timed_stream.peerClosed(c.stream)) {
+                if (probe and timed_stream.peerClosed(engine.io, c.stream)) {
                     log.debug("turn: session {d}, the client hung up", .{sid});
                     return error.ConnClosed;
                 }
@@ -869,7 +870,7 @@ fn respondHeadError(w: *Io.Writer, e: map.HttpError) void {
     w.flush() catch {};
 }
 
-/// Draw a seed from the secure source, the vLLM rule, so equal sampled requests differ.
+/// Draw a seed from the secure source, so equal sampled requests differ.
 /// Null refuses the request. The server never falls back to a fixed seed.
 fn drawSeed(io: Io) ?u64 {
     var bytes: [8]u8 = undefined;

@@ -9,6 +9,7 @@ const args = @import("../args.zig");
 const limits = @import("../../core/limits.zig");
 const chat_mod = @import("../../core/chat.zig");
 const protocol = @import("../../serve/protocol.zig");
+const socket_wait = @import("../../os/socket_wait.zig");
 const client_mod = @import("../../serve/client.zig");
 const transcript_mod = @import("client_transcript.zig");
 
@@ -71,7 +72,10 @@ pub const Options = struct {
         .socket = args.Doc{
             .group = "connection",
             .value = "PATH",
-            .text = "connect to a server on a unix socket",
+            .text = if (socket_wait.unix_path_absolute_only)
+                "connect to a server on a unix socket, an absolute path"
+            else
+                "connect to a server on a unix socket",
         },
         .system = args.Doc{
             .group = "session",
@@ -294,7 +298,13 @@ pub fn parseOptions(ctx: context.Context) !?Options {
 }
 
 pub fn parseTarget(ctx: context.Context, opts: *const Options) !Target {
-    if (opts.socket) |path| return .{ .unix = path };
+    if (opts.socket) |path| {
+        if (socket_wait.unix_path_absolute_only and !std.fs.path.isAbsolute(path)) {
+            return args.fail(ctx.io, "--socket needs an absolute path on this OS: {s}", .{path});
+        }
+
+        return .{ .unix = path };
+    }
 
     const hostport = opts.connect.?;
     const colon = std.mem.findScalarLast(u8, hostport, ':') orelse

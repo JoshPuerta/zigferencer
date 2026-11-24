@@ -12,7 +12,7 @@ persists across turns. One forward pass per tick advances a batch of sessions. `
 | `scheduler.zig` | `Scheduler`, the control unit: the session table and the composed tick. |
 | `engine.zig` | `ServeEngine`, the engine thread, the queues, and the connection lifecycle. |
 | `conn_slots.zig` | `ConnSlots`, the connection slot table and the steps of each thread. |
-| `timed_stream.zig` | The socket reader and writer with a deadline, and the hang-up probe. |
+| `timed_stream.zig` | The socket reader and writer with a deadline, the wake, the hang-up probe, and the close of a refused socket. |
 | `event.zig` | `Request`, `OutEvent`, and `Codec`, the values across the two boundaries. |
 | `prefill_chunk.zig` | The pure rule for the prefill rows of one pass. |
 | `residency.zig` | `Residency`, the optional tiered KV pool. |
@@ -181,7 +181,7 @@ session table consumes. The manager makes the calls whose result only the cache 
   codepoint back until the next token. The HTTP adapter holds a partial
   codepoint back too, so every SSE delta is valid UTF-8.
 - **A control token sends no text.** `cli/boot/codec_parts.zig` gives each token of the GGUF type
-  CONTROL the empty piece, as llama.cpp does by default. Examples are `<|im_end|>`, `<|eot_id|>`,
+  CONTROL the empty piece. Examples are `<|im_end|>`, `<|eot_id|>`,
   and `<|python_tag|>`. A user-defined token, such as `<think>` or `<tool_call>` in the Qwen3.5
   files, keeps its text. The id, the count, and the position of a control token stay as they are,
   and a turn still ends at the EOS id. Only the text of its event is empty. So a `stop` string
@@ -216,12 +216,17 @@ session table consumes. The manager makes the calls whose result only the cache 
   the engine closed its queue. At shutdown the request queue closes, so a `conn_closed` can be lost.
   Teardown then awaits the tasks and frees the slot.
 - **A half-close is a hang-up.** A client that closes its send side ends its turns on the binary
-  frontend. On Linux it also ends a buffered HTTP turn at the next token. A streamed HTTP turn runs
-  to its end, because a write to a half-closed client succeeds. The sweep cancels a turn in flight,
-  drops a parked event, and ends a waiting resume. A reply that the engine made before the sweep
-  still arrives. A buffered HTTP reply that is complete when the probe runs still goes out. A binary
-  frame error queues its error frame, and the replies to the earlier requests of the connection
-  follow it before the close.
+  frontend. On Linux and Windows it also ends a buffered HTTP turn at the next token. A streamed
+  HTTP turn runs to its end, because a write to a half-closed client succeeds. The sweep cancels a
+  turn in flight, drops a parked event, and ends a waiting resume. A reply that the engine made
+  before the sweep still arrives. A buffered HTTP reply that is complete when the probe runs still
+  goes out. A binary frame error queues its error frame, and the replies to the earlier requests of
+  the connection follow it before the close. On Windows the reader then drops the client input until
+  the end of the stream, 528 KiB (`limits.close_drain_bytes`), or 5 seconds
+  (`limits.close_linger_ms`), whichever comes first. A nonzero `--io-timeout` below 5 seconds
+  shortens the wait. A refused handshake takes the same drop. Until the drop ends, the connection
+  keeps its slot, its sessions, and its turns. So a client must close after it reads the error. Past
+  the byte bound or the time bound, the client can lose the error frame.
 - **A slot that waits for the engine does not refuse a client.** `--max-connections` counts the
   `live` slots, where a task runs and the engine has not handled `conn_closed`. The table holds
   two slots per allowed connection, so a client can connect while the slot of an ended
@@ -229,37 +234,41 @@ session table consumes. The manager makes the calls whose result only the cache 
   of the cap. A slot costs `@sizeOf(Conn)` of its frontend plus the slot record, so the table
   costs twice that per allowed connection. The debug line `listen: N connection slots of B
   bytes` of the engine prints the sum at boot.
-- **A refusal never waits.** The refusal of a client past the cap is one send that does not
-  wait. The server then shuts its send side, drops at most 528 KiB (`limits.close_drain_bytes`) of
-  the input that has already arrived with no wait, and closes. So the refusal does not turn into a
-  reset where the client has sent little.
+- **A refusal waits at most a short linger.** The refusal of a client past the cap is one send
+  that does not wait. The server then shuts its send side, drops input, and closes. So the refusal
+  does not turn into a reset where the client has sent little. On Linux it drops at most 528 KiB
+  (`limits.close_drain_bytes`) of the input that has already arrived, with no wait. On Windows,
+  input that arrives after the close makes the client lose the refusal that it has not read. So
+  there the server drops input until the end of the stream, 528 KiB, or 250 ms
+  (`limits.refuse_linger_ms`), whichever comes first. A refused client that keeps its socket open
+  holds the acceptor for that time, and a stop waits for that refusal too.
 - **A socket wait has a deadline.** `--io-timeout` sets the longest wait of one socket read or
-  write, 600 seconds by default (the default of the llama.cpp server `--timeout`). 0 sets no
+  write, 600 seconds by default. 0 sets no
   deadline. Each read of an HTTP request head and body waits at most the deadline, which covers the
   idle wait between two requests on one connection. A client that sends one byte per deadline can
   still hold its connection. The deadline also bounds each read of the binary handshake and of a
   binary frame after its first byte, and each write that the client does not read. At the deadline
-  the task exits, so the slot and the sessions of the connection free as after a hang-up. Only Linux
-  has the deadline. On other platforms a socket wait has no bound. The input drain before a close
-  and the refusal send that does not wait are Linux only too. On other platforms the server drops no
-  input before a close, and the refusal send is a write that blocks.
+  the task exits, so the slot and the sessions of the connection free as after a hang-up. Linux and
+  Windows have the deadline, the input drain before a close, and the refusal send that does not
+  wait. On other platforms a socket wait has no bound, the server drops no input before a close,
+  and the refusal send is a write that blocks.
 - **An idle binary connection closes when it holds nothing.** A binary reader waits for the first
   byte of a frame with no bound while its connection holds a session or a request in the engine,
   because an idle session is normal. A connection with neither closes after one deadline with no
-  frame. So only a client that keeps a session open holds a slot with no traffic. On Linux the TCP
-  keepalive of an accepted socket finds a peer that vanished with no close after 120 seconds
-  (`limits.zig`). That time holds for a connection with no unacknowledged output, because the kernel
-  sends no probe while output waits for an acknowledgment. With output in flight, a write that
-  waits for room in the send buffer ends at the `--io-timeout` deadline. Output that fits in the
-  send buffer starts no wait. A binary connection that holds a session then ends only at the
-  retransmission limit of the kernel. With `--io-timeout 0` the server sets no bound on a write
-  wait, and only the retransmission limit of the kernel ends it.
+  frame. So only a client that keeps a session open holds a slot with no traffic. Linux and Windows
+  turn on the TCP keepalive of an accepted socket. On Linux it finds a peer that vanished with no
+  close after 120 seconds (`limits.zig`). That time holds for a connection with no unacknowledged
+  output, because the kernel sends no probe while output waits for an acknowledgment. With output in
+  flight, a write that waits for room in the send buffer ends at the `--io-timeout` deadline. Output
+  that fits in the send buffer starts no wait. A binary connection that holds a session then ends
+  only at the retransmission limit of the kernel. With `--io-timeout 0` the server sets no bound on
+  a write wait, and only the retransmission limit of the kernel ends it.
 - **A buffered reply sees a hang-up at the next token.** A buffered HTTP reply writes nothing
   before the turn ends. So at each token event of the turn the task probes the socket for a
   hang-up, and a hang-up ends the turn and closes the session. The probe skips the `done`, so a
   complete reply still goes out. A request that the client sends before it reads the reply is no
   hang-up. A prefill emits no event, so the probe waits for the first token. A streamed reply sees
-  a hang-up as a write error. Only Linux has the probe.
+  a hang-up as a write error. Linux and Windows have the probe.
 - **An HTTP reply that says close ends the connection.** An error reply, a request with
   `Connection: close`, and every HTTP/1.0 request end the connection after the reply. A request
   that the client sent after it is not answered.
@@ -272,9 +281,10 @@ session table consumes. The manager makes the calls whose result only the cache 
   close sends the end of stream. The drain lowers the chance of a reset, and it does not remove it.
   Every error reply ends the connection this way, also one that follows a complete body (a bad JSON
   body, a model mismatch, a prompt past the window). The connection counts toward
-  `--max-connections` until the client closes or the wait ends. On the binary frontend only the
-  refusal at the cap drains: it shuts the send side and drops the input that has arrived, with no
-  wait. Any other binary connection closes with no drain.
+  `--max-connections` until the client closes or the wait ends. On the binary frontend the refusal
+  at the cap drains, in the form of the refusal item above. On Windows the reader also drops input
+  after a frame error or a refused handshake, as the half-close item states. Any other binary
+  connection closes with no drain.
 - **The two transports serve two kinds of traffic.** The binary wire serves embedded interactive
   traffic. That means many short, low-latency sessions that often share a prefilled prefix. The HTTP
   frontend serves general interop. A program that sends the request shapes of the field table in
@@ -566,12 +576,12 @@ chunked coding, and it ends at the close.
 
 An omitted sampling field takes a default. Under `--sampling model`,
 the default, it takes the field of the registry card entry of the resolved
-thinking mode, the vLLM priority. A model with no card entry takes the greedy
+thinking mode. A model with no card entry takes the greedy
 entry. Under `--sampling greedy`, every omitted field keeps the greedy
 identity. A field that the request sends always wins over the card. A client
 that needs a fixed reply sends `temperature: 0` or a fixed `seed`. One seed,
 one build, and one request give one reply. Under the card defaults,
-`temperature: 0` still applies the card penalties, the vLLM rule, so the
+`temperature: 0` still applies the card penalties, so the
 reply can differ from the pure greedy stream. `--sampling greedy`
 gives the pure greedy stream.
 

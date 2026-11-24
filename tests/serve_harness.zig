@@ -8,8 +8,9 @@
 //! runner over the Qwen fixture.
 //!
 //! Transport. The server listens on an ephemeral TCP port or on a unix socket in a temporary
-//! directory. A test drives it through the reference client and stops it over the wire or through
-//! the process owner's own request.
+//! directory. The socket path is absolute, because some systems refuse a relative one. A test
+//! drives the server through the reference client and stops it over the wire or through the
+//! process owner's own request.
 //!
 //! Fixtures. The harness reads the canonical SmolLM2 Q8_0 or Qwen3.5-2B Q8_0 from
 //! `test_fixtures.path`. `boot` returns `error.SkipZigTest` only when that function does. A load
@@ -17,8 +18,8 @@
 //!
 //! Close waits. `awaitServerClose` reads a raw socket until the server closes it. Each read waits
 //! at most `close_wait_ms`, so a server with no deadline fails a test and does not hang it.
-//! `readWithinWait` and `setReceiveBufferBytes` make raw socket calls, and they return
-//! `error.SkipZigTest` on Windows.
+//! `readWithinWait` reads through the socket reader of the server, so it returns
+//! `error.SkipZigTest` where that reader has no deadline.
 //!
 //! Chat template. The kind defaults to `.none`, because template wrapping has its own unit tests
 //! and the reference comparison holds for any template. A test of the turn wraps names its kind.
@@ -31,7 +32,6 @@
 //! control end-of-sequence token.
 
 const std = @import("std");
-const builtin = @import("builtin");
 const Io = std.Io;
 const Allocator = std.mem.Allocator;
 const zigferencer = @import("zigferencer");
@@ -49,6 +49,7 @@ const event = zigferencer.serve_event;
 const server_mod = zigferencer.serve_server;
 const prefill_chunk = zigferencer.serve_prefill_chunk;
 const Client = zigferencer.serve_client.Client;
+const timed_stream = zigferencer.serve_timed_stream;
 
 // -- constants --------------------------------------------------------------
 
@@ -230,13 +231,12 @@ pub fn HarnessFor(comptime Runner: type) type {
                 .tcp => .{ .tcp = .{} },
                 .unix => blk: {
                     tmp = std.testing.tmpDir(.{});
-                    const path = try std.fmt.bufPrint(
-                        &path_buf,
-                        ".zig-cache/tmp/{s}/serve.sock",
-                        .{&tmp.?.sub_path},
-                    );
-                    path_len = path.len;
-                    break :blk .{ .unix = path };
+                    const dir_len = try tmp.?.dir.realPath(io, &path_buf);
+                    const name = std.fs.path.sep_str ++ "serve.sock";
+                    if (dir_len + name.len > path_buf.len) return error.NameTooLong;
+                    @memcpy(path_buf[dir_len..][0..name.len], name);
+                    path_len = dir_len + name.len;
+                    break :blk .{ .unix = path_buf[0..path_len] };
                 },
             };
 
@@ -395,30 +395,27 @@ pub fn awaitServerClose(stream: Io.net.Stream) !usize {
 }
 
 /// Wait at most `wait_ms` for bytes or a close on `stream`, then read once into `buf`.
-/// Null means that the wait ended first. Zero means that the peer closed.
+/// Null means that the wait ended first. Zero means that the peer closed. A failed wait or a
+/// failed read counts as a reset.
 pub fn readWithinWait(
     stream: Io.net.Stream,
     buf: []u8,
     wait_ms: i32,
-) (std.posix.PollError || std.posix.ReadError || error{SkipZigTest})!?usize {
-    std.debug.assert(wait_ms >= 0);
-    return switch (builtin.os.tag) {
-        .windows => skipOnWindows(),
-        else => readWithinWaitPosix(stream, buf, wait_ms),
-    };
-}
+) error{ ConnectionResetByPeer, SkipZigTest }!?usize {
+    std.debug.assert(wait_ms > 0);
+    std.debug.assert(buf.len > 0);
+    if (!timed_stream.has_deadline) return error.SkipZigTest;
 
-/// Set the receive buffer of `stream` to `bytes`, so a test can fill the send path of the server
-/// with few bytes.
-pub fn setReceiveBufferBytes(
-    stream: Io.net.Stream,
-    bytes: c_int,
-) (std.posix.SetSockOptError || error{SkipZigTest})!void {
-    std.debug.assert(bytes > 0);
-    return switch (builtin.os.tag) {
-        .windows => skipOnWindows(),
-        else => setReceiveBufferBytesPosix(stream, bytes),
+    // The reader has no buffer of its own, so its one read lands in `buf`.
+    var r: timed_stream.Reader = .init(stream, std.testing.io, &.{}, @intCast(wait_ms));
+    var dest = [_][]u8{buf};
+    const n = r.interface.readVec(&dest) catch |err| switch (err) {
+        error.EndOfStream => return 0,
+        error.ReadFailed => if (r.timed_out) return null else return error.ConnectionResetByPeer,
     };
+    std.debug.assert(n > 0);
+    std.debug.assert(n <= buf.len);
+    return n;
 }
 
 /// The serving invariant for one turn: the same token ids and the same
@@ -445,34 +442,4 @@ pub fn controlVocab(arena: Allocator) !vocab_mod.Vocab {
         .alignment = 1,
     };
     return vocab_mod.buildFromParsed(arena, parsed);
-}
-
-// -- helpers ----------------------------------------------------------------
-
-/// A std socket on Windows is not a POSIX descriptor, so the raw socket calls skip the test there.
-fn skipOnWindows() error{SkipZigTest} {
-    return error.SkipZigTest;
-}
-
-fn readWithinWaitPosix(
-    stream: Io.net.Stream,
-    buf: []u8,
-    wait_ms: i32,
-) (std.posix.PollError || std.posix.ReadError)!?usize {
-    const posix = std.posix;
-    const fd = stream.socket.handle;
-    var fds = [_]posix.pollfd{.{ .fd = fd, .events = posix.POLL.IN, .revents = 0 }};
-    if (try posix.poll(&fds, wait_ms) == 0) {
-        return null;
-    }
-
-    const n = try posix.read(fd, buf);
-    std.debug.assert(n <= buf.len);
-    return n;
-}
-
-fn setReceiveBufferBytesPosix(stream: Io.net.Stream, bytes: c_int) std.posix.SetSockOptError!void {
-    const posix = std.posix;
-    const fd = stream.socket.handle;
-    try posix.setsockopt(fd, posix.SOL.SOCKET, posix.SO.RCVBUF, std.mem.asBytes(&bytes));
 }

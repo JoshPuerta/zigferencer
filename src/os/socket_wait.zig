@@ -1,14 +1,12 @@
-//! The OS calls of the serve sockets. They are the read, the write, the wake, the wait with a
-//! deadline, the send and the drain that do not block, the hang-up probe, and the TCP keepalive.
+//! The OS calls of the serve sockets, with their result types and capability constants.
 //! `serve/timed_stream.zig` builds its reader and writer on them.
 //!
-//! Platforms. One file holds the calls of each OS, and this file selects one at compile time.
-//! Linux uses `socket_wait_linux.zig`. Windows uses `socket_wait_windows.zig`: its own read, write,
-//! and wake, and no deadline. Every other OS uses `socket_wait_none.zig`: no deadline, a probe that
-//! reports no hang-up, no keepalive, and drains that drop nothing.
+//! Platforms. One file holds the calls of each OS, and this file selects one at compile time. The
+//! files are `socket_wait_linux.zig`, `socket_wait_windows.zig`, and `socket_wait_none.zig` for an
+//! OS with no deadline. Each OS file states how it makes the calls.
 //!
-//! Comptime. A check below asserts that the selected file declares every function with the type
-//! that this file expects, so an incomplete OS file fails the build.
+//! Comptime. `assertImpl` fails the build when the selected file lacks a function or a capability
+//! constant, or declares one with another type.
 
 const std = @import("std");
 const builtin = @import("builtin");
@@ -21,7 +19,6 @@ comptime {
 
 // -- types ------------------------------------------------------------------
 
-/// The file that holds the calls of the target OS.
 const Impl = switch (builtin.os.tag) {
     .linux => @import("socket_wait_linux.zig"),
     .windows => @import("socket_wait_windows.zig"),
@@ -31,13 +28,20 @@ const Impl = switch (builtin.os.tag) {
 /// The end of a wait: the socket is ready, the deadline passed, or the wait call failed.
 pub const Wait = enum { ready, timed_out, failed };
 
-/// The end of a send that does not block: the bytes that it sent, a full send buffer, or a failure.
-pub const SendResult = union(enum) { sent: usize, again, failed };
+/// The end of a send with a deadline: the bytes that it sent, the deadline, or a failure.
+pub const TimedSendResult = union(enum) { sent: usize, timed_out, failed };
 
 // -- api --------------------------------------------------------------------
 
-/// True when the OS file has the deadline, the probe, the keepalive, and the drains.
+/// True when the OS file has the deadline, the probe, the keepalive, and the drain.
 pub const has_deadline: bool = Impl.has_deadline;
+
+/// True where input that arrives after a close makes the peer lose the reply that it has not read.
+/// A refusal and a fatal reply then drop the input of the client until a deadline.
+pub const late_input_drops_reply: bool = Impl.late_input_drops_reply;
+
+/// True where a unix socket takes an absolute path only.
+pub const unix_path_absolute_only: bool = Impl.unix_path_absolute_only;
 
 /// Read once into the buffers of `dest`. Null when the read failed. Zero is the end of the stream.
 pub const read = Impl.read;
@@ -49,21 +53,18 @@ pub const write = Impl.write;
 /// End every read and write that waits on the socket, and fail the later ones.
 pub const wake = Impl.wake;
 
-/// Wait until the socket is readable, or until the deadline. A hang-up or an error counts as ready,
-/// so the next read reports it.
+/// Wait until the socket is readable, or until the deadline. A hang-up counts as ready, so the
+/// next read reports it. An error counts as ready or fails the wait.
 pub const waitReadable = Impl.waitReadable;
 
-/// Wait until the socket has room to send, or until the deadline. A hang-up or an error counts as
-/// ready, so the next write reports it.
-pub const waitWritable = Impl.waitWritable;
+/// Send some of `bytes`, and wait for room until the deadline. A wake ends the wait. After
+/// `timed_out` or `failed`, some of the bytes can have reached the peer, so the caller must end
+/// the connection. Call it only when `has_deadline` is true.
+pub const sendUntil = Impl.sendUntil;
 
-/// Send what fits now, with no wait. Call it only when `has_deadline` is true.
-pub const sendNow = Impl.sendNow;
-
-/// Read and drop at most `max_bytes` that the peer has sent so far, with no wait.
-pub const drainNow = Impl.drainNow;
-
-/// Read and drop input until the end of the stream, until `max_bytes`, or until the deadline.
+/// Read and drop input until the end of the stream, until `max_bytes`, or until the deadline. A
+/// deadline that passed drops only the arrived input. The byte bound keeps the caller from looping.
+/// True when a receive gave the end of the stream. On Linux a receive after `wake` gives it too.
 pub const drainUntil = Impl.drainUntil;
 
 /// True when the peer has closed the connection or its send side.
@@ -75,8 +76,6 @@ pub const enableKeepalive = Impl.enableKeepalive;
 
 // -- helpers ----------------------------------------------------------------
 
-/// An OS file must declare each function with the type of the Linux file. One that lacks a
-/// function, or declares it with another type, fails the build.
 fn assertImpl(comptime T: type) void {
     const Deadline = Io.Clock.Timestamp;
     const expected = .{
@@ -84,15 +83,20 @@ fn assertImpl(comptime T: type) void {
         .{ "write", fn (Io, net.Stream, []const u8, []const []const u8, usize) ?usize },
         .{ "wake", fn (Io, net.Stream) void },
         .{ "waitReadable", fn (Io, net.Stream, Deadline) Wait },
-        .{ "waitWritable", fn (Io, net.Stream, Deadline) Wait },
-        .{ "sendNow", fn (net.Stream, []const u8) SendResult },
-        .{ "drainNow", fn (net.Stream, usize) void },
-        .{ "drainUntil", fn (Io, net.Stream, usize, Deadline) void },
-        .{ "peerClosed", fn (net.Stream) bool },
-        .{ "enableKeepalive", fn (net.Stream, c_int, c_int, c_int) void },
+        .{ "sendUntil", fn (Io, net.Stream, []const u8, Deadline) TimedSendResult },
+        .{ "drainUntil", fn (Io, net.Stream, usize, Deadline) bool },
+        .{ "peerClosed", fn (Io, net.Stream) bool },
+        .{ "enableKeepalive", fn (Io, net.Stream, c_int, c_int, c_int) void },
     };
-    if (!@hasDecl(T, "has_deadline") or @TypeOf(T.has_deadline) != bool) {
-        @compileError("socket wait file " ++ @typeName(T) ++ " lacks has_deadline: bool");
+    const flags = .{ "has_deadline", "late_input_drops_reply", "unix_path_absolute_only" };
+    inline for (flags) |name| {
+        if (!@hasDecl(T, name) or @TypeOf(@field(T, name)) != bool) {
+            @compileError("socket wait file " ++ @typeName(T) ++ " lacks " ++ name ++ ": bool");
+        }
+    }
+    // The drop of late input uses `drainUntil`, which needs the deadline.
+    if (T.late_input_drops_reply and !T.has_deadline) {
+        @compileError("socket wait file " ++ @typeName(T) ++ " drops replies with no deadline");
     }
     inline for (expected) |entry| {
         const name = entry[0];

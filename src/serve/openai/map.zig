@@ -17,7 +17,7 @@
 //! NaN fails it. The ranges are the binary wire guards, so the scheduler accepts every value that
 //! passes.
 //!
-//! Thinking. A budget of 0 turns thinking off, the vLLM rule, so it wins over `enable_thinking`.
+//! Thinking. A budget of 0 turns thinking off, so it wins over `enable_thinking`.
 //! A model with no think tags accepts only the closed modes, the rule of the binary wire. A
 //! budget above 0 also needs the ids of a forced close, or the scheduler refuses it.
 //!
@@ -159,7 +159,7 @@ pub const UnknownFields = struct {
 };
 
 /// The source of an omitted sampling field. `model` takes the card entry of
-/// the resolved thinking mode, the vLLM priority. `greedy` keeps the greedy
+/// the resolved thinking mode. `greedy` keeps the greedy
 /// identity for every omitted field.
 pub const SamplingDefaults = enum {
     model,
