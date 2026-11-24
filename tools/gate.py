@@ -22,7 +22,7 @@ from enum import StrEnum
 from pathlib import Path
 from types import MappingProxyType
 
-BIN = Path("zig-out/bin/zigferencer-dev")
+BIN = Path("zig-out/bin/zigferencer-dev" + (".exe" if sys.platform == "win32" else ""))
 SMOLLM2 = "SmolLM2-135M-Instruct-Q8_0"
 QWEN_2B = "Qwen3.5-2B-Q8_0"
 SAME = "same"
@@ -285,11 +285,17 @@ def note(text: str) -> None:
 
 
 def host_has_simd() -> bool:
+    """Ask Zig for the CPU of a native build. A simd backend needs x86_64 with AVX2 and FMA."""
+    argv = [os.environ.get("ZIG") or "zig", "build-exe", "--show-builtin"]
     try:
-        words = set(Path("/proc/cpuinfo").read_text(encoding="utf-8").split())
-    except OSError:
-        return False
-    return "avx2" in words and "fma" in words
+        text = subprocess.run(argv, capture_output=True, text=True, check=True).stdout
+    except OSError as err:
+        raise GateError(f"cannot ask zig for the host CPU: {err}") from err
+    except subprocess.CalledProcessError as err:
+        raise GateError(f"cannot ask zig for the host CPU: {err}\n{err.stderr}") from err
+    if "pub const cpu: std.Target.Cpu" not in text:
+        raise GateError("zig printed no CPU for the host")
+    return ".avx2," in text and ".fma," in text
 
 
 def build(backend: str) -> None:
@@ -517,21 +523,21 @@ def run(argv: list[str], gates: Mapping[str, Gate] = GATES) -> int:
     """The exit code of one run. A test can pass other tables."""
     parser = make_parser(gates)
     opts = parse(parser, gates, argv)
-    has_simd = host_has_simd()
-    if opts.listing:
-        for name in (opts.gate,) if opts.gate else tuple(gates):
-            cases, pairs = select(parser, gates[name], opts, has_simd)
-            if not opts.gate:
-                print(f"# {name}")
-            print_list(cases, pairs, max(len(case.label) for case in gates[name].cases))
-        return 0
-    assert opts.gate is not None
-    cases, pairs = select(parser, gates[opts.gate], opts, has_simd)
-    if len(cases) < 2:
-        parser.error(f"gate {opts.gate} selected {len(cases)} case(s), too few to compare")
-    if opts.measure and not pairs:
-        parser.error(f"gate {opts.gate} selected no pair to measure")
     try:
+        has_simd = host_has_simd()
+        if opts.listing:
+            for name in (opts.gate,) if opts.gate else tuple(gates):
+                cases, pairs = select(parser, gates[name], opts, has_simd)
+                if not opts.gate:
+                    print(f"# {name}")
+                print_list(cases, pairs, max(len(case.label) for case in gates[name].cases))
+            return 0
+        assert opts.gate is not None
+        cases, pairs = select(parser, gates[opts.gate], opts, has_simd)
+        if len(cases) < 2:
+            parser.error(f"gate {opts.gate} selected {len(cases)} case(s), too few to compare")
+        if opts.measure and not pairs:
+            parser.error(f"gate {opts.gate} selected no pair to measure")
         run_gate(opts, cases, pairs)
     except GateError as err:
         print(f"[!] {err}", file=sys.stderr)

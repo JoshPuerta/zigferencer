@@ -1,8 +1,8 @@
 //! What a single op-backend variant needs from the target. Each `ops/<variant>.zig` exposes
 //! `pub const requires: OpRequires = ...;`.
 //!
-//! Host check. `isMetByHost` scores a variant against the host card, so `info` reports what the
-//! running host supports even for a `-Dcpu=baseline` binary. No SIMD probing runs in the hot path.
+//! Target check. `isMetByHost` scores a variant against the SIMD features of the build target,
+//! so `info` reports what this binary can run. No SIMD probing runs in the hot path.
 //!
 //! Build mirror. The build does not read this value. `simdBackendSupportedBy` in `build.zig`
 //! mirrors what the two SIMD variants declare, and it rejects a bad target and backend pair at
@@ -99,8 +99,8 @@ pub fn isMetBy(req: OpRequires, cpu: std.Target.Cpu) bool {
     return true;
 }
 
-/// Runtime eligibility check using a detected host card.
-/// `info` calls this to show which variants the running host satisfies.
+/// Whether `card` meets the needs of a variant. The SIMD features of a card are those of the
+/// build target, so `info` shows which variants this binary can run.
 pub fn isMetByHost(req: OpRequires, card: hwinfo.HwCard) bool {
     const arch_ok = switch (req.arch) {
         .any => true,
