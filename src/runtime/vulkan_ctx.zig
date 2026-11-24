@@ -10,8 +10,11 @@
 //!
 //! The module compiles only under `-Druntime=vulkan`. The runtime is a
 //! build-time axis, gated by `build_options.use_vulkan` and the conditional
-//! re-export in `main.zig`, so CPU builds never link libvulkan or the Vulkan
-//! bindings.
+//! re-export in `main.zig`, so CPU builds never open the Vulkan loader or
+//! compile the Vulkan bindings.
+//!
+//! Loader. `init` opens the Vulkan loader library at run time and loads every function through its
+//! `vkGetInstanceProcAddr`. The library stays open until the process ends.
 //!
 //! Device selection (`scoreDeviceType`) ranks DISCRETE > INTEGRATED > VIRTUAL
 //! and rejects `.cpu`, so a software rasterizer like llvmpipe never wins the
@@ -22,8 +25,8 @@
 //! such a device holds fewer lanes. Only `linear_q8_0_subgroup.comp` reads the lanes of a subgroup,
 //! and only `tools/bench_matmul.zig` runs it. Timings on this device mean nothing.
 //!
-//! The engine targets a translation-layer driver, and four properties of that
-//! driver shape this file. It advertises Vulkan 1.2, so the code stays inside
+//! The file must also run on a translation-layer driver, and four properties of
+//! that driver shape it. It advertises Vulkan 1.2, so the code stays inside
 //! 1.2. It reports subgroup sizes 32 to 64, so `init` pins 32 on every compute
 //! pipeline through the subgroup-size-control extension. It exposes neither
 //! 8-bit storage nor `shaderInt8`, so the quant kernels pack four quants to a
@@ -33,11 +36,11 @@
 //! Device features. The Q8_0 kernels read f16 weight scales out of storage buffers. That needs
 //! 16-bit storage and float16 arithmetic, which are core in Vulkan 1.1 and 1.2, so a
 //! Vulkan11/12Features chain enables them. 8-bit storage and `shaderInt8` stay off, because the
-//! driver exposes neither on RDNA2. The kernels pack the quants four to a `uint` and decode them
-//! with `bitfieldExtract`, at the cost of a few ALU ops. `VK_EXT_subgroup_size_control` pins a
-//! required subgroup size of 32 on every compute pipeline. The driver reports 32 to 64, and
-//! without the pin its shader compiler can choose wave64. RDNA2 issues a wave64 vector op in two
-//! passes, so the pin forces the native wave32.
+//! translation-layer driver exposes neither on RDNA2. The kernels pack the quants four to a
+//! `uint` and decode them with `bitfieldExtract`, at the cost of a few ALU ops.
+//! `VK_EXT_subgroup_size_control` pins a required subgroup size of 32 on every compute pipeline.
+//! The driver reports 32 to 64, and without the pin its shader compiler can choose wave64. RDNA2
+//! issues a wave64 vector op in two passes, so the pin forces the native wave32.
 //!
 //! Memory budget. `VK_EXT_memory_budget` is optional and exposes the free device-local VRAM,
 //! which sizes the multi-stream KV window to the hardware. When a driver lacks it,
@@ -45,6 +48,9 @@
 //!
 //! Driver. `VK_KHR_driver_properties`, core since Vulkan 1.2, names the driver. A device older
 //! than 1.2 and without the extension reads as `other`. The VRAM line of `limits` reads the driver.
+//!
+//! Subgroup size. `init` refuses a GPU device that cannot run the pinned subgroup size at the
+//! compute stage.
 //!
 //! One-shot submit. The translation layer makes a native command allocator for each command
 //! buffer, and the paravirtual driver leaks part of it when the buffer is freed. So a one-shot
@@ -59,6 +65,7 @@ const span = @import("../core/span.zig");
 const kv_index = @import("../core/kv_index.zig");
 const attn_split = @import("../core/attn_split.zig");
 const core_log = @import("../core/utils/log.zig");
+const vulkan_loader_library = @import("vulkan_loader_library.zig");
 const dispatch_list = if (core_log.hot) @import("../ops_vulkan/dispatch_list.zig") else void;
 
 const log = std.log.scoped(.gpu);
@@ -70,13 +77,6 @@ comptime {
             "or fix the caller to gate on build_options.use_vulkan.");
     }
 }
-
-/// The one symbol the dynamic linker resolves. Every other Vulkan function pointer loads
-/// through it. `wireVulkan` in `build.zig` links `libvulkan.so.1` (or the platform equivalent).
-extern fn vkGetInstanceProcAddr(
-    instance: vk.Instance,
-    name: [*:0]const u8,
-) callconv(vk.vulkan_call_conv) vk.PfnVoidFunction;
 
 // -- constants --------------------------------------------------------------
 
@@ -114,6 +114,9 @@ pub const InitError = error{
     InstanceFunctionsMissing,
     DeviceFunctionsMissing,
     WorkgroupCountBelowMinimum,
+    SubgroupSizeUnsupported,
+    VulkanLoaderLibraryMissing,
+    VulkanLoaderEntryPointMissing,
 } ||
     vk.BaseWrapper.CreateInstanceError ||
     vk.InstanceWrapper.EnumeratePhysicalDevicesError ||
@@ -177,7 +180,7 @@ pub const Context = struct {
         }
 
         // Create the instance.
-        const vkb = vk.BaseWrapper.load(vkGetInstanceProcAddr);
+        const vkb = vk.BaseWrapper.load(try vulkan_loader_library.open());
         if (vkb.dispatch.vkCreateInstance == null) return error.BaseFunctionsMissing;
 
         const app_info: vk.ApplicationInfo = .{
@@ -254,6 +257,7 @@ pub const Context = struct {
         var has_memory_budget = false;
         var has_maintenance4 = apiAtLeast13(picked.props.api_version);
         var has_driver_properties = apiAtLeast12(picked.props.api_version);
+        var has_subgroup_size_control = apiAtLeast13(picked.props.api_version);
         for (avail_exts) |*ext| {
             const name = std.mem.sliceTo(&ext.extension_name, 0);
             if (std.mem.eql(u8, name, vk.extensions.ext_memory_budget.name)) {
@@ -262,6 +266,10 @@ pub const Context = struct {
 
             if (std.mem.eql(u8, name, vk.extensions.khr_driver_properties.name)) {
                 has_driver_properties = true;
+            }
+
+            if (std.mem.eql(u8, name, vk.extensions.ext_subgroup_size_control.name)) {
+                has_subgroup_size_control = true;
             }
 
             if (std.mem.eql(u8, name, vk.extensions.khr_maintenance_4.name)) {
@@ -276,6 +284,12 @@ pub const Context = struct {
 
         // Name the driver, which picks the usable share of the VRAM budget.
         const driver = if (has_driver_properties) readDriver(vki, picked.device) else .other;
+
+        // Refuse a device that cannot run the pinned subgroup size. A device without the
+        // extension cannot answer the query, and the device create below refuses it.
+        if (has_subgroup_size_control and !options.software) {
+            try checkSubgroupSize(vki, picked.device);
+        }
 
         // Read the buffer limits, and apply the storage-range override.
         const reported = try readBufferLimits(vki, picked.device, picked.props, has_maintenance4);
@@ -394,15 +408,14 @@ pub const Context = struct {
             });
         }
 
-        var vram_mib: f64 = 0;
-        for (mem_props.memory_heaps[0..mem_props.memory_heap_count]) |heap| {
-            if (heap.flags.device_local_bit) {
-                vram_mib = @as(f64, @floatFromInt(heap.size)) / (1024.0 * 1024.0);
-                break;
-            }
-        }
-
-        log.debug("init done: queue family {d}, vram {d:.0} MiB", .{ queue_family, vram_mib });
+        const vram_heap = deviceHeapIndex(&mem_props);
+        const vram_bytes: u64 = if (vram_heap) |heap| mem_props.memory_heaps[heap].size else 0;
+        const vram_mib = @as(f64, @floatFromInt(vram_bytes)) / (1024.0 * 1024.0);
+        log.debug("init done: queue family {d}, vram {d:.0} MiB, budget heap {?d}", .{
+            queue_family,
+            vram_mib,
+            vram_heap,
+        });
 
         // Hand the handles to the context.
         return .{
@@ -444,8 +457,9 @@ pub const Context = struct {
         self.vki.destroyInstance(self.instance, null);
     }
 
-    /// Budget and usage of the device-local heap, from the live memory-budget query.
-    /// Null when the extension is absent. Read once at runner init, so the KV window stays fixed.
+    /// Budget and usage of the heap that the device buffers use, from the live memory-budget query.
+    /// Null when the extension is absent or the device has no device-local memory type. Read once
+    /// at runner init, so the KV window stays fixed.
     pub fn deviceLocalBudget(self: *const Context) ?struct { budget: u64, usage: u64 } {
         if (!self.has_memory_budget) return null;
 
@@ -458,18 +472,11 @@ pub const Context = struct {
             .p_next = @ptrCast(&budget_props),
         };
         self.vki.getPhysicalDeviceMemoryProperties2(self.physical_device, &props2);
-        const mp = &props2.memory_properties;
-        var i: u32 = 0;
-        while (i < mp.memory_heap_count) : (i += 1) {
-            if (mp.memory_heaps[i].flags.device_local_bit) {
-                return .{
-                    .budget = budget_props.heap_budget[i],
-                    .usage = budget_props.heap_usage[i],
-                };
-            }
-        }
-
-        return null;
+        const heap = deviceHeapIndex(&props2.memory_properties) orelse return null;
+        return .{
+            .budget = budget_props.heap_budget[heap],
+            .usage = budget_props.heap_usage[heap],
+        };
     }
 
     /// The live usage and budget of heap `heap`. `null` when the extension is
@@ -500,11 +507,8 @@ pub const Context = struct {
     /// The heap size overstates the free bytes on a GPU that a desktop shares.
     pub fn deviceLocalAvailableBytes(self: *const Context) u64 {
         if (self.deviceLocalBudget()) |b| return b.budget -| b.usage;
-        for (self.mem_props.memory_heaps[0..self.mem_props.memory_heap_count]) |heap| {
-            if (heap.flags.device_local_bit) return heap.size;
-        }
-
-        return 0;
+        const heap = deviceHeapIndex(&self.mem_props) orelse return 0;
+        return self.mem_props.memory_heaps[heap].size;
     }
 
     /// Refuse a step buffer of `n` blocks of `block_elems` f32 elements that breaks a device buffer
@@ -704,6 +708,19 @@ pub fn findMemoryType(
     return null;
 }
 
+/// The heap that the device buffers of the kernels use: the heap of the first device-local memory
+/// type. `findMemoryType` gives the kernels that type when the buffer allows it. The Vulkan spec
+/// orders the memory types, and it does not order the heaps.
+pub fn deviceHeapIndex(mem_props: *const vk.PhysicalDeviceMemoryProperties) ?u32 {
+    const all_type_bits: u32 = std.math.maxInt(u32);
+    const device_local: vk.MemoryPropertyFlags = .{ .device_local_bit = true };
+    const memory_type = findMemoryType(mem_props.*, all_type_bits, device_local) orelse return null;
+    const heap = mem_props.memory_types[memory_type].heap_index;
+
+    std.debug.assert(heap < mem_props.memory_heap_count);
+    return heap;
+}
+
 /// Pick the memory type for a buffer that the CPU writes and reads. A cached type wins, because
 /// an uncached mapping runs at a small fraction of memory speed. The coherent fallback is slow.
 /// Returns null when no allowed type is host-visible and coherent.
@@ -735,12 +752,48 @@ fn readDriver(vki: vk.InstanceWrapper, dev: vk.PhysicalDevice) limits.Driver {
     };
     vki.getPhysicalDeviceProperties2(dev, &props2);
     const driver = driverEntry(driver_props.driver_id);
-    log.debug("driver: {s} (id {d}), limits entry {t}", .{
+    log.info("driver: {s}, version {s} (id {d}), limits entry {t}", .{
         std.mem.sliceTo(&driver_props.driver_name, 0),
+        std.mem.sliceTo(&driver_props.driver_info, 0),
         @intFromEnum(driver_props.driver_id),
         driver,
     });
     return driver;
+}
+
+/// Refuse a GPU device that cannot run every compute pipeline at the pinned subgroup size. The
+/// caller checks that the device states `VK_EXT_subgroup_size_control`.
+fn checkSubgroupSize(
+    vki: vk.InstanceWrapper,
+    dev: vk.PhysicalDevice,
+) error{SubgroupSizeUnsupported}!void {
+    var sizes: vk.PhysicalDeviceSubgroupSizeControlProperties = .{
+        .min_subgroup_size = 0,
+        .max_subgroup_size = 0,
+        .max_compute_workgroup_subgroups = 0,
+        .required_subgroup_size_stages = .{},
+    };
+    var props2: vk.PhysicalDeviceProperties2 = .{
+        .properties = undefined,
+        .p_next = @ptrCast(&sizes),
+    };
+    vki.getPhysicalDeviceProperties2(dev, &props2);
+
+    const pin = limits.required_subgroup_size;
+    const compute_stage = sizes.required_subgroup_size_stages.compute_bit;
+    log.debug("subgroup sizes: {d} to {d}, compute stage {}", .{
+        sizes.min_subgroup_size,
+        sizes.max_subgroup_size,
+        compute_stage,
+    });
+    if (compute_stage and pin >= sizes.min_subgroup_size and pin <= sizes.max_subgroup_size) return;
+
+    log.err(
+        "device: the driver states subgroup sizes {d} to {d}, compute stage {}. The kernels " ++
+            "need a required subgroup size of {d} at the compute stage. Use a CPU build",
+        .{ sizes.min_subgroup_size, sizes.max_subgroup_size, compute_stage, pin },
+    );
+    return error.SubgroupSizeUnsupported;
 }
 
 /// The one map from a Vulkan driver id to an entry of `limits.Driver`.
@@ -847,6 +900,23 @@ fn fakeMemProps(flag_words: []const u32) vk.PhysicalDeviceMemoryProperties {
 }
 
 const all_types: u32 = 0xffff_ffff;
+
+test "deviceHeapIndex: the heap of the first device-local type, whatever the heap order" {
+    // The types of the native Windows driver: device, host, and a small heap that is both.
+    var props = fakeMemProps(&.{ 0x1, 0x6, 0x7 });
+    props.memory_heap_count = 3;
+    props.memory_types[1].heap_index = 1;
+    props.memory_types[2].heap_index = 2;
+    try std.testing.expectEqual(@as(?u32, 0), deviceHeapIndex(&props));
+
+    // The same types with the small heap first in the heap list.
+    props.memory_types[0].heap_index = 2;
+    props.memory_types[2].heap_index = 0;
+    try std.testing.expectEqual(@as(?u32, 2), deviceHeapIndex(&props));
+
+    const host_only = fakeMemProps(&.{ 0x6, 0xe });
+    try std.testing.expectEqual(@as(?u32, null), deviceHeapIndex(&host_only));
+}
 
 test "scoreDeviceType: a CPU device needs the software option, which rejects a GPU" {
     try std.testing.expectEqual(@as(i32, 3), scoreDeviceType(.discrete_gpu, false));

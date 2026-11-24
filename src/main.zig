@@ -305,6 +305,11 @@ fn isUserError(err: anyerror) bool {
         error.InvalidSoftwareDevice,
         // The context logged the workgroup counts of the device.
         error.WorkgroupCountBelowMinimum,
+        // The context logged the subgroup sizes of the device and the pinned size.
+        error.SubgroupSizeUnsupported,
+        // The loader library logged its file name and the cause.
+        error.VulkanLoaderLibraryMissing,
+        error.VulkanLoaderEntryPointMissing,
         // The profile logged the timestamp bits and the period.
         error.TimestampsUnsupported,
         // Client errors.
@@ -395,6 +400,7 @@ test {
     _ = hwinfo;
     _ = console;
     _ = os_process;
+    _ = @import("os/dynamic_library.zig");
     _ = @import("os/file_map.zig");
     _ = @import("os/host_cores.zig");
     _ = @import("os/host_cpu_name.zig");

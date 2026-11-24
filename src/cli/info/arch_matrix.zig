@@ -103,9 +103,9 @@ pub fn print(w: *Io.Writer, p: style.Palette) Io.Writer.Error!void {
         }
     }
 
-    try w.print("\n{s}[*] vulkan backends need -Druntime=vulkan (glslc + libvulkan-dev){s}\n", .{
-        p.dim, p.reset,
-    });
+    const hint = "\n{s}[*] vulkan backends need -Druntime=vulkan " ++
+        "(glslc + vk.xml to build, the Vulkan loader to run){s}\n";
+    try w.print(hint, .{ p.dim, p.reset });
 }
 
 // -- helpers ----------------------------------------------------------------

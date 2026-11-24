@@ -1,4 +1,4 @@
-# zigferencer: short names for the common flows, and the one entry for CI.
+# zigferencer: short names for the common flows, and the entry of the Linux CI job.
 #
 # `zig build` is the build system of record. A target exists for one of three reasons: it joins
 # commands, it fixes a default that a bare `zig build` gets wrong (Debug in a measurement), or it is
@@ -57,12 +57,14 @@ check-targets: ## Type-check the CPU: default, naive, Windows, and macOS. Compil
 	$(ZIG) build test-build -Dtarget=x86_64-windows-gnu $(FLAGS)
 
 ci: FLAGS += -Dtrace=true --seed 0x2a
-ci: check-targets test ## Run the CPU part of CI. It needs no GPU and no model file
+ci: check-targets test ## Run the Linux CPU job of CI. It needs no GPU and no model file
 	$(ZIG) build test-unit bench-build simd-probe $(FLAGS) $(TEST_RUN)
 
-ci-gpu: ## Compile every GPU path and run none. It needs glslc and libvulkan-dev, not a GPU
+ci-gpu: ## Compile every GPU path for Linux and Windows and run none. It needs glslc and vk.xml
 	for b in $(GPU_BACKENDS); do $(ZIG) build test-build bench-build install dev -Druntime=vulkan \
 	  -Dops-backend=$$b --prefix zig-out/ci-gpu/$$b; done
+	for b in $(GPU_BACKENDS); do $(ZIG) build test-build bench-build install dev -Druntime=vulkan \
+	  -Dops-backend=$$b -Dtarget=x86_64-windows-gnu --prefix zig-out/ci-gpu/win-$$b; done
 
 clean: ## Remove .zig-cache and zig-out
 	rm -rf .zig-cache zig-out

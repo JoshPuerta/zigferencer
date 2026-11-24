@@ -95,9 +95,11 @@ sudo apt install glslc libvulkan-dev
   not read `HTTPS_PROXY`. It writes to `models/` under the current directory, or to
   `$ZIGFERENCER_MODELS_DIR` when that is set. A command looks in `models/` first, then in that
   store, and `list` prints where each model is.
-- **GPU build.** It reads the Vulkan registry that `libvulkan-dev` installs. Another distribution
-  passes its path with `-Dvk-registry`.
-- **GPU run.** It needs a Vulkan 1.2 driver with `VK_EXT_subgroup_size_control`, 16-bit storage,
+- **GPU build.** It needs `glslc` and the Vulkan registry file `vk.xml`, which `libvulkan-dev`
+  installs. Another distribution passes its path with `-Dvk-registry`. The binary links no Vulkan
+  library.
+- **GPU run.** It opens the Vulkan loader of the system at run time (`libvulkan1` on Debian and
+  Ubuntu). It needs a Vulkan 1.2 driver with `VK_EXT_subgroup_size_control`, 16-bit storage,
   f16 arithmetic, and a subgroup size of 32. On Linux with an AMD card, RADV in the stock
   `mesa-vulkan-drivers` package provides it (not fully tested yet). The tested setup is WSL2 with
   the Mesa Dozen driver, which needs more than the stock packages:

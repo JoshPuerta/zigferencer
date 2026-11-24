@@ -19,6 +19,10 @@ const windows = std.os.windows;
 /// `RelationProcessorCore`: one record for each physical core.
 pub const relation_processor_core: u32 = 0;
 
+/// `LOAD_LIBRARY_SEARCH_SYSTEM32`: search the System32 directory alone, for the library and for
+/// the libraries that it loads.
+pub const load_library_search_system32: windows.DWORD = 0x0000_0800;
+
 // -- types ------------------------------------------------------------------
 
 /// `MEMORYSTATUSEX`. The caller sets `dwLength` to the struct size before the call.
@@ -85,3 +89,14 @@ pub extern "kernel32" fn PrefetchVirtualMemory(
     VirtualAddresses: [*]const WIN32_MEMORY_RANGE_ENTRY,
     Flags: windows.ULONG,
 ) callconv(.winapi) windows.BOOL;
+
+pub extern "kernel32" fn LoadLibraryExW(
+    lpLibFileName: [*:0]const u16,
+    hFile: ?windows.HANDLE,
+    dwFlags: windows.DWORD,
+) callconv(.winapi) ?windows.HMODULE;
+
+pub extern "kernel32" fn GetProcAddress(
+    hModule: windows.HMODULE,
+    lpProcName: [*:0]const u8,
+) callconv(.winapi) ?windows.FARPROC;

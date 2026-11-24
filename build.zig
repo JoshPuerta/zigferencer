@@ -1,12 +1,14 @@
 //! The Zig build script: the release and developer executables, the tests, the benches, and the
 //! SIMD probe. The ops backend is a build-time decision, so an unsupported target fails here and
-//! never as a runtime SIGILL. Only `-Druntime=vulkan` touches glslc and libvulkan.
+//! never as a runtime SIGILL. Only `-Druntime=vulkan` touches glslc and the Vulkan registry.
 //!
 //! Comptime. `debugNoteStep` takes its note at comptime, so the print string joins at build time.
 //!
-//! Vulkan link. The Vulkan loader uses TLS, pthreads, and malloc. It segfaults in its own data
-//! setup when the executable does not link libc. With `-lc` the TLS init of the C runtime runs
-//! before `main`, so `libvulkan.so.1` finds the slots it expects.
+//! Vulkan loader. A GPU binary links no Vulkan library and opens the loader at run time, so a
+//! cross build for Windows works from Linux. A Linux GPU binary links libc, because the loader
+//! needs the TLS init of the C runtime and `std.DynLib` calls `dlopen` only with libc. A Windows
+//! binary loads the library through kernel32 and links no libc.
+//! `runtime/vulkan_loader_library.zig` stops the compiler for a target that opens no library.
 //!
 //! Common invocations. The Makefile wraps most of these as short targets, and
 //! `check-fmt` has no target of its own:
@@ -23,9 +25,10 @@
 //!                                            for a debugger (the stem of a tests/ file
 //!                                            names an integration test)
 //!   zig build -Druntime=vulkan -Dops-backend=vulkan_fused
-//!                                            GPU build (needs glslc + libvulkan-dev)
+//!                                            GPU build (needs glslc and vk.xml)
 
 const std = @import("std");
+const builtin = @import("builtin");
 const limits = @import("src/core/limits.zig");
 
 const Compile = std.Build.Step.Compile;
@@ -185,8 +188,8 @@ const ops_backend_help = "Op kernel backend. 'auto' (default) picks the stronges
 
 const runtime_help = "Dispatch runtime. 'cpu' = the ops/ variants alone. " ++
     "'vulkan' = also compile src/ops_vulkan/shaders/*.comp to SPIR-V with glslc, " ++
-    "link libvulkan, and pull vulkan-zig as a build dependency. " ++
-    "It needs glslc on PATH and libvulkan-dev installed. " ++
+    "and pull vulkan-zig as a build dependency. The binary opens the Vulkan loader at run time. " ++
+    "It needs glslc on PATH and the Vulkan registry (see -Dvk-registry). " ++
     "The default is 'vulkan' for a GPU ops backend, otherwise 'cpu'.";
 
 const attn_kernel_help = "GPU attention kernel set. " ++
@@ -195,7 +198,8 @@ const attn_kernel_help = "GPU attention kernel set. " ++
 
 const vk_registry_help = "Path to the Vulkan registry XML (vk.xml). " ++
     "The build reads it only under -Druntime=vulkan. " ++
-    "The default is the Ubuntu and Debian libvulkan-dev location.";
+    "The default is the Ubuntu and Debian libvulkan-dev location. " ++
+    "On a Windows host it is the registry of the Vulkan SDK that VULKAN_SDK names.";
 
 const trace_help = "Compile the trace: the span sites, the per-op CPU timer, " ++
     "and the layer, dispatch, and token log scopes. The default is false in every mode. " ++
@@ -266,7 +270,7 @@ pub fn build(b: *std.Build) void {
     const modules = addModules(b, config);
 
     if (config.runtime == .vulkan) {
-        wireVulkan(b, modules, config.vk_registry);
+        wireVulkan(b, config, modules);
     }
 
     const exe = addExecutables(b, config, modules);
@@ -303,7 +307,7 @@ fn readConfig(b: *std.Build) Config {
         .ops_backend = resolveOpsBackend(requested_backend, target, runtime),
         .attn_kernel = b.option(AttnKernelOption, "attn-kernel", attn_kernel_help) orelse .split,
         .vk_registry = b.option([]const u8, "vk-registry", vk_registry_help) orelse
-            "/usr/share/vulkan/registry/vk.xml",
+            defaultVkRegistry(b),
         .trace_hot = b.option(bool, "trace", trace_help) orelse false,
         .test_filters = b.option([]const []const u8, "test-filter", test_filter_help) orelse &.{},
         .test_threads = checkTestThreads(b.option(u32, "test-threads", test_threads_help) orelse 4),
@@ -321,14 +325,24 @@ fn resolveTarget(b: *std.Build) std.Build.ResolvedTarget {
     if (query.cpu_arch == .x86_64 and query.cpu_model == .determined_by_arch_os) {
         query.cpu_model = .{ .explicit = &std.Target.x86.cpu.x86_64_v3 };
     }
-    // Std has unix sockets only for a Windows minimum of 1803 or later (`Io/net.zig`), and the
-    // serve tests run them on a build for 1809. A native build takes the version of the host, and
-    // a minimum that the user names stays.
+    // Std compiles unix sockets in only for a Windows minimum of 1803 or later (`Io/net.zig`).
+    // A native build takes the version of the host, and a minimum that the user names stays.
     if (query.os_tag == .windows and query.os_version_min == null) {
         query.os_version_min = .{ .windows = .win10_rs5 };
     }
 
     return b.resolveTargetQuery(query);
+}
+
+/// The registry path when the user names none. A Windows host has no fixed place for the file,
+/// so the build takes it from the Vulkan SDK that `VULKAN_SDK` names. Every other host keeps the
+/// libvulkan-dev path of Ubuntu and Debian.
+fn defaultVkRegistry(b: *std.Build) []const u8 {
+    const linux_path = "/usr/share/vulkan/registry/vk.xml";
+    if (builtin.os.tag != .windows) return linux_path;
+
+    const sdk = b.graph.environ_map.get("VULKAN_SDK") orelse return linux_path;
+    return b.pathJoin(&.{ sdk, "share", "vulkan", "registry", "vk.xml" });
 }
 
 fn checkTestThreads(test_threads: u32) u32 {
@@ -346,9 +360,9 @@ fn resolveOpsBackend(
 ) OpsBackendResolved {
     const needs_avx2_fma =
         " needs AVX2+FMA on x86_64. This target lacks it. Use -Dops-backend=naive or =auto.";
-    // The vulkan runtime owns the shader compiles and the libvulkan link. Without this refusal the
-    // build fails later at a confusing missing-symbol link error.
-    const needs_vulkan = " needs -Druntime=vulkan to wire the shaders and the libvulkan link.";
+    // The vulkan runtime owns the shader compiles and the vulkan-zig import. Without this refusal
+    // the build fails later at a confusing missing-import error.
+    const needs_vulkan = " needs -Druntime=vulkan to wire the shaders and the Vulkan bindings.";
 
     const avx2_fma_ok = simdBackendSupportedBy(target.result.cpu);
     const vulkan_ok = runtime == .vulkan;
@@ -792,19 +806,21 @@ fn debugNoteStep(b: *std.Build, comptime note: []const u8) *Step {
 
 // -- helpers: vulkan --------------------------------------------------------
 
-/// Add vulkan-zig, link `libvulkan`, and compile `vulkan_shaders` to SPIR-V. Each blob becomes an
-/// anonymous import, so source can call `@embedFile("vec_add.spv")` wherever the build wrote it.
-fn wireVulkan(b: *std.Build, modules: Modules, vk_registry: []const u8) void {
+/// Add vulkan-zig and compile `vulkan_shaders` to SPIR-V. Each blob becomes an anonymous import, so
+/// source can call `@embedFile("vec_add.spv")` wherever the build wrote it.
+fn wireVulkan(b: *std.Build, config: Config, modules: Modules) void {
     const exe_mod = modules.exe;
     // A lazy dependency is null on the first pass. The build runner then fetches it and runs
     // `build` again.
-    const vk_dep = b.lazyDependency("vulkan", .{ .registry = vk_registry }) orelse return;
+    const vk_dep = b.lazyDependency("vulkan", .{ .registry = config.vk_registry }) orelse return;
     exe_mod.addImport("vulkan", vk_dep.module("vulkan-zig"));
     modules.dev.addImport("vulkan", vk_dep.module("vulkan-zig"));
 
-    // `link_libc` is load-bearing.
-    exe_mod.linkSystemLibrary("vulkan", .{});
-    exe_mod.link_libc = true;
+    // The Linux loader needs the TLS init of libc, and libc makes `std.DynLib` call `dlopen`.
+    // Windows opens the loader through kernel32, so a Windows binary stays free of libc.
+    if (config.target.result.os.tag == .linux) {
+        exe_mod.link_libc = true;
+    }
 
     for (vulkan_shaders) |shader| {
         addShaderImport(b, exe_mod, shader);

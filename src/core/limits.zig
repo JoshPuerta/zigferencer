@@ -277,10 +277,9 @@ pub const openai_max_chunk_overhead_bytes: usize = openai_max_request_bytes;
 /// a chunked body of the cap with the most framing bytes. That is more than one binary message.
 pub const close_drain_bytes: usize = openai_max_header_bytes + openai_max_request_bytes +
     openai_max_chunk_overhead_bytes;
-/// The longest wait for the input of a refused HTTP request to end. The value follows the nginx
-/// default `lingering_timeout` of 5 seconds, its wait for more input in a lingering close. Here
-/// it bounds the whole drain. The error reply before the drain has its own `--io-timeout`
-/// deadline per write.
+/// The longest wait for client input to end after a refused HTTP request or a fatal binary
+/// reply. The value is a project choice, not a measurement. It bounds the whole drain. The error
+/// reply before the drain has its own `--io-timeout` deadline per write.
 pub const close_linger_ms: u32 = 5_000;
 /// The longest wait of a refusal at the connection cap for the end of the client input, where late
 /// input drops the unread refusal. The value is a project choice, not a measurement. A refused
@@ -419,6 +418,10 @@ pub const storage_range_max: u64 = std.math.maxInt(u32);
 /// The environment variable that runs the Vulkan paths on a CPU device. The value `1` takes a CPU
 /// device and no other, so a debug run with no GPU is a named choice.
 pub const software_device_env = "ZIGFERENCER_VK_SOFTWARE";
+
+/// The subgroup size that every compute pipeline of a GPU device requires. RDNA2 runs a wave32
+/// vector op in one pass and a wave64 op in two.
+pub const required_subgroup_size: u32 = 32;
 
 // -- types ------------------------------------------------------------------
 

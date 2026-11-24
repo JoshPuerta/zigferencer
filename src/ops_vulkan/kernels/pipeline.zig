@@ -153,7 +153,7 @@ pub fn createComputePipeline(
     // Pin wave32. Every workgroup size must be a multiple of 32. See docs/gpu-rdna2.md section 5.
     // A software device holds fewer lanes, so the size stays with its driver.
     const required_size: vk.PipelineShaderStageRequiredSubgroupSizeCreateInfo = .{
-        .required_subgroup_size = 32,
+        .required_subgroup_size = limits.required_subgroup_size,
     };
     const stage: vk.PipelineShaderStageCreateInfo = .{
         .p_next = if (ctx.software) null else @ptrCast(&required_size),

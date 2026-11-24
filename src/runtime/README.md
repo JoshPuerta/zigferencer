@@ -37,6 +37,7 @@ comes in, and token ids go out.
 | `decode_ring.zig` | `DecodeRing`, the two decode command buffers of a GPU runner. |
 | `gpu_profile.zig` | `GpuProfile`, the timestamps of one command buffer. |
 | `vulkan_ctx.zig` | `Context`, the owning handle of the Vulkan device. |
+| `vulkan_loader_library.zig` | `open`, which opens the Vulkan loader at run time and returns its `vkGetInstanceProcAddr`. |
 | `vulkan_runner.zig` | `Runner`, the `Context` and the per-op kernel bundle. |
 | `qwen_gpu_guard.zig` | The load gate of the Qwen3.5 GPU kernels. |
 | `dispatch_guard.zig` | The gate of the head counts that a fused kernel dispatches. |

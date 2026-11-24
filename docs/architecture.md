@@ -161,9 +161,10 @@ The main build steps:
 Two build options decide which code computes the model:
 
 - `-Druntime` decides what the binary links. `cpu` links only the Zig standard
-  library. `vulkan` adds the `vulkan-zig` bindings, `libvulkan`, and `libc`, and it
-  compiles the shaders. The Vulkan loader uses thread-local storage and the libc
-  allocator, so a Vulkan binary must link `libc`.
+  library. `vulkan` adds the `vulkan-zig` bindings, and it compiles the shaders. It
+  links no Vulkan library. The binary opens the Vulkan loader of the system at run
+  time. On Linux it also links `libc`, because the loader uses thread-local storage
+  and the libc allocator.
 - `-Dops-backend` decides which kernels compute the ops: `naive`, `simd`, or
   `simd_pf` on the CPU, `vulkan` or `vulkan_fused` on the GPU. `auto`, the
   default, selects `simd_pf` on an x86_64 target with AVX2 and FMA, and `naive` on
@@ -213,7 +214,7 @@ gets one branch each. `op_requires.ops_backend_names` and the backend tables of
 | `-Doptimize` | `Debug` (the default of `zig build`), `ReleaseSafe` (keeps every assertion), or `ReleaseFast` (every measurement). |
 | `-Dtrace` | Compiles the trace: the span sites, the per-op CPU timer, and the hot log scopes (`layer`, `dispatch`, `token`). It is off by default in every mode. |
 | `-Dllvm` | Forces the LLVM code generator. A debugger needs it to show local variables. |
-| `-Dvk-registry` | The path of the Vulkan registry, `vk.xml`. The default is the Debian and Ubuntu location. |
+| `-Dvk-registry` | The path of the Vulkan registry, `vk.xml`. The default is the Debian and Ubuntu location. On a Windows host it is the registry of the Vulkan SDK that `VULKAN_SDK` names. |
 | `-Dattn-kernel` | The set of GPU attention kernels. `split` is the only set. |
 | `-Dtest-filter`, `-Dtest-threads`, `-Dtest-bin` | Run only the tests whose name holds a string, the thread count of the runner tests, and the binary that `test-install` installs. |
 
@@ -236,7 +237,7 @@ The `Makefile` is a small layer over `zig build`, and `make help` lists the targ
   flags.
 - `make build` and `make run` install both executables in one `zig build install dev` call.
   `make run` runs `zigferencer-dev`, which holds every command.
-- `make ci` runs the CPU part of CI. `make ci-gpu` compiles every GPU path and runs none.
+- `make ci` runs the Linux CPU job of CI. `make ci-gpu` compiles every GPU path and runs none.
 - `make gate`, `make profile`, and `make simd-report` call the scripts of `tools/`, and
   `ARGS=` carries their arguments. `make debug-build` calls `tools/debug-build.sh` with no
   arguments.
@@ -860,8 +861,8 @@ because the device limits do not apply to it.
 
 ### Why slots are fixed (no paged attention)
 
-A slot reserves a full window at boot, also for a session that stays short. Engines
-such as vLLM use paged attention instead. The KV cache is a pool of small blocks, a
+A slot reserves a full window at boot, also for a session that stays short. Other
+engines use paged attention instead. The KV cache is a pool of small blocks, a
 session gets blocks as it grows, and a block table maps its positions to blocks.
 zigferencer does not do this yet, for three reasons:
 
@@ -1170,7 +1171,7 @@ the registry entry of the model. `--thinking-budget N` limits the think tokens o
 turn, and `0` means no limit. When a turn reaches the budget, the scheduler forces
 the close tag, and the model continues with the answer. A turn can set both values
 for itself. The OpenAI frontend takes them as `chat_template_kwargs.enable_thinking`
-and `thinking_token_budget`. There, the vLLM rule applies: a budget of 0 turns
+and `thinking_token_budget`. There, a budget of 0 turns
 thinking off, and -1 or no field keeps the value of the server.
 
 ### State that outlives a turn
@@ -1201,7 +1202,7 @@ thinking off, and -1 or no field keeps the value of the server.
 | Requests in the queue of the engine | `serve/engine.zig` |
 | Events in the queue of one connection | `serve/engine.zig` |
 | Live connections | `--max-connections`, at most `limits.max_connections` |
-| Wait of one socket read or write | `--io-timeout`, at most `limits.max_io_timeout_s` (Linux only) |
+| Wait of one socket read or write | `--io-timeout`, at most `limits.max_io_timeout_s` (Linux and Windows) |
 | Size of one binary frame | a 20-byte header and at most 64 KiB of payload (`serve/protocol.zig`) |
 | Sessions | `--max-sessions`, at most `limits.max_batch` on a CPU build. A fused GPU build allows up to `limits.max_logical_sessions` when `--vram-slots` or `--kv-vram` enables the KV tiers |
 | Decode rows in one step | `--max-batch`, at most `limits.max_batch` |

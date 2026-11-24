@@ -11,6 +11,16 @@ const builtin = @import("builtin");
 const Io = std.Io;
 const Allocator = std.mem.Allocator;
 
+// -- constants --------------------------------------------------------------
+
+/// The file name of the Vulkan loader on this OS, or null where no build opens one. The Vulkan
+/// runtime opens this name, and the Windows probe looks for the same file.
+pub const vulkan_loader_file: ?[:0]const u8 = switch (builtin.os.tag) {
+    .linux => "libvulkan.so.1",
+    .windows => "vulkan-1.dll",
+    else => null,
+};
+
 // -- types ------------------------------------------------------------------
 
 /// Best-effort GPU presence. `present` drives the vulkan op-backends' host eligibility in `info`.
@@ -67,7 +77,7 @@ fn exists(io: Io, path: []const u8) bool {
 fn detectWindows(io: Io, arena: Allocator) Gpu {
     _ = arena;
 
-    const loader_name = "\\vulkan-1.dll";
+    const loader_name = "\\" ++ vulkan_loader_file.?;
     const system_directory = std.os.windows.getSystemDirectoryWtf16Le();
     var path_buf: [1024]u8 = undefined;
     if (std.unicode.calcWtf8Len(system_directory) + loader_name.len > path_buf.len) {
