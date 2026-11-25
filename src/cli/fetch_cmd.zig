@@ -42,6 +42,7 @@ const HfPathError = error{
     NoRepoSegment,
     NoFileSegment,
     EmptySegment,
+    SeparatorInSegment,
 };
 
 /// The flags of `fetch`.
@@ -215,6 +216,8 @@ fn parseHfPath(s: []const u8) HfPathError!HfSpec {
     const file_in_repo = s[slash2 + 1 ..];
 
     if (org.len == 0 or repo.len == 0 or file_in_repo.len == 0) return error.EmptySegment;
+    // The org and the repo name the local directory, so neither can hold a path separator.
+    if (std.mem.findAny(u8, s[0..slash2], "\\:") != null) return error.SeparatorInSegment;
 
     return .{ .org = org, .repo = repo, .file_in_repo = file_in_repo };
 }
@@ -250,6 +253,9 @@ fn printHfPathError(io: Io, arg: []const u8, err: HfPathError) !void {
             "missing file segment, expected <org>/<repo>/<file.gguf>\n",
         ),
         error.EmptySegment => try w.writeAll("an org/repo/file segment was empty\n"),
+        error.SeparatorInSegment => try w.writeAll(
+            "the org and the repo cannot hold '\\' or ':'\n",
+        ),
     }
 
     try w.flush();
@@ -283,6 +289,13 @@ test "parseHfPath rejects missing repo segment" {
 
 test "parseHfPath rejects empty segments" {
     try std.testing.expectError(error.EmptySegment, parseHfPath("org//file.gguf"));
+}
+
+test "parseHfPath rejects a path separator in the org or the repo" {
+    const sep = error.SeparatorInSegment;
+    try std.testing.expectError(sep, parseHfPath("..\\..\\x/repo/file.gguf"));
+    try std.testing.expectError(sep, parseHfPath("org/C:repo/file.gguf"));
+    _ = try parseHfPath("org/repo/dir/file.gguf");
 }
 
 test "buildSyntheticModel constructs the resolve URL and flattens local path" {
