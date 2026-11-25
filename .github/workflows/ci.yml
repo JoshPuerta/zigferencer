@@ -15,19 +15,27 @@ jobs:
       - name: Install Zig 0.16.0
         run: |
           set -eu
-          url=https://ziglang.org/download/0.16.0/zig-x86_64-linux-0.16.0.tar.xz
+          file=zig-x86_64-linux-0.16.0.tar.xz
           sha=70e49664a74374b48b51e6f3fdfbf437f6395d42509050588bd49abe52ba3d00
-          mkdir -p "$RUNNER_TEMP/zig-dl"
-          curl -fsSL -o "$RUNNER_TEMP/zig-dl/zig.tar.xz" "$url"
-          echo "$sha  $RUNNER_TEMP/zig-dl/zig.tar.xz" | sha256sum -c -
-          tar -xf "$RUNNER_TEMP/zig-dl/zig.tar.xz" -C "$RUNNER_TEMP/zig-dl"
-          echo "$RUNNER_TEMP/zig-dl/zig-x86_64-linux-0.16.0" >> "$GITHUB_PATH"
+          dl="$RUNNER_TEMP/zig-dl"
+          mkdir -p "$dl"
+          # ziglang.org asks automated jobs to use a community mirror. The hash makes every
+          # source give the same bytes. ziglang.org is the last source and has no time limit.
+          same() { echo "$sha  $dl/$file" | sha256sum -c - > /dev/null 2>&1; }
+          for base in https://zigmirror.com https://zig.squirl.dev https://zig.chainsafe.dev; do
+            curl -fsSL --connect-timeout 10 --max-time 120 -o "$dl/$file" "$base/$file" &&
+              same && break
+          done
+          same || curl -fsSL -o "$dl/$file" "https://ziglang.org/download/0.16.0/$file"
+          echo "$sha  $dl/$file" | sha256sum -c -
+          tar -xf "$dl/$file" -C "$dl"
+          echo "$dl/zig-x86_64-linux-0.16.0" >> "$GITHUB_PATH"
       - name: Run the CPU checks
         run: make ci
 
   windows:
     runs-on: windows-latest
-    timeout-minutes: 30
+    timeout-minutes: 45
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
       - name: Install Zig 0.16.0
@@ -36,14 +44,24 @@ jobs:
           $ErrorActionPreference = 'Stop'
           # Keep the progress bar out of the job log.
           $ProgressPreference = 'SilentlyContinue'
-          $url = 'https://ziglang.org/download/0.16.0/zig-x86_64-windows-0.16.0.zip'
+          $file = 'zig-x86_64-windows-0.16.0.zip'
           $sha = '68659eb5f1e4eb1437a722f1dd889c5a322c9954607f5edcf337bc3684a75a7e'
           $dl = Join-Path $env:RUNNER_TEMP 'zig-dl'
-          $zip = Join-Path $dl 'zig.zip'
+          $zip = Join-Path $dl $file
           New-Item -ItemType Directory -Force -Path $dl | Out-Null
-          Invoke-WebRequest -Uri $url -OutFile $zip
-          $got = (Get-FileHash -Algorithm SHA256 -Path $zip).Hash.ToLowerInvariant()
-          if ($got -ne $sha) { throw "SHA-256 of $zip is $got, expected $sha" }
+          # The same sources and the same rule as in the cpu job.
+          function Test-Same {
+            (Test-Path $zip) -and ((Get-FileHash -Algorithm SHA256 -Path $zip).Hash -ieq $sha)
+          }
+          $mirrors = 'https://zigmirror.com', 'https://zig.squirl.dev', 'https://zig.chainsafe.dev'
+          foreach ($base in $mirrors) {
+            curl.exe -fsSL --connect-timeout 10 --max-time 120 -o $zip "$base/$file"
+            if (($LASTEXITCODE -eq 0) -and (Test-Same)) { break }
+          }
+          if (-not (Test-Same)) {
+            curl.exe -fsSL -o $zip "https://ziglang.org/download/0.16.0/$file"
+          }
+          if (-not (Test-Same)) { throw "no source gave $file with the SHA-256 $sha" }
           Expand-Archive -Path $zip -DestinationPath $dl
           Add-Content -Path $env:GITHUB_PATH -Value (Join-Path $dl 'zig-x86_64-windows-0.16.0')
       - name: Run the tests in ReleaseSafe
