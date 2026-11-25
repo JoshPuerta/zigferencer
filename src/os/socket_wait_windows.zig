@@ -449,13 +449,10 @@ const event_wait_ms: u32 = 60_000;
 /// The deadline of a wait that no event ends.
 const silent_wait_ms: u32 = 20;
 
-/// The bound is far over what a loopback send path takes before it is full.
-const fill_chunks_max = 4096;
-const fill_chunk = [_]u8{'x'} ** (64 * 1024);
-
-/// The passes of the test of a send that the wake ends. Room can come back right after the fill,
-/// so a pass can end as `sent`, and the next pass tries again on a new pair.
-const send_wake_passes_max = 8;
+/// The sends that one test queues on a socket whose peer reads nothing. Their bytes are far over
+/// what a loopback send path takes, so the last send still waits for room at the wake.
+const queued_sends = 1024;
+const send_chunk = [_]u8{'x'} ** (64 * 1024);
 
 const Pair = struct {
     server: net.Server,
@@ -489,19 +486,6 @@ const Pair = struct {
 fn deadlineAfter(io: Io, wait_ms: u32) Io.Clock.Timestamp {
     const now = Io.Clock.Timestamp.now(io, .awake);
     return now.addDuration(.{ .raw = .fromMilliseconds(wait_ms), .clock = .awake });
-}
-
-/// Send with a deadline of now until a send finds no room.
-fn fillSendPath(io: Io, stream: net.Stream) !void {
-    for (0..fill_chunks_max) |_| {
-        switch (sendUntil(io, stream, &fill_chunk, .now(io, .awake))) {
-            .sent => {},
-            .timed_out => return,
-            .failed => return error.SendFailed,
-        }
-    }
-
-    return error.SendPathNeverFull;
 }
 
 fn waitInput(io: Io, stream: net.Stream) Wait {
@@ -758,35 +742,54 @@ test "socket_wait_windows: a task cancel that a keepalive request takes still en
     try testing.expectError(error.Canceled, task.cancel(io));
 }
 
-test "socket_wait_windows: a wake ends a send that waits for room" {
-    // `timed_out` means only that the send found no room at that time. Room can come back at
-    // once, so a send can complete before the wake. Each pass uses a new pair, until one send waits
-    // at the wake. No pass returns between the start and the finish of its send, because the kernel
-    // holds pointers into `output` until the routine ran.
-    const io = testing.io;
-    for (0..send_wake_passes_max) |_| {
-        var p = try Pair.open(io);
-        defer p.close(io);
+/// How the queued sends of one test ended.
+const SendEnds = struct {
+    sent: usize = 0,
+    cancelled: usize = 0,
+    timed_out: usize = 0,
+    other: usize = 0,
+};
 
-        try fillSendPath(io, p.conn);
-        const handle = p.conn.socket.handle;
-        var output: TimedRequest = undefined;
-        const status = output.startSend(handle, &fill_chunk);
-        if (status != .PENDING and status != .SUCCESS) {
-            std.debug.assert(isErrorStatus(status));
-            return error.SendRefused;
-        }
-        wake(io, p.conn);
-        switch (output.finishSend(io, handle, deadlineAfter(io, event_wait_ms))) {
-            .sent => {},
-            .timed_out => return error.WakeReportedDeadline,
-            .failed => {
-                try testing.expectEqual(windows.NTSTATUS.CANCELLED, output.iosb.u.Status);
-                return;
+test "socket_wait_windows: a wake ends a send that waits for room" {
+    // A send that found no room does not prove a full path, because room can come back at once.
+    // So no send here has a deadline, and all of them queue on the socket. The peer reads nothing.
+    // The path takes the first sends, and the last one waits for room until the wake.
+    const io = testing.io;
+    var p = try Pair.open(io);
+    defer p.close(io);
+
+    const sends = try testing.allocator.alloc(TimedRequest, queued_sends);
+    defer testing.allocator.free(sends);
+    const handle = p.conn.socket.handle;
+    // The kernel holds pointers into a started request until its routine ran. So no path returns
+    // between the first start and the last finish.
+    var started: usize = 0;
+    for (sends) |*send| {
+        if (isErrorStatus(send.startSend(handle, &send_chunk))) break;
+        started += 1;
+    }
+
+    wake(io, p.conn);
+    const deadline = deadlineAfter(io, event_wait_ms);
+    var ends: SendEnds = .{};
+    for (sends[0..started]) |*send| {
+        switch (send.finishSend(io, handle, deadline)) {
+            .sent => ends.sent += 1,
+            .timed_out => ends.timed_out += 1,
+            .failed => if (send.iosb.u.Status == .CANCELLED) {
+                ends.cancelled += 1;
+            } else {
+                ends.other += 1;
             },
         }
     }
 
-    std.debug.print("each of {d} sends completed before the wake\n", .{send_wake_passes_max});
-    return error.NoSendWaitedAtWake;
+    errdefer std.debug.print(
+        "{d} of {d} sends started: {d} sent, {d} cancelled, {d} at the deadline, {d} other\n",
+        .{ started, queued_sends, ends.sent, ends.cancelled, ends.timed_out, ends.other },
+    );
+    try testing.expectEqual(queued_sends, started);
+    // A send at the deadline waited through the wake.
+    try testing.expectEqual(0, ends.timed_out);
+    try testing.expectEqual(windows.NTSTATUS.CANCELLED, sends[started - 1].iosb.u.Status);
 }
