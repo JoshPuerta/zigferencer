@@ -3,7 +3,7 @@
 // dependency. `zig fetch` uses the `.dependencies` hashes to fill the cache.
 .{
     .name = .zigferencer,
-    .version = "0.1.0",
+    .version = "0.2.0",
 
     // Auto-generated package id (Zig writes it on first build). Do not hand-edit.
     .fingerprint = 0x8d219c7ebb4de560,
