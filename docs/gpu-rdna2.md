@@ -80,6 +80,39 @@ The engine reads each limit from the driver at start, except the 32 KiB of share
 memory. That bound is a constant in `core/limits.zig`, and every AMD driver allows
 at least 32 KiB.
 
+### Native Windows driver
+
+A Windows build opens `vulkan-1.dll` at run time and uses the AMD driver with no
+translation layer and no virtual machine. The table gives what the two drivers report
+for the same card. The native driver is AMD driver 26.9.2 on Windows 10 22H2. The
+other one is Dozen of Mesa 26.1 under WSL2. `ZIGFERENCER_LOG=info,gpu=debug` prints
+these lines at start.
+
+| Value | Native Windows driver | Vulkan on D3D12 under WSL2 |
+| --- | --- | --- |
+| Storage-buffer range | 4 GiB minus 1 byte | 128 MiB |
+| Largest allocation | 2 GiB | 2 GiB |
+| Offset alignment of a storage buffer | 4 bytes | 16 bytes |
+| Subgroup sizes, with the compute stage | 32 to 64 | 32 to 64 |
+| Timestamp bits of the compute queue | 64 | 64 |
+| Workgroup count in x | 4294967295 | 65535 |
+| Device extensions | 198 | 47 |
+| Device-local heaps | 16112 MiB and 256 MiB | 16338 MiB |
+| Host heap | 16356 MiB | 16356 MiB |
+
+The native driver has two device-local heaps. The small one is also host-visible.
+The VRAM budget reads the heap of the first device-local memory type, which is the heap
+that the kernels allocate from.
+
+The engine pins a subgroup size of 32 on every compute pipeline. At start it checks
+that the device allows 32 for the compute stage, and it stops with a message when the
+device does not.
+
+The native driver maps to the default entry of `limits.vram_shares`, so the VRAM
+preflight keeps 1/8 of the free VRAM in reserve. The token hashes of SmolLM2-135M and
+Qwen3.5-2B on this driver equal the CPU reference, on the fused backend and on a
+hybrid placement.
+
 ## 3. The card in numbers
 
 | Part | RX 6800 XT |

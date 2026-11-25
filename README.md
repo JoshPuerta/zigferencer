@@ -76,7 +76,8 @@ and its API can change in any release.
 
 ## Requirements
 
-Ubuntu 24.04 on x86_64 is the tested platform. These commands install what the quick start needs:
+Ubuntu 24.04 and Windows 10 22H2, both on x86_64, are the tested platforms. On Ubuntu, these
+commands install what the quick start needs:
 
 ```bash
 sudo apt install make curl xz-utils
@@ -90,7 +91,7 @@ sudo apt install glslc libvulkan-dev
 
 - **CPU build.** It needs only Zig 0.16.0. The binary links no libc and is static. By default the
   build targets the CPU that builds it, and `-Dcpu=x86_64_v3` gives a binary for any x86_64 CPU of
-  that level. The CPU build also passes the compile check for Windows and macOS, which are not tested yet.
+  that level. The CPU build also passes the compile check for macOS, which is not tested yet.
 - **`fetch`.** It downloads over HTTPS from huggingface and needs no account and no token. It does
   not read `HTTPS_PROXY`. It writes to `models/` under the current directory, or to
   `$ZIGFERENCER_MODELS_DIR` when that is set. A command looks in `models/` first, then in that
@@ -101,8 +102,8 @@ sudo apt install glslc libvulkan-dev
 - **GPU run.** It opens the Vulkan loader of the system at run time (`libvulkan1` on Debian and
   Ubuntu). It needs a Vulkan 1.2 driver with `VK_EXT_subgroup_size_control`, 16-bit storage,
   f16 arithmetic, and a subgroup size of 32. On Linux with an AMD card, RADV in the stock
-  `mesa-vulkan-drivers` package provides it (not fully tested yet). The tested setup is WSL2 with
-  the Mesa Dozen driver, which needs more than the stock packages:
+  `mesa-vulkan-drivers` package provides it (not fully tested yet). The tested Linux setup is
+  WSL2 with the Mesa Dozen driver, which needs more than the stock packages:
   [`docs/gpu-rdna2.md`](docs/gpu-rdna2.md) lists its versions and its limits.
 
 **Optional tools:**
@@ -141,6 +142,40 @@ zig-out/bin/zigferencer fetch Qwen3.5-2B-Q8_0  # the model of the examples above
 benchmarks and the kernel checks are in a second executable, `zigferencer-dev`.
 `make build` installs both.
 
+### Windows
+
+Windows 10 version 1809 or later, on x86_64. The CPU build needs only
+[Zig 0.16.0 for Windows](https://ziglang.org/download/0.16.0/zig-x86_64-windows-0.16.0.zip).
+The GPU build also needs the [Vulkan SDK](https://vulkan.lunarg.com/sdk/home#windows), which
+installs `glslc` and the registry file `vk.xml`.
+The `Makefile` and the shell scripts of `tools/` need bash, so on Windows the `zig build`
+commands take their place:
+
+```powershell
+zig build install dev -Doptimize=ReleaseFast   # as `make build`
+zig build test -Doptimize=ReleaseSafe          # as `make test`
+zig build install dev -Doptimize=ReleaseFast -Dops-backend=vulkan_fused   # the GPU build
+
+zig-out\bin\zigferencer.exe fetch SmolLM2-135M-Instruct-Q8_0
+zig-out\bin\zigferencer.exe run SmolLM2-135M-Instruct-Q8_0 --prompt "Tell me a joke" --max-tokens 64
+zig-out\bin\zigferencer.exe serve SmolLM2-135M-Instruct-Q8_0 --port 8000 --max-sessions 4
+zig-out\bin\zigferencer.exe info
+```
+
+Some caveats:
+- A Linux host can build the Windows binaries with
+  `zig build install dev -Doptimize=ReleaseFast -Dtarget=x86_64-windows-gnu`. A build with
+  `-Dtarget` and no `-Dcpu` needs a CPU with AVX2 and FMA.
+- A CPU build gives the same tokens on Windows and on Linux in every measured case (if not I messed up badly).
+- `uv run tools/gate.py backends --cpu` runs a token-hash gate of `make gate`. It
+  needs [uv](https://docs.astral.sh/uv/), and `zig` on the `PATH` or in `ZIG`.
+- For GPU runtime, it needs only the driver of the GPU, which installs the Vulkan loader
+  `vulkan-1.dll`. The Vulkan SDK is a build dependency only. A Linux host can also build the
+  GPU binaries for Windows: add `-Dops-backend=vulkan_fused` to the command above.
+- A unix socket path must be absolute on Windows.
+- A second process on the same host can listen on the port of a running server and take some of
+  its connections. Run a server on a host whose accounts you trust.
+
 ## Performance
 
 To measure your own host, run:
@@ -166,7 +201,7 @@ zigferencer-dev bench-serve MODEL --max-tokens 128
 
 Planned after this release, in no fixed order:
 
-- A Windows port, with performance numbers on the native AMD driver.
+- Performance numbers for Windows on the native AMD driver.
 - MacOS and metal.
 - Better kernels.
 - Numbers from a native Linux run on RADV.
