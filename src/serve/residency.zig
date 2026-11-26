@@ -118,8 +118,8 @@ pub fn Residency(comptime SessionsT: type) type {
         restore_ms: f64 = 0,
 
         /// `n_logical` can exceed the physical slot count only when the runner can evict.
-        /// `blob_budget` is the ledger budget of the blob tier: zero refuses every eviction, and
-        /// null enforces nothing.
+        /// `blob_budget` is the ledger budget of the blob tier. Zero refuses the eviction of a
+        /// session with committed rows. Null enforces nothing.
         pub fn init(
             arena: Allocator,
             gpa: Allocator,
@@ -213,6 +213,7 @@ pub fn Residency(comptime SessionsT: type) type {
                 // A slot has one owner, so no two entries name one slot.
                 if (e.phys) |s| {
                     std.debug.assert(s < self.phys_owner.len);
+                    std.debug.assert(e.blob.bytes.len == 0);
                     std.debug.assert(self.phys_owner[s] != null);
                     std.debug.assert(self.phys_owner[s].? == i);
                 }
@@ -947,6 +948,10 @@ test "residency ledger: the incremental count equals the blob sum across a trace
     try res.decodeBatch(&.{b}, &out);
     try expectLedger(res, 1 * fake_row_bytes); // c's row, b's removed
 
+    // The victim is the least recently used session, not the first resident one.
+    try std.testing.expectEqual(@as(?u32, null), res.entries[c].phys);
+    try std.testing.expect(res.entries[a].phys != null);
+
     res.destroy(c); // the one session still out of VRAM
     try expectLedger(res, 0);
     res.destroy(a);
@@ -987,6 +992,34 @@ test "residency ledger: an over-budget eviction refuses and changes nothing" {
     try std.testing.expectEqual(a_blob_len, res.entries[a].blob.bytes.len);
     try std.testing.expectEqual(a_blob_rows, res.entries[a].blob.n_rows);
     try std.testing.expectEqual(evicts_before, fx.fake.evicts); // no device copy ran
+
+    res.destroy(a);
+    res.destroy(b);
+    res.destroy(c);
+}
+
+test "residency ledger: the need of the boot funds each swap" {
+    const gpa = std.testing.allocator;
+    // The budget holds one blob for the session that the slots cannot hold, and one more.
+    var fx: Fixture = undefined;
+    try fx.setUp(gpa, 2, 3, 2 * fake_row_bytes);
+    defer fx.tearDown(gpa);
+
+    const res = &fx.res;
+
+    const a = try res.create(1, .{});
+    _ = try res.feed(a, &.{0}, true);
+    const b = try res.create(2, .{});
+    _ = try res.feed(b, &.{0}, true);
+    const c = try res.create(3, .{});
+    _ = try res.feed(c, &.{0}, true); // evicts a
+    try expectLedger(res, 1 * fake_row_bytes);
+
+    // Each swap holds two blobs until the restore releases one.
+    for ([_]u32{ a, b, c }) |id| {
+        try res.ensureResident(id, &.{});
+        try expectLedger(res, 1 * fake_row_bytes);
+    }
 
     res.destroy(a);
     res.destroy(b);

@@ -702,9 +702,8 @@ fn keptCosts(t: *const Transcript, p: Plan, out: []u32) []const u32 {
     return out[0..p.kept];
 }
 
-// The anchors read their numbers as system rows and live deltas, so a real
-// transcript produces them. They run through `plan` and `retryPlan`.
-test "anchor A' keeps the three newest turns" {
+// These tests hold the numbers of the plan as system rows and live deltas.
+test "plan keeps the three newest turns" {
     const t = try weighed(&.{ 12, 9, 20, 7, 11 });
     defer testing.allocator.destroy(t);
 
@@ -714,7 +713,7 @@ test "anchor A' keeps the three newest turns" {
     try testing.expectEqual(@as(u32, 48), p.estimate);
 }
 
-test "anchor B' keeps an exact fit" {
+test "plan keeps an exact fit" {
     const t = try weighed(&.{ 8, 38 });
     defer testing.allocator.destroy(t);
 
@@ -724,7 +723,7 @@ test "anchor B' keeps an exact fit" {
     try testing.expectEqual(@as(u32, 56), p.estimate);
 }
 
-test "anchor C' keeps nothing when the newest turn alone is too large" {
+test "plan keeps nothing when the newest turn alone is too large" {
     const t = try weighed(&.{ 5, 50 });
     defer testing.allocator.destroy(t);
 
@@ -732,16 +731,17 @@ test "anchor C' keeps nothing when the newest turn alone is too large" {
     try testing.expectEqual(Plan{ .kept = 0, .dropped = 2, .estimate = 10 }, p);
 }
 
-test "anchor D' keeps three turns at the scale of a long chat" {
+test "plan keeps three turns at the scale of a long chat" {
     const t = try weighed(&.{ 700, 300, 900, 500 });
     defer testing.allocator.destroy(t);
 
     const p = plan(t, .{ .window = 2048, .reserve = 256, .system_rows = 40 });
     var buf: [8]u32 = undefined;
     try testing.expectEqualSlices(u32, &.{ 300, 900, 500 }, keptCosts(t, p, &buf));
+    try testing.expectEqual(@as(u32, 1740), p.estimate);
 }
 
-test "anchor E' leaves room for the refused prompt" {
+test "retryPlan leaves room for the refused prompt" {
     const t = try weighed(&.{ 12, 9, 20, 7, 11 });
     defer testing.allocator.destroy(t);
 

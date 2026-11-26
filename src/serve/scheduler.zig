@@ -3463,6 +3463,25 @@ test "a cancel after a natural stop keeps the natural finish reason" {
     }
 }
 
+test "EOS at the token cap finishes the turn with eos, not with max_tokens" {
+    var fx = try Fixture.setUp(std.testing.allocator, 1, 64, null);
+    defer fx.tearDown();
+
+    const sid = try fx.openSession(1, "a");
+    const from = fx.sink.n;
+    // The prompt byte 6 is the token 6, so the first sampled id is 7, the end-of-sequence id.
+    try fx.generate(1, sid, "\x06", 1);
+    fx.drain();
+
+    const seen = fx.sink.seen()[from..];
+    try std.testing.expectEqual(@as(usize, 2), seen.len);
+    try std.testing.expectEqual(@as(u32, 7), seen[0].ev.body.token.token_id);
+    const done = seen[1].ev.body.done;
+    try std.testing.expectEqual(protocol.FinishReason.eos, done.finish_reason);
+    try std.testing.expectEqual(@as(u32, 1), done.gen_tokens);
+    try std.testing.expectEqual(@as(?u32, null), fx.sched.entries[0].carry);
+}
+
 test "a cancel on an idle session emits nothing" {
     var fx = try Fixture.setUp(std.testing.allocator, 1, 64, null);
     defer fx.tearDown();
@@ -4439,6 +4458,35 @@ test "think budget: end-of-sequence inside the block ends the turn open" {
     });
     try std.testing.expect(fx.sched.entries[0].think_open);
     try std.testing.expectEqual(@as(u32, 4), fx.sched.entries[0].think_n);
+}
+
+test "a cancel in the prefill of an open turn ends it with the echo alone and no carry" {
+    var fx = try Fixture.setUpThink(std.testing.allocator, 65, 0, think_tags);
+    defer fx.tearDown();
+
+    const sid = try fx.openSession(1, "");
+    const from = fx.sink.n;
+    try fx.generate(1, sid, "4", 64);
+    const entry = &fx.sched.entries[0];
+    try std.testing.expectEqual(SessionPhase.prefill, entry.state);
+    _ = fx.sched.handle(
+        .{ .conn = 1, .request_id = 3, .session_id = sid, .body = .cancel },
+        fx.sink,
+    );
+    fx.drain();
+
+    // The echo is no generated token, so the cut turn has no last token to carry.
+    const seen = fx.sink.seen()[from..];
+    try std.testing.expectEqual(@as(usize, 2), seen.len);
+    try std.testing.expectEqual(think_tags.open_id, seen[0].ev.body.token.token_id);
+    try std.testing.expectEqual(protocol.Channel.open_tag, seen[0].ev.body.token.channel);
+    const done = seen[1].ev.body.done;
+    try std.testing.expectEqual(protocol.FinishReason.cancelled, done.finish_reason);
+    try std.testing.expectEqual(@as(u32, 0), done.gen_tokens);
+    try std.testing.expectEqual(@as(u32, 0), done.reasoning_tokens);
+    try std.testing.expectEqual(@as(u32, 0), done.kv_pos);
+    try std.testing.expectEqual(@as(?u32, null), entry.carry);
+    try std.testing.expectEqual(SessionPhase.idle, entry.state);
 }
 
 test "think echo: a parked echo holds the prefill and skips the prefix restore" {
