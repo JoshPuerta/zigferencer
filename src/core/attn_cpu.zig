@@ -353,3 +353,10 @@ test "anchors: the tiles, the parts, and the records at T = 2048 and P = 16" {
     try testing.expectEqual(@as(u64, 266_240), partialLen(32, 128) * elem_bytes);
     try testing.expectEqual(partialLen(32, 128), recordOffset(32, 128, 31, 15) + recordElems(128));
 }
+
+test "partialLen: the records of row 2 of a step start two partial buffers in" {
+    // A step of three rows of Qwen3.5-2B holds three partial buffers, one after the other.
+    const row_parts_len = partialLen(8, 256);
+    try testing.expectEqual(@as(usize, 99_072), 3 * row_parts_len);
+    try testing.expectEqual(@as(usize, 79_722), 2 * row_parts_len + recordOffset(8, 256, 3, 5));
+}

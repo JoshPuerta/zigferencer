@@ -1012,6 +1012,23 @@ test "maxGranuleWindow: the registry shapes under the spec-minimum storage range
     try testing.expectEqual(@as(u32, 131_072), maxGranuleWindow(16, 1024, .f32, wide_limits));
 }
 
+test "maxGranuleWindow: the granule window fits where the deepest window is misaligned" {
+    // A 4-byte row under a 4006-byte range. The deepest window of 1001 rows is not a whole
+    // number of 16-byte units, and three granules are.
+    var lim = spec_min_limits;
+    lim.storage_range = 4006;
+    try testing.expectEqual(@as(u32, 1001), maxWindowForLimits(1, 2, .f16, lim));
+    try testing.expectEqual(
+        limits.BufferVerdict.misaligned,
+        fits(Layout.init(1, 1001, 2, 1, .f16), lim),
+    );
+    try testing.expectEqual(@as(u32, 768), maxGranuleWindow(1, 2, .f16, lim));
+    try testing.expectEqual(
+        limits.BufferVerdict.fits,
+        fits(Layout.init(1, 768, 2, 1, .f16), lim),
+    );
+}
+
 test "limitOf: each broken limit names its words, its value, and its unit" {
     const lim = spec_min_limits;
     const index = limitOf(.index_past_31_bits, lim);

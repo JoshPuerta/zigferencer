@@ -22,7 +22,8 @@
 //!
 //! Layer sizes. The planner takes a per-layer size vector, so a family whose layers differ in
 //! size is summed by layer span instead of by one product. It also sizes the host RAM of the
-//! split, and it refuses a split whose anonymous host bytes pass the usable share of the free RAM.
+//! split. `planRam` refuses a split whose anonymous host bytes pass the usable share of the free
+//! RAM.
 //!
 //! Overflow bounds. The window is at most 2^18 (`limits.max_model_ctx`). The per-token column sums
 //! to at most 2^30 and the fixed column to at most 2^32. So one slot's span stays under 2^49. The
@@ -306,7 +307,7 @@ pub const KvStructure = struct {
 /// pure CPU runner and `host_layers == 0` is the whole-model GPU runner.
 pub const LayerSplit = struct {
     /// The host bytes one split implies, all of it anonymous memory. The
-    /// vector takes nothing from Y. `planLayerSplit` refuses a split whose
+    /// vector takes nothing from Y. `planRam` refuses a split whose
     /// vector passes the usable RAM, and the stages hold zero bytes for a caller
     /// without residency.
     pub const Ram = struct {
@@ -2148,6 +2149,11 @@ test "kvPlan mode A: refusal, VRAM bound, slot band, and monotonicity in X" {
                 try std.testing.expect(plan.vram.kv <= x);
                 try std.testing.expect(plan.n_slots >= batch);
                 try std.testing.expect(plan.n_slots <= caps.max_vram_slots);
+                // The ceiling never cuts the count without the flag.
+                try std.testing.expectEqual(raw > caps.max_vram_slots, plan.slots_clamped);
+                if (!plan.slots_clamped) {
+                    try std.testing.expectEqual(raw, @as(u64, plan.n_slots));
+                }
                 try std.testing.expectEqual(batch, plan.n_streams);
                 try std.testing.expect(plan.window <= windowCeil(caps));
                 try std.testing.expect(plan.n_slots >= previous_slots);
@@ -2990,6 +2996,15 @@ test "planLayerSplit: the three split anchors" {
     try std.testing.expectEqual(@as(u32, 0), roomy.host_layers);
     try std.testing.expectEqual(@as(u64, 32_000), roomy.weight_resident);
     try std.testing.expectEqual(@as(u64, 0), roomy.kv_host);
+}
+
+test "planLayerSplit: the translation-layer entry takes three quarters of the budget" {
+    // 56000 free bytes give 42000 usable. The suffix `[11..32)` uses `2000 * 21 = 42000` and
+    // fits. The suffix `[10..32)` uses 44000 and does not.
+    var caps = anchorCaps(56_000);
+    caps.driver = .vulkan_on_d3d12;
+    const plan = try planLayerSplit(caps, &anchor_weights, 0, anchor_kv, unchecked_serve, null);
+    try std.testing.expectEqual(@as(u32, 11), plan.host_layers);
 }
 
 // The RAM anchors: Llama-3.1-8B Q8_0 at a 131072-token window and one slot.
@@ -4196,9 +4211,11 @@ test "planLayerSplit: the window never multiplies the fixed state" {
     try std.testing.expectEqual(fixed, wide_plan.kv_vram - token_wide);
 }
 
-test "planLayerSplit: a pointwise-smaller vector never yields a larger split" {
-    // Every entry halves in both columns, so the smaller vector is pointwise no
-    // dearer and the auto scan can only reach the same split or a lower one.
+test "planLayerSplit: a smaller vector that keeps each KV layer never yields a larger split" {
+    // Every entry halves in both columns, so the smaller vector is pointwise no dearer. A token
+    // cost above 0 stays above 0, so each range with a KV layer keeps one. The auto scan then
+    // reaches the same split or a lower one. The condition is necessary, because `autoSplit`
+    // returns `n_layers` when the first range that fits holds no KV layer.
     const n: u32 = 32;
     var table: [limits.max_layers]u64 = undefined;
     for (table[0..n], 0..) |*w, i| {

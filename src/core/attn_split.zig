@@ -649,6 +649,8 @@ test "anchors: the scratch of the four registry shapes at S = 256 and 4 rows" {
     for ([_]Scratch{ qwen_2b, qwen_9b, llama_8b, smollm2 }) |scratch| {
         try testing.expectEqual(limits.BufferVerdict.fits, fits(scratch, spec_min_limits));
     }
+    // The last element of the 9B scratch is the last offset of its box.
+    try testing.expectEqual(qwen_9b.totalElems(), qwen_9b.offset(3, 15, 1023, 257) + 1);
 }
 
 test "fits: the 31-bit index and the storage range pass at their bounds, fail one step past" {
