@@ -98,7 +98,7 @@ pub fn stepRows(rule: Rule, slots: u32, batch: u32) u32 {
     return @max(slots, @max(batch + 1, batch + prompt_rows));
 }
 
-/// The row cap of one pass: every row of the runner for `derived`, else the requested rows cut to
+/// The row cap of one step: every row of the runner for `derived`, else the requested rows cut to
 /// the runner cap. The launcher sets `max_step_rows` with it.
 pub fn stepCap(rule: Rule, requested: u32, runner_cap: u32) u32 {
     std.debug.assert(runner_cap >= 1);
@@ -164,6 +164,29 @@ test "chunk: decode rows narrow the chunk to the spare rows, and a full pass tak
     }
 }
 
+const IdleWalk = struct { width: u32, step_cap: usize, n: usize, passes: usize, last: usize };
+
+test "chunk: an idle prompt walks at the full width of a derived rule" {
+    const walks = [_]IdleWalk{
+        .{ .width = 128, .step_cap = 128, .n = 440, .passes = 4, .last = 56 },
+        .{ .width = 128, .step_cap = 128, .n = 1215, .passes = 10, .last = 63 },
+        .{ .width = 64, .step_cap = 65, .n = 440, .passes = 7, .last = 56 },
+    };
+    for (walks) |w| {
+        var fed: usize = 0;
+        var passes: usize = 0;
+        // Each step takes the wanted rows, at least 1, so the walk ends within n steps.
+        while (fed < w.n) : (passes += 1) {
+            const k = chunk(.{ .derived = w.width }, w.n - fed, 0, 1, w.step_cap);
+            const want: usize = if (w.n - fed > w.width) w.width else w.last;
+            try std.testing.expectEqual(want, k);
+            fed += k;
+        }
+
+        try std.testing.expectEqual(w.passes, passes);
+    }
+}
+
 test "flag maps to a rule" {
     try std.testing.expectEqual(Rule{ .derived = 128 }, fromFlag(null, 128));
     try std.testing.expectEqual(Rule.spare_rows, fromFlag(0, 128));
@@ -176,6 +199,13 @@ test "stepRows keeps the original size for spare_rows and holds a full width for
     try std.testing.expectEqual(@as(u32, 8), stepRows(.{ .fixed = 4 }, 2, 4));
     try std.testing.expectEqual(@as(u32, 65), stepRows(cpu_rule, 1, 1));
     try std.testing.expectEqual(@as(u32, 68), stepRows(cpu_rule, 3, 4));
+}
+
+test "stepCap gives derived the runner cap and cuts the request of the other rules" {
+    try std.testing.expectEqual(@as(u32, 128), stepCap(.{ .derived = 64 }, 65, 128));
+    try std.testing.expectEqual(@as(u32, 9), stepCap(.spare_rows, 9, 128));
+    try std.testing.expectEqual(@as(u32, 8), stepCap(.{ .fixed = 4 }, 8, 128));
+    try std.testing.expectEqual(@as(u32, 6), stepCap(.{ .fixed = 4 }, 8, 6));
 }
 
 const TileCase = struct {

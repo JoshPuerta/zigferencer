@@ -410,7 +410,7 @@ pub fn Scheduler(comptime SessionPool: type, comptime CodecT: type) type {
             std.debug.assert(cfg.max_seq >= 1);
             std.debug.assert(cfg.max_step_rows >= 1);
 
-            // The decode rows of one pass must fit the row cap.
+            // The decode rows of one step must fit the row cap.
             std.debug.assert(cfg.max_batch <= cfg.max_step_rows);
             switch (cfg.prefill) {
                 .derived => |width| std.debug.assert(width >= 1 and width <= cfg.max_step_rows),
@@ -5396,6 +5396,12 @@ const view_attached_1_plain: EntryView = .{
     .token = null,
     .ttl = 0,
 };
+const view_attached_2_plain: EntryView = .{
+    .owner = .{ .attached = 2 },
+    .pid = 2,
+    .token = null,
+    .ttl = 0,
+};
 
 /// Entry 1 after a live open took it from a detached session.
 const view_yield_taken: EntryView = .{
@@ -5554,6 +5560,19 @@ test "lease anchors: the deadline, the token, the takeover order, the share, and
                 .{ .view = .{ .entry = 0, .want = view_attached_1_plain } },
                 .{ .close = .{ .conn = 1, .sid = 1, .refused = false } },
                 .{ .view = .{ .entry = 0, .want = free_view } },
+            },
+        },
+        .{
+            .name = "a drop of one connection frees its session and keeps the session of another",
+            .n_slots = 2,
+            .share = 2,
+            .steps = &.{
+                .{ .open = .{ .conn = 1, .sid = 1 } },
+                .{ .open = .{ .conn = 2, .sid = 2 } },
+                .{ .detach = .{ .conn = 1, .at = 10 } },
+                .{ .view = .{ .entry = 0, .want = free_view } },
+                .{ .view = .{ .entry = 1, .want = view_attached_2_plain } },
+                .{ .route = .{ .sid = 2, .conn = 2, .entry = 1 } },
             },
         },
         .{
