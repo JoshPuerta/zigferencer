@@ -732,8 +732,8 @@ pub const LinearQ80Gemm = struct {
             @sizeOf(PushConsts),
             @ptrCast(&pc),
         );
-        const wg_n: u32 = (n + tile_n - 1) / tile_n;
-        const wg_m: u32 = (b + tile_m - 1) / tile_m;
+        const wg_n: u32 = limits.gemmTileCount(n, tile_n);
+        const wg_m: u32 = limits.gemmTileCount(b, tile_m);
         std.debug.assert(wg_n <= max_workgroups_x);
         std.debug.assert(wg_m <= max_workgroups_x);
         self.ctx.vkd.cmdDispatch(cb, wg_n, wg_m, 1);

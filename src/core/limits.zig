@@ -670,6 +670,13 @@ pub fn gdnScanCell(group: u32, lane: u32) GdnScanCell {
     return cell;
 }
 
+/// The tiles of `tile` entries that cover `len` entries of one output axis of the Q8_0 GEMM.
+pub fn gemmTileCount(len: u32, tile: u32) u32 {
+    std.debug.assert(tile >= 1);
+
+    return (len + tile - 1) / tile;
+}
+
 comptime {
     // A power of two turns the multiply by the grid width in the reduce shaders into a shift, and
     // the width fits the guaranteed count.
@@ -1040,4 +1047,12 @@ test "gdnScanCell: every state column of every head has exactly one owner lane" 
 
     try std.testing.expectEqual(@as(u32, 64), gdnScanGroups(16));
     try std.testing.expectEqual(@as(u32, 20_736), gdnScanLdsBytes());
+}
+
+test "gemmTileCount: the tiles of the 2B projections, and a partial tile" {
+    try std.testing.expectEqual(@as(u32, 2), gemmTileCount(65, gemm_m_tile));
+    try std.testing.expectEqual(@as(u32, 1), gemmTileCount(64, gemm_m_tile));
+    try std.testing.expectEqual(@as(u32, 2), gemmTileCount(128, gemm_m_tile));
+    try std.testing.expectEqual(@as(u32, 32), gemmTileCount(2048, gemm_n_tile));
+    try std.testing.expectEqual(@as(u32, 96), gemmTileCount(6144, gemm_n_tile));
 }
