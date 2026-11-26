@@ -98,6 +98,20 @@ pub fn stepRows(rule: Rule, slots: u32, batch: u32) u32 {
     return @max(slots, @max(batch + 1, batch + prompt_rows));
 }
 
+/// The row cap of one pass: every row of the runner for `derived`, else the requested rows cut to
+/// the runner cap. The launcher sets `max_step_rows` with it.
+pub fn stepCap(rule: Rule, requested: u32, runner_cap: u32) u32 {
+    std.debug.assert(runner_cap >= 1);
+
+    const result = switch (rule) {
+        .derived => runner_cap,
+        .spare_rows, .fixed => @min(requested, runner_cap),
+    };
+    std.debug.assert(result <= runner_cap);
+
+    return result;
+}
+
 // -- tests ------------------------------------------------------------------
 
 const ChunkCase = struct {
@@ -164,20 +178,32 @@ test "stepRows keeps the original size for spare_rows and holds a full width for
     try std.testing.expectEqual(@as(u32, 68), stepRows(cpu_rule, 3, 4));
 }
 
-const TileCase = struct { rule: Rule, batch: u32, slots: u32, n: usize, all_idle: bool, seed: u64 };
+const TileCase = struct {
+    rule: Rule,
+    batch: u32,
+    slots: u32,
+    runner_cap: u32,
+    n: usize,
+    all_idle: bool,
+    seed: u64,
+};
 
 fn genTile(_: void, random: std.Random, size: u32) TileCase {
     _ = size;
     const width = random.intRangeAtMost(u32, 1, 64);
     const batch = random.intRangeAtMost(u32, 1, 16);
+    const rule: Rule = switch (random.uintLessThan(u8, 3)) {
+        0 => .{ .derived = width },
+        1 => .spare_rows,
+        else => .{ .fixed = random.intRangeAtMost(u32, 1, 64) },
+    };
+    // `Scheduler.init` refuses a derived width above the step cap, so the runner cap holds it.
+    const cap_min = if (rule == .derived) @max(batch + 1, width) else batch + 1;
     return .{
-        .rule = switch (random.uintLessThan(u8, 3)) {
-            0 => .{ .derived = width },
-            1 => .spare_rows,
-            else => .{ .fixed = random.intRangeAtMost(u32, 1, 64) },
-        },
+        .rule = rule,
         .batch = batch,
         .slots = random.intRangeAtMost(u32, batch, batch + 4),
+        .runner_cap = random.intRangeAtMost(u32, cap_min, batch + 128),
         .n = random.intRangeAtMost(usize, 1, 700),
         .all_idle = random.boolean(),
         .seed = random.int(u64),
@@ -187,7 +213,8 @@ fn genTile(_: void, random: std.Random, size: u32) TileCase {
 fn checkTile(_: void, c: TileCase) anyerror!void {
     var prng = std.Random.DefaultPrng.init(c.seed);
     const rng = prng.random();
-    const step_cap = stepRows(c.rule, c.slots, c.batch);
+    const step_cap: usize = stepCap(c.rule, stepRows(c.rule, c.slots, c.batch), c.runner_cap);
+    try std.testing.expect(step_cap > c.batch);
     var fed: usize = 0;
     var steps: usize = 0;
     while (fed < c.n) : (steps += 1) {
@@ -213,7 +240,10 @@ fn checkTile(_: void, c: TileCase) anyerror!void {
         switch (c.rule) {
             .derived => |w| try std.testing.expectEqual((c.n + w - 1) / w, steps),
             .spare_rows => try std.testing.expectEqual((c.n + c.batch - 1) / c.batch, steps),
-            .fixed => |f| try std.testing.expectEqual((c.n + f - 1) / f, steps),
+            .fixed => |f| {
+                const width = @min(f, step_cap);
+                try std.testing.expectEqual((c.n + width - 1) / width, steps);
+            },
         }
     }
 }

@@ -7,9 +7,10 @@
 //! Tick order. One tick runs four steps in order. It expires leases and retries parked emits. It
 //! finalizes stopped turns, which emits `done`. It then makes ONE composed engine call. That call
 //! takes every admissible decode row (round-robin up to `max_batch`) plus a prefill chunk of the
-//! longest-waiting feeding turn. The chunk fills the rows that decode left free. Its floor of one
-//! row keeps saturated decode from starving a waiting turn, and it can exceed `max_batch`. A long
-//! prefill never preempts a decoder. An empty tick returns `.idle`, and the server then blocks.
+//! longest-waiting feeding turn. The chunk fills the rows that decode left free, and it can exceed
+//! `max_batch`. When `max_step_rows` is above `max_batch`, which the launcher asserts, its floor of
+//! one row keeps saturated decode from starving a waiting turn. A long prefill never preempts a
+//! decoder. An empty tick returns `.idle`, and the server then blocks.
 //!
 //! Session phases. Each entry of the session table is one logical session, not a KV slot. Its
 //! `SessionPhase` is free, idle, prefill, or decode. An open or a clone moves an entry from free to
@@ -408,6 +409,9 @@ pub fn Scheduler(comptime SessionPool: type, comptime CodecT: type) type {
             // These two catch an unpatched base.
             std.debug.assert(cfg.max_seq >= 1);
             std.debug.assert(cfg.max_step_rows >= 1);
+
+            // The decode rows of one pass must fit the row cap.
+            std.debug.assert(cfg.max_batch <= cfg.max_step_rows);
             switch (cfg.prefill) {
                 .derived => |width| std.debug.assert(width >= 1 and width <= cfg.max_step_rows),
                 .fixed => |n| std.debug.assert(n >= 1),
@@ -1611,7 +1615,7 @@ pub fn Scheduler(comptime SessionPool: type, comptime CodecT: type) type {
             return entry.owner.attached;
         }
 
-        /// Check the rules of "Lease table" in the header after each event.
+        /// Check the rules of "Lease table" and "Shares" in the header after each event.
         fn checkLeases(self: *const Self) void {
             if (!std.debug.runtime_safety) return;
             std.debug.assert(self.next_proto_id >= 1);
@@ -1647,7 +1651,9 @@ pub fn Scheduler(comptime SessionPool: type, comptime CodecT: type) type {
                     std.debug.assert(lease.ttl_ms <= self.cfg.resume_ttl_max_ms);
                 }
 
-                // No two live entries share a session id or a token.
+                // No two live entries share a session id or a token. The first entry of a
+                // connection counts every entry that the connection holds.
+                var held: u32 = 1;
                 for (self.entries[i + 1 ..]) |*other| {
                     if (other.state == .free) continue;
                     std.debug.assert(other.proto_id != entry.proto_id);
@@ -1656,6 +1662,14 @@ pub fn Scheduler(comptime SessionPool: type, comptime CodecT: type) type {
                             !std.mem.eql(u8, &entry.lease.?.token, &other.lease.?.token),
                         );
                     }
+
+                    if (entry.owner == .attached and attachedTo(other, connOf(entry))) {
+                        held += 1;
+                    }
+                }
+
+                if (entry.owner == .attached) {
+                    std.debug.assert(held <= self.cfg.sessions_per_connection);
                 }
             }
         }
@@ -2573,9 +2587,9 @@ fn msDuration(ms: u32) Io.Clock.Duration {
     return .{ .raw = .fromMilliseconds(ms), .clock = .awake };
 }
 
-/// The well-formed think config the launcher builds. A nonzero budget forces
-/// the close first, so the block never runs past the budget. No forced id and
-/// no close is the end-of-sequence id, so a forced id never ends a turn.
+/// The think config the launcher builds. The forced ids start with the close for every server
+/// budget, because a request can bring its own budget. A nonzero server budget needs forced ids.
+/// No forced id and no close is the end-of-sequence id, so a forced id never ends a turn.
 fn assertThinkConfig(t: Think, eos_id: u32, vocab_size: u32) void {
     std.debug.assert(t.force_len <= limits.think_force_ids_max);
 
@@ -2591,11 +2605,12 @@ fn assertThinkConfig(t: Think, eos_id: u32, vocab_size: u32) void {
 
     if (t.open_id != no_token) std.debug.assert(t.open_id < vocab_size);
 
-    if (t.budget > 0) {
+    if (t.force_len >= 1) {
         std.debug.assert(t.hasTags());
-        std.debug.assert(t.force_len >= 1);
         std.debug.assert(t.force[0] == t.close_id);
     }
+
+    if (t.budget > 0) std.debug.assert(t.force_len >= 1);
 
     if (t.open_default) std.debug.assert(t.hasTags());
 }
@@ -6646,6 +6661,33 @@ test "per-turn budget: a request budget forces the close at its count, not at th
     try generateWith(&fx, 1, sid, "3", 64, null, null, null);
     fx.drain();
     try std.testing.expectEqual(@as(u32, 2), fx.sched.entries[0].think_budget);
+}
+
+test "per-turn budget: a request budget forces the close when the server budget is zero" {
+    var tags = think_tags;
+    tags.budget = 0;
+    var fx = try Fixture.setUpThink(std.testing.allocator, 65, 0, tags);
+    defer fx.tearDown();
+
+    const sid = try fx.openSession(1, "");
+    const budget: u32 = 3;
+    const from = fx.sink.n;
+    try generateWith(&fx, 1, sid, "3", 64, null, null, budget);
+    fx.drain();
+    try std.testing.expectEqual(budget, fx.sched.entries[0].think_budget);
+    var ids: [16]u32 = undefined;
+    var n: usize = 0;
+    for (fx.sink.seen()[from..]) |e| {
+        if (e.ev.body != .token) continue;
+        ids[n] = e.ev.body.token.token_id;
+        n += 1;
+    }
+
+    // The echo of the open is event 0, so the close is event budget + 1.
+    try std.testing.expect(n > budget + 1);
+    try std.testing.expectEqual(tags.close_id, ids[budget + 1]);
+    try std.testing.expectEqualSlices(u32, &.{ 2, 4, 5, 6, 3, 0, 1, 2, 3, 4, 5, 6, 7 }, ids[0..n]);
+    try std.testing.expectEqual(budget, fx.sink.last().ev.body.done.reasoning_tokens);
 }
 
 test "per-turn switch: the render and the session read the one resolved value" {

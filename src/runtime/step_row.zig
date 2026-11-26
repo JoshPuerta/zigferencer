@@ -31,7 +31,8 @@ pub const StepRow = struct {
     token: u32,
     /// Position to write at. Attention spans `0..=pos`.
     pos: u32,
-    /// Compute the final norm and lm_head for this row. Row i lands at `logits[i * vocab_size ..]`.
+    /// Compute the final norm and lm_head for this row. The j-th `want_logits` row of a step lands
+    /// at `logits[j * vocab_size ..]`.
     want_logits: bool,
 };
 

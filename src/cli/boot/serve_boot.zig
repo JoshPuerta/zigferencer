@@ -596,20 +596,14 @@ fn setStepShape(
     width: u32,
 ) void {
     cfg.prefill = prefill_chunk.fromFlag(flag, width);
-    cfg.max_step_rows = switch (cfg.prefill) {
-        .derived => runner_cap,
-        .spare_rows, .fixed => clampStepRows(requested, runner_cap),
-    };
-}
-
-/// Clamp the requested rows to the row scratch of the runner, and log a cut.
-fn clampStepRows(requested: u32, runner_cap: u32) u32 {
-    if (runner_cap < requested) {
+    cfg.max_step_rows = prefill_chunk.stepCap(cfg.prefill, requested, runner_cap);
+    if (cfg.prefill != .derived and cfg.max_step_rows < requested) {
         log.info("prefill chunk capped at {d} rows/pass by the GPU runner's buffers " ++
             "(requested {d})", .{ runner_cap, requested });
     }
 
-    return @min(requested, runner_cap);
+    // Every runner holds more rows than the decode width, so one prompt row always fits.
+    std.debug.assert(cfg.max_step_rows > cfg.max_batch);
 }
 
 /// Whether a thinking budget can force the close inside a window. Zero is unbounded. The n-th

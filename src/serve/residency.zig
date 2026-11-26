@@ -194,15 +194,28 @@ pub fn Residency(comptime SessionsT: type) type {
             e.ever_resident = false;
         }
 
-        /// The incremental ledger equals the blob sum, and stays under the
-        /// budget. The scan is bounded by the logical session count, which
-        /// `init` caps at `limits.max_logical_sessions`.
+        /// The ledger equals the blob sum, and stays under the budget. A free entry is clean, an
+        /// entry with a blob has `ever_resident` set, and an entry owns the slot it names. The scan
+        /// is bounded by the logical session count, at most `limits.max_logical_sessions`.
         fn assertLedger(self: *const Self) void {
             if (comptime !std.debug.runtime_safety) return;
 
             var total: u64 = 0;
-            for (self.entries) |*e| {
+            for (self.entries, 0..) |*e, i| {
                 total += e.blob.bytes.len;
+                if (!e.used) {
+                    std.debug.assert(e.phys == null);
+                    std.debug.assert(e.blob.bytes.len == 0);
+                    std.debug.assert(!e.ever_resident);
+                }
+
+                if (e.blob.bytes.len != 0) std.debug.assert(e.ever_resident);
+                // A slot has one owner, so no two entries name one slot.
+                if (e.phys) |s| {
+                    std.debug.assert(s < self.phys_owner.len);
+                    std.debug.assert(self.phys_owner[s] != null);
+                    std.debug.assert(self.phys_owner[s].? == i);
+                }
             }
 
             std.debug.assert(total == self.ram_used);

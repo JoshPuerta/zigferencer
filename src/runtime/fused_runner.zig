@@ -43,9 +43,9 @@
 //! recurrent state stays f32 under every KV dtype.
 //!
 //! Logits. `logit_rows_max` is the most logits rows of one call: the decode rows and the final
-//! prefill row of a composed tick. Row i of a step lands at `logits[i * vocab ..]`. One bulk copy
-//! per step moves the host-coherent stage into cached heap memory, because the CPU reads the stage
-//! slowly across the virtualized bus.
+//! prefill row of a composed tick. The j-th `want_logits` row of a step lands at
+//! `logits[j * vocab ..]`. One bulk copy per step moves the host-coherent stage into cached heap
+//! memory, because the CPU reads the stage slowly across the virtualized bus.
 //!
 //! Blobs. A blob is the state of one slot after `n` rows: the K rows, then the V rows of a KV
 //! layer, or the recurrent slab, then the conv slab of a recurrent layer, in model order. The CPU
