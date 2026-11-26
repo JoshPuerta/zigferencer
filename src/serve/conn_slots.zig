@@ -1,12 +1,14 @@
 //! The connection slot table of the serve engine: the state of each slot and the steps that move
 //! it. `engine.zig` holds the queue and the socket of slot i in `conns[i]`, and this table decides
-//! who can touch them.
+//! who can touch them. This file also holds the order of the engine actions of one emit.
 //!
 //! Comptime. The schedule test takes the slot rules as a type, so one schedule drives the real
 //! rules and each broken-rule variant.
 //!
 //! Role. This file holds the control rules alone, so a test can call the steps of all three
-//! threads from one thread, in any order that the rules of each thread allow.
+//! threads from one thread, in any order that the rules of each thread allow. The emit order lives
+//! here for the same reason as `idle_load_order`. A test runs it against the writer from one
+//! thread.
 //!
 //! States. A slot is `free`, `live`, `closing`, `swept`, or `reclaimable`. Two events end a
 //! connection: the last task exits, and the engine handles `conn_closed`. They can come in either
@@ -52,6 +54,16 @@
 //!
 //! An emit for an id that no `live` or `closing` slot holds is dropped. Such an id belongs to a
 //! connection that the engine has swept, so its queue is closed.
+//!
+//! Park. A task that takes events from an out-queue swaps `parked_hint` after each event that does
+//! not end its loop. It sends a `wakeup` when the swap reads true. A task that ends its loop then
+//! submits a request or exits. The emit runs `emit_park_order`. So while an event is parked, the
+//! queue is full or a request waits for the engine. A `wakeup` is a request, and a full request
+//! queue drops it only while other requests wait. The tick after each request retries the park.
+//!
+//! The HTTP task takes `session_opened`, `done`, and `err` with no swap. It cannot stall, because
+//! each of these events ends its loop and a request follows: the turn, or `session_close` from its
+//! `defer`. An `err` of the open replies to the one request in flight, so no event waits behind it.
 
 const std = @import("std");
 const assert = std.debug.assert;
@@ -68,11 +80,26 @@ pub const slots_per_connection = 2;
 /// never looks idle.
 pub const idle_load_order = [2]IdleCounter{ .requests_open, .sessions };
 
+/// The order of the engine actions of one emit. The emit ends at the first put that sends the
+/// event. The writer can drain the queue between the refused put and the store. So the second put
+/// takes the event, or its refusal proves a full queue after the store. The next swap of the
+/// writer then reads the hint.
+pub const emit_park_order = [3]EmitAction{ .put, .store_hint, .put };
+
+comptime {
+    assert(emit_park_order[emit_park_order.len - 1] == .put);
+    const front = emit_park_order[0 .. emit_park_order.len - 1];
+    assert(std.mem.findScalar(EmitAction, front, .store_hint) != null);
+}
+
 // -- types ------------------------------------------------------------------
 
 pub const State = enum(u8) { free, live, closing, swept, reclaimable };
 
 pub const IdleCounter = enum { requests_open, sessions };
+
+/// One engine action of an emit: a put with a minimum of zero, or the store of `parked_hint`.
+pub const EmitAction = enum { put, store_hint };
 
 /// One slot. Every field is atomic, because three threads read it.
 pub const Slot = struct {
@@ -261,7 +288,52 @@ pub const ConnSlots = struct {
     }
 };
 
+// -- api --------------------------------------------------------------------
+
+/// Run the actions of `order` until a put sends the event. True when the event left the engine.
+/// `Sink.emit` passes `emit_park_order`. A test passes two parts of it, with a writer drain
+/// between them.
+pub fn runEmitActions(
+    comptime Event: type,
+    order: []const EmitAction,
+    io: std.Io,
+    out_q: *std.Io.Queue(Event),
+    hint: *std.atomic.Value(bool),
+    ev: Event,
+) bool {
+    assert(order.len <= emit_park_order.len);
+
+    for (order) |action| {
+        if (runEmitAction(Event, action, io, out_q, hint, ev)) return true;
+    }
+
+    return false;
+}
+
 // -- helpers ----------------------------------------------------------------
+
+/// True when the event left the engine: the queue took it, or the put failed on a closed queue or
+/// a cancel. No put clears the hint, because another entry of the connection can be parked.
+fn runEmitAction(
+    comptime Event: type,
+    action: EmitAction,
+    io: std.Io,
+    out_q: *std.Io.Queue(Event),
+    hint: *std.atomic.Value(bool),
+    ev: Event,
+) bool {
+    switch (action) {
+        .put => {
+            const n = out_q.put(io, &.{ev}, 0) catch return true;
+            assert(n <= 1);
+            return n == 1;
+        },
+        .store_hint => {
+            hint.store(true, .release);
+            return false;
+        },
+    }
+}
 
 /// One state change whose source can be `first` or `second`, from the state `read`. `first` moves
 /// to `first_to`, and `second` moves to `second_to`. The other thread of rule 5 can move `first`
@@ -1205,4 +1277,178 @@ test "conn_slots: teardown frees a slot whose conn_closed was lost" {
     try testing.expect(!t.exitTask(0));
     t.abandon(0);
     try testing.expectEqual(State.free, t.stateOf(0));
+}
+
+/// One point of a schedule of an emit against the writer, on a queue of capacity 1 that holds one
+/// event when the emit starts.
+const EmitWalk = struct {
+    order: []const EmitAction,
+    /// The engine actions that ran.
+    done: usize = 0,
+    sent: bool = false,
+    queued: u1 = 1,
+    hint: bool = false,
+    writer: WriterAction,
+    wakeup: bool = false,
+
+    const WriterAction = enum { take, swap, wakeup };
+};
+
+/// The writer states that an emit can meet. At `.take` the writer waits for the queued event. At
+/// `.swap` it took an event before the emit, and an earlier emit filled the queue again.
+const walk_starts = [2]EmitWalk.WriterAction{ .take, .swap };
+
+/// The schedules of one walk that end in a stall, and all the schedules of the walk.
+const WalkCount = struct { stalls: u32 = 0, ends: u32 = 0 };
+
+/// A schedule interleaves the engine actions in `order` with the writer actions. It ends in a stall
+/// with a parked event, no wakeup, and the writer on an empty queue.
+fn parkStallCount(order: []const EmitAction, start: EmitWalk.WriterAction) WalkCount {
+    var count: WalkCount = .{};
+    walkPark(.{ .order = order, .writer = start }, 0, &count);
+    assert(count.stalls <= count.ends);
+    return count;
+}
+
+fn walkPark(w: EmitWalk, depth: usize, count: *WalkCount) void {
+    // The writer takes at most two events, the queued one and the emitted one. A start at `.swap`
+    // adds one swap and its wakeup before the first take.
+    const writer_takes_max = 2;
+    const writer_actions = @typeInfo(EmitWalk.WriterAction).@"enum".fields.len;
+    assert(depth <= w.order.len + (writer_takes_max + 1) * writer_actions);
+    const engine_ready = !w.sent and w.done < w.order.len;
+    const writer_ready = w.writer != .take or w.queued == 1;
+    if (!engine_ready and !writer_ready) {
+        if (!w.sent and !w.wakeup) {
+            count.stalls += 1;
+        }
+        count.ends += 1;
+        return;
+    }
+
+    if (engine_ready) {
+        var next = w;
+        next.done += 1;
+        switch (w.order[w.done]) {
+            .put => if (w.queued == 0) {
+                next.queued = 1;
+                next.sent = true;
+            },
+            .store_hint => next.hint = true,
+        }
+        walkPark(next, depth + 1, count);
+    }
+    if (writer_ready) {
+        var next = w;
+        switch (w.writer) {
+            .take => {
+                next.queued = 0;
+                next.writer = .swap;
+            },
+            .swap => {
+                next.hint = false;
+                next.writer = if (w.hint) .wakeup else .take;
+            },
+            .wakeup => {
+                next.wakeup = true;
+                next.writer = .take;
+            },
+        }
+        walkPark(next, depth + 1, count);
+    }
+}
+
+test "conn_slots: no schedule of an emit and its writer parks an event with no wakeup" {
+    const fixed = [walk_starts.len]WalkCount{
+        .{ .stalls = 0, .ends = 10 },
+        .{ .stalls = 0, .ends = 23 },
+    };
+    const no_second_put = [walk_starts.len]WalkCount{
+        .{ .stalls = 1, .ends = 5 },
+        .{ .stalls = 2, .ends = 9 },
+    };
+    for (walk_starts, fixed, no_second_put) |start, want_fixed, want_broken| {
+        try testing.expectEqual(want_fixed, parkStallCount(&emit_park_order, start));
+        // An order with no second put stalls, so the count detects a removed put.
+        try testing.expectEqual(want_broken, parkStallCount(&.{ .put, .store_hint }, start));
+    }
+}
+
+const EmitRun = struct { emitted: bool = false, taken: u32 = 0, wakeups: u32 = 0 };
+
+const store_hint_index = std.mem.indexOfScalar(EmitAction, &emit_park_order, .store_hint).?;
+
+/// Run `emit_park_order` into a full queue of one event, with a writer drain before the action at
+/// `drain_at`. The writer then drains until it waits, as its loop does after each event.
+fn emitWithDrainAt(drain_at: usize) !EmitRun {
+    assert(drain_at <= emit_park_order.len);
+    const io = testing.io;
+    var buf: [1]u32 = undefined;
+    var out_q: std.Io.Queue(u32) = .init(&buf);
+    var hint: std.atomic.Value(bool) = .init(false);
+    try out_q.putOne(io, 0);
+
+    const order: []const EmitAction = &emit_park_order;
+    var run: EmitRun = .{};
+    run.emitted = runEmitActions(u32, order[0..drain_at], io, &out_q, &hint, 1);
+    if (!run.emitted) {
+        try drainAsWriter(io, &out_q, &hint, &run);
+        run.emitted = runEmitActions(u32, order[drain_at..], io, &out_q, &hint, 1);
+    }
+    try drainAsWriter(io, &out_q, &hint, &run);
+
+    // A parked event has a wakeup on its way, so the engine retries it.
+    try testing.expect(run.emitted or run.wakeups > 0);
+    try testing.expectEqual(@as(u32, if (run.emitted) 2 else 1), run.taken);
+    return run;
+}
+
+/// The writer loop without the socket: take one event, then swap the hint, and count a wakeup
+/// when the swap reads true. A get with a minimum of zero returns 0 where the writer waits.
+fn drainAsWriter(
+    io: std.Io,
+    out_q: *std.Io.Queue(u32),
+    hint: *std.atomic.Value(bool),
+    run: *EmitRun,
+) !void {
+    var buf: [1]u32 = undefined;
+    // The queue holds one event before the emit, and the emit adds at most one. So the third get
+    // finds an empty queue.
+    for (0..3) |_| {
+        if (try out_q.get(io, &buf, 0) == 0) return;
+
+        run.taken += 1;
+        if (hint.swap(false, .acq_rel)) {
+            run.wakeups += 1;
+        }
+    }
+
+    return error.TestUnexpectedResult;
+}
+
+test "conn_slots: an emit into a queue with room stores no hint and sends no wakeup" {
+    // A store before the first put sends one wakeup for each event, and the wakeups fill the
+    // request queue.
+    const run = try emitWithDrainAt(0);
+    try testing.expect(run.emitted);
+    try testing.expectEqual(@as(u32, 0), run.wakeups);
+}
+
+test "conn_slots: an emit with the drain before the store sends the event" {
+    const run = try emitWithDrainAt(store_hint_index);
+    try testing.expect(run.emitted);
+    // The hint stays true for another parked entry, so the next swap sends one spare wakeup.
+    try testing.expectEqual(@as(u32, 1), run.wakeups);
+}
+
+test "conn_slots: an emit with the drain between the store and the last put sends the event" {
+    const run = try emitWithDrainAt(store_hint_index + 1);
+    try testing.expect(run.emitted);
+    try testing.expectEqual(@as(u32, 1), run.wakeups);
+}
+
+test "conn_slots: an emit with the drain after the last put parks, and the drain sends a wakeup" {
+    const run = try emitWithDrainAt(emit_park_order.len);
+    try testing.expect(!run.emitted);
+    try testing.expectEqual(@as(u32, 1), run.wakeups);
 }

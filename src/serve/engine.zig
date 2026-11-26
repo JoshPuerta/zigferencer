@@ -15,8 +15,9 @@
 //! Bounds. `Config.max_connections` live connections (at most `limits.max_connections`) in a table
 //! of `conn_slots.slots_per_connection` slots per allowed connection, one `request_queue_capacity`
 //! request queue, and one `out_queue_capacity` event queue per slot. The engine never blocks on a
-//! client. Emission is non-blocking, and a full output
-//! queue parks the event in the cell of the session while the draining task signals a `wakeup`.
+//! client. Emission is non-blocking, and a full output queue parks the event in the cell of the
+//! session. The draining task then sends a `wakeup`, because the engine stores `parked_hint`
+//! before its last put (`conn_slots.emit_park_order`).
 //!
 //! Connection slots. `conn_slots.zig` holds the state of each slot and the rules that keep the
 //! engine thread away from a slot that the acceptor rewrites. Slot i of that table owns `conns[i]`.
@@ -356,14 +357,17 @@ pub fn ServeEngine(comptime SessionPool: type, comptime CodecT: type, comptime A
 
             /// This never blocks. A missing or closed connection swallows the event. The engine
             /// closed the queue of a missing connection at its conn_closed. A full queue reports
-            /// false so the scheduler parks, and flags the draining task to send a wakeup.
+            /// false so the scheduler parks, and the hint tells the draining task to send a wakeup.
             pub fn emit(s: *Sink, conn_id: u32, ev: OutEvent) bool {
                 const conn = s.engine.findConn(conn_id) orelse return true;
-                const n = conn.out_q.put(s.engine.io, &.{ev}, 0) catch return true;
-                if (n == 1) return true;
-
-                conn.parked_hint.store(true, .release);
-                return false;
+                return conn_slots.runEmitActions(
+                    OutEvent,
+                    &conn_slots.emit_park_order,
+                    s.engine.io,
+                    &conn.out_q,
+                    &conn.parked_hint,
+                    ev,
+                );
             }
 
             pub fn disconnect(s: *Sink, conn_id: u32) void {
