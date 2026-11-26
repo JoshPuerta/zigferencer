@@ -28,7 +28,6 @@ the host details through `src/os/`, and `registry.locate` checks a path on disk.
 | `layer_op.zig` | The one list of op names, and the keys that a span and a GPU mark time. |
 | `step_stats.zig` | The timers of a decode step. |
 | `record_ring.zig` | The state of the decode record ring. |
-| `ring_fsm.zig` | The slot state machine of the upload ring. |
 | `test_fixtures.zig` | The path of a test model. |
 | [`tokenizer/`](./tokenizer/README.md) | The BPE encoder and decoder. |
 | [`utils/`](./utils/README.md) | The general services: time, log, host probe, Perfetto, property tests. |
@@ -71,8 +70,7 @@ A byte budget becomes the shape of the KV cache:
 ```
 
 Inside the directory, `Tensor` reads `dtype` and `limits`, `Model` reads `chat` and `dtype`, and
-`OpRequires` reads `hwinfo`. `ring_fsm` faces one consumer, `ops_vulkan/stream_ring`, and
-`record_ring` faces `runtime/decode_ring`. `span` reads `trace_file` and `gpu_record`, and
+`OpRequires` reads `hwinfo`. `record_ring` faces one consumer, `runtime/decode_ring`. `span` reads `trace_file` and `gpu_record`, and
 `trace_file` reads `perfetto` and `gpu_record`. `span`, `trace_file`, and `gpu_record` read the op names of `layer_op`.
 
 ## Rules
@@ -107,6 +105,3 @@ Inside the directory, `Tensor` reads `dtype` and `limits`, `Model` reads `chat` 
 - The chat wraps are hand-coded per family, with no template interpreter and no
   dependency. They pair-validate against the special tokens the BPE encoder
   matches greedily.
-- `ring_fsm.next` returns null for an operation the table does not name, and the
-  caller asserts. The table and the anchor trace run at comptime, so drift fails
-  the build instead of a test run.

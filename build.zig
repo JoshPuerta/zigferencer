@@ -165,7 +165,6 @@ const vulkan_integration_tests = [_][]const u8{
     "tests/vulkan_linear_q8_0_test.zig",
     "tests/vulkan_attention_test.zig",
     "tests/vulkan_prefill_kernels_test.zig",
-    "tests/vulkan_stream_ring_test.zig",
 };
 
 /// The tests that reach a fused or a hybrid runner. `src/main.zig` re-exports those runners under

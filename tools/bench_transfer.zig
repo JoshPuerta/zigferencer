@@ -27,7 +27,7 @@ const bench_util = @import("bench_util.zig");
 
 // -- constants --------------------------------------------------------------
 
-/// Transfer sizes in MiB: 266 MiB is about one Llama-8B-Q8 layer, and 128 and
+/// Transfer sizes in MiB: 266 MiB covers one Llama-8B-Q8 layer, which is 221 MiB, and 128 and
 /// 512 MiB are about one KV slot at window 512 and 2048.
 const transfer_mib = [_]u32{ 8, 32, 64, 128, 266, 512 };
 

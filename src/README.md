@@ -20,7 +20,7 @@ read.
 | [`io/`](./io/README.md) | The I/O shell: an HTTPS download, a read-only whole-file map, and the GGUF parser and loader. |
 | [`ops/`](./ops/README.md) | The CPU op variants. |
 | [`os/`](./os/README.md) | The lowest layer: every OS condition of the engine, one file for each concern, and one file for each OS for the serve socket calls. |
-| [`ops_vulkan/`](./ops_vulkan/README.md) | The GPU op backend: one pipeline struct per shader, the upload ring, and the GLSL sources. GPU builds only. |
+| [`ops_vulkan/`](./ops_vulkan/README.md) | The GPU op backend: one pipeline struct per shader and the GLSL sources. GPU builds only. |
 | [`runtime/`](./runtime/README.md) | The control units that own state: the six runners, the KV cache, the session pool, the sampler, and the prompt cache. |
 | [`serve/`](./serve/README.md) | The serving layer: the scheduler, the transport-independent engine, the residency tier, and two transport adapters. |
 

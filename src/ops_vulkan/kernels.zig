@@ -118,9 +118,6 @@ pub const LinearQ40Batch = linear.LinearQ40Batch;
 pub const GdnDecode = gdn.GdnDecode;
 pub const GdnChunkParallel = gdn.GdnChunkParallel;
 
-/// Double-buffered host-to-device upload ring, the asynchronous counterpart to `runStagingCopies`.
-pub const StreamRing = @import("stream_ring.zig").StreamRing;
-
 // -- tests ------------------------------------------------------------------
 
 test {

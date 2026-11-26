@@ -55,7 +55,6 @@ This document explains how zigferencer works, from the build to a served token.
 | decode | The steps that make one new token for each session. |
 | host, device | The CPU side and the GPU side. |
 | decode ring | The two decode command buffers of a fused runner (`DecodeRing`). While the GPU runs one decode step, the host records the next step into the other buffer. `RecordRing` in `core/record_ring.zig` holds its state. |
-| upload ring | Two host-to-device upload segments (`StreamRing`). No runner uses it. |
 | span ring | The trace buffer of one thread in `core/span.zig`. [profiling.md](profiling.md) calls it the span log. |
 
 **Memory**
@@ -484,14 +483,11 @@ on every step.
 | Ring | File | What it holds | Slots | When it is full |
 | --- | --- | --- | --- | --- |
 | decode ring | `runtime/decode_ring.zig`, the state in `core/record_ring.zig` | The decode command buffers of a fused runner. | 2, one for each value of `record_ring.Buf` | It never blocks. A new record replaces a recording, which counts as wasted. |
-| upload ring | `ops_vulkan/stream_ring.zig`, the slot table in `core/ring_fsm.zig` | Host-to-device upload segments (`StreamRing`). | `ring_fsm.depth` | `acquire` returns null, and the caller decides. |
 | span ring | `core/span.zig` | The trace spans of one thread. One more ring holds the GPU submit records. | `limits.spans_per_thread` by default, `limits.trace_gpu_records` | It drops the new entry and counts it. |
 | convolution ring | `ops/gdn.zig` | The last inputs of the convolution of one GDN layer and slot. | `conv_kernel - 1` for each channel | It never fills. Each token drops the oldest input. |
 
 In this document, "the ring" is the decode ring. The `host_ring` line of
 `bench-model` counts its hits, misses, speculative records, and wasted records.
-`StreamRing` keeps one upload in flight while the host fills the next segment. No
-runner uses it, and only `tests/vulkan_stream_ring_test.zig` drives it.
 
 ### The op API
 

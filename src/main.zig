@@ -45,7 +45,6 @@ pub const attn_split = @import("core/attn_split.zig");
 pub const attn_cpu = @import("core/attn_cpu.zig");
 pub const layer_op = @import("core/layer_op.zig");
 pub const attn_record = @import("runtime/attn_record.zig");
-pub const ring_fsm = @import("core/ring_fsm.zig");
 pub const tensor = @import("core/tensor.zig");
 pub const dtype = @import("core/dtype.zig");
 pub const step_stats = @import("core/step_stats.zig");
@@ -349,7 +348,6 @@ test {
     _ = @import("runtime/layer_kernels.zig");
     _ = @import("runtime/qwen_layer.zig");
     _ = @import("runtime/llama_layer.zig");
-    _ = @import("core/ring_fsm.zig");
     _ = @import("core/utils/time.zig");
     _ = @import("core/step_stats.zig");
     _ = @import("core/record_ring.zig");
@@ -427,17 +425,6 @@ test {
     _ = gdn_simd;
     _ = @import("ops/linear_simd.zig");
     _ = @import("ops/elementwise_simd.zig");
-    if (build_options.use_vulkan) {
-        // Take the address of each method, because `_ = f;` leaves the body unanalyzed.
-        _ = &ops_vulkan.StreamRing.init;
-        _ = &ops_vulkan.StreamRing.acquire;
-        _ = &ops_vulkan.StreamRing.submit;
-        _ = &ops_vulkan.StreamRing.wait;
-        _ = &ops_vulkan.StreamRing.view;
-        _ = &ops_vulkan.StreamRing.release;
-        _ = &ops_vulkan.StreamRing.deinit;
-    }
-
     if (build_options.use_vulkan and log.hot) {
         _ = dispatch_list;
     }

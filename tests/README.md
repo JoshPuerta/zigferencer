@@ -35,7 +35,6 @@ GPU skips the test, and the suite stays green.
 | `vulkan_kv_commit_f16_test.zig` | The f16 rounding of the KV commit. |
 | `vulkan_attention_test.zig` | GPU attention against the CPU reference. |
 | `vulkan_prefill_kernels_test.zig` | The batched-prefill kernels at the Qwen shapes. |
-| `vulkan_stream_ring_test.zig` | The fence and slot reuse of the upload ring. |
 
 ## How the pieces fit
 

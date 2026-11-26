@@ -21,7 +21,6 @@ plain slice goes in, a caller-owned `[]f32` comes out, and no device handle esca
 | `kernels/linear.zig` | The Q8_0 and Q4_0 linear kernels, decode and batch. |
 | `kernels/gdn.zig` | `GdnDecode` and `GdnChunkParallel`. |
 | `dispatch_list.zig` | `DispatchList`, the command lists and the device loader of a trace build. |
-| `stream_ring.zig` | `StreamRing`, the double-buffered host-to-device upload ring. |
 | `wrap.zig` | The op-API facade that maps the CPU op signatures onto kernels. |
 | [`shaders/`](./shaders/README.md) | The GLSL compute sources. |
 
@@ -38,7 +37,6 @@ the per-op path. Both sit on a `Context`.
 | Kernel struct | `kernels/` | A `Pipeline` and a `record` or `run` method, such as `LinearQ80` or `Attention` | `Runner`, the fused runners | `wrap.zig`, `runtime/attn_record`, the fused runners |
 | `KvStore` | `kernels/memory.zig` | The device KV regions, one per layer and tensor | `FusedRunner` | The same runner |
 | `VramArena` | `kernels/memory.zig` | Aligned views of a few device allocations for the weights | `FusedRunner` | The same runner |
-| `StreamRing` | `stream_ring.zig` | Two upload segments, their fences, and a command pool | `tests/vulkan_stream_ring_test` | The same test |
 
 The per-op path runs from a CPU op signature to a submit.
 
@@ -70,19 +68,17 @@ The fused path records a whole token into one command buffer instead.
 `KvStore` puts the KV regions of `core/kv_index.zig` in device allocations. `VramArena` hands out
 aligned views and never frees one. A plan from a dry run of the upload sizes each allocation to its
 views. A one-shot submit, such as an upload or a slot fill, goes through `submitOnce` on the staging
-command buffer of the `Context`. `StreamRing` stays outside both paths. It owns fences and a command
-pool, and `core/ring_fsm.zig` holds its slot table. No runner drives it.
+command buffer of the `Context`.
 
 ## Rules
 
-- **Only `StreamRing` tracks a submission.** Every other path here submits with a null fence and
-  blocks on `queueWaitIdle`. The ring leaves one upload outstanding on purpose. No runner drives it.
-  `src/main.zig` takes the address of every method so the build analyzes the bodies, and
-  `tests/vulkan_stream_ring_test.zig` gates it against a live device.
+- **No path here tracks a submission.** Every path in this directory submits with a null fence and
+  blocks on `queueWaitIdle`. The decode ring in `runtime/decode_ring.zig` waits on a fence of its
+  own.
 - **A shader header owns its kernel.** The header of each shader holds the math, the schedule, the
   memory table, and the bindings. A wrapper states what the host must supply: a precondition or a
   tolerance.
-- **Build guard.** `kernels.zig`, `dispatch_list.zig`, `stream_ring.zig`, and `wrap.zig` raise
+- **Build guard.** `kernels.zig`, `dispatch_list.zig`, and `wrap.zig` raise
   `@compileError` when `build_options.use_vulkan` is false. The files of `kernels/` load only
   through `kernels.zig`. The backend is unreachable outside `-Druntime=vulkan`.
 - **The split length bounds the resident attention kernels.** `Attention`, `AttentionMultiStream`,
