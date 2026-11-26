@@ -30,7 +30,9 @@
 //!
 //! No lost wake-up. The two seq_cst pairs fall in one total order. Either the owner load sees the
 //! increment of a worker and wakes it, or the worker load sees the new epoch and does not wait. The
-//! kernel compares the futex word atomically, so no wake-up is lost between the load and the wait.
+//! futex wait compares the word and queues the thread as one atomic action against a wake. So no
+//! wake-up is lost between the load and the wait. The kernel does this on Linux. On Windows the
+//! standard library does it under a lock.
 //!
 //! Sequence wrap. The sequence wraps at 2^24 dispatches. The pool assumes that no worker stays
 //! preempted across exactly a multiple of 2^24 dispatches between two of its loads of `ctl`. Such a
@@ -276,6 +278,9 @@ pub const Pool = struct {
             if (word == ctl_stop) return;
             if (w >= unpackParts(word)) continue;
 
+            // The owner keeps the epoch open until this worker reports done.
+            assert(self.ctl.value.load(.monotonic) == word);
+            if (std.debug.runtime_safety) assert(self.busy.load(.acquire));
             runShare(&self.job, &self.claim.value, w);
             _ = self.pending.value.fetchSub(1, .release);
         }
@@ -527,6 +532,52 @@ test "pool: one participant runs inline and stores no shared word" {
     try testing.expectEqual(@as(u32, 0), pool.claim.value.load(.seq_cst));
     try testing.expectEqual(@as(u32, 0), pool.pending.value.load(.seq_cst));
     try testing.expectEqual(@as(u32, 0), pool.seq);
+}
+
+test "pool: one dispatch runs every unit once and ends the claim counter past the units" {
+    if (builtin.single_threaded) return error.SkipZigTest;
+
+    const Case = struct { n_units: u32, parts: u32, claim_end: u32 };
+    const cases = [_]Case{
+        .{ .n_units = 3, .parts = 2, .claim_end = 5 },
+        .{ .n_units = 10, .parts = 3, .claim_end = 13 },
+        .{ .n_units = 5, .parts = 5, .claim_end = 10 },
+        .{ .n_units = 8, .parts = 2, .claim_end = 10 },
+    };
+    var runs: [10]std.atomic.Value(u32) = undefined;
+    const counts: Counts = .{ .runs = &runs };
+    for (cases) |c| {
+        var pool: Pool = undefined;
+        try pool.init(testing.io, c.parts, 0);
+        defer pool.deinit();
+
+        counts.reset();
+        pool.run(Counts, &counts, Counts.unit, c.n_units, c.parts);
+        try expectRuns(counts, c.n_units, 1);
+        try testing.expectEqual(c.claim_end, pool.claim.value.load(.seq_cst));
+        try testing.expectEqual(pack(1, c.parts), pool.ctl.value.load(.seq_cst));
+        try testing.expectEqual(@as(u32, 0), pool.pending.value.load(.seq_cst));
+    }
+}
+
+test "pool: the sequence wraps to zero and the workers still see the new word" {
+    if (builtin.single_threaded) return error.SkipZigTest;
+
+    var runs: [8]std.atomic.Value(u32) = undefined;
+    const counts: Counts = .{ .runs = &runs };
+    var pool: Pool = undefined;
+    try pool.init(testing.io, 4, 0);
+    defer pool.deinit();
+
+    // Only the owner reads `seq`, and the pool is idle here.
+    pool.seq = seq_mask - 1;
+    counts.reset();
+    pool.run(Counts, &counts, Counts.unit, runs.len, 4);
+    try testing.expectEqual(pack(seq_mask, 4), pool.ctl.value.load(.seq_cst));
+    pool.run(Counts, &counts, Counts.unit, runs.len, 4);
+    try testing.expectEqual(pack(0, 4), pool.ctl.value.load(.seq_cst));
+    try testing.expectEqual(@as(u32, 0), pool.seq);
+    try expectRuns(counts, runs.len, 2);
 }
 
 test "pool: 10000 back-to-back dispatches of tiny units, spinning and sleeping" {
