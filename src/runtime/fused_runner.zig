@@ -559,7 +559,8 @@ pub fn FusedRunner(comptime Family: type) type {
             // Generic callers read the field, and the scratch and the bindings hold the constant.
             assert(self.prefill_batch_max == prefill_rows_max);
             errdefer self.commands.deinit();
-            errdefer self.memory.deinit();
+            // The weight upload writes the arenas, so they go only after its submits end.
+            errdefer if (kernels.drainStaging(ctx)) self.memory.deinit();
 
             // Build the kernels, the op resources, the device scratch, and the KV store.
             self.pipelines = try initPipelines(ctx, kv_dtype);
@@ -579,7 +580,7 @@ pub fn FusedRunner(comptime Family: type) type {
             try self.allocHost();
 
             // Upload the weights of each layer and of the head, then zero the recurrent slabs.
-            errdefer self.freeSlabs();
+            errdefer if (kernels.drainStaging(ctx)) self.freeSlabs();
             try self.uploadWeights(refs);
             try self.allocSlabs();
 
@@ -594,7 +595,8 @@ pub fn FusedRunner(comptime Family: type) type {
             return self;
         }
 
-        /// Free every resource of the runner, then the runner itself.
+        /// Free every resource of the runner, then the runner itself. After a failed drain the
+        /// device objects stay to the end of the process, and only the host memory goes.
         pub fn deinit(self: *Self) void {
             const ctx = self.commands.ctx;
             log.debug("deinit {t}: layers [{d}..{d}), {d} slots", .{
@@ -603,6 +605,16 @@ pub fn FusedRunner(comptime Family: type) type {
                 self.first_layer + self.n_layers,
                 self.n_slots,
             });
+
+            // A submission that the drain cannot end can still use every device object.
+            if (!self.commands.drain()) {
+                log.err("deinit {t}: the device objects stay until the process ends", .{
+                    self.commands.gpu_runner,
+                });
+                self.freeHost();
+                self.gpa.destroy(self);
+                return;
+            }
 
             // Free the command buffers and the stages, then the pool, which frees every set.
             self.commands.deinit();
@@ -628,6 +640,7 @@ pub fn FusedRunner(comptime Family: type) type {
             if (pos >= self.max_seq) return error.PositionOutOfRange;
 
             log.debug("step: token {d} at pos {d}", .{ token_id, pos });
+            try self.commands.checkWait();
             self.embedRow(0, token_id);
             return self.stepStaged(pos);
         }
@@ -640,6 +653,7 @@ pub fn FusedRunner(comptime Family: type) type {
             if (pos >= self.max_seq) return error.PositionOutOfRange;
 
             log.debug("step hidden: pos {d}", .{pos});
+            try self.commands.checkWait();
             @memcpy(self.commands.stage_in.sliceTyped(f32, x.len), x);
             return self.stepStaged(pos);
         }
@@ -701,6 +715,7 @@ pub fn FusedRunner(comptime Family: type) type {
             assert(self.commands.prof.level == span.gpuLevel());
             assert(pos < self.max_seq);
 
+            try self.commands.checkWait();
             try self.recordDecode(self.commands.cmd_buffer, &self.commands.prof, pos, .{});
             self.commands.probe_recorded = false;
         }
@@ -711,6 +726,7 @@ pub fn FusedRunner(comptime Family: type) type {
             assert(self.commands.prof.level == span.gpuLevel());
             assert(pos < self.max_seq);
 
+            try self.commands.checkWait();
             const cb = self.commands.cmd_buffer;
             try self.recordDecode(cb, &self.commands.prof, pos, .{ .one_time = false });
             self.commands.probe_recorded = true;
@@ -768,6 +784,7 @@ pub fn FusedRunner(comptime Family: type) type {
                 .{ rows.len, rows[0].slot, rows[0].pos, rows[rows.len - 1].pos },
             );
 
+            try self.commands.checkWait();
             for (rows, 0..) |r, i| {
                 self.embedRow(i, r.token);
             }
@@ -789,6 +806,7 @@ pub fn FusedRunner(comptime Family: type) type {
                 "step_batch hidden: {d} rows, slot {d} pos {d}..{d}",
                 .{ rows.len, rows[0].slot, rows[0].pos, rows[rows.len - 1].pos },
             );
+            try self.commands.checkWait();
             @memcpy(self.commands.stage_in.sliceTyped(f32, x.len), x);
             return self.stepBatchStaged(rows, n_logits);
         }
@@ -862,6 +880,7 @@ pub fn FusedRunner(comptime Family: type) type {
 
             const b: u32 = @intCast(tokens.len);
             log.debug("prefill: {d} tokens at start_pos {d}", .{ b, start_pos });
+            try self.commands.checkWait();
             for (tokens, 0..) |token, i| {
                 self.embedRow(i, token);
             }
@@ -882,6 +901,7 @@ pub fn FusedRunner(comptime Family: type) type {
             assert(x.len == @as(usize, b) * self.card.embedding_length);
 
             log.debug("prefill hidden: {d} rows at start_pos {d}", .{ b, start_pos });
+            try self.commands.checkWait();
             @memcpy(self.commands.stage_in.sliceTyped(f32, x.len), x);
             return self.prefillStaged(b, start_pos);
         }
@@ -959,7 +979,8 @@ pub fn FusedRunner(comptime Family: type) type {
             assert(tokens.len <= self.prefill_batch_max);
 
             // Raise the timestamps to `phases` for this call. The pool grows on the first probe,
-            // so level off creates none. No submit of this buffer is pending here.
+            // so level off creates none. After the wait check no submit of this buffer is pending.
+            try self.commands.checkWait();
             const level = self.commands.prof.level;
             try self.commands.prof.reserve(.phases);
             self.commands.prof.setLevel(.phases);
@@ -1003,7 +1024,7 @@ pub fn FusedRunner(comptime Family: type) type {
             tag: []const u8,
         ) !void {
             // Raise the timestamps to `phases` for this call, as `profilePrefill` does.
-            self.commands.invalidateDecode();
+            try self.commands.invalidateDecode();
             const level = self.commands.prof.level;
             try self.commands.prof.reserve(.phases);
             self.commands.prof.setLevel(.phases);
@@ -1038,29 +1059,27 @@ pub fn FusedRunner(comptime Family: type) type {
         // -- slot state -----------------------------------------------------
 
         /// Zero the recurrent slabs of a slot for a fresh conversation. `Sessions.create` calls
-        /// this on slot reuse. A family without recurrent state does nothing. A failure panics,
-        /// because a swallowed one corrupts the next conversation.
-        pub fn resetSlotState(self: *Self, slot: u32) void {
+        /// this on slot reuse. A family without recurrent state does nothing. The caller must not
+        /// start the session after an error, because the slot then holds the old state.
+        pub fn resetSlotState(self: *Self, slot: u32) !void {
             assert(slot < self.n_slots);
 
             if (comptime !has_recurrent_state) return;
 
-            self.zeroSlot(slot) catch |err| std.debug.panic("fused slot reset failed: {t}", .{err});
+            try self.zeroSlot(slot);
         }
 
         /// Fork slot state for a session clone: every KV region, and the whole recurrent slabs,
-        /// which have no position axis. Attention never reads the stale rows past `pos`. A
-        /// failure panics for the reason `resetSlotState` states.
-        pub fn cloneSlotState(self: *Self, source_slot: u32, target_slot: u32, pos: u32) void {
+        /// which have no position axis. Attention never reads the stale rows past `pos`. The
+        /// caller must not start the clone after an error.
+        pub fn cloneSlotState(self: *Self, source_slot: u32, target_slot: u32, pos: u32) !void {
             assert(source_slot < self.n_slots);
             assert(target_slot < self.n_slots);
             assert(source_slot != target_slot);
             assert(pos <= self.max_seq);
 
             log_kv.debug("clone slot {d} -> {d}, pos {d}", .{ source_slot, target_slot, pos });
-            self.copySlot(source_slot, target_slot) catch |err| {
-                std.debug.panic("fused slot clone failed: {t}", .{err});
-            };
+            try self.copySlot(source_slot, target_slot);
         }
 
         // -- blobs ----------------------------------------------------------
@@ -1478,7 +1497,8 @@ pub fn FusedRunner(comptime Family: type) type {
             const bytes = fused_weights.stageBytes(largest, self.commands.swap_chunk_bytes);
             fused_weights.logHeaps(self.commands.ctx, "before");
             var stage: kernels.UploadStage = .init(self.commands.ctx);
-            defer stage.deinit();
+            // A failed upload wait can leave a copy that reads the stage pending.
+            defer if (kernels.drainStaging(self.commands.ctx)) stage.deinit();
 
             try stage.ensure(bytes.small, bytes.quants);
             for (uploads) |u| {
@@ -2060,7 +2080,7 @@ pub fn FusedRunner(comptime Family: type) type {
             };
 
             // Free the decode ring, then submit the fill.
-            self.commands.invalidateDecode();
+            try self.commands.invalidateDecode();
             try kernels.submitOnce(self.commands.ctx, .fill, Rec{ .runner = self, .slot = slot });
         }
 
@@ -2115,7 +2135,7 @@ pub fn FusedRunner(comptime Family: type) type {
             };
 
             // Free the decode ring, then submit the copies.
-            self.commands.invalidateDecode();
+            try self.commands.invalidateDecode();
             try kernels.submitOnce(self.commands.ctx, .clone, Rec{
                 .runner = self,
                 .source = source,
@@ -2126,6 +2146,8 @@ pub fn FusedRunner(comptime Family: type) type {
 
         /// Move the state of `slot` over its first `n` rows through the stage of the direction.
         fn stageSlot(self: *Self, slot: u32, n: u32, side: kernels.StageSide) !kernels.SwapSplit {
+            // The stage regrow destroys the old stage, and a restore writes it.
+            try self.commands.checkWait();
             const stage = try self.commands.slotStage(side, self.snapshotBytes(self.max_seq));
             var copies: [kernels.KvStore.max_segments]kernels.Copy = undefined;
             const list = self.slotCopies(slot, n, side == .to_host, stage.buffer, &copies);

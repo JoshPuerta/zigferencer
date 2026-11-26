@@ -32,6 +32,7 @@ const HostBuffer = @import("memory.zig").HostBuffer;
 const OneShot = @import("submit.zig").OneShot;
 const Recorded = @import("submit.zig").Recorded;
 const submitOnce = @import("submit.zig").submitOnce;
+const drainStaging = @import("submit.zig").drainStaging;
 const VecAdd = @import("elementwise.zig").VecAdd;
 const ResidualAdd = @import("elementwise.zig").ResidualAdd;
 
@@ -1185,16 +1186,17 @@ pub fn kvCommitF16OneShot(
     const out_bytes: vk.DeviceSize = @intCast(k_src.len * @sizeOf(u16));
 
     var buf_k_src: HostBuffer = .{ .ctx = ctx };
-    defer buf_k_src.deinit();
-
     var buf_v_src: HostBuffer = .{ .ctx = ctx };
-    defer buf_v_src.deinit();
-
     var buf_k_out: HostBuffer = .{ .ctx = ctx };
-    defer buf_k_out.deinit();
-
     var buf_v_out: HostBuffer = .{ .ctx = ctx };
-    defer buf_v_out.deinit();
+    // A failed wait can leave the dispatch pending, so the buffers go only after a drain. An empty
+    // buffer frees nothing.
+    defer if (drainStaging(ctx)) {
+        buf_v_out.deinit();
+        buf_k_out.deinit();
+        buf_v_src.deinit();
+        buf_k_src.deinit();
+    };
 
     try buf_k_src.ensure(src_bytes);
     try buf_v_src.ensure(src_bytes);
@@ -1205,7 +1207,7 @@ pub fn kvCommitF16OneShot(
 
     // Build a throwaway pool and set, and bind the four buffers.
     const desc_pool = try createSingleSetPool(ctx, 4);
-    defer ctx.vkd.destroyDescriptorPool(ctx.device, desc_pool, null);
+    defer if (drainStaging(ctx)) ctx.vkd.destroyDescriptorPool(ctx.device, desc_pool, null);
 
     const desc_set = try allocateOneSet(ctx, desc_pool, kernel.pipeline.set_layout);
 

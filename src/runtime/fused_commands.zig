@@ -13,6 +13,13 @@
 //! Decode ring. A submit of another command buffer invalidates the speculative decode record. So
 //! every submit here frees the ring first. A recording never outlives a change to what it reads.
 //!
+//! Failed waits. A failed queue wait with a live device can leave a submission pending. A reset of
+//! a pending buffer is invalid. A host write to a stage that it reads is invalid too. So `wait`
+//! keeps the error of `cmd_buffer`. `checkWait` returns it, the error of the one-shot submits, or
+//! the error of the decode ring, at every later entry. The runner calls `checkWait` before every
+//! stage write and every record, and every submit here calls it first. `deinit` drains the queue
+//! before it frees a buffer. A drain that fails leaves every buffer to the end of the process.
+//!
 //! Comptime. A build gate refuses non-Vulkan builds, and `core_log.hot` removes the trace code from
 //! builds without hot tracing.
 
@@ -30,6 +37,7 @@ const span = @import("../core/span.zig");
 const step_stats = @import("../core/step_stats.zig");
 const gpu_profile = @import("gpu_profile.zig");
 const decode_ring = @import("decode_ring.zig");
+const record_ring = @import("../core/record_ring.zig");
 
 const log = std.log.scoped(.runner);
 const log_dispatch = std.log.scoped(.dispatch);
@@ -66,6 +74,8 @@ pub const FusedCommands = struct {
     host: step_stats.DecodeHost,
     /// True while `cmd_buffer` holds a resubmittable decode recording. Only bench hooks set it.
     probe_recorded: bool,
+    /// The error of a failed wait that left `cmd_buffer` pending. Every later entry returns it.
+    wait: record_ring.WaitGuard,
 
     /// The value before `initRecording`: empty stages and no command buffer.
     pub fn init(ctx: *const vulkan_ctx.Context, gpu_runner: span.GpuRunner) FusedCommands {
@@ -82,6 +92,7 @@ pub const FusedCommands = struct {
             .gpu_runner = gpu_runner,
             .host = .{},
             .probe_recorded = false,
+            .wait = .{},
         };
     }
 
@@ -119,9 +130,16 @@ pub const FusedCommands = struct {
     }
 
     /// Free the four stages, and what `initRecording` allocated when it ran. An empty stage frees
-    /// nothing, so the error path of a runner init calls it at any point.
+    /// nothing, so the error path of a runner init calls it at any point. After a failed drain it
+    /// frees nothing.
     pub fn deinit(self: *FusedCommands) void {
         const ctx = self.ctx;
+        if (!self.drain()) {
+            log.err("fused commands: a submission can still use the buffers, so they stay until " ++
+                "the process ends", .{});
+            return;
+        }
+
         if (self.cmd_buffer != .null_handle) {
             self.prof.deinit();
             self.decode.deinit();
@@ -136,8 +154,43 @@ pub const FusedCommands = struct {
         self.stage_in.deinit();
     }
 
-    /// Free the decode ring before a submit that is not a decode step.
-    pub fn invalidateDecode(self: *FusedCommands) void {
+    /// Refuse every entry after a failed wait that can leave `cmd_buffer`, a one-shot submit, or a
+    /// decode ring buffer pending. No ring exists before `initRecording`.
+    pub fn checkWait(self: *const FusedCommands) record_ring.WaitError!void {
+        try self.wait.check();
+        try kernels.stagingWaitCheck();
+        if (self.cmd_buffer != .null_handle) {
+            try self.decode.checkWait();
+        }
+    }
+
+    /// Wait for the queue when a stored error says that a submission can be pending. A queue wait
+    /// covers every submission of the queue, so one wait ends each stored error. True when no
+    /// submission is pending after it. A false result keeps the device to the end of the process.
+    pub fn drain(self: *FusedCommands) bool {
+        const stored = if (self.checkWait()) |_| return true else |err| err;
+
+        if (!kernels.drainStaging(self.ctx)) return false;
+
+        const waited = self.ctx.vkd.queueWaitIdle(self.ctx.queue);
+        self.wait.drain(waited);
+        if (self.cmd_buffer != .null_handle) {
+            self.decode.drain(waited);
+        }
+
+        self.checkWait() catch |err| {
+            vulkan_ctx.leaveObjects();
+            log.err("fused commands: the drain after {t} failed: {t}", .{ stored, err });
+            return false;
+        };
+        return true;
+    }
+
+    /// Free the decode ring before a submit that is not a decode step. It refuses after a failed
+    /// wait. The submit after it resets `cmd_buffer` or writes a stage that a pending submission
+    /// can use. The ring invalidation also asserts that no buffer is pending.
+    pub fn invalidateDecode(self: *FusedCommands) record_ring.WaitError!void {
+        try self.checkWait();
         self.decode.invalidate(&self.host);
     }
 
@@ -149,12 +202,14 @@ pub const FusedCommands = struct {
         const submits = [_]vk.SubmitInfo{
             .{ .command_buffer_count = 1, .p_command_buffers = &cmds },
         };
-        self.invalidateDecode();
+        try self.invalidateDecode();
         const timed = self.prof.level != .off or span.enabled();
         const t0: std.Io.Timestamp = if (timed) core_log.now() else undefined;
         try self.ctx.vkd.queueSubmit(self.ctx.queue, &submits, .null_handle);
         const t1: std.Io.Timestamp = if (timed) core_log.now() else undefined;
-        try self.ctx.vkd.queueWaitIdle(self.ctx.queue);
+        const waited = self.ctx.vkd.queueWaitIdle(self.ctx.queue);
+        self.wait.end(waited);
+        try waited;
         if (!timed) return;
 
         const t2 = core_log.now();
@@ -198,7 +253,7 @@ pub const FusedCommands = struct {
             .to_device => std.debug.assert(stage == &self.kv_swap_stage),
         }
 
-        self.invalidateDecode();
+        try self.invalidateDecode();
         return kernels.walkStage(self.ctx, copies, stage, side, self.swap_chunk_bytes);
     }
 
@@ -209,9 +264,11 @@ pub const FusedCommands = struct {
         const submits = [_]vk.SubmitInfo{
             .{ .command_buffer_count = 1, .p_command_buffers = &cmds },
         };
-        self.invalidateDecode();
+        try self.invalidateDecode();
         try self.ctx.vkd.queueSubmit(self.ctx.queue, &submits, .null_handle);
-        try self.ctx.vkd.queueWaitIdle(self.ctx.queue);
+        const waited = self.ctx.vkd.queueWaitIdle(self.ctx.queue);
+        self.wait.end(waited);
+        try waited;
     }
 };
 

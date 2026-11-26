@@ -474,7 +474,8 @@ pub fn CpuRunner(comptime Family: type) type {
 
         /// Zero the recurrent slabs of a slot for a fresh conversation. KV needs no scrub, because
         /// attention reads only rewritten positions. A family without recurrent state does nothing.
-        pub fn resetSlotState(self: *Self, slot: u32) void {
+        /// It cannot fail. The empty error set matches the hook of a GPU runner, which can.
+        pub fn resetSlotState(self: *Self, slot: u32) error{}!void {
             assert(slot < self.n_slots);
 
             if (comptime !has_recurrent_state) return;
@@ -492,7 +493,12 @@ pub fn CpuRunner(comptime Family: type) type {
         /// Copy slot state for a session fork: KV rows `0..pos` of the KV layers, and the WHOLE
         /// recurrent slabs, because they have no position axis. Rows past `pos` stay stale,
         /// because attention reads only `0..=pos`.
-        pub fn cloneSlotState(self: *Self, source_slot: u32, target_slot: u32, pos: u32) void {
+        pub fn cloneSlotState(
+            self: *Self,
+            source_slot: u32,
+            target_slot: u32,
+            pos: u32,
+        ) error{}!void {
             assert(source_slot < self.n_slots);
             assert(target_slot < self.n_slots);
             assert(source_slot != target_slot);

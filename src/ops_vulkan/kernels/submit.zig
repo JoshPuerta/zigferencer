@@ -5,7 +5,13 @@
 //! every one-shot submit reuses the one staging buffer of the context. The wait before
 //! `submitOnce` returns keeps that buffer idle at the next entry. A failed wait can leave the
 //! buffer pending, and a reset of a pending buffer is invalid, so every later call returns that
-//! error. The Vulkan host thread is single, and the busy flag asserts that no call nests.
+//! error until a drain ends the submit. The Vulkan host thread is single, and the busy flag
+//! asserts that no call nests.
+//!
+//! Frees after a failed wait. The copy of a pending submit can still read or write each buffer
+//! that it names. So a caller frees those buffers only after `drainStaging` returns true. A drain
+//! that fails leaves them to the end of the process, because a destroy of an object that a
+//! pending submit uses is invalid.
 //!
 //! Staged swaps. Evict, restore, and the prefix snapshot all walk one loop, `walkStage`. The stage
 //! holds one chunk of at most `chunk_bytes`. The walk takes `kv_budget.ChunkWalk.count` trips.
@@ -20,6 +26,7 @@ const span = @import("../../core/span.zig");
 const time = @import("../../core/utils/time.zig");
 const gpu_profile = @import("../../runtime/gpu_profile.zig");
 const vulkan_ctx = @import("../../runtime/vulkan_ctx.zig");
+const record_ring = @import("../../core/record_ring.zig");
 const log = std.log.scoped(.gpu);
 
 const allocateOnePrimaryCmdBuffer = @import("pipeline.zig").allocateOnePrimaryCmdBuffer;
@@ -98,7 +105,7 @@ pub const SubmitError = vk.DeviceWrapper.ResetCommandBufferError ||
     vk.DeviceWrapper.BeginCommandBufferError ||
     vk.DeviceWrapper.EndCommandBufferError ||
     vk.DeviceWrapper.QueueSubmitError ||
-    vk.DeviceWrapper.QueueWaitIdleError;
+    record_ring.WaitError;
 
 /// Records one `cmdCopyBuffer` per copy, in list order, with no barrier.
 pub const CopyRecorder = struct {
@@ -145,14 +152,39 @@ var staging_submits: std.atomic.Value(u64) = .init(0);
 /// because every caller holds its context through a `*const` pointer.
 var staging_busy: std.atomic.Value(bool) = .init(false);
 
-/// The error of a failed wait. Every later submit returns it.
-var staging_wait_error: ?SubmitError = null;
+/// The error of a failed wait that left the staging buffer pending. Every later submit returns it.
+var staging_wait: record_ring.WaitGuard = .{};
 
 // -- api --------------------------------------------------------------------
 
 /// The number of one-shot submits this process started.
 pub fn stagingSubmitCount() u64 {
     return staging_submits.load(.monotonic);
+}
+
+/// Refuse a write to a buffer that a pending one-shot submit can use.
+pub fn stagingWaitCheck() record_ring.WaitError!void {
+    return staging_wait.check();
+}
+
+/// Wait for the queue when a failed wait left a one-shot submit pending. True when no one-shot
+/// submit is pending after it, so the caller can free the buffers of the submit.
+pub fn drainStaging(ctx: *const vulkan_ctx.Context) bool {
+    const stored = staging_wait.err orelse return true;
+
+    std.debug.assert(!staging_busy.load(.acquire));
+    staging_wait.drain(ctx.vkd.queueWaitIdle(ctx.queue));
+    if (staging_wait.err) |err| {
+        vulkan_ctx.leaveObjects();
+        log.err(
+            "staging: the drain after {t} failed: {t}. The buffers of the submit stay until " ++
+                "the process ends",
+            .{ stored, err },
+        );
+        return false;
+    }
+
+    return true;
 }
 
 /// Submit one command buffer of work on the staging buffer of `ctx`, and block until the queue is
@@ -170,10 +202,10 @@ pub fn submitOnce(
     std.debug.assert(!was_busy);
     defer staging_busy.store(false, .release);
 
-    if (staging_wait_error) |err| {
+    staging_wait.check() catch |err| {
         log.err("staging: submit refused, an earlier wait failed: {t}", .{err});
         return err;
-    }
+    };
 
     // Number this submit and start the laps.
     const number = staging_submits.fetchAdd(1, .monotonic) + 1;
@@ -223,10 +255,7 @@ pub fn submitOnce(
     t = core_log.now();
     const t_wait = t;
     const waited = ctx.vkd.queueWaitIdle(ctx.queue);
-    if (waited) |_| {} else |err| {
-        staging_wait_error = err;
-    }
-
+    staging_wait.end(waited);
     try waited;
 
     // Close the laps and record the spans.
@@ -276,7 +305,8 @@ pub fn walkStage(
     side: StageSide,
     chunk_bytes: u64,
 ) !SwapSplit {
-    // Check the chunk and the stage.
+    // Refuse a stage write under a pending submit, then check the chunk and the stage.
+    try stagingWaitCheck();
     const to_host = side == .to_host;
     const total: u64 = switch (side) {
         inline else => |blob| blob.len,

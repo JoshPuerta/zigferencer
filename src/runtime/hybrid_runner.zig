@@ -414,25 +414,25 @@ pub fn HybridRunner(comptime Family: type) type {
         /// Zero the recurrent state of a slot on both tiers for a fresh conversation.
         /// `Sessions.create` calls this on slot reuse. The KV needs no scrub, because attention
         /// reads only rewritten positions.
-        pub fn resetSlotState(self: *Self, slot: u32) void {
+        pub fn resetSlotState(self: *Self, slot: u32) !void {
             std.debug.assert(slot < self.n_slots);
 
             if (comptime has_recurrent_state) {
-                self.prefix.resetSlotState(slot);
-                self.suffix.resetSlotState(slot);
+                try self.prefix.resetSlotState(slot);
+                try self.suffix.resetSlotState(slot);
             }
         }
 
         /// Fork slot state for a session clone across both tiers. One slot id spans them, because
         /// both carry the same slot count. `Sessions.clone` calls this.
-        pub fn cloneSlotState(self: *Self, source_slot: u32, target_slot: u32, pos: u32) void {
+        pub fn cloneSlotState(self: *Self, source_slot: u32, target_slot: u32, pos: u32) !void {
             std.debug.assert(source_slot < self.n_slots);
             std.debug.assert(target_slot < self.n_slots);
             std.debug.assert(source_slot != target_slot);
             std.debug.assert(pos <= self.max_seq);
 
-            self.prefix.cloneSlotState(source_slot, target_slot, pos);
-            self.suffix.cloneSlotState(source_slot, target_slot, pos);
+            try self.prefix.cloneSlotState(source_slot, target_slot, pos);
+            try self.suffix.cloneSlotState(source_slot, target_slot, pos);
         }
 
         // -- tiered kv ------------------------------------------------------

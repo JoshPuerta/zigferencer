@@ -15,6 +15,7 @@ const HostBuffer = @import("memory.zig").HostBuffer;
 const OneShot = @import("submit.zig").OneShot;
 const Recorded = @import("submit.zig").Recorded;
 const submitOnce = @import("submit.zig").submitOnce;
+const drainStaging = @import("submit.zig").drainStaging;
 const Q80Weight = @import("weights.zig").Q80Weight;
 const VecAdd = @import("elementwise.zig").VecAdd;
 
@@ -853,16 +854,19 @@ fn matmulOneShot(
 
     // Build the weight of this call.
     const ctx = kernel.ctx;
+    // A failed wait can leave the dispatch pending, so every object of the call goes only after a
+    // drain. An empty buffer frees nothing.
     var w = try Q80Weight.init(ctx, weight_bytes, in_features, out_features);
-    defer w.deinit();
+    defer if (drainStaging(ctx)) w.deinit();
 
     // Stage the input and size the output.
     const F = @sizeOf(f32);
     var buf_in: HostBuffer = .{ .ctx = ctx };
-    defer buf_in.deinit();
-
     var buf_out: HostBuffer = .{ .ctx = ctx };
-    defer buf_out.deinit();
+    defer if (drainStaging(ctx)) {
+        buf_out.deinit();
+        buf_in.deinit();
+    };
 
     try buf_in.ensure(@intCast(input.len * F));
     try buf_out.ensure(@intCast(out.len * F));
@@ -878,7 +882,7 @@ fn matmulOneShot(
         .p_pool_sizes = &pool_sizes,
     };
     const pool = try ctx.vkd.createDescriptorPool(ctx.device, &pool_info, null);
-    defer ctx.vkd.destroyDescriptorPool(ctx.device, pool, null);
+    defer if (drainStaging(ctx)) ctx.vkd.destroyDescriptorPool(ctx.device, pool, null);
 
     const layouts = [_]vk.DescriptorSetLayout{kernel.pipeline.set_layout};
     const ai: vk.DescriptorSetAllocateInfo = .{

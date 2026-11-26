@@ -23,6 +23,10 @@
 //! only the profile of its buffer, and `step` reads that profile back right after the fence wait.
 //! The ring invariant keeps at most one buffer pending, so no record resets a pool that a pending
 //! buffer writes.
+//!
+//! Failed waits. A failed fence wait with a live device leaves the buffer pending. The ring keeps
+//! it pending and refuses every later step. An object of a pending submission must not go, so
+//! the owner drains the queue before `deinit`, and a failed drain skips `deinit`.
 
 const std = @import("std");
 const vk = @import("vulkan");
@@ -76,6 +80,7 @@ pub const DecodeRing = struct {
 
     pub fn deinit(self: *DecodeRing) void {
         std.debug.assert(self.ring.pendingCount() == 0);
+        std.debug.assert(self.ring.wait_error == null);
 
         for (&self.profs) |*p| {
             p.deinit();
@@ -85,10 +90,29 @@ pub const DecodeRing = struct {
         self.ctx.vkd.freeCommandBuffers(self.ctx.device, self.ctx.command_pool, &self.cbs);
     }
 
-    /// Free both buffers. The runner calls this before any submit that is not a ring step.
-    /// The discarded recordings count as wasted.
+    /// Free both buffers. The runner calls this before any submit that is not a ring step, after
+    /// `checkWait`. The discarded recordings count as wasted.
     pub fn invalidate(self: *DecodeRing, host: *step_stats.DecodeHost) void {
         host.ring.wasted += self.ring.invalidate();
+    }
+
+    /// Refuse every call after a failed wait that left a ring buffer pending.
+    pub fn checkWait(self: *const DecodeRing) record_ring.WaitError!void {
+        return self.ring.checkWait();
+    }
+
+    /// Apply the result of a queue wait at a drain. The queue wait covers the pending buffer, so a
+    /// result that ends a submission completes it.
+    pub fn drain(self: *DecodeRing, waited: record_ring.WaitError!void) void {
+        if (record_ring.pendingError(waited) != null) return;
+
+        for ([_]record_ring.Buf{ .a, .b }) |c| {
+            if (self.ring.isPending(c)) {
+                self.ring.complete(c);
+            }
+        }
+
+        std.debug.assert(self.ring.pendingCount() == 0);
     }
 
     /// The level the next decode key carries.
@@ -102,6 +126,7 @@ pub const DecodeRing = struct {
     /// pending and no recording at the old level can be submitted. Only `bench-decode-host` calls
     /// it.
     pub fn setLevel(self: *DecodeRing, new: gpu_profile.Level, host: *step_stats.DecodeHost) !void {
+        try self.checkWait();
         self.invalidate(host);
         std.debug.assert(self.ring.pendingCount() == 0);
         // Both pools grow before either level moves, so a failed reserve leaves the old level.
@@ -126,12 +151,13 @@ pub const DecodeRing = struct {
         rec: anytype,
         host: *step_stats.DecodeHost,
     ) !void {
+        try self.checkWait();
         std.debug.assert(self.ring.pendingCount() == 0);
 
         if (next) |k| std.debug.assert(!std.meta.eql(k, key));
 
         std.debug.assert(key.opts.level == self.level());
-        // A failed submit or wait leaves the GPU state unknown, so no buffer is trusted after it.
+        // After a failed call no recording is trusted. A pending buffer stays pending.
         errdefer self.ring.drop();
 
         const vkd = self.ctx.vkd;
@@ -148,8 +174,8 @@ pub const DecodeRing = struct {
 
         const t1 = core_log.now();
 
-        // Submit the buffer and set the fence.
-        self.ring.submit(p.buf, key);
+        // Submit the buffer and set the fence. A failed submit leaves no buffer pending, so the
+        // ring marks the buffer pending only after the queue took it.
         const fences = [_]vk.Fence{self.fence};
         try vkd.resetFences(self.ctx.device, &fences);
         const cmds = [_]vk.CommandBuffer{self.cbs[@intFromEnum(p.buf)]};
@@ -157,6 +183,7 @@ pub const DecodeRing = struct {
             .{ .command_buffer_count = 1, .p_command_buffers = &cmds },
         };
         try vkd.queueSubmit(self.ctx.queue, &submits, self.fence);
+        self.ring.submit(p.buf, key);
         const t2 = core_log.now();
 
         // Record the predicted next key into the other buffer, which can hold it after a rewind.
@@ -170,11 +197,16 @@ pub const DecodeRing = struct {
 
         const t3 = core_log.now();
 
-        // Wait on the fence even when the speculative record failed, so no buffer stays pending.
-        const result = try vkd.waitForFences(self.ctx.device, &fences, .true, std.math.maxInt(u64));
-        // An infinite timeout cannot report `timeout`.
-        std.debug.assert(result == .success);
-        self.ring.complete(p.buf);
+        // Wait on the fence even when the speculative record failed. A timeout is a broken
+        // driver at an infinite timeout, and the fence did not signal, so the buffer stays pending.
+        const waited = vkd.waitForFences(self.ctx.device, &fences, .true, std.math.maxInt(u64));
+        const result: record_ring.WaitError!void = if (waited) |r| switch (r) {
+            .success => {},
+            .timeout => error.WaitTimeout,
+            // The wrapper returns every other result code as an error.
+            else => unreachable,
+        } else |err| err;
+        try self.ring.endWait(p.buf, result);
         const t4 = core_log.now();
         try speculated;
         self.last = try self.profs[@intFromEnum(p.buf)].collectInto(self.runner, .decode, t1, t4);

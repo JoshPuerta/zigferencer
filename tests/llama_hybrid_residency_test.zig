@@ -336,7 +336,7 @@ test "llama hybrid swap: a restored slot decodes as if it never left" {
         const n_rows = pool.posOf(sids[1]);
         const blob = blob_max[0..@intCast(hybrid.evictSlotBytesFor(n_rows))];
         try hybrid.evictSlot(1, n_rows, blob);
-        hybrid.cloneSlotState(0, 1, n_rows);
+        try hybrid.cloneSlotState(0, 1, n_rows);
         try hybrid.restoreSlot(1, n_rows, blob);
         var out: [prompts.len]u32 = undefined;
         try pool.decodeBatch(&sids, &out);

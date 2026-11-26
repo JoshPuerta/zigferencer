@@ -2720,7 +2720,12 @@ const TestRunner = struct {
 
     // The fake holds no per-slot state, so the copy is a no-op. It exists so that
     // `Sessions(TestRunner).can_clone` holds and a test can reach `handleClone`.
-    pub fn cloneSlotState(self: *TestRunner, source_slot: u32, target_slot: u32, pos: u32) void {
+    pub fn cloneSlotState(
+        self: *TestRunner,
+        source_slot: u32,
+        target_slot: u32,
+        pos: u32,
+    ) error{}!void {
         _ = self;
         _ = source_slot;
         _ = target_slot;

@@ -162,8 +162,9 @@ pub fn Sessions(comptime RunnerT: type) type {
             };
         }
 
-        /// Claim a free slot. The seed is explicit, so generation replays.
-        pub fn create(self: *Self, seed: u64, params: sampler.Params) error{NoFreeSession}!u32 {
+        /// Claim a free slot. The seed is explicit, so generation replays. A failed slot reset
+        /// leaves the slot free.
+        pub fn create(self: *Self, seed: u64, params: sampler.Params) !u32 {
             std.debug.assert(params.temperature >= 0);
             std.debug.assert(params.top_p > 0);
 
@@ -171,7 +172,7 @@ pub fn Sessions(comptime RunnerT: type) type {
                 if (s.state != .free) continue;
 
                 if (comptime @hasDecl(RunnerT, "resetSlotState")) {
-                    self.runner.resetSlotState(@intCast(id));
+                    try self.runner.resetSlotState(@intCast(id));
                 }
 
                 s.* = .{
@@ -192,13 +193,14 @@ pub fn Sessions(comptime RunnerT: type) type {
         }
 
         /// Fork a session into a free slot: KV rows `0..pos`, `pos`, and the pending token.
-        /// The clone gets its own seed and params. The source stays untouched.
+        /// The clone gets its own seed and params. The source stays untouched. A failed copy
+        /// leaves the slot free.
         pub fn clone(
             self: *Self,
             source_id: u32,
             seed: u64,
             params: sampler.Params,
-        ) error{NoFreeSession}!u32 {
+        ) !u32 {
             std.debug.assert(source_id < self.table.len);
 
             const source = &self.table[source_id];
@@ -210,7 +212,7 @@ pub fn Sessions(comptime RunnerT: type) type {
                 if (s.state != .free) continue;
 
                 std.debug.assert(id != source_id);
-                self.runner.cloneSlotState(source_id, @intCast(id), source.pos);
+                try self.runner.cloneSlotState(source_id, @intCast(id), source.pos);
                 s.* = .{
                     .pos = source.pos,
                     .token_pending = source.token_pending,
@@ -586,7 +588,12 @@ const FakeRunner = struct {
         test_fakes.writeCannedLogits(self.logits, rows);
     }
 
-    pub fn cloneSlotState(self: *FakeRunner, source_slot: u32, target_slot: u32, pos: u32) void {
+    pub fn cloneSlotState(
+        self: *FakeRunner,
+        source_slot: u32,
+        target_slot: u32,
+        pos: u32,
+    ) error{}!void {
         std.debug.assert(self.clones_log_len < self.clones_log.len);
 
         self.clones_log[self.clones_log_len] = .{ source_slot, target_slot, pos };

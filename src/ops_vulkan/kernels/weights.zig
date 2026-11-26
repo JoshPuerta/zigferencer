@@ -70,7 +70,7 @@ pub const Q80Weight = struct {
         vk.DeviceWrapper.BeginCommandBufferError ||
         vk.DeviceWrapper.EndCommandBufferError ||
         vk.DeviceWrapper.QueueSubmitError ||
-        vk.DeviceWrapper.QueueWaitIdleError;
+        SubmitError;
 
     /// Build a weight with its own device memory: 2 buffers and 2 memory objects. Use it for
     /// one-off uses: the bench, the per-op tests, and the `wrap.zig` cache. A bulk upload takes

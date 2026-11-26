@@ -146,7 +146,7 @@ fn batchedDecodeGate(kv_dtype: zigferencer.dtype.KvDtype) !void {
         const rows = pool.posOf(sids[1]);
         const blob = blob_max[0..@intCast(fused.evictSlotBytesFor(rows))];
         try fused.evictSlot(1, rows, blob);
-        fused.cloneSlotState(0, 1, rows); // corrupt slot 1
+        try fused.cloneSlotState(0, 1, rows); // corrupt slot 1
         try fused.restoreSlot(1, rows, blob); // must fully undo it
         var out: [prompts.len]u32 = undefined;
         try pool.decodeBatch(&sids, &out);

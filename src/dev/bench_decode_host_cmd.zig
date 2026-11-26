@@ -383,7 +383,11 @@ fn gapProbe(
         try runner.setDecodeLevel(.submit);
     }
 
-    defer if (level == .off) runner.setDecodeLevel(.off) catch unreachable;
+    // A failed step stores its wait error, and the reset then returns it. The error path logs it,
+    // because the step error goes up first.
+    errdefer if (level == .off) runner.setDecodeLevel(.off) catch |err| {
+        log.err("the level reset failed: {t}", .{err});
+    };
 
     // Run the timed steps and keep the stamps of each.
     runner.commands.host = .{};
@@ -438,6 +442,9 @@ fn gapProbe(
         "  record ring     hits={d}  misses={d}  speculated={d}  wasted={d}\n",
         .{ r.hits, r.misses, r.speculated, r.wasted },
     );
+    if (level == .off) {
+        try runner.setDecodeLevel(.off);
+    }
 }
 
 fn printStat(w: *Io.Writer, label: []const u8, s: step_stats.Stat) !void {

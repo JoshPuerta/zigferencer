@@ -56,6 +56,12 @@
 //! buffer, and the paravirtual driver leaks part of it when the buffer is freed. So a one-shot
 //! submit never allocates. It resets `staging_cmd`, and every submit waits before it returns, so
 //! the buffer is never pending at the next reset.
+//!
+//! Teardown. A failed wait with a live device can leave a submission pending, and a destroy of an
+//! object that a pending submission uses is invalid. So `deinit` waits for the queue first. A
+//! drain that fails, or an earlier teardown that left objects, keeps every object to the end of
+//! the process. The device stays too, because a destroy of a device with live child objects is
+//! invalid.
 
 const std = @import("std");
 const build_options = @import("build_options");
@@ -65,6 +71,7 @@ const span = @import("../core/span.zig");
 const kv_index = @import("../core/kv_index.zig");
 const attn_split = @import("../core/attn_split.zig");
 const core_log = @import("../core/utils/log.zig");
+const record_ring = @import("../core/record_ring.zig");
 const vulkan_loader_library = @import("vulkan_loader_library.zig");
 const dispatch_list = if (core_log.hot) @import("../ops_vulkan/dispatch_list.zig") else void;
 
@@ -445,6 +452,18 @@ pub const Context = struct {
     pub fn deinit(self: *Context) void {
         std.debug.assert(self.staging_cmd != .null_handle);
 
+        // Wait for the queue, and keep every object when a submission can still use one.
+        if (record_ring.pendingError(self.vkd.queueWaitIdle(self.queue))) |err| {
+            log.err("context: the drain at deinit failed: {t}", .{err});
+            leaveObjects();
+        }
+
+        if (objectsLeft()) {
+            log.err("context: a submission can still use the device, so it stays until the " ++
+                "process ends", .{});
+            return;
+        }
+
         const cmds = [_]vk.CommandBuffer{self.staging_cmd};
         self.vkd.freeCommandBuffers(self.device, self.command_pool, &cmds);
         self.staging_cmd = .null_handle;
@@ -645,7 +664,24 @@ pub const Context = struct {
 
 const QueueFamily = struct { index: u32, timestamp_valid_bits: u32 };
 
+// -- state ------------------------------------------------------------------
+
+/// True after a teardown left objects that a pending submission can use. It is process-wide,
+/// because every caller holds its context through a `*const` pointer.
+var objects_left: std.atomic.Value(bool) = .init(false);
+
 // -- api --------------------------------------------------------------------
+
+/// Keep the device to the end of the process. A teardown calls it when a failed drain leaves
+/// objects that a pending submission can use.
+pub fn leaveObjects() void {
+    objects_left.store(true, .release);
+}
+
+/// True after a teardown left objects that a pending submission can use.
+pub fn objectsLeft() bool {
+    return objects_left.load(.acquire);
+}
 
 pub fn pickPhysicalDevice(
     vki: vk.InstanceWrapper,

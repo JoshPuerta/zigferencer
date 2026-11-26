@@ -378,11 +378,11 @@ pub fn Residency(comptime SessionsT: type) type {
                     self.restore_ms += time.rawMsBetween(t0, t1);
                     self.dropBlob(e);
                 } else if (comptime @hasDecl(Runner, "resetSlotState")) {
-                    self.sessions.runner.resetSlotState(s);
+                    try self.sessions.runner.resetSlotState(s);
                 }
             } else if (comptime @hasDecl(Runner, "resetSlotState")) {
                 if (!e.ever_resident) {
-                    self.sessions.runner.resetSlotState(s);
+                    try self.sessions.runner.resetSlotState(s);
                 }
             }
 
@@ -443,8 +443,11 @@ pub fn Residency(comptime SessionsT: type) type {
 
             try self.ensureResident(id, &.{src_phys});
             const dst_phys = self.entries[id].phys.?;
+            // A failed copy must also free the slot, or the slot keeps an owner with no entry.
+            errdefer self.phys_owner[dst_phys] = null;
+
             const src = self.sessions.table[src_phys];
-            self.sessions.runner.cloneSlotState(src_phys, dst_phys, src.pos);
+            try self.sessions.runner.cloneSlotState(src_phys, dst_phys, src.pos);
             self.sessions.table[dst_phys] = .{
                 .pos = src.pos,
                 .token_pending = src.token_pending,
@@ -686,6 +689,7 @@ fn indexOf(haystack: []const u32, needle: u32) ?usize {
 // -- tests ------------------------------------------------------------------
 
 const test_fakes = @import("../runtime/test_fakes.zig");
+const WaitError = @import("../core/record_ring.zig").WaitError;
 const test_vocab = test_fakes.vocab;
 const fake_row_bytes: usize = @sizeOf(u32);
 
@@ -702,6 +706,12 @@ const FakeRunner = struct {
     resets: u32 = 0,
     last_evict_rows: u32 = 0,
     last_restore_rows: u32 = 0,
+    /// The stored error of a failed GPU wait. While set, the hook returns it, as a GPU runner
+    /// refuses every entry after such a wait.
+    reset_error: ?WaitError = null,
+    /// The same error for the clone. A GPU family without recurrent state submits no reset, so
+    /// only its clone returns the error.
+    clone_error: ?WaitError = null,
 
     fn initFake(gpa: Allocator, n_slots: u32) !FakeRunner {
         const logits = try gpa.alloc(f32, n_slots * test_vocab);
@@ -739,9 +749,24 @@ const FakeRunner = struct {
         self.last_restore_rows = n_rows;
     }
 
-    pub fn resetSlotState(self: *FakeRunner, slot: u32) void {
+    pub fn resetSlotState(self: *FakeRunner, slot: u32) WaitError!void {
+        if (self.reset_error) |err| return err;
+
         self.markers[slot] = 0;
         self.resets += 1;
+    }
+
+    pub fn cloneSlotState(
+        self: *FakeRunner,
+        source_slot: u32,
+        target_slot: u32,
+        pos: u32,
+    ) WaitError!void {
+        std.debug.assert(source_slot != target_slot);
+        std.debug.assert(pos <= self.max_seq);
+        if (self.clone_error) |err| return err;
+
+        self.markers[target_slot] = self.markers[source_slot];
     }
 
     pub fn maxStepRows(self: *const FakeRunner) u32 {
@@ -855,6 +880,65 @@ test "residency: more logical sessions than physical slots, streams survive evic
     for (ids[1..]) |id| {
         res.destroy(id);
     }
+}
+
+/// The physical slots that hold an owner. A slot with no entry that names it counts too.
+fn ownedSlots(res: *const TestRes) u32 {
+    var n: u32 = 0;
+    for (res.phys_owner) |o| {
+        if (o != null) {
+            n += 1;
+        }
+    }
+
+    return n;
+}
+
+test "residency: a stored wait error fails the turn that brings a fresh session in" {
+    const gpa = std.testing.allocator;
+    var fx: Fixture = undefined;
+    try fx.setUp(gpa, 2, 2, null);
+    defer fx.tearDown(gpa);
+
+    const res = &fx.res;
+
+    // The reset refuses, so the session gets no slot and keeps no half state.
+    fx.fake.reset_error = error.OutOfDeviceMemory;
+    const a = try res.create(1, .{});
+    try std.testing.expectError(error.OutOfDeviceMemory, res.feed(a, &.{5}, true));
+    try std.testing.expectEqual(@as(?u32, null), res.entries[a].phys);
+    try std.testing.expectEqual(@as(u32, 0), ownedSlots(res));
+    try std.testing.expectEqual(@as(u32, 0), fx.fake.resets);
+
+    // The next turn after the error clears resets the slot and starts the session.
+    fx.fake.reset_error = null;
+    try std.testing.expectEqual(@as(u32, 6), (try res.feed(a, &.{5}, true)).?);
+    try std.testing.expectEqual(@as(u32, 1), fx.fake.resets);
+    try std.testing.expectEqual(@as(u32, 1), ownedSlots(res));
+}
+
+test "residency: a failed clone frees the logical session and the slot that it took" {
+    const gpa = std.testing.allocator;
+    var fx: Fixture = undefined;
+    try fx.setUp(gpa, 2, 2, null);
+    defer fx.tearDown(gpa);
+
+    const res = &fx.res;
+    const a = try res.create(1, .{});
+    _ = try res.feed(a, &.{5}, true);
+
+    // The copy refuses after the clone took a logical session and a slot.
+    fx.fake.clone_error = error.OutOfDeviceMemory;
+    try std.testing.expectError(error.OutOfDeviceMemory, res.clone(a, 2, .{}));
+    try std.testing.expectEqual(@as(u32, 1), ownedSlots(res));
+    try std.testing.expectEqual(@as(u32, 1), res.stats().slots_resident);
+
+    // A retry gets the same slot back, and the clone holds the state of its source.
+    fx.fake.clone_error = null;
+    const b = try res.clone(a, 2, .{});
+    const dst = res.entries[b].phys.?;
+    try std.testing.expectEqual(@as(u32, 5), fx.fake.markers[dst]);
+    try std.testing.expectEqual(@as(u32, 2), ownedSlots(res));
 }
 
 test "residency: identity when physical >= logical (no eviction)" {

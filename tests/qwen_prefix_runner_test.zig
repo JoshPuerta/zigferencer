@@ -271,7 +271,7 @@ test "qwen prefix below the attention interval holds no KV and still steps" {
     try std.testing.expect(!std.mem.allEqual(u8, first, 0));
 
     // A fork copies the GDN slabs alone, because there is no KV to copy.
-    prefix.cloneSlotState(0, 1, 1);
+    try prefix.cloneSlotState(0, 1, 1);
     for (0..k) |li| {
         try std.testing.expectEqualSlices(f32, prefix.gdn_state[li], prefix.gdn_state[k + li]);
         try std.testing.expectEqualSlices(
@@ -326,7 +326,7 @@ test "qwen prefix resetSlotState zeroes its own slot's slabs only" {
 
     try std.testing.expectEqual(@as(usize, 5), live); // every GDN layer ran
 
-    prefix.resetSlotState(0);
+    try prefix.resetSlotState(0);
     for (0..k) |li| {
         try std.testing.expect(std.mem.allEqual(f32, prefix.gdn_state[li], 0));
         try std.testing.expect(std.mem.allEqual(f32, prefix.gdn_conv_state[li], 0));
