@@ -94,7 +94,9 @@ pub const Budget = struct {
 };
 
 /// The split of the held turns. The `dropped` oldest turns leave, and `estimate` is the position
-/// after the kept pairs.
+/// after the kept pairs. The estimate plus the reserve fits the window when the system rows and the
+/// reserve fit it. Otherwise the plan keeps only turns of cost zero, and the estimate equals the
+/// system rows.
 pub const Plan = struct {
     kept: u32,
     dropped: u32,
@@ -593,7 +595,9 @@ fn keepCount(cap: u64, weights_newest_first: []const u32) u32 {
     return @intCast(weights_newest_first.len);
 }
 
-/// `plan` over a weight list, newest first.
+/// `plan` over a weight list, newest first. A reserve that leaves no room beside the system rows
+/// gives a cap of zero. The plan then keeps only turns of cost zero, so the estimate stays at the
+/// system rows and cannot fit beside the reserve.
 fn planOver(weights_newest_first: []const u32, budget: Budget) Plan {
     assert(budget.window > 0);
     assert(budget.reserve <= budget.window);
@@ -606,7 +610,9 @@ fn planOver(weights_newest_first: []const u32, budget: Budget) Plan {
         estimate += w;
     }
 
-    if (kept > 0) assert(estimate + budget.reserve <= budget.window);
+    const room_beside_system = @as(u64, budget.system_rows) + budget.reserve <= budget.window;
+    if (room_beside_system) assert(estimate + budget.reserve <= budget.window);
+    if (!room_beside_system) assert(estimate == budget.system_rows);
 
     const n: u32 = @intCast(weights_newest_first.len);
     assert(kept <= n);
@@ -659,6 +665,7 @@ fn parseFields(pieces: [3][]const u8, detail: []const u8) ?[2]u32 {
 // -- tests ------------------------------------------------------------------
 
 const testing = std.testing;
+const prop = @import("../../core/utils/prop.zig");
 
 fn newTranscript() !*Transcript {
     const t = try testing.allocator.create(Transcript);
@@ -1137,6 +1144,119 @@ test "plan keeps the newest turns that fit beside the system rows and reserve" {
     const q = plan(t, .{ .window = 64, .reserve = r, .system_rows = 20 });
     try testing.expectEqual(Plan{ .kept = 1, .dropped = 2, .estimate = 30 }, q);
     try testing.expect(q.estimate + 20 <= 64);
+}
+
+const PlanCase = struct {
+    weights: [12]u32,
+    len: usize,
+    budget: Budget,
+};
+
+fn genPlanCase(_: void, rand: std.Random, size: u32) PlanCase {
+    _ = size;
+    var c: PlanCase = undefined;
+    c.len = rand.uintAtMost(usize, c.weights.len);
+    for (&c.weights) |*w| {
+        w.* = if (rand.boolean()) 0 else rand.uintAtMost(u32, 40);
+    }
+
+    const window = rand.intRangeAtMost(u32, 1, 200);
+    c.budget = .{
+        .window = window,
+        .reserve = rand.uintAtMost(u32, window),
+        .system_rows = rand.uintAtMost(u32, 2 * window),
+    };
+    return c;
+}
+
+fn checkPlanCase(_: void, c: PlanCase) anyerror!void {
+    const ws = c.weights[0..c.len];
+    const b = c.budget;
+    const p = planOver(ws, b);
+    try testing.expectEqual(c.len, p.kept + p.dropped);
+
+    if (@as(u64, b.system_rows) + b.reserve <= b.window) {
+        try testing.expect(p.estimate + @as(u64, b.reserve) <= b.window);
+    } else {
+        try testing.expectEqual(b.system_rows, p.estimate);
+        for (ws[0..p.kept]) |w| {
+            try testing.expectEqual(@as(u32, 0), w);
+        }
+    }
+
+    // The kept turns are the longest suffix that fits: one more turn passes the cap.
+    if (p.kept < c.len) {
+        const cap = (@as(u64, b.window) - b.reserve) -| b.system_rows;
+        var sum: u64 = 0;
+        for (ws[0 .. p.kept + 1]) |w| {
+            sum += w;
+        }
+
+        try testing.expect(sum > cap);
+    }
+}
+
+test "plan: the estimate and the reserve hold on random budgets, past the window too" {
+    const opts: prop.Options = .{ .site = 0x5eed_0f10, .cases = 500 };
+    try prop.forAll(opts, {}, PlanCase, genPlanCase, checkPlanCase);
+}
+
+test "plan: a reserve past the room keeps the turn of cost zero" {
+    const t = try weighed(&.{ 7, 0 });
+    defer testing.allocator.destroy(t);
+
+    const p = plan(t, .{ .window = 64, .reserve = 60, .system_rows = 10 });
+    try testing.expectEqual(Plan{ .kept = 1, .dropped = 1, .estimate = 10 }, p);
+}
+
+test "plan: a reserve past the room keeps no turn when the newest turn costs one" {
+    const t = try weighed(&.{ 7, 1 });
+    defer testing.allocator.destroy(t);
+
+    const p = plan(t, .{ .window = 64, .reserve = 60, .system_rows = 10 });
+    try testing.expectEqual(Plan{ .kept = 0, .dropped = 2, .estimate = 10 }, p);
+}
+
+test "plan: system rows plus reserve one below the window keep the turn of cost one" {
+    const t = try weighed(&.{ 1, 0 });
+    defer testing.allocator.destroy(t);
+
+    const p = plan(t, .{ .window = 64, .reserve = 53, .system_rows = 10 });
+    try testing.expectEqual(Plan{ .kept = 2, .dropped = 0, .estimate = 11 }, p);
+    try testing.expect(p.estimate + 53 <= 64);
+}
+
+test "plan: system rows plus reserve equal to the window keep only the turn of cost zero" {
+    const t = try weighed(&.{ 1, 0 });
+    defer testing.allocator.destroy(t);
+
+    const p = plan(t, .{ .window = 64, .reserve = 54, .system_rows = 10 });
+    try testing.expectEqual(Plan{ .kept = 1, .dropped = 1, .estimate = 10 }, p);
+    try testing.expect(p.estimate + 54 <= 64);
+}
+
+test "plan: system rows plus reserve one above the window keep only the turn of cost zero" {
+    const t = try weighed(&.{ 1, 0 });
+    defer testing.allocator.destroy(t);
+
+    const p = plan(t, .{ .window = 64, .reserve = 55, .system_rows = 10 });
+    try testing.expectEqual(Plan{ .kept = 1, .dropped = 1, .estimate = 10 }, p);
+}
+
+test "plan: a reserve of zero keeps every turn that fits beside the system rows" {
+    const t = try weighed(&.{ 7, 0 });
+    defer testing.allocator.destroy(t);
+
+    const p = plan(t, .{ .window = 64, .reserve = 0, .system_rows = 10 });
+    try testing.expectEqual(Plan{ .kept = 2, .dropped = 0, .estimate = 17 }, p);
+}
+
+test "plan: system rows past the window keep only turns of cost zero" {
+    const t = try weighed(&.{ 5, 0 });
+    defer testing.allocator.destroy(t);
+
+    const p = plan(t, .{ .window = 64, .reserve = 8, .system_rows = 100 });
+    try testing.expectEqual(Plan{ .kept = 1, .dropped = 1, .estimate = 100 }, p);
 }
 
 test "retryPlan leaves room for the prompt on random budgets" {
