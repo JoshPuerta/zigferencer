@@ -4,8 +4,8 @@
 //!
 //! Role. While the GPU runs the submitted buffer, the runner records the predicted next step into
 //! the other buffer. The next step then submits that buffer with no record on its critical path.
-//! This file holds the control state alone. The fused runners own the
-//! command buffers and call these transitions around each Vulkan action.
+//! This file holds the control state alone. The decode ring of a fused runner owns the command
+//! buffers and calls these transitions around each Vulkan action.
 //!
 //! States. A buffer is `free`, `recorded k`, or `pending k`. `recorded k` holds the
 //! commands of key `k` that the GPU has not seen. `pending k` is submitted and
@@ -188,7 +188,7 @@ pub fn RecordRing(comptime Key: type) type {
             return wasted;
         }
 
-        /// Forget both buffers after a failed submit or wait. The runner reports
+        /// Forget both buffers after an error return of a decode step. The runner reports
         /// the error, and a lost device makes every buffer unusable anyway.
         pub fn drop(self: *Self) void {
             self.slots = .{ .free, .free };
@@ -207,7 +207,7 @@ pub fn decodeKey(pos: u32, level: span.GpuLevel) DecodeKey {
 
 const Ring = RecordRing(u32);
 
-/// One decode step the way the runners drive the ring, without the GPU. The
+/// One decode step the way `DecodeRing.step` drives the ring, without the GPU. The
 /// caller completes the step before the next one, as `waitForFences` does.
 fn stepOnce(r: *Ring, w: u32, next: ?u32, wasted: *u32) Prepared {
     const p = r.prepare(w);
@@ -222,11 +222,13 @@ fn stepOnce(r: *Ring, w: u32, next: ?u32, wasted: *u32) Prepared {
     r.submit(p.buf, w);
     if (next) |k| {
         const o = r.speculateTarget(p.buf);
-        if (r.beginRecord(o)) {
-            wasted.* += 1;
-        }
+        if (!r.holds(o, k)) {
+            if (r.beginRecord(o)) {
+                wasted.* += 1;
+            }
 
-        r.endRecord(o, k);
+            r.endRecord(o, k);
+        }
     }
 
     std.debug.assert(r.pendingCount() == 1);
@@ -299,6 +301,28 @@ test "RecordRing: an invalidation between steps forces a miss and counts the was
     try std.testing.expectEqual(@as(u32, 1), wasted);
 }
 
+test "RecordRing: a rewind keeps the recording that holds the predicted key" {
+    var r: Ring = .{};
+    var wasted: u32 = 0;
+    try std.testing.expectEqual(Prepared{ .buf = .a, .hit = false }, stepOnce(&r, 5, 6, &wasted));
+    try std.testing.expectEqual(Prepared{ .buf = .b, .hit = true }, stepOnce(&r, 6, 7, &wasted));
+    try std.testing.expectEqual(Prepared{ .buf = .a, .hit = true }, stepOnce(&r, 7, 8, &wasted));
+    try std.testing.expectEqual(Prepared{ .buf = .a, .hit = false }, stepOnce(&r, 7, 8, &wasted));
+    try std.testing.expectEqual(Ring.SlotT{ .recorded = 8 }, r.get(.b));
+    try std.testing.expectEqual(Prepared{ .buf = .b, .hit = true }, stepOnce(&r, 8, 9, &wasted));
+    try std.testing.expectEqual(@as(u32, 0), wasted);
+}
+
+test "RecordRing: a failed speculative record leaves the ring empty after the complete" {
+    var r: Ring = .{};
+    r.endRecord(.a, 7);
+    r.endRecord(.b, 5);
+    r.submit(.a, 7);
+    try std.testing.expect(r.beginRecord(r.speculateTarget(.a)));
+    r.complete(.a);
+    try std.testing.expectEqual(Ring{}, r);
+}
+
 fn checkRingModel(_: void, seed: u64) anyerror!void {
     var prng: std.Random.DefaultPrng = .init(seed);
     const rnd = prng.random();
@@ -331,6 +355,8 @@ fn checkRingModel(_: void, seed: u64) anyerror!void {
         try std.testing.expectEqual(Ring.SlotT.free, r.get(p.buf));
         if (next) |k| {
             try std.testing.expectEqual(Ring.SlotT{ .recorded = k }, r.get(p.buf.other()));
+        } else {
+            try std.testing.expectEqual(before.get(p.buf.other()), r.get(p.buf.other()));
         }
     }
 }
