@@ -29,8 +29,10 @@
 //!
 //! Rules. These rules keep the engine away from a slot that the acceptor writes.
 //!   1. The acceptor writes a slot (its id, its queue) only in `free` or `reclaimable`, and in
-//!      `live` before a task starts (`abandon`).
-//!   2. The engine thread reads a slot (find, put, close) only in `live` or `closing`.
+//!      `live` before the reader starts and after the started tasks exit (`abandon`).
+//!   2. The engine thread uses a slot (put, close) only in `live` or `closing`. A scan of `find`
+//!      can load the id of a slot that `abandon` freed. That id is never the wanted id, because
+//!      the wanted id is held.
 //!   3. Only `release` takes a slot out of `live` or `closing` toward `reclaimable` in the engine.
 //!      The engine thread calls it after it handles `conn_closed`, so no find of that thread is
 //!      open on the slot.
@@ -188,8 +190,8 @@ pub const ConnSlots = struct {
         transition(slot, from, .live);
     }
 
-    /// Free a slot whose reader did not start. No request names the new id, so the engine holds
-    /// no find on the slot. The acceptor must await the started tasks first.
+    /// Free a slot whose reader did not start. No request names the new id, so no find returns
+    /// the slot. The acceptor must await the started tasks first.
     pub fn abandon(self: *ConnSlots, index: u32) void {
         const slot = &self.slots[index];
         slot.tasks.store(0, .monotonic);
@@ -806,13 +808,18 @@ fn Schedule(comptime Table: type) type {
                 },
                 .accept_open => try self.acceptOpen(random),
                 .accept_fail => {
-                    // The writer starts, the reader does not, and the acceptor awaits the writer.
+                    // The reader does not start. A binary writer can start first, and the acceptor
+                    // awaits it.
                     const c = self.claimed.?;
                     try self.checkInit(c.index);
                     const id = self.table.nextId(self.last_id);
-                    self.table.open(c.index, id, 2);
-                    const last = self.table.dropTask(c.index);
-                    assert(!last);
+                    const tasks: u8 = if (random.boolean()) 2 else 1;
+                    self.table.open(c.index, id, tasks);
+                    if (tasks == 2 and random.boolean()) {
+                        const last = self.table.dropTask(c.index);
+                        assert(!last);
+                    }
+
                     self.table.abandon(c.index);
                     self.claimed = null;
                 },
