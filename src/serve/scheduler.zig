@@ -1140,7 +1140,7 @@ pub fn Scheduler(comptime SessionPool: type, comptime CodecT: type) type {
             }
         }
 
-        /// The cancel rule of a turn. A cancel and a drop share it.
+        /// The cancel rule of a turn. A cancel, a drop, and a shutdown share it.
         fn cancelTurn(self: *Self, entry: *SessionEntry) void {
             std.debug.assert(entry.state == .prefill or entry.state == .decode);
 
@@ -1674,32 +1674,40 @@ pub fn Scheduler(comptime SessionPool: type, comptime CodecT: type) type {
             }
         }
 
+        /// A shutdown cuts every entry with work in flight by the cancel rule of its kind. A turn
+        /// ends with a `done`, an append with an `err`, and an opening with no event.
         fn cancelAll(self: *Self, sink: anytype) void {
             log.debug("cancel-all", .{});
             for (self.entries) |*entry| {
-                if (entry.state != .prefill and entry.state != .decode) continue;
-
-                if (entry.state == .prefill and entry.kind == .append) {
-                    self.cancelAppend(entry, sink);
-                    continue;
+                switch (entry.state) {
+                    .free, .idle => {},
+                    .decode => self.cancelTurn(entry),
+                    .prefill => switch (entry.kind) {
+                        .turn => self.cancelTurn(entry),
+                        .append => self.cancelAppend(entry, sink),
+                        .opening => self.stopOpening(entry, sink),
+                    },
                 }
-
-                if (entry.state == .prefill) {
-                    self.gpa.free(entry.turn_tokens);
-                    entry.turn_tokens = &.{};
-                    entry.t_prefill_end = Io.Clock.Timestamp.now(self.io, .awake);
-                    std.debug.assert(entry.stop == null);
-                }
-
-                // A natural stop keeps its reason.
-                if (entry.stop == null) {
-                    entry.stop = .cancelled;
-                }
-
-                entry.state = .decode;
             }
 
             self.finalizeStops(sink);
+        }
+
+        /// A shutdown ends an opening prefill with no event. An opening has no turn, so no `done`
+        /// can name it, and the close of the connection answers the open.
+        fn stopOpening(self: *Self, entry: *SessionEntry, sink: anytype) void {
+            std.debug.assert(entry.state == .prefill);
+            std.debug.assert(entry.kind == .opening);
+
+            log.info(
+                "stop: session {d} opening cancelled after {d} of {d} tokens",
+                .{ entry.proto_id, entry.fed, entry.turn_tokens.len },
+            );
+            self.gpa.free(entry.turn_tokens);
+            entry.turn_tokens = &.{};
+            entry.state = .idle;
+            entry.kind = .turn;
+            self.deliverResume(entry, sink);
         }
 
         // -- the tick, in order ---------------------------------------------
@@ -7457,6 +7465,147 @@ test "property: random wire traces keep the table, end leases, and stop tokens a
         prop.genSeed(void),
         checkLeaseTrace,
     );
+}
+
+/// The request id of the open in the shutdown cases.
+const open_request: u32 = 41;
+
+/// An open of the four-byte system prompt. Two slots feed two tokens a tick, so the prefill of
+/// the opening needs two ticks.
+fn openOnly(fx: *Fixture, conn: u32) !void {
+    const dup = try std.testing.allocator.dupe(u8, "abcd");
+    _ = fx.sched.handle(.{ .conn = conn, .request_id = open_request, .session_id = 0, .body = .{
+        .session_open = .{ .sampling = protocol.Sampling.greedy, .system_prompt = dup },
+    } }, fx.sink);
+}
+
+fn shutdownNow(fx: *Fixture) !void {
+    const res = fx.sched.handle(
+        .{ .conn = 0, .request_id = 77, .session_id = 0, .body = .shutdown },
+        fx.sink,
+    );
+    try std.testing.expectEqual(HandleResult.shutdown, res);
+    fx.sched.checkLeases();
+}
+
+/// No event names the open with a `done`, and the entry counts no turn.
+fn expectOpeningStopped(fx: *const Fixture, entry: *const TestScheduler.SessionEntry) !void {
+    for (fx.sink.seen()) |e| {
+        if (e.ev.body == .done) {
+            try std.testing.expect(e.ev.request_id != open_request);
+        }
+    }
+
+    try std.testing.expectEqual(@as(u32, 0), entry.turns_done);
+    try std.testing.expect(entry.last_done == null);
+    try std.testing.expect(entry.state != .prefill and entry.state != .decode);
+}
+
+test "a shutdown ends an opening with no done and no counted turn: before the first chunk" {
+    var fx = try leaseFixture(2, 2);
+    defer fx.tearDown();
+
+    try openOnly(&fx, 1);
+    try std.testing.expectEqual(SessionPhase.prefill, fx.sched.entries[0].state);
+    try std.testing.expectEqual(@as(usize, 0), fx.sched.entries[0].fed);
+
+    try shutdownNow(&fx);
+    try expectOpeningStopped(&fx, &fx.sched.entries[0]);
+    try std.testing.expectEqual(
+        OutEvent.Body.shutdown_ack,
+        std.meta.activeTag(fx.sink.last().ev.body),
+    );
+}
+
+test "a shutdown ends an opening with no done and no counted turn: between two chunks" {
+    var fx = try leaseFixture(2, 2);
+    defer fx.tearDown();
+
+    try openOnly(&fx, 1);
+    _ = fx.sched.tick(fx.sink);
+    try std.testing.expectEqual(SessionPhase.prefill, fx.sched.entries[0].state);
+    try std.testing.expect(fx.sched.entries[0].fed > 0);
+
+    try shutdownNow(&fx);
+    try expectOpeningStopped(&fx, &fx.sched.entries[0]);
+    try std.testing.expectEqual(
+        OutEvent.Body.shutdown_ack,
+        std.meta.activeTag(fx.sink.last().ev.body),
+    );
+}
+
+test "a shutdown ends an opening with no done and no counted turn: after the last chunk" {
+    var fx = try leaseFixture(2, 2);
+    defer fx.tearDown();
+
+    try openOnly(&fx, 1);
+    fx.drain();
+    try std.testing.expectEqual(
+        OutEvent.Body.session_opened,
+        std.meta.activeTag(fx.sink.last().ev.body),
+    );
+
+    try shutdownNow(&fx);
+    try expectOpeningStopped(&fx, &fx.sched.entries[0]);
+    var opened: usize = 0;
+    for (fx.sink.seen()) |e| {
+        if (e.ev.body == .session_opened) {
+            opened += 1;
+        }
+    }
+
+    try std.testing.expectEqual(@as(usize, 1), opened);
+}
+
+test "a shutdown ends an opening with no done and no counted turn: beside a decoding session" {
+    var fx = try leaseFixture(2, 2);
+    defer fx.tearDown();
+
+    const sid = try fx.openSession(1, "a");
+    try fx.generate(1, sid, "x", 50);
+    var ticks: usize = 0;
+    while (fx.sched.entries[0].state != .decode and ticks < 8) : (ticks += 1) {
+        _ = fx.sched.tick(fx.sink);
+    }
+
+    try std.testing.expectEqual(SessionPhase.decode, fx.sched.entries[0].state);
+    try openOnly(&fx, 2);
+    try std.testing.expectEqual(SessionPhase.prefill, fx.sched.entries[1].state);
+
+    const before = fx.sink.n;
+    try shutdownNow(&fx);
+    try expectOpeningStopped(&fx, &fx.sched.entries[1]);
+    var dones: usize = 0;
+    for (fx.sink.seen()[before..]) |e| {
+        if (e.ev.body != .done) continue;
+
+        dones += 1;
+        try std.testing.expectEqual(@as(u32, 9), e.ev.request_id);
+        try std.testing.expectEqual(protocol.FinishReason.cancelled, e.ev.body.done.finish_reason);
+    }
+
+    try std.testing.expectEqual(@as(usize, 1), dones);
+    try std.testing.expectEqual(@as(u32, 1), fx.sched.entries[0].turns_done);
+}
+
+test "a shutdown ends an opening with no done and no counted turn: with a waiting resume" {
+    var fx = try leaseFixture(2, 2);
+    defer fx.tearDown();
+
+    try openOnly(&fx, 1);
+    _ = fx.sched.tick(fx.sink);
+    const entry = &fx.sched.entries[0];
+    try std.testing.expectEqual(SessionPhase.prefill, entry.state);
+    _ = try fx.sched.keepLease(entry.proto_id, 1, 50, tok(7));
+    fx.sched.detachConn(1, atMs(10));
+    const r = try fx.sched.resumeLease(2, 5, tok(7), atMs(20), tok(8));
+    try std.testing.expect(!r.ready);
+    try std.testing.expect(entry.resume_wait != null);
+
+    try shutdownNow(&fx);
+    try expectOpeningStopped(&fx, entry);
+    try std.testing.expect(entry.resume_wait == null);
+    try std.testing.expectEqual(SessionPhase.idle, entry.state);
 }
 
 test "wire trace: a cancel in an opening prefill leaves the open to end with session_opened" {
